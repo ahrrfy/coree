@@ -60,13 +60,23 @@ pub fn render_underlay_effects(
     obj: &SceneObject,
     deformed_local_path: &BezierPath,
     world_xf: Affine2D,
-    page_to_screen: Affine2D,
+    parent_to_screen: Affine2D,
+    page_to_surface: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
     backend: &mut dyn CanvasBackend,
 ) {
-    let local_to_screen = page_to_screen.compose(&world_xf);
+    if !world_xf.is_finite() || !parent_to_screen.is_finite() || !page_to_surface.is_finite() {
+        return;
+    }
     let world_path = deformed_local_path.transformed(&world_xf);
+    // Compute true page-mm path for page-space effects (`Blend`, `Extrude25D`) even inside Groups!
+    let page_world_xf = page_to_surface
+        .inverse()
+        .map(|inv| inv.compose(&parent_to_screen).compose(&world_xf))
+        .filter(|m| m.is_finite())
+        .unwrap_or(world_xf);
+    let page_world_path = deformed_local_path.transformed(&page_world_xf);
 
     for eff in &obj.effects {
         match eff {
@@ -80,7 +90,7 @@ pub fn render_underlay_effects(
             } => {
                 render_drop_shadow(
                     &world_path,
-                    page_to_screen,
+                    parent_to_screen,
                     *dx_mm,
                     *dy_mm,
                     *blur_mm,
@@ -100,7 +110,7 @@ pub fn render_underlay_effects(
             } => {
                 render_block_shadow(
                     &world_path,
-                    page_to_screen,
+                    parent_to_screen,
                     *dx_mm,
                     *dy_mm,
                     color,
@@ -126,7 +136,7 @@ pub fn render_underlay_effects(
                     fill_color,
                     &obj.outline,
                     outline_color,
-                    page_to_screen,
+                    parent_to_screen,
                     px_per_mm,
                     obj.opacity,
                     anti_alias,
@@ -141,13 +151,13 @@ pub fn render_underlay_effects(
                 light_dir,
             } => {
                 render_extrude_25d(
-                    &world_path,
+                    &page_world_path,
                     primary_fill_color(&obj.fill),
                     *vanishing_point,
                     *depth,
                     shade_color,
                     *light_dir,
-                    page_to_screen,
+                    page_to_surface,
                     obj.opacity,
                     anti_alias,
                     backend,
@@ -162,20 +172,18 @@ pub fn render_underlay_effects(
                 render_blend_effect(
                     doc,
                     obj,
-                    &world_path,
+                    &page_world_path,
                     *target_id,
                     *steps,
                     *rotation_deg,
                     *along_path,
-                    page_to_screen,
+                    page_to_surface,
                     px_per_mm,
                     anti_alias,
                     backend,
                 );
             }
-            _ => {
-                let _ = local_to_screen;
-            }
+            _ => {}
         }
     }
 }
@@ -192,6 +200,9 @@ pub fn render_overlay_effects(
     anti_alias: bool,
     backend: &mut dyn CanvasBackend,
 ) {
+    if !world_xf.is_finite() || !page_to_screen.is_finite() {
+        return;
+    }
     let world_path = deformed_local_path.transformed(&world_xf);
     for eff in &obj.effects {
         match eff {
@@ -610,7 +621,7 @@ fn render_contour_steps(
         rings.reverse();
     }
 
-    let total = rings.len() as f32;
+    let max_k = rings.iter().map(|(k, _)| *k).max().unwrap_or(1) as f32;
     let stroke_w = if base_outline.is_visible() {
         (base_outline.effective_width_mm() as f32).max((1.0 / px_per_mm.max(1e-3)) as f32)
     } else {
@@ -618,7 +629,7 @@ fn render_contour_steps(
     };
 
     for (k, ring) in rings {
-        let t = (k as f32 / total.max(1.0)).clamp(0.0, 1.0);
+        let t = (k as f32 / max_k.max(1.0)).clamp(0.0, 1.0);
         let step_fill = base_fill.lerp(target_fill, t);
         let paint = BackendPaint {
             shader: crate::backend::PaintShader::Solid(step_fill),
@@ -814,7 +825,7 @@ fn render_blend_effect(
 
 /// Applies Envelope bilinear/Coons cage deformation to `path`.
 fn apply_envelope_to_path(path: &BezierPath, mode: EnvelopeMode, cage: &[Point2D]) -> BezierPath {
-    if cage.len() < 4 || path.is_empty() {
+    if cage.len() < 4 || path.is_empty() || !cage.iter().all(|p| p.is_finite()) {
         return path.clone();
     }
     let Some(bb) = path.bounding_box() else {

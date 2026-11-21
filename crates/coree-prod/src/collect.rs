@@ -141,6 +141,12 @@ pub fn collect_for_output(
         let images_dir = output_dir.join("images");
         fs::create_dir_all(&images_dir)?;
         for (&asset_id, asset) in &doc.assets {
+            if asset.width == 0 || asset.height == 0 {
+                return Err(ProdError::ImageError(format!(
+                    "raster asset {asset_id} has zero dimensions ({}x{})",
+                    asset.width, asset.height
+                )));
+            }
             let file_name = format!("{}.png", asset_id.0);
             let rel = format!("images/{file_name}");
             let full = images_dir.join(&file_name);
@@ -268,15 +274,31 @@ pub fn collect_for_output(
         format: "coree-collect-for-output/v1".to_owned(),
         document_title: doc.title.clone(),
         color_mode: doc.color_mode,
-        dpi: doc.dpi,
+        dpi: if doc.dpi.is_finite() && doc.dpi > 0.0 {
+            doc.dpi
+        } else {
+            300.0
+        },
         pages: doc
             .pages
             .iter()
             .map(|p| PageSummary {
                 name: p.name.clone(),
-                width_mm: p.width_mm,
-                height_mm: p.height_mm,
-                bleed_mm: p.bleed_mm,
+                width_mm: if p.width_mm.is_finite() {
+                    p.width_mm
+                } else {
+                    0.0
+                },
+                height_mm: if p.height_mm.is_finite() {
+                    p.height_mm
+                } else {
+                    0.0
+                },
+                bleed_mm: if p.bleed_mm.is_finite() {
+                    p.bleed_mm
+                } else {
+                    0.0
+                },
                 layer_count: p.layers.len(),
             })
             .collect(),

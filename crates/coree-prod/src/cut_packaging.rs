@@ -49,9 +49,9 @@ pub fn generate_cut_contour(
             "generate_cut_contour requires at least one target object".into(),
         ));
     }
-    if !offset_mm.is_finite() {
+    if !offset_mm.is_finite() || offset_mm.abs() > 10_000.0 {
         return Err(ProdError::InvalidParameter(
-            "offset_mm must be finite".into(),
+            "offset_mm must be finite and within +/- 10000 mm".into(),
         ));
     }
 
@@ -225,19 +225,22 @@ pub struct DielineResult {
     pub crease_length_mm: f64,
 }
 
+/// Maximum physical dieline dimension in millimeters (100 meters, guards against float overflow).
+const MAX_DIELINE_DIM_MM: f64 = 100_000.0;
+
 fn check_pos(name: &str, v: f64) -> ProdResult<()> {
-    if !v.is_finite() || v <= 0.0 {
+    if !v.is_finite() || v <= 0.0 || v > MAX_DIELINE_DIM_MM {
         return Err(ProdError::InvalidParameter(format!(
-            "{name} must be positive and finite (got {v})"
+            "{name} must be positive and finite in (0, {MAX_DIELINE_DIM_MM}] (got {v})"
         )));
     }
     Ok(())
 }
 
 fn check_non_neg(name: &str, v: f64) -> ProdResult<()> {
-    if !v.is_finite() || v < 0.0 {
+    if !v.is_finite() || v < 0.0 || v > MAX_DIELINE_DIM_MM {
         return Err(ProdError::InvalidParameter(format!(
-            "{name} must be non-negative and finite (got {v})"
+            "{name} must be non-negative and finite in [0, {MAX_DIELINE_DIM_MM}] (got {v})"
         )));
     }
     Ok(())
@@ -904,18 +907,22 @@ pub fn compute_production_metrics(
 
     if let Some(bb) = metrics.bounding_box {
         let sheet_area = bb.width() * bb.height();
-        metrics.bounding_sheet_area_mm2 = sheet_area;
-        metrics.bounding_sheet_area_m2 = sheet_area / 1_000_000.0;
-        let utilized_area = if metrics.filled_area_mm2 > 1e-6 {
-            metrics.filled_area_mm2
-        } else {
-            metrics.cut_enclosed_area_mm2
-        };
-        if sheet_area > 1e-6 {
-            metrics.material_utilization_pct =
-                (utilized_area / sheet_area * 100.0).clamp(0.0, 100.0);
+        if sheet_area.is_finite() && sheet_area >= 0.0 {
+            metrics.bounding_sheet_area_mm2 = sheet_area;
+            metrics.bounding_sheet_area_m2 = sheet_area / 1_000_000.0;
+            let utilized_area = if metrics.filled_area_mm2 > 1e-6 {
+                metrics.filled_area_mm2
+            } else {
+                metrics.cut_enclosed_area_mm2
+            };
+            if sheet_area > 1e-6 && utilized_area.is_finite() {
+                metrics.material_utilization_pct =
+                    (utilized_area / sheet_area * 100.0).clamp(0.0, 100.0);
+            }
         }
-        metrics.estimated_vinyl_roll_m = bb.height() / 1_000.0;
+        if bb.height().is_finite() && bb.height() >= 0.0 {
+            metrics.estimated_vinyl_roll_m = bb.height() / 1_000.0;
+        }
     }
 
     // Realistic laser cutter & vinyl plotter time estimates
@@ -1015,6 +1022,9 @@ fn accumulate_object_metrics(
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        return;
+    }
 
     match &obj.payload {
         NodePayload::Group(children) => {
@@ -1069,7 +1079,7 @@ fn accumulate_object_metrics(
         NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
         NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints(c);
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
             Some(c.route_path(a, b))
         }
         _ => None,
@@ -1103,8 +1113,18 @@ fn record_path_metrics(
     if path.is_empty() {
         return;
     }
-    let len = path.path_length_mm();
-    let area = path.area_mm2();
+    let raw_len = path.path_length_mm();
+    let len = if raw_len.is_finite() && raw_len >= 0.0 {
+        raw_len
+    } else {
+        0.0
+    };
+    let raw_area = path.area_mm2();
+    let area = if raw_area.is_finite() && raw_area >= 0.0 {
+        raw_area
+    } else {
+        0.0
+    };
     let role = classify_path_role(layer, obj);
 
     metrics.object_count += 1;

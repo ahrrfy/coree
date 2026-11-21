@@ -6,7 +6,10 @@
 use crate::backend::{CanvasBackend, PixelRect, RgbaBuffer, TinySkiaBackend};
 use crate::renderer::{compute_page_layouts, RenderOptions, SceneRenderer};
 use crate::viewport::{ViewMode, Viewport};
-use coree_core::{Affine2D, Document, PerspectiveGridMode, Rect2D, SpatialIndex};
+use coree_core::{
+    Affine2D, BuiltinIccProfile, Document, GuideOrientation, PerspectiveGridMode, Rect2D,
+    RenderingIntent, SpatialIndex,
+};
 use std::collections::HashMap;
 
 /// Tile edge length in screen pixels (`256 × 256`).
@@ -64,11 +67,48 @@ struct ViewportKey {
     perspective_grid_horizon_bits: u64,
     perspective_grid_opacity_bits: u32,
     guides_len: usize,
+    guides_hash: u64,
+    pages_hash: u64,
+    soft_proof_cmyk: bool,
+    gamut_warning: bool,
+    proof_profile: BuiltinIccProfile,
+    proof_intent: RenderingIntent,
 }
 
 impl ViewportKey {
     fn from(doc: &Document, vp: &Viewport, mode: ViewMode, options: &RenderOptions) -> Self {
         let active_page = doc.pages.get(doc.active_page_index);
+        let mut guides_hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mix = |h: &mut u64, v: u64| {
+            *h ^= v;
+            *h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        for g in &doc.guides {
+            mix(&mut guides_hash, g.id);
+            match g.orientation {
+                GuideOrientation::Horizontal(y) => {
+                    mix(&mut guides_hash, 1);
+                    mix(&mut guides_hash, y.to_bits());
+                }
+                GuideOrientation::Vertical(x) => {
+                    mix(&mut guides_hash, 2);
+                    mix(&mut guides_hash, x.to_bits());
+                }
+                GuideOrientation::Angled { origin, angle_deg } => {
+                    mix(&mut guides_hash, 3);
+                    mix(&mut guides_hash, origin.x.to_bits());
+                    mix(&mut guides_hash, origin.y.to_bits());
+                    mix(&mut guides_hash, angle_deg.to_bits());
+                }
+            }
+        }
+        let mut pages_hash = 0xcbf2_9ce4_8422_2325_u64;
+        for p in &doc.pages {
+            mix(&mut pages_hash, p.id.0);
+            mix(&mut pages_hash, p.width_mm.to_bits());
+            mix(&mut pages_hash, p.height_mm.to_bits());
+            mix(&mut pages_hash, p.bleed_mm.to_bits());
+        }
         Self {
             width_px: vp.width_px,
             height_px: vp.height_px,
@@ -107,6 +147,12 @@ impl ViewportKey {
             perspective_grid_horizon_bits: doc.perspective_grid.horizon_y_mm.to_bits(),
             perspective_grid_opacity_bits: doc.perspective_grid.opacity.to_bits(),
             guides_len: doc.guides.len(),
+            guides_hash,
+            pages_hash,
+            soft_proof_cmyk: options.soft_proof_cmyk,
+            gamut_warning: options.gamut_warning,
+            proof_profile: options.proof_profile,
+            proof_intent: options.proof_intent,
         }
     }
 }

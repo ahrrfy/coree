@@ -384,7 +384,7 @@ pub(crate) fn world_bounds_with_xf(
         NodePayload::Table(t) => world_xf.try_transform_rect(t.to_bounding_box()),
         NodePayload::Dimension(d) => world_xf.try_transform_rect(d.bounding_box()),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints(c);
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, world_xf);
             c.route_path(a, b).bounding_box()
         }
         NodePayload::PowerClip { container, .. } => container.transformed(world_xf).bounding_box(),
@@ -412,31 +412,39 @@ pub(crate) fn bezier_to_skia_path(
     scale_x: f32,
     scale_y: f32,
 ) -> Option<tiny_skia::Path> {
-    if path.is_empty() {
+    if path.is_empty() || !scale_x.is_finite() || !scale_y.is_finite() {
         return None;
     }
     let kb = path.to_kurbo();
     let mut pb = tiny_skia::PathBuilder::new();
     let sx = f64::from(scale_x);
     let sy = f64::from(scale_y);
+    let to_f32 = |x: f64, y: f64| -> Option<(f32, f32)> {
+        let fx = (x * sx) as f32;
+        let fy = (y * sy) as f32;
+        (fx.is_finite() && fy.is_finite()).then_some((fx, fy))
+    };
     for el in kb.elements() {
         match *el {
-            PathEl::MoveTo(p) => pb.move_to((p.x * sx) as f32, (p.y * sy) as f32),
-            PathEl::LineTo(p) => pb.line_to((p.x * sx) as f32, (p.y * sy) as f32),
-            PathEl::QuadTo(p1, p2) => pb.quad_to(
-                (p1.x * sx) as f32,
-                (p1.y * sy) as f32,
-                (p2.x * sx) as f32,
-                (p2.y * sy) as f32,
-            ),
-            PathEl::CurveTo(p1, p2, p3) => pb.cubic_to(
-                (p1.x * sx) as f32,
-                (p1.y * sy) as f32,
-                (p2.x * sx) as f32,
-                (p2.y * sy) as f32,
-                (p3.x * sx) as f32,
-                (p3.y * sy) as f32,
-            ),
+            PathEl::MoveTo(p) => {
+                let (x, y) = to_f32(p.x, p.y)?;
+                pb.move_to(x, y);
+            }
+            PathEl::LineTo(p) => {
+                let (x, y) = to_f32(p.x, p.y)?;
+                pb.line_to(x, y);
+            }
+            PathEl::QuadTo(p1, p2) => {
+                let (x1, y1) = to_f32(p1.x, p1.y)?;
+                let (x2, y2) = to_f32(p2.x, p2.y)?;
+                pb.quad_to(x1, y1, x2, y2);
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let (x1, y1) = to_f32(p1.x, p1.y)?;
+                let (x2, y2) = to_f32(p2.x, p2.y)?;
+                let (x3, y3) = to_f32(p3.x, p3.y)?;
+                pb.cubic_to(x1, y1, x2, y2, x3, y3);
+            }
             PathEl::ClosePath => pb.close(),
         }
     }
@@ -458,6 +466,10 @@ pub(crate) fn collect_silhouette_paths(
     }
     if let Some(obj) = doc.objects.get(&id) {
         let world_xf = parent_xf.compose(&obj.transform);
+        if !world_xf.is_finite() {
+            visiting.remove(&id);
+            return;
+        }
         match &obj.payload {
             NodePayload::Path(p) => {
                 if !p.is_empty() {
@@ -477,19 +489,39 @@ pub(crate) fn collect_silhouette_paths(
                 }
             }
             NodePayload::ArtisticText(t) => {
-                out.push(BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf));
+                let p = BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf);
+                if !p.is_empty() {
+                    out.push(p);
+                }
             }
             NodePayload::ParagraphText(t) => {
-                out.push(BezierPath::from_rect(t.bounding_box()).transformed(&world_xf));
+                let p = BezierPath::from_rect(t.bounding_box()).transformed(&world_xf);
+                if !p.is_empty() {
+                    out.push(p);
+                }
             }
             NodePayload::Raster(r) => {
-                let rect = r
-                    .crop_rect
-                    .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm));
-                out.push(BezierPath::from_rect(rect).transformed(&world_xf));
+                let rect = match r.crop_rect {
+                    Some(cr) if cr.is_finite() => Some(cr),
+                    Some(_) => None,
+                    None if r.width_mm.is_finite()
+                        && r.width_mm > 0.0
+                        && r.height_mm.is_finite()
+                        && r.height_mm > 0.0 =>
+                    {
+                        Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+                    }
+                    None => None,
+                };
+                if let Some(rc) = rect {
+                    out.push(BezierPath::from_rect(rc).transformed(&world_xf));
+                }
             }
             NodePayload::Table(t) => {
-                out.push(BezierPath::from_rect(t.to_bounding_box()).transformed(&world_xf));
+                let p = BezierPath::from_rect(t.to_bounding_box()).transformed(&world_xf);
+                if !p.is_empty() {
+                    out.push(p);
+                }
             }
             NodePayload::Group(children) => {
                 for &cid in children {
@@ -500,10 +532,18 @@ pub(crate) fn collect_silhouette_paths(
                 if let Some(sym) = doc.symbols.get(sym_id) {
                     for sub in &sym.objects {
                         let sub_xf = world_xf.compose(&sub.transform);
+                        if !sub_xf.is_finite() {
+                            continue;
+                        }
                         match &sub.payload {
-                            NodePayload::Path(p) => out.push(p.transformed(&sub_xf)),
+                            NodePayload::Path(p) if !p.is_empty() => {
+                                out.push(p.transformed(&sub_xf))
+                            }
                             NodePayload::Shape(s) => {
-                                out.push(s.to_bezier_path().transformed(&sub_xf))
+                                let p = s.to_bezier_path().transformed(&sub_xf);
+                                if !p.is_empty() {
+                                    out.push(p);
+                                }
                             }
                             _ => {}
                         }

@@ -1018,3 +1018,230 @@ fn regression_angular_nan_and_zero_sx_decompose() {
         );
     }
 }
+
+#[test]
+fn autofit_page_to_content_resizes_shifts_and_ignores_hidden_objects() {
+    let mut doc = Document::new_a4("Autofit Test");
+    // Empty page must return an error instead of collapsing page size
+    assert!(doc.autofit_page_to_content(0, 5.0).is_err());
+    // Out-of-range page index returns PageIndexOutOfRange
+    assert!(matches!(
+        doc.autofit_page_to_content(9, 5.0),
+        Err(CoreError::PageIndexOutOfRange { index: 9, len: 1 })
+    ));
+
+    // Place two visible rects at (40, 60, 30x20) and (90, 80, 30x30) -> union [40..120, 60..110] (80x50)
+    let r1 = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "R1", rect_shape(30.0, 20.0))
+                .with_transform(Affine2D::translate(40.0, 60.0)),
+            None,
+        )
+        .unwrap();
+    let r2 = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "R2", rect_shape(30.0, 30.0))
+                .with_transform(Affine2D::translate(90.0, 80.0)),
+            None,
+        )
+        .unwrap();
+    // Hidden object far away must NOT inflate page bounds
+    let mut hidden_obj = SceneObject::new(ObjectId(0), "HiddenFar", rect_shape(50.0, 50.0))
+        .with_transform(Affine2D::translate(400.0, 500.0));
+    hidden_obj.visible = false;
+    let hidden_id = doc.add_object(hidden_obj, None).unwrap();
+
+    let (new_w, new_h) = doc.autofit_page_to_content(0, 5.0).unwrap();
+    assert!((new_w - 90.0).abs() < 1e-6, "expected 90mm, got {new_w}");
+    assert!((new_h - 60.0).abs() < 1e-6, "expected 60mm, got {new_h}");
+    assert!((doc.pages[0].width_mm - 90.0).abs() < 1e-6);
+    assert!((doc.pages[0].height_mm - 60.0).abs() < 1e-6);
+
+    let b1 = doc.object_bounds(r1).unwrap();
+    let b2 = doc.object_bounds(r2).unwrap();
+    assert!((b1.min_x - 5.0).abs() < 1e-6);
+    assert!((b1.min_y - 5.0).abs() < 1e-6);
+    assert!((b2.max_x - 85.0).abs() < 1e-6);
+    assert!((b2.max_y - 55.0).abs() < 1e-6);
+
+    // Hidden object shifted by the exact same delta (-35, -55) so relative alignment stays intact
+    let bh = doc.object_bounds(hidden_id).unwrap();
+    assert!((bh.min_x - 365.0).abs() < 1e-6);
+    assert!((bh.min_y - 445.0).abs() < 1e-6);
+
+    // Works cleanly with negative object coordinates and NaN margin sanitization
+    doc.objects.get_mut(&r1).unwrap().transform = Affine2D::translate(-25.0, -15.0);
+    let (w2, h2) = doc.autofit_page_to_content(0, f64::NAN).unwrap();
+    assert!(w2 >= 1.0 && h2 >= 1.0);
+    let b1_after = doc.object_bounds(r1).unwrap();
+    assert!(b1_after.min_x.abs() < 1e-6);
+    assert!(b1_after.min_y.abs() < 1e-6);
+}
+
+#[test]
+fn icc_profiles_gamut_and_postscript_presets_end_to_end() {
+    // Display P3 <-> sRGB roundtrip through D50 PCS
+    let sample = [0.42_f32, 0.58, 0.71];
+    let p3 = convert_rgb_between_builtin_profiles(
+        sample,
+        BuiltinIccProfile::Srgb,
+        BuiltinIccProfile::DisplayP3,
+    );
+    let back = convert_rgb_between_builtin_profiles(
+        p3,
+        BuiltinIccProfile::DisplayP3,
+        BuiltinIccProfile::Srgb,
+    );
+    for ch in 0..3 {
+        assert!(
+            (sample[ch] - back[ch]).abs() < 1e-3,
+            "sRGB->P3->sRGB drift on ch {ch}: {} vs {}",
+            sample[ch],
+            back[ch]
+        );
+    }
+
+    // All 4 rendering intents execute cleanly without NaNs on both CMYK profiles
+    for prof in [
+        BuiltinIccProfile::IsoCoatedV2Cmyk,
+        BuiltinIccProfile::UsWebCoatedSwopCmyk,
+    ] {
+        for intent in [
+            RenderingIntent::Perceptual,
+            RenderingIntent::RelativeColorimetric,
+            RenderingIntent::Saturation,
+            RenderingIntent::AbsoluteColorimetric,
+        ] {
+            let cmyk = convert_rgb_to_cmyk_icc([0.8, 0.2, 0.5], prof, intent);
+            assert!(cmyk
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            let proof = soft_proof_srgb_through_cmyk([0.8, 0.2, 0.5], prof, intent);
+            assert!(proof
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        }
+        // Built-in profile metadata checks
+        let built = IccProfile::builtin(prof);
+        assert_eq!(built.header.color_space, IccColorSpace::Cmyk);
+        assert!(built.white_point.is_some());
+    }
+
+    // Parametric curve types 0..=4 forward + inverse roundtrip
+    let curves = [
+        IccToneCurve::Parametric {
+            func_type: 0,
+            params: [2.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+        IccToneCurve::Parametric {
+            func_type: 1,
+            params: [2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+        IccToneCurve::Parametric {
+            func_type: 2,
+            params: [2.0, 0.95, 0.05, 0.0, 0.0, 0.0, 0.0],
+        },
+        IccToneCurve::srgb(),
+        IccToneCurve::Parametric {
+            func_type: 4,
+            params: [
+                2.4,
+                1.0 / 1.055,
+                0.055 / 1.055,
+                1.0 / 12.92,
+                0.04045,
+                0.0,
+                0.0,
+            ],
+        },
+    ];
+    for c in &curves {
+        let y = c.eval(0.5);
+        let x = c.eval_inverse(y);
+        assert!((x - 0.5).abs() < 1e-4, "curve inverse mismatch: {x}");
+    }
+
+    // All 10 PostScript presets roundtrip cleanly with hyphen & case tolerance
+    assert_eq!(PostScriptFillPreset::ALL.len(), 10);
+    assert_eq!(
+        PostScriptFillPreset::from_preset_str("PS:cross-hatch"),
+        Some(PostScriptFillPreset::CrossHatch)
+    );
+    assert_eq!(
+        PostScriptFillPreset::from_preset_str("ps:halftone-dots"),
+        Some(PostScriptFillPreset::HalftoneDots)
+    );
+}
+
+#[test]
+fn regression_nested_powerclip_world_transforms_locked_layer_hit_test_and_zero_impact() {
+    let mut doc = Document::new_a4("Audit Core Fixes");
+
+    // 1. Nested PowerClip inside a translated Group must preserve exact child world coordinates!
+    let container = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Container", rect_shape(40.0, 40.0))
+                .with_transform(Affine2D::translate(10.0, 5.0)),
+            None,
+        )
+        .unwrap();
+    let grp = doc.group_objects(&[container], "ParentGroup").unwrap();
+    doc.objects.get_mut(&grp).unwrap().transform = Affine2D::translate(50.0, 20.0);
+
+    // Top-level child at world (65, 30)
+    let child = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Child", rect_shape(10.0, 10.0))
+                .with_transform(Affine2D::translate(65.0, 30.0)),
+            None,
+        )
+        .unwrap();
+
+    doc.create_powerclip(container, &[child]).unwrap();
+    // Composed world transform of child inside Group(50,20) -> Container(10,5) -> Child must remain (65,30)!
+    let child_world = doc.world_transform_of(child).unwrap();
+    let origin_world = child_world.transform_point(Point2D::ZERO);
+    assert!(
+        (origin_world.x - 65.0).abs() < 1e-6 && (origin_world.y - 30.0).abs() < 1e-6,
+        "Nested PowerClip drifted child world position to {origin_world:?}"
+    );
+
+    // 2. world_path_of must include ancestor Group transform!
+    let container_world_bb = doc
+        .world_path_of(container)
+        .unwrap()
+        .bounding_box()
+        .unwrap();
+    assert!((container_world_bb.min_x - 60.0).abs() < 1e-6);
+    assert!((container_world_bb.min_y - 25.0).abs() < 1e-6);
+
+    // 3. Document::hit_test must skip objects on locked layers
+    let page_id = doc.pages[0].id;
+    let locked_lid = doc
+        .add_layer(page_id, "LockedLayer", false, MasterLayerScope::None)
+        .unwrap();
+    let on_locked = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "OnLocked", rect_shape(20.0, 20.0))
+                .with_transform(Affine2D::translate(150.0, 150.0)),
+            Some(locked_lid),
+        )
+        .unwrap();
+    assert_eq!(
+        doc.hit_test(Point2D::new(160.0, 160.0), 1.0),
+        Some(on_locked)
+    );
+    doc.set_layer_flags(locked_lid, None, Some(true), None, None)
+        .unwrap();
+    assert_eq!(doc.hit_test(Point2D::new(160.0, 160.0), 1.0), None);
+
+    // 4. Zero-size ParametricShape::Impact returns empty path safely
+    let zero_impact = ParametricShape::Impact {
+        rays: 12,
+        inner_radius: 0.0,
+        outer_radius: 0.0,
+        style: ImpactStyle::Radial,
+    }
+    .to_bezier_path();
+    assert!(zero_impact.is_empty());
+}

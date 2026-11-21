@@ -865,32 +865,45 @@ pub(crate) fn extract_marching_squares_contours(
     loops
 }
 
-/// Ramer-Douglas-Peucker simplification for open polylines.
+/// Iterative stack-based Ramer-Douglas-Peucker simplification for open polylines
+/// (zero recursion stack-overflow risk even on very long traced contours).
 #[must_use]
 pub(crate) fn rdp_simplify_open(pts: &[Point2D], eps: f64) -> Vec<Point2D> {
     if pts.len() <= 2 {
         return pts.to_vec();
     }
-    let a = pts[0];
-    let b = pts[pts.len() - 1];
-    let mut max_d = 0.0;
-    let mut idx = 0;
-    for (i, &p) in pts.iter().enumerate().take(pts.len() - 1).skip(1) {
-        let d = point_seg_dist(p, a, b);
-        if d > max_d {
-            max_d = d;
-            idx = i;
+    let n = pts.len();
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+
+    while let Some((start, end)) = stack.pop() {
+        if end <= start + 1 {
+            continue;
+        }
+        let a = pts[start];
+        let b = pts[end];
+        let mut max_d = 0.0_f64;
+        let mut idx = start;
+        for (i, &p) in pts.iter().enumerate().take(end).skip(start + 1) {
+            let d = point_seg_dist(p, a, b);
+            if d > max_d {
+                max_d = d;
+                idx = i;
+            }
+        }
+        if max_d > eps && idx > start && idx < end {
+            keep[idx] = true;
+            stack.push((start, idx));
+            stack.push((idx, end));
         }
     }
-    if max_d > eps && idx > 0 {
-        let mut left = rdp_simplify_open(&pts[..=idx], eps);
-        let right = rdp_simplify_open(&pts[idx..], eps);
-        left.pop();
-        left.extend(right);
-        left
-    } else {
-        vec![a, b]
-    }
+
+    pts.iter()
+        .enumerate()
+        .filter_map(|(i, &p)| keep[i].then_some(p))
+        .collect()
 }
 
 /// Ramer-Douglas-Peucker simplification for closed polygon rings.

@@ -231,6 +231,7 @@ fn parse_cpt_native(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> 
     doc.metadata.source_format = Some(format!("CPT v{version}"));
 
     let mut budget_remaining = limits.max_uncompressed_bytes;
+    limits.consume_budget(&mut budget_remaining, bytes.len() as u64)?;
     let warnings = Vec::new();
 
     for layer_idx in 0..layer_count {
@@ -398,20 +399,21 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
         ));
     }
 
+    let endian = riff_tree.endian;
     let head = riff_tree
         .find_chunk(b"head")
         .ok_or_else(|| CdrError::MalformedHeader("RIFF CPT missing 'head' chunk".to_owned()))?;
     let mut hr = ByteReader::new(head);
-    let canvas_w = hr.read_u32_le("RIFF CPT width")?;
-    let canvas_h = hr.read_u32_le("RIFF CPT height")?;
+    let canvas_w = endian.read_u32(&mut hr, "RIFF CPT width")?;
+    let canvas_h = endian.read_u32(&mut hr, "RIFF CPT height")?;
     limits.validate_bitmap_dims(canvas_w, canvas_h)?;
-    let model_raw = hr.read_u16_le("RIFF CPT color_model")?;
+    let model_raw = endian.read_u16(&mut hr, "RIFF CPT color_model")?;
     let canvas_model = CptColorModel::from_u16(model_raw).ok_or_else(|| {
         CdrError::MalformedHeader(format!("unsupported RIFF CPT color model {model_raw}"))
     })?;
-    let dpi_x = sanitize_f32(hr.read_f32_le("RIFF CPT dpi_x")?, 300.0).max(1.0);
-    let dpi_y = sanitize_f32(hr.read_f32_le("RIFF CPT dpi_y")?, dpi_x).max(1.0);
-    let tlen = usize::from(hr.read_u16_le("RIFF CPT title_len").unwrap_or(0));
+    let dpi_x = sanitize_f32(endian.read_f32(&mut hr, "RIFF CPT dpi_x")?, 300.0).max(1.0);
+    let dpi_y = sanitize_f32(endian.read_f32(&mut hr, "RIFF CPT dpi_y")?, dpi_x).max(1.0);
+    let tlen = usize::from(endian.read_u16(&mut hr, "RIFF CPT title_len").unwrap_or(0));
     let title = if tlen > 0 && tlen <= hr.remaining() {
         decode_cdr_text(
             hr.read_bytes(tlen, "RIFF CPT title")?,
@@ -435,6 +437,7 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
     doc.metadata.source_format = Some("CPT RIFF".to_owned());
 
     let warnings = Vec::new();
+    let mut layer_count = 0usize;
 
     for node in &riff_tree.children {
         if let RiffNode::List {
@@ -446,6 +449,13 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
             if list_type != b"layr" {
                 continue;
             }
+            layer_count += 1;
+            if layer_count > limits.max_chunks || layer_count > 4096 {
+                return Err(CdrError::ChunkLimitExceeded {
+                    count: layer_count,
+                    limit: limits.max_chunks.min(4096),
+                });
+            }
             let info_bytes = node
                 .find_chunk(b"info")
                 .ok_or_else(|| CdrError::InvalidChunk {
@@ -453,18 +463,18 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
                     reason: "missing 'info' chunk in RIFF CPT layer".to_owned(),
                 })?;
             let mut ir = ByteReader::new(info_bytes);
-            let nlen = usize::from(ir.read_u16_le("CPT info name_len")?);
+            let nlen = usize::from(endian.read_u16(&mut ir, "CPT info name_len")?);
             let name = decode_cdr_text(ir.read_bytes(nlen, "CPT info name")?, None, None);
-            let ox = ir.read_i32_le("CPT info ox")?;
-            let oy = ir.read_i32_le("CPT info oy")?;
-            let lw = ir.read_u32_le("CPT info w")?;
-            let lh = ir.read_u32_le("CPT info h")?;
+            let ox = endian.read_i32(&mut ir, "CPT info ox")?;
+            let oy = endian.read_i32(&mut ir, "CPT info oy")?;
+            let lw = endian.read_u32(&mut ir, "CPT info w")?;
+            let lh = endian.read_u32(&mut ir, "CPT info h")?;
             limits.validate_bitmap_dims(lw, lh)?;
             let opacity = ir.read_u8("CPT info opacity")?;
             let blend = decode_blend_mode(ir.read_u8("CPT info blend")?);
             let flags = ir.read_u8("CPT info flags")?;
-            let lmodel =
-                CptColorModel::from_u16(ir.read_u16_le("CPT info model")?).unwrap_or(canvas_model);
+            let lmodel = CptColorModel::from_u16(endian.read_u16(&mut ir, "CPT info model")?)
+                .unwrap_or(canvas_model);
 
             let pxls_bytes = node
                 .find_chunk(b"pxls")
@@ -647,6 +657,8 @@ fn insert_cpt_layer_into_doc(
         }),
     );
     obj.transform = Affine2D::translate(tx_mm, ty_mm);
+    obj.fill = coree_core::Fill::None;
+    obj.outline = coree_core::OutlineStyle::none();
     obj.opacity = f32::from(opacity_u8) / 255.0;
     obj.blend_mode = blend_mode;
     obj.visible = visible;

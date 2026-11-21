@@ -218,6 +218,35 @@ fn format_location(
 /// Runs a comprehensive print-production preflight inspection across all pages and layers.
 #[must_use]
 pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport {
+    let defaults = PreflightRules::default();
+    let safe_rules = PreflightRules {
+        min_dpi: if rules.min_dpi.is_finite() && rules.min_dpi >= 0.0 {
+            rules.min_dpi
+        } else {
+            defaults.min_dpi
+        },
+        min_outline_width_mm: if rules.min_outline_width_mm.is_finite()
+            && rules.min_outline_width_mm >= 0.0
+        {
+            rules.min_outline_width_mm
+        } else {
+            defaults.min_outline_width_mm
+        },
+        bleed_edge_tolerance_mm: if rules.bleed_edge_tolerance_mm.is_finite()
+            && rules.bleed_edge_tolerance_mm >= 0.0
+        {
+            rules.bleed_edge_tolerance_mm
+        } else {
+            defaults.bleed_edge_tolerance_mm
+        },
+        max_tac_pct: if rules.max_tac_pct.is_finite() && rules.max_tac_pct >= 0.0 {
+            rules.max_tac_pct
+        } else {
+            defaults.max_tac_pct
+        },
+        ..rules.clone()
+    };
+
     let mut issues = Vec::new();
 
     if doc.pages.is_empty() {
@@ -235,7 +264,7 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
 
     for page in &doc.pages {
         for layer in &page.layers {
-            check_layer(doc, page, layer, rules, &mut issues);
+            check_layer(doc, page, layer, &safe_rules, &mut issues);
         }
     }
 
@@ -493,9 +522,15 @@ fn check_object(
         let mut worst_tac = 0.0_f64;
         for &(_, color) in &colors {
             if let Color::Cmyk { c, m, y, k, a } = *color {
-                if a > 1e-4 {
+                if a.is_finite()
+                    && a > 1e-4
+                    && c.is_finite()
+                    && m.is_finite()
+                    && y.is_finite()
+                    && k.is_finite()
+                {
                     let tac = f64::from(c + m + y + k) * 100.0;
-                    if tac > worst_tac {
+                    if tac.is_finite() && tac > worst_tac {
                         worst_tac = tac;
                     }
                 }
@@ -558,33 +593,41 @@ fn check_object(
                     });
                 }
 
-                let dec = world_xf.decompose();
-                let placed_w = (raster.width_mm * dec.scale.x.abs()).max(1e-6);
-                let placed_h = (raster.height_mm * dec.scale.y.abs()).max(1e-6);
-                let eff_dpi_x = f64::from(asset.width) / (placed_w / 25.4);
-                let eff_dpi_y = f64::from(asset.height) / (placed_h / 25.4);
-                let effective_dpi = eff_dpi_x.min(eff_dpi_y);
+                if world_xf.is_finite()
+                    && raster.width_mm.is_finite()
+                    && raster.height_mm.is_finite()
+                    && raster.width_mm > 0.0
+                    && raster.height_mm > 0.0
+                {
+                    let dec = world_xf.decompose();
+                    let placed_w = (raster.width_mm * dec.scale.x.abs()).max(1e-6);
+                    let placed_h = (raster.height_mm * dec.scale.y.abs()).max(1e-6);
+                    let eff_dpi_x = f64::from(asset.width) / (placed_w / 25.4);
+                    let eff_dpi_y = f64::from(asset.height) / (placed_h / 25.4);
+                    let effective_dpi = eff_dpi_x.min(eff_dpi_y);
 
-                if effective_dpi + 1e-3 < rules.min_dpi {
-                    let sev = if effective_dpi < rules.min_dpi * 0.5 {
-                        PreflightSeverity::Error
-                    } else {
-                        PreflightSeverity::Warning
-                    };
-                    issues.push(PreflightIssue {
-                        severity: sev,
-                        kind: PreflightIssueKind::LowResolutionImage,
-                        page_id: Some(page.id),
-                        layer_id: Some(layer.id),
-                        object_id: Some(oid),
-                        message: format!(
-                            "Image '{}' effective resolution is {effective_dpi:.1} DPI (minimum {:.0} DPI)",
-                            obj.name, rules.min_dpi
-                        ),
-                        suggestion: "Replace with a higher-resolution bitmap or reduce placed dimensions."
-                            .into(),
-                        measured_value: Some(effective_dpi),
-                    });
+                    if effective_dpi.is_finite() && effective_dpi + 1e-3 < rules.min_dpi {
+                        let sev = if effective_dpi < rules.min_dpi * 0.5 {
+                            PreflightSeverity::Error
+                        } else {
+                            PreflightSeverity::Warning
+                        };
+                        issues.push(PreflightIssue {
+                            severity: sev,
+                            kind: PreflightIssueKind::LowResolutionImage,
+                            page_id: Some(page.id),
+                            layer_id: Some(layer.id),
+                            object_id: Some(oid),
+                            message: format!(
+                                "Image '{}' effective resolution is {effective_dpi:.1} DPI (minimum {:.0} DPI)",
+                                obj.name, rules.min_dpi
+                            ),
+                            suggestion:
+                                "Replace with a higher-resolution bitmap or reduce placed dimensions."
+                                    .into(),
+                            measured_value: Some(effective_dpi),
+                        });
+                    }
                 }
             }
         }

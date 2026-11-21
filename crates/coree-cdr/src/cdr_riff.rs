@@ -5,8 +5,8 @@
 //! Arabic decoding, and lossless Unknown-Chunk Passthrough.
 
 use crate::coord::{
-    cdr32_to_mm, contains_arabic, decode_cdr_text, mm_to_cdr32, read_tagged_color,
-    write_tagged_color, CODEPAGE_ARABIC_CP1256, CODEPAGE_UTF8,
+    cdr32_to_mm, contains_arabic, decode_cdr_color, decode_cdr_text, mm_to_cdr32,
+    read_tagged_color, write_tagged_color, CODEPAGE_ARABIC_CP1256, CODEPAGE_UTF16LE, CODEPAGE_UTF8,
 };
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{ByteReader, CodecLimits};
@@ -14,6 +14,7 @@ use crate::riff::{
     fourcc_to_string, parse_list_body, parse_riff_with_budget, serialize_list_body, write_riff,
     RiffDocument, RiffEndian, RiffNode,
 };
+use crate::zcf::{parse_c9_style_override, CdssStyle, ZcfContext};
 use coree_core::{
     math::{sanitize_f32, sanitize_f64},
     Affine2D, ArrowheadStyle, ArtisticText, BasicShapeKind, BezierPath, BlendMode, ColorMapMode,
@@ -23,7 +24,7 @@ use coree_core::{
     ParametricShape, PathNode, Point2D, RasterAsset, RasterLayerData, Rect2D, SceneObject, Subpath,
     TextAlign, TextDirection, TextRun, TextStyle, UnknownCdrChunk, Vec2D,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // LODA argument type IDs
 const LODA_ARG_RECTANGLE: u32 = 0x0001;
@@ -36,8 +37,23 @@ const LODA_ARG_OUTLINE_ID: u32 = 0x000A;
 const LODA_ARG_FILL_ID: u32 = 0x0014;
 const LODA_ARG_CURVE: u32 = 0x001E;
 const LODA_ARG_STYLE_ID: u32 = 0x00C8;
+const LODA_ARG_STYLE_JSON: u32 = 0x00C9;
 const LODA_ARG_OBJ_PROPS: u32 = 0x00D0;
 const LODA_ARG_EXTRA_SHAPE: u32 = 0x00D1;
+const LODA_ARG_NAME: u32 = 0x03E8;
+
+// Authentic CorelDRAW LODA chunk types (offset 16 in 20-byte LODA header)
+const CDR_CTYPE_GROUP_OR_LAYER: u32 = 0x00;
+const CDR_CTYPE_RECTANGLE: u32 = 0x01;
+const CDR_CTYPE_ELLIPSE: u32 = 0x02;
+const CDR_CTYPE_CURVE: u32 = 0x03;
+const CDR_CTYPE_POLYGON: u32 = 0x04;
+const CDR_CTYPE_BITMAP: u32 = 0x05;
+const CDR_CTYPE_ARTISTIC_TEXT: u32 = 0x06;
+const CDR_CTYPE_PARAGRAPH_TEXT: u32 = 0x10;
+const CDR_CTYPE_LAYER_GRID: u32 = 0x0B;
+const CDR_CTYPE_LAYER_GUIDES: u32 = 0x0C;
+const CDR_CTYPE_LAYER_DESKTOP: u32 = 0x11;
 
 // Curve node flags (bitmask)
 const NODE_KIND_MASK: u8 = 0xC0;
@@ -51,6 +67,10 @@ const NODE_CONT_SMOOTH: u8 = 0x10;
 const NODE_CONT_SYMMETRICAL: u8 = 0x20;
 const NODE_FLAG_CLOSED: u8 = 0x08;
 const NODE_CTRL_PRESENT: u8 = 0x01;
+/// Marker bit written by clean-room `encode_curve_points` when one of the two cubic
+/// control handles is absent (`None`), distinguishing it from real CorelDRAW `0xC0`
+/// control points (which always represent present off-curve Bezier handles).
+const NODE_CTRL_ABSENT: u8 = 0x02;
 
 // Tagged bitmap chunk header magic
 const CBMP_MAGIC: &[u8; 4] = b"CBMP";
@@ -478,10 +498,19 @@ struct ParseContext<'a> {
     budget_remaining: &'a mut u64,
     endian: RiffEndian,
     version: u16,
+    is_zcf: bool,
+    doc_page_width_mm: f64,
+    doc_page_height_mm: f64,
+    current_page_w_mm: f64,
+    current_page_h_mm: f64,
+    zcf: &'a ZcfContext,
     fills: HashMap<u32, Fill>,
     outlines: HashMap<u32, OutlineStyle>,
+    outlines_explicit_none: HashSet<u32>,
     styles: HashMap<u32, ParsedStyleEntry>,
     bitmaps: HashMap<u32, ImageAssetId>,
+    text_streams: HashMap<u32, Vec<u8>>,
+    master_layers: Vec<Layer>,
     warnings: Vec<String>,
 }
 
@@ -506,6 +535,26 @@ pub fn parse_cdr_riff_with_budget(
     charge_input_bytes: bool,
 ) -> CdrResult<ParsedRiffCdr> {
     let riff_tree = parse_riff_with_budget(bytes, limits, budget_remaining, charge_input_bytes)?;
+    let default_zcf = ZcfContext::default();
+    parse_cdr_riff_tree(
+        riff_tree,
+        limits,
+        external_bitmaps,
+        budget_remaining,
+        &default_zcf,
+    )
+}
+
+/// Decodes a pre-parsed (and for ZCF v16–26, already dereferenced) [`RiffDocument`]
+/// into a [`ParsedRiffCdr`], merging any document-wide [`ZcfContext`] resources
+/// (`styles/document.cdss`, `META-INF/textinfo.xml`, metadata page dimensions).
+pub(crate) fn parse_cdr_riff_tree(
+    riff_tree: RiffDocument,
+    limits: &CodecLimits,
+    external_bitmaps: &HashMap<u32, Vec<u8>>,
+    budget_remaining: &mut u64,
+    zcf: &ZcfContext,
+) -> CdrResult<ParsedRiffCdr> {
     let is_template = is_cdt_form_type(&riff_tree.form_type);
     if !is_cdr_form_type(&riff_tree.form_type) && !is_template {
         return Err(CdrError::UnsupportedFormat(format!(
@@ -515,17 +564,31 @@ pub fn parse_cdr_riff_with_budget(
     }
 
     let mut version = version_from_form_type(&riff_tree.form_type);
+    if let Some(v) = zcf.version_hint {
+        if v > 0 {
+            version = v;
+        }
+    }
+    if let Some(fver_bytes) = riff_tree.find_chunk(b"fver") {
+        if fver_bytes.len() >= 2 {
+            let v = u16::from_le_bytes([fver_bytes[0], fver_bytes[1]]);
+            if v > 0 && v != u16::MAX {
+                version = v;
+            }
+        }
+    }
     if let Some(vrsn_bytes) = riff_tree.find_chunk(b"vrsn") {
         if vrsn_bytes.len() >= 2 {
             let mut vr = ByteReader::new(vrsn_bytes);
             if let Ok(v) = vr.read_u16_le("vrsn") {
-                if v > 0 {
+                if v > 0 && v != u16::MAX {
                     version = v;
                 }
             }
         }
     }
 
+    let (init_w, init_h) = zcf.metadata_page_size_mm.unwrap_or((210.0, 297.0));
     let mut doc = Document::new_a4("Imported CDR");
     doc.pages.clear();
     doc.metadata.source_format = Some(if is_template {
@@ -539,10 +602,19 @@ pub fn parse_cdr_riff_with_budget(
         budget_remaining,
         endian: riff_tree.endian,
         version,
+        is_zcf: zcf.is_zcf || &riff_tree.form_type == b"CDRO" || &riff_tree.form_type == b"CDTO",
+        doc_page_width_mm: init_w,
+        doc_page_height_mm: init_h,
+        current_page_w_mm: init_w,
+        current_page_h_mm: init_h,
+        zcf,
         fills: HashMap::new(),
         outlines: HashMap::new(),
+        outlines_explicit_none: HashSet::new(),
         styles: HashMap::new(),
         bitmaps: HashMap::new(),
+        text_streams: HashMap::new(),
+        master_layers: Vec::new(),
         warnings: Vec::new(),
     };
 
@@ -562,16 +634,17 @@ pub fn parse_cdr_riff_with_budget(
         }
     }
 
-    // Walk top-level children: unwrap `LIST cmpr` transparently to reach `LIST doc `
+    // Walk top-level children: unwrap `LIST cmpr` transparently to reach `LIST doc ` & top-level `LIST page`
     let mut found_doc_list = false;
     let mut is_template_flag = is_template;
     let mut top_nodes = Vec::new();
     flatten_cmpr_nodes(&riff_tree.children, &mut top_nodes);
 
-    for node in top_nodes {
+    // Pass 1 (top-level): parse `LIST doc ` and any top-level metadata/resources BEFORE pages
+    for &node in &top_nodes {
         match node {
             RiffNode::Chunk { fourcc, data, .. } => match fourcc {
-                b"vrsn" | b"DISP" => {}
+                b"vrsn" | b"fver" | b"DISP" => {}
                 b"tmpt" => {
                     is_template_flag = true;
                 }
@@ -587,11 +660,15 @@ pub fn parse_cdr_riff_with_budget(
                 list_type,
                 children,
                 ..
-            } => {
-                if list_type == b"doc " {
+            } => match list_type {
+                b"doc " => {
                     found_doc_list = true;
                     parse_doc_list(children, &mut doc, &mut ctx)?;
-                } else {
+                }
+                b"page" => {
+                    // Parsed in Pass 2 after `LIST doc ` fills/outlines/mcfg are loaded
+                }
+                _ => {
                     // Preserve unknown top-level LIST verbatim (list_type + full nested structure)
                     let raw = serialize_list_body(list_type, children, ctx.endian)?;
                     doc.unknown_doc_chunks.push(UnknownCdrChunk {
@@ -600,6 +677,20 @@ pub fn parse_cdr_riff_with_budget(
                         raw_bytes: raw,
                     });
                 }
+            },
+        }
+    }
+
+    // Pass 2 (top-level): parse top-level `LIST page` containers (CorelDRAW X6–2025 `CDRO` layout)
+    for &node in &top_nodes {
+        if let RiffNode::List {
+            list_type,
+            children: page_ch,
+            ..
+        } = node
+        {
+            if list_type == b"page" {
+                parse_page_list(page_ch, &mut doc, &mut ctx)?;
             }
         }
     }
@@ -612,8 +703,28 @@ pub fn parse_cdr_riff_with_budget(
     if doc.pages.is_empty() {
         let pid = PageId(doc.alloc_id());
         let lid = LayerId(doc.alloc_id());
-        doc.pages
-            .push(Page::new(pid, "Page 1", 210.0, 297.0, 3.0, lid));
+        doc.pages.push(Page::new(
+            pid,
+            "Page 1",
+            ctx.doc_page_width_mm,
+            ctx.doc_page_height_mm,
+            3.0,
+            lid,
+        ));
+    }
+
+    // Attach any non-empty Master Page layers onto the first document page
+    if !ctx.master_layers.is_empty() {
+        doc.pages[0].layers.extend(ctx.master_layers);
+    }
+
+    // Apply optional `META-INF/textinfo.xml` page names when binary chunks had defaults
+    for (idx, pname) in ctx.zcf.textinfo.page_names.iter().enumerate() {
+        if let Some(page) = doc.pages.get_mut(idx) {
+            if !pname.is_empty() {
+                page.name = pname.clone();
+            }
+        }
     }
 
     if doc.document_palette.swatches.is_empty() {
@@ -652,23 +763,26 @@ fn parse_doc_list(
     ctx: &mut ParseContext<'_>,
 ) -> CdrResult<()> {
     // Flatten any nested `LIST cmpr` blocks BEFORE Pass 1 & Pass 2 so compressed pages
-    // can resolve later sibling resource tables (`LIST fill`/`outl`/`stlt`/`bmps`).
+    // can resolve later sibling resource tables (`LIST fill`/`filt`/`outl`/`otlt`/`stlt`/`bmps`/`bmpt`).
     let mut flat_nodes = Vec::new();
     flatten_cmpr_nodes(children, &mut flat_nodes);
 
-    // Pass 1: load ALL shared document resources (`mcfg`, `plte`, `fill`, `outl`, `stlt`, `bmps`/`bmp `)
+    // Pass 1: load ALL shared document resources
     for &node in &flat_nodes {
         match node {
             RiffNode::Chunk { fourcc, data, .. } => match fourcc {
                 b"mcfg" => parse_doc_mcfg(data, doc, ctx),
                 b"plte" => parse_plte_chunk(data, doc, ctx),
                 b"fild" => {
-                    if let Ok((id, fill)) = parse_fild_chunk(data) {
+                    if let Ok((id, fill)) = parse_fild_chunk(data, ctx.is_zcf) {
                         ctx.fills.insert(id, fill);
                     }
                 }
                 b"outl" => {
-                    if let Ok((id, outl)) = parse_outl_chunk(data) {
+                    if let Ok((id, outl, is_none)) = parse_outl_chunk(data, ctx.is_zcf) {
+                        if is_none {
+                            ctx.outlines_explicit_none.insert(id);
+                        }
                         ctx.outlines.insert(id, outl);
                     }
                 }
@@ -680,7 +794,8 @@ fn parse_doc_list(
                 b"bmp " => {
                     register_bmp_chunk_payload(data, None, doc, ctx)?;
                 }
-                b"vrsn" | b"DISP" | b"tmpt" => {}
+                b"vrsn" | b"fver" | b"DISP" | b"tmpt" | b"pref" | b"ptrt" | b"flgs" | b"spid"
+                | b"bbox" | b"obbx" | b"usdn" => {}
                 _ => {
                     doc.unknown_doc_chunks.push(UnknownCdrChunk {
                         fourcc: *fourcc,
@@ -694,29 +809,33 @@ fn parse_doc_list(
                 children: list_ch,
                 ..
             } => match list_type {
-                b"fill" => {
+                b"fill" | b"filt" => {
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"fild" {
-                                if let Ok((id, fill)) = parse_fild_chunk(data) {
+                                if let Ok((id, fill)) = parse_fild_chunk(data, ctx.is_zcf) {
                                     ctx.fills.insert(id, fill);
                                 }
                             }
                         }
                     }
                 }
-                b"outl" => {
+                b"outl" | b"otlt" => {
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"outl" {
-                                if let Ok((id, outl)) = parse_outl_chunk(data) {
+                                if let Ok((id, outl, is_none)) = parse_outl_chunk(data, ctx.is_zcf)
+                                {
+                                    if is_none {
+                                        ctx.outlines_explicit_none.insert(id);
+                                    }
                                     ctx.outlines.insert(id, outl);
                                 }
                             }
                         }
                     }
                 }
-                b"stlt" => {
+                b"stlt" | b"styd" | b"font" => {
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"stlt" {
@@ -727,16 +846,36 @@ fn parse_doc_list(
                         }
                     }
                 }
-                b"bmps" => {
+                b"bmps" | b"bmpt" => {
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"bmp " {
-                                register_bmp_chunk_payload(data, None, doc, ctx)?;
+                                if let Err(e) = register_bmp_chunk_payload(data, None, doc, ctx) {
+                                    if matches!(
+                                        e,
+                                        CdrError::InvalidBitmapDimensions { .. }
+                                            | CdrError::UncompressedSizeLimitExceeded { .. }
+                                    ) {
+                                        return Err(e);
+                                    }
+                                    ctx.warnings.push(format!("skipped document bitmap: {e}"));
+                                }
                             }
                         }
                     }
                 }
-                b"page" => {}
+                b"txsm" => {
+                    // Document-level text stream table (CorelDRAW v12–26 `LIST txsm`)
+                    for ch in list_ch {
+                        if let RiffNode::Chunk { fourcc, data, .. } = ch {
+                            if (fourcc == b"txsm" || fourcc == b"txst") && data.len() >= 8 {
+                                let tid = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                                ctx.text_streams.insert(tid, data.clone());
+                            }
+                        }
+                    }
+                }
+                b"page" | b"arrw" | b"bmpf" | b"osmk" | b"vpat" | b"ppdt" | b"clrs" => {}
                 _ => {
                     // Preserve unknown document-level LIST verbatim!
                     let raw = serialize_list_body(list_type, list_ch, ctx.endian)?;
@@ -750,7 +889,7 @@ fn parse_doc_list(
         }
     }
 
-    // Pass 2: parse ALL pages (both uncompressed and previously inside `LIST cmpr`)
+    // Pass 2: parse ALL pages inside `LIST doc ` (classic RIFF / X4–X5 / synthetic layout)
     for &node in &flat_nodes {
         if let RiffNode::List {
             list_type,
@@ -768,6 +907,36 @@ fn parse_doc_list(
 }
 
 fn parse_doc_mcfg(data: &[u8], doc: &mut Document, ctx: &mut ParseContext<'_>) {
+    // 1. Authentic CorelDRAW v16–26 ZCF `mcfg` (large struct >= 64 bytes; page size at offset 12..20)
+    if data.len() >= 64 {
+        let mut r = ByteReader::new(data);
+        let first = r.read_u32_le("mcfg hdr0").unwrap_or(0);
+        // Real v16+ mcfg stores struct marker (e.g. 2100) at 0..4, body size at 4..8,
+        // and page (width, height) in 0.1 µm at 12..20.
+        if (100..100_000).contains(&first) && data.len() >= 20 {
+            let w_cdr = i32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+            let h_cdr = i32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            let wm = cdr32_to_mm(w_cdr);
+            let hm = cdr32_to_mm(h_cdr);
+            if wm > 1.0 && hm > 1.0 && wm < 50_000.0 && hm < 50_000.0 {
+                ctx.doc_page_width_mm = wm;
+                ctx.doc_page_height_mm = hm;
+                return;
+            }
+        }
+        // Real v7–v15 mcfg stores (width, height) at offset 4..12.
+        let w_cdr = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let h_cdr = i32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let wm = cdr32_to_mm(w_cdr);
+        let hm = cdr32_to_mm(h_cdr);
+        if wm > 1.0 && hm > 1.0 && wm < 50_000.0 && hm < 50_000.0 {
+            ctx.doc_page_width_mm = wm;
+            ctx.doc_page_height_mm = hm;
+            return;
+        }
+    }
+
+    // 2. Clean-room synthetic `mcfg` (compact: w_cdr, h_cdr, color_mode, dpi, title_len, title)
     let mut r = ByteReader::new(data);
     let Ok(w_cdr) = r.read_i32_le("doc mcfg w") else {
         ctx.warnings.push("truncated doc mcfg chunk".into());
@@ -776,7 +945,12 @@ fn parse_doc_mcfg(data: &[u8], doc: &mut Document, ctx: &mut ParseContext<'_>) {
     let Ok(h_cdr) = r.read_i32_le("doc mcfg h") else {
         return;
     };
-    let _ = (w_cdr, h_cdr);
+    let wm = cdr32_to_mm(w_cdr);
+    let hm = cdr32_to_mm(h_cdr);
+    if wm > 1.0 && hm > 1.0 && wm < 50_000.0 && hm < 50_000.0 {
+        ctx.doc_page_width_mm = wm;
+        ctx.doc_page_height_mm = hm;
+    }
     if let Ok(cm) = r.read_u8("doc mcfg color_mode") {
         doc.color_mode = if cm == 1 {
             ColorMode::Rgb
@@ -862,49 +1036,128 @@ fn parse_page_list(
 ) -> CdrResult<()> {
     let page_num = doc.pages.len() + 1;
     let mut page_name = format!("Page {page_num}");
-    let mut width_mm = 210.0;
-    let mut height_mm = 297.0;
+    let mut width_mm = ctx.doc_page_width_mm;
+    let mut height_mm = ctx.doc_page_height_mm;
     let mut bleed_mm = 3.0;
     let mut facing_pages = false;
+    let mut is_master_page = false;
 
     for node in children {
         if let RiffNode::Chunk { fourcc, data, .. } = node {
-            if fourcc == b"mcfg" {
-                let mut r = ByteReader::new(data);
-                if let (Ok(w), Ok(h)) = (r.read_i32_le("page w"), r.read_i32_le("page h")) {
-                    let wm = cdr32_to_mm(w);
-                    let hm = cdr32_to_mm(h);
-                    if wm > 0.1 && hm > 0.1 {
-                        width_mm = wm;
-                        height_mm = hm;
-                    }
-                }
-                if let Ok(b) = r.read_i32_le("page bleed") {
-                    bleed_mm = cdr32_to_mm(b).max(0.0);
-                }
-                if let Ok(fp) = r.read_u8("page facing") {
-                    facing_pages = fp != 0;
-                }
-                if let Ok(nlen) = r.read_u16_le("page name len") {
-                    if let Ok(nb) = r.read_bytes(usize::from(nlen), "page name") {
-                        let s = decode_cdr_text(nb, Some(CODEPAGE_UTF8), None);
-                        if !s.is_empty() {
-                            page_name = s;
+            match fourcc {
+                b"mcfg" => {
+                    if data.len() >= 64 {
+                        if let Some((wm, hm)) = parse_real_page_mcfg(data) {
+                            width_mm = wm;
+                            height_mm = hm;
+                        }
+                    } else {
+                        let mut r = ByteReader::new(data);
+                        if let (Ok(w), Ok(h)) = (r.read_i32_le("page w"), r.read_i32_le("page h")) {
+                            let wm = cdr32_to_mm(w);
+                            let hm = cdr32_to_mm(h);
+                            if wm > 0.1 && hm > 0.1 {
+                                width_mm = wm;
+                                height_mm = hm;
+                            }
+                        }
+                        if let Ok(b) = r.read_i32_le("page bleed") {
+                            bleed_mm = cdr32_to_mm(b).max(0.0);
+                        }
+                        if let Ok(fp) = r.read_u8("page facing") {
+                            facing_pages = fp != 0;
+                        }
+                        if let Ok(nlen) = r.read_u16_le("page name len") {
+                            if let Ok(nb) = r.read_bytes(usize::from(nlen), "page name") {
+                                let s = decode_cdr_text(nb, Some(CODEPAGE_UTF8), None);
+                                if !s.is_empty() {
+                                    page_name = s;
+                                }
+                            }
                         }
                     }
                 }
-            } else {
-                doc.unknown_doc_chunks.push(UnknownCdrChunk {
-                    fourcc: *fourcc,
-                    version_hint: u32::from(ctx.version),
-                    raw_bytes: data.clone(),
-                });
+                b"flgs" => {
+                    if data.len() >= 4 {
+                        let flgs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                        // Bit 0x0001_0000 marks the CorelDRAW Master Page container (`masterPage.dat`)
+                        if (flgs & 0x0001_0000) != 0 {
+                            is_master_page = true;
+                        }
+                    }
+                }
+                b"spid" | b"bbox" | b"obbx" | b"usdn" => {}
+                _ => {
+                    doc.unknown_doc_chunks.push(UnknownCdrChunk {
+                        fourcc: *fourcc,
+                        version_hint: u32::from(ctx.version),
+                        raw_bytes: data.clone(),
+                    });
+                }
             }
         }
     }
 
+    ctx.current_page_w_mm = width_mm;
+    ctx.current_page_h_mm = height_mm;
+
+    // Collect `LIST layr` children both directly under `LIST page` AND inside `LIST gobj`
+    let mut layer_lists: Vec<&[RiffNode]> = Vec::new();
+    for node in children {
+        if let RiffNode::List {
+            list_type,
+            children: sub_ch,
+            ..
+        } = node
+        {
+            match list_type {
+                b"layr" => layer_lists.push(sub_ch.as_slice()),
+                b"gobj" => {
+                    for gnode in sub_ch {
+                        if let RiffNode::List {
+                            list_type: glt,
+                            children: gch,
+                            ..
+                        } = gnode
+                        {
+                            if glt == b"layr" {
+                                layer_lists.push(gch.as_slice());
+                            }
+                        }
+                    }
+                }
+                b"lgob" => {
+                    // Optional page-level loda carrying a custom page name
+                    for lnode in sub_ch {
+                        if let RiffNode::Chunk { fourcc, data, .. } = lnode {
+                            if fourcc == b"loda" {
+                                if let Some(name) = extract_real_loda_name(data) {
+                                    page_name = name;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if is_master_page {
+        // Master Page: keep only layers that actually carry artwork objects (as MasterLayerScope::AllPages)
+        for layr_ch in layer_lists {
+            if let Some(mut layer) = parse_layer_to_struct(layr_ch, true, 0, doc, ctx)? {
+                if !layer.objects.is_empty() {
+                    layer.master_scope = MasterLayerScope::AllPages;
+                    ctx.master_layers.push(layer);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let page_id = PageId(doc.alloc_id());
-    let mut page = Page {
+    let page = Page {
         id: page_id,
         name: page_name,
         width_mm,
@@ -913,72 +1166,179 @@ fn parse_page_list(
         facing_pages,
         layers: Vec::new(),
     };
-    doc.pages.push(page.clone());
+    doc.pages.push(page);
     let page_idx = doc.pages.len() - 1;
 
-    for node in children {
-        if let RiffNode::List {
-            list_type,
-            children: layr_ch,
-            ..
-        } = node
-        {
-            if list_type == b"layr" {
-                parse_layer_list(layr_ch, page_idx, doc, ctx)?;
-            }
+    for layr_ch in layer_lists {
+        let next_num = doc.pages[page_idx].layers.len() + 1;
+        if let Some(layer) = parse_layer_to_struct(layr_ch, false, next_num, doc, ctx)? {
+            doc.pages[page_idx].layers.push(layer);
         }
     }
 
     if doc.pages[page_idx].layers.is_empty() {
+        let fallback_name = ctx
+            .zcf
+            .textinfo
+            .layer_names
+            .first()
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Layer 1".to_owned());
         let lid = LayerId(doc.alloc_id());
-        page.layers.push(Layer::new(lid, "Layer 1"));
-        doc.pages[page_idx].layers = page.layers;
+        doc.pages[page_idx]
+            .layers
+            .push(Layer::new(lid, fallback_name));
     }
 
     Ok(())
 }
 
-fn parse_layer_list(
+fn parse_real_page_mcfg(data: &[u8]) -> Option<(f64, f64)> {
+    if data.len() >= 20 {
+        let first = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let (off_w, off_h) = if (100..100_000).contains(&first) {
+            (12, 16)
+        } else {
+            (4, 8)
+        };
+        let w = cdr32_to_mm(i32::from_le_bytes([
+            data[off_w],
+            data[off_w + 1],
+            data[off_w + 2],
+            data[off_w + 3],
+        ]));
+        let h = cdr32_to_mm(i32::from_le_bytes([
+            data[off_h],
+            data[off_h + 1],
+            data[off_h + 2],
+            data[off_h + 3],
+        ]));
+        if w > 1.0 && h > 1.0 && w < 50_000.0 && h < 50_000.0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+fn parse_layer_to_struct(
     children: &[RiffNode],
-    page_idx: usize,
+    is_master_page: bool,
+    layer_num: usize,
     doc: &mut Document,
     ctx: &mut ParseContext<'_>,
-) -> CdrResult<()> {
-    let layer_num = doc.pages[page_idx].layers.len() + 1;
+) -> CdrResult<Option<Layer>> {
     let layer_id = LayerId(doc.alloc_id());
-    let mut layer = Layer::new(layer_id, format!("Layer {layer_num}"));
+    let mut layer = Layer::new(layer_id, format!("Layer {}", layer_num.max(1)));
+    let mut is_system_layer = false;
+    let mut has_explicit_name = false;
 
     for node in children {
-        if let RiffNode::Chunk { fourcc, data, .. } = node {
-            if fourcc == b"layr" || fourcc == b"loda" {
-                let mut r = ByteReader::new(data);
-                if let Ok(flags) = r.read_u8("layer flags") {
-                    layer.visible = (flags & 0x01) != 0;
-                    layer.locked = (flags & 0x02) != 0;
-                    layer.printable = (flags & 0x04) != 0;
-                    layer.is_cut_layer = (flags & 0x08) != 0;
+        match node {
+            RiffNode::Chunk { fourcc, data, .. } => match fourcc {
+                b"layr" | b"loda" => {
+                    if is_real_corel_loda(data) {
+                        if let Some((ctype, name)) = parse_real_layer_loda(data) {
+                            if matches!(
+                                ctype,
+                                CDR_CTYPE_LAYER_GRID
+                                    | CDR_CTYPE_LAYER_GUIDES
+                                    | CDR_CTYPE_LAYER_DESKTOP
+                            ) {
+                                is_system_layer = true;
+                                if ctype == CDR_CTYPE_LAYER_GRID || ctype == CDR_CTYPE_LAYER_GUIDES
+                                {
+                                    layer.printable = false;
+                                }
+                            }
+                            if let Some(n) = name {
+                                layer.name = n;
+                                has_explicit_name = true;
+                            }
+                        }
+                    } else {
+                        let mut r = ByteReader::new(data);
+                        if let Ok(flags) = r.read_u8("layer flags") {
+                            layer.visible = (flags & 0x01) != 0;
+                            layer.locked = (flags & 0x02) != 0;
+                            layer.printable = (flags & 0x04) != 0;
+                            layer.is_cut_layer = (flags & 0x08) != 0;
+                        }
+                        if let Ok(ms) = r.read_u8("layer master_scope") {
+                            layer.master_scope = match ms {
+                                1 => MasterLayerScope::AllPages,
+                                2 => MasterLayerScope::OddPages,
+                                3 => MasterLayerScope::EvenPages,
+                                _ => MasterLayerScope::None,
+                            };
+                        }
+                        if let Ok(nlen) = r.read_u16_le("layer name len") {
+                            if let Ok(nb) = r.read_bytes(usize::from(nlen), "layer name") {
+                                let s = decode_cdr_text(nb, Some(CODEPAGE_UTF8), None);
+                                if !s.is_empty() {
+                                    layer.name = s;
+                                    has_explicit_name = true;
+                                }
+                            }
+                        }
+                    }
                 }
-                if let Ok(ms) = r.read_u8("layer master_scope") {
-                    layer.master_scope = match ms {
-                        1 => MasterLayerScope::AllPages,
-                        2 => MasterLayerScope::OddPages,
-                        3 => MasterLayerScope::EvenPages,
-                        _ => MasterLayerScope::None,
-                    };
+                b"flgs" => {
+                    if data.len() >= 4 {
+                        let flgs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                        layer.visible = (flgs & 0x0010) == 0;
+                        layer.printable = (flgs & 0x0002) == 0;
+                        layer.locked = (flgs & 0x0004) != 0;
+                        if (flgs & 0x0001_0000) != 0 {
+                            layer.master_scope = MasterLayerScope::AllPages;
+                        }
+                    }
                 }
-                if let Ok(nlen) = r.read_u16_le("layer name len") {
-                    if let Ok(nb) = r.read_bytes(usize::from(nlen), "layer name") {
-                        let s = decode_cdr_text(nb, Some(CODEPAGE_UTF8), None);
-                        if !s.is_empty() {
-                            layer.name = s;
+                b"spid" | b"bbox" | b"obbx" | b"usdn" => {}
+                _ => {}
+            },
+            RiffNode::List {
+                list_type: [b'l', b'g', b'o', b'b'],
+                children: lgob_ch,
+                ..
+            } => {
+                for gc in lgob_ch {
+                    if let RiffNode::Chunk { fourcc, data, .. } = gc {
+                        if fourcc == b"loda" {
+                            if let Some((ctype, name)) = parse_real_layer_loda(data) {
+                                if matches!(
+                                    ctype,
+                                    CDR_CTYPE_LAYER_GRID
+                                        | CDR_CTYPE_LAYER_GUIDES
+                                        | CDR_CTYPE_LAYER_DESKTOP
+                                ) {
+                                    is_system_layer = true;
+                                    if ctype == CDR_CTYPE_LAYER_GRID
+                                        || ctype == CDR_CTYPE_LAYER_GUIDES
+                                    {
+                                        layer.printable = false;
+                                    }
+                                }
+                                if let Some(n) = name {
+                                    layer.name = n;
+                                    has_explicit_name = true;
+                                }
+                            }
                         }
                     }
                 }
             }
+            _ => {}
         }
     }
 
-    doc.pages[page_idx].layers.push(layer);
+    if !has_explicit_name && !is_system_layer && layer_num > 0 {
+        if let Some(ti_name) = ctx.zcf.textinfo.layer_names.get(layer_num - 1) {
+            if !ti_name.is_empty() {
+                layer.name = ti_name.clone();
+            }
+        }
+    }
 
     for node in children {
         if let RiffNode::List {
@@ -988,18 +1348,15 @@ fn parse_layer_list(
         } = node
         {
             match list_type {
+                b"lgob" => {}
                 b"obj " => {
                     if let Some(oid) = parse_object_list(sub_ch, 1, doc, ctx)? {
-                        if let Some(l) = doc.find_layer_mut(layer_id) {
-                            l.objects.push(oid);
-                        }
+                        layer.objects.push(oid);
                     }
                 }
                 b"grp " => {
                     if let Some(gid) = parse_group_list(sub_ch, 1, doc, ctx)? {
-                        if let Some(l) = doc.find_layer_mut(layer_id) {
-                            l.objects.push(gid);
-                        }
+                        layer.objects.push(gid);
                     }
                 }
                 b"cmpr" => {
@@ -1013,16 +1370,12 @@ fn parse_layer_list(
                             match ilt {
                                 b"obj " => {
                                     if let Some(oid) = parse_object_list(ich, 1, doc, ctx)? {
-                                        if let Some(l) = doc.find_layer_mut(layer_id) {
-                                            l.objects.push(oid);
-                                        }
+                                        layer.objects.push(oid);
                                     }
                                 }
                                 b"grp " => {
                                     if let Some(gid) = parse_group_list(ich, 1, doc, ctx)? {
-                                        if let Some(l) = doc.find_layer_mut(layer_id) {
-                                            l.objects.push(gid);
-                                        }
+                                        layer.objects.push(gid);
                                     }
                                 }
                                 _ => {
@@ -1049,7 +1402,13 @@ fn parse_layer_list(
         }
     }
 
-    Ok(())
+    // Omit empty internal Corel system layers (`Guides`, `Desktop`, `Document Grid`) so real
+    // documents present clean user layers; preserve them whenever they actually hold objects.
+    if (is_system_layer || is_master_page) && layer.objects.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(layer))
 }
 
 fn parse_group_list(
@@ -1062,6 +1421,7 @@ fn parse_group_list(
     let mut child_ids = Vec::new();
     let mut name = "Group".to_owned();
     let mut transform = Affine2D::IDENTITY;
+    let mut is_real_cdr_group = ctx.is_zcf;
     let mut visible = true;
     let mut locked = false;
     let mut printable = true;
@@ -1077,6 +1437,33 @@ fn parse_group_list(
                 children: sub_ch,
                 ..
             } => match list_type {
+                b"lgob" => {
+                    is_real_cdr_group = true;
+                    for gc in sub_ch {
+                        match gc {
+                            RiffNode::Chunk {
+                                fourcc: [b'l', b'o', b'd', b'a'],
+                                data,
+                                ..
+                            } => {
+                                if let Some(n) = extract_real_loda_name(data) {
+                                    name = n;
+                                }
+                            }
+                            RiffNode::List {
+                                list_type: [b't', b'r', b'f', b'l'],
+                                ..
+                            } => {
+                                // In authentic CorelDRAW files, group transforms are already
+                                // baked into every descendant leaf object's `trfd` matrix.
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                b"trfl" => {
+                    is_real_cdr_group = true;
+                }
                 b"obj " => {
                     if let Some(oid) = parse_object_list(sub_ch, depth + 1, doc, ctx)? {
                         child_ids.push(oid);
@@ -1098,7 +1485,9 @@ fn parse_group_list(
             },
             RiffNode::Chunk { fourcc, data, .. } => match fourcc {
                 b"trfd" => {
-                    if let Ok(xf) = parse_trfd_chunk(data) {
+                    if is_real_corel_trfd(data) {
+                        is_real_cdr_group = true;
+                    } else if let Ok(xf) = parse_synthetic_trfd_chunk(data) {
                         transform = xf;
                     }
                 }
@@ -1108,7 +1497,12 @@ fn parse_group_list(
                     }
                 }
                 b"loda" => {
-                    if let Ok(parsed) = parse_loda_chunk(data) {
+                    if is_real_corel_loda(data) {
+                        is_real_cdr_group = true;
+                        if let Some(n) = extract_real_loda_name(data) {
+                            name = n;
+                        }
+                    } else if let Ok(parsed) = parse_loda_chunk(data) {
                         if let Some(p) = parsed.props {
                             name = p.name;
                             visible = p.visible;
@@ -1119,6 +1513,7 @@ fn parse_group_list(
                         }
                     }
                 }
+                b"flgs" | b"spid" | b"bbox" | b"obbx" | b"ftil" | b"usdn" => {}
                 _ => {
                     unknown_chunks.push(UnknownCdrChunk {
                         fourcc: *fourcc,
@@ -1130,9 +1525,15 @@ fn parse_group_list(
         }
     }
 
+    if is_real_cdr_group {
+        transform = Affine2D::IDENTITY;
+    }
+
     let gid = doc.alloc_object_id();
     let mut grp = SceneObject::new(gid, name, NodePayload::Group(child_ids));
     grp.transform = transform;
+    grp.fill = Fill::None;
+    grp.outline = OutlineStyle::none();
     grp.visible = visible;
     grp.locked = locked;
     grp.printable = printable;
@@ -1153,9 +1554,11 @@ fn parse_object_list(
     ctx.limits.check_depth(depth)?;
 
     let mut loda_data: Option<ParsedLoda> = None;
-    let mut transform = Affine2D::IDENTITY;
+    let mut synthetic_transform = Affine2D::IDENTITY;
+    let mut real_trfd: Option<RealCorelMatrix> = None;
     let mut inline_fill: Option<Fill> = None;
     let mut inline_outline: Option<OutlineStyle> = None;
+    let mut inline_outline_explicit_none = false;
     let mut inline_style: Option<ParsedStyleEntry> = None;
     let mut inline_bmp_id: Option<ImageAssetId> = None;
     let mut txsm_payload: Option<ParsedTxsm> = None;
@@ -1163,71 +1566,46 @@ fn parse_object_list(
     let mut powerclip_children: Vec<ObjectId> = Vec::new();
     let mut unknown_chunks: Vec<UnknownCdrChunk> = Vec::new();
 
+    // Helper closure-free inline scanner for both direct children and `LIST lgob` children
+    let mut flat_chunks: Vec<(&[u8; 4], &[u8])> = Vec::new();
     for node in children {
         match node {
-            RiffNode::Chunk { fourcc, data, .. } => match fourcc {
-                b"loda" => match parse_loda_chunk(data) {
-                    Ok(parsed) => loda_data = Some(parsed),
-                    Err(e) => ctx.warnings.push(format!("malformed loda chunk: {e}")),
-                },
-                b"trfd" => match parse_trfd_chunk(data) {
-                    Ok(xf) => transform = xf,
-                    Err(e) => ctx.warnings.push(format!("malformed trfd chunk: {e}")),
-                },
-                b"fild" => match parse_fild_chunk(data) {
-                    Ok((id, fill)) => {
-                        if id != 0 {
-                            ctx.fills.insert(id, fill.clone());
-                        }
-                        inline_fill = Some(fill);
-                    }
-                    Err(e) => ctx.warnings.push(format!("malformed fild chunk: {e}")),
-                },
-                b"outl" => match parse_outl_chunk(data) {
-                    Ok((id, outl)) => {
-                        if id != 0 {
-                            ctx.outlines.insert(id, outl.clone());
-                        }
-                        inline_outline = Some(outl);
-                    }
-                    Err(e) => ctx.warnings.push(format!("malformed outl chunk: {e}")),
-                },
-                b"stlt" => match parse_stlt_chunk(data) {
-                    Ok((id, entry)) => {
-                        if id != 0 {
-                            ctx.styles.insert(id, entry.clone());
-                        }
-                        inline_style = Some(entry);
-                    }
-                    Err(e) => ctx.warnings.push(format!("malformed stlt chunk: {e}")),
-                },
-                b"txsm" => {
-                    // Defer resolving stlt style references until after all sibling chunks are scanned
-                    txsm_payload = Some(ParsedTxsm::Raw(data.clone()));
-                }
-                b"bmp " => {
-                    let asset_id = register_bmp_chunk_payload(data, None, doc, ctx)?;
-                    inline_bmp_id = Some(asset_id);
-                }
-                b"lens" => match parse_lens_chunk(data) {
-                    Ok(l) => lens = Some(l),
-                    Err(e) => ctx.warnings.push(format!("malformed lens chunk: {e}")),
-                },
-                _ => {
-                    unknown_chunks.push(UnknownCdrChunk {
-                        fourcc: *fourcc,
-                        version_hint: u32::from(ctx.version),
-                        raw_bytes: data.clone(),
-                    });
-                }
-            },
+            RiffNode::Chunk { fourcc, data, .. } => flat_chunks.push((fourcc, data.as_slice())),
             RiffNode::List {
                 list_type,
-                children: pwr_ch,
+                children: sub_ch,
                 ..
-            } => {
-                if list_type == b"pwrp" {
-                    for pnode in pwr_ch {
+            } => match list_type {
+                b"lgob" => {
+                    for gc in sub_ch {
+                        match gc {
+                            RiffNode::Chunk { fourcc, data, .. } => {
+                                flat_chunks.push((fourcc, data.as_slice()));
+                            }
+                            RiffNode::List {
+                                list_type: [b't', b'r', b'f', b'l'],
+                                children: gch,
+                                ..
+                            } => {
+                                for tc in gch {
+                                    if let RiffNode::Chunk { fourcc, data, .. } = tc {
+                                        flat_chunks.push((fourcc, data.as_slice()));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                b"trfl" => {
+                    for tc in sub_ch {
+                        if let RiffNode::Chunk { fourcc, data, .. } = tc {
+                            flat_chunks.push((fourcc, data.as_slice()));
+                        }
+                    }
+                }
+                b"pwrp" => {
+                    for pnode in sub_ch {
                         if let RiffNode::List {
                             list_type: plt,
                             children: pch,
@@ -1250,39 +1628,171 @@ fn parse_object_list(
                             }
                         }
                     }
-                } else {
-                    let raw = serialize_list_body(list_type, pwr_ch, ctx.endian)?;
+                }
+                _ => {
+                    let raw = serialize_list_body(list_type, sub_ch, ctx.endian)?;
                     unknown_chunks.push(UnknownCdrChunk {
                         fourcc: *b"LIST",
                         version_hint: u32::from(ctx.version),
                         raw_bytes: raw,
                     });
                 }
+            },
+        }
+    }
+
+    for (fourcc, data) in flat_chunks {
+        match fourcc {
+            b"loda" => match parse_loda_chunk(data) {
+                Ok(parsed) => loda_data = Some(parsed),
+                Err(e) => ctx.warnings.push(format!("malformed loda chunk: {e}")),
+            },
+            b"trfd" => {
+                if is_real_corel_trfd(data) {
+                    match parse_real_corel_trfd(data) {
+                        Ok(m) => real_trfd = Some(m),
+                        Err(e) => ctx.warnings.push(format!("malformed real trfd chunk: {e}")),
+                    }
+                } else {
+                    match parse_synthetic_trfd_chunk(data) {
+                        Ok(xf) => synthetic_transform = xf,
+                        Err(e) => ctx.warnings.push(format!("malformed trfd chunk: {e}")),
+                    }
+                }
+            }
+            b"fild" => match parse_fild_chunk(data, ctx.is_zcf) {
+                Ok((id, fill)) => {
+                    if id != 0 {
+                        ctx.fills.insert(id, fill.clone());
+                    }
+                    inline_fill = Some(fill);
+                }
+                Err(e) => ctx.warnings.push(format!("malformed fild chunk: {e}")),
+            },
+            b"outl" => match parse_outl_chunk(data, ctx.is_zcf) {
+                Ok((id, outl, is_none)) => {
+                    if id != 0 {
+                        if is_none {
+                            ctx.outlines_explicit_none.insert(id);
+                        }
+                        ctx.outlines.insert(id, outl.clone());
+                    }
+                    inline_outline_explicit_none = is_none;
+                    inline_outline = Some(outl);
+                }
+                Err(e) => ctx.warnings.push(format!("malformed outl chunk: {e}")),
+            },
+            b"stlt" => match parse_stlt_chunk(data) {
+                Ok((id, entry)) => {
+                    if id != 0 {
+                        ctx.styles.insert(id, entry.clone());
+                    }
+                    inline_style = Some(entry);
+                }
+                Err(e) => ctx.warnings.push(format!("malformed stlt chunk: {e}")),
+            },
+            b"txsm" | b"txst" => {
+                txsm_payload = Some(ParsedTxsm::Raw(data.to_vec()));
+            }
+            b"bmp " => {
+                let asset_id = register_bmp_chunk_payload(data, None, doc, ctx)?;
+                inline_bmp_id = Some(asset_id);
+            }
+            b"lens" => match parse_lens_chunk(data) {
+                Ok(l) => lens = Some(l),
+                Err(e) => ctx.warnings.push(format!("malformed lens chunk: {e}")),
+            },
+            b"flgs" | b"spid" | b"bbox" | b"obbx" | b"ftil" | b"usdn" => {}
+            _ => {
+                unknown_chunks.push(UnknownCdrChunk {
+                    fourcc: *fourcc,
+                    version_hint: u32::from(ctx.version),
+                    raw_bytes: data.to_vec(),
+                });
             }
         }
     }
 
     let loda = loda_data.unwrap_or_default();
 
-    // Resolve fill and outline (inline takes precedence, then ID lookup)
-    let fill = inline_fill
+    // Resolve fill: inline `fild`, then `fill_id` lookup, then `0x00C9` JSON explicit fill type
+    let mut fill = inline_fill
         .or_else(|| loda.fill_id.and_then(|id| ctx.fills.get(&id).cloned()))
         .unwrap_or(Fill::None);
-    let outline = inline_outline
+    if let Some(ref c9) = loda.style_json {
+        if let Some(explicit_fill) = c9.explicit_fill() {
+            fill = explicit_fill;
+        }
+    }
+
+    // Resolve outline: inline `outl`, then `outline_id` lookup, then merge `0x00C9` overrides
+    let outline_explicit_none = inline_outline_explicit_none
+        || loda
+            .outline_id
+            .is_some_and(|id| ctx.outlines_explicit_none.contains(&id));
+    let mut outline = inline_outline
         .or_else(|| {
             loda.outline_id
                 .and_then(|id| ctx.outlines.get(&id).cloned())
         })
         .unwrap_or_else(OutlineStyle::none);
+    if let Some(ref c9) = loda.style_json {
+        c9.apply_outline_overrides(&mut outline, outline_explicit_none);
+    }
+
+    // Resolve document-level `txsm` reference for real CorelDRAW text objects
+    if txsm_payload.is_none() {
+        if let Some(tid) = loda.text_stream_id {
+            if let Some(raw) = ctx.text_streams.get(&tid) {
+                txsm_payload = Some(ParsedTxsm::Raw(raw.clone()));
+            }
+        }
+    }
+
+    // Convert authentic CorelDRAW geometry + `trfd` (centered Y-up 0.1 µm) into `coree`
+    // top-left Y-down millimeter coordinates on the active page.
+    let mut final_transform = synthetic_transform;
+    let mut resolved_curve = loda.curve;
+    let mut resolved_shape = loda.shape;
+
+    if loda.is_real_cdr {
+        let m = real_trfd.unwrap_or(RealCorelMatrix::IDENTITY);
+        let page_xf = m.to_page_mm_affine(ctx.current_page_w_mm, ctx.current_page_h_mm);
+
+        if let Some(rect) = loda.real_rect {
+            let (shape, rect_xf) =
+                convert_real_corel_rect(rect, m, ctx.current_page_w_mm, ctx.current_page_h_mm);
+            resolved_shape = Some(shape);
+            final_transform = rect_xf;
+        } else if let Some(ell) = loda.real_ellipse {
+            let (shape, ell_xf) =
+                convert_real_corel_ellipse(ell, m, ctx.current_page_w_mm, ctx.current_page_h_mm);
+            resolved_shape = Some(shape);
+            final_transform = ell_xf;
+        } else if let Some(curve) = resolved_curve.take() {
+            // Bake world page-mm transform directly into BezierPath nodes & handles so
+            // outlines and editing never suffer from negative-Y reflection or non-uniform scale.
+            resolved_curve = Some(curve.transformed(&page_xf));
+            final_transform = Affine2D::IDENTITY;
+        } else {
+            final_transform = page_xf;
+        }
+    }
 
     // Resolve payload
     let payload: Option<NodePayload> = if let Some(ParsedTxsm::Raw(raw_txsm)) = txsm_payload {
+        let cdss_default = if loda.text_meta.is_some_and(|m| m.is_paragraph) {
+            ctx.zcf.stylesheet.default_paragraph_text()
+        } else {
+            ctx.zcf.stylesheet.default_artistic_text()
+        };
         match parse_txsm_chunk(
             &raw_txsm,
             loda.style_id,
             inline_style.as_ref(),
             loda.text_meta,
             &ctx.styles,
+            cdss_default,
         ) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -1319,18 +1829,17 @@ fn parse_object_list(
             crop_rect: None,
         }))
     } else if !powerclip_children.is_empty() {
-        let container = loda
-            .curve
-            .or_else(|| loda.shape.as_ref().map(ParametricShape::to_bezier_path))
+        let container = resolved_curve
+            .or_else(|| resolved_shape.as_ref().map(ParametricShape::to_bezier_path))
             .unwrap_or_else(|| BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0)));
         Some(NodePayload::PowerClip {
             container: Box::new(container),
             contents: powerclip_children,
         })
-    } else if let Some(shape) = loda.shape {
+    } else if let Some(shape) = resolved_shape {
         Some(NodePayload::Shape(shape))
     } else {
-        loda.curve.map(NodePayload::Path)
+        resolved_curve.map(NodePayload::Path)
     };
 
     let Some(payload) = payload else {
@@ -1340,9 +1849,24 @@ fn parse_object_list(
     };
 
     let oid = doc.alloc_object_id();
-    let props = loda.props.unwrap_or_default();
+    let props = loda.props.unwrap_or_else(|| {
+        let default_name = match &payload {
+            NodePayload::Shape(ParametricShape::Rectangle { .. }) => "Rectangle",
+            NodePayload::Shape(ParametricShape::Ellipse { .. }) => "Ellipse",
+            NodePayload::Shape(ParametricShape::Polygon { .. }) => "Polygon",
+            NodePayload::Path(_) => "Curve",
+            NodePayload::ArtisticText(_) => "Artistic Text",
+            NodePayload::ParagraphText(_) => "Paragraph Text",
+            NodePayload::Raster(_) => "Bitmap",
+            _ => "Object",
+        };
+        ParsedObjProps {
+            name: loda.real_name.unwrap_or_else(|| default_name.to_owned()),
+            ..ParsedObjProps::default()
+        }
+    });
     let mut obj = SceneObject::new(oid, props.name, payload);
-    obj.transform = transform;
+    obj.transform = final_transform;
     obj.fill = fill;
     obj.outline = outline;
     obj.lens = lens;
@@ -1397,15 +1921,257 @@ struct ParsedTextMeta {
     gutter_mm: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RealCorelRect {
+    local_w_mm: f64,
+    local_h_mm: f64,
+    /// Corner radii either as normalized fractions of `min(world_w, world_h) / 2` (when `relative == true`)
+    /// or absolute millimeters (when `relative == false`), ordered `[TL, TR, BR, BL]`.
+    corners: [f64; 4],
+    relative_corners: bool,
+    corner_style: CornerStyle,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealCorelEllipse {
+    local_w_mm: f64,
+    local_h_mm: f64,
+    mode: EllipseMode,
+    start_deg: f64,
+    end_deg: f64,
+}
+
+/// Authentic CorelDRAW 2x3 row-major affine matrix in Corel `0.1 µm` centered Y-up space:
+/// `x' = v0 * x + v1 * y + x0_mm`, `y' = v3 * x + v4 * y + y0_mm`.
+#[derive(Debug, Clone, Copy)]
+struct RealCorelMatrix {
+    v0: f64,
+    v1: f64,
+    x0_mm: f64,
+    v3: f64,
+    v4: f64,
+    y0_mm: f64,
+}
+
+impl RealCorelMatrix {
+    const IDENTITY: Self = Self {
+        v0: 1.0,
+        v1: 0.0,
+        x0_mm: 0.0,
+        v3: 0.0,
+        v4: 1.0,
+        y0_mm: 0.0,
+    };
+
+    fn is_finite(self) -> bool {
+        self.v0.is_finite()
+            && self.v1.is_finite()
+            && self.x0_mm.is_finite()
+            && self.v3.is_finite()
+            && self.v4.is_finite()
+            && self.y0_mm.is_finite()
+            && self.v0.hypot(self.v3).is_finite()
+            && self.v1.hypot(self.v4).is_finite()
+    }
+
+    fn sanitized(self) -> Self {
+        if self.is_finite() {
+            self
+        } else {
+            Self::IDENTITY
+        }
+    }
+
+    fn compose(self, other: Self) -> Self {
+        let composed = Self {
+            v0: self.v0 * other.v0 + self.v1 * other.v3,
+            v1: self.v0 * other.v1 + self.v1 * other.v4,
+            x0_mm: self.v0 * other.x0_mm + self.v1 * other.y0_mm + self.x0_mm,
+            v3: self.v3 * other.v0 + self.v4 * other.v3,
+            v4: self.v3 * other.v1 + self.v4 * other.v4,
+            y0_mm: self.v3 * other.x0_mm + self.v4 * other.y0_mm + self.y0_mm,
+        };
+        composed.sanitized()
+    }
+
+    fn transform_point_cdr_mm(self, x_mm: f64, y_mm: f64) -> (f64, f64) {
+        let tx = self.v0 * x_mm + self.v1 * y_mm + self.x0_mm;
+        let ty = self.v3 * x_mm + self.v4 * y_mm + self.y0_mm;
+        (sanitize_f64(tx, 0.0), sanitize_f64(ty, 0.0))
+    }
+
+    /// Maps local Corel Y-up mm coordinates directly into `coree` top-left Y-down page mm.
+    fn to_page_mm_affine(self, page_w_mm: f64, page_h_mm: f64) -> Affine2D {
+        let m = self.sanitized();
+        let xf = Affine2D::new(
+            m.v0,
+            -m.v3,
+            m.v1,
+            -m.v4,
+            m.x0_mm + page_w_mm * 0.5,
+            page_h_mm * 0.5 - m.y0_mm,
+        );
+        if xf.is_finite() {
+            xf
+        } else {
+            Affine2D::IDENTITY
+        }
+    }
+}
+
+fn convert_real_corel_rect(
+    rect: RealCorelRect,
+    m: RealCorelMatrix,
+    page_w_mm: f64,
+    page_h_mm: f64,
+) -> (ParametricShape, Affine2D) {
+    let m = m.sanitized();
+    let sx = {
+        let raw = m.v0.hypot(m.v3);
+        if raw.is_finite() && raw > 1e-9 {
+            raw
+        } else {
+            1.0
+        }
+    };
+    let sy = {
+        let raw = m.v1.hypot(m.v4);
+        if raw.is_finite() && raw > 1e-9 {
+            raw
+        } else {
+            1.0
+        }
+    };
+    let world_w = sanitize_f64((rect.local_w_mm * sx).abs(), 0.0).max(0.0);
+    let world_h = sanitize_f64((rect.local_h_mm * sy).abs(), 0.0).max(0.0);
+    let max_r = sanitize_f64(0.5 * world_w.min(world_h), 0.0).max(0.0);
+
+    let mut radii = rect.corners.map(|c| {
+        let r = if rect.relative_corners {
+            c * max_r
+        } else {
+            c * sx.min(sy)
+        };
+        sanitize_f64(r, 0.0).clamp(0.0, max_r)
+    });
+
+    // Axis-aligned (including horizontal/vertical mirror flips): absorb signs into corner order
+    // and emit a pure translation so strokes & 45° chamfers remain undistorted.
+    if m.v1.abs() < 1e-6 && m.v3.abs() < 1e-6 {
+        if m.v0 < 0.0 {
+            radii.swap(0, 1); // TL <-> TR
+            radii.swap(2, 3); // BR <-> BL
+        }
+        if m.v4 < 0.0 {
+            radii.swap(0, 3); // TL <-> BL
+            radii.swap(1, 2); // TR <-> BR
+        }
+        let page_xf = m.to_page_mm_affine(page_w_mm, page_h_mm);
+        let p0 = page_xf.transform_point(Point2D::new(0.0, 0.0));
+        let p1 = page_xf.transform_point(Point2D::new(rect.local_w_mm, rect.local_h_mm));
+        let min_x = sanitize_f64(p0.x.min(p1.x), 0.0);
+        let min_y = sanitize_f64(p0.y.min(p1.y), 0.0);
+        let lock_corners = radii.iter().all(|&r| (r - radii[0]).abs() < 1e-3);
+        let shape = ParametricShape::Rectangle {
+            width: world_w,
+            height: world_h,
+            corner_radii: radii,
+            corner_style: rect.corner_style,
+            lock_corners,
+        };
+        return (shape, Affine2D::translate(min_x, min_y));
+    }
+
+    // Rotated / sheared rectangle: factor scale `(sx, sy)` into `(world_w, world_h)` and map
+    // `coree` Y-down local `(0..world_w, 0..world_h)` -> Corel Y-up local `(0..local_w, 0..local_h)`.
+    let page_xf = m.to_page_mm_affine(page_w_mm, page_h_mm);
+    let to_corel_local = Affine2D::new(1.0 / sx, 0.0, 0.0, -1.0 / sy, 0.0, rect.local_h_mm);
+    let rect_xf = page_xf.compose(&to_corel_local);
+    let rect_xf = if rect_xf.is_finite() {
+        rect_xf
+    } else {
+        Affine2D::IDENTITY
+    };
+    let lock_corners = radii.iter().all(|&r| (r - radii[0]).abs() < 1e-3);
+    let shape = ParametricShape::Rectangle {
+        width: world_w,
+        height: world_h,
+        corner_radii: radii,
+        corner_style: rect.corner_style,
+        lock_corners,
+    };
+    (shape, rect_xf)
+}
+
+fn convert_real_corel_ellipse(
+    ell: RealCorelEllipse,
+    m: RealCorelMatrix,
+    page_w_mm: f64,
+    page_h_mm: f64,
+) -> (ParametricShape, Affine2D) {
+    let m = m.sanitized();
+    let sx = {
+        let raw = m.v0.hypot(m.v3);
+        if raw.is_finite() && raw > 1e-9 {
+            raw
+        } else {
+            1.0
+        }
+    };
+    let sy = {
+        let raw = m.v1.hypot(m.v4);
+        if raw.is_finite() && raw > 1e-9 {
+            raw
+        } else {
+            1.0
+        }
+    };
+    let rx = sanitize_f64((ell.local_w_mm * 0.5 * sx).abs(), 0.0).max(0.0);
+    let ry = sanitize_f64((ell.local_h_mm * 0.5 * sy).abs(), 0.0).max(0.0);
+    let (cx_cdr, cy_cdr) = m.transform_point_cdr_mm(ell.local_w_mm * 0.5, ell.local_h_mm * 0.5);
+    let cx = sanitize_f64(cx_cdr + page_w_mm * 0.5, 0.0);
+    let cy = sanitize_f64(page_h_mm * 0.5 - cy_cdr, 0.0);
+
+    let shape = ParametricShape::Ellipse {
+        rx,
+        ry,
+        mode: ell.mode,
+        start_deg: sanitize_f64(ell.start_deg, 0.0),
+        end_deg: sanitize_f64(ell.end_deg, 360.0),
+    };
+    if m.v1.abs() < 1e-6 && m.v3.abs() < 1e-6 {
+        return (shape, Affine2D::translate(cx, cy));
+    }
+    let rot_a = sanitize_f64(m.v0 / sx, 1.0);
+    let rot_b = sanitize_f64(-m.v3 / sx, 0.0);
+    let rot_c = sanitize_f64(m.v1 / sy, 0.0);
+    let rot_d = sanitize_f64(-m.v4 / sy, 1.0);
+    let xf = Affine2D::new(rot_a, rot_b, rot_c, rot_d, cx, cy);
+    (
+        shape,
+        if xf.is_finite() {
+            xf
+        } else {
+            Affine2D::translate(cx, cy)
+        },
+    )
+}
+
 #[derive(Debug, Default)]
 struct ParsedLoda {
+    is_real_cdr: bool,
     curve: Option<BezierPath>,
     shape: Option<ParametricShape>,
+    real_rect: Option<RealCorelRect>,
+    real_ellipse: Option<RealCorelEllipse>,
     bitmap_ref: Option<ParsedBitmapRef>,
     text_meta: Option<ParsedTextMeta>,
+    text_stream_id: Option<u32>,
     fill_id: Option<u32>,
     outline_id: Option<u32>,
     style_id: Option<u32>,
+    style_json: Option<CdssStyle>,
+    real_name: Option<String>,
     props: Option<ParsedObjProps>,
 }
 
@@ -1413,7 +2179,377 @@ enum ParsedTxsm {
     Raw(Vec<u8>),
 }
 
+/// Returns `true` if `data` matches the authentic CorelDRAW 20-byte `loda` header layout:
+/// `[0..4] chunk_len == data.len()`, `[4..8] num_args`, `[8..12] args_offset >= 20`,
+/// `[12..16] types_offset`, `[16..20] chunk_type`.
+fn is_real_corel_loda(data: &[u8]) -> bool {
+    if data.len() < 20 {
+        return false;
+    }
+    let chunk_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let num_args = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let args_off = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let types_off = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    chunk_len == data.len()
+        && num_args <= 1024
+        && args_off >= 20
+        && types_off >= args_off
+        && types_off
+            .checked_add(num_args.saturating_mul(4))
+            .is_some_and(|end| end <= data.len())
+}
+
+type RealLodaArgs<'a> = (u32, Vec<(u32, &'a [u8])>);
+
+fn parse_real_loda_args(data: &[u8]) -> Option<RealLodaArgs<'_>> {
+    if !is_real_corel_loda(data) {
+        return None;
+    }
+    let num_args = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let args_off = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let types_off = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let chunk_type = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+
+    let table_bytes = num_args.checked_mul(4)?;
+    let offsets_slice = data.get(args_off..args_off.checked_add(table_bytes)?)?;
+    let types_slice = data.get(types_off..types_off.checked_add(table_bytes)?)?;
+
+    // Optional trailing end-offset entry at `args_off + num_args * 4` (present in v16–26)
+    let trailing_end = if types_off >= args_off.saturating_add(table_bytes).saturating_add(4) {
+        let p = args_off + table_bytes;
+        Some(u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize)
+    } else {
+        None
+    };
+
+    let mut offsets = Vec::with_capacity(num_args);
+    let mut types = Vec::with_capacity(num_args);
+    for i in 0..num_args {
+        let o = i * 4;
+        offsets.push(u32::from_le_bytes([
+            offsets_slice[o],
+            offsets_slice[o + 1],
+            offsets_slice[o + 2],
+            offsets_slice[o + 3],
+        ]) as usize);
+        types.push(u32::from_le_bytes([
+            types_slice[o],
+            types_slice[o + 1],
+            types_slice[o + 2],
+            types_slice[o + 3],
+        ]));
+    }
+
+    // Authentic CorelDRAW `loda` stores `types` in REVERSE order relative to `offsets`!
+    // Enforce strictly non-overlapping monotonic arg offsets (`start >= prev_end`, `end <= data.len()`)
+    // so adversarial alternating/overlapping offset tables cannot trigger 512x CPU/memory amplification.
+    let mut out = Vec::with_capacity(num_args);
+    let mut prev_end = 0usize;
+    let mut total_bytes = 0usize;
+    for i in 0..num_args {
+        let start = offsets[i];
+        let end = offsets
+            .get(i + 1)
+            .copied()
+            .or(trailing_end)
+            .unwrap_or(data.len());
+        if start < prev_end || start > end || end > data.len() {
+            return None;
+        }
+        let seg_len = end - start;
+        total_bytes = total_bytes.checked_add(seg_len)?;
+        if total_bytes > data.len() {
+            return None;
+        }
+        prev_end = end;
+        let arg_type = types[num_args - 1 - i];
+        out.push((arg_type, &data[start..end]));
+    }
+    Some((chunk_type, out))
+}
+
+fn parse_real_layer_loda(data: &[u8]) -> Option<(u32, Option<String>)> {
+    let (ctype, args) = parse_real_loda_args(data)?;
+    let mut name = None;
+    for (typ, seg) in args {
+        if typ == LODA_ARG_NAME && !seg.is_empty() {
+            let decoded = decode_cdr_text(seg, None, None);
+            let trimmed = decoded.trim_matches('\0').trim();
+            if !trimmed.is_empty() {
+                name = Some(trimmed.to_owned());
+            }
+        }
+    }
+    Some((ctype, name))
+}
+
+fn extract_real_loda_name(data: &[u8]) -> Option<String> {
+    parse_real_layer_loda(data).and_then(|(_, name)| name)
+}
+
+fn parse_real_corel_loda(data: &[u8]) -> CdrResult<ParsedLoda> {
+    let Some((chunk_type, args)) = parse_real_loda_args(data) else {
+        return Err(CdrError::InvalidChunk {
+            fourcc: "loda".to_owned(),
+            reason: "invalid authentic CorelDRAW loda header".to_owned(),
+        });
+    };
+
+    let mut out = ParsedLoda {
+        is_real_cdr: true,
+        ..ParsedLoda::default()
+    };
+
+    for (typ, seg) in args {
+        match typ {
+            LODA_ARG_OUTLINE_ID if seg.len() >= 4 => {
+                out.outline_id = Some(u32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]]));
+            }
+            LODA_ARG_FILL_ID if seg.len() >= 4 => {
+                out.fill_id = Some(u32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]]));
+            }
+            LODA_ARG_STYLE_ID if seg.len() >= 4 => {
+                out.style_id = Some(u32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]]));
+            }
+            LODA_ARG_STYLE_JSON => {
+                out.style_json = parse_c9_style_override(seg);
+            }
+            LODA_ARG_NAME if !seg.is_empty() => {
+                let decoded = decode_cdr_text(seg, None, None);
+                let trimmed = decoded.trim_matches('\0').trim();
+                if !trimmed.is_empty() {
+                    out.real_name = Some(trimmed.to_owned());
+                }
+            }
+            LODA_ARG_CURVE => match chunk_type {
+                CDR_CTYPE_RECTANGLE => {
+                    if let Some(rect) = parse_real_rect_arg(seg) {
+                        out.real_rect = Some(rect);
+                    }
+                }
+                CDR_CTYPE_ELLIPSE => {
+                    if let Some(ell) = parse_real_ellipse_arg(seg) {
+                        out.real_ellipse = Some(ell);
+                    }
+                }
+                CDR_CTYPE_CURVE | CDR_CTYPE_POLYGON => {
+                    let mut ar = ByteReader::new(seg);
+                    if let Ok(path) = parse_loda_curve(&mut ar) {
+                        if !path.subpaths.is_empty() {
+                            out.curve = Some(path);
+                        }
+                    }
+                }
+                CDR_CTYPE_BITMAP => {
+                    if seg.len() >= 36 {
+                        let w =
+                            cdr32_to_mm(i32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]])).abs();
+                        let h =
+                            cdr32_to_mm(i32::from_le_bytes([seg[4], seg[5], seg[6], seg[7]])).abs();
+                        let bmp_id = u32::from_le_bytes([seg[32], seg[33], seg[34], seg[35]]);
+                        out.bitmap_ref = Some(ParsedBitmapRef {
+                            bmp_id,
+                            width_mm: w.max(1.0),
+                            height_mm: h.max(1.0),
+                            crop_rect: None,
+                        });
+                    }
+                }
+                CDR_CTYPE_ARTISTIC_TEXT | CDR_CTYPE_PARAGRAPH_TEXT => {
+                    let is_para = chunk_type == CDR_CTYPE_PARAGRAPH_TEXT;
+                    if seg.len() >= 4 {
+                        out.text_stream_id =
+                            Some(u32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]]));
+                    }
+                    let (fw, fh) = if is_para && seg.len() >= 12 {
+                        (
+                            cdr32_to_mm(i32::from_le_bytes([seg[4], seg[5], seg[6], seg[7]])).abs(),
+                            cdr32_to_mm(i32::from_le_bytes([seg[8], seg[9], seg[10], seg[11]]))
+                                .abs(),
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    out.text_meta = Some(ParsedTextMeta {
+                        is_paragraph: is_para,
+                        frame_w_mm: fw,
+                        frame_h_mm: fh,
+                        columns: 1,
+                        gutter_mm: 5.0,
+                    });
+                }
+                CDR_CTYPE_GROUP_OR_LAYER => {}
+                _ => {
+                    // Fallback: if arg 0x1e has an exact curve point+flag array, parse it as a curve
+                    let mut ar = ByteReader::new(seg);
+                    if let Ok(path) = parse_loda_curve(&mut ar) {
+                        if !path.subpaths.is_empty() {
+                            out.curve = Some(path);
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
+fn parse_real_rect_arg(seg: &[u8]) -> Option<RealCorelRect> {
+    // Authentic CorelDRAW X5–2025 (v15–26): 128-byte (or >=32-byte) f64 rectangle geometry
+    if seg.len() >= 32 {
+        let mut r = ByteReader::new(seg);
+        let w_raw = sanitize_f64(r.read_f64_le("rect f64 w").ok()?, 0.0);
+        let h_raw = sanitize_f64(r.read_f64_le("rect f64 h").ok()?, 0.0);
+        if w_raw.abs() > 10.0 && h_raw.abs() > 10.0 && w_raw.abs() < 1e11 && h_raw.abs() < 1e11 {
+            let local_w_mm = w_raw.abs() / coree_core::math::CDR_UNITS_PER_MM;
+            let local_h_mm = h_raw.abs() / coree_core::math::CDR_UNITS_PER_MM;
+            let mut corners = [0.0_f64; 4];
+            let mut corner_style = CornerStyle::Rounded;
+            let mut relative_corners = true;
+
+            if seg.len() >= 128 {
+                let mut any_non_zero_style = None;
+                for (i, slot) in corners.iter_mut().enumerate() {
+                    let base = 32 + i * 24;
+                    let abs_r = i32::from_le_bytes([
+                        seg[base],
+                        seg[base + 1],
+                        seg[base + 2],
+                        seg[base + 3],
+                    ]);
+                    let mode_flag = u32::from_le_bytes([
+                        seg[base + 4],
+                        seg[base + 5],
+                        seg[base + 6],
+                        seg[base + 7],
+                    ]);
+                    let frac = sanitize_f64(
+                        f64::from_le_bytes([
+                            seg[base + 8],
+                            seg[base + 9],
+                            seg[base + 10],
+                            seg[base + 11],
+                            seg[base + 12],
+                            seg[base + 13],
+                            seg[base + 14],
+                            seg[base + 15],
+                        ]),
+                        0.0,
+                    );
+                    let style_raw = u32::from_le_bytes([
+                        seg[base + 16],
+                        seg[base + 17],
+                        seg[base + 18],
+                        seg[base + 19],
+                    ]);
+                    if mode_flag == 0x7FFF || frac > 1e-9 {
+                        *slot = frac.clamp(0.0, 1.0);
+                    } else if abs_r > 0 {
+                        relative_corners = false;
+                        *slot = cdr32_to_mm(abs_r);
+                    }
+                    if *slot > 1e-9 || any_non_zero_style.is_none() {
+                        let st = match style_raw {
+                            1 => CornerStyle::Scalloped,
+                            2 => CornerStyle::Chamfered,
+                            _ => CornerStyle::Rounded,
+                        };
+                        if *slot > 1e-9 {
+                            any_non_zero_style = Some(st);
+                        } else {
+                            corner_style = st;
+                        }
+                    }
+                }
+                if let Some(st) = any_non_zero_style {
+                    corner_style = st;
+                }
+            }
+            return Some(RealCorelRect {
+                local_w_mm,
+                local_h_mm,
+                corners,
+                relative_corners,
+                corner_style,
+            });
+        }
+    }
+
+    // Legacy CorelDRAW v7–v14: i32 width, height, and 1 or 4 corner radii
+    if seg.len() >= 8 {
+        let local_w_mm = cdr32_to_mm(i32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]])).abs();
+        let local_h_mm = cdr32_to_mm(i32::from_le_bytes([seg[4], seg[5], seg[6], seg[7]])).abs();
+        let mut corners = [0.0_f64; 4];
+        if seg.len() >= 24 {
+            for (i, slot) in corners.iter_mut().enumerate() {
+                let b = 8 + i * 4;
+                *slot = cdr32_to_mm(i32::from_le_bytes([
+                    seg[b],
+                    seg[b + 1],
+                    seg[b + 2],
+                    seg[b + 3],
+                ]))
+                .max(0.0);
+            }
+        } else if seg.len() >= 12 {
+            let r = cdr32_to_mm(i32::from_le_bytes([seg[8], seg[9], seg[10], seg[11]])).max(0.0);
+            corners = [r; 4];
+        }
+        return Some(RealCorelRect {
+            local_w_mm,
+            local_h_mm,
+            corners,
+            relative_corners: false,
+            corner_style: CornerStyle::Rounded,
+        });
+    }
+    None
+}
+
+fn parse_real_ellipse_arg(seg: &[u8]) -> Option<RealCorelEllipse> {
+    if seg.len() < 8 {
+        return None;
+    }
+    let local_w_mm = cdr32_to_mm(i32::from_le_bytes([seg[0], seg[1], seg[2], seg[3]])).abs();
+    let local_h_mm = cdr32_to_mm(i32::from_le_bytes([seg[4], seg[5], seg[6], seg[7]])).abs();
+    let start_deg = if seg.len() >= 12 {
+        f64::from(i32::from_le_bytes([seg[8], seg[9], seg[10], seg[11]])) / 1_000_000.0
+    } else {
+        0.0
+    };
+    let end_deg = if seg.len() >= 16 {
+        f64::from(i32::from_le_bytes([seg[12], seg[13], seg[14], seg[15]])) / 1_000_000.0
+    } else {
+        0.0
+    };
+    let pie_flag = if seg.len() >= 20 {
+        u32::from_le_bytes([seg[16], seg[17], seg[18], seg[19]])
+    } else {
+        0
+    };
+    let (mode, s_deg, e_deg) = if (start_deg - end_deg).abs() < 1e-4 {
+        (EllipseMode::Full, 0.0, 360.0)
+    } else if pie_flag != 0 {
+        (EllipseMode::Pie, start_deg, end_deg)
+    } else {
+        (EllipseMode::Arc, start_deg, end_deg)
+    };
+    Some(RealCorelEllipse {
+        local_w_mm,
+        local_h_mm,
+        mode,
+        start_deg: s_deg,
+        end_deg: e_deg,
+    })
+}
+
 fn parse_loda_chunk(data: &[u8]) -> CdrResult<ParsedLoda> {
+    if is_real_corel_loda(data) {
+        return parse_real_corel_loda(data);
+    }
+
     let mut r = ByteReader::new(data);
     let num_args = usize::try_from(r.read_u32_le("loda num_args")?)
         .map_err(|_| CdrError::ArithmeticOverflow("loda num_args"))?;
@@ -1467,24 +2603,41 @@ fn parse_loda_chunk(data: &[u8]) -> CdrResult<ParsedLoda> {
         args.push((typ, off));
     }
 
+    let payload_limit = args_offset.min(types_offset).min(data.len());
+    let mut prev_end = 0usize;
+    let mut total_bytes = 0usize;
     let mut out = ParsedLoda::default();
     for (i, &(typ, off)) in args.iter().enumerate() {
         let end = args
             .get(i + 1)
             .map(|&(_, next_off)| next_off)
-            .unwrap_or(args_offset.min(types_offset))
-            .min(data.len());
-        let arg_slice = if off <= end {
-            &data[off..end]
-        } else if off <= data.len() {
-            &data[off..]
-        } else {
+            .unwrap_or(payload_limit);
+        if off > data.len() {
             return Err(CdrError::UnexpectedEof {
                 context: "loda arg payload",
                 needed: off,
                 available: data.len(),
             });
-        };
+        }
+        if off < prev_end || off > end || end > payload_limit {
+            return Err(CdrError::InvalidChunk {
+                fourcc: "loda".to_owned(),
+                reason: format!(
+                    "overlapping or non-monotonic loda arg range {off}..{end} (prev_end={prev_end}, limit={payload_limit})"
+                ),
+            });
+        }
+        total_bytes = total_bytes
+            .checked_add(end - off)
+            .ok_or(CdrError::ArithmeticOverflow("loda total arg bytes"))?;
+        if total_bytes > data.len() {
+            return Err(CdrError::InvalidChunk {
+                fourcc: "loda".to_owned(),
+                reason: "cumulative loda arg bytes exceed chunk length".to_owned(),
+            });
+        }
+        prev_end = end;
+        let arg_slice = &data[off..end];
 
         let mut ar = ByteReader::new(arg_slice);
         match typ {
@@ -1748,7 +2901,10 @@ pub(crate) fn decode_curve_points(pts: &[Point2D], flags: &[u8]) -> BezierPath {
                 current = Some(sp);
             }
             NODE_CTRL_PT => {
-                pending_ctrls.push((pt, (flag & NODE_CTRL_PRESENT) != 0));
+                // Authentic CorelDRAW emits `0xC0` for every cubic Bezier handle; clean-room
+                // `encode_curve_points` sets `NODE_CTRL_ABSENT` (`0x02`) when a handle is `None`.
+                let present = (flag & NODE_CTRL_ABSENT) == 0;
+                pending_ctrls.push((pt, present));
             }
             NODE_LINE_TO => {
                 pending_ctrls.clear();
@@ -1857,11 +3013,11 @@ pub(crate) fn encode_curve_points(path: &BezierPath) -> (Vec<Point2D>, Vec<u8>) 
             } else {
                 let (c1, f1) = match n0.handle_out {
                     Some(h) => (h, NODE_CTRL_PT | NODE_CTRL_PRESENT),
-                    None => (n0.pos, NODE_CTRL_PT),
+                    None => (n0.pos, NODE_CTRL_PT | NODE_CTRL_ABSENT),
                 };
                 let (c2, f2) = match n1.handle_in {
                     Some(h) => (h, NODE_CTRL_PT | NODE_CTRL_PRESENT),
-                    None => (n1.pos, NODE_CTRL_PT),
+                    None => (n1.pos, NODE_CTRL_PT | NODE_CTRL_ABSENT),
                 };
                 pts.push(c1);
                 flags.push(f1);
@@ -1884,7 +3040,83 @@ fn encode_node_kind(kind: NodeKind) -> u8 {
     }
 }
 
-fn parse_trfd_chunk(data: &[u8]) -> CdrResult<Affine2D> {
+fn is_real_corel_trfd(data: &[u8]) -> bool {
+    if data.len() < 56 {
+        return false;
+    }
+    let chunk_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let num_args = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let args_off = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    chunk_len == data.len()
+        && (1..=64).contains(&num_args)
+        && args_off >= 12
+        && args_off
+            .checked_add(num_args.saturating_mul(4))
+            .is_some_and(|end| end <= data.len())
+}
+
+fn parse_real_corel_trfd(data: &[u8]) -> CdrResult<RealCorelMatrix> {
+    let mut r = ByteReader::new(data);
+    let _chunk_len = r.read_u32_le("trfd len")?;
+    let num_args = usize::try_from(r.read_u32_le("trfd num_args")?)
+        .map_err(|_| CdrError::ArithmeticOverflow("trfd num_args"))?;
+    let args_off = usize::try_from(r.read_u32_le("trfd args_off")?)
+        .map_err(|_| CdrError::ArithmeticOverflow("trfd args_off"))?;
+
+    let mut offsets = Vec::with_capacity(num_args);
+    for i in 0..num_args {
+        let p = args_off + i * 4;
+        if p + 4 > data.len() {
+            break;
+        }
+        offsets.push(u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize);
+    }
+
+    let mut acc = RealCorelMatrix::IDENTITY;
+    for start in offsets {
+        if start >= data.len() {
+            continue;
+        }
+        // Locate the `0x0008` affine transform tag either at `start + 8` (v16+ ZCF) or `start` (v7–v15).
+        let matrix_off = if start.checked_add(64).is_some_and(|e| e <= data.len())
+            && u16::from_le_bytes([data[start + 8], data[start + 9]]) == 0x0008
+        {
+            Some(start + 16)
+        } else if start.checked_add(56).is_some_and(|e| e <= data.len())
+            && u16::from_le_bytes([data[start], data[start + 1]]) == 0x0008
+        {
+            Some(start + 8)
+        } else {
+            None
+        };
+
+        if let Some(moff) = matrix_off {
+            if moff.checked_add(48).is_some_and(|e| e <= data.len()) {
+                let mut mr = ByteReader::new(&data[moff..moff + 48]);
+                let v0 = sanitize_f64(mr.read_f64_le("trfd v0")?, 1.0);
+                let v1 = sanitize_f64(mr.read_f64_le("trfd v1")?, 0.0);
+                let x0 = sanitize_f64(mr.read_f64_le("trfd x0")?, 0.0);
+                let v3 = sanitize_f64(mr.read_f64_le("trfd v3")?, 0.0);
+                let v4 = sanitize_f64(mr.read_f64_le("trfd v4")?, 1.0);
+                let y0 = sanitize_f64(mr.read_f64_le("trfd y0")?, 0.0);
+                let step = RealCorelMatrix {
+                    v0,
+                    v1,
+                    x0_mm: x0 / coree_core::math::CDR_UNITS_PER_MM,
+                    v3,
+                    v4,
+                    y0_mm: y0 / coree_core::math::CDR_UNITS_PER_MM,
+                }
+                .sanitized();
+                acc = step.compose(acc);
+            }
+        }
+    }
+
+    Ok(acc)
+}
+
+fn parse_synthetic_trfd_chunk(data: &[u8]) -> CdrResult<Affine2D> {
     let mut r = ByteReader::new(data);
     // Support both tagged (4-byte header + 48 bytes) and raw (48 bytes = 6 * f64)
     if data.len() >= 52 {
@@ -1911,7 +3143,113 @@ fn parse_trfd_chunk(data: &[u8]) -> CdrResult<Affine2D> {
     ))
 }
 
-fn parse_fild_chunk(data: &[u8]) -> CdrResult<(u32, Fill)> {
+/// Decodes a CorelDRAW 12-byte inline color record (`u16 model`, `u16 palette`, `u32`, `[u8; 4] channels`).
+fn decode_real_corel_color_record(raw: &[u8]) -> Option<coree_core::Color> {
+    if raw.len() < 12 {
+        return None;
+    }
+    let model_id = u16::from_le_bytes([raw[0], raw[1]]);
+    let channels = &raw[8..12];
+    decode_cdr_color(model_id, channels, None).ok()
+}
+
+fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill)> {
+    let mut r = ByteReader::new(data);
+    let fill_id = r.read_u32_le("real fild id")?;
+    if data.len() < 14 {
+        return Ok((fill_id, Fill::None));
+    }
+    let sub_tag = u16::from_le_bytes([data[4], data[5]]);
+    let fill_type = if sub_tag > 16 || data.len() == 22 {
+        u16::from_le_bytes([data[12], data[13]])
+    } else {
+        sub_tag
+    };
+
+    let fill = match fill_type {
+        0 => Fill::None,
+        1 => {
+            // Solid fill: locate embedded Corel color block (`01 0c 00 00 00 <model> ...`) or fixed offset
+            let color = find_embedded_corel_color(&data[12..])
+                .or_else(|| {
+                    if data.len() >= 25 {
+                        decode_real_corel_color_record(&data[13..25])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(coree_core::Color::BLACK);
+            Fill::Solid(color)
+        }
+        2 => {
+            // Fountain fill: collect up to two embedded color stops as fallback gradient
+            let mut stops = Vec::new();
+            let mut pos = 14usize;
+            while pos + 17 <= data.len() && stops.len() < 8 {
+                if data[pos] == 0x01
+                    && data[pos + 1] == 0x0C
+                    && data[pos + 2] == 0x00
+                    && data[pos + 3] == 0x00
+                    && data[pos + 4] == 0x00
+                {
+                    if let Some(c) = decode_real_corel_color_record(&data[pos + 5..pos + 17]) {
+                        stops.push(c);
+                    }
+                    pos += 17;
+                } else {
+                    pos += 1;
+                }
+            }
+            if stops.len() >= 2 {
+                let last = (stops.len() - 1) as f32;
+                let grad_stops = stops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| GradientStop::new(i as f32 / last, c))
+                    .collect();
+                Fill::LinearGradient {
+                    start: Point2D::new(0.0, 0.5),
+                    end: Point2D::new(1.0, 0.5),
+                    stops: grad_stops,
+                }
+            } else if let Some(c) = stops.into_iter().next() {
+                Fill::Solid(c)
+            } else {
+                Fill::None
+            }
+        }
+        _ => Fill::None,
+    };
+    Ok((fill_id, fill))
+}
+
+fn find_embedded_corel_color(slice: &[u8]) -> Option<coree_core::Color> {
+    if slice.len() < 17 {
+        return None;
+    }
+    for i in 0..=slice.len() - 17 {
+        if slice[i] == 0x01
+            && slice[i + 1] == 0x0C
+            && slice[i + 2] == 0x00
+            && slice[i + 3] == 0x00
+            && slice[i + 4] == 0x00
+        {
+            if let Some(c) = decode_real_corel_color_record(&slice[i + 5..i + 17]) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn parse_fild_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, Fill)> {
+    if is_zcf
+        || (data.len() >= 14 && u16::from_le_bytes([data[4], data[5]]) > 16)
+        || (data.len() == 22 && u16::from_le_bytes([data[4], data[5]]) == 0x0514)
+    {
+        return parse_real_fild_v16(data);
+    }
+
     let mut r = ByteReader::new(data);
     let fill_id = r.read_u32_le("fild id")?;
     let fill_type = r.read_u16_le("fild type")?;
@@ -2026,12 +3364,111 @@ fn parse_fild_chunk(data: &[u8]) -> CdrResult<(u32, Fill)> {
     Ok((fill_id, fill))
 }
 
-fn parse_outl_chunk(data: &[u8]) -> CdrResult<(u32, OutlineStyle)> {
+fn is_real_outl_v16(data: &[u8]) -> bool {
+    if data.len() < 90 {
+        return false;
+    }
+    let color_block_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
+    color_block_len >= 17
+        && 24usize
+            .checked_add(color_block_len)
+            .and_then(|b| b.checked_add(24))
+            .is_some_and(|end| end <= data.len())
+        && data[24] == 0x01
+}
+
+fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
+    let outline_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let miter_e6 = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let miter_limit = if miter_e6 > 0 {
+        (f64::from(miter_e6) / 1_000_000.0).clamp(1.0, 90.0)
+    } else {
+        4.0
+    };
+    let color_block_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
+    let color = decode_real_corel_color_record(&data[29..41]).unwrap_or(coree_core::Color::BLACK);
+
+    let base = 24 + color_block_len;
+    let line_type = u16::from_le_bytes([data[base + 8], data[base + 9]]);
+    let caps_raw = u16::from_le_bytes([data[base + 10], data[base + 11]]);
+    let join_raw = u16::from_le_bytes([data[base + 12], data[base + 13]]);
+    let width_cdr = i32::from_le_bytes([
+        data[base + 14],
+        data[base + 15],
+        data[base + 16],
+        data[base + 17],
+    ]);
+    let stretch_raw = u16::from_le_bytes([data[base + 18], data[base + 19]]);
+    let angle_e6 = i32::from_le_bytes([
+        data[base + 20],
+        data[base + 21],
+        data[base + 22],
+        data[base + 23],
+    ]);
+
+    // In CorelDRAW `outl`, `line_type == 1` (bit 0x01 set without bit 0x02/0x04) means NO OUTLINE!
+    if (line_type & 0x0001) != 0 && (line_type & 0x0006) == 0 {
+        return Ok((outline_id, OutlineStyle::none(), true));
+    }
+
+    let width_mm = cdr32_to_mm(width_cdr).max(0.0);
+    let cap = match caps_raw {
+        1 => LineCap::Round,
+        2 => LineCap::Square,
+        _ => LineCap::Butt,
+    };
+    let join = match join_raw {
+        1 => LineJoin::Round,
+        2 => LineJoin::Bevel,
+        _ => LineJoin::Miter,
+    };
+    let dash_pattern = if (line_type & 0x0004) != 0 {
+        vec![2.0, 1.0]
+    } else {
+        Vec::new()
+    };
+
+    Ok((
+        outline_id,
+        OutlineStyle {
+            color,
+            width_mm,
+            is_hairline: width_mm > 0.0 && width_mm <= 0.08,
+            cap,
+            join,
+            miter_limit,
+            dash_pattern,
+            start_arrow: ArrowheadStyle::None,
+            end_arrow: ArrowheadStyle::None,
+            behind_fill: (line_type & 0x0010) != 0,
+            scale_with_object: (line_type & 0x0020) != 0,
+            overprint: false,
+            calligraphy_angle_deg: f64::from(angle_e6) / 1_000_000.0,
+            calligraphy_stretch: if stretch_raw > 0 {
+                (f64::from(stretch_raw) / 100.0).clamp(0.01, 10.0)
+            } else {
+                1.0
+            },
+        },
+        false,
+    ))
+}
+
+fn parse_outl_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, OutlineStyle, bool)> {
+    if is_real_outl_v16(data) {
+        return parse_real_outl_v16(data);
+    }
+    if is_zcf && data.len() >= 12 {
+        // Fallback for non-standard ZCF outl
+        let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        return Ok((id, OutlineStyle::none(), true));
+    }
+
     let mut r = ByteReader::new(data);
     let outline_id = r.read_u32_le("outl id")?;
     let flags = r.read_u16_le("outl flags")?;
     if (flags & 0x0001) != 0 {
-        return Ok((outline_id, OutlineStyle::none()));
+        return Ok((outline_id, OutlineStyle::none(), true));
     }
     let width_mm = cdr32_to_mm(r.read_i32_le("outl width")?).max(0.0);
     let cap = match r.read_u8("outl cap")? {
@@ -2080,6 +3517,7 @@ fn parse_outl_chunk(data: &[u8]) -> CdrResult<(u32, OutlineStyle)> {
             calligraphy_angle_deg,
             calligraphy_stretch,
         },
+        false,
     ))
 }
 
@@ -2139,58 +3577,67 @@ fn parse_txsm_chunk(
     inline_style: Option<&ParsedStyleEntry>,
     text_meta: Option<ParsedTextMeta>,
     styles: &HashMap<u32, ParsedStyleEntry>,
+    cdss_default: Option<&TextStyle>,
 ) -> CdrResult<NodePayload> {
     let mut r = ByteReader::new(data);
     let format_ver = r.read_u8("txsm version")?;
 
     match format_ver {
-        0x01 => {
-            // Legacy single-run text stream (supports CP1256 Arabic, UTF-16LE, UTF-8)
-            let style_id = r.read_u32_le("txsm style_id")?;
-            let cp_raw = r.read_u16_le("txsm codepage")?;
-            let cs_raw = r.read_u8("txsm charset")?;
-            let is_para = r.read_u8("txsm is_paragraph")? != 0;
-            let frame_w = cdr32_to_mm(r.read_i32_le("txsm frame_w")?).abs();
-            let frame_h = cdr32_to_mm(r.read_i32_le("txsm frame_h")?).abs();
-            let text_len = usize::try_from(r.read_u32_le("txsm text_len")?)
-                .map_err(|_| CdrError::ArithmeticOverflow("txsm text_len"))?;
-            let raw_text = r.read_bytes(text_len, "txsm text bytes")?;
+        0x01 if data.len() >= 21 => {
+            // Check whether this is our exact clean-room `0x01` layout (`21 + text_len == data.len()`)
+            let declared_len =
+                u32::from_le_bytes([data[17], data[18], data[19], data[20]]) as usize;
+            if 21usize.checked_add(declared_len) == Some(data.len()) {
+                // Legacy single-run text stream (supports CP1256 Arabic, UTF-16LE, UTF-8)
+                let style_id = r.read_u32_le("txsm style_id")?;
+                let cp_raw = r.read_u16_le("txsm codepage")?;
+                let cs_raw = r.read_u8("txsm charset")?;
+                let is_para = r.read_u8("txsm is_paragraph")? != 0;
+                let frame_w = cdr32_to_mm(r.read_i32_le("txsm frame_w")?).abs();
+                let frame_h = cdr32_to_mm(r.read_i32_le("txsm frame_h")?).abs();
+                let text_len = usize::try_from(r.read_u32_le("txsm text_len")?)
+                    .map_err(|_| CdrError::ArithmeticOverflow("txsm text_len"))?;
+                let raw_text = r.read_bytes(text_len, "txsm text bytes")?;
 
-            let resolved_entry = inline_style
-                .or_else(|| styles.get(&style_id))
-                .or_else(|| loda_style_id.and_then(|sid| styles.get(&sid)));
+                let resolved_entry = inline_style
+                    .or_else(|| styles.get(&style_id))
+                    .or_else(|| loda_style_id.and_then(|sid| styles.get(&sid)));
 
-            let codepage = (cp_raw != 0)
-                .then_some(cp_raw)
-                .or_else(|| resolved_entry.and_then(|e| e.codepage));
-            let charset = (cs_raw != 0)
-                .then_some(cs_raw)
-                .or_else(|| resolved_entry.and_then(|e| e.charset));
+                let codepage = (cp_raw != 0)
+                    .then_some(cp_raw)
+                    .or_else(|| resolved_entry.and_then(|e| e.codepage));
+                let charset = (cs_raw != 0)
+                    .then_some(cs_raw)
+                    .or_else(|| resolved_entry.and_then(|e| e.charset));
 
-            let decoded = decode_cdr_text(raw_text, codepage, charset);
-            let mut style = resolved_entry.map_or_else(TextStyle::default, |e| e.style.clone());
-            if contains_arabic(&decoded) && style.direction == TextDirection::Ltr {
-                style.direction = TextDirection::Rtl;
-            }
+                let decoded = decode_cdr_text(raw_text, codepage, charset);
+                let mut style = resolved_entry.map_or_else(
+                    || cdss_default.cloned().unwrap_or_default(),
+                    |e| e.style.clone(),
+                );
+                if contains_arabic(&decoded) && style.direction == TextDirection::Ltr {
+                    style.direction = TextDirection::Rtl;
+                }
 
-            if is_para || text_meta.is_some_and(|m| m.is_paragraph) {
-                let (w, h, cols, gutter) = match text_meta {
-                    Some(m) if m.frame_w_mm > 0.1 && m.frame_h_mm > 0.1 => {
-                        (m.frame_w_mm, m.frame_h_mm, m.columns, m.gutter_mm)
-                    }
-                    _ => (frame_w.max(10.0), frame_h.max(10.0), 1, 5.0),
-                };
-                let mut para = ParagraphText::new(decoded, Vec2D::new(w, h), style);
-                para.columns = cols;
-                para.column_gutter_mm = gutter;
-                Ok(NodePayload::ParagraphText(para))
-            } else {
-                Ok(NodePayload::ArtisticText(ArtisticText::from_plain(
+                if is_para || text_meta.is_some_and(|m| m.is_paragraph) {
+                    let (w, h, cols, gutter) = match text_meta {
+                        Some(m) if m.frame_w_mm > 0.1 && m.frame_h_mm > 0.1 => {
+                            (m.frame_w_mm, m.frame_h_mm, m.columns, m.gutter_mm)
+                        }
+                        _ => (frame_w.max(10.0), frame_h.max(10.0), 1, 5.0),
+                    };
+                    let mut para = ParagraphText::new(decoded, Vec2D::new(w, h), style);
+                    para.columns = cols;
+                    para.column_gutter_mm = gutter;
+                    return Ok(NodePayload::ParagraphText(para));
+                }
+                return Ok(NodePayload::ArtisticText(ArtisticText::from_plain(
                     decoded, style,
-                )))
+                )));
             }
+            parse_real_corel_txsm(data, inline_style, text_meta, cdss_default)
         }
-        0x02 => {
+        0x02 if data.len() >= 22 => {
             // Multi-run styled text stream
             let is_para = r.read_u8("txsm2 is_para")? != 0;
             let direction = decode_text_direction(r.read_u8("txsm2 dir")?);
@@ -2233,7 +3680,8 @@ fn parse_txsm_chunk(
                     .or_else(|| entry.as_ref().and_then(|e| e.charset));
 
                 let text = decode_cdr_text(raw_bytes, cp, cs);
-                let style = entry.map_or_else(TextStyle::default, |e| e.style);
+                let style =
+                    entry.map_or_else(|| cdss_default.cloned().unwrap_or_default(), |e| e.style);
                 runs.push(TextRun::new(text, style));
             }
 
@@ -2257,20 +3705,74 @@ fn parse_txsm_chunk(
                 }))
             }
         }
-        _ => {
-            // Raw legacy fallback: auto-detect CP1256 / UTF-16LE / UTF-8 over entire chunk
-            let cp = inline_style.and_then(|s| s.codepage);
-            let cs = inline_style.and_then(|s| s.charset);
-            let decoded = decode_cdr_text(data, cp, cs);
-            let mut style = inline_style.map_or_else(TextStyle::default, |s| s.style.clone());
-            if contains_arabic(&decoded) {
-                style.direction = TextDirection::Rtl;
-            }
-            Ok(NodePayload::ArtisticText(ArtisticText::from_plain(
-                decoded, style,
-            )))
+        _ => parse_real_corel_txsm(data, inline_style, text_meta, cdss_default),
+    }
+}
+
+/// Decodes an authentic CorelDRAW v12–26 `txsm`/`txst` binary text stream (supporting
+/// UTF-16LE Unicode runs and legacy Windows-1256 Arabic CP1256 runs).
+fn parse_real_corel_txsm(
+    data: &[u8],
+    inline_style: Option<&ParsedStyleEntry>,
+    text_meta: Option<ParsedTextMeta>,
+    cdss_default: Option<&TextStyle>,
+) -> CdrResult<NodePayload> {
+    let cp = inline_style.and_then(|s| s.codepage);
+    let cs = inline_style.and_then(|s| s.charset);
+
+    // Authentic CorelDRAW v16+ `txsm` header:
+    // `[0..4]` frame_flag (u32), `[4..8]` text_id (u32), `[8..12]` encoding (`1` = UTF-16LE, `0` = 8-bit),
+    // `[12..16]` char_count (u32), followed by text payload (2*char_count bytes for UTF-16LE, or char_count bytes).
+    let decoded = if data.len() >= 16 {
+        let encoding = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let char_count = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        if encoding == 1
+            && char_count > 0
+            && char_count
+                .checked_mul(2)
+                .and_then(|b| 16usize.checked_add(b))
+                .is_some_and(|end| end <= data.len())
+        {
+            let byte_len = char_count * 2;
+            decode_cdr_text(&data[16..16 + byte_len], Some(CODEPAGE_UTF16LE), None)
+        } else if encoding == 0
+            && char_count > 0
+            && 16usize
+                .checked_add(char_count)
+                .is_some_and(|end| end <= data.len())
+        {
+            decode_cdr_text(&data[16..16 + char_count], cp, cs)
+        } else {
+            decode_cdr_text(data, cp, cs)
+        }
+    } else {
+        decode_cdr_text(data, cp, cs)
+    };
+
+    let mut style = inline_style.map_or_else(
+        || cdss_default.cloned().unwrap_or_default(),
+        |s| s.style.clone(),
+    );
+    if contains_arabic(&decoded) && style.direction == TextDirection::Ltr {
+        style.direction = TextDirection::Rtl;
+    }
+
+    if let Some(m) = text_meta {
+        if m.is_paragraph {
+            let mut para = ParagraphText::new(
+                decoded,
+                Vec2D::new(m.frame_w_mm.max(10.0), m.frame_h_mm.max(10.0)),
+                style,
+            );
+            para.columns = m.columns.max(1);
+            para.column_gutter_mm = m.gutter_mm;
+            return Ok(NodePayload::ParagraphText(para));
         }
     }
+
+    Ok(NodePayload::ArtisticText(ArtisticText::from_plain(
+        decoded, style,
+    )))
 }
 
 fn parse_lens_chunk(data: &[u8]) -> CdrResult<LensConfig> {

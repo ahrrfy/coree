@@ -1412,18 +1412,30 @@ impl Document {
             }
         }
 
+        // Capture true world transforms of container & newly added contents BEFORE detaching
+        // so nested PowerClips inside Groups/PowerClips preserve exact world placement.
+        let container_world = self
+            .world_transform_of(container_id)
+            .unwrap_or(container_obj.transform);
+        let child_worlds: Vec<(ObjectId, Affine2D)> = new_contents
+            .iter()
+            .filter_map(|&cid| {
+                let xf = self
+                    .world_transform_of(cid)
+                    .or_else(|| self.objects.get(&cid).map(|o| o.transform))?;
+                Some((cid, xf))
+            })
+            .collect();
+
         // Detach newly added content objects from prior layers and parent containers
         let content_set: HashSet<ObjectId> = new_contents.iter().copied().collect();
         self.detach_from_parents(&content_set);
 
         // Convert world-space transforms of newly added contents into container-local space
-        let inv_container = container_obj
-            .transform
-            .inverse()
-            .unwrap_or(Affine2D::IDENTITY);
-        for &cid in &new_contents {
+        let inv_container = container_world.inverse().unwrap_or(Affine2D::IDENTITY);
+        for (cid, child_world) in child_worlds {
             if let Some(child) = self.objects.get_mut(&cid) {
-                child.transform = inv_container.compose(&child.transform);
+                child.transform = inv_container.compose(&child_world);
             }
         }
 
@@ -1557,8 +1569,44 @@ impl Document {
     /// Resolves world-space endpoints for a [`ConnectorObject`].
     #[must_use]
     pub fn resolve_connector_endpoints(&self, conn: &ConnectorObject) -> (Point2D, Point2D) {
+        self.resolve_connector_endpoints_with_transform(conn, &Affine2D::IDENTITY)
+    }
+
+    /// Resolves world-space endpoints for a [`ConnectorObject`] whose own transform is `world_xf`.
+    #[must_use]
+    pub fn resolve_connector_endpoints_with_transform(
+        &self,
+        conn: &ConnectorObject,
+        world_xf: &Affine2D,
+    ) -> (Point2D, Point2D) {
         let mut visiting = HashSet::new();
-        self.resolve_connector_endpoints_inner(conn, &Affine2D::IDENTITY, 0, &mut visiting)
+        self.resolve_connector_endpoints_inner(conn, world_xf, 0, &mut visiting)
+    }
+
+    /// Computes the full composed world-space affine transform of `id`, walking up any
+    /// ancestor `Group` or `PowerClip` containers. Returns `None` if `id` does not exist
+    /// or has a non-finite/cyclic ancestor chain.
+    #[must_use]
+    pub fn world_transform_of(&self, id: ObjectId) -> Option<Affine2D> {
+        let mut chain = Vec::new();
+        let mut cur = id;
+        let mut seen = HashSet::new();
+        for _ in 0..=MAX_SCENE_DEPTH {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let obj = self.objects.get(&cur)?;
+            chain.push(obj.transform);
+            match self.parent_container_of(cur) {
+                Some(pid) => cur = pid,
+                None => break,
+            }
+        }
+        let mut acc = Affine2D::IDENTITY;
+        for xf in chain.into_iter().rev() {
+            acc = acc.compose(&xf);
+        }
+        acc.is_finite().then_some(acc)
     }
 
     fn resolve_connector_endpoints_inner(
@@ -1622,7 +1670,11 @@ impl Document {
             NodePayload::ArtisticText(t) => world_xf.try_transform_rect(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => world_xf.try_transform_rect(t.bounding_box()),
             NodePayload::TextOnPath(top) => self
-                .object_bounds_inner(top.path_id, &Affine2D::IDENTITY, depth + 1, visiting)
+                .world_path_of(top.path_id)
+                .and_then(|wp| wp.bounding_box())
+                .or_else(|| {
+                    self.object_bounds_inner(top.path_id, &Affine2D::IDENTITY, depth + 1, visiting)
+                })
                 .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds())),
             NodePayload::Raster(r) => {
                 let rect = match r.crop_rect {
@@ -1732,7 +1784,8 @@ impl Document {
         }
     }
 
-    /// Extracts world-space [`BezierPath`] representation of `id` if it is a curve/shape.
+    /// Extracts world-space [`BezierPath`] representation of `id` if it is a curve/shape,
+    /// including any ancestor `Group` or `PowerClip` transforms.
     #[must_use]
     pub fn world_path_of(&self, id: ObjectId) -> Option<BezierPath> {
         let obj = self.objects.get(&id)?;
@@ -1742,7 +1795,8 @@ impl Document {
             NodePayload::PowerClip { container, .. } => (**container).clone(),
             _ => return None,
         };
-        Some(local.transformed(&obj.transform))
+        let world_xf = self.world_transform_of(id).unwrap_or(obj.transform);
+        Some(local.transformed(&world_xf))
     }
 
     fn collect_world_paths(
@@ -1804,13 +1858,25 @@ impl Document {
         }
     }
 
-    /// Returns the topmost visible, unlocked object hit near `pt` on the active page.
+    /// Returns the topmost visible, unlocked object hit near `pt` on the active page,
+    /// skipping objects residing on locked or invisible layers.
     #[must_use]
     pub fn hit_test(&self, pt: Point2D, tolerance_mm: f64) -> Option<ObjectId> {
+        let mut locked_layer_ids = HashSet::new();
+        if let Some(page) = self.pages.get(self.active_page_index) {
+            for layer in &page.layers {
+                if layer.locked || !layer.visible {
+                    locked_layer_ids.extend(layer.objects.iter().copied());
+                }
+            }
+        }
         let index = self.build_spatial_index(self.active_page_index);
         for oid in index.query_point(pt, tolerance_mm) {
+            if locked_layer_ids.contains(&oid) {
+                continue;
+            }
             if let Some(obj) = self.objects.get(&oid) {
-                if !obj.locked {
+                if obj.visible && !obj.locked {
                     return Some(oid);
                 }
             }
@@ -1821,6 +1887,69 @@ impl Document {
     // -------------------------------------------------------------------------
     // Pages, Layers, Guides, Assets, Palettes
     // -------------------------------------------------------------------------
+
+    /// Computes the tight world bounding box of all visible objects on `page_idx`,
+    /// shifts all objects on that page so the visible content's top-left corner sits at
+    /// `(margin_mm, margin_mm)`, resizes the page to `(content_w + 2*margin_mm, content_h + 2*margin_mm)`
+    /// clamped to `[1.0, 50_000.0]` mm, and returns the new `(width_mm, height_mm)`.
+    pub fn autofit_page_to_content(
+        &mut self,
+        page_idx: usize,
+        margin_mm: f64,
+    ) -> CoreResult<(f64, f64)> {
+        if page_idx >= self.pages.len() {
+            return Err(CoreError::PageIndexOutOfRange {
+                index: page_idx,
+                len: self.pages.len(),
+            });
+        }
+        let margin = sanitize_f64(margin_mm, 0.0).clamp(0.0, 5_000.0);
+
+        let mut visible_ids = Vec::new();
+        let mut all_page_obj_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for layer in &self.pages[page_idx].layers {
+            for &oid in &layer.objects {
+                if seen.insert(oid) {
+                    all_page_obj_ids.push(oid);
+                    if layer.visible {
+                        if let Some(obj) = self.objects.get(&oid) {
+                            if obj.visible {
+                                visible_ids.push(oid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let bounds = self.combined_bounds(&visible_ids).ok_or_else(|| {
+            CoreError::InvalidGeometry("page has no visible content to autofit".into())
+        })?;
+        if !bounds.is_finite() {
+            return Err(CoreError::InvalidGeometry(
+                "visible content bounds are non-finite".into(),
+            ));
+        }
+
+        let dx = margin - bounds.min_x;
+        let dy = margin - bounds.min_y;
+        let shift = Affine2D::translate(dx, dy);
+        for oid in all_page_obj_ids {
+            if let Some(obj) = self.objects.get_mut(&oid) {
+                obj.transform = shift.compose(&obj.transform);
+            }
+        }
+
+        let new_w = (bounds.width() + 2.0 * margin).clamp(1.0, 50_000.0);
+        let new_h = (bounds.height() + 2.0 * margin).clamp(1.0, 50_000.0);
+        if let Some(page) = self.pages.get_mut(page_idx) {
+            page.width_mm = new_w;
+            page.height_mm = new_h;
+        }
+        self.touch();
+        Ok((new_w, new_h))
+    }
 
     /// Appends a new page and returns its [`PageId`].
     pub fn add_page(

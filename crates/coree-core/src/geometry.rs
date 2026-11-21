@@ -2803,8 +2803,12 @@ fn build_impact_path(
     style: ImpactStyle,
 ) -> BezierPath {
     let n = rays.clamp(3, 360) as usize;
-    let r_in = sanitize_f64(inner_radius, 5.0).abs();
-    let r_out = sanitize_f64(outer_radius, 25.0).abs().max(r_in + 0.5);
+    let r_in = sanitize_f64(inner_radius, 0.0).abs();
+    let r_out_raw = sanitize_f64(outer_radius, 0.0).abs();
+    if r_out_raw <= 1e-9 && r_in <= 1e-9 {
+        return BezierPath::new();
+    }
+    let r_out = r_out_raw.max(r_in + 0.5);
     let mut subpaths = Vec::with_capacity(n);
 
     match style {

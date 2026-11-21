@@ -200,7 +200,7 @@ fn object_hits_point(
             path_hits_point(&wp, true, pt_mm, stroke_tol)
         }
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints(c);
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
             let route = c.route_path(a, b);
             path_hits_point(&route, false, pt_mm, stroke_tol)
         }

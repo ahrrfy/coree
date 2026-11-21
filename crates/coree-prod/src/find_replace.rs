@@ -84,9 +84,14 @@ impl ColorMatch {
     /// Creates a perceptual color match with the given CIE76 Delta-E threshold.
     #[must_use]
     pub fn within_delta_e(color: Color, delta_e_tolerance: f32) -> Self {
+        let safe = if delta_e_tolerance.is_finite() {
+            delta_e_tolerance.max(0.0)
+        } else {
+            0.0
+        };
         Self {
             color,
-            delta_e_tolerance: delta_e_tolerance.max(0.0),
+            delta_e_tolerance: safe,
         }
     }
 
@@ -97,7 +102,12 @@ impl ColorMatch {
     /// that happen to share their visual fallback.
     #[must_use]
     pub fn matches(&self, candidate: &Color) -> bool {
-        if self.delta_e_tolerance <= 1e-4 {
+        let tol = if self.delta_e_tolerance.is_finite() {
+            self.delta_e_tolerance.max(0.0)
+        } else {
+            0.0
+        };
+        if tol <= 1e-4 {
             return match (&self.color, candidate) {
                 (Color::Spot { name: a, .. }, Color::Spot { name: b, .. }) => {
                     a.eq_ignore_ascii_case(b)
@@ -106,7 +116,7 @@ impl ColorMatch {
                 _ => self.color.delta_e76(candidate) <= 0.01,
             };
         }
-        self.color.delta_e76(candidate) <= self.delta_e_tolerance
+        self.color.delta_e76(candidate) <= tol
     }
 }
 
@@ -239,10 +249,25 @@ pub fn find_and_replace(
         };
     }
 
+    // Collect objects residing on locked layers so batch replacement also respects layer locks
+    let mut locked_layer_ids: HashSet<ObjectId> = HashSet::new();
+    for page in &doc.pages {
+        for layer in &page.layers {
+            if layer.locked {
+                visit_layer_objects(doc, layer, &mut |oid, _, _| {
+                    locked_layer_ids.insert(oid);
+                });
+            }
+        }
+    }
+
     let mut modified_ids = Vec::new();
     let mut replacements_applied = 0usize;
 
     for &oid in &matched_ids {
+        if locked_layer_ids.contains(&oid) {
+            continue;
+        }
         let Some(obj) = doc.objects.get_mut(&oid) else {
             continue;
         };
@@ -291,12 +316,12 @@ fn object_matches(obj: &SceneObject, query: &FindQuery) -> bool {
         }
     }
 
-    if let Some(min_w) = query.outline_width_min_mm {
+    if let Some(min_w) = query.outline_width_min_mm.filter(|v| v.is_finite()) {
         if !obj.outline.is_visible() || obj.outline.effective_width_mm() + 1e-9 < min_w {
             return false;
         }
     }
-    if let Some(max_w) = query.outline_width_max_mm {
+    if let Some(max_w) = query.outline_width_max_mm.filter(|v| v.is_finite()) {
         if !obj.outline.is_visible() || obj.outline.effective_width_mm() - 1e-9 > max_w {
             return false;
         }

@@ -11,6 +11,7 @@ use crate::backend::{
     validate_surface_dimensions, BackendPaint, CanvasBackend, FillRule, PixelRect, RgbaBuffer,
     TinySkiaBackend,
 };
+use crate::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
 use crate::renderer::{render_page_surface, RenderOptions, SceneRenderer};
 use crate::viewport::ViewMode;
 use coree_core::math::sanitize_f32;
@@ -86,11 +87,21 @@ pub fn render_lens_object(
     underlying_ids: &[ObjectId],
     depth: usize,
 ) {
+    if !lens_to_surface.is_finite() || !page_to_surface.is_finite() {
+        return;
+    }
     let Some(local_bounds) = lens_local_path.bounding_box() else {
         return;
     };
+    if local_bounds.width() <= 1e-9 || local_bounds.height() <= 1e-9 {
+        return;
+    }
     let lens_screen_bounds = lens_to_surface.transform_rect(local_bounds);
-    if !lens_screen_bounds.is_finite() || lens_screen_bounds.is_empty() {
+    if !lens_screen_bounds.is_finite()
+        || lens_screen_bounds.is_empty()
+        || lens_screen_bounds.width() <= 1e-6
+        || lens_screen_bounds.height() <= 1e-6
+    {
         return;
     }
 
@@ -226,39 +237,41 @@ fn compute_lens_buffer(
     let shift_x = sample_center_px.x - lens_center_px.x;
     let shift_y = sample_center_px.y - lens_center_px.y;
 
-    // Optional `remove_face` coverage mask of underlying artwork (excluding blank page background!)
-    let face_mask: Option<Vec<u8>> = if lens.remove_face {
-        Some(build_underlying_coverage_mask(
-            doc,
-            underlying_ids,
-            target_rect,
-            page_to_target,
-            shift_x,
-            shift_y,
-        ))
-    } else {
-        None
-    };
-
+    // Optional `remove_face` coverage mask of underlying artwork (excluding blank page background!).
+    // For geometric lenses (`FishEye` / `Magnify`), warp-sample the silhouette mask using the exact
+    // same coordinate mapping as the backdrop so magnified/warped artwork is never erroneously clipped!
     let kind = lens.kind.clamped();
-    let mut out = match &kind {
+    let (mut out, face_mask): (RgbaBuffer, Option<Vec<u8>>) = match &kind {
         LensKind::Wireframe {
             override_outline,
             override_fill,
-        } => render_wireframe_lens(
-            renderer,
-            doc,
-            page,
-            underlying_ids,
-            target_rect,
-            page_to_target,
-            shift_x,
-            shift_y,
-            override_outline.as_ref(),
-            override_fill.as_ref(),
-            options,
-            depth,
-        ),
+        } => {
+            let buf = render_wireframe_lens(
+                renderer,
+                doc,
+                page,
+                underlying_ids,
+                target_rect,
+                page_to_target,
+                shift_x,
+                shift_y,
+                override_outline.as_ref(),
+                override_fill.as_ref(),
+                options,
+                depth,
+            );
+            let mask = lens.remove_face.then(|| {
+                build_underlying_coverage_mask(
+                    doc,
+                    underlying_ids,
+                    target_rect,
+                    page_to_target,
+                    shift_x,
+                    shift_y,
+                )
+            });
+            (buf, mask)
+        }
         LensKind::FishEye { rate_pct } => {
             let strength = f64::from(sanitize_f32(*rate_pct, 100.0).clamp(-1000.0, 1000.0)) / 100.0;
             let inv_exp = if strength >= 0.0 {
@@ -289,7 +302,7 @@ fn compute_lens_buffer(
                 sy1,
                 depth,
             );
-            render_fisheye_lens(
+            let buf = render_fisheye_lens(
                 &backdrop,
                 target_rect,
                 lens_center_px,
@@ -297,7 +310,37 @@ fn compute_lens_buffer(
                 rx,
                 ry,
                 inv_exp,
-            )
+            );
+            let mask = lens.remove_face.then(|| {
+                let cov_backdrop = build_underlying_coverage_backdrop(
+                    doc,
+                    underlying_ids,
+                    page_to_target,
+                    sx0,
+                    sy0,
+                    sx1,
+                    sy1,
+                );
+                let mut warped = Vec::with_capacity((w as usize) * (h as usize));
+                for ly in 0..h {
+                    let dst_y = f64::from(target_rect.y) + f64::from(ly) + 0.5;
+                    for lx in 0..w {
+                        let dst_x = f64::from(target_rect.x) + f64::from(lx) + 0.5;
+                        let (sx, sy) = fisheye_map_point(
+                            dst_x,
+                            dst_y,
+                            lens_center_px,
+                            sample_center_px,
+                            rx,
+                            ry,
+                            inv_exp,
+                        );
+                        warped.push(cov_backdrop.sample_bilinear(sx - 0.5, sy - 0.5)[3]);
+                    }
+                }
+                warped
+            });
+            (buf, mask)
         }
         LensKind::Magnify { amount } => {
             let mag = f64::from(sanitize_f32(*amount, 2.0).clamp(1.0, 100.0));
@@ -334,13 +377,36 @@ fn compute_lens_buffer(
                 sy1,
                 depth,
             );
-            render_magnify_lens(
+            let buf = render_magnify_lens(
                 &backdrop,
                 target_rect,
                 lens_center_px,
                 sample_center_px,
                 inv_mag,
-            )
+            );
+            let mask = lens.remove_face.then(|| {
+                let cov_backdrop = build_underlying_coverage_backdrop(
+                    doc,
+                    underlying_ids,
+                    page_to_target,
+                    sx0,
+                    sy0,
+                    sx1,
+                    sy1,
+                );
+                let mut warped = Vec::with_capacity((w as usize) * (h as usize));
+                for ly in 0..h {
+                    let dst_y = f64::from(target_rect.y) + f64::from(ly) + 0.5;
+                    let sy = sample_center_px.y + (dst_y - lens_center_px.y) * inv_mag;
+                    for lx in 0..w {
+                        let dst_x = f64::from(target_rect.x) + f64::from(lx) + 0.5;
+                        let sx = sample_center_px.x + (dst_x - lens_center_px.x) * inv_mag;
+                        warped.push(cov_backdrop.sample_bilinear(sx - 0.5, sy - 0.5)[3]);
+                    }
+                }
+                warped
+            });
+            (buf, mask)
         }
         _ => {
             // Color-transform lenses: Brighten, ColorAdd, ColorLimit, CustomColorMap,
@@ -395,7 +461,17 @@ fn compute_lens_buffer(
                     buf.set_pixel(lx, ly, mapped);
                 }
             }
-            buf
+            let mask = lens.remove_face.then(|| {
+                build_underlying_coverage_mask(
+                    doc,
+                    underlying_ids,
+                    target_rect,
+                    page_to_target,
+                    shift_x,
+                    shift_y,
+                )
+            });
+            (buf, mask)
         }
     };
 
@@ -824,6 +900,50 @@ fn build_underlying_coverage_mask(
     buf.rgba.as_chunks::<4>().0.iter().map(|px| px[3]).collect()
 }
 
+/// Builds a sampleable silhouette coverage backdrop over `[sx0..sx1, sy0..sy1]` for warped `remove_face`.
+fn build_underlying_coverage_backdrop(
+    doc: &Document,
+    underlying_ids: &[ObjectId],
+    page_to_target: Affine2D,
+    sx0: i64,
+    sy0: i64,
+    sx1: i64,
+    sy1: i64,
+) -> SampleBackdrop {
+    let bw_i64 = sx1.saturating_sub(sx0);
+    let bh_i64 = sy1.saturating_sub(sy0);
+    if bw_i64 <= 0
+        || bh_i64 <= 0
+        || bw_i64 > MAX_BACKDROP_DIM
+        || bh_i64 > MAX_BACKDROP_DIM
+        || validate_surface_dimensions(bw_i64 as u32, bh_i64 as u32).is_err()
+    {
+        return SampleBackdrop {
+            origin_x: sx0 as f64,
+            origin_y: sy0 as f64,
+            buffer: RgbaBuffer::new_filled(1, 1, [255, 255, 255, 255]),
+        };
+    }
+    let Ok(mut mask_backend) = TinySkiaBackend::new(bw_i64 as u32, bh_i64 as u32) else {
+        return SampleBackdrop {
+            origin_x: sx0 as f64,
+            origin_y: sy0 as f64,
+            buffer: RgbaBuffer::new_filled(1, 1, [255, 255, 255, 255]),
+        };
+    };
+    mask_backend.clear(Color::TRANSPARENT);
+    let local_xf = Affine2D::translate(-(sx0 as f64), -(sy0 as f64)).compose(&page_to_target);
+    let solid = BackendPaint::solid(Color::WHITE);
+    for &oid in underlying_ids {
+        rasterize_object_silhouette(doc, oid, local_xf, &solid, &mut mask_backend, 0);
+    }
+    SampleBackdrop {
+        origin_x: sx0 as f64,
+        origin_y: sy0 as f64,
+        buffer: mask_backend.into_rgba(),
+    }
+}
+
 fn rasterize_object_silhouette(
     doc: &Document,
     id: ObjectId,
@@ -841,63 +961,69 @@ fn rasterize_object_silhouette(
     if !obj.visible {
         return;
     }
-    let world_xf = parent_xf.compose(&obj.transform);
-    match &obj.payload {
-        NodePayload::Path(p) => backend.fill_path(p, paint, FillRule::Winding, world_xf),
-        NodePayload::Shape(s) => {
-            backend.fill_path(&s.to_bezier_path(), paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::PowerClip { container, .. } => {
-            backend.fill_path(container, paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::Table(t) => {
-            let rect = BezierPath::from_rect(t.to_bounding_box());
-            backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::Raster(r) => {
-            let rect = BezierPath::from_rect(r.crop_rect.unwrap_or_else(|| {
-                coree_core::Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm)
-            }));
-            backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::ArtisticText(t) => {
-            let rect = BezierPath::from_rect(t.estimated_bounds());
-            backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::ParagraphText(t) => {
-            let rect = BezierPath::from_rect(t.bounding_box());
-            backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
-        }
-        NodePayload::Group(children) => {
-            for &cid in children {
-                rasterize_object_silhouette(doc, cid, world_xf, paint, backend, depth + 1);
+    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    for sym_xf in sym_transforms {
+        let world_xf = parent_xf.compose(&sym_xf).compose(&obj.transform);
+        match &obj.payload {
+            NodePayload::Path(p) => {
+                let deformed = apply_geometry_effects(p, &obj.effects);
+                backend.fill_path(&deformed, paint, FillRule::Winding, world_xf);
             }
-        }
-        NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
-                for sub in &sym.objects {
-                    if !sub.visible {
-                        continue;
-                    }
-                    let sub_xf = world_xf.compose(&sub.transform);
-                    match &sub.payload {
-                        NodePayload::Path(p) => {
-                            backend.fill_path(p, paint, FillRule::Winding, sub_xf);
+            NodePayload::Shape(s) => {
+                let deformed = apply_geometry_effects(&s.to_bezier_path(), &obj.effects);
+                backend.fill_path(&deformed, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::PowerClip { container, .. } => {
+                let deformed = apply_geometry_effects(container, &obj.effects);
+                backend.fill_path(&deformed, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::Table(t) => {
+                let rect = BezierPath::from_rect(t.to_bounding_box());
+                backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::Raster(r) => {
+                let rect = BezierPath::from_rect(r.crop_rect.unwrap_or_else(|| {
+                    coree_core::Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm)
+                }));
+                backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::ArtisticText(t) => {
+                let rect = BezierPath::from_rect(t.estimated_bounds());
+                backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::ParagraphText(t) => {
+                let rect = BezierPath::from_rect(t.bounding_box());
+                backend.fill_path(&rect, paint, FillRule::Winding, world_xf);
+            }
+            NodePayload::Group(children) => {
+                for &cid in children {
+                    rasterize_object_silhouette(doc, cid, world_xf, paint, backend, depth + 1);
+                }
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(sym) = doc.symbols.get(sym_id) {
+                    for sub in &sym.objects {
+                        if !sub.visible {
+                            continue;
                         }
-                        NodePayload::Shape(s) => {
-                            backend.fill_path(
-                                &s.to_bezier_path(),
-                                paint,
-                                FillRule::Winding,
-                                sub_xf,
-                            );
+                        let sub_xf = world_xf.compose(&sub.transform);
+                        match &sub.payload {
+                            NodePayload::Path(p) => {
+                                let deformed = apply_geometry_effects(p, &sub.effects);
+                                backend.fill_path(&deformed, paint, FillRule::Winding, sub_xf);
+                            }
+                            NodePayload::Shape(s) => {
+                                let deformed =
+                                    apply_geometry_effects(&s.to_bezier_path(), &sub.effects);
+                                backend.fill_path(&deformed, paint, FillRule::Winding, sub_xf);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 

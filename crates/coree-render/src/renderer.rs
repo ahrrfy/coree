@@ -22,9 +22,10 @@ use crate::text_layout::TextEngine;
 use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
-    Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, Color, DimensionKind,
-    DimensionObject, Document, Fill, GuideOrientation, Layer, MasterLayerScope, MeshNode,
-    NodePayload, ObjectId, OutlineStyle, Page, PerspectiveGridMode, Point2D, Rect2D, SceneObject,
+    apply_soft_proof_rgba, Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode,
+    BuiltinIccProfile, Color, DimensionKind, DimensionObject, Document, Fill, GuideOrientation,
+    Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page,
+    PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject,
     SpatialIndex, Subpath, SymbolDef, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
@@ -32,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 /// Maximum scene recursion depth matching `coree-core`.
 const MAX_RENDER_DEPTH: usize = 64;
 
-/// Configurable chrome, guides, and surface styling for [`SceneRenderer`].
+/// Configurable chrome, guides, color proofing, and surface styling for [`SceneRenderer`].
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
     pub show_page_shadow: bool,
@@ -46,6 +47,14 @@ pub struct RenderOptions {
     pub page_bg: Color,
     pub wireframe_stroke_color: Color,
     pub multipage_gap_mm: f64,
+    /// When `true`, soft-proofs rendered artwork through `proof_profile` CMYK press gamut.
+    pub soft_proof_cmyk: bool,
+    /// When `true`, overlays high-visibility cyan-green warning tint on out-of-CMYK-gamut pixels.
+    pub gamut_warning: bool,
+    /// Built-in ICC CMYK press profile used for soft-proofing & gamut warnings.
+    pub proof_profile: BuiltinIccProfile,
+    /// ICC rendering intent used when `soft_proof_cmyk` is enabled.
+    pub proof_intent: RenderingIntent,
 }
 
 impl Default for RenderOptions {
@@ -70,6 +79,10 @@ impl RenderOptions {
             page_bg: Color::WHITE,
             wireframe_stroke_color: Color::BLACK,
             multipage_gap_mm: 20.0,
+            soft_proof_cmyk: false,
+            gamut_warning: false,
+            proof_profile: BuiltinIccProfile::IsoCoatedV2Cmyk,
+            proof_intent: RenderingIntent::RelativeColorimetric,
         }
     }
 
@@ -88,6 +101,10 @@ impl RenderOptions {
             page_bg: Color::WHITE,
             wireframe_stroke_color: Color::BLACK,
             multipage_gap_mm: 20.0,
+            soft_proof_cmyk: false,
+            gamut_warning: false,
+            proof_profile: BuiltinIccProfile::IsoCoatedV2Cmyk,
+            proof_intent: RenderingIntent::RelativeColorimetric,
         }
     }
 }
@@ -316,8 +333,37 @@ impl SceneRenderer {
                     rendered_so_far.push(oid);
                 }
             }
+        }
 
-            // 4. Page overlays: Grid, Bleed/Margin guides, Perspective Grid, Guidelines
+        // 4. Optional live ICC CMYK Soft-Proofing & Out-of-Gamut Warning pass over rendered artwork
+        // (applied BEFORE page chrome overlays so guides/grids stay crisp and never false-flag).
+        if (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe {
+            let mut buf = backend.snapshot_rgba();
+            if !buf.is_empty() {
+                apply_soft_proof_rgba(
+                    &mut buf.rgba,
+                    options.proof_profile,
+                    options.proof_intent,
+                    options.soft_proof_cmyk,
+                    options.gamut_warning,
+                );
+                backend.clear(Color::TRANSPARENT);
+                backend.composite_region(
+                    PixelRect::new(0, 0, buf.width, buf.height),
+                    &buf,
+                    1.0,
+                    BlendMode::Normal,
+                );
+            }
+        }
+
+        // 5. Page overlays: Grid, Bleed/Margin guides, Perspective Grid, Guidelines
+        for layout in &layouts {
+            let Some(page) = doc.pages.get(layout.page_index) else {
+                continue;
+            };
+            let page_to_surface = world_to_surface
+                .compose(&Affine2D::translate(layout.origin_mm.x, layout.origin_mm.y));
             render_page_overlays(doc, page, page_to_surface, px_per_mm, options, backend);
         }
 
@@ -398,7 +444,11 @@ impl SceneRenderer {
         underlying_ids: &[ObjectId],
         depth: usize,
     ) {
-        if !obj.visible || obj.opacity <= 1e-6 || depth > MAX_RENDER_DEPTH {
+        let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
+        if !obj.visible || obj_opacity <= 1e-6 || depth > MAX_RENDER_DEPTH {
+            return;
+        }
+        if !parent_to_screen.is_finite() || !obj.transform.is_finite() {
             return;
         }
         let px_per_mm = estimate_scale(&parent_to_screen);
@@ -460,7 +510,30 @@ impl SceneRenderer {
         trans_mode: &coree_core::TransparencyMode,
         trans_blend: BlendMode,
     ) {
-        let Some(world_bounds) = doc.object_bounds(obj.id) else {
+        let Some(screen_to_world) = parent_to_screen.inverse() else {
+            return;
+        };
+        // Include geometry-effect deformations (`Distort`/`Envelope`/`Perspective`) in offscreen bounds
+        // so Transparency never clips deformed artwork!
+        let mut world_bounds = doc.object_bounds(obj.id);
+        let deformed_bb = match &obj.payload {
+            NodePayload::Path(p) => Some(apply_geometry_effects(p, &obj.effects)),
+            NodePayload::Shape(s) => {
+                Some(apply_geometry_effects(&s.to_bezier_path(), &obj.effects))
+            }
+            NodePayload::PowerClip { container, .. } => {
+                Some(apply_geometry_effects(container, &obj.effects))
+            }
+            _ => None,
+        }
+        .and_then(|p| p.transformed(&obj.transform).bounding_box());
+        if let Some(dbb) = deformed_bb {
+            world_bounds = Some(match world_bounds {
+                Some(prev) => prev.union(dbb),
+                None => dbb,
+            });
+        }
+        let Some(world_bounds) = world_bounds else {
             return;
         };
         let pad = effect_bounds_padding_mm(&obj.effects) + 2.0;
@@ -493,7 +566,6 @@ impl SceneRenderer {
         );
 
         let mut buf = sub.into_rgba();
-        let screen_to_world = parent_to_screen.inverse().unwrap_or(Affine2D::IDENTITY);
         apply_transparency_mask(&mut buf, clamped, screen_to_world, trans_mode);
         backend.composite_region(clamped, &buf, 1.0, trans_blend);
     }
@@ -565,6 +637,7 @@ impl SceneRenderer {
                     doc,
                     obj,
                     path,
+                    page_to_surface,
                     parent_to_screen,
                     px_per_mm,
                     view_mode,
@@ -579,6 +652,7 @@ impl SceneRenderer {
                     doc,
                     obj,
                     &path,
+                    page_to_surface,
                     parent_to_screen,
                     px_per_mm,
                     view_mode,
@@ -675,7 +749,7 @@ impl SceneRenderer {
                 );
             }
             NodePayload::Connector(conn) => {
-                let (a, b) = doc.resolve_connector_endpoints(conn);
+                let (a, b) = doc.resolve_connector_endpoints_with_transform(conn, &obj.transform);
                 let route = conn.route_path(a, b);
                 if view_mode == ViewMode::Wireframe {
                     stroke_wireframe(&route, parent_to_screen, px_per_mm, options, backend);
@@ -786,13 +860,14 @@ impl SceneRenderer {
                 }
 
                 // Underlay effects on PowerClip container
-                if view_mode == ViewMode::Enhanced && !obj.effects.is_empty() {
+                if !obj.effects.is_empty() {
                     render_underlay_effects(
                         doc,
                         obj,
                         &deformed_container,
                         obj.transform,
                         parent_to_screen,
+                        page_to_surface,
                         px_per_mm,
                         anti_alias,
                         backend,
@@ -847,6 +922,19 @@ impl SceneRenderer {
                 }
                 backend.pop_clip();
 
+                // Overlay effects on PowerClip container (e.g. Contour::Inside, Extrude bevel)
+                if !obj.effects.is_empty() {
+                    render_overlay_effects(
+                        obj,
+                        &deformed_container,
+                        obj.transform,
+                        parent_to_screen,
+                        px_per_mm,
+                        anti_alias,
+                        backend,
+                    );
+                }
+
                 // Foreground container outline
                 if !obj.outline.behind_fill && obj.outline.is_visible() {
                     draw_outline_styled(
@@ -889,6 +977,7 @@ impl SceneRenderer {
         doc: &Document,
         obj: &SceneObject,
         local_path: &BezierPath,
+        page_to_surface: Affine2D,
         parent_to_screen: Affine2D,
         px_per_mm: f64,
         view_mode: ViewMode,
@@ -913,6 +1002,7 @@ impl SceneRenderer {
                 &deformed,
                 obj.transform,
                 parent_to_screen,
+                page_to_surface,
                 px_per_mm,
                 anti_alias,
                 backend,
@@ -1454,25 +1544,66 @@ impl SceneRenderer {
             } => {
                 let fg_rgba = fg.to_rgba_f32();
                 let bg_rgba = bg.to_rgba_f32();
-                let preset_lc = preset.to_ascii_lowercase();
                 let seed_val = *seed;
-                render_pixel_shader_fill(
-                    local_path,
-                    local_to_screen,
-                    op,
-                    blend_mode,
-                    backend,
-                    |local_pt| {
-                        let n =
-                            eval_procedural_texture(&preset_lc, seed_val, local_pt.x, local_pt.y);
-                        [
-                            ((bg_rgba[0] + (fg_rgba[0] - bg_rgba[0]) * n) * 255.0).round() as u8,
-                            ((bg_rgba[1] + (fg_rgba[1] - bg_rgba[1]) * n) * 255.0).round() as u8,
-                            ((bg_rgba[2] + (fg_rgba[2] - bg_rgba[2]) * n) * 255.0).round() as u8,
-                            ((bg_rgba[3] + (fg_rgba[3] - bg_rgba[3]) * n) * 255.0).round() as u8,
-                        ]
-                    },
-                );
+                if let Some(ps_preset) = PostScriptFillPreset::from_preset_str(preset) {
+                    let aa_mm = (1.0 / estimate_scale(&local_to_screen)).clamp(1e-4, 2.0);
+                    let center = local_path
+                        .bounding_box()
+                        .map_or(Point2D::ZERO, |b| b.center());
+                    render_pixel_shader_fill(
+                        local_path,
+                        local_to_screen,
+                        op,
+                        blend_mode,
+                        backend,
+                        |local_pt| {
+                            let n =
+                                eval_postscript_fill(ps_preset, seed_val, local_pt, center, aa_mm);
+                            [
+                                ((bg_rgba[0] + (fg_rgba[0] - bg_rgba[0]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[1] + (fg_rgba[1] - bg_rgba[1]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[2] + (fg_rgba[2] - bg_rgba[2]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[3] + (fg_rgba[3] - bg_rgba[3]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                            ]
+                        },
+                    );
+                } else {
+                    let preset_lc = preset.to_ascii_lowercase();
+                    render_pixel_shader_fill(
+                        local_path,
+                        local_to_screen,
+                        op,
+                        blend_mode,
+                        backend,
+                        |local_pt| {
+                            let n = eval_procedural_texture(
+                                &preset_lc, seed_val, local_pt.x, local_pt.y,
+                            );
+                            [
+                                ((bg_rgba[0] + (fg_rgba[0] - bg_rgba[0]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[1] + (fg_rgba[1] - bg_rgba[1]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[2] + (fg_rgba[2] - bg_rgba[2]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                                ((bg_rgba[3] + (fg_rgba[3] - bg_rgba[3]) * n) * 255.0)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8,
+                            ]
+                        },
+                    );
+                }
             }
             Fill::MeshFill { rows, cols, nodes } => {
                 render_mesh_fill(
@@ -1597,6 +1728,7 @@ fn render_mesh_fill(
     // Build complete (r_cnt x c_cnt) lookup grid with automatic fallback placement if sparse
     let mut grid_pos = vec![vec![Point2D::ZERO; c_cnt]; r_cnt];
     let mut grid_col = vec![vec![[1.0_f32, 1.0, 1.0, 1.0]; c_cnt]; r_cnt];
+    let mut populated = vec![vec![false; c_cnt]; r_cnt];
     for (r, pos_row) in grid_pos.iter_mut().enumerate() {
         let v = r as f64 / (r_cnt - 1) as f64;
         for (c, slot) in pos_row.iter_mut().enumerate() {
@@ -1605,11 +1737,44 @@ fn render_mesh_fill(
         }
     }
     for node in nodes {
+        let r_idx = node.row.min(r_cnt - 1);
+        let c_idx = node.col.min(c_cnt - 1);
         if node.row < r_cnt && node.col < c_cnt {
             if node.pos.is_finite() {
-                grid_pos[node.row][node.col] = node.pos;
+                // Clamp runaway control nodes to a generous envelope around the object bounds
+                let margin = lb.width().max(lb.height()).max(1.0) * 4.0;
+                grid_pos[r_idx][c_idx] = Point2D::new(
+                    node.pos.x.clamp(lb.min_x - margin, lb.max_x + margin),
+                    node.pos.y.clamp(lb.min_y - margin, lb.max_y + margin),
+                );
             }
-            grid_col[node.row][node.col] = node.color.to_rgba_f32();
+            grid_col[r_idx][c_idx] = node.color.to_rgba_f32();
+            populated[r_idx][c_idx] = true;
+        }
+    }
+    // Fill any unpopulated sparse grid cells from the nearest supplied mesh node instead of opaque white
+    if !nodes.is_empty() {
+        for r in 0..r_cnt {
+            for c in 0..c_cnt {
+                if populated[r][c] {
+                    continue;
+                }
+                let mut best: Option<(usize, [f32; 4])> = None;
+                for sr in 0..r_cnt {
+                    for sc in 0..c_cnt {
+                        if !populated[sr][sc] {
+                            continue;
+                        }
+                        let dist_sq = sr.abs_diff(r).pow(2) + sc.abs_diff(c).pow(2);
+                        if best.is_none_or(|(bd, _)| dist_sq < bd) {
+                            best = Some((dist_sq, grid_col[sr][sc]));
+                        }
+                    }
+                }
+                if let Some((_, col)) = best {
+                    grid_col[r][c] = col;
+                }
+            }
         }
     }
 
@@ -1686,8 +1851,11 @@ fn rasterize_gouraud_triangle(
     let (p0, c0) = v0;
     let (p1, c1) = v1;
     let (p2, c2) = v2;
+    if !p0.is_finite() || !p1.is_finite() || !p2.is_finite() {
+        return;
+    }
     let area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
-    if area.abs() <= 1e-6 {
+    if !area.is_finite() || area.abs() <= 1e-6 {
         return;
     }
     let inv_area = 1.0 / area;
@@ -1707,9 +1875,13 @@ fn rasterize_gouraud_triangle(
             let w1 = ((p2.x - px) * (p0.y - py) - (p0.x - px) * (p2.y - py)) * inv_area;
             let w2 = 1.0 - w0 - w1;
             if w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4 {
-                let w0f = w0.clamp(0.0, 1.0) as f32;
-                let w1f = w1.clamp(0.0, 1.0) as f32;
-                let w2f = w2.clamp(0.0, 1.0) as f32;
+                let raw0 = w0.clamp(0.0, 1.0) as f32;
+                let raw1 = w1.clamp(0.0, 1.0) as f32;
+                let raw2 = w2.clamp(0.0, 1.0) as f32;
+                let wsum = (raw0 + raw1 + raw2).max(1e-6);
+                let w0f = raw0 / wsum;
+                let w1f = raw1 / wsum;
+                let w2f = raw2 / wsum;
                 let r = ((c0[0] * w0f + c1[0] * w1f + c2[0] * w2f) * 255.0)
                     .round()
                     .clamp(0.0, 255.0) as u8;
@@ -2441,6 +2613,171 @@ fn generate_two_color_pattern_tile(name: &str, fg: &Color, bg: &Color, size: u32
         }
     }
     buf
+}
+
+/// Analytic resolution-independent PostScript procedural fill evaluator returning `0.0..=1.0`
+/// (`0.0` = background color, `1.0` = foreground color) with smooth `aa_mm` anti-aliased edges.
+fn eval_postscript_fill(
+    preset: PostScriptFillPreset,
+    seed: u64,
+    pt: Point2D,
+    center: Point2D,
+    aa_mm: f64,
+) -> f32 {
+    let smoothstep = |edge0: f64, edge1: f64, x: f64| -> f64 {
+        let t = ((x - edge0) / (edge1 - edge0).max(1e-9)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let sdf_fill = |signed_dist: f64| -> f32 {
+        // Negative inside fg, positive outside fg
+        (1.0 - smoothstep(-aa_mm * 0.5, aa_mm * 0.5, signed_dist)) as f32
+    };
+
+    // Deterministic seed phase/scale modulation (`seed == 0` stays canonical 1.0x unshifted)
+    let phase_x = if seed == 0 {
+        0.0
+    } else {
+        hash_grid(seed as i64, 17, seed) * 4.0
+    };
+    let phase_y = if seed == 0 {
+        0.0
+    } else {
+        hash_grid(31, seed as i64, seed) * 4.0
+    };
+    let x = pt.x + phase_x;
+    let y = pt.y + phase_y;
+
+    match preset {
+        PostScriptFillPreset::Hatch => {
+            // Crisp 45° parallel hatching lines
+            let period = 3.0;
+            let half_stroke = 0.42;
+            let u = (x + y) * std::f64::consts::FRAC_1_SQRT_2;
+            let cell = u.rem_euclid(period) - period * 0.5;
+            sdf_fill(cell.abs() - half_stroke)
+        }
+        PostScriptFillPreset::CrossHatch => {
+            // Perpendicular +45° and -45° overlapping hatch lines
+            let period = 3.2;
+            let half_stroke = 0.36;
+            let u = (x + y) * std::f64::consts::FRAC_1_SQRT_2;
+            let v = (x - y) * std::f64::consts::FRAC_1_SQRT_2;
+            let du = (u.rem_euclid(period) - period * 0.5).abs() - half_stroke;
+            let dv = (v.rem_euclid(period) - period * 0.5).abs() - half_stroke;
+            sdf_fill(du.min(dv))
+        }
+        PostScriptFillPreset::Checker => {
+            // Crisp anti-aliased checkerboard squares
+            let cell = 4.0;
+            let gx = (x / cell).floor() as i64;
+            let gy = (y / cell).floor() as i64;
+            let fx = x.rem_euclid(cell);
+            let fy = y.rem_euclid(cell);
+            let edge_d = fx.min(cell - fx).min(fy.min(cell - fy));
+            let is_fg = ((gx ^ gy) & 1) == 0;
+            let signed = if is_fg { -edge_d } else { edge_d };
+            sdf_fill(signed)
+        }
+        PostScriptFillPreset::PolkaDots => {
+            // Staggered brick-lattice circular dots
+            let pitch = 4.0;
+            let radius = 1.15;
+            let row = (y / pitch).floor() as i64;
+            let stagger = if (row & 1) != 0 { pitch * 0.5 } else { 0.0 };
+            let cx = (x + stagger).rem_euclid(pitch) - pitch * 0.5;
+            let cy = y.rem_euclid(pitch) - pitch * 0.5;
+            sdf_fill(cx.hypot(cy) - radius)
+        }
+        PostScriptFillPreset::Waves => {
+            // Sinusoidal wave bands
+            let pitch = 3.5;
+            let amp = 0.95;
+            let freq = std::f64::consts::TAU / 8.0;
+            let warped_y = y + amp * (x * freq).sin();
+            let cell = warped_y.rem_euclid(pitch) - pitch * 0.5;
+            // Scale signed distance by gradient magnitude for uniform stroke thickness on slopes
+            let slope = amp * freq * (x * freq).cos();
+            let grad_len = (1.0 + slope * slope).sqrt();
+            let dist = (cell.abs() - 0.72) / grad_len;
+            sdf_fill(dist)
+        }
+        PostScriptFillPreset::Bricks => {
+            // Running-bond masonry bricks (fg = brick face, bg = mortar joints)
+            let brick_w = 8.0;
+            let brick_h = 4.0;
+            let mortar = 0.45;
+            let row = (y / brick_h).floor() as i64;
+            let offset = if (row & 1) != 0 { brick_w * 0.5 } else { 0.0 };
+            let lx = (x + offset).rem_euclid(brick_w);
+            let ly = y.rem_euclid(brick_h);
+            let dx = lx.min(brick_w - lx);
+            let dy = ly.min(brick_h - ly);
+            let dist_from_joint = dx.min(dy);
+            // Positive inside mortar -> bg; negative inside brick -> fg
+            sdf_fill(mortar * 0.5 - dist_from_joint)
+        }
+        PostScriptFillPreset::RadialBurst => {
+            // 16 alternating sunburst wedges radiating from the object center
+            let rays = 16.0;
+            let dx = pt.x - center.x;
+            let dy = pt.y - center.y;
+            let r = dx.hypot(dy);
+            let angle = dy.atan2(dx) + phase_x * 0.2;
+            let sector = std::f64::consts::TAU / rays;
+            let local_a = angle.rem_euclid(sector) - sector * 0.5;
+            // Convert angular distance to perpendicular mm distance for zoom-invariant crisp AA!
+            let signed_mm = (local_a.abs() - sector * 0.25) * r.max(0.2);
+            sdf_fill(signed_mm)
+        }
+        PostScriptFillPreset::HexGrid => {
+            // Exact honeycomb hexagonal lattice wall SDF
+            let s = 3.2; // hex circumradius-like scale
+            let sqrt3 = 3.0_f64.sqrt();
+            let px = x / s;
+            let py = y / s;
+            // Dual-lattice nearest hex center in normalized coordinates
+            let r_w = 1.0;
+            let r_h = sqrt3;
+            let ax = px.rem_euclid(r_w) - 0.5 * r_w;
+            let ay = py.rem_euclid(r_h) - 0.5 * r_h;
+            let bx = (px - 0.5 * r_w).rem_euclid(r_w) - 0.5 * r_w;
+            let by = (py - 0.5 * r_h).rem_euclid(r_h) - 0.5 * r_h;
+            let (hx, hy) = if ax * ax + ay * ay < bx * bx + by * by {
+                (ax.abs(), ay.abs())
+            } else {
+                (bx.abs(), by.abs())
+            };
+            // Distance from hex center to hex boundary (apothem = 0.5)
+            let hex_d = hx.max(hx * 0.5 + hy * (sqrt3 * 0.5));
+            let wall_dist_mm = (0.5 - hex_d) * s;
+            let half_wall = 0.24;
+            sdf_fill(wall_dist_mm - half_wall)
+        }
+        PostScriptFillPreset::Woodgrain => {
+            // Warped concentric wood growth rings + fine longitudinal grain fibers
+            let sx = (x - center.x) * 0.35;
+            let sy = (y - center.y) * 0.12;
+            let warp = fbm2d(x * 0.08, y * 0.08, seed.wrapping_add(73), 3) * 2.2;
+            let ring_coord = (sx.hypot(sy) * 2.4 + warp).rem_euclid(1.0);
+            let band = (ring_coord - 0.5).abs() * 2.0; // 0..1 sawtooth-like ring profile
+            let grain = fbm2d(x * 0.6, y * 0.09, seed.wrapping_add(199), 2) * 0.22;
+            let val = (smoothstep(0.18, 0.82, band) * 0.82 + grain).clamp(0.0, 1.0);
+            val as f32
+        }
+        PostScriptFillPreset::HalftoneDots => {
+            // Angled 45° PostScript halftone dot screen with smoothly modulated dot radius
+            let pitch = 2.8;
+            let u = (x + y) * std::f64::consts::FRAC_1_SQRT_2;
+            let v = (x - y) * std::f64::consts::FRAC_1_SQRT_2;
+            let cu = u.rem_euclid(pitch) - pitch * 0.5;
+            let cv = v.rem_euclid(pitch) - pitch * 0.5;
+            // Smooth spatial tone modulation across the shape (0.22..0.46 of pitch)
+            let tone =
+                0.5 + 0.38 * ((pt.x - center.x) * 0.12).sin() * ((pt.y - center.y) * 0.12).cos();
+            let radius = pitch * (0.18 + 0.28 * tone.clamp(0.0, 1.0));
+            sdf_fill(cu.hypot(cv) - radius)
+        }
+    }
 }
 
 /// Deterministic 2D value-noise FBM procedural texture evaluator returning `0.0..=1.0`.

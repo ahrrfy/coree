@@ -10,7 +10,9 @@ pub mod collect;
 pub mod cut_packaging;
 pub mod error;
 pub mod find_replace;
+pub mod laser_plugin;
 pub mod macros;
+pub mod plugins;
 pub mod preflight;
 pub mod prepress;
 pub mod print_merge;
@@ -38,9 +40,22 @@ pub use find_replace::{
     find_and_replace, find_objects, ColorMatch, FindQuery, FindReplaceReport, FindScope,
     LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
 };
+pub use laser_plugin::{
+    apply_kerf_offset, default_laser_layer_rules, export_laser_dxf_r12, export_laser_eps,
+    export_laser_gcode, export_laser_plt, export_laser_svg, generate_hatch_fill, join_open_curves,
+    plan_laser_toolpath, remove_duplicate_segments, GcodeDialect, LaserJobConfig, LaserLayerRule,
+    LaserOperationKind, LaserOrigin, LaserToolpathPlan, ToolpathSegment,
+};
 pub use macros::{
     builtin_macros, find_builtin_macro, run_macro, run_recorded_macro, BuiltinMacro,
     MacroExecutionResult, MacroSandboxConfig, MacroValue,
+};
+pub use plugins::{
+    default_plugin_dirs, detect_executable, discover_plugins, export_for_plugin,
+    install_sample_plugin_template, launch_external_bridge, run_rhai_plugin,
+    substitute_bridge_args, PluginCategory, PluginExportFormat, PluginExportOutcome, PluginKind,
+    PluginManifest, PluginRegistry, MAX_BRIDGE_ARGS, MAX_PLUGINS_PER_DIR,
+    MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_SCRIPT_BYTES,
 };
 pub use preflight::{
     run_preflight, PreflightIssue, PreflightIssueKind, PreflightReport, PreflightRules,

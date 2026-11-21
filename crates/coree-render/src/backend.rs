@@ -557,6 +557,9 @@ impl CanvasBackend for TinySkiaBackend {
         rule: FillRule,
         transform: Affine2D,
     ) {
+        if !transform.is_finite() || transform.determinant().abs() <= 1e-12 {
+            return;
+        }
         let use_device_clip =
             needs_f64_device_clip(path, transform, self.pixmap.width(), self.pixmap.height());
         let Some(ts_path) = (if use_device_clip {
@@ -730,7 +733,7 @@ impl CanvasBackend for TinySkiaBackend {
     }
 
     fn stroke_path(&mut self, path: &BezierPath, stroke: &StrokeParams, transform: Affine2D) {
-        if stroke.width <= 1e-6 || stroke.opacity <= 1e-6 {
+        if !transform.is_finite() || stroke.width <= 1e-6 || stroke.opacity <= 1e-6 {
             return;
         }
         let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) else {
@@ -779,7 +782,11 @@ impl CanvasBackend for TinySkiaBackend {
         smooth: bool,
     ) {
         let opacity = sanitize_f32(opacity, 1.0).clamp(0.0, 1.0);
-        if opacity <= 1e-6 || image.is_empty() {
+        if !transform.is_finite()
+            || transform.determinant().abs() <= 1e-12
+            || opacity <= 1e-6
+            || image.is_empty()
+        {
             return;
         }
         let Some(pm) = image.to_premultiplied_pixmap() else {
@@ -814,14 +821,16 @@ impl CanvasBackend for TinySkiaBackend {
             FillRule::Winding => ts::FillRule::Winding,
             FillRule::EvenOdd => ts::FillRule::EvenOdd,
         };
-        if needs_f64_device_clip(path, transform, w, h) {
-            if let Some(ts_path) =
-                build_clipped_device_skia_path(path, transform, w, h, self.flatten_tolerance)
-            {
-                mask.fill_path(&ts_path, ts_rule, true, ts::Transform::identity());
+        if transform.is_finite() && transform.determinant().abs() > 1e-12 {
+            if needs_f64_device_clip(path, transform, w, h) {
+                if let Some(ts_path) =
+                    build_clipped_device_skia_path(path, transform, w, h, self.flatten_tolerance)
+                {
+                    mask.fill_path(&ts_path, ts_rule, true, ts::Transform::identity());
+                }
+            } else if let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) {
+                mask.fill_path(&ts_path, ts_rule, true, affine_to_skia(transform));
             }
-        } else if let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) {
-            mask.fill_path(&ts_path, ts_rule, true, affine_to_skia(transform));
         }
         if let Some(parent) = self.clip_stack.last() {
             let parent_data = parent.data();

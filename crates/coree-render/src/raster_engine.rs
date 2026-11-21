@@ -486,6 +486,410 @@ pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32
     }
 }
 
+/// Tonal luminance band targeted by [`apply_dodge_burn_stroke`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ToneRange {
+    Shadows,
+    #[default]
+    Midtones,
+    Highlights,
+}
+
+/// Photographic exposure operation for [`apply_dodge_burn_stroke`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DodgeBurnMode {
+    /// Lightens pixels within the targeted [`ToneRange`].
+    #[default]
+    Dodge,
+    /// Darkens pixels within the targeted [`ToneRange`].
+    Burn,
+}
+
+/// Seamless Healing Brush: transfers high-frequency texture from `src_origin` along
+/// `dst_points` while matching the destination perimeter's ambient luminance and
+/// chrominance (BT.709 YCbCr) so patches blend seamlessly without harsh seams.
+pub fn apply_healing_stroke(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[Point2D],
+    radius_px: f32,
+    hardness: f32,
+) {
+    let r = sanitize_f32(radius_px, 8.0).clamp(1.0, MAX_BRUSH_RADIUS_PX);
+    let hard = sanitize_f32(hardness, 0.5).clamp(0.0, 1.0);
+    if !src_origin.is_finite() || dst_points.is_empty() || !is_valid_raster_asset(asset) {
+        return;
+    }
+    let dabs = sample_stroke_dabs(dst_points, (r * 0.3).max(1.0));
+    let Some(first_dab) = dabs.first().copied() else {
+        return;
+    };
+    let snapshot = asset.rgba_bytes.clone();
+    let offset = src_origin - first_dab;
+    let w = asset.width;
+    let h = asset.height;
+    let w_i64 = i64::from(w);
+    let h_i64 = i64::from(h);
+
+    for dab in dabs {
+        // Measure ambient destination luminance/chrominance around the dab boundary ring
+        // (`0.65*r ..= 1.25*r`) and mean source luminance/chrominance across the dab.
+        let ring_outer = (r * 1.25).min(MAX_BRUSH_RADIUS_PX);
+        let ring_inner = r * 0.65;
+        let (rx0, ry0, rx1, ry1) = dab_bounds(dab, ring_outer, w, h);
+
+        let mut dst_y_sum = 0.0_f64;
+        let mut dst_cb_sum = 0.0_f64;
+        let mut dst_cr_sum = 0.0_f64;
+        let mut dst_w_sum = 0.0_f64;
+
+        let mut src_y_sum = 0.0_f64;
+        let mut src_cb_sum = 0.0_f64;
+        let mut src_cr_sum = 0.0_f64;
+        let mut src_w_sum = 0.0_f64;
+
+        for y in ry0..ry1 {
+            for x in rx0..rx1 {
+                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
+                if d >= ring_inner && d <= ring_outer {
+                    let didx = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                    let da = f64::from(asset.rgba_bytes[didx + 3]) / 255.0;
+                    if da > 0.05 {
+                        let (yy, cb, cr) = rgb_to_ycbcr(
+                            f64::from(asset.rgba_bytes[didx]) / 255.0,
+                            f64::from(asset.rgba_bytes[didx + 1]) / 255.0,
+                            f64::from(asset.rgba_bytes[didx + 2]) / 255.0,
+                        );
+                        dst_y_sum += yy * da;
+                        dst_cb_sum += cb * da;
+                        dst_cr_sum += cr * da;
+                        dst_w_sum += da;
+                    }
+                }
+                if d <= r {
+                    let sx = (f64::from(x) + offset.x).round() as i64;
+                    let sy = (f64::from(y) + offset.y).round() as i64;
+                    if sx >= 0 && sy >= 0 && sx < w_i64 && sy < h_i64 {
+                        let sidx = ((sy as usize) * (w as usize) + (sx as usize)) * 4;
+                        let sa = f64::from(snapshot[sidx + 3]) / 255.0;
+                        if sa > 0.05 {
+                            let (yy, cb, cr) = rgb_to_ycbcr(
+                                f64::from(snapshot[sidx]) / 255.0,
+                                f64::from(snapshot[sidx + 1]) / 255.0,
+                                f64::from(snapshot[sidx + 2]) / 255.0,
+                            );
+                            src_y_sum += yy * sa;
+                            src_cb_sum += cb * sa;
+                            src_cr_sum += cr * sa;
+                            src_w_sum += sa;
+                        }
+                    }
+                }
+            }
+        }
+
+        if src_w_sum <= 1e-6 {
+            continue;
+        }
+        let src_mean = (
+            src_y_sum / src_w_sum,
+            src_cb_sum / src_w_sum,
+            src_cr_sum / src_w_sum,
+        );
+        // Fallback to interior destination mean if ring is clipped at image edge or empty
+        let dst_mean = if dst_w_sum > 1e-6 {
+            (
+                dst_y_sum / dst_w_sum,
+                dst_cb_sum / dst_w_sum,
+                dst_cr_sum / dst_w_sum,
+            )
+        } else {
+            let mut iy = 0.0_f64;
+            let mut icb = 0.0_f64;
+            let mut icr = 0.0_f64;
+            let mut iw = 0.0_f64;
+            let (ix0, iy0, ix1, iy1) = dab_bounds(dab, r, w, h);
+            for y in iy0..iy1 {
+                for x in ix0..ix1 {
+                    let didx = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                    let da = f64::from(asset.rgba_bytes[didx + 3]) / 255.0;
+                    if da > 0.05 {
+                        let (yy, cb, cr) = rgb_to_ycbcr(
+                            f64::from(asset.rgba_bytes[didx]) / 255.0,
+                            f64::from(asset.rgba_bytes[didx + 1]) / 255.0,
+                            f64::from(asset.rgba_bytes[didx + 2]) / 255.0,
+                        );
+                        iy += yy * da;
+                        icb += cb * da;
+                        icr += cr * da;
+                        iw += da;
+                    }
+                }
+            }
+            if iw > 1e-6 {
+                (iy / iw, icb / iw, icr / iw)
+            } else {
+                src_mean
+            }
+        };
+
+        let (x0, y0, x1, y1) = dab_bounds(dab, r, w, h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
+                let falloff = brush_hardness_falloff(d, r, hard);
+                if falloff <= 1e-5 {
+                    continue;
+                }
+                let sx = (f64::from(x) + offset.x).round() as i64;
+                let sy = (f64::from(y) + offset.y).round() as i64;
+                if sx < 0 || sy < 0 || sx >= w_i64 || sy >= h_i64 {
+                    continue;
+                }
+                let sidx = ((sy as usize) * (w as usize) + (sx as usize)) * 4;
+                let sa = (f32::from(snapshot[sidx + 3]) / 255.0) * falloff;
+                if sa <= 1e-5 {
+                    continue;
+                }
+                let (sy_val, scb_val, scr_val) = rgb_to_ycbcr(
+                    f64::from(snapshot[sidx]) / 255.0,
+                    f64::from(snapshot[sidx + 1]) / 255.0,
+                    f64::from(snapshot[sidx + 2]) / 255.0,
+                );
+
+                // Transfer high-frequency source luminance/chrominance detail onto destination tone
+                let healed_y = (dst_mean.0 + (sy_val - src_mean.0)).clamp(0.0, 1.0);
+                let healed_cb = (dst_mean.1 + (scb_val - src_mean.1)).clamp(-0.5, 0.5);
+                let healed_cr = (dst_mean.2 + (scr_val - src_mean.2)).clamp(-0.5, 0.5);
+                let (hr, hg, hb) = ycbcr_to_rgb(healed_y, healed_cb, healed_cr);
+
+                blend_pixel_over(asset, x, y, hr as f32, hg as f32, hb as f32, sa);
+            }
+        }
+    }
+}
+
+/// Applies photographic Dodge (lighten) or Burn (darken) exposure adjustment along `points`,
+/// smoothly weighted to the chosen [`ToneRange`] (`Shadows`, `Midtones`, or `Highlights`).
+///
+/// Uses a per-stroke maximum coverage mask so overlapping dabs along a single drag produce
+/// smooth, uniform exposure without runaway clipping.
+pub fn apply_dodge_burn_stroke(
+    asset: &mut RasterAsset,
+    points: &[Point2D],
+    radius_px: f32,
+    hardness: f32,
+    mode: DodgeBurnMode,
+    range: ToneRange,
+    exposure: f32,
+) {
+    let r = sanitize_f32(radius_px, 8.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+    let hard = sanitize_f32(hardness, 0.4).clamp(0.0, 1.0);
+    let exp = sanitize_f32(exposure, 0.35).clamp(0.0, 1.0);
+    if points.is_empty() || exp <= 1e-5 || !is_valid_raster_asset(asset) {
+        return;
+    }
+    let dabs = sample_stroke_dabs(points, (r * 0.25).max(1.0));
+    if dabs.is_empty() {
+        return;
+    }
+
+    // Compute tight clamped pixel bbox covering the entire stroke
+    let mut bx0 = asset.width;
+    let mut by0 = asset.height;
+    let mut bx1 = 0u32;
+    let mut by1 = 0u32;
+    for &dab in &dabs {
+        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+        if x0 < x1 && y0 < y1 {
+            bx0 = bx0.min(x0);
+            by0 = by0.min(y0);
+            bx1 = bx1.max(x1);
+            by1 = by1.max(y1);
+        }
+    }
+    if bx0 >= bx1 || by0 >= by1 {
+        return;
+    }
+
+    let bw = (bx1 - bx0) as usize;
+    let bh = (by1 - by0) as usize;
+    let mut coverage = vec![0.0_f32; bw.saturating_mul(bh)];
+
+    for dab in dabs {
+        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+        for y in y0..y1 {
+            let row_off = ((y - by0) as usize) * bw;
+            for x in x0..x1 {
+                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
+                let falloff = brush_hardness_falloff(d, r, hard);
+                if falloff > 1e-5 {
+                    let slot = &mut coverage[row_off + ((x - bx0) as usize)];
+                    if falloff > *slot {
+                        *slot = falloff;
+                    }
+                }
+            }
+        }
+    }
+
+    let w = asset.width as usize;
+    for ly in 0..bh {
+        let y = (by0 as usize) + ly;
+        let cov_row = ly * bw;
+        for lx in 0..bw {
+            let cov = coverage[cov_row + lx];
+            if cov <= 1e-5 {
+                continue;
+            }
+            let x = (bx0 as usize) + lx;
+            let idx = (y * w + x) * 4;
+            if asset.rgba_bytes[idx + 3] == 0 {
+                continue;
+            }
+            let rf = f32::from(asset.rgba_bytes[idx]) / 255.0;
+            let gf = f32::from(asset.rgba_bytes[idx + 1]) / 255.0;
+            let bf = f32::from(asset.rgba_bytes[idx + 2]) / 255.0;
+            let luma = (0.2126 * rf + 0.7152 * gf + 0.0722 * bf).clamp(0.0, 1.0);
+
+            let tone_weight = match range {
+                ToneRange::Shadows => (1.0 - luma) * (1.0 - luma),
+                ToneRange::Midtones => 4.0 * luma * (1.0 - luma),
+                ToneRange::Highlights => luma * luma,
+            };
+            let strength = (exp * cov * tone_weight * 0.70).clamp(0.0, 0.95);
+            if strength <= 1e-5 {
+                continue;
+            }
+
+            let adjust = |ch: f32| -> u8 {
+                let out = match mode {
+                    DodgeBurnMode::Dodge => ch + (1.0 - ch) * strength,
+                    DodgeBurnMode::Burn => ch * (1.0 - strength),
+                };
+                (out * 255.0).round().clamp(0.0, 255.0) as u8
+            };
+            asset.rgba_bytes[idx] = adjust(rf);
+            asset.rgba_bytes[idx + 1] = adjust(gf);
+            asset.rgba_bytes[idx + 2] = adjust(bf);
+        }
+    }
+}
+
+/// Contiguous raster paint-bucket flood fill using an iterative scanline-span BFS queue
+/// (zero recursion, safe on arbitrarily large images) with per-channel tolerance `0..=255`.
+///
+/// Returns the exact number of pixels modified.
+pub fn raster_flood_fill(
+    asset: &mut RasterAsset,
+    seed_x: u32,
+    seed_y: u32,
+    fill_color: Color,
+    tolerance: u8,
+) -> usize {
+    if !is_valid_raster_asset(asset) || seed_x >= asset.width || seed_y >= asset.height {
+        return 0;
+    }
+    let w = asset.width as usize;
+    let h = asset.height as usize;
+    let seed_px = asset_pixel(asset, seed_x, seed_y);
+    let fill_px = fill_color.to_rgba8();
+    if tolerance == 0 && seed_px == fill_px {
+        return 0;
+    }
+
+    let tol = i32::from(tolerance);
+    let matches_seed = |bytes: &[u8], x: usize, y: usize| -> bool {
+        let idx = (y * w + x) * 4;
+        (i32::from(bytes[idx]) - i32::from(seed_px[0])).abs() <= tol
+            && (i32::from(bytes[idx + 1]) - i32::from(seed_px[1])).abs() <= tol
+            && (i32::from(bytes[idx + 2]) - i32::from(seed_px[2])).abs() <= tol
+            && (i32::from(bytes[idx + 3]) - i32::from(seed_px[3])).abs() <= tol
+    };
+
+    let mut visited = vec![false; w * h];
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    queue.push_back((seed_x as usize, seed_y as usize));
+    let mut filled_count = 0usize;
+
+    let [fr, fg, fb, fa] = fill_color.to_rgba_f32();
+    let direct_write = fill_px[3] == 255 || fill_px[3] == 0;
+
+    while let Some((sx, sy)) = queue.pop_front() {
+        let row_base = sy * w;
+        if visited[row_base + sx] || !matches_seed(&asset.rgba_bytes, sx, sy) {
+            continue;
+        }
+
+        // Expand horizontal span to left & right boundaries
+        let mut lx = sx;
+        while lx > 0 && !visited[row_base + lx - 1] && matches_seed(&asset.rgba_bytes, lx - 1, sy) {
+            lx -= 1;
+        }
+        let mut rx = sx;
+        while rx + 1 < w
+            && !visited[row_base + rx + 1]
+            && matches_seed(&asset.rgba_bytes, rx + 1, sy)
+        {
+            rx += 1;
+        }
+
+        // Fill span and queue contiguous matching runs on rows above and below
+        let mut above_in_run = false;
+        let mut below_in_run = false;
+        for x in lx..=rx {
+            visited[row_base + x] = true;
+            if direct_write {
+                let off = (row_base + x) * 4;
+                asset.rgba_bytes[off..off + 4].copy_from_slice(&fill_px);
+            } else {
+                blend_pixel_over(asset, x as u32, sy as u32, fr, fg, fb, fa);
+            }
+            filled_count += 1;
+
+            if sy > 0 {
+                let ay = sy - 1;
+                let a_match = !visited[ay * w + x] && matches_seed(&asset.rgba_bytes, x, ay);
+                if a_match && !above_in_run {
+                    queue.push_back((x, ay));
+                    above_in_run = true;
+                } else if !a_match {
+                    above_in_run = false;
+                }
+            }
+            if sy + 1 < h {
+                let by = sy + 1;
+                let b_match = !visited[by * w + x] && matches_seed(&asset.rgba_bytes, x, by);
+                if b_match && !below_in_run {
+                    queue.push_back((x, by));
+                    below_in_run = true;
+                } else if !b_match {
+                    below_in_run = false;
+                }
+            }
+        }
+    }
+
+    filled_count
+}
+
+#[inline]
+fn rgb_to_ycbcr(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    // BT.709 luminance & opponent chrominance
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let cb = (b - y) / 1.8556;
+    let cr = (r - y) / 1.5748;
+    (y, cb, cr)
+}
+
+#[inline]
+fn ycbcr_to_rgb(y: f64, cb: f64, cr: f64) -> (f64, f64, f64) {
+    let r = (y + 1.5748 * cr).clamp(0.0, 1.0);
+    let b = (y + 1.8556 * cb).clamp(0.0, 1.0);
+    let g = ((y - 0.2126 * r - 0.0722 * b) / 0.7152).clamp(0.0, 1.0);
+    (r, g, b)
+}
+
 /// Applies a stack of non-destructive [`RasterFilter`]s sequentially, returning a new [`RasterAsset`].
 #[must_use]
 pub fn apply_raster_filters(asset: &RasterAsset, filters: &[RasterFilter]) -> RasterAsset {

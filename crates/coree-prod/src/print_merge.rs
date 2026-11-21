@@ -54,13 +54,14 @@ impl SerialNumberConfig {
         let val = self
             .start
             .saturating_add((row_idx as u64).saturating_mul(self.step.max(1)));
-        if self.pad_width > 0 {
+        let capped_width = self.pad_width.min(64);
+        if capped_width > 0 {
             format!(
                 "{}{:0width$}{}",
                 self.prefix,
                 val,
                 self.suffix,
-                width = self.pad_width
+                width = capped_width
             )
         } else {
             format!("{}{val}{}", self.prefix, self.suffix)
@@ -89,6 +90,12 @@ impl PrintMergeTable {
     /// Parses a delimited table supporting RFC-4180 quotes, `""` escaping, embedded newlines,
     /// `\r\n`/`\n` line endings, and UTF-8 BOM stripping.
     pub fn from_delimited(input: &str, delimiter: char) -> ProdResult<Self> {
+        if matches!(delimiter, '"' | '\r' | '\n') {
+            return Err(ProdError::CsvParseError {
+                line: 1,
+                reason: format!("invalid CSV/TSV delimiter {delimiter:?}"),
+            });
+        }
         let text = input.strip_prefix('\u{FEFF}').unwrap_or(input);
         let records = parse_rfc4180(text, delimiter)?;
         if records.is_empty() {
@@ -279,7 +286,16 @@ pub fn apply_print_merge(
 
     let tpl_w = tpl_page.width_mm;
     let tpl_h = tpl_page.height_mm;
-    let tpl_bleed = tpl_page.bleed_mm;
+    let tpl_bleed = if tpl_page.bleed_mm.is_finite() {
+        tpl_page.bleed_mm.max(0.0)
+    } else {
+        0.0
+    };
+    if !tpl_w.is_finite() || tpl_w <= 0.0 || !tpl_h.is_finite() || tpl_h <= 0.0 {
+        return Err(ProdError::MergeError(
+            "template page dimensions must be positive and finite".into(),
+        ));
+    }
 
     let mut out = clone_document_shell(template_doc, format!("{} (Merged)", template_doc.title));
 

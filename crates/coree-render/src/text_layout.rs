@@ -15,6 +15,7 @@ use cosmic_text::{
     Style, SwashCache, SwashContent, Weight, Wrap,
 };
 use kurbo::BezPath;
+use std::sync::{Mutex, OnceLock};
 
 /// Internal layout resolution scale (logical pixels per millimeter) used during
 /// unhinted glyph outline extraction so coordinates convert cleanly back to mm.
@@ -356,11 +357,22 @@ impl TextEngine {
             let baseline_y_px = col_y_px + baseline_offset_px;
 
             let mut extra_spacing_px = 0.0_f32;
+            let mut seen_base = false;
             for g in &glyphs {
                 let run_style = processed_runs
                     .get(g.metadata)
                     .map(|r| &r.style)
                     .unwrap_or(&default_style);
+                let is_base = g.w > 1e-3;
+                if is_base && seen_base {
+                    let letter_extra = sanitize_f64(run_style.letter_spacing_mm, 0.0) as f32;
+                    if letter_extra.abs() > 1e-6 {
+                        extra_spacing_px += letter_extra * LAYOUT_UNITS_PER_MM;
+                    }
+                }
+                if is_base {
+                    seen_base = true;
+                }
                 if let Some(path) = self.glyph_outline_mm(
                     g,
                     col_x_px + g.x + extra_spacing_px,
@@ -372,10 +384,6 @@ impl TextEngine {
                         path,
                         fill: run_style.fill.clone(),
                     });
-                }
-                let letter_extra = sanitize_f64(run_style.letter_spacing_mm, 0.0) as f32;
-                if letter_extra.abs() > 1e-6 {
-                    extra_spacing_px += letter_extra * LAYOUT_UNITS_PER_MM;
                 }
             }
             col_y_px += lh_px;
@@ -462,39 +470,103 @@ impl TextEngine {
         let text_width_mm = f64::from((max_x - min_x).max(0.0) / LAYOUT_UNITS_PER_MM);
         let offset_mm = sanitize_f64(top.offset_mm, 0.0);
         let dist_mm = sanitize_f64(top.distance_mm, 0.0);
+        let is_closed_host = host_path.subpaths.first().is_some_and(|sp| sp.closed);
+        let sx = if top.flip_horizontal { -1.0 } else { 1.0 };
+        let sy = if top.flip_vertical { -1.0 } else { 1.0 };
 
+        // Helper mapping an arc-length distance onto `(anchor_mm, tangent_angle_rad)` without
+        // piling glyphs onto endpoints (wraps closed loops; linearly extrapolates tiny open overhangs).
+        let sample_frame = |along_mm: f64, half_w_mm: f64| -> Option<(coree_core::Point2D, f64)> {
+            if is_closed_host {
+                let wrapped = along_mm.rem_euclid(total_path_len);
+                let (pt, tangent) = host_path.point_and_tangent_at(wrapped)?;
+                let up_normal = Vec2D::new(tangent.y, -tangent.x);
+                return Some((pt + up_normal * dist_mm, tangent.angle_rad()));
+            }
+            let overhang_tol = half_w_mm.max(1.0);
+            if along_mm < -overhang_tol || along_mm > total_path_len + overhang_tol {
+                return None;
+            }
+            let clamped = along_mm.clamp(0.0, total_path_len);
+            let (pt, tangent) = host_path.point_and_tangent_at(clamped)?;
+            let extra = along_mm - clamped;
+            let extrap_pt = pt + tangent * extra;
+            let up_normal = Vec2D::new(tangent.y, -tangent.x);
+            Some((extrap_pt + up_normal * dist_mm, tangent.angle_rad()))
+        };
+
+        // Track active base glyph frame `(base_center_x_px, anchor_mm, angle_rad)` so zero-width
+        // combining marks (Arabic tashkeel / diacritics) remain locked to their base letter
+        // around tight curves and circular paths!
+        let mut active_base: Option<(f32, coree_core::Point2D, f64)> = None;
         let mut pieces = Vec::with_capacity(snapshots.len());
-        for g in &snapshots {
+
+        for (idx, g) in snapshots.iter().enumerate() {
             let run_style = processed_runs
                 .get(g.metadata)
                 .map(|r| &r.style)
                 .unwrap_or(&default_style);
-            // Extract glyph centered horizontally at 0 around baseline y = 0
-            let half_w_px = g.w * 0.5;
-            let Some(mut glyph_path) = self.glyph_outline_mm(g, -half_w_px, g.y, run_style, g.w)
+            let is_combining_mark = g.w <= 1e-3;
+
+            let (glyph_origin_x_px, anchor, angle) = if is_combining_mark {
+                // Attach to active preceding base glyph, or peek forward to next base glyph if leading
+                let base_info = active_base.or_else(|| {
+                    snapshots[idx + 1..]
+                        .iter()
+                        .find(|next| next.w > 1e-3)
+                        .and_then(|next| {
+                            let b_half = next.w * 0.5;
+                            let b_center_x = next.x + b_half;
+                            let rel_mm = f64::from((b_center_x - min_x) / LAYOUT_UNITS_PER_MM);
+                            let along = if top.flip_horizontal {
+                                offset_mm + (text_width_mm - rel_mm)
+                            } else {
+                                offset_mm + rel_mm
+                            };
+                            let (a, ang) =
+                                sample_frame(along, f64::from(b_half / LAYOUT_UNITS_PER_MM))?;
+                            Some((b_center_x, a, ang))
+                        })
+                });
+                if let Some((base_center_x, base_anchor, base_angle)) = base_info {
+                    (g.x - base_center_x, base_anchor, base_angle)
+                } else {
+                    let rel_mm = f64::from((g.x - min_x) / LAYOUT_UNITS_PER_MM);
+                    let along = if top.flip_horizontal {
+                        offset_mm + (text_width_mm - rel_mm)
+                    } else {
+                        offset_mm + rel_mm
+                    };
+                    let Some((a, ang)) = sample_frame(along, 1.0) else {
+                        continue;
+                    };
+                    (0.0, a, ang)
+                }
+            } else {
+                let half_w_px = g.w * 0.5;
+                let base_center_x = g.x + half_w_px;
+                let rel_center_mm = f64::from((base_center_x - min_x) / LAYOUT_UNITS_PER_MM);
+                let along_mm = if top.flip_horizontal {
+                    offset_mm + (text_width_mm - rel_center_mm)
+                } else {
+                    offset_mm + rel_center_mm
+                };
+                let Some((a, ang)) =
+                    sample_frame(along_mm, f64::from(half_w_px / LAYOUT_UNITS_PER_MM))
+                else {
+                    active_base = None;
+                    continue;
+                };
+                active_base = Some((base_center_x, a, ang));
+                (-half_w_px, a, ang)
+            };
+
+            let Some(mut glyph_path) =
+                self.glyph_outline_mm(g, glyph_origin_x_px, g.y, run_style, g.w)
             else {
                 continue;
             };
 
-            let rel_center_mm = f64::from((g.x - min_x + half_w_px) / LAYOUT_UNITS_PER_MM);
-            let along_mm = if top.flip_horizontal {
-                offset_mm + (text_width_mm - rel_center_mm)
-            } else {
-                offset_mm + rel_center_mm
-            };
-            if along_mm < -5.0 || along_mm > total_path_len + 5.0 {
-                continue;
-            }
-            let Some((pt, tangent)) = host_path.point_and_tangent_at(along_mm) else {
-                continue;
-            };
-            let angle = tangent.angle_rad();
-            // Upward normal in Y-down space is (tangent.y, -tangent.x) = -tangent.perp()
-            let up_normal = Vec2D::new(tangent.y, -tangent.x);
-            let anchor = pt + up_normal * dist_mm;
-
-            let sx = if top.flip_horizontal { -1.0 } else { 1.0 };
-            let sy = if top.flip_vertical { -1.0 } else { 1.0 };
             let xf = Affine2D::translate(anchor.x, anchor.y)
                 .compose(&Affine2D::rotate(angle))
                 .compose(&Affine2D::scale(sx, sy));
@@ -546,11 +618,22 @@ impl TextEngine {
         let mut pieces = Vec::new();
         for (line_y, glyphs) in snapshots {
             let mut extra_spacing_px = 0.0_f32;
+            let mut seen_base = false;
             for g in &glyphs {
                 let run_style = runs
                     .get(g.metadata)
                     .map(|r| &r.style)
                     .unwrap_or(&default_style);
+                let is_base = g.w > 1e-3;
+                if is_base && seen_base {
+                    let ls = sanitize_f64(run_style.letter_spacing_mm, 0.0) as f32;
+                    if ls.abs() > 1e-6 {
+                        extra_spacing_px += ls * LAYOUT_UNITS_PER_MM;
+                    }
+                }
+                if is_base {
+                    seen_base = true;
+                }
                 let gx = g.x + x_shift_px + extra_spacing_px;
                 let gy = line_y + g.y + y_shift_px;
                 if let Some(path) = self.glyph_outline_mm(g, gx, gy, run_style, g.w) {
@@ -558,10 +641,6 @@ impl TextEngine {
                         path,
                         fill: run_style.fill.clone(),
                     });
-                }
-                let ls = sanitize_f64(run_style.letter_spacing_mm, 0.0) as f32;
-                if ls.abs() > 1e-6 {
-                    extra_spacing_px += ls * LAYOUT_UNITS_PER_MM;
                 }
             }
         }
@@ -1064,4 +1143,609 @@ pub fn paragraph_to_curves(para: &ParagraphText) -> BezierPath {
 pub fn text_on_path_to_curves(top: &TextOnPath, host_path: &BezierPath) -> BezierPath {
     let mut engine = TextEngine::new();
     engine.text_on_path_to_curves(top, host_path)
+}
+
+// =============================================================================
+// Interactive Font Glyph Catalog / Glyphs Docker Listing API
+// =============================================================================
+
+/// Unicode script & symbol block filter for the interactive Glyphs Docker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GlyphBlockFilter {
+    #[default]
+    All,
+    Arabic,
+    ArabicPresentationForms,
+    Latin,
+    SymbolsAndDingbats,
+    Arrows,
+    Geometric,
+    Math,
+    Punctuation,
+}
+
+impl GlyphBlockFilter {
+    /// All selectable filter tabs for the Glyphs Docker UI.
+    pub const ALL_FILTERS: [Self; 9] = [
+        Self::All,
+        Self::Arabic,
+        Self::ArabicPresentationForms,
+        Self::Latin,
+        Self::SymbolsAndDingbats,
+        Self::Arrows,
+        Self::Geometric,
+        Self::Math,
+        Self::Punctuation,
+    ];
+
+    /// Human-readable display label for UI dropdowns and filter chips.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All Blocks",
+            Self::Arabic => "Arabic",
+            Self::ArabicPresentationForms => "Arabic Presentation Forms",
+            Self::Latin => "Latin",
+            Self::SymbolsAndDingbats => "Symbols & Dingbats",
+            Self::Arrows => "Arrows",
+            Self::Geometric => "Geometric Shapes",
+            Self::Math => "Math Operators",
+            Self::Punctuation => "Punctuation",
+        }
+    }
+}
+
+/// Single selectable glyph entry returned by [`list_glyphs_for_block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlyphCatalogEntry {
+    /// Unicode scalar character to insert into text.
+    pub ch: char,
+    /// Numeric Unicode codepoint (`ch as u32`).
+    pub codepoint: u32,
+    /// Canonical uppercase hex identifier (e.g. `"U+0627"`).
+    pub codepoint_hex: String,
+    /// Human-readable glyph / Unicode character name.
+    pub name: String,
+    /// Specific block category this glyph belongs to.
+    pub block: GlyphBlockFilter,
+    /// Whether the queried font family (or an installed system font when `None`) has a cmap entry.
+    pub supported_by_font: bool,
+}
+
+impl TextEngine {
+    /// Lists Unicode glyphs matching `filter` and `search`, annotating `supported_by_font`
+    /// against `font_family` (or any installed font if `None`) using this engine's `FontSystem`.
+    #[must_use]
+    pub fn list_glyphs_for_block(
+        &mut self,
+        font_family: Option<&str>,
+        filter: GlyphBlockFilter,
+        search: &str,
+        max_items: usize,
+    ) -> Vec<GlyphCatalogEntry> {
+        list_glyphs_with_font_system(
+            &mut self.font_system,
+            font_family,
+            filter,
+            search,
+            max_items,
+        )
+    }
+}
+
+/// Lists curated Unicode glyphs for the interactive Glyphs Docker filtered by `filter`,
+/// optional case-insensitive `search` (matching glyph char, descriptive name, or hex codepoint),
+/// and bounded to `max_items`, checking actual OpenType/TrueType cmap coverage in `font_family`.
+///
+/// Uses a process-wide cached `FontSystem` so live UI search stays sub-millisecond.
+#[must_use]
+pub fn list_glyphs_for_block(
+    font_family: Option<&str>,
+    filter: GlyphBlockFilter,
+    search: &str,
+    max_items: usize,
+) -> Vec<GlyphCatalogEntry> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+    static SHARED_FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
+    let mutex = SHARED_FONT_SYSTEM.get_or_init(|| Mutex::new(FontSystem::new()));
+    if let Ok(mut fs) = mutex.lock() {
+        list_glyphs_with_font_system(&mut fs, font_family, filter, search, max_items)
+    } else {
+        let mut fallback = FontSystem::new();
+        list_glyphs_with_font_system(&mut fallback, font_family, filter, search, max_items)
+    }
+}
+
+fn list_glyphs_with_font_system(
+    font_system: &mut FontSystem,
+    font_family: Option<&str>,
+    filter: GlyphBlockFilter,
+    search: &str,
+    max_items: usize,
+) -> Vec<GlyphCatalogEntry> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+
+    // Resolve matching font face IDs to inspect actual cmap glyph support
+    let trimmed_fam = font_family.map(str::trim).filter(|s| !s.is_empty());
+    let candidate_ids: Vec<cosmic_text::fontdb::ID> = if let Some(fam) = trimmed_fam {
+        let exact: Vec<_> = font_system
+            .db()
+            .faces()
+            .filter(|f| {
+                f.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(fam))
+            })
+            .map(|f| f.id)
+            .take(8)
+            .collect();
+        if exact.is_empty() {
+            // Fall back to checking a small set of general system fonts if requested family isn't installed
+            font_system.db().faces().map(|f| f.id).take(16).collect()
+        } else {
+            exact
+        }
+    } else {
+        // Sample representative system faces (preferring regular faces across Latin/Arabic/Symbol fonts)
+        font_system
+            .db()
+            .faces()
+            .filter(|f| f.weight == Weight::NORMAL)
+            .map(|f| f.id)
+            .take(32)
+            .collect()
+    };
+
+    let loaded_fonts: Vec<_> = candidate_ids
+        .into_iter()
+        .filter_map(|id| font_system.get_font(id, Weight::NORMAL))
+        .collect();
+
+    let is_supported = |ch: char| -> bool {
+        loaded_fonts
+            .iter()
+            .any(|font| font.as_swash().charmap().map(ch) != 0)
+    };
+
+    let query = search.trim().to_ascii_lowercase();
+    let query_raw = search.trim();
+    let blocks: &[GlyphBlockFilter] = if filter == GlyphBlockFilter::All {
+        &[
+            GlyphBlockFilter::Arabic,
+            GlyphBlockFilter::ArabicPresentationForms,
+            GlyphBlockFilter::Latin,
+            GlyphBlockFilter::SymbolsAndDingbats,
+            GlyphBlockFilter::Arrows,
+            GlyphBlockFilter::Geometric,
+            GlyphBlockFilter::Math,
+            GlyphBlockFilter::Punctuation,
+        ]
+    } else {
+        std::slice::from_ref(&filter)
+    };
+
+    let mut out = Vec::with_capacity(max_items.min(256));
+    let mut seen_cp = std::collections::HashSet::new();
+
+    for &blk in blocks {
+        for (ch, name) in block_catalog_entries(blk) {
+            if out.len() >= max_items {
+                return out;
+            }
+            let cp = ch as u32;
+            if !seen_cp.insert(cp) {
+                continue;
+            }
+            let hex = format!("U+{cp:04X}");
+            if !query.is_empty() {
+                let hex_lc = hex.to_ascii_lowercase();
+                let name_lc = name.to_ascii_lowercase();
+                let char_matches = query_raw.chars().count() == 1 && query_raw.starts_with(ch);
+                if !char_matches
+                    && !name_lc.contains(&query)
+                    && !hex_lc.contains(&query)
+                    && !format!("{cp:04x}").contains(&query)
+                {
+                    continue;
+                }
+            }
+            out.push(GlyphCatalogEntry {
+                ch,
+                codepoint: cp,
+                codepoint_hex: hex,
+                name,
+                block: blk,
+                supported_by_font: is_supported(ch),
+            });
+        }
+    }
+
+    out
+}
+
+fn block_catalog_entries(block: GlyphBlockFilter) -> Vec<(char, String)> {
+    let mut items: Vec<(char, String)> = Vec::new();
+    match block {
+        GlyphBlockFilter::All => {}
+        GlyphBlockFilter::Arabic => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{0621}', "ARABIC LETTER HAMZA"),
+                ('\u{0622}', "ARABIC LETTER ALEF WITH MADDA ABOVE"),
+                ('\u{0623}', "ARABIC LETTER ALEF WITH HAMZA ABOVE"),
+                ('\u{0624}', "ARABIC LETTER WAW WITH HAMZA ABOVE"),
+                ('\u{0625}', "ARABIC LETTER ALEF WITH HAMZA BELOW"),
+                ('\u{0626}', "ARABIC LETTER YEH WITH HAMZA ABOVE"),
+                ('\u{0627}', "ARABIC LETTER ALEF"),
+                ('\u{0628}', "ARABIC LETTER BEH"),
+                ('\u{0629}', "ARABIC LETTER TEH MARBUTA"),
+                ('\u{062A}', "ARABIC LETTER TEH"),
+                ('\u{062B}', "ARABIC LETTER THEH"),
+                ('\u{062C}', "ARABIC LETTER JEEM"),
+                ('\u{062D}', "ARABIC LETTER HAH"),
+                ('\u{062E}', "ARABIC LETTER KHAH"),
+                ('\u{062F}', "ARABIC LETTER DAL"),
+                ('\u{0630}', "ARABIC LETTER THAL"),
+                ('\u{0631}', "ARABIC LETTER REH"),
+                ('\u{0632}', "ARABIC LETTER ZAIN"),
+                ('\u{0633}', "ARABIC LETTER SEEN"),
+                ('\u{0634}', "ARABIC LETTER SHEEN"),
+                ('\u{0635}', "ARABIC LETTER SAD"),
+                ('\u{0636}', "ARABIC LETTER DAD"),
+                ('\u{0637}', "ARABIC LETTER TAH"),
+                ('\u{0638}', "ARABIC LETTER ZAH"),
+                ('\u{0639}', "ARABIC LETTER AIN"),
+                ('\u{063A}', "ARABIC LETTER GHAIN"),
+                ('\u{0640}', "ARABIC TATWEEL (KASHIDA)"),
+                ('\u{0641}', "ARABIC LETTER FEH"),
+                ('\u{0642}', "ARABIC LETTER QAF"),
+                ('\u{0643}', "ARABIC LETTER KAF"),
+                ('\u{0644}', "ARABIC LETTER LAM"),
+                ('\u{0645}', "ARABIC LETTER MEEM"),
+                ('\u{0646}', "ARABIC LETTER NOON"),
+                ('\u{0647}', "ARABIC LETTER HEH"),
+                ('\u{0648}', "ARABIC LETTER WAW"),
+                ('\u{0649}', "ARABIC LETTER ALEF MAKSURA"),
+                ('\u{064A}', "ARABIC LETTER YEH"),
+                ('\u{064B}', "ARABIC FATHATAN"),
+                ('\u{064C}', "ARABIC DAMMATAN"),
+                ('\u{064D}', "ARABIC KASRATAN"),
+                ('\u{064E}', "ARABIC FATHA"),
+                ('\u{064F}', "ARABIC DAMMA"),
+                ('\u{0650}', "ARABIC KASRA"),
+                ('\u{0651}', "ARABIC SHADDA"),
+                ('\u{0652}', "ARABIC SUKUN"),
+                ('\u{0653}', "ARABIC MADDAH ABOVE"),
+                ('\u{0654}', "ARABIC HAMZA ABOVE"),
+                ('\u{0655}', "ARABIC HAMZA BELOW"),
+                ('\u{0660}', "ARABIC-INDIC DIGIT ZERO"),
+                ('\u{0661}', "ARABIC-INDIC DIGIT ONE"),
+                ('\u{0662}', "ARABIC-INDIC DIGIT TWO"),
+                ('\u{0663}', "ARABIC-INDIC DIGIT THREE"),
+                ('\u{0664}', "ARABIC-INDIC DIGIT FOUR"),
+                ('\u{0665}', "ARABIC-INDIC DIGIT FIVE"),
+                ('\u{0666}', "ARABIC-INDIC DIGIT SIX"),
+                ('\u{0667}', "ARABIC-INDIC DIGIT SEVEN"),
+                ('\u{0668}', "ARABIC-INDIC DIGIT EIGHT"),
+                ('\u{0669}', "ARABIC-INDIC DIGIT NINE"),
+                ('\u{066A}', "ARABIC PERCENT SIGN"),
+                ('\u{066B}', "ARABIC DECIMAL SEPARATOR"),
+                ('\u{066C}', "ARABIC THOUSANDS SEPARATOR"),
+                ('\u{066D}', "ARABIC FIVE POINTED STAR"),
+                ('\u{060C}', "ARABIC COMMA"),
+                ('\u{061B}', "ARABIC SEMICOLON"),
+                ('\u{061F}', "ARABIC QUESTION MARK"),
+                ('\u{067E}', "ARABIC LETTER PEH"),
+                ('\u{0686}', "ARABIC LETTER TCHEH"),
+                ('\u{0698}', "ARABIC LETTER JEH"),
+                ('\u{06A9}', "ARABIC LETTER KEHEH"),
+                ('\u{06AF}', "ARABIC LETTER GAF"),
+                ('\u{06CC}', "ARABIC LETTER FARSI YEH"),
+                ('\u{06DE}', "ARABIC START OF RUB EL HIZB"),
+                ('\u{06E9}', "ARABIC PLACE OF SAJDAH"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::ArabicPresentationForms => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{FDF2}', "ARABIC LIGATURE ALLAH ISOLATED FORM"),
+                ('\u{FDFA}', "ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM"),
+                ('\u{FDFB}', "ARABIC LIGATURE JALLAJALALOUHOU"),
+                ('\u{FDFC}', "RIAL SIGN"),
+                ('\u{FDFD}', "ARABIC LIGATURE BISMILLAH AR-RAHMAN AR-RAHEEM"),
+                ('\u{FD3E}', "ORNATE LEFT PARENTHESIS"),
+                ('\u{FD3F}', "ORNATE RIGHT PARENTHESIS"),
+                ('\u{FEFB}', "ARABIC LIGATURE LAM WITH ALEF ISOLATED FORM"),
+                ('\u{FEFC}', "ARABIC LIGATURE LAM WITH ALEF FINAL FORM"),
+                (
+                    '\u{FEF5}',
+                    "ARABIC LIGATURE LAM WITH ALEF WITH MADDA ABOVE ISOLATED FORM",
+                ),
+                (
+                    '\u{FEF7}',
+                    "ARABIC LIGATURE LAM WITH ALEF WITH HAMZA ABOVE ISOLATED FORM",
+                ),
+                (
+                    '\u{FEF9}',
+                    "ARABIC LIGATURE LAM WITH ALEF WITH HAMZA BELOW ISOLATED FORM",
+                ),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+            for cp in 0xFE80u32..=0xFEFCu32 {
+                if let Some(ch) = char::from_u32(cp) {
+                    if !NAMED.iter().any(|&(nc, _)| nc == ch) {
+                        items.push((ch, format!("ARABIC PRESENTATION FORM U+{cp:04X}")));
+                    }
+                }
+            }
+        }
+        GlyphBlockFilter::Latin => {
+            for cp in 0x0041u32..=0x005Au32 {
+                if let Some(ch) = char::from_u32(cp) {
+                    items.push((ch, format!("LATIN CAPITAL LETTER {ch}")));
+                }
+            }
+            for cp in 0x0061u32..=0x007Au32 {
+                if let Some(ch) = char::from_u32(cp) {
+                    items.push((ch, format!("LATIN SMALL LETTER {ch}")));
+                }
+            }
+            for cp in 0x0030u32..=0x0039u32 {
+                if let Some(ch) = char::from_u32(cp) {
+                    items.push((ch, format!("DIGIT {ch}")));
+                }
+            }
+            for cp in 0x00C0u32..=0x00FFu32 {
+                if cp == 0x00D7 || cp == 0x00F7 {
+                    continue;
+                }
+                if let Some(ch) = char::from_u32(cp) {
+                    items.push((ch, format!("LATIN SUPPLEMENT LETTER {ch} (U+{cp:04X})")));
+                }
+            }
+            const EXTRA: &[(char, &str)] = &[
+                ('\u{0152}', "LATIN CAPITAL LIGATURE OE"),
+                ('\u{0153}', "LATIN SMALL LIGATURE OE"),
+                ('\u{0160}', "LATIN CAPITAL LETTER S WITH CARON"),
+                ('\u{0161}', "LATIN SMALL LETTER S WITH CARON"),
+                ('\u{0178}', "LATIN CAPITAL LETTER Y WITH DIAERESIS"),
+                ('\u{017D}', "LATIN CAPITAL LETTER Z WITH CARON"),
+                ('\u{017E}', "LATIN SMALL LETTER Z WITH CARON"),
+            ];
+            for &(c, n) in EXTRA {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::SymbolsAndDingbats => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{00A9}', "COPYRIGHT SIGN"),
+                ('\u{00AE}', "REGISTERED SIGN"),
+                ('\u{2122}', "TRADE MARK SIGN"),
+                ('\u{00A7}', "SECTION SIGN"),
+                ('\u{00B6}', "PILCROW SIGN"),
+                ('\u{00B0}', "DEGREE SIGN"),
+                ('\u{20AC}', "EURO SIGN"),
+                ('\u{00A3}', "POUND SIGN"),
+                ('\u{00A5}', "YEN SIGN"),
+                ('\u{00A2}', "CENT SIGN"),
+                ('\u{20B9}', "INDIAN RUPEE SIGN"),
+                ('\u{20BA}', "TURKISH LIRA SIGN"),
+                ('\u{2600}', "BLACK SUN WITH RAYS"),
+                ('\u{2601}', "CLOUD"),
+                ('\u{2605}', "BLACK STAR"),
+                ('\u{2606}', "WHITE STAR"),
+                ('\u{260E}', "BLACK TELEPHONE"),
+                ('\u{2611}', "BALLOT BOX WITH CHECK"),
+                ('\u{2622}', "RADIOACTIVE SIGN"),
+                ('\u{262E}', "PEACE SYMBOL"),
+                ('\u{262F}', "YIN YANG"),
+                ('\u{263A}', "WHITE SMILING FACE"),
+                ('\u{2660}', "BLACK SPADE SUIT"),
+                ('\u{2663}', "BLACK CLUB SUIT"),
+                ('\u{2665}', "BLACK HEART SUIT"),
+                ('\u{2666}', "BLACK DIAMOND SUIT"),
+                ('\u{266A}', "EIGHTH NOTE"),
+                ('\u{266B}', "BEAMED EIGHTH NOTES"),
+                ('\u{2699}', "GEAR"),
+                ('\u{26A0}', "WARNING SIGN"),
+                ('\u{26A1}', "HIGH VOLTAGE SIGN"),
+                ('\u{2702}', "BLACK SCISSORS"),
+                ('\u{2708}', "AIRPLANE"),
+                ('\u{2709}', "ENVELOPE"),
+                ('\u{2713}', "CHECK MARK"),
+                ('\u{2714}', "HEAVY CHECK MARK"),
+                ('\u{2715}', "MULTIPLICATION X"),
+                ('\u{2716}', "HEAVY MULTIPLICATION X"),
+                ('\u{271A}', "HEAVY GREEK CROSS"),
+                ('\u{2726}', "BLACK FOUR POINTED STAR"),
+                ('\u{2727}', "WHITE FOUR POINTED STAR"),
+                ('\u{272F}', "PINWHEEL STAR"),
+                ('\u{2736}', "SIX POINTED BLACK STAR"),
+                ('\u{273F}', "BLACK FLORETTE"),
+                ('\u{2740}', "WHITE FLORETTE"),
+                ('\u{2744}', "SNOWFLAKE"),
+                ('\u{2756}', "BLACK DIAMOND MINUS WHITE X"),
+                ('\u{2764}', "HEAVY BLACK HEART"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::Arrows => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{2190}', "LEFTWARDS ARROW"),
+                ('\u{2191}', "UPWARDS ARROW"),
+                ('\u{2192}', "RIGHTWARDS ARROW"),
+                ('\u{2193}', "DOWNWARDS ARROW"),
+                ('\u{2194}', "LEFT RIGHT ARROW"),
+                ('\u{2195}', "UP DOWN ARROW"),
+                ('\u{2196}', "NORTH WEST ARROW"),
+                ('\u{2197}', "NORTH EAST ARROW"),
+                ('\u{2198}', "SOUTH EAST ARROW"),
+                ('\u{2199}', "SOUTH WEST ARROW"),
+                ('\u{21A9}', "LEFTWARDS ARROW WITH HOOK"),
+                ('\u{21AA}', "RIGHTWARDS ARROW WITH HOOK"),
+                ('\u{21BA}', "ANTICLOCKWISE OPEN CIRCLE ARROW"),
+                ('\u{21BB}', "CLOCKWISE OPEN CIRCLE ARROW"),
+                ('\u{21C4}', "RIGHTWARDS ARROW OVER LEFTWARDS ARROW"),
+                ('\u{21D0}', "LEFTWARDS DOUBLE ARROW"),
+                ('\u{21D1}', "UPWARDS DOUBLE ARROW"),
+                ('\u{21D2}', "RIGHTWARDS DOUBLE ARROW"),
+                ('\u{21D3}', "DOWNWARDS DOUBLE ARROW"),
+                ('\u{21D4}', "LEFT RIGHT DOUBLE ARROW"),
+                ('\u{21D5}', "UP DOWN DOUBLE ARROW"),
+                ('\u{21E6}', "LEFTWARDS WHITE ARROW"),
+                ('\u{21E7}', "UPWARDS WHITE ARROW"),
+                ('\u{21E8}', "RIGHTWARDS WHITE ARROW"),
+                ('\u{21E9}', "DOWNWARDS WHITE ARROW"),
+                ('\u{2794}', "HEAVY WIDE-HEADED RIGHTWARDS ARROW"),
+                ('\u{279C}', "HEAVY ROUND-TIPPED RIGHTWARDS ARROW"),
+                ('\u{27A1}', "BLACK RIGHTWARDS ARROW"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::Geometric => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{25A0}', "BLACK SQUARE"),
+                ('\u{25A1}', "WHITE SQUARE"),
+                ('\u{25A2}', "WHITE SQUARE WITH ROUNDED CORNERS"),
+                ('\u{25A3}', "WHITE SQUARE CONTAINING BLACK SMALL SQUARE"),
+                ('\u{25AA}', "BLACK SMALL SQUARE"),
+                ('\u{25AB}', "WHITE SMALL SQUARE"),
+                ('\u{25AC}', "BLACK RECTANGLE"),
+                ('\u{25AD}', "WHITE RECTANGLE"),
+                ('\u{25B2}', "BLACK UP-POINTING TRIANGLE"),
+                ('\u{25B3}', "WHITE UP-POINTING TRIANGLE"),
+                ('\u{25B6}', "BLACK RIGHT-POINTING TRIANGLE"),
+                ('\u{25B7}', "WHITE RIGHT-POINTING TRIANGLE"),
+                ('\u{25BC}', "BLACK DOWN-POINTING TRIANGLE"),
+                ('\u{25BD}', "WHITE DOWN-POINTING TRIANGLE"),
+                ('\u{25C0}', "BLACK LEFT-POINTING TRIANGLE"),
+                ('\u{25C1}', "WHITE LEFT-POINTING TRIANGLE"),
+                ('\u{25C6}', "BLACK DIAMOND"),
+                ('\u{25C7}', "WHITE DIAMOND"),
+                ('\u{25C8}', "WHITE DIAMOND CONTAINING BLACK SMALL DIAMOND"),
+                ('\u{25CA}', "LOZENGE"),
+                ('\u{25CB}', "WHITE CIRCLE"),
+                ('\u{25CC}', "DOTTED CIRCLE"),
+                ('\u{25CE}', "BULLSEYE"),
+                ('\u{25CF}', "BLACK CIRCLE"),
+                ('\u{25D0}', "CIRCLE WITH LEFT HALF BLACK"),
+                ('\u{25D1}', "CIRCLE WITH RIGHT HALF BLACK"),
+                ('\u{25D2}', "CIRCLE WITH LOWER HALF BLACK"),
+                ('\u{25D3}', "CIRCLE WITH UPPER HALF BLACK"),
+                ('\u{25E6}', "WHITE BULLET"),
+                ('\u{25EF}', "LARGE CIRCLE"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::Math => {
+            const NAMED: &[(char, &str)] = &[
+                ('\u{00B1}', "PLUS-MINUS SIGN"),
+                ('\u{00D7}', "MULTIPLICATION SIGN"),
+                ('\u{00F7}', "DIVISION SIGN"),
+                ('\u{00AC}', "NOT SIGN"),
+                ('\u{00BC}', "VULGAR FRACTION ONE QUARTER"),
+                ('\u{00BD}', "VULGAR FRACTION ONE HALF"),
+                ('\u{00BE}', "VULGAR FRACTION THREE QUARTERS"),
+                ('\u{2200}', "FOR ALL"),
+                ('\u{2202}', "PARTIAL DIFFERENTIAL"),
+                ('\u{2203}', "THERE EXISTS"),
+                ('\u{2205}', "EMPTY SET"),
+                ('\u{2206}', "INCREMENT"),
+                ('\u{2207}', "NABLA"),
+                ('\u{2208}', "ELEMENT OF"),
+                ('\u{2209}', "NOT AN ELEMENT OF"),
+                ('\u{220F}', "N-ARY PRODUCT"),
+                ('\u{2211}', "N-ARY SUMMATION"),
+                ('\u{2212}', "MINUS SIGN"),
+                ('\u{221A}', "SQUARE ROOT"),
+                ('\u{221E}', "INFINITY"),
+                ('\u{2220}', "ANGLE"),
+                ('\u{2227}', "LOGICAL AND"),
+                ('\u{2228}', "LOGICAL OR"),
+                ('\u{2229}', "INTERSECTION"),
+                ('\u{222A}', "UNION"),
+                ('\u{222B}', "INTEGRAL"),
+                ('\u{2248}', "ALMOST EQUAL TO"),
+                ('\u{2260}', "NOT EQUAL TO"),
+                ('\u{2261}', "IDENTICAL TO"),
+                ('\u{2264}', "LESS-THAN OR EQUAL TO"),
+                ('\u{2265}', "GREATER-THAN OR EQUAL TO"),
+                ('\u{2282}', "SUBSET OF"),
+                ('\u{2283}', "SUPERSET OF"),
+                ('\u{2286}', "SUBSET OF OR EQUAL TO"),
+                ('\u{2287}', "SUPERSET OF OR EQUAL TO"),
+                ('\u{2295}', "CIRCLED PLUS"),
+                ('\u{2297}', "CIRCLED TIMES"),
+                ('\u{22A5}', "UP TACK (PERPENDICULAR)"),
+                ('\u{22C5}', "DOT OPERATOR"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+        GlyphBlockFilter::Punctuation => {
+            const NAMED: &[(char, &str)] = &[
+                ('!', "EXCLAMATION MARK"),
+                ('"', "QUOTATION MARK"),
+                ('#', "NUMBER SIGN"),
+                ('$', "DOLLAR SIGN"),
+                ('%', "PERCENT SIGN"),
+                ('&', "AMPERSAND"),
+                ('\'', "APOSTROPHE"),
+                ('(', "LEFT PARENTHESIS"),
+                (')', "RIGHT PARENTHESIS"),
+                ('*', "ASTERISK"),
+                (',', "COMMA"),
+                ('-', "HYPHEN-MINUS"),
+                ('.', "FULL STOP"),
+                ('/', "SOLIDUS"),
+                (':', "COLON"),
+                (';', "SEMICOLON"),
+                ('?', "QUESTION MARK"),
+                ('@', "COMMERCIAL AT"),
+                ('[', "LEFT SQUARE BRACKET"),
+                (']', "RIGHT SQUARE BRACKET"),
+                ('{', "LEFT CURLY BRACKET"),
+                ('}', "RIGHT CURLY BRACKET"),
+                ('\u{00AB}', "LEFT-POINTING DOUBLE ANGLE QUOTATION MARK"),
+                ('\u{00BB}', "RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK"),
+                ('\u{060C}', "ARABIC COMMA"),
+                ('\u{061B}', "ARABIC SEMICOLON"),
+                ('\u{061F}', "ARABIC QUESTION MARK"),
+                ('\u{2013}', "EN DASH"),
+                ('\u{2014}', "EM DASH"),
+                ('\u{2018}', "LEFT SINGLE QUOTATION MARK"),
+                ('\u{2019}', "RIGHT SINGLE QUOTATION MARK"),
+                ('\u{201C}', "LEFT DOUBLE QUOTATION MARK"),
+                ('\u{201D}', "RIGHT DOUBLE QUOTATION MARK"),
+                ('\u{2020}', "DAGGER"),
+                ('\u{2021}', "DOUBLE DAGGER"),
+                ('\u{2022}', "BULLET"),
+                ('\u{2026}', "HORIZONTAL ELLIPSIS"),
+                ('\u{2030}', "PER MILLE SIGN"),
+                ('\u{2032}', "PRIME"),
+                ('\u{2033}', "DOUBLE PRIME"),
+                ('\u{2039}', "SINGLE LEFT-POINTING ANGLE QUOTATION MARK"),
+                ('\u{203A}', "SINGLE RIGHT-POINTING ANGLE QUOTATION MARK"),
+                ('\u{203D}', "INTERROBANG"),
+            ];
+            for &(c, n) in NAMED {
+                items.push((c, n.to_owned()));
+            }
+        }
+    }
+    items
 }

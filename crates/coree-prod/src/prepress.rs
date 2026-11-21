@@ -134,6 +134,8 @@ pub fn compute_separations(
     options: &SeparationOptions,
 ) -> ProdResult<SeparationResult> {
     let page = get_page(doc, page_index)?;
+    validate_positive("page.width_mm", page.width_mm)?;
+    validate_positive("page.height_mm", page.height_mm)?;
     if !options.dpi.is_finite() || options.dpi <= 0.0 {
         return Err(ProdError::InvalidParameter(
             "separation DPI must be positive and finite".into(),
@@ -350,11 +352,15 @@ fn rasterize_object_separation(
         visiting.remove(&id);
         return;
     };
-    if !obj.visible || !obj.printable || obj.opacity <= 1e-6 {
+    if !obj.visible || !obj.printable || !obj.opacity.is_finite() || obj.opacity <= 1e-6 {
         visiting.remove(&id);
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        visiting.remove(&id);
+        return;
+    }
 
     match &obj.payload {
         NodePayload::Group(children) => {
@@ -446,7 +452,9 @@ fn rasterize_object_separation(
             Some(BezierPath::from_rect(d.bounding_box()).transformed(&world_xf))
         }
         NodePayload::Connector(c) => {
-            let (a, b) = ctx.doc.resolve_connector_endpoints(c);
+            let (a, b) = ctx
+                .doc
+                .resolve_connector_endpoints_with_transform(c, &world_xf);
             Some(c.route_path(a, b))
         }
         _ => None,
@@ -895,9 +903,12 @@ fn rasterize_stroke_mask(
         let dashes: Vec<f32> = outline
             .dash_pattern
             .iter()
-            .map(|&d| ((d as f32) * avg_scale).max(0.5))
+            .filter(|d| d.is_finite() && **d > 0.0)
+            .map(|&d| ((d as f32) * avg_scale).clamp(0.5, 10_000.0))
             .collect();
-        stroke.dash = tiny_skia::StrokeDash::new(dashes, 0.0);
+        if !dashes.is_empty() {
+            stroke.dash = tiny_skia::StrokeDash::new(dashes, 0.0);
+        }
     }
 
     pixmap.stroke_path(
@@ -960,7 +971,12 @@ fn build_plate(
 /// (`width * height * 4` bytes).
 #[must_use]
 pub fn simulate_overprint_rgba(sep: &SeparationResult) -> Vec<u8> {
-    let pixel_count = (sep.width as usize) * (sep.height as usize);
+    let Some(pixel_count) = (sep.width as usize).checked_mul(sep.height as usize) else {
+        return Vec::new();
+    };
+    let Some(byte_len) = pixel_count.checked_mul(4) else {
+        return Vec::new();
+    };
     let c_map = sep
         .plate(&SeparationChannel::Cyan)
         .map(|p| p.ink_map.as_slice());
@@ -987,7 +1003,7 @@ pub fn simulate_overprint_rgba(sep: &SeparationResult) -> Vec<u8> {
         })
         .collect();
 
-    let mut out = vec![0u8; pixel_count * 4];
+    let mut out = vec![0u8; byte_len];
     out.par_chunks_exact_mut(4)
         .enumerate()
         .for_each(|(px, rgba)| {
@@ -1167,6 +1183,8 @@ fn impose_nup(
     }
     let src_w = doc.pages[0].width_mm;
     let src_h = doc.pages[0].height_mm;
+    validate_positive("source page width_mm", src_w)?;
+    validate_positive("source page height_mm", src_h)?;
 
     let grid_w = f64::from(cols) * src_w + f64::from(cols - 1) * gap_x_mm;
     let grid_h = f64::from(rows) * src_h + f64::from(rows - 1) * gap_y_mm;
@@ -1223,8 +1241,18 @@ fn impose_nup(
 fn impose_booklet(doc: &Document, sheet_w_mm: f64, sheet_h_mm: f64) -> ProdResult<Document> {
     validate_positive("sheet_w_mm", sheet_w_mm)?;
     validate_positive("sheet_h_mm", sheet_h_mm)?;
+    for p in &doc.pages {
+        validate_positive("page.width_mm", p.width_mm)?;
+        validate_positive("page.height_mm", p.height_mm)?;
+    }
 
     let spreads = booklet_signature_order(doc.pages.len());
+    if spreads.len() > MAX_IMPOSITION_PAGES {
+        return Err(ProdError::InvalidParameter(format!(
+            "booklet imposition would produce {} spreads (exceeds cap {MAX_IMPOSITION_PAGES})",
+            spreads.len()
+        )));
+    }
     let half_w = sheet_w_mm * 0.5;
     let mut out = clone_document_shell(doc, format!("{} (Booklet)", doc.title));
 
@@ -1292,6 +1320,8 @@ fn impose_tiling(
     let mut page_grids: Vec<(usize, usize)> = Vec::with_capacity(doc.pages.len());
     let mut total_tiles = 0usize;
     for src_page in &doc.pages {
+        validate_positive("page.width_mm", src_page.width_mm)?;
+        validate_positive("page.height_mm", src_page.height_mm)?;
         let cols_f = if src_page.width_mm <= tile_w_mm + 1e-6 {
             1.0
         } else {
@@ -1581,7 +1611,13 @@ pub fn generate_print_marks(
     let page = get_page(doc, page_index)?;
     let w = page.width_mm;
     let h = page.height_mm;
-    let bleed = page.bleed_mm.max(0.0);
+    let bleed = if page.bleed_mm.is_finite() {
+        page.bleed_mm.max(0.0)
+    } else {
+        0.0
+    };
+    validate_positive("page.width_mm", w)?;
+    validate_positive("page.height_mm", h)?;
     let page_name = page.name.clone();
     let total_pages = doc.pages.len();
     let doc_title = doc.title.clone();

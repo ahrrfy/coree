@@ -1107,3 +1107,126 @@ fn regression_4_palette_nan_inf_rejection_and_clean_room_name() {
     let pal = coree_io::import_pal("\"Ink\" 50 0 0 0\n").unwrap();
     assert_eq!(pal.name, "Named CMYK Palette");
 }
+
+#[test]
+fn all_four_new_importers_roundtrip_end_to_end_via_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = build_all_features_document();
+
+    // 1. PDF & PDF-compatible `.ai` file round-trip
+    let pdf_path = dir.path().join("brochure.pdf");
+    let ai_path = dir.path().join("brochure.ai");
+    let pdf_opts = PdfExportOptions {
+        color_space: PdfColorSpace::DeviceCmyk,
+        compress_streams: true,
+        ..PdfExportOptions::default()
+    };
+    export_pdf(&doc, &pdf_opts, &pdf_path).unwrap();
+    std::fs::copy(&pdf_path, &ai_path).unwrap();
+
+    let imported_pdf = coree_io::import_pdf(&pdf_path).unwrap();
+    let imported_ai = coree_io::import_pdf(&ai_path).unwrap();
+    assert_eq!(imported_pdf.pages.len(), doc.pages.len());
+    assert_eq!(imported_ai.pages.len(), doc.pages.len());
+    assert!(!imported_pdf.objects.is_empty());
+    assert!(!imported_pdf.assets.is_empty());
+    assert_eq!(imported_pdf.metadata.source_format.as_deref(), Some("pdf"));
+
+    // 2. EPS file round-trip
+    let eps_path = dir.path().join("page1.eps");
+    export_eps(&doc, 0, &eps_path).unwrap();
+    let imported_eps = coree_io::import_eps(&eps_path).unwrap();
+    assert_eq!(imported_eps.pages.len(), 1);
+    assert!((imported_eps.pages[0].width_mm - 210.0).abs() < 0.2);
+    assert!((imported_eps.pages[0].height_mm - 297.0).abs() < 0.2);
+    assert!(!imported_eps.objects.is_empty());
+    assert_eq!(imported_eps.metadata.source_format.as_deref(), Some("eps"));
+
+    // 3. DXF file round-trip
+    let dxf_path = dir.path().join("cut.dxf");
+    export_dxf(&doc, 0, &dxf_path).unwrap();
+    let imported_dxf = coree_io::import_dxf(&dxf_path).unwrap();
+    assert_eq!(imported_dxf.pages.len(), 1);
+    assert!(imported_dxf.pages[0]
+        .layers
+        .iter()
+        .any(|l| l.name.eq_ignore_ascii_case("CutContour") && l.is_cut_layer));
+    assert!(!imported_dxf.objects.is_empty());
+    assert_eq!(imported_dxf.metadata.source_format.as_deref(), Some("dxf"));
+
+    // 4. HPGL `.plt` file round-trip
+    let plt_path = dir.path().join("cut.plt");
+    export_plt(&doc, 0, &plt_path).unwrap();
+    let imported_plt = coree_io::import_plt(&plt_path).unwrap();
+    assert_eq!(imported_plt.pages.len(), 1);
+    assert!(!imported_plt.objects.is_empty());
+    assert_eq!(imported_plt.metadata.source_format.as_deref(), Some("plt"));
+
+    // 5. Minimal valid PSD file import via disk path
+    let psd_path = dir.path().join("flat.psd");
+    let mut psd = Vec::new();
+    psd.extend_from_slice(b"8BPS");
+    psd.extend_from_slice(&1u16.to_be_bytes());
+    psd.extend_from_slice(&[0u8; 6]);
+    psd.extend_from_slice(&3u16.to_be_bytes()); // RGB
+    psd.extend_from_slice(&2u32.to_be_bytes()); // h=2
+    psd.extend_from_slice(&2u32.to_be_bytes()); // w=2
+    psd.extend_from_slice(&8u16.to_be_bytes()); // depth=8
+    psd.extend_from_slice(&3u16.to_be_bytes()); // RGB mode
+    psd.extend_from_slice(&0u32.to_be_bytes()); // color mode len
+    psd.extend_from_slice(&0u32.to_be_bytes()); // img resources len
+    psd.extend_from_slice(&0u32.to_be_bytes()); // layer/mask len
+    psd.extend_from_slice(&0u16.to_be_bytes()); // composite RAW
+    psd.extend_from_slice(&[255, 255, 255, 255]); // R
+    psd.extend_from_slice(&[128, 128, 128, 128]); // G
+    psd.extend_from_slice(&[64, 64, 64, 64]); // B
+    std::fs::write(&psd_path, &psd).unwrap();
+
+    let imported_psd = coree_io::import_psd(&psd_path).unwrap();
+    assert_eq!(imported_psd.pages.len(), 1);
+    assert_eq!(imported_psd.assets.len(), 1);
+    assert_eq!(imported_psd.metadata.source_format.as_deref(), Some("psd"));
+}
+
+#[test]
+fn optional_external_real_file_smoke_check() {
+    if let Ok(pdf_path) = std::env::var("COREE_VERIFY_PDF") {
+        let p = std::path::Path::new(&pdf_path);
+        let t0 = std::time::Instant::now();
+        let doc = coree_io::import_pdf(p).expect("real PDF must import cleanly");
+        let elapsed = t0.elapsed();
+        assert!(!doc.pages.is_empty());
+        assert!(!doc.objects.is_empty());
+        eprintln!(
+            "[VERIFY PDF] pages={} objects={} assets={} page0={:.2}x{:.2}mm mode={:?} elapsed={:.2?}",
+            doc.pages.len(),
+            doc.objects.len(),
+            doc.assets.len(),
+            doc.pages[0].width_mm,
+            doc.pages[0].height_mm,
+            doc.color_mode,
+            elapsed
+        );
+    }
+    if let Ok(psd_path) = std::env::var("COREE_VERIFY_PSD") {
+        let p = std::path::Path::new(&psd_path);
+        let t0 = std::time::Instant::now();
+        let doc = coree_io::import_psd(p).expect("real PSD must import cleanly");
+        let elapsed = t0.elapsed();
+        assert_eq!(doc.pages.len(), 1);
+        assert!(!doc.objects.is_empty());
+        assert!(!doc.assets.is_empty());
+        let total_rgba: usize = doc.assets.values().map(|a| a.rgba_bytes.len()).sum();
+        eprintln!(
+            "[VERIFY PSD] layers={} objects={} assets={} page={:.2}x{:.2}mm dpi={:.1} total_rgba={:.1}MiB elapsed={:.2?}",
+            doc.pages[0].layers.len(),
+            doc.objects.len(),
+            doc.assets.len(),
+            doc.pages[0].width_mm,
+            doc.pages[0].height_mm,
+            doc.dpi,
+            (total_rgba as f64) / (1024.0 * 1024.0),
+            elapsed
+        );
+    }
+}

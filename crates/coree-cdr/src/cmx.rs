@@ -345,10 +345,16 @@ fn parse_rlin(
         let Ok(join_b) = r.read_u8("rlin join") else {
             break;
         };
-        let Ok(dcount) = endian.read_u16(&mut r, "rlin dash_count") else {
+        let Ok(dcount_raw) = endian.read_u16(&mut r, "rlin dash_count") else {
             break;
         };
-        let dcount = usize::from(dcount).min(256);
+        let dcount = usize::from(dcount_raw);
+        if dcount > 256 || dcount.saturating_mul(4) > r.remaining() {
+            warnings.push(format!(
+                "truncated or excessive rlin dash_count {dcount}; stopping rlin parse"
+            ));
+            break;
+        }
         let mut dashes = Vec::with_capacity(dcount);
         for _ in 0..dcount {
             if let Ok(d) = endian.read_i32(&mut r, "rlin dash") {
@@ -720,6 +726,8 @@ fn parse_cmx_page_chunk(
                 let oid = doc.alloc_object_id();
                 let mut obj = SceneObject::new(oid, res.string(name_idx, "Text"), payload);
                 obj.transform = transform;
+                obj.fill = Fill::None;
+                obj.outline = OutlineStyle::none();
                 doc.objects.insert(oid, obj);
                 attach_object(
                     oid,
@@ -754,6 +762,8 @@ fn parse_cmx_page_chunk(
                         }),
                     );
                     obj.transform = transform;
+                    obj.fill = Fill::None;
+                    obj.outline = OutlineStyle::none();
                     doc.objects.insert(oid, obj);
                     attach_object(
                         oid,
@@ -812,6 +822,8 @@ fn finalize_group(grp: OpenGroup, doc: &mut Document) -> ObjectId {
     let gid = doc.alloc_object_id();
     let mut obj = SceneObject::new(gid, grp.name, NodePayload::Group(grp.children));
     obj.transform = grp.transform;
+    obj.fill = Fill::None;
+    obj.outline = OutlineStyle::none();
     doc.objects.insert(gid, obj);
     gid
 }

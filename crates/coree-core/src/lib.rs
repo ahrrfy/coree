@@ -14,6 +14,7 @@ pub mod document;
 pub mod effects;
 pub mod error;
 pub mod geometry;
+pub mod icc;
 pub mod ids;
 pub mod lens;
 pub mod math;
@@ -51,13 +52,19 @@ pub use geometry::{
     ArtisticWidthProfile, BasicShapeKind, BezierPath, CornerStyle, EllipseMode, ImpactStyle,
     LiveSketch, NodeKind, ParametricShape, PathNode, RecognizedShape, SmartDrawing, Subpath,
 };
+pub use icc::{
+    apply_soft_proof_rgba, convert_cmyk_to_rgb_icc, convert_rgb_between_builtin_profiles,
+    convert_rgb_to_cmyk_icc, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk, BuiltinIccProfile,
+    IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass, IccProfileHeader, IccTagEntry,
+    IccToneCurve, RenderingIntent, MAX_ICC_PROFILE_BYTES,
+};
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
 pub use math::{Affine2D, AffineDecomposed, Point2D, Rect2D, Unit, Vec2D};
 pub use selection::{NodeRef, NodeSelection, SelectionState, TransformMode};
 pub use style::{
     ArrowheadStyle, BlendMode, Fill, GradientStop, LineCap, LineJoin, MeshNode, ObjectStyle,
-    OutlineStyle, HAIRLINE_WIDTH_MM,
+    OutlineStyle, PostScriptFillPreset, HAIRLINE_WIDTH_MM,
 };
 pub use table::{TableCell, VectorTable};
 pub use text::{

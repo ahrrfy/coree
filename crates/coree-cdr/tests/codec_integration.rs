@@ -1714,3 +1714,1185 @@ fn regression_6_detect_format_truncation_and_vrsn_tmpt_consistency() {
         expected
     );
 }
+
+// =============================================================================
+// Clean-Room ZCF v23 (X6–2025) Indirect Pointer, Preview PNG & Audit Tests
+// =============================================================================
+
+fn zcf_inline_ptr(payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() <= 8);
+    let mut out = vec![0u8; 16];
+    out[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    out[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    out[8..8 + payload.len()].copy_from_slice(payload);
+    out
+}
+
+fn zcf_ext_ptr(file_idx: u32, blob: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
+    let off = blob.len() as u32;
+    let len = payload.len() as u32;
+    blob.extend_from_slice(payload);
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&file_idx.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&off.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
+}
+
+/// Builds an authentic 20-byte header ZCF `loda` chunk with reversed `types` table.
+fn build_zcf_loda(chunk_type: u32, args: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let n = args.len();
+    let args_off = 20usize;
+    let offsets_table_len = (n + 1) * 4;
+    let types_off = args_off + offsets_table_len;
+    let data_start = types_off + n * 4;
+
+    let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut payload_buf = Vec::new();
+    for (_, seg) in args {
+        offsets.push((data_start + payload_buf.len()) as u32);
+        payload_buf.extend_from_slice(seg);
+    }
+    let total_len = (data_start + payload_buf.len()) as u32;
+    offsets.push(total_len);
+
+    let mut out = Vec::with_capacity(total_len as usize);
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+    out.extend_from_slice(&(args_off as u32).to_le_bytes());
+    out.extend_from_slice(&(types_off as u32).to_le_bytes());
+    out.extend_from_slice(&chunk_type.to_le_bytes());
+    for o in offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+    // Authentic ZCF stores arg types in REVERSE order relative to offsets
+    for (typ, _) in args.iter().rev() {
+        out.extend_from_slice(&typ.to_le_bytes());
+    }
+    out.extend_from_slice(&payload_buf);
+    out
+}
+
+/// Builds an authentic 96-byte ZCF v16–26 `trfd` matrix chunk (`[v0, v1, x0, v3, v4, y0]`).
+fn build_zcf_trfd(v0: f64, v1: f64, x0_cdr: f64, v3: f64, v4: f64, y0_cdr: f64) -> Vec<u8> {
+    let mut out = vec![0u8; 96];
+    out[0..4].copy_from_slice(&96u32.to_le_bytes());
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..12].copy_from_slice(&16u32.to_le_bytes());
+    out[12..16].copy_from_slice(&0xFFFFu32.to_le_bytes());
+    out[16..20].copy_from_slice(&24u32.to_le_bytes());
+    out[20..24].copy_from_slice(&96u32.to_le_bytes());
+    out[24..28].copy_from_slice(&0x06CCu32.to_le_bytes());
+    out[28..32].copy_from_slice(&0x38u32.to_le_bytes());
+    out[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
+    for (i, val) in [v0, v1, x0_cdr, v3, v4, y0_cdr].iter().enumerate() {
+        let base = 40 + i * 8;
+        out[base..base + 8].copy_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
+/// Builds an authentic 213-byte ZCF v16–26 `outl` chunk.
+fn build_zcf_outl(id: u32, model: u16, ch: [u8; 4], line_type: u16, width_cdr: u32) -> Vec<u8> {
+    let mut out = vec![0u8; 213];
+    out[0..4].copy_from_slice(&id.to_le_bytes());
+    out[4..8].copy_from_slice(&3u32.to_le_bytes());
+    out[8..12].copy_from_slice(&4u32.to_le_bytes());
+    out[12..16].copy_from_slice(&45_000_000u32.to_le_bytes());
+    out[16..20].copy_from_slice(&2u32.to_le_bytes());
+    out[20..24].copy_from_slice(&43u32.to_le_bytes());
+    out[24] = 0x01;
+    out[25..29].copy_from_slice(&12u32.to_le_bytes());
+    out[29..31].copy_from_slice(&model.to_le_bytes());
+    out[31..33].copy_from_slice(&5u16.to_le_bytes());
+    out[37..41].copy_from_slice(&ch);
+    out[67..71].copy_from_slice(&1u32.to_le_bytes());
+    out[71..75].copy_from_slice(&130u32.to_le_bytes());
+    out[75..77].copy_from_slice(&line_type.to_le_bytes());
+    out[81..85].copy_from_slice(&width_cdr.to_le_bytes());
+    out[85..87].copy_from_slice(&100u16.to_le_bytes());
+    out
+}
+
+fn build_zcf_c9(json: &str) -> Vec<u8> {
+    let jb = json.as_bytes();
+    let mut out = Vec::with_capacity(8 + jb.len());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+    out.extend_from_slice(jb);
+    out
+}
+
+fn build_zcf_rect128(
+    w_cdr: f64,
+    h_cdr: f64,
+    sx: f64,
+    sy: f64,
+    corner_fracs: [f64; 4],
+    style: u32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; 128];
+    out[0..8].copy_from_slice(&w_cdr.to_le_bytes());
+    out[8..16].copy_from_slice(&h_cdr.to_le_bytes());
+    out[16..24].copy_from_slice(&sx.to_le_bytes());
+    out[24..32].copy_from_slice(&sy.to_le_bytes());
+    for (i, &frac) in corner_fracs.iter().enumerate() {
+        let base = 32 + i * 24;
+        out[base + 4..base + 8].copy_from_slice(&0x7FFFu32.to_le_bytes());
+        out[base + 8..base + 16].copy_from_slice(&frac.to_le_bytes());
+        out[base + 16..base + 20].copy_from_slice(&style.to_le_bytes());
+    }
+    out
+}
+
+fn build_zcf_v23_fixture_bytes() -> Vec<u8> {
+    use coree_cdr::coord::encode_utf16le;
+
+    let mut data1 = Vec::new();
+    let mut master_dat = Vec::new();
+    let mut page1_dat = Vec::new();
+    let mut page2_dat = Vec::new();
+    let mut page3_dat = Vec::new();
+
+    // `mcfg` (v23: 7944-byte style header with 210x297 mm A4 at offset 12..20)
+    let mut mcfg = vec![0u8; 128];
+    mcfg[0..4].copy_from_slice(&2100u32.to_le_bytes());
+    mcfg[4..8].copy_from_slice(&120u32.to_le_bytes());
+    mcfg[12..16].copy_from_slice(&2_100_000i32.to_le_bytes());
+    mcfg[16..20].copy_from_slice(&2_970_000i32.to_le_bytes());
+    let mcfg_ptr = zcf_ext_ptr(0, &mut data1, &mcfg);
+
+    // `fild` id=1 (None, 22 bytes)
+    let mut fild_none = vec![0u8; 22];
+    fild_none[0..4].copy_from_slice(&1u32.to_le_bytes());
+    fild_none[4..8].copy_from_slice(&0x0514u32.to_le_bytes());
+    fild_none[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let fild1_ptr = zcf_ext_ptr(0, &mut data1, &fild_none);
+
+    // `outl`: id=1 Red CMYK255 hairline, id=2 None (line_type=1), id=3 Black CMYK100 hairline
+    let outl1_ptr = zcf_ext_ptr(
+        0,
+        &mut data1,
+        &build_zcf_outl(1, 3, [0, 255, 255, 0], 2, 762),
+    );
+    let outl2_ptr = zcf_ext_ptr(0, &mut data1, &build_zcf_outl(2, 2, [0, 0, 0, 100], 1, 50));
+    let outl3_ptr = zcf_ext_ptr(0, &mut data1, &build_zcf_outl(3, 2, [0, 0, 0, 100], 2, 762));
+
+    // Master Page (flgs = 0x9001_0040 -> Master bit set, empty Guides layer)
+    let master_guides_loda = build_zcf_loda(0x0C, &[(0x03E8, encode_utf16le("Guides\0"))]);
+    let master_page = RiffNode::list(
+        *b"page",
+        vec![
+            RiffNode::chunk(*b"flgs", zcf_inline_ptr(&0x9001_0040u32.to_le_bytes())),
+            RiffNode::list(
+                *b"gobj",
+                vec![RiffNode::list(
+                    *b"layr",
+                    vec![
+                        RiffNode::chunk(*b"flgs", zcf_inline_ptr(&0x9801_000Au32.to_le_bytes())),
+                        RiffNode::list(
+                            *b"lgob",
+                            vec![RiffNode::chunk(
+                                *b"loda",
+                                zcf_ext_ptr(1, &mut master_dat, &master_guides_loda),
+                            )],
+                        ),
+                    ],
+                )],
+            ),
+        ],
+    );
+
+    // Page 1: Group (with large group trfd that MUST NOT double-apply) containing:
+    //  - Cubic Bezier curve (`ctype=0x03`) using authentic `0xC0` control points + Red hairline
+    //  - Horizontally flipped (`sx = -1.3387`) Chamfered Rectangle (`ctype=0x01`) 130x230 mm
+    //  - Plus an empty system layer (`Guides`, `ctype=0x0C`) that should be omitted cleanly
+    let mut curve_arg = Vec::new();
+    // 5 points: MoveTo(0,0), Ctrl(100000, 200000), Ctrl(300000, 200000), CurveTo(400000, 0), LineTo(0,0, closed)
+    curve_arg.extend_from_slice(&5u32.to_le_bytes());
+    for (x, y) in [
+        (0i32, 0i32),
+        (100_000, 200_000),
+        (300_000, 200_000),
+        (400_000, 0),
+        (0, 0),
+    ] {
+        curve_arg.extend_from_slice(&x.to_le_bytes());
+        curve_arg.extend_from_slice(&y.to_le_bytes());
+    }
+    curve_arg.extend_from_slice(&[0x0C, 0xC0, 0xC0, 0x84, 0x48]);
+
+    let p1_curve_loda = build_zcf_loda(
+        0x03,
+        &[
+            (
+                0x00C9,
+                build_zcf_c9(
+                    r#"{"fill":{"primaryColor":"CMYK,USER,0,0,0,100,100,0000"},"outline":{"width":"762","color":"CMYK255,USER,0,255,255,0,100,0000"}}"#,
+                ),
+            ),
+            (0x001E, curve_arg),
+            (0x0014, 1u32.to_le_bytes().to_vec()),
+            (0x000A, 1u32.to_le_bytes().to_vec()),
+        ],
+    );
+    let p1_curve_trfd = build_zcf_trfd(1.0, 0.0, -200_000.0, 0.0, 1.0, -100_000.0);
+
+    // Horizontally flipped chamfered rect: 130x230 mm centered at (-0.07, -0.01) mm -> [39.93..169.93] x [33.51..263.51]
+    let p1_rect_arg = build_zcf_rect128(
+        971_099.0,
+        1_873_245.0,
+        -1.3386942,
+        1.2278159,
+        [0.0, 35.0 / 65.0, 0.0, 0.0],
+        2,
+    );
+    let p1_rect_loda = build_zcf_loda(
+        0x01,
+        &[
+            (0x001E, p1_rect_arg),
+            (0x0014, 1u32.to_le_bytes().to_vec()),
+            (0x000A, 3u32.to_le_bytes().to_vec()),
+        ],
+    );
+    let p1_rect_trfd = build_zcf_trfd(-1.3386942, 0.0, 649_287.0, 0.0, 1.2278159, -1_150_053.0);
+
+    let p1_grp_loda = build_zcf_loda(0x00, &[(0x00C9, build_zcf_c9("{}"))]);
+    let p1_grp_trfd = build_zcf_trfd(1.0, 0.0, 5_000_000.0, 0.0, 1.0, 2_000_000.0);
+    let p1_layr_loda = build_zcf_loda(0x00, &[(0x03E8, encode_utf16le("Layer 1\0"))]);
+    let p1_guides_loda = build_zcf_loda(0x0C, &[(0x03E8, encode_utf16le("Guides\0"))]);
+
+    let page1 = RiffNode::list(
+        *b"page",
+        vec![
+            RiffNode::chunk(*b"flgs", zcf_inline_ptr(&0x9000_0040u32.to_le_bytes())),
+            RiffNode::list(
+                *b"gobj",
+                vec![
+                    RiffNode::list(
+                        *b"layr",
+                        vec![RiffNode::list(
+                            *b"lgob",
+                            vec![RiffNode::chunk(
+                                *b"loda",
+                                zcf_ext_ptr(2, &mut page1_dat, &p1_guides_loda),
+                            )],
+                        )],
+                    ),
+                    RiffNode::list(
+                        *b"layr",
+                        vec![
+                            RiffNode::chunk(
+                                *b"flgs",
+                                zcf_inline_ptr(&0x9800_0040u32.to_le_bytes()),
+                            ),
+                            RiffNode::list(
+                                *b"lgob",
+                                vec![RiffNode::chunk(
+                                    *b"loda",
+                                    zcf_ext_ptr(2, &mut page1_dat, &p1_layr_loda),
+                                )],
+                            ),
+                            RiffNode::list(
+                                *b"grp ",
+                                vec![
+                                    RiffNode::list(
+                                        *b"lgob",
+                                        vec![
+                                            RiffNode::chunk(
+                                                *b"loda",
+                                                zcf_ext_ptr(2, &mut page1_dat, &p1_grp_loda),
+                                            ),
+                                            RiffNode::list(
+                                                *b"trfl",
+                                                vec![RiffNode::chunk(
+                                                    *b"trfd",
+                                                    zcf_ext_ptr(2, &mut page1_dat, &p1_grp_trfd),
+                                                )],
+                                            ),
+                                        ],
+                                    ),
+                                    RiffNode::list(
+                                        *b"obj ",
+                                        vec![RiffNode::list(
+                                            *b"lgob",
+                                            vec![
+                                                RiffNode::chunk(
+                                                    *b"loda",
+                                                    zcf_ext_ptr(2, &mut page1_dat, &p1_curve_loda),
+                                                ),
+                                                RiffNode::list(
+                                                    *b"trfl",
+                                                    vec![RiffNode::chunk(
+                                                        *b"trfd",
+                                                        zcf_ext_ptr(
+                                                            2,
+                                                            &mut page1_dat,
+                                                            &p1_curve_trfd,
+                                                        ),
+                                                    )],
+                                                ),
+                                            ],
+                                        )],
+                                    ),
+                                    RiffNode::list(
+                                        *b"obj ",
+                                        vec![RiffNode::list(
+                                            *b"lgob",
+                                            vec![
+                                                RiffNode::chunk(
+                                                    *b"loda",
+                                                    zcf_ext_ptr(2, &mut page1_dat, &p1_rect_loda),
+                                                ),
+                                                RiffNode::list(
+                                                    *b"trfl",
+                                                    vec![RiffNode::chunk(
+                                                        *b"trfd",
+                                                        zcf_ext_ptr(
+                                                            2,
+                                                            &mut page1_dat,
+                                                            &p1_rect_trfd,
+                                                        ),
+                                                    )],
+                                                ),
+                                            ],
+                                        )],
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    );
+
+    // Page 2: Unflipped Chamfered Rectangle (TR chamfer = 35mm, 130x190 mm) + Solid-filled Ellipse
+    let p2_rect_arg = build_zcf_rect128(
+        971_099.0,
+        1_873_245.0,
+        1.3386942,
+        1.0142827,
+        [0.0, 35.0 / 65.0, 0.0, 0.0],
+        2,
+    );
+    let p2_rect_loda = build_zcf_loda(
+        0x01,
+        &[
+            (0x001E, p2_rect_arg),
+            (0x0014, 1u32.to_le_bytes().to_vec()),
+            (0x000A, 3u32.to_le_bytes().to_vec()),
+        ],
+    );
+    let p2_rect_trfd = build_zcf_trfd(1.3386942, 0.0, -650_713.0, 0.0, 1.0142827, -950_053.0);
+
+    let mut ell_arg = Vec::new();
+    ell_arg.extend_from_slice(&400_000i32.to_le_bytes()); // w = 40mm -> rx = 20mm
+    ell_arg.extend_from_slice(&200_000i32.to_le_bytes()); // h = 20mm -> ry = 10mm
+    ell_arg.extend_from_slice(&0i32.to_le_bytes());
+    ell_arg.extend_from_slice(&0i32.to_le_bytes());
+    ell_arg.extend_from_slice(&0u32.to_le_bytes());
+    let p2_ell_loda = build_zcf_loda(
+        0x02,
+        &[
+            (
+                0x00C9,
+                build_zcf_c9(
+                    r#"{"fill":{"type":"1","primaryColor":"CMYK,USER,0,0,100,0,100,0000"},"outline":{"width":"762","color":"CMYK,USER,0,0,0,100,100,0000"}}"#,
+                ),
+            ),
+            (0x001E, ell_arg),
+            (0x0014, 1u32.to_le_bytes().to_vec()),
+            (0x000A, 2u32.to_le_bytes().to_vec()), // explicit none outl id=2 -> stays none!
+        ],
+    );
+    let p2_ell_trfd = build_zcf_trfd(1.0, 0.0, -200_000.0, 0.0, 1.0, -100_000.0);
+    let p2_layr_loda = build_zcf_loda(0x00, &[(0x03E8, encode_utf16le("Layer 1\0"))]);
+
+    let page2 = RiffNode::list(
+        *b"page",
+        vec![
+            RiffNode::chunk(*b"flgs", zcf_inline_ptr(&0x9000_0040u32.to_le_bytes())),
+            RiffNode::list(
+                *b"gobj",
+                vec![RiffNode::list(
+                    *b"layr",
+                    vec![
+                        RiffNode::list(
+                            *b"lgob",
+                            vec![RiffNode::chunk(
+                                *b"loda",
+                                zcf_ext_ptr(3, &mut page2_dat, &p2_layr_loda),
+                            )],
+                        ),
+                        RiffNode::list(
+                            *b"obj ",
+                            vec![RiffNode::list(
+                                *b"lgob",
+                                vec![
+                                    RiffNode::chunk(
+                                        *b"loda",
+                                        zcf_ext_ptr(3, &mut page2_dat, &p2_rect_loda),
+                                    ),
+                                    RiffNode::list(
+                                        *b"trfl",
+                                        vec![RiffNode::chunk(
+                                            *b"trfd",
+                                            zcf_ext_ptr(3, &mut page2_dat, &p2_rect_trfd),
+                                        )],
+                                    ),
+                                ],
+                            )],
+                        ),
+                        RiffNode::list(
+                            *b"obj ",
+                            vec![RiffNode::list(
+                                *b"lgob",
+                                vec![
+                                    RiffNode::chunk(
+                                        *b"loda",
+                                        zcf_ext_ptr(3, &mut page2_dat, &p2_ell_loda),
+                                    ),
+                                    RiffNode::list(
+                                        *b"trfl",
+                                        vec![RiffNode::chunk(
+                                            *b"trfd",
+                                            zcf_ext_ptr(3, &mut page2_dat, &p2_ell_trfd),
+                                        )],
+                                    ),
+                                ],
+                            )],
+                        ),
+                    ],
+                )],
+            ),
+        ],
+    );
+
+    // Page 3: Arabic UTF-16LE Artistic Text (`ctype=0x06` + real `txsm`)
+    let arabic = "شكر وعرفان";
+    let arabic_u16 = encode_utf16le(arabic);
+    let mut txsm = Vec::new();
+    txsm.extend_from_slice(&0u32.to_le_bytes()); // frame flag
+    txsm.extend_from_slice(&42u32.to_le_bytes()); // text_id
+    txsm.extend_from_slice(&1u32.to_le_bytes()); // encoding = 1 (UTF-16LE)
+    txsm.extend_from_slice(&((arabic_u16.len() / 2) as u32).to_le_bytes());
+    txsm.extend_from_slice(&arabic_u16);
+    let p3_txt_loda = build_zcf_loda(0x06, &[(0x001E, 42u32.to_le_bytes().to_vec())]);
+    let p3_txt_trfd = build_zcf_trfd(1.0, 0.0, 0.0, 0.0, 1.0, 500_000.0);
+    let p3_layr_loda = build_zcf_loda(0x00, &[(0x03E8, encode_utf16le("Layer 1\0"))]);
+
+    let page3 = RiffNode::list(
+        *b"page",
+        vec![
+            RiffNode::chunk(*b"flgs", zcf_inline_ptr(&0x9000_0040u32.to_le_bytes())),
+            RiffNode::list(
+                *b"gobj",
+                vec![RiffNode::list(
+                    *b"layr",
+                    vec![
+                        RiffNode::list(
+                            *b"lgob",
+                            vec![RiffNode::chunk(
+                                *b"loda",
+                                zcf_ext_ptr(4, &mut page3_dat, &p3_layr_loda),
+                            )],
+                        ),
+                        RiffNode::list(
+                            *b"obj ",
+                            vec![RiffNode::list(
+                                *b"lgob",
+                                vec![
+                                    RiffNode::chunk(
+                                        *b"loda",
+                                        zcf_ext_ptr(4, &mut page3_dat, &p3_txt_loda),
+                                    ),
+                                    RiffNode::chunk(
+                                        *b"txsm",
+                                        zcf_ext_ptr(4, &mut page3_dat, &txsm),
+                                    ),
+                                    RiffNode::list(
+                                        *b"trfl",
+                                        vec![RiffNode::chunk(
+                                            *b"trfd",
+                                            zcf_ext_ptr(4, &mut page3_dat, &p3_txt_trfd),
+                                        )],
+                                    ),
+                                ],
+                            )],
+                        ),
+                    ],
+                )],
+            ),
+        ],
+    );
+
+    let root_doc = RiffDocument::new(
+        *b"CDRO",
+        vec![
+            RiffNode::chunk(
+                *b"fver",
+                zcf_inline_ptr(&[0xFC, 0x08, 0x01, 0x00, 0x00, 0x00, 0x17, 0x00]),
+            ),
+            RiffNode::chunk(*b"vrsn", zcf_inline_ptr(&2300u16.to_le_bytes())),
+            RiffNode::list(
+                *b"doc ",
+                vec![
+                    RiffNode::chunk(*b"mcfg", mcfg_ptr),
+                    RiffNode::list(*b"filt", vec![RiffNode::chunk(*b"fild", fild1_ptr)]),
+                    RiffNode::list(
+                        *b"otlt",
+                        vec![
+                            RiffNode::chunk(*b"outl", outl1_ptr),
+                            RiffNode::chunk(*b"outl", outl2_ptr),
+                            RiffNode::chunk(*b"outl", outl3_ptr),
+                        ],
+                    ),
+                ],
+            ),
+            master_page,
+            page1,
+            page2,
+            page3,
+        ],
+    );
+    let root_bytes = write_riff(&root_doc).unwrap();
+
+    // Build minimal valid 2x2 PNG via `extract_cdr_preview_png` round-trip fixture
+    let bmp_2x2 = coree_cdr::cdr_riff::encode_bmp_file_rgba(2, 2, &[220u8; 16]).unwrap();
+    let mut temp_zip = Cursor::new(Vec::new());
+    {
+        let mut zw = ZipWriter::new(&mut temp_zip);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("preview/thumbnail.bmp", opts).unwrap();
+        zw.write_all(&bmp_2x2).unwrap();
+        zw.finish().unwrap();
+    }
+    let thumb_png =
+        coree_cdr::extract_cdr_preview_png(&temp_zip.into_inner(), &CodecLimits::default())
+            .unwrap()
+            .unwrap();
+
+    let mut cur = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cur);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/x-vnd.corel.zcf.draw.document+zip")
+            .unwrap();
+        zip.start_file("content/dataFileList.dat", deflated)
+            .unwrap();
+        zip.write_all(b"data1.dat\nmasterPage.dat\npage1.dat\npage2.dat\npage3.dat")
+            .unwrap();
+        zip.start_file("content/root.dat", deflated).unwrap();
+        zip.write_all(&root_bytes).unwrap();
+        zip.start_file("content/data/data1.dat", deflated).unwrap();
+        zip.write_all(&data1).unwrap();
+        zip.start_file("content/data/masterPage.dat", deflated)
+            .unwrap();
+        zip.write_all(&master_dat).unwrap();
+        zip.start_file("content/data/page1.dat", deflated).unwrap();
+        zip.write_all(&page1_dat).unwrap();
+        zip.start_file("content/data/page2.dat", deflated).unwrap();
+        zip.write_all(&page2_dat).unwrap();
+        zip.start_file("content/data/page3.dat", deflated).unwrap();
+        zip.write_all(&page3_dat).unwrap();
+
+        zip.start_file("color/docPalette.xml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><palette name="Document Palette"><colors><page><color cs="CMYK" name="Black" tints="0,0,0,1"/><color cs="CMYK" name="Red" tints="0,1,1,0"/><color cs="CMYK" name="Dark Brown" tints="0,0.2,0.2,0.6"/><color cs="CMYK" name="White" tints="0,0,0,0"/><color cs="CMYK" name="Yellow" tints="0,0,1,0"/></page></colors></palette>"#,
+        )
+        .unwrap();
+        zip.start_file("color/color.xml", deflated).unwrap();
+        zip.write_all(b"<Color><ColorContext><ColorModel>Cmyk</ColorModel></ColorContext></Color>")
+            .unwrap();
+        zip.start_file("styles/document.cdss", deflated).unwrap();
+        zip.write_all(
+            br#"{"version":2300,"style":{"~graphic~":{"fill":{"primaryColor":"CMYK,USER,0,0,0,100,100,0000"},"outline":{"width":"762","color":"CMYK,USER,0,0,0,100,100,0000"}},"~artistic~":{"character":{"fill":{"type":"1","primaryColor":"CMYK,USER,0,0,0,100,100,0000"},"RTL":{"font":"Noto Naskh Arabic","size":"84667","charset":"178"}}}}}"#,
+        )
+        .unwrap();
+        zip.start_file("META-INF/textinfo.xml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><x:xmpmeta><rdf:RDF><rdf:Description><LayerNames><rdf:Bag><rdf:li>Layer 1</rdf:li></rdf:Bag></LayerNames></rdf:Description></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+        zip.start_file("META-INF/metadata.xml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><x:xmpmeta><rdf:RDF><rdf:Description><cdr:CoreVersion>2300</cdr:CoreVersion><cdrinfo:PageWidth>2100000</cdrinfo:PageWidth><cdrinfo:PageHeight>2970000</cdrinfo:PageHeight></rdf:Description></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+        zip.start_file("previews/thumbnail.png", stored).unwrap();
+        zip.write_all(&thumb_png).unwrap();
+        zip.finish().unwrap();
+    }
+    cur.into_inner()
+}
+
+#[test]
+fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
+    use coree_cdr::cdr_zip::{parse_cdr_zip, CdrZipEra};
+    use coree_cdr::detect_format;
+    use coree_core::Affine2D;
+
+    let bytes = build_zcf_v23_fixture_bytes();
+    assert_eq!(detect_format(&bytes).unwrap(), CorelFormat::CdrZipX6);
+
+    let parsed = parse_cdr_zip(&bytes, &CodecLimits::default()).unwrap();
+    assert_eq!(parsed.era, CdrZipEra::X6);
+    assert_eq!(parsed.version, 2300);
+    assert!(!parsed.is_template);
+    assert!(
+        parsed.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        parsed.warnings
+    );
+
+    let doc = &parsed.document;
+    assert_eq!(doc.color_mode, ColorMode::Cmyk);
+    // 3 real pages (Master Page excluded cleanly!), 1 user layer each (`Guides` omitted)
+    assert_eq!(doc.pages.len(), 3);
+    for p in &doc.pages {
+        assert!((p.width_mm - 210.0).abs() < 0.01);
+        assert!((p.height_mm - 297.0).abs() < 0.01);
+        assert_eq!(p.layers.len(), 1);
+        assert_eq!(p.layers[0].name, "Layer 1");
+    }
+
+    // Document palette: 5 authentic CMYK swatches
+    let pal_names: Vec<&str> = doc
+        .document_palette
+        .swatches
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        pal_names,
+        vec!["Black", "Red", "Dark Brown", "White", "Yellow"]
+    );
+
+    // Page 1: Group has IDENTITY transform (not double-applied!), 2 children (cubic curve + flipped chamfered rect)
+    assert_eq!(doc.pages[0].layers[0].objects.len(), 1);
+    let grp = &doc.objects[&doc.pages[0].layers[0].objects[0]];
+    assert_eq!(grp.transform, Affine2D::IDENTITY);
+    assert!(!grp.outline.is_visible());
+    let NodePayload::Group(ref children) = grp.payload else {
+        panic!("expected Group on Page 1");
+    };
+    assert_eq!(children.len(), 2);
+
+    // P1 Child 0: Curve with authentic 0xC0 cubic Bezier control handles preserved + Red CMYK hairline + no fill
+    let p1_curve = &doc.objects[&children[0]];
+    assert_eq!(p1_curve.fill, Fill::None);
+    assert!(p1_curve.outline.is_visible());
+    assert!((p1_curve.outline.width_mm - 0.0762).abs() < 1e-4);
+    assert_eq!(p1_curve.outline.color, Color::cmyk(0.0, 1.0, 1.0, 0.0));
+    let NodePayload::Path(ref path) = p1_curve.payload else {
+        panic!("expected Path");
+    };
+    assert_eq!(path.subpaths.len(), 1);
+    assert!(path.subpaths[0].closed);
+    // Verify BOTH cubic Bezier handles (from 0xC0 flags) survived!
+    assert!(path.subpaths[0].nodes[0].handle_out.is_some());
+    assert!(path.subpaths[0].nodes[1].handle_in.is_some());
+    let cbb = path.bounding_box().unwrap();
+    assert!(cbb.min_x >= 0.0 && cbb.max_x <= 210.0 && cbb.min_y >= 0.0 && cbb.max_y <= 297.0);
+
+    // P1 Child 1: Horizontally flipped Chamfered Rectangle -> Top-Left chamfer = 35mm!
+    let p1_rect = &doc.objects[&children[1]];
+    assert_eq!(p1_rect.outline.color, Color::cmyk(0.0, 0.0, 0.0, 1.0));
+    let NodePayload::Shape(ParametricShape::Rectangle {
+        width,
+        height,
+        corner_radii,
+        corner_style,
+        ..
+    }) = p1_rect.payload
+    else {
+        panic!("expected Rectangle on P1");
+    };
+    assert!((width - 130.0).abs() < 0.05);
+    assert!((height - 230.0).abs() < 0.05);
+    assert_eq!(corner_style, CornerStyle::Chamfered);
+    assert!(
+        (corner_radii[0] - 35.0).abs() < 0.05,
+        "TL chamfer expected: {corner_radii:?}"
+    );
+    assert!(corner_radii[1].abs() < 1e-3);
+
+    // Page 2: Unflipped Chamfered Rectangle (TR chamfer = 35mm) + Solid-Yellow Ellipse (explicit none outline)
+    assert_eq!(doc.pages[1].layers[0].objects.len(), 2);
+    let p2_rect = &doc.objects[&doc.pages[1].layers[0].objects[0]];
+    if let NodePayload::Shape(ParametricShape::Rectangle {
+        width,
+        height,
+        corner_radii,
+        corner_style,
+        ..
+    }) = p2_rect.payload
+    {
+        assert!((width - 130.0).abs() < 0.05);
+        assert!((height - 190.0).abs() < 0.05);
+        assert_eq!(corner_style, CornerStyle::Chamfered);
+        assert!(corner_radii[0].abs() < 1e-3);
+        assert!(
+            (corner_radii[1] - 35.0).abs() < 0.05,
+            "TR chamfer expected: {corner_radii:?}"
+        );
+    } else {
+        panic!("expected Rectangle on P2");
+    }
+    let p2_ell = &doc.objects[&doc.pages[1].layers[0].objects[1]];
+    assert_eq!(p2_ell.fill, Fill::Solid(Color::YELLOW));
+    assert!(
+        !p2_ell.outline.is_visible(),
+        "explicit none outline id=2 must stay invisible"
+    );
+    assert!(matches!(
+        p2_ell.payload,
+        NodePayload::Shape(ParametricShape::Ellipse { rx, ry, .. })
+            if (rx - 20.0).abs() < 0.05 && (ry - 10.0).abs() < 0.05
+    ));
+
+    // Page 3: Arabic UTF-16LE Artistic Text inheriting `~artistic~` CDSS defaults
+    assert_eq!(doc.pages[2].layers[0].objects.len(), 1);
+    let p3_txt = &doc.objects[&doc.pages[2].layers[0].objects[0]];
+    let NodePayload::ArtisticText(ref at) = p3_txt.payload else {
+        panic!("expected ArtisticText on Page 3");
+    };
+    assert_eq!(at.plain_text(), "شكر وعرفان");
+    assert_eq!(at.runs[0].style.direction, TextDirection::Rtl);
+    assert_eq!(at.runs[0].style.font_family, "Noto Naskh Arabic");
+
+    // Structural Inspector matches resolved ZCF metadata
+    let rep = inspect_corel_bytes(&bytes).unwrap();
+    assert_eq!(rep.version_number, Some(2300));
+    assert_eq!(rep.page_count, 3);
+    assert_eq!(rep.layer_count, 3);
+    assert_eq!(rep.object_count, 6); // 1 group + 2 P1 + 2 P2 + 1 P3
+    assert_eq!(rep.color_models, vec!["CMYK"]);
+    assert!(rep.warnings.is_empty());
+}
+
+#[test]
+fn extract_cdr_preview_png_all_containers_and_security() {
+    use coree_cdr::extract_cdr_preview_png;
+
+    let limits = CodecLimits::default();
+
+    // 1. ZCF ZIP with `previews/thumbnail.png`
+    let zcf_bytes = build_zcf_v23_fixture_bytes();
+    let png1 = extract_cdr_preview_png(&zcf_bytes, &limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&png1[0..8], b"\x89PNG\r\n\x1a\n");
+
+    // 2. Synthetic ZIP X6 with `preview/thumbnail.bmp` -> decoded & encoded to PNG
+    let x6_bytes = sample_cdr_zip_x6_bytes();
+    let png2 = extract_cdr_preview_png(&x6_bytes, &limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&png2[0..8], b"\x89PNG\r\n\x1a\n");
+
+    // 3. Classic RIFF CDR v12 with `DISP` DIB -> PNG
+    let riff_bytes = sample_cdr_riff_v12_bytes();
+    let png3 = extract_cdr_preview_png(&riff_bytes, &limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&png3[0..8], b"\x89PNG\r\n\x1a\n");
+
+    // 4. Classic RIFF with 4-byte `CF_DIB` (`8u32`) prefix in `DISP` -> PNG
+    let raw_dib = coree_cdr::cdr_riff::encode_dib_rgba(2, 2, &[100u8; 16]).unwrap();
+    let mut cf_disp = Vec::with_capacity(4 + raw_dib.len());
+    cf_disp.extend_from_slice(&8u32.to_le_bytes());
+    cf_disp.extend_from_slice(&raw_dib);
+    let cf_riff = write_riff(&RiffDocument::new(
+        *b"CDRC",
+        vec![
+            RiffNode::chunk(*b"vrsn", 1200u16.to_le_bytes().to_vec()),
+            RiffNode::chunk(*b"DISP", cf_disp),
+        ],
+    ))
+    .unwrap();
+    let png4 = extract_cdr_preview_png(&cf_riff, &limits).unwrap().unwrap();
+    assert_eq!(&png4[0..8], b"\x89PNG\r\n\x1a\n");
+
+    // 5. Security: PNG inside ZIP with oversized IHDR width > max_bitmap_dim must be rejected!
+    let mut bad_png = png1.clone();
+    bad_png[16..20].copy_from_slice(&(limits.max_bitmap_dim + 100).to_be_bytes());
+    let mut bad_zip = Cursor::new(Vec::new());
+    {
+        let mut zw = ZipWriter::new(&mut bad_zip);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("previews/thumbnail.png", opts).unwrap();
+        zw.write_all(&bad_png).unwrap();
+        zw.finish().unwrap();
+    }
+    let err = extract_cdr_preview_png(&bad_zip.into_inner(), &limits).unwrap_err();
+    assert!(matches!(err, CdrError::InvalidBitmapDimensions { .. }));
+}
+
+#[test]
+fn audit_fixes_group_outline_none_cpt_rifx_and_cmx_rlin_guard() {
+    use coree_cdr::cpt::parse_cpt_bytes;
+
+    // 1. Groups in CDR and CMX must carry OutlineStyle::none() (no phantom default stroke)
+    let doc = generate_sample_document();
+    for bytes in [
+        export_cdr_bytes(&doc, CdrWriteVersion::RiffV12).unwrap(),
+        export_cmx_bytes(&doc, CmxPrecision::Bit32).unwrap(),
+    ] {
+        let rep = import_corel_bytes(&bytes).unwrap();
+        for obj in rep.document.objects.values() {
+            if matches!(obj.payload, NodePayload::Group(_)) {
+                assert!(
+                    !obj.outline.is_visible(),
+                    "Group should have no default outline"
+                );
+            }
+        }
+    }
+
+    // 2. Big-endian `RIFX CPT ` parses cleanly with OutlineStyle::none() on raster layers
+    let mut head = Vec::new();
+    head.extend_from_slice(&2u32.to_be_bytes()); // w
+    head.extend_from_slice(&2u32.to_be_bytes()); // h
+    head.extend_from_slice(&2u16.to_be_bytes()); // Rgba32
+    head.extend_from_slice(&300.0f32.to_be_bytes());
+    head.extend_from_slice(&300.0f32.to_be_bytes());
+    head.extend_from_slice(&0u16.to_be_bytes());
+
+    let mut info = Vec::new();
+    info.extend_from_slice(&0u16.to_be_bytes()); // name len
+    info.extend_from_slice(&0i32.to_be_bytes());
+    info.extend_from_slice(&0i32.to_be_bytes());
+    info.extend_from_slice(&2u32.to_be_bytes());
+    info.extend_from_slice(&2u32.to_be_bytes());
+    info.push(255); // opacity
+    info.push(0); // blend
+    info.push(0x01); // visible
+    info.extend_from_slice(&2u16.to_be_bytes()); // Rgba32
+
+    let mut pxls = vec![0u8]; // Raw compression
+    pxls.extend_from_slice(&[200u8; 16]);
+
+    let rifx_cpt = write_riff(&RiffDocument {
+        endian: RiffEndian::Big,
+        form_type: *b"CPT ",
+        children: vec![
+            RiffNode::chunk(*b"head", head),
+            RiffNode::list(
+                *b"layr",
+                vec![
+                    RiffNode::chunk(*b"info", info),
+                    RiffNode::chunk(*b"pxls", pxls),
+                ],
+            ),
+        ],
+    })
+    .unwrap();
+    let parsed_cpt = parse_cpt_bytes(&rifx_cpt, &CodecLimits::default()).unwrap();
+    assert_eq!(parsed_cpt.document.objects.len(), 1);
+    let raster_obj = parsed_cpt.document.objects.values().next().unwrap();
+    assert!(!raster_obj.outline.is_visible());
+
+    // 3. CMX `rlin` with bogus dash_count = 500 stops cleanly with warning and zero panics
+    let mut bad_rlin = Vec::new();
+    bad_rlin.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+    bad_rlin.push(0); // cap
+    bad_rlin.push(0); // join
+    bad_rlin.extend_from_slice(&500u16.to_le_bytes()); // invalid dash_count > 256
+    let bad_cmx = write_riff(&RiffDocument::new(
+        *b"CMX2",
+        vec![RiffNode::chunk(*b"rlin", bad_rlin)],
+    ))
+    .unwrap();
+    let cmx_rep = import_corel_bytes(&bad_cmx).unwrap();
+    assert!(cmx_rep
+        .warnings
+        .iter()
+        .any(|w| w.contains("rlin dash_count")));
+}
+
+#[test]
+fn regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape() {
+    use coree_cdr::zcf::{parse_c9_style_override, parse_textinfo_xml};
+
+    // 7a. [S1] Extreme finite `trfd` (`1.5e308`) + zero-size legacy rect (`0x0`) AND chained
+    // overflowing `trfd` transforms + ellipse division must NEVER panic or emit NaN/Inf!
+    let huge_trfd = build_zcf_trfd(1.5e308, 1.5e308, 1.5e308, 1.5e308, 1.5e308, 1.5e308);
+    let zero_rect_loda = build_zcf_loda(0x01, &[(0x001E, vec![0u8; 8])]);
+    let ell_arg = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&200_000i32.to_le_bytes());
+        v.extend_from_slice(&100_000i32.to_le_bytes());
+        v
+    };
+    let huge_ell_loda = build_zcf_loda(0x02, &[(0x001E, ell_arg)]);
+
+    // Chained 2-arg trfd whose matrix product overflows to Inf/NaN
+    let mut chained_trfd = vec![0u8; 20 + 8 + 72 * 2];
+    let c_len = chained_trfd.len() as u32;
+    chained_trfd[0..4].copy_from_slice(&c_len.to_le_bytes());
+    chained_trfd[4..8].copy_from_slice(&2u32.to_le_bytes());
+    chained_trfd[8..12].copy_from_slice(&16u32.to_le_bytes());
+    chained_trfd[16..20].copy_from_slice(&28u32.to_le_bytes());
+    chained_trfd[20..24].copy_from_slice(&100u32.to_le_bytes());
+    for base in [28usize, 100usize] {
+        chained_trfd[base + 8..base + 10].copy_from_slice(&0x0008u16.to_le_bytes());
+        for i in 0..6 {
+            let p = base + 16 + i * 8;
+            chained_trfd[p..p + 8].copy_from_slice(&1.0e200_f64.to_le_bytes());
+        }
+    }
+
+    let overflow_doc = RiffDocument::new(
+        *b"CDRO",
+        vec![
+            RiffNode::chunk(*b"vrsn", 2300u16.to_le_bytes().to_vec()),
+            RiffNode::list(*b"doc ", Vec::new()),
+            RiffNode::list(
+                *b"page",
+                vec![RiffNode::list(
+                    *b"gobj",
+                    vec![RiffNode::list(
+                        *b"layr",
+                        vec![
+                            RiffNode::list(
+                                *b"obj ",
+                                vec![RiffNode::list(
+                                    *b"lgob",
+                                    vec![
+                                        RiffNode::chunk(*b"loda", zero_rect_loda),
+                                        RiffNode::list(
+                                            *b"trfl",
+                                            vec![RiffNode::chunk(*b"trfd", huge_trfd)],
+                                        ),
+                                    ],
+                                )],
+                            ),
+                            RiffNode::list(
+                                *b"obj ",
+                                vec![RiffNode::list(
+                                    *b"lgob",
+                                    vec![
+                                        RiffNode::chunk(*b"loda", huge_ell_loda),
+                                        RiffNode::list(
+                                            *b"trfl",
+                                            vec![RiffNode::chunk(*b"trfd", chained_trfd)],
+                                        ),
+                                    ],
+                                )],
+                            ),
+                        ],
+                    )],
+                )],
+            ),
+        ],
+    );
+    let overflow_bytes = write_riff(&overflow_doc).unwrap();
+    let rep = import_corel_bytes(&overflow_bytes).unwrap();
+    assert_eq!(rep.document.objects.len(), 2);
+    for obj in rep.document.objects.values() {
+        assert!(
+            obj.transform.is_finite(),
+            "transform must stay finite: {:?}",
+            obj.transform
+        );
+        match &obj.payload {
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width,
+                height,
+                corner_radii,
+                ..
+            }) => {
+                assert!(width.is_finite() && height.is_finite());
+                assert!(corner_radii.iter().all(|r| r.is_finite()));
+            }
+            NodePayload::Shape(ParametricShape::Ellipse { rx, ry, .. }) => {
+                assert!(rx.is_finite() && ry.is_finite());
+            }
+            _ => {}
+        }
+    }
+
+    // 7b. [S1] Overlapping/decreasing `loda` arg offsets (both synthetic & authentic ZCF)
+    // must be rejected cleanly with zero amplification!
+    // Synthetic decreasing offsets: 64 entries pointing back to offset 12
+    let mut syn_amp = Vec::new();
+    let num_args = 64u32;
+    let fake_curve = vec![0u8; 64];
+    let args_off = 12 + fake_curve.len() as u32;
+    let types_off = args_off + num_args * 4;
+    syn_amp.extend_from_slice(&num_args.to_le_bytes());
+    syn_amp.extend_from_slice(&args_off.to_le_bytes());
+    syn_amp.extend_from_slice(&types_off.to_le_bytes());
+    syn_amp.extend_from_slice(&fake_curve);
+    for i in 0..num_args {
+        // Decreasing offsets [20, 12, 20, 12, ...]
+        let off = if i % 2 == 0 { 20u32 } else { 12u32 };
+        syn_amp.extend_from_slice(&off.to_le_bytes());
+    }
+    for _ in 0..num_args {
+        syn_amp.extend_from_slice(&0x001Eu32.to_le_bytes());
+    }
+
+    // Authentic ZCF alternating offsets `[start, total_len, start, total_len, ...]`
+    let n_real = 64usize;
+    let r_args_off = 20usize;
+    let r_types_off = r_args_off + n_real * 4;
+    let r_data_start = r_types_off + n_real * 4;
+    let r_payload = vec![0u8; 64];
+    let r_total = r_data_start + r_payload.len();
+    let mut real_amp = Vec::with_capacity(r_total);
+    real_amp.extend_from_slice(&(r_total as u32).to_le_bytes());
+    real_amp.extend_from_slice(&(n_real as u32).to_le_bytes());
+    real_amp.extend_from_slice(&(r_args_off as u32).to_le_bytes());
+    real_amp.extend_from_slice(&(r_types_off as u32).to_le_bytes());
+    real_amp.extend_from_slice(&0x03u32.to_le_bytes());
+    for i in 0..n_real {
+        let off = if i % 2 == 0 { r_data_start } else { r_total };
+        real_amp.extend_from_slice(&(off as u32).to_le_bytes());
+    }
+    for _ in 0..n_real {
+        real_amp.extend_from_slice(&0x001Eu32.to_le_bytes());
+    }
+    real_amp.extend_from_slice(&r_payload);
+
+    let amp_doc = RiffDocument::new(
+        *b"CDRC",
+        vec![
+            RiffNode::chunk(*b"vrsn", 1200u16.to_le_bytes().to_vec()),
+            RiffNode::list(
+                *b"doc ",
+                vec![RiffNode::list(
+                    *b"page",
+                    vec![RiffNode::list(
+                        *b"layr",
+                        vec![
+                            RiffNode::list(*b"obj ", vec![RiffNode::chunk(*b"loda", syn_amp)]),
+                            RiffNode::list(*b"obj ", vec![RiffNode::chunk(*b"loda", real_amp)]),
+                        ],
+                    )],
+                )],
+            ),
+        ],
+    );
+    let amp_rep = import_corel_bytes(&write_riff(&amp_doc).unwrap()).unwrap();
+    assert_eq!(amp_rep.document.objects.len(), 0);
+    assert!(
+        amp_rep.warnings.len() >= 2,
+        "expected malformed loda warnings for both overlapping chunks, got {:?}",
+        amp_rep.warnings
+    );
+
+    // Oversized `0x00C9` JSON payload (> 256 KiB) rejected cleanly before JSON parsing
+    let mut huge_c9 = Vec::with_capacity(8 + 300_000);
+    huge_c9.extend_from_slice(&1u32.to_le_bytes());
+    huge_c9.extend_from_slice(&300_000u32.to_le_bytes());
+    huge_c9.push(b'{');
+    huge_c9.resize(8 + 300_000 - 1, b' ');
+    huge_c9.push(b'}');
+    assert!(parse_c9_style_override(&huge_c9).is_none());
+
+    // 7c. [S2] Minimal 29-byte v16 solid `fild` (`&data[12..]` len == 17) AND 31-byte solid `fild`
+    // (`&data[12..]` len == 19, color block at tail `14..31`) must both decode `Solid(Color::CYAN)`!
+    let mut fild29 = vec![0u8; 29];
+    fild29[0..4].copy_from_slice(&7u32.to_le_bytes()); // fill_id = 7
+    fild29[4..6].copy_from_slice(&1u16.to_le_bytes()); // fill_type = 1 (Solid, ZCF context)
+    fild29[12] = 0x01;
+    fild29[13..17].copy_from_slice(&12u32.to_le_bytes());
+    fild29[17..19].copy_from_slice(&3u16.to_le_bytes()); // CMYK255
+    fild29[19..21].copy_from_slice(&5u16.to_le_bytes());
+    fild29[25..29].copy_from_slice(&[255, 0, 0, 0]); // Pure Cyan at exact tail `12..29`!
+
+    let mut fild31 = vec![0u8; 31];
+    fild31[0..4].copy_from_slice(&8u32.to_le_bytes()); // fill_id = 8
+    fild31[4..8].copy_from_slice(&0x0514u32.to_le_bytes()); // v16+ sub_tag
+    fild31[8..12].copy_from_slice(&2u32.to_le_bytes());
+    fild31[12..14].copy_from_slice(&1u16.to_le_bytes()); // fill_type = 1 (Solid)
+    fild31[14] = 0x01;
+    fild31[15..19].copy_from_slice(&12u32.to_le_bytes());
+    fild31[19..21].copy_from_slice(&3u16.to_le_bytes()); // CMYK255
+    fild31[21..23].copy_from_slice(&5u16.to_le_bytes());
+    fild31[27..31].copy_from_slice(&[255, 0, 0, 0]); // Pure Cyan at exact tail `14..31`!
+
+    let rect_loda_7 = build_zcf_loda(
+        0x01,
+        &[
+            (
+                0x001E,
+                build_zcf_rect128(100_000.0, 100_000.0, 1.0, 1.0, [0.0; 4], 0),
+            ),
+            (0x0014, 7u32.to_le_bytes().to_vec()),
+        ],
+    );
+    let rect_loda_8 = build_zcf_loda(
+        0x01,
+        &[
+            (
+                0x001E,
+                build_zcf_rect128(100_000.0, 100_000.0, 1.0, 1.0, [0.0; 4], 0),
+            ),
+            (0x0014, 8u32.to_le_bytes().to_vec()),
+        ],
+    );
+    let fild_doc = RiffDocument::new(
+        *b"CDRO",
+        vec![
+            RiffNode::chunk(*b"vrsn", 2300u16.to_le_bytes().to_vec()),
+            RiffNode::list(
+                *b"doc ",
+                vec![RiffNode::list(
+                    *b"filt",
+                    vec![
+                        RiffNode::chunk(*b"fild", fild29),
+                        RiffNode::chunk(*b"fild", fild31),
+                    ],
+                )],
+            ),
+            RiffNode::list(
+                *b"page",
+                vec![RiffNode::list(
+                    *b"gobj",
+                    vec![RiffNode::list(
+                        *b"layr",
+                        vec![
+                            RiffNode::list(
+                                *b"obj ",
+                                vec![RiffNode::list(
+                                    *b"lgob",
+                                    vec![RiffNode::chunk(*b"loda", rect_loda_7)],
+                                )],
+                            ),
+                            RiffNode::list(
+                                *b"obj ",
+                                vec![RiffNode::list(
+                                    *b"lgob",
+                                    vec![RiffNode::chunk(*b"loda", rect_loda_8)],
+                                )],
+                            ),
+                        ],
+                    )],
+                )],
+            ),
+        ],
+    );
+    let fild_rep = import_corel_bytes(&write_riff(&fild_doc).unwrap()).unwrap();
+    assert_eq!(fild_rep.document.objects.len(), 2);
+    for rect_obj in fild_rep.document.objects.values() {
+        assert_eq!(rect_obj.fill, Fill::Solid(Color::CYAN));
+    }
+
+    // 7d. [S2] Single-pass XML unescaping in `extract_rdf_li_list` (no double unescape or tag truncation!)
+    let tricky_xml = r#"<x:xmpmeta><rdf:RDF><rdf:Description>
+        <LayerNames><rdf:Bag>
+            <rdf:li>Cut &lt;/rdf:li&gt; Layer</rdf:li>
+            <rdf:li>A &amp;lt; B</rdf:li>
+        </rdf:Bag></LayerNames>
+    </rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    let ti = parse_textinfo_xml(tricky_xml);
+    assert_eq!(ti.layer_names, vec!["Cut </rdf:li> Layer", "A &lt; B"]);
+}

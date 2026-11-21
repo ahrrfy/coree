@@ -260,7 +260,11 @@ pub fn run_recorded_macro(
                 }
                 let mut coeffs = [0.0_f64; 6];
                 for (i, v) in m.into_iter().enumerate() {
-                    coeffs[i] = dyn_to_f64(v, "affine")?;
+                    let val = dyn_to_f64(v, "affine")?;
+                    if !val.is_finite() {
+                        return Err("transform_objects requires finite affine coefficients".into());
+                    }
+                    coeffs[i] = val;
                 }
                 q.borrow_mut().push(CommandOp::TransformObjects {
                     ids: rhai_array_to_ids(ids),
@@ -340,11 +344,26 @@ pub fn run_recorded_macro(
                   h: Dynamic,
                   b: Dynamic|
                   -> Result<(), Box<EvalAltResult>> {
+                let width_mm = dyn_to_f64(w, "width_mm")?;
+                let height_mm = dyn_to_f64(h, "height_mm")?;
+                let bleed_mm = dyn_to_f64(b, "bleed_mm")?;
+                if !width_mm.is_finite()
+                    || width_mm <= 0.0
+                    || !height_mm.is_finite()
+                    || height_mm <= 0.0
+                    || !bleed_mm.is_finite()
+                    || bleed_mm < 0.0
+                {
+                    return Err(
+                        "add_page requires positive finite width/height and non-negative finite bleed"
+                            .into(),
+                    );
+                }
                 q.borrow_mut().push(CommandOp::AddPage {
                     name: name.to_owned(),
-                    width_mm: dyn_to_f64(w, "width_mm")?,
-                    height_mm: dyn_to_f64(h, "height_mm")?,
-                    bleed_mm: dyn_to_f64(b, "bleed_mm")?,
+                    width_mm,
+                    height_mm,
+                    bleed_mm,
                 });
                 Ok(())
             },
@@ -475,7 +494,11 @@ fn register_production_api(
                 }
                 let mut coeffs = [0.0_f64; 6];
                 for (i, v) in m.into_iter().enumerate() {
-                    coeffs[i] = dyn_to_f64(v, "affine")?;
+                    let val = dyn_to_f64(v, "affine")?;
+                    if !val.is_finite() {
+                        return Err("transform_objects requires finite affine coefficients".into());
+                    }
+                    coeffs[i] = val;
                 }
                 let op = CommandOp::TransformObjects {
                     ids: rhai_array_to_ids(ids),
@@ -587,11 +610,26 @@ fn register_production_api(
                   h: Dynamic,
                   b: Dynamic|
                   -> Result<(), Box<EvalAltResult>> {
+                let width_mm = dyn_to_f64(w, "width_mm")?;
+                let height_mm = dyn_to_f64(h, "height_mm")?;
+                let bleed_mm = dyn_to_f64(b, "bleed_mm")?;
+                if !width_mm.is_finite()
+                    || width_mm <= 0.0
+                    || !height_mm.is_finite()
+                    || height_mm <= 0.0
+                    || !bleed_mm.is_finite()
+                    || bleed_mm < 0.0
+                {
+                    return Err(
+                        "add_page requires positive finite width/height and non-negative finite bleed"
+                            .into(),
+                    );
+                }
                 let op = CommandOp::AddPage {
                     name: name.to_owned(),
-                    width_mm: dyn_to_f64(w, "width_mm")?,
-                    height_mm: dyn_to_f64(h, "height_mm")?,
-                    bleed_mm: dyn_to_f64(b, "bleed_mm")?,
+                    width_mm,
+                    height_mm,
+                    bleed_mm,
                 };
                 apply_command(&mut d.borrow_mut(), &op)
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
@@ -647,6 +685,9 @@ fn register_production_api(
                     }
                     let sx = target_w / bb.width();
                     let sy = target_h / bb.height();
+                    if !sx.is_finite() || !sy.is_finite() {
+                        continue;
+                    }
                     let pivot = Point2D::new(bb.min_x, bb.min_y);
                     let scale_xf = Affine2D::scale_about(sx, sy, pivot);
                     if let Some(obj) = doc_mut.objects.get_mut(&oid) {
@@ -675,6 +716,9 @@ fn register_production_api(
                   -> Result<i64, Box<EvalAltResult>> {
                 let dx = dyn_to_f64(dx_dyn, "dx_mm")?;
                 let dy = dyn_to_f64(dy_dyn, "dy_mm")?;
+                if !dx.is_finite() || !dy.is_finite() {
+                    return Err("translate_objects requires finite offsets".into());
+                }
                 let obj_ids = rhai_array_to_ids(ids);
                 let op = CommandOp::TransformObjects {
                     ids: obj_ids.clone(),
@@ -758,6 +802,9 @@ fn register_production_api(
                     let target_y = sy + (row as f64) * (cell_h + gy);
                     let dx = target_x - bb.min_x;
                     let dy = target_y - bb.min_y;
+                    if !dx.is_finite() || !dy.is_finite() {
+                        continue;
+                    }
                     if let Some(obj) = doc_mut.objects.get_mut(&oid) {
                         if !obj.locked {
                             obj.transform = Affine2D::translate(dx, dy).compose(&obj.transform);

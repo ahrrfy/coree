@@ -8,11 +8,15 @@
 //! All archive entries are validated strictly against Zip-Slip and Zip-Bomb limits.
 
 use crate::cdr_riff::{
-    encode_bmp_file_rgba, parse_cdr_riff_with_budget, write_cdr_riff_with_options, RiffWriteOptions,
+    encode_bmp_file_rgba, parse_cdr_riff_tree, write_cdr_riff_with_options, RiffWriteOptions,
 };
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{read_bounded, sanitize_zip_path, CodecLimits};
-use crate::riff::RiffDocument;
+use crate::riff::{parse_riff_with_budget, RiffDocument};
+use crate::zcf::{
+    apply_xmp_metadata_xml, is_zcf_indirect_tree, parse_color_context_xml, parse_doc_palette_xml,
+    parse_document_cdss, parse_textinfo_xml, resolve_zcf_riff_tree, ZcfContext,
+};
 use coree_core::{ColorMode, Document};
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
@@ -159,11 +163,16 @@ pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipC
         }
     }
 
-    // Load external data files for CDR X6+ (`content/dataFileList.dat` + `content/data/*.dat`)
+    // Load external data files for CDR X6+ (`content/dataFileList.dat` + `content/data/*.dat`).
+    // Preserve exact 0-based `dataFileList.dat` indices via `file_index_map -> data_pool`, while
+    // deduplicating ZIP entry reads so repeated entries cannot amplify CPU or memory budget.
     let mut external_bitmaps: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut data_pool: Vec<Vec<u8>> = Vec::new();
+    let mut file_index_map: Vec<Option<usize>> = Vec::new();
+    let mut pool_by_zip_idx: HashMap<usize, usize> = HashMap::new();
+
     if era == CdrZipEra::X6 {
-        let mut listed_paths: Vec<String> = Vec::new();
-        let mut seen_paths: HashSet<String> = HashSet::new();
+        let mut seen_zip_indices: HashSet<usize> = HashSet::new();
         if let Some(&list_idx) = index_by_path.get("content/datafilelist.dat") {
             let raw_list = read_entry_by_index(
                 &mut archive,
@@ -178,55 +187,135 @@ pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipC
                 if trimmed.is_empty() {
                     continue;
                 }
-                let candidate = if trimmed.to_ascii_lowercase().starts_with("content/") {
-                    trimmed.to_owned()
-                } else {
-                    format!("content/{trimmed}")
-                };
-                // Validate paths listed inside dataFileList.dat against Zip-Slip too!
-                let safe = sanitize_zip_path(candidate.as_bytes())?;
-                let lower = safe.to_ascii_lowercase();
-                // Skip primary RIFF entries and deduplicate repeated references (anti-amplification)
-                if lower == "content/root.dat" || lower == "content/riffdata.cdr" {
+                // Validate raw entry listed inside dataFileList.dat against Zip-Slip!
+                let safe_raw = sanitize_zip_path(trimmed.as_bytes())?;
+                let lower_raw = safe_raw.to_ascii_lowercase();
+
+                // Skip primary RIFF entries (anti-amplification) without corrupting subsequent indices
+                if lower_raw == "content/root.dat"
+                    || lower_raw == "content/riffdata.cdr"
+                    || lower_raw == "root.dat"
+                {
+                    file_index_map.push(None);
                     continue;
                 }
-                if seen_paths.insert(lower.clone()) {
-                    listed_paths.push(lower);
-                }
-            }
-        }
-        // Also discover any `content/data/*.dat` present in the archive
-        for info in &entries {
-            let lower = info.name.to_ascii_lowercase();
-            if lower.starts_with("content/data/")
-                && lower.ends_with(".dat")
-                && seen_paths.insert(lower.clone())
-            {
-                listed_paths.push(lower);
+
+                // Resolve against authentic `content/data/<name>`, `content/<name>`, or `<name>`
+                let resolved_zip_idx = if lower_raw.starts_with("content/") {
+                    index_by_path.get(&lower_raw).copied()
+                } else {
+                    let in_data = format!("content/data/{lower_raw}");
+                    let in_content = format!("content/{lower_raw}");
+                    index_by_path
+                        .get(&in_data)
+                        .or_else(|| index_by_path.get(&in_content))
+                        .or_else(|| index_by_path.get(&lower_raw))
+                        .copied()
+                };
+
+                let Some(zip_idx) = resolved_zip_idx else {
+                    file_index_map.push(None);
+                    continue;
+                };
+
+                let pool_idx = if let Some(&existing) = pool_by_zip_idx.get(&zip_idx) {
+                    existing
+                } else {
+                    let data_bytes = read_entry_by_index(
+                        &mut archive,
+                        zip_idx,
+                        archive_len,
+                        limits,
+                        &mut budget_remaining,
+                    )?;
+                    // Recognize clean-room externalized CBMP payloads (`b"CBMP"` + u32 id + ...)
+                    if data_bytes.len() >= 13 && &data_bytes[0..4] == b"CBMP" {
+                        let id = u32::from_le_bytes([
+                            data_bytes[4],
+                            data_bytes[5],
+                            data_bytes[6],
+                            data_bytes[7],
+                        ]);
+                        external_bitmaps.insert(id, data_bytes.clone());
+                    }
+                    let idx_in_pool = data_pool.len();
+                    data_pool.push(data_bytes);
+                    pool_by_zip_idx.insert(zip_idx, idx_in_pool);
+                    seen_zip_indices.insert(zip_idx);
+                    idx_in_pool
+                };
+                file_index_map.push(Some(pool_idx));
             }
         }
 
-        for data_path in listed_paths {
-            if let Some(&idx) = index_by_path.get(&data_path) {
-                let data_bytes = read_entry_by_index(
-                    &mut archive,
-                    idx,
-                    archive_len,
-                    limits,
-                    &mut budget_remaining,
-                )?;
-                // Recognize externalized CBMP payloads (`b"CBMP"` + u32 id + ...)
-                if data_bytes.len() >= 13 && &data_bytes[0..4] == b"CBMP" {
-                    let id = u32::from_le_bytes([
-                        data_bytes[4],
-                        data_bytes[5],
-                        data_bytes[6],
-                        data_bytes[7],
-                    ]);
-                    external_bitmaps.insert(id, data_bytes);
+        // Also discover any unlisted `content/data/*.dat` (e.g., clean-room externalized bitmaps)
+        for info in &entries {
+            let lower = info.name.to_ascii_lowercase();
+            if lower.starts_with("content/data/") && lower.ends_with(".dat") {
+                if let Some(&zip_idx) = index_by_path.get(&lower) {
+                    if seen_zip_indices.insert(zip_idx) {
+                        let data_bytes = read_entry_by_index(
+                            &mut archive,
+                            zip_idx,
+                            archive_len,
+                            limits,
+                            &mut budget_remaining,
+                        )?;
+                        if data_bytes.len() >= 13 && &data_bytes[0..4] == b"CBMP" {
+                            let id = u32::from_le_bytes([
+                                data_bytes[4],
+                                data_bytes[5],
+                                data_bytes[6],
+                                data_bytes[7],
+                            ]);
+                            external_bitmaps.insert(id, data_bytes);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    // Pre-load ZCF auxiliary context (`styles/document.cdss`, `META-INF/textinfo.xml`, XMP metadata)
+    let mut zcf_ctx = ZcfContext::default();
+    if let Some(&cdss_idx) = index_by_path.get("styles/document.cdss") {
+        let cdss_bytes = read_entry_by_index(
+            &mut archive,
+            cdss_idx,
+            archive_len,
+            limits,
+            &mut budget_remaining,
+        )?;
+        zcf_ctx.stylesheet = parse_document_cdss(&cdss_bytes);
+        if zcf_ctx.version_hint.is_none() {
+            zcf_ctx.version_hint = zcf_ctx.stylesheet.version;
+        }
+    }
+    if let Some(&ti_idx) = index_by_path.get("meta-inf/textinfo.xml") {
+        let ti_bytes = read_entry_by_index(
+            &mut archive,
+            ti_idx,
+            archive_len,
+            limits,
+            &mut budget_remaining,
+        )?;
+        let xml = String::from_utf8_lossy(&ti_bytes);
+        zcf_ctx.textinfo = parse_textinfo_xml(&xml);
+    }
+    let mut xmp_metadata_xml: Option<String> = None;
+    if let Some(&xmp_idx) = index_by_path.get("meta-inf/metadata.xml") {
+        let xmp_bytes = read_entry_by_index(
+            &mut archive,
+            xmp_idx,
+            archive_len,
+            limits,
+            &mut budget_remaining,
+        )?;
+        let xml = String::from_utf8_lossy(&xmp_bytes).into_owned();
+        // Extract version/page-size hints before scene decoding
+        let mut dummy_doc = Document::new_a4("");
+        apply_xmp_metadata_xml(&xml, &mut dummy_doc, &mut is_template, &mut zcf_ctx);
+        xmp_metadata_xml = Some(xml);
     }
 
     // Read primary RIFF payload (`content/root.dat` or `content/riffData.cdr`)
@@ -246,20 +335,48 @@ pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipC
         &mut budget_remaining,
     )?;
 
-    // Share remaining cumulative budget across `LIST cmpr` streams and decoded RGBA bitmaps!
-    let mut parsed_riff = parse_cdr_riff_with_budget(
-        &primary_bytes,
+    // Parse raw RIFF tree, dereferencing ZCF 16-byte indirect pointers when present!
+    let raw_riff_tree =
+        parse_riff_with_budget(&primary_bytes, limits, &mut budget_remaining, false)?;
+    let resolved_riff_tree =
+        if era == CdrZipEra::X6 && is_zcf_indirect_tree(&raw_riff_tree, file_index_map.len()) {
+            zcf_ctx.is_zcf = true;
+            resolve_zcf_riff_tree(
+                raw_riff_tree,
+                &data_pool,
+                &file_index_map,
+                limits,
+                &mut budget_remaining,
+                &mut warnings,
+            )?
+        } else {
+            raw_riff_tree
+        };
+
+    // Share remaining cumulative budget across decoded RGBA bitmaps & scene objects!
+    let mut parsed_riff = parse_cdr_riff_tree(
+        resolved_riff_tree,
         limits,
         &external_bitmaps,
         &mut budget_remaining,
-        false,
+        &zcf_ctx,
     )?;
     warnings.extend(parsed_riff.warnings);
     if parsed_riff.is_template {
         is_template = true;
     }
 
-    // Parse optional `metadata/metadata.xml`
+    // Apply XMP `META-INF/metadata.xml` onto the decoded Document
+    if let Some(ref xml) = xmp_metadata_xml {
+        apply_xmp_metadata_xml(
+            xml,
+            &mut parsed_riff.document,
+            &mut is_template,
+            &mut zcf_ctx,
+        );
+    }
+
+    // Parse optional `metadata/metadata.xml` (X4–X5 & clean-room synthetic writer)
     if let Some(&meta_idx) = index_by_path.get("metadata/metadata.xml") {
         let meta_bytes = read_entry_by_index(
             &mut archive,
@@ -272,7 +389,41 @@ pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipC
         apply_metadata_xml(&xml, &mut parsed_riff.document, &mut is_template);
     }
 
-    // Parse optional `styles/default.xml` (X6+)
+    // Parse optional `color/color.xml` (primary document color space)
+    if let Some(&cc_idx) = index_by_path.get("color/color.xml") {
+        let cc_bytes = read_entry_by_index(
+            &mut archive,
+            cc_idx,
+            archive_len,
+            limits,
+            &mut budget_remaining,
+        )?;
+        let xml = String::from_utf8_lossy(&cc_bytes);
+        if let Some(mode) = parse_color_context_xml(&xml) {
+            parsed_riff.document.color_mode = mode;
+        }
+    }
+
+    // Parse optional `color/docPalette.xml` (authentic X6–2025) or `color/documentPalette.xml`
+    for pal_path in ["color/docpalette.xml", "color/documentpalette.xml"] {
+        if let Some(&pal_idx) = index_by_path.get(pal_path) {
+            let pal_bytes = read_entry_by_index(
+                &mut archive,
+                pal_idx,
+                archive_len,
+                limits,
+                &mut budget_remaining,
+            )?;
+            let xml = String::from_utf8_lossy(&pal_bytes);
+            let swatches = parse_doc_palette_xml(&xml);
+            if !swatches.is_empty() {
+                parsed_riff.document.document_palette.swatches = swatches;
+                break;
+            }
+        }
+    }
+
+    // Parse optional `styles/default.xml` (clean-room synthetic X6+)
     if let Some(&style_idx) = index_by_path.get("styles/default.xml") {
         let style_bytes = read_entry_by_index(
             &mut archive,

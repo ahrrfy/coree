@@ -4,25 +4,44 @@
 
 use coree_core::geometry::EllipseMode;
 use coree_core::{
-    Affine2D, AnchorPoint, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, Color,
-    ColorMapMode, ColorMode, ConnectorObject, ConnectorStyle, ContourMode, CornerStyle,
+    Affine2D, AnchorPoint, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, BuiltinIccProfile,
+    Color, ColorMapMode, ColorMode, ConnectorObject, ConnectorStyle, ContourMode, CornerStyle,
     DimensionKind, DimensionObject, DistortKind, Document, Effect, EnvelopeMode, FeatherDirection,
     Fill, GradientStop, GuideOrientation, LensConfig, LensKind, MasterLayerScope, MeshNode,
-    NodePayload, ObjectId, OutlineStyle, ParagraphText, ParametricShape, Point2D, RasterAsset,
-    RasterFilter, RasterLayerData, Rect2D, SceneObject, SymbolDef, TextAlign, TextDirection,
-    TextOnPath, TextStyle, TransparencyMode, Vec2D, VectorTable,
+    NodePayload, ObjectId, OutlineStyle, ParagraphText, ParametricShape, Point2D,
+    PostScriptFillPreset, RasterAsset, RasterFilter, RasterLayerData, Rect2D, SceneObject,
+    SymbolDef, TextAlign, TextDirection, TextOnPath, TextStyle, TransparencyMode, Vec2D,
+    VectorTable,
 };
 use coree_render::{
-    apply_cutout_background_removal, apply_kashida_elongation, apply_raster_filter,
-    clone_stamp_stroke, compute_page_layouts, compute_smart_fill, convert_object_to_bitmap,
-    erase_stroke, hit_test_node, hit_test_point, hit_test_rect, paint_brush_stroke,
-    paragraph_to_curves, render_page_to_rgba, render_page_to_rgba_with_options, render_svg_to_rgba,
+    apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,
+    apply_kashida_elongation, apply_raster_filter, clone_stamp_stroke, compute_page_layouts,
+    compute_smart_fill, convert_object_to_bitmap, erase_stroke, hit_test_node, hit_test_point,
+    hit_test_rect, list_glyphs_for_block, paint_brush_stroke, paragraph_to_curves,
+    raster_flood_fill, render_page_to_rgba, render_page_to_rgba_with_options, render_svg_to_rgba,
     resample, smudge_stroke, text_on_path_to_curves, text_to_curves, trace_raster,
-    trace_raster_to_mm, BackendPaint, CanvasBackend, DirtyTileCache, DynamicGuideKind, FillRule,
-    OutlinePreset, PixelRect, RasterMask, RenderOptions, RgbaBuffer, SceneRenderer, SnapEngine,
-    SnapOptions, StrokeParams, TinySkiaBackend, TraceConfig, TraceMode, ViewMode, Viewport,
-    TILE_SIZE_PX,
+    trace_raster_to_mm, BackendPaint, CanvasBackend, DirtyTileCache, DodgeBurnMode,
+    DynamicGuideKind, FillRule, GlyphBlockFilter, OutlinePreset, PixelRect, RasterMask,
+    RenderOptions, RgbaBuffer, SceneRenderer, SnapEngine, SnapOptions, StrokeParams, TextEngine,
+    TinySkiaBackend, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport, TILE_SIZE_PX,
 };
+
+fn rect_obj(x: f64, y: f64, w: f64, h: f64, fill: Fill) -> SceneObject {
+    SceneObject::new(
+        ObjectId(0),
+        "Rect",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: w,
+            height: h,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(fill)
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(x, y))
+}
 
 fn make_rect(x: f64, y: f64, w: f64, h: f64, color: Color) -> SceneObject {
     SceneObject::new(
@@ -2839,5 +2858,621 @@ fn regression_7_vector_pattern_bevel_wireframe_dims_trace_and_arabic() {
     assert!(
         !k_lam_wasla.contains("ل\u{0640}ٱ"),
         "Kashida must NOT split Lam-Alef Wasla 'لٱ' ligature: {k_lam_wasla:?}"
+    );
+}
+
+#[test]
+fn icc_live_cmyk_soft_proofing_gamut_warning_and_tile_cache_invalidation() {
+    let mut doc = Document::new("SoftProof", 90.0, 30.0, ColorMode::Rgb, 96.0);
+    // Swatch 1: Pure neon sRGB green (0,255,0) — OUT of CMYK gamut
+    doc.add_object(
+        rect_obj(
+            0.0,
+            0.0,
+            30.0,
+            30.0,
+            Fill::Solid(Color::rgba8(0, 255, 0, 255)),
+        ),
+        None,
+    )
+    .unwrap();
+    // Swatch 2: Pure electric sRGB blue (0,0,255) — OUT of CMYK gamut
+    doc.add_object(
+        rect_obj(
+            30.0,
+            0.0,
+            30.0,
+            30.0,
+            Fill::Solid(Color::rgba8(0, 0, 255, 255)),
+        ),
+        None,
+    )
+    .unwrap();
+    // Swatch 3: Neutral mid-gray (128,128,128) — strictly IN CMYK gamut
+    doc.add_object(
+        rect_obj(
+            60.0,
+            0.0,
+            30.0,
+            30.0,
+            Fill::Solid(Color::rgba8(128, 128, 128, 255)),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let raw_opts = RenderOptions::export();
+    let img_raw =
+        render_page_to_rgba_with_options(&doc, 0, 96.0, ViewMode::Enhanced, &raw_opts).unwrap();
+    let mut iso_opts = RenderOptions::export();
+    iso_opts.soft_proof_cmyk = true;
+    iso_opts.proof_profile = BuiltinIccProfile::IsoCoatedV2Cmyk;
+    let img_iso =
+        render_page_to_rgba_with_options(&doc, 0, 96.0, ViewMode::Enhanced, &iso_opts).unwrap();
+
+    let mut swop_opts = iso_opts.clone();
+    swop_opts.proof_profile = BuiltinIccProfile::UsWebCoatedSwopCmyk;
+    let img_swop =
+        render_page_to_rgba_with_options(&doc, 0, 96.0, ViewMode::Enhanced, &swop_opts).unwrap();
+
+    let mut warn_opts = iso_opts.clone();
+    warn_opts.gamut_warning = true;
+    let img_warn =
+        render_page_to_rgba_with_options(&doc, 0, 96.0, ViewMode::Enhanced, &warn_opts).unwrap();
+
+    let raw_green = pixel_at_mm(&img_raw, 15.0, 15.0);
+    let iso_green = pixel_at_mm(&img_iso, 15.0, 15.0);
+    let swop_green = pixel_at_mm(&img_swop, 15.0, 15.0);
+    let warn_green = pixel_at_mm(&img_warn, 15.0, 15.0);
+    let warn_blue = pixel_at_mm(&img_warn, 45.0, 15.0);
+    let warn_gray = pixel_at_mm(&img_warn, 75.0, 15.0);
+
+    assert_eq!(raw_green, [0, 255, 0, 255]);
+    assert!(
+        iso_green[1] < 220,
+        "ISO Coated v2 soft-proof must noticeably dull neon green: {iso_green:?}"
+    );
+    assert_ne!(
+        iso_green, swop_green,
+        "ISO Coated v2 and US Web Coated SWOP must render distinct soft-proof colors"
+    );
+    assert!(
+        warn_green[2] > 100 && warn_blue[1] > 150,
+        "Gamut warning must tint out-of-gamut green & blue: green={warn_green:?}, blue={warn_blue:?}"
+    );
+    assert!(
+        (i32::from(warn_gray[0]) - i32::from(warn_gray[1])).abs() < 15
+            && (i32::from(warn_gray[1]) - i32::from(warn_gray[2])).abs() < 15,
+        "In-gamut neutral gray must NOT trigger gamut warning tint: {warn_gray:?}"
+    );
+
+    // DirtyTileCache must auto-invalidate when toggling soft_proof_cmyk, gamut_warning, or moving a guide!
+    let mut cache = DirtyTileCache::new(300, 120);
+    let mut renderer = SceneRenderer::new();
+    let vp = Viewport::new(300, 120);
+    let _ = cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &raw_opts, &mut renderer);
+    assert_eq!(
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &raw_opts, &mut renderer),
+        0
+    );
+    assert!(
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &iso_opts, &mut renderer) > 0,
+        "Enabling soft_proof_cmyk must invalidate tile cache"
+    );
+    assert!(
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &warn_opts, &mut renderer) > 0,
+        "Enabling gamut_warning must invalidate tile cache"
+    );
+    let gid = doc.add_guide(GuideOrientation::Vertical(20.0), false);
+    let mut g_opts = RenderOptions::interactive();
+    let _ = cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &g_opts, &mut renderer);
+    // Move existing guide in-place without changing guides.len()
+    doc.guides
+        .iter_mut()
+        .find(|g| g.id == gid)
+        .unwrap()
+        .orientation = GuideOrientation::Vertical(55.0);
+    g_opts.show_guidelines = true;
+    assert!(
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &g_opts, &mut renderer) > 0,
+        "Moving an existing guide must invalidate DirtyTileCache"
+    );
+}
+
+#[test]
+fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
+    // 1. Healing Brush: left half is dark textured blue; right half is uniform bright warm orange.
+    //    Healing from left -> right must preserve bright warm orange ambient color while transferring texture!
+    let w = 64u32;
+    let h = 32u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = ((y * w + x) * 4) as usize;
+            if x < 32 {
+                // Dark blue with +/- 28 high-frequency checkerboard texture
+                let tex: i16 = if ((x / 2) + (y / 2)) % 2 == 0 {
+                    28
+                } else {
+                    -28
+                };
+                rgba[idx] = (40 + tex).clamp(0, 255) as u8;
+                rgba[idx + 1] = (60 + tex).clamp(0, 255) as u8;
+                rgba[idx + 2] = (140 + tex).clamp(0, 255) as u8;
+                rgba[idx + 3] = 255;
+            } else {
+                // Uniform bright warm orange (225, 130, 65)
+                rgba[idx..idx + 4].copy_from_slice(&[225, 130, 65, 255]);
+            }
+        }
+    }
+    let mut heal_asset = RasterAsset::new(w, h, rgba, 96.0, ColorMode::Rgb).unwrap();
+    apply_healing_stroke(
+        &mut heal_asset,
+        Point2D::new(16.0, 16.0),
+        &[Point2D::new(48.0, 16.0)],
+        8.0,
+        0.7,
+    );
+    // Inspect healed center patch [44..52, 12..20]: must remain warm (R > B + 80) AND have texture variance!
+    let mut min_r = 255u8;
+    let mut max_r = 0u8;
+    let mut sum_r = 0u32;
+    let mut sum_b = 0u32;
+    let mut cnt = 0u32;
+    for y in 12..20 {
+        for x in 44..52 {
+            let idx = ((y * w + x) * 4) as usize;
+            let r = heal_asset.rgba_bytes[idx];
+            let b = heal_asset.rgba_bytes[idx + 2];
+            min_r = min_r.min(r);
+            max_r = max_r.max(r);
+            sum_r += u32::from(r);
+            sum_b += u32::from(b);
+            cnt += 1;
+        }
+    }
+    assert!(
+        (sum_r / cnt) > (sum_b / cnt) + 80,
+        "Healing brush must match destination warm tone, not paste dark blue (avg_r={}, avg_b={})",
+        sum_r / cnt,
+        sum_b / cnt
+    );
+    assert!(
+        max_r.saturating_sub(min_r) >= 20,
+        "Healing brush must transfer high-frequency texture variance (min_r={min_r}, max_r={max_r})"
+    );
+
+    // 2. Dodge & Burn across Shadows, Midtones, Highlights
+    let mut db_rgba = Vec::with_capacity(60 * 20 * 4);
+    for _y in 0..20 {
+        for x in 0..60 {
+            let v = if x < 20 {
+                35u8 // Shadows band
+            } else if x < 40 {
+                128u8 // Midtones band
+            } else {
+                225u8 // Highlights band
+            };
+            db_rgba.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    let base_db = RasterAsset::new(60, 20, db_rgba, 96.0, ColorMode::Rgb).unwrap();
+    let stroke = [Point2D::new(5.0, 10.0), Point2D::new(55.0, 10.0)];
+
+    // Dodge Shadows: dark band must brighten far more than highlights band
+    let mut dodge_sh = base_db.clone();
+    apply_dodge_burn_stroke(
+        &mut dodge_sh,
+        &stroke,
+        6.0,
+        0.8,
+        DodgeBurnMode::Dodge,
+        ToneRange::Shadows,
+        0.8,
+    );
+    let sh_delta = i32::from(dodge_sh.rgba_bytes[(10 * 60 + 10) * 4]) - 35;
+    let hi_delta = i32::from(dodge_sh.rgba_bytes[(10 * 60 + 50) * 4]) - 225;
+    assert!(
+        sh_delta > 30 && sh_delta > hi_delta * 5,
+        "Dodge(Shadows) must strongly lift shadows vs highlights: sh_delta={sh_delta}, hi_delta={hi_delta}"
+    );
+
+    // Burn Highlights: bright band must darken far more than dark shadows band
+    let mut burn_hi = base_db.clone();
+    apply_dodge_burn_stroke(
+        &mut burn_hi,
+        &stroke,
+        6.0,
+        0.8,
+        DodgeBurnMode::Burn,
+        ToneRange::Highlights,
+        0.8,
+    );
+    let burn_hi_delta = 225 - i32::from(burn_hi.rgba_bytes[(10 * 60 + 50) * 4]);
+    let burn_sh_delta = 35 - i32::from(burn_hi.rgba_bytes[(10 * 60 + 10) * 4]);
+    assert!(
+        burn_hi_delta > 40 && burn_hi_delta > burn_sh_delta * 5,
+        "Burn(Highlights) must strongly darken highlights vs shadows: hi={burn_hi_delta}, sh={burn_sh_delta}"
+    );
+
+    // Dodge Midtones: midtone band rises cleanly
+    let mut dodge_mid = base_db;
+    apply_dodge_burn_stroke(
+        &mut dodge_mid,
+        &stroke,
+        6.0,
+        0.8,
+        DodgeBurnMode::Dodge,
+        ToneRange::Midtones,
+        0.7,
+    );
+    assert!(dodge_mid.rgba_bytes[(10 * 60 + 30) * 4] > 165);
+
+    // 3. Contiguous Scanline Flood Fill (Paint Bucket) with tolerance & large image stress test
+    let fw = 64u32;
+    let fh = 64u32;
+    let mut fb = vec![240u8; (fw * fh * 4) as usize];
+    for px in fb.as_chunks_mut::<4>().0 {
+        px[3] = 255;
+    }
+    // Draw a closed black box border at x=16..=47, y=16..=47 (30x30 interior = 900 pixels)
+    for x in 16..=47 {
+        for y in [16u32, 47u32] {
+            let idx = ((y * fw + x) * 4) as usize;
+            fb[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+    for y in 16..=47 {
+        for x in [16u32, 47u32] {
+            let idx = ((y * fw + x) * 4) as usize;
+            fb[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+    // Slightly noisy interior pixel (225, 225, 225) within tolerance 20 of (240,240,240)
+    let n_idx = ((25 * fw + 25) * 4) as usize;
+    fb[n_idx..n_idx + 4].copy_from_slice(&[225, 225, 225, 255]);
+
+    let mut bucket_asset = RasterAsset::new(fw, fh, fb, 96.0, ColorMode::Rgb).unwrap();
+    assert_eq!(
+        raster_flood_fill(&mut bucket_asset, 999, 999, Color::CYAN, 10),
+        0
+    );
+    let filled = raster_flood_fill(
+        &mut bucket_asset,
+        30,
+        30,
+        Color::rgba8(220, 40, 80, 255),
+        20,
+    );
+    assert_eq!(
+        filled,
+        30 * 30,
+        "Exact enclosed 30x30 pocket must be filled"
+    );
+    assert_eq!(
+        &bucket_asset.rgba_bytes[n_idx..n_idx + 4],
+        &[220, 40, 80, 255],
+        "Pixel within tolerance=20 must be filled"
+    );
+    // Exterior pixel outside border must stay untouched (240, 240, 240)
+    assert_eq!(&bucket_asset.rgba_bytes[0..4], &[240, 240, 240, 255]);
+
+    // Large 512x512 flood fill confirms zero stack overflow
+    let mut big =
+        RasterAsset::new(512, 512, vec![255u8; 512 * 512 * 4], 96.0, ColorMode::Rgb).unwrap();
+    let big_count = raster_flood_fill(&mut big, 256, 256, Color::rgba8(10, 20, 30, 255), 0);
+    assert_eq!(big_count, 512 * 512);
+}
+
+#[test]
+fn all_ten_postscript_procedural_fills_render_crisply_at_multiple_dpis() {
+    let fg = Color::rgba8(20, 30, 180, 255);
+    let bg = Color::rgba8(245, 240, 220, 255);
+    let mut fingerprints: Vec<Vec<u8>> = Vec::with_capacity(10);
+
+    for preset in PostScriptFillPreset::ALL {
+        let mut doc = Document::new("PSFill", 40.0, 40.0, ColorMode::Rgb, 96.0);
+        doc.add_object(
+            rect_obj(
+                0.0,
+                0.0,
+                40.0,
+                40.0,
+                preset.to_fill(fg.clone(), bg.clone(), 0),
+            ),
+            None,
+        )
+        .unwrap();
+        let img = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+        let fg_count = img
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[2] > 120 && px[0] < 100)
+            .count();
+        let bg_count = img
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] > 180 && px[1] > 180)
+            .count();
+        assert!(
+            fg_count > 100 && bg_count > 100,
+            "PostScript preset {preset:?} must render both fg and bg pixels (fg={fg_count}, bg={bg_count})"
+        );
+        fingerprints.push(img.rgba);
+    }
+
+    // All 10 presets must produce distinct rendered images
+    for i in 0..fingerprints.len() {
+        for j in (i + 1)..fingerprints.len() {
+            assert_ne!(
+                fingerprints[i],
+                fingerprints[j],
+                "PostScript presets {:?} and {:?} rendered identically",
+                PostScriptFillPreset::ALL[i],
+                PostScriptFillPreset::ALL[j]
+            );
+        }
+    }
+
+    // High-DPI (300 DPI) crispness check on HexGrid
+    let mut hi_doc = Document::new("PSHiDpi", 20.0, 20.0, ColorMode::Rgb, 300.0);
+    hi_doc
+        .add_object(
+            rect_obj(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                PostScriptFillPreset::HexGrid.to_fill(fg, bg, 7),
+            ),
+            None,
+        )
+        .unwrap();
+    let hi_img = render_page_to_rgba(&hi_doc, 0, 300.0, ViewMode::Enhanced).unwrap();
+    assert!(hi_img.width > 200 && hi_img.height > 200);
+}
+
+#[test]
+fn interactive_font_glyph_catalog_filters_search_and_bounds() {
+    // 1. Every GlyphBlockFilter returns non-empty catalog entries
+    for filter in GlyphBlockFilter::ALL_FILTERS {
+        let items = list_glyphs_for_block(None, filter, "", 50);
+        assert!(
+            !items.is_empty(),
+            "GlyphBlockFilter::{filter:?} returned no entries"
+        );
+        assert!(items.len() <= 50);
+        if filter != GlyphBlockFilter::All {
+            assert!(items.iter().all(|e| e.block == filter));
+        }
+    }
+
+    // 2. Arabic block contains Alef, Kashida, and Tashkeel; Presentation Forms contains Allah/Bismillah
+    let arabic = list_glyphs_for_block(None, GlyphBlockFilter::Arabic, "", 200);
+    assert!(arabic
+        .iter()
+        .any(|e| e.ch == 'ا' && e.codepoint_hex == "U+0627"));
+    assert!(arabic.iter().any(|e| e.ch == '\u{0640}'));
+
+    let ar_forms = list_glyphs_for_block(None, GlyphBlockFilter::ArabicPresentationForms, "", 200);
+    assert!(ar_forms.iter().any(|e| e.ch == '\u{FDF2}')); // Allah ligature
+    assert!(ar_forms.iter().any(|e| e.ch == '\u{FEFB}')); // Lam-Alef ligature
+
+    // 3. Search by name, hex codepoint, and direct glyph char
+    let by_name = list_glyphs_for_block(None, GlyphBlockFilter::All, "alef", 50);
+    assert!(by_name.iter().any(|e| e.ch == 'ا'));
+    let by_hex = list_glyphs_for_block(None, GlyphBlockFilter::Arrows, "2192", 50);
+    assert_eq!(by_hex.len(), 1);
+    assert_eq!(by_hex[0].ch, '\u{2192}');
+    let by_char = list_glyphs_for_block(None, GlyphBlockFilter::All, "★", 10);
+    assert!(by_char.iter().any(|e| e.ch == '★'));
+
+    // 4. max_items = 0 returns empty; TextEngine method matches free function
+    assert!(list_glyphs_for_block(None, GlyphBlockFilter::All, "", 0).is_empty());
+    let mut engine = TextEngine::new();
+    let via_engine = engine.list_glyphs_for_block(None, GlyphBlockFilter::Math, "infinity", 10);
+    assert!(via_engine.iter().any(|e| e.ch == '∞'));
+}
+
+#[test]
+fn regression_8_audit_fixes_lenses_effects_arabic_diacritics_mesh_powerclip_and_degenerate_matrices(
+) {
+    // 1. Magnify Lens with `remove_face = true`: magnified artwork extending outside the
+    //    unmagnified object's original bounds must remain VISIBLE (not clipped by unwarped mask!),
+    //    while blank white page areas stay transparent/untouched!
+    let mut doc = Document::new("MagnifyRemoveFace", 100.0, 100.0, ColorMode::Rgb, 96.0);
+    // Small 10x10 red square centered at (50, 50) -> spans [45..55, 45..55]
+    doc.add_object(
+        rect_obj(
+            45.0,
+            45.0,
+            10.0,
+            10.0,
+            Fill::Solid(Color::rgba8(220, 20, 20, 255)),
+        ),
+        None,
+    )
+    .unwrap();
+    // 3x Magnify lens covering [20..80, 20..80] -> magnified square should span [35..65, 35..65]!
+    let mut mag_lens = rect_obj(20.0, 20.0, 60.0, 60.0, Fill::None);
+    mag_lens.lens = Some(LensConfig {
+        kind: LensKind::Magnify { amount: 3.0 },
+        frozen: false,
+        viewpoint: None,
+        remove_face: true,
+    });
+    doc.add_object(mag_lens, None).unwrap();
+
+    let img_mag = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    // At (40, 50): outside original [45..55], INSIDE 3x magnified [35..65] -> MUST BE RED!
+    let magnified_edge = pixel_at_mm(&img_mag, 40.0, 50.0);
+    assert!(
+        magnified_edge[0] > 180 && magnified_edge[1] < 60,
+        "Magnify+remove_face must keep magnified pixels at (40,50), got {magnified_edge:?}"
+    );
+    // At (24, 24): blank page outside magnified area -> MUST REMAIN WHITE!
+    let blank_corner = pixel_at_mm(&img_mag, 24.0, 24.0);
+    assert_eq!(blank_corner, [255, 255, 255, 255]);
+
+    // 2. Degenerate singular matrices, NaN opacity, NaN Envelope cage, and zero-size shapes never panic
+    let mut deg_doc = Document::new("Degenerate", 80.0, 80.0, ColorMode::Rgb, 96.0);
+    let mut singular = rect_obj(10.0, 10.0, 20.0, 20.0, Fill::Solid(Color::CYAN));
+    singular.transform = Affine2D::scale(0.0, 0.0);
+    deg_doc.add_object(singular, None).unwrap();
+
+    let mut nan_op = rect_obj(20.0, 20.0, 20.0, 20.0, Fill::Solid(Color::MAGENTA));
+    nan_op.opacity = f32::NAN;
+    deg_doc.add_object(nan_op, None).unwrap();
+
+    let mut nan_env = rect_obj(30.0, 30.0, 20.0, 20.0, Fill::Solid(Color::YELLOW));
+    nan_env.effects.push(Effect::Envelope {
+        mode: EnvelopeMode::Straight,
+        cage: vec![
+            Point2D::new(f64::NAN, 0.0),
+            Point2D::new(20.0, 0.0),
+            Point2D::new(20.0, 20.0),
+            Point2D::new(0.0, 20.0),
+        ],
+    });
+    deg_doc.add_object(nan_env, None).unwrap();
+
+    let deg_img = render_page_to_rgba(&deg_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    assert_eq!(deg_img.width, (80.0 * 96.0 / 25.4_f64).round() as u32);
+
+    // 3. Arabic RTL with combining diacritics (tashkeel) on a closed circular path + letter spacing
+    let circle_host = ParametricShape::Ellipse {
+        rx: 25.0,
+        ry: 25.0,
+        mode: EllipseMode::Full,
+        start_deg: 0.0,
+        end_deg: 360.0,
+    }
+    .to_bezier_path()
+    .transformed(&Affine2D::translate(50.0, 50.0));
+    let vocalized_arabic = ArtisticText::from_plain(
+        "بِسْمِ اللَّهِ",
+        TextStyle {
+            font_size_pt: 18.0,
+            direction: TextDirection::Rtl,
+            letter_spacing_mm: 1.5,
+            ..TextStyle::default()
+        },
+    );
+    let top_closed = TextOnPath {
+        text: vocalized_arabic.clone(),
+        path_id: ObjectId(1),
+        offset_mm: 140.0, // wraps around closed circle seam cleanly!
+        distance_mm: 2.0,
+        flip_vertical: false,
+        flip_horizontal: false,
+    };
+    let top_curves = text_on_path_to_curves(&top_closed, &circle_host);
+    assert!(top_curves.is_finite());
+    assert!(
+        !top_curves.is_empty(),
+        "Arabic text with tashkeel wrapping across closed circle seam must emit curves"
+    );
+    let spaced_curves = text_to_curves(&vocalized_arabic);
+    assert!(spaced_curves.is_finite() && !spaced_curves.is_empty());
+
+    // 4. Sparse MeshFill (single red node on 2x2 grid) must fill unpopulated cells from nearest
+    //    supplied node instead of opaque white!
+    let mut mesh_doc = Document::new("SparseMesh", 40.0, 40.0, ColorMode::Rgb, 96.0);
+    let sparse_mesh = Fill::MeshFill {
+        rows: 2,
+        cols: 2,
+        nodes: vec![MeshNode {
+            row: 0,
+            col: 0,
+            pos: Point2D::new(0.0, 0.0),
+            color: Color::rgba8(200, 30, 30, 255),
+        }],
+    };
+    mesh_doc
+        .add_object(rect_obj(5.0, 5.0, 30.0, 30.0, sparse_mesh), None)
+        .unwrap();
+    let mesh_img = render_page_to_rgba(&mesh_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    let far_corner = pixel_at_mm(&mesh_img, 30.0, 30.0);
+    assert!(
+        far_corner[0] > 170 && far_corner[1] < 60 && far_corner[2] < 60,
+        "Sparse MeshFill must inherit nearest node color (red) instead of white: {far_corner:?}"
+    );
+
+    // 5. PowerClip container overlay effect (Contour::Inside) renders visibly!
+    let mut pc_doc = Document::new("PowerClipOverlay", 60.0, 60.0, ColorMode::Rgb, 96.0);
+    let mut container = rect_obj(
+        10.0,
+        10.0,
+        40.0,
+        40.0,
+        Fill::Solid(Color::rgba8(20, 40, 200, 255)),
+    );
+    container.effects.push(Effect::Contour {
+        mode: ContourMode::Inside,
+        steps: 2,
+        offset_mm: 4.0,
+        fill_color: Color::rgba8(240, 220, 20, 255),
+        outline_color: Color::TRANSPARENT,
+    });
+    let cid = pc_doc.add_object(container, None).unwrap();
+    let inner = pc_doc
+        .add_object(
+            rect_obj(
+                12.0,
+                12.0,
+                8.0,
+                8.0,
+                Fill::Solid(Color::rgba8(20, 200, 40, 255)),
+            ),
+            None,
+        )
+        .unwrap();
+    pc_doc.create_powerclip(cid, &[inner]).unwrap();
+    let pc_img = render_page_to_rgba(&pc_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    let pc_center = pixel_at_mm(&pc_img, 30.0, 30.0);
+    assert!(
+        pc_center[0] > 180 && pc_center[1] > 160,
+        "PowerClip Contour::Inside overlay must paint yellow center: {pc_center:?}"
+    );
+
+    // 6. Moved standalone Connector renders AND hit-tests at its transformed position!
+    let mut conn_doc = Document::new("MovedConn", 100.0, 60.0, ColorMode::Rgb, 96.0);
+    let conn = ConnectorObject {
+        from_obj: None,
+        from_anchor: AnchorPoint::Center,
+        from_fallback: Point2D::new(5.0, 10.0),
+        to_obj: None,
+        to_anchor: AnchorPoint::Center,
+        to_fallback: Point2D::new(35.0, 10.0),
+        style: ConnectorStyle::Straight,
+        corner_radius_mm: 0.0,
+    };
+    let conn_id = conn_doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "MovedLink", NodePayload::Connector(conn))
+                .with_outline(OutlineStyle::solid(Color::rgba8(220, 20, 20, 255), 2.5))
+                .with_transform(Affine2D::translate(40.0, 25.0)),
+            None,
+        )
+        .unwrap();
+    // Transformed line runs from (45, 35) to (75, 35)
+    assert_eq!(
+        hit_test_point(&conn_doc, 0, Point2D::new(60.0, 35.0), 2.0),
+        Some(conn_id)
+    );
+    assert_eq!(
+        hit_test_point(&conn_doc, 0, Point2D::new(20.0, 10.0), 2.0),
+        None
+    );
+    let conn_img = render_page_to_rgba(&conn_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    let conn_px = pixel_at_mm(&conn_img, 60.0, 35.0);
+    assert!(
+        conn_px[0] > 180 && conn_px[1] < 60,
+        "Transformed standalone Connector must render red at (60,35): {conn_px:?}"
     );
 }

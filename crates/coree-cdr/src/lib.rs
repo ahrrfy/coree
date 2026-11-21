@@ -20,6 +20,7 @@ pub mod fixtures;
 pub mod inspector;
 pub mod limits;
 pub mod riff;
+pub mod zcf;
 
 use crate::cdr_riff::{
     is_cdr_form_type, is_cdt_form_type, parse_cdr_riff, write_cdr_riff, RiffWriteOptions,
@@ -45,6 +46,7 @@ pub use limits::{
     read_file_bounded, CodecLimits, MAX_BITMAP_DIM, MAX_CHUNKS, MAX_COMPRESSION_RATIO,
     MAX_TREE_DEPTH, MAX_UNCOMPRESSED_BYTES, MAX_ZIP_ENTRIES,
 };
+pub use zcf::extract_cdr_preview_png;
 
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-cdr";

@@ -42,6 +42,115 @@ pub struct MeshNode {
     pub color: Color,
 }
 
+/// Built-in PostScript-style procedural vector/hatching fill presets encoded via
+/// [`Fill::TextureFill`] with `"ps:<id>"` preset identifiers for 100% enum compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PostScriptFillPreset {
+    #[default]
+    Hatch,
+    CrossHatch,
+    Checker,
+    PolkaDots,
+    Waves,
+    Bricks,
+    RadialBurst,
+    HexGrid,
+    Woodgrain,
+    HalftoneDots,
+}
+
+impl PostScriptFillPreset {
+    /// All 10 built-in PostScript procedural fill presets.
+    pub const ALL: [Self; 10] = [
+        Self::Hatch,
+        Self::CrossHatch,
+        Self::Checker,
+        Self::PolkaDots,
+        Self::Waves,
+        Self::Bricks,
+        Self::RadialBurst,
+        Self::HexGrid,
+        Self::Woodgrain,
+        Self::HalftoneDots,
+    ];
+
+    /// Canonical lowercase identifier suffix (without the `"ps:"` prefix).
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Hatch => "hatch",
+            Self::CrossHatch => "cross_hatch",
+            Self::Checker => "checker",
+            Self::PolkaDots => "polka_dots",
+            Self::Waves => "waves",
+            Self::Bricks => "bricks",
+            Self::RadialBurst => "radial_burst",
+            Self::HexGrid => "hex_grid",
+            Self::Woodgrain => "woodgrain",
+            Self::HalftoneDots => "halftone_dots",
+        }
+    }
+
+    /// Human-readable display label for UI pickers.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Hatch => "Hatch",
+            Self::CrossHatch => "Cross-Hatch",
+            Self::Checker => "Checker",
+            Self::PolkaDots => "Polka Dots",
+            Self::Waves => "Waves",
+            Self::Bricks => "Bricks",
+            Self::RadialBurst => "Radial Burst",
+            Self::HexGrid => "Hex Grid",
+            Self::Woodgrain => "Woodgrain",
+            Self::HalftoneDots => "Halftone Dots",
+        }
+    }
+
+    /// Encoded preset string (`"ps:<id>"`) stored in [`Fill::TextureFill::preset`].
+    #[must_use]
+    pub fn preset_str(self) -> String {
+        format!("ps:{}", self.id())
+    }
+
+    /// Encodes this PostScript preset as a backwards-compatible [`Fill::TextureFill`].
+    #[must_use]
+    pub fn to_fill(self, fg: Color, bg: Color, seed: u64) -> Fill {
+        Fill::TextureFill {
+            preset: self.preset_str(),
+            seed,
+            fg,
+            bg,
+        }
+    }
+
+    /// Parses a `"ps:<id>"` preset string into its typed [`PostScriptFillPreset`].
+    ///
+    /// Returns `None` for non-PostScript texture presets (such as `"clouds"` or `"marble"`).
+    #[must_use]
+    pub fn from_preset_str(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        let rest = trimmed
+            .strip_prefix("ps:")
+            .or_else(|| trimmed.strip_prefix("PS:"))?;
+        let normalized = rest.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "hatch" => Some(Self::Hatch),
+            "cross_hatch" | "crosshatch" => Some(Self::CrossHatch),
+            "checker" | "checkerboard" => Some(Self::Checker),
+            "polka_dots" | "polkadots" | "dots" => Some(Self::PolkaDots),
+            "waves" | "wave" => Some(Self::Waves),
+            "bricks" | "brick" => Some(Self::Bricks),
+            "radial_burst" | "radialburst" | "sunburst" => Some(Self::RadialBurst),
+            "hex_grid" | "hexgrid" | "honeycomb" => Some(Self::HexGrid),
+            "woodgrain" | "wood_grain" => Some(Self::Woodgrain),
+            "halftone_dots" | "halftonedots" | "halftone" => Some(Self::HalftoneDots),
+            _ => None,
+        }
+    }
+}
+
 /// Complete vector fill model covering solid, fountain/gradient, pattern, texture, and mesh fills.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum Fill {
@@ -347,5 +456,23 @@ mod tests {
         assert!(cut.is_visible());
         assert!((cut.effective_width_mm() - HAIRLINE_WIDTH_MM).abs() < 1e-9);
         assert!(!OutlineStyle::none().is_visible());
+
+        for preset in PostScriptFillPreset::ALL {
+            let fill = preset.to_fill(Color::BLACK, Color::WHITE, 42);
+            match fill {
+                Fill::TextureFill {
+                    preset: p_str,
+                    seed,
+                    ..
+                } => {
+                    assert!(p_str.starts_with("ps:"));
+                    assert_eq!(seed, 42);
+                    assert_eq!(PostScriptFillPreset::from_preset_str(&p_str), Some(preset));
+                }
+                _ => panic!("expected Fill::TextureFill"),
+            }
+        }
+        assert_eq!(PostScriptFillPreset::from_preset_str("clouds"), None);
+        assert_eq!(PostScriptFillPreset::from_preset_str("ps:unknown"), None);
     }
 }

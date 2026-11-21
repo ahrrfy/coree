@@ -234,6 +234,11 @@ pub fn add_qr_code_to_document(
     options: &QrCodeOptions,
     layer_id: Option<LayerId>,
 ) -> ProdResult<ObjectId> {
+    if !origin.is_finite() {
+        return Err(ProdError::BarcodeError(
+            "QR code origin must be finite".into(),
+        ));
+    }
     let qr = generate_qr_code(data, options)?;
     let mut children = Vec::new();
 
@@ -386,19 +391,28 @@ pub fn generate_barcode(
     data: &str,
     options: &BarcodeOptions,
 ) -> ProdResult<BarcodeOutput> {
-    if !options.module_width_mm.is_finite() || options.module_width_mm <= 0.0 {
+    if !options.module_width_mm.is_finite()
+        || options.module_width_mm <= 0.0
+        || options.module_width_mm > 1_000.0
+    {
         return Err(ProdError::BarcodeError(
-            "module_width_mm must be positive and finite".into(),
+            "module_width_mm must be finite in (0, 1000]".into(),
         ));
     }
-    if !options.bar_height_mm.is_finite() || options.bar_height_mm <= 0.0 {
+    if !options.bar_height_mm.is_finite()
+        || options.bar_height_mm <= 0.0
+        || options.bar_height_mm > 10_000.0
+    {
         return Err(ProdError::BarcodeError(
-            "bar_height_mm must be positive and finite".into(),
+            "bar_height_mm must be finite in (0, 10000]".into(),
         ));
     }
-    if !options.guard_extension_mm.is_finite() || options.guard_extension_mm < 0.0 {
+    if !options.guard_extension_mm.is_finite()
+        || options.guard_extension_mm < 0.0
+        || options.guard_extension_mm > 1_000.0
+    {
         return Err(ProdError::BarcodeError(
-            "guard_extension_mm must be non-negative and finite".into(),
+            "guard_extension_mm must be finite in [0, 1000]".into(),
         ));
     }
     if options.quiet_zone_modules > MAX_QUIET_ZONE_MODULES {
@@ -430,6 +444,11 @@ pub fn generate_barcode(
         0.0
     };
     let total_h = options.bar_height_mm + guard_ext.max(text_zone_h);
+    if !total_w.is_finite() || !total_h.is_finite() || total_w > MAX_QR_SIZE_MM {
+        return Err(ProdError::BarcodeError(
+            "computed barcode dimensions overflowed safe physical bounds".into(),
+        ));
+    }
 
     // Emit merged vector bar rectangles (splitting only if bar height changes at guard indices)
     let mut subpaths = Vec::new();
@@ -480,6 +499,11 @@ pub fn add_barcode_to_document(
     options: &BarcodeOptions,
     layer_id: Option<LayerId>,
 ) -> ProdResult<ObjectId> {
+    if !origin.is_finite() {
+        return Err(ProdError::BarcodeError(
+            "barcode origin must be finite".into(),
+        ));
+    }
     let out = generate_barcode(symbology, data, options)?;
     let mut children = Vec::new();
 

@@ -306,7 +306,7 @@ fn collect_object_paths(
         NodePayload::PowerClip { container, .. } => out.push(container.transformed(&world_xf)),
         NodePayload::Table(t) => out.push(t.to_grid_paths().transformed(&world_xf)),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints(c);
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
             out.push(c.route_path(a, b));
         }
         NodePayload::Group(children) => {
