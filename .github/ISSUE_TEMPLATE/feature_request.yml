@@ -1,0 +1,19 @@
+name: Feature Request
+description: Suggest an improvement or new production capability for coree
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow Problem
+      description: What graphic design, layout, signage, or print-production task are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the ideal offline-first Rust behavior.
+    validations:
+      required: true

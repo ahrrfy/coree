@@ -31,11 +31,25 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run workspace tests
-        run: cargo test --workspace
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run workspace unit & integration tests
+        run: cargo test --workspace --all-targets
+
+      - name: Run workspace doc tests
+        run: cargo test --workspace --doc
 
       - name: Run Clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build release binaries
+      - name: Build release binary
         run: cargo build --release
+
+      - name: Smoke test release binary (Linux)
+        if: runner.os == 'Linux'
+        run: ./target/release/coree --diagnostics
+
+      - name: Smoke test release binary (Windows)
+        if: runner.os == 'Windows'
+        run: .\target\release\coree.exe --diagnostics

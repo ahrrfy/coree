@@ -1,0 +1,34 @@
+name: CDR / CDT / CMX / CPT File Compatibility
+description: Report a file import/export compatibility issue for .cdr, .cdt, .cmx, or .cpt files
+title: "[CDR Compat]: "
+labels: ["file-format"]
+body:
+  - type: dropdown
+    id: format
+    attributes:
+      label: File Format & Era
+      options:
+        - .cdr (RIFF v4–v13 / X3)
+        - .cdr (ZIP X4–X5)
+        - .cdr (ZIP X6–2025)
+        - .cdt (Template)
+        - .cmx (Presentation Exchange)
+        - .cpt (Raster Image)
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: inspect
+    attributes:
+      label: Output of `coree inspect <file> --json`
+      description: Helps diagnose chunks, warnings, and unknown tags without sharing sensitive artwork.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected vs Actual Result
+      description: Describe missing shapes, colors, text encoding (e.g., CP1256 Arabic), or export differences.
+    validations:
+      required: true

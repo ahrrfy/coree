@@ -4,8 +4,19 @@
 
 **كورِي (`coree`) — حزمة رسوميات متجهية وتخطيط صفحات وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر — لينكس أولاً، تعمل محلياً دون اتصال بالإنترنت**
 
+[![CI](https://github.com/ahrrfy/coree/actions/workflows/ci.yml/badge.svg)](https://github.com/ahrrfy/coree/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-3ea6ff.svg)](LICENSE)
 [![Rust: #![forbid(unsafe_code)]](https://img.shields.io/badge/Rust-forbid(unsafe__code)-f6ad3c.svg)](SECURITY.md)
+
+---
+
+## Visual Showcase / معرض المخرجات الفعلية
+
+All images below are rendered directly by `coree render` (verified 100.0% pixel-deterministic):
+
+| Live Optical Lenses & Mesh Fill | Arabic RTL/Kashida + Parametric Dieline + QR/EAN-13 | Multipage View |
+| :---: | :---: | :---: |
+| ![Lenses and Vectors](docs/images/showcase_lenses_vectors.png) | ![Arabic Packaging Dieline](docs/images/showcase_arabic_packaging.png) | ![Multipage View](docs/images/showcase_multipage.png) |
 
 ---
 

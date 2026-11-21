@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package-linux:
+    name: Package Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke test binary
+        run: ./target/release/coree --diagnostics
+
+      - name: Assemble Linux release archive
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG="coree-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${PKG}/packaging/linux"
+          cp target/release/coree "dist/${PKG}/coree"
+          cp packaging/linux/coree.svg packaging/linux/coree.desktop packaging/linux/coree-mime.xml packaging/linux/install-linux.sh "dist/${PKG}/packaging/linux/"
+          cp LICENSE NOTICE README.md CHANGELOG.md "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          sha256sum "dist/${PKG}.tar.gz" > "dist/${PKG}.tar.gz.sha256"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  package-windows:
+    name: Package Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke test binary
+        run: .\target\release\coree.exe --diagnostics
+
+      - name: Assemble Windows release archive
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $pkg = "coree-$tag-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
+          Copy-Item "target/release/coree.exe" "dist/$pkg/coree.exe"
+          Copy-Item "LICENSE", "NOTICE", "README.md", "CHANGELOG.md" "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip" -Force
+          $hash = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $pkg.zip" | Out-File -Encoding ascii "dist/$pkg.zip.sha256"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [package-linux, package-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

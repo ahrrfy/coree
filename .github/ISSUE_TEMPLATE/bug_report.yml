@@ -1,0 +1,41 @@
+name: Bug Report
+description: Report a crash, rendering glitch, or unexpected behavior in coree
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Exact clicks, tools, or CLI commands to reproduce.
+      placeholder: |
+        1. Open coree
+        2. Create a rectangle and apply Lens -> FishEye
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Output of `coree --diagnostics`
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux (Wayland)
+        - Linux (X11)
+        - Windows 11 / 10
+        - Other
+    validations:
+      required: true

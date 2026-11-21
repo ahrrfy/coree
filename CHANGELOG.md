@@ -1,0 +1,19 @@
+# Changelog
+
+All notable changes to **`coree`** are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-11-21
+
+### Added
+- **7-Crate Pure-Rust Workspace (`MPL-2.0`, `#![forbid(unsafe_code)]`):**
+  - `coree-core`: Scene graph, 8 physical units (`mm`..`CdrTenthMicron`), 6 color models (`RGB`/`CMYK`/`HSL`/`Lab`/`Gray`/`Spot`), procedural CMYK/RGB palettes, 8 live parametric shapes, Bezier node editing & sculpting tools, Knife/Virtual Segment Delete/Eraser, Smart Drawing, LiveSketch, Artistic Media, 9 `i_overlay` Boolean shaping operations, all 11 Lens models, 10 live vector effects, 19 raster filters, Arabic RTL/Kashida text model, `VectorTable`, live Dimensions & Connectors, R-Tree `SpatialIndex`, 28 serializable deterministic `CommandOp`s, transactional undo/redo, and sandboxed Rhai macro recording.
+  - `coree-cdr`: Clean-room Pure-Rust `.cdr` (RIFF v4–v13, ZIP X4–X5, ZIP X6–2025), `.cdt`, `.cmx` (16/32-bit RIFF & RIFX), and `.cpt` codecs with byte-exact Unknown-Chunk Passthrough, legacy Arabic Windows-1256 (`CP1256`) text decoding, CDR Structural Inspector, and strict Zip-Bomb / Zip-Slip / depth / OOM guards.
+  - `coree-io`: Atomic `.coree` native ZIP format, hardened `.svg`/`.svgz` import & export, print-ready DeviceCMYK/RGB PDF 1.7 export with Bleed/Crop/Registration/Color Bars, PostScript EPS Level 3, AutoCAD DXF & HPGL `.plt` plotter export, PNG/JPEG/WebP/TIFF/BMP with PNG `pHYs` DPI, and `.gpl`/`.ase`/`.pal` palette I/O.
+  - `coree-storage`: Offline-first embedded SQLite 3 (WAL mode, 10-table schema), SHA-256 autosave snapshots, deterministic `command_journal` crash recovery, recents/palettes/templates/layouts/preferences, local SFNT system font scanner with Arabic coverage detection, and non-blocking Rayon background job pool.
+  - `coree-render`: Backend-agnostic `CanvasBackend` (`tiny-skia`), Rayon 256×256 `DirtyTileCache` with Frustum Culling & drag LOD, all 11 live optical Lenses (with `Frozen`, `Viewpoint`, `RemoveFace`), Mesh Fill, 2.5D Extrude & vector effects, `cosmic-text` Arabic RTL/BiDi/Kashida shaping + `Fit Text to Path` + real glyph curves, integrated Raster Studio (brushes/masks/cutout/19 filters), 3-mode Vector Trace (`Quick`, `Outline`, `Centerline`), Smart Fill, and spatial hit-testing/snapping.
+  - `coree-prod`: CMYK + Spot separations & Overprint simulation, N-Up / Saddle-Stitch Booklet / Tiling imposition, Print Marks, Preflight Inspector, Collect for Output, one-click `CutContour`, 4 Parametric Packaging Dielines (`TuckEndBox`, `Envelope`, `ShoppingBag`, `StickerSheet`), live Path Length & Area Meter, vector QR & 1D Barcodes (`EAN-13`/`EAN-8`/`UPC-A`/`Code128`/`Code39`), bilingual UTF-8 CSV Print Merge, CIE76 Find & Replace, and sandboxed Rhai automation macros.
+  - `coree-app`: Native Linux/Windows desktop GUI (`eframe 0.37` / `egui 0.37` / `egui_dock 0.22` / pure-Rust `rfd` XDG Portal) with 15 Toolbox Flyout groups (62 tools), Context Property Bar, 20px drag-to-guide Rulers, Multipage View, dual-click Transform/Rotate handles with movable pivot, 14 dockable panels, right Color Palette Bar (L-click Fill / R-click Outline), Command Palette, WCAG 2.2 AA/AAA Dark/Light/High-Contrast themes, and 9-subcommand headless CLI (`coree`).
+- **Linux & Windows Packaging:** Zero-sudo Linux installer (`packaging/linux/install-linux.sh`), `.desktop` entry, freedesktop MIME associations, SVG icon, AppImage staging script, Windows build guide, WiX v4 MSI manifest, and Linux + Windows GitHub Actions CI & Release workflows.
+- **Verification:** 202/202 automated tests green (`0` failures), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean, 35/35 WCAG AA/AAA contrast pairs passing, and 100.0% deterministic pixel rendering verified.
