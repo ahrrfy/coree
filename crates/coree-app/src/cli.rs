@@ -47,6 +47,10 @@ pub struct Cli {
     #[arg(long)]
     pub diagnostics: bool,
 
+    /// Launch an independent studio window instead of forwarding files to the running instance.
+    #[arg(long)]
+    pub new_window: bool,
+
     /// Optional document file(s) to open directly as tabs in the desktop GUI (supports `Exec=coree %F` and Windows file associations).
     #[arg(value_name = "FILES")]
     pub files: Vec<PathBuf>,

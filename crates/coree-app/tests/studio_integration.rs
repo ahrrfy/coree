@@ -1743,3 +1743,210 @@ fn regression_edit_fill_f11_outline_pen_f12_guide_ops_and_arabic_ui() {
     );
     let _ = &mut hidpi_in;
 }
+
+#[test]
+fn wave_d_v030_break_effect_powerclip_desktop_icc_and_workspace_bundle_suite() {
+    use coree_app::shortcuts::{shortcut_label_for, ShortcutAction, ShortcutProfile};
+    use coree_app::state::StudioApp;
+    use coree_app::theme::StudioLanguage;
+    use coree_core::{
+        generate_minimal_cmyk_icc_v2, Affine2D, BuiltinIccProfile, Color, CommandOp, ContourMode,
+        CornerStyle, Effect, Layer, NodePayload, ObjectId, ParametricShape, Point2D, SceneObject,
+    };
+    use coree_storage::StorageDb;
+
+    let mut app = StudioApp::new_headless();
+
+    // 1. Break Effect Apart (`Ctrl+K`) lowers attached effects into independent editable shapes + Undo!
+    let mut obj = SceneObject::new(
+        ObjectId(0),
+        "FX Emblem",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    obj.effects.push(Effect::Contour {
+        mode: ContourMode::Outside,
+        steps: 2,
+        offset_mm: 2.0,
+        fill_color: Color::CYAN,
+        outline_color: Color::BLACK,
+    });
+    let lid = app.active_tab().unwrap().active_layer_id;
+    app.execute_command(CommandOp::create_object(obj, lid))
+        .unwrap();
+    let fx_id = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .next_back()
+        .unwrap();
+    let doc_snap1 = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap1, fx_id);
+    app.break_apart_selection();
+    // Contour(2) + Base shape = 3 independent vector objects, 0 effects remaining
+    assert_eq!(app.active_tab().unwrap().document.objects.len(), 3);
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .values()
+        .all(|o| o.effects.is_empty()));
+    app.undo().unwrap();
+    assert_eq!(app.active_tab().unwrap().document.objects.len(), 1);
+    assert_eq!(
+        app.active_tab().unwrap().document.objects[&fx_id]
+            .effects
+            .len(),
+        1
+    );
+
+    // 2. PowerClip Lock Contents toggle + Desktop Layer across multi-page + Undo!
+    let child = SceneObject::new(
+        ObjectId(0),
+        "Child",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 10.0,
+            height: 10.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_transform(Affine2D::translate(15.0, 15.0));
+    let frame = SceneObject::new(
+        ObjectId(0),
+        "Frame",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 40.0,
+            height: 40.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::create_object(child, lid))
+        .unwrap();
+    let cid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .next_back()
+        .unwrap();
+    app.execute_command(CommandOp::create_object(frame, lid))
+        .unwrap();
+    let pid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .next_back()
+        .unwrap();
+    app.execute_command(CommandOp::CreatePowerClip {
+        container_id: pid,
+        content_ids: vec![cid],
+    })
+    .unwrap();
+    let doc_snap2 = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap2, pid);
+    app.set_powerclip_lock_selected(Some(false));
+    assert!(matches!(
+        app.active_tab().unwrap().document.objects[&pid].payload,
+        NodePayload::PowerClip {
+            lock_contents: false,
+            ..
+        }
+    ));
+
+    // Move FX object to cross-page Desktop layer
+    let doc_snap3 = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap3, fx_id);
+    app.move_selection_to_desktop_layer();
+    let desk_lid = app
+        .active_tab()
+        .unwrap()
+        .document
+        .desktop_layer_id()
+        .expect("Desktop layer created");
+    assert_eq!(
+        app.active_tab().unwrap().document.layer_of_object(fx_id),
+        Some(desk_lid)
+    );
+    let _ = Layer::desktop;
+
+    // 3. Attach custom ICC v2 profile and soft-proof render a frame
+    let icc_bytes =
+        generate_minimal_cmyk_icc_v2("Studio Proof CMYK", BuiltinIccProfile::IsoCoatedV2Cmyk);
+    app.active_tab_mut()
+        .unwrap()
+        .document
+        .set_custom_icc_profile(icc_bytes)
+        .unwrap();
+    app.soft_proof_cmyk = true;
+    app.sync_proof_options_to_tabs();
+    let proof_ctx = egui::Context::default();
+    let mut out = proof_ctx.run_ui(RawInput::default(), |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+
+    // 4. Full v2 WorkspaceBundle export/import + SQLite shutdown -> reload persistence
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("studio_persist.db");
+    let data_dir = dir.path().join("data");
+    {
+        let db = StorageDb::open_with_data_dir(&db_path, data_dir.clone()).expect("open sqlite db");
+        let mut app1 = StudioApp::new_with_storage(db);
+        app1.set_ui_language(StudioLanguage::Arabic);
+        app1.toolbox_two_column = true;
+        app1.custom_shortcuts
+            .set_binding(ShortcutAction::PrintDocument, "Ctrl+Alt+P")
+            .unwrap();
+        let ws_json = app1.export_workspace_json();
+
+        let mut app2 = StudioApp::new_headless();
+        app2.import_workspace_json(&ws_json)
+            .expect("import v2 workspace");
+        assert_eq!(app2.ui_language, StudioLanguage::Arabic);
+        assert!(app2.toolbox_two_column);
+        assert_eq!(
+            shortcut_label_for(
+                ShortcutProfile::ClassicStudio,
+                &app2.custom_shortcuts,
+                ShortcutAction::PrintDocument
+            ),
+            "Ctrl+Alt+P"
+        );
+
+        app1.shutdown_cleanly();
+    }
+
+    let db_reopened = StorageDb::open_with_data_dir(&db_path, data_dir).expect("reopen sqlite db");
+    let app_reloaded = StudioApp::new_with_storage(db_reopened);
+    assert_eq!(app_reloaded.ui_language, StudioLanguage::Arabic);
+    assert!(app_reloaded.toolbox_two_column);
+    assert_eq!(
+        app_reloaded
+            .custom_shortcuts
+            .combo_for(ShortcutAction::PrintDocument),
+        Some("Ctrl+Alt+P")
+    );
+    let _ = Point2D::ZERO;
+}

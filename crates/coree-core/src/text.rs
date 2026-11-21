@@ -101,12 +101,53 @@ impl Default for DropCapConfig {
     }
 }
 
+/// Controllable OpenType layout features passed to text shaping (`liga`, `calt`, `kern`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OpenTypeFeatures {
+    #[serde(default = "default_true")]
+    pub liga: bool,
+    #[serde(default = "default_true")]
+    pub calt: bool,
+    #[serde(default = "default_true")]
+    pub kern: bool,
+    #[serde(default)]
+    pub dlig: bool,
+    #[serde(default)]
+    pub smcp: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_font_weight() -> u16 {
+    400
+}
+
+impl Default for OpenTypeFeatures {
+    fn default() -> Self {
+        Self {
+            liga: true,
+            calt: true,
+            kern: true,
+            dlig: false,
+            smcp: false,
+        }
+    }
+}
+
 /// Character and paragraph formatting attributes applied to a [`TextRun`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
     pub font_family: String,
     pub font_size_pt: f64,
     pub bold: bool,
+    #[serde(default = "default_font_weight")]
+    pub font_weight: u16,
+    #[serde(default)]
+    pub bidi_font_family: Option<String>,
+    #[serde(default)]
+    pub opentype_features: OpenTypeFeatures,
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
@@ -125,6 +166,9 @@ impl Default for TextStyle {
             font_family: "Noto Sans".to_owned(),
             font_size_pt: 24.0,
             bold: false,
+            font_weight: 400,
+            bidi_font_family: None,
+            opentype_features: OpenTypeFeatures::default(),
             italic: false,
             underline: false,
             strikethrough: false,
@@ -143,6 +187,44 @@ impl TextStyle {
     #[must_use]
     pub fn font_size_mm(&self) -> f64 {
         Unit::Point.to_mm(sanitize_f64(self.font_size_pt, 12.0).max(1.0), 96.0)
+    }
+
+    /// Resolves effective numeric CSS/OpenType font weight (`100..=900`), honoring
+    /// explicit `font_weight != 400` and legacy `bold` toggles cleanly.
+    #[must_use]
+    pub fn effective_weight(&self) -> u16 {
+        let clamped = self.font_weight.clamp(100, 900);
+        if clamped != 400 {
+            clamped
+        } else if self.bold {
+            700
+        } else {
+            400
+        }
+    }
+
+    /// Sets numeric `font_weight` (`100..=900`) and synchronizes `bold` (`>= 600`).
+    pub fn set_weight(&mut self, weight: u16) {
+        let clamped = weight.clamp(100, 900);
+        self.font_weight = clamped;
+        self.bold = clamped >= 600;
+    }
+
+    /// Returns the preferred font family for the given directional script context
+    /// (`bidi_font_family` when RTL and configured, otherwise `font_family`).
+    #[must_use]
+    pub fn family_for_direction(&self, dir: TextDirection) -> &str {
+        if dir == TextDirection::Rtl {
+            if let Some(bidi) = self
+                .bidi_font_family
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return bidi;
+            }
+        }
+        self.font_family.as_str()
     }
 }
 

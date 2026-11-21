@@ -10,7 +10,9 @@ use coree_core::{
     Affine2D, BuiltinIccProfile, Document, GuideOrientation, PerspectiveGridMode, Rect2D,
     RenderingIntent, SpatialIndex,
 };
+use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Tile edge length in screen pixels (`256 × 256`).
 pub const TILE_SIZE_PX: u32 = 256;
@@ -277,6 +279,46 @@ impl DirtyTileCache {
         }
 
         let world_to_screen = viewport.world_to_screen_transform();
+        let dirty_count = self.dirty_tile_count();
+        let has_frozen = doc
+            .objects
+            .values()
+            .any(|o| o.lens.as_ref().is_some_and(|l| l.frozen));
+
+        if dirty_count >= 2 && !has_frozen {
+            let rendered_counter = AtomicUsize::new(0);
+            let spatial_ref = &self.spatial_indices;
+            self.tiles.par_iter_mut().filter(|t| t.dirty).for_each_init(
+                SceneRenderer::new,
+                |r, tile| {
+                    let Ok(mut backend) =
+                        TinySkiaBackend::new(tile.rect_px.width, tile.rect_px.height)
+                    else {
+                        return;
+                    };
+                    let tile_transform =
+                        Affine2D::translate(-f64::from(tile.rect_px.x), -f64::from(tile.rect_px.y))
+                            .compose(&world_to_screen);
+
+                    r.render_document_with_transform(
+                        doc,
+                        viewport,
+                        tile_transform,
+                        view_mode,
+                        options,
+                        &mut backend,
+                        Some(tile.world_rect_mm),
+                        Some(spatial_ref),
+                    );
+
+                    tile.buffer = backend.into_rgba();
+                    tile.dirty = false;
+                    rendered_counter.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            return rendered_counter.load(Ordering::Relaxed);
+        }
+
         let mut rendered_count = 0usize;
 
         for tile in &mut self.tiles {
@@ -384,5 +426,57 @@ impl DirtyTileCache {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_page_to_rgba;
+    use coree_core::{Affine2D, Color, CornerStyle, Fill, ObjectId, ParametricShape, SceneObject};
+
+    #[test]
+    fn parallel_dirty_tile_cache_matches_sequential_pixel_output() {
+        let mut doc = Document::new_a4("Parallel Tiles");
+        for i in 0u8..8 {
+            let mut r = SceneObject::new(
+                ObjectId(0),
+                format!("TileBox {i}"),
+                coree_core::NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 45.0,
+                    height: 35.0,
+                    corner_radii: [3.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(f32::from(i) * 0.1, 0.35, 0.0, 0.0)))
+            .with_transform(Affine2D::translate(
+                15.0 + f64::from(i % 4) * 48.0,
+                20.0 + f64::from(i / 4) * 60.0,
+            ));
+            r.effects.clear();
+            doc.add_object(r, None).unwrap();
+        }
+
+        let vp = Viewport::new(768, 512);
+        let mut opts = RenderOptions::interactive();
+        opts.show_page_shadow = false;
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        let mut renderer = SceneRenderer::new();
+        let tiled = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+
+        // Render same viewport with a single direct backend pass
+        let mut direct_backend = crate::TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+        renderer.render_document(&doc, &vp, ViewMode::Enhanced, &opts, &mut direct_backend);
+        let direct = direct_backend.into_rgba();
+
+        assert_eq!(tiled.width, direct.width);
+        assert_eq!(tiled.height, direct.height);
+        assert_eq!(
+            tiled.rgba, direct.rgba,
+            "Rayon parallel dirty tiles must match single-pass pixel output bit-for-bit"
+        );
+        let _ = render_page_to_rgba;
     }
 }

@@ -27,6 +27,17 @@ use uuid::Uuid;
 /// Maximum recursion depth for nested groups / PowerClips / symbols to prevent stack overflow.
 const MAX_SCENE_DEPTH: usize = 64;
 
+/// Encodes arbitrary bytes as standard unpadded/padded Base64.
+#[must_use]
+pub fn encode_base64(bytes: &[u8]) -> String {
+    serde_bytes_base64::encode_raw(bytes)
+}
+
+/// Decodes standard Base64 ASCII into raw bytes.
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    serde_bytes_base64::decode_b64(input)
+}
+
 /// Pure-Rust base64 serde adapter for binary payloads (`RasterAsset::rgba_bytes`
 /// and `UnknownCdrChunk::raw_bytes`), also accepting JSON byte arrays on deserialize.
 mod serde_bytes_base64 {
@@ -36,7 +47,7 @@ mod serde_bytes_base64 {
 
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn encode_raw(bytes: &[u8]) -> String {
         let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let b0 = u32::from(chunk[0]);
@@ -64,7 +75,11 @@ mod serde_bytes_base64 {
                 encoded.push('=');
             }
         }
-        serializer.serialize_str(&encoded)
+        encoded
+    }
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&encode_raw(bytes))
     }
 
     fn decode_val(b: u8) -> Option<u8> {
@@ -78,7 +93,7 @@ mod serde_bytes_base64 {
         }
     }
 
-    fn decode_b64(input: &str) -> Result<Vec<u8>, String> {
+    pub(super) fn decode_b64(input: &str) -> Result<Vec<u8>, String> {
         let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         if !clean.len().is_multiple_of(4) {
             return Err("invalid base64 length".into());
@@ -251,6 +266,10 @@ pub enum NodePayload {
     Group(Vec<ObjectId>),
     PowerClip {
         container: Box<BezierPath>,
+        #[serde(default)]
+        container_parametric: Option<ParametricShape>,
+        #[serde(default = "default_true_lock")]
+        lock_contents: bool,
         contents: Vec<ObjectId>,
     },
     SymbolInstance(SymbolId),
@@ -331,6 +350,29 @@ pub enum MasterLayerScope {
     EvenPages,
 }
 
+const fn default_true_lock() -> bool {
+    true
+}
+
+/// Optional base64 serde wrapper for `Option<Vec<u8>>` ICC binary profile bytes.
+mod opt_serde_bytes_base64 {
+    use super::serde_bytes_base64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match val {
+            Some(bytes) => serde_bytes_base64::serialize(bytes, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        #[derive(Deserialize)]
+        struct Helper(#[serde(with = "serde_bytes_base64")] Vec<u8>);
+        Option::<Helper>::deserialize(d).map(|opt| opt.map(|h| h.0))
+    }
+}
+
 /// Layer within a page holding an ordered z-stack of top-level object IDs (index 0 = back).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
@@ -342,6 +384,9 @@ pub struct Layer {
     pub master_scope: MasterLayerScope,
     /// Marks a dedicated cutting/plotter layer (`CutContour` / dielines).
     pub is_cut_layer: bool,
+    /// Marks a cross-page shared Corel-style `Desktop` off-page holding layer.
+    #[serde(default)]
+    pub is_desktop_layer: bool,
     pub objects: Vec<ObjectId>,
 }
 
@@ -357,6 +402,23 @@ impl Layer {
             printable: true,
             master_scope: MasterLayerScope::None,
             is_cut_layer: false,
+            is_desktop_layer: false,
+            objects: Vec::new(),
+        }
+    }
+
+    /// Creates a cross-page shared `"Desktop"` layer for off-page workspace objects.
+    #[must_use]
+    pub fn desktop(id: LayerId) -> Self {
+        Self {
+            id,
+            name: "Desktop".to_owned(),
+            visible: true,
+            locked: false,
+            printable: true,
+            master_scope: MasterLayerScope::AllPages,
+            is_cut_layer: false,
+            is_desktop_layer: true,
             objects: Vec::new(),
         }
     }
@@ -643,6 +705,10 @@ pub struct Document {
     pub perspective_grid: PerspectiveGridConfig,
     pub metadata: DocumentMetadata,
     pub unknown_doc_chunks: Vec<UnknownCdrChunk>,
+    #[serde(default, with = "opt_serde_bytes_base64")]
+    pub custom_icc_profile: Option<Vec<u8>>,
+    #[serde(default)]
+    pub custom_icc_name: Option<String>,
     pub next_id: u64,
 }
 
@@ -690,6 +756,8 @@ impl Document {
             perspective_grid: PerspectiveGridConfig::default(),
             metadata: DocumentMetadata::default(),
             unknown_doc_chunks: Vec::new(),
+            custom_icc_profile: None,
+            custom_icc_name: None,
             next_id,
         }
     }
@@ -1213,9 +1281,9 @@ impl Document {
                     reference.center().y - bb.center().y,
                 ),
             };
-            if let Some(obj) = self.objects.get_mut(&id) {
+            if let Some(obj) = self.objects.get(&id) {
                 if !obj.locked {
-                    obj.transform = Affine2D::translate(dx, dy).compose(&obj.transform);
+                    let _ = self.transform_object(id, Affine2D::translate(dx, dy));
                 }
             }
         }
@@ -1353,9 +1421,9 @@ impl Document {
         };
 
         for (id, dx, dy) in deltas {
-            if let Some(obj) = self.objects.get_mut(&id) {
+            if let Some(obj) = self.objects.get(&id) {
                 if !obj.locked {
-                    obj.transform = Affine2D::translate(dx, dy).compose(&obj.transform);
+                    let _ = self.transform_object(id, Affine2D::translate(dx, dy));
                 }
             }
         }
@@ -1375,20 +1443,28 @@ impl Document {
             .cloned()
             .ok_or(CoreError::ObjectNotFound(container_id))?;
 
-        // Extract clipping contour and any already-clipped children from container
-        let (clip_path, existing_contents) = match &container_obj.payload {
-            NodePayload::Path(p) => (p.clone(), Vec::new()),
-            NodePayload::Shape(s) => (s.to_bezier_path(), Vec::new()),
-            NodePayload::PowerClip {
-                container,
-                contents,
-            } => ((**container).clone(), contents.clone()),
-            _ => {
-                return Err(CoreError::InvalidGeometry(
-                    "PowerClip container must be a Path or ParametricShape".into(),
-                ));
-            }
-        };
+        // Extract clipping contour, optional parametric container shape, and existing clipped children
+        let (clip_path, container_parametric, lock_contents, existing_contents) =
+            match &container_obj.payload {
+                NodePayload::Path(p) => (p.clone(), None, true, Vec::new()),
+                NodePayload::Shape(s) => (s.to_bezier_path(), Some(s.clone()), true, Vec::new()),
+                NodePayload::PowerClip {
+                    container,
+                    container_parametric,
+                    lock_contents,
+                    contents,
+                } => (
+                    (**container).clone(),
+                    container_parametric.clone(),
+                    *lock_contents,
+                    contents.clone(),
+                ),
+                _ => {
+                    return Err(CoreError::InvalidGeometry(
+                        "PowerClip container must be a Path or ParametricShape".into(),
+                    ));
+                }
+            };
         let existing_set: HashSet<ObjectId> = existing_contents.iter().copied().collect();
 
         // Validate newly added contents, deduplicate against existing contents, and guard cycles
@@ -1444,6 +1520,8 @@ impl Document {
             merged_contents.extend(new_contents);
             obj.payload = NodePayload::PowerClip {
                 container: Box::new(clip_path),
+                container_parametric,
+                lock_contents,
                 contents: merged_contents,
             };
         }
@@ -1451,8 +1529,73 @@ impl Document {
         Ok(container_id)
     }
 
+    /// Toggles `lock_contents` on an existing [`NodePayload::PowerClip`].
+    pub fn set_powerclip_lock_contents(
+        &mut self,
+        powerclip_id: ObjectId,
+        locked: bool,
+    ) -> CoreResult<()> {
+        let obj = self
+            .objects
+            .get_mut(&powerclip_id)
+            .ok_or(CoreError::ObjectNotFound(powerclip_id))?;
+        if let NodePayload::PowerClip { lock_contents, .. } = &mut obj.payload {
+            *lock_contents = locked;
+            self.touch();
+            Ok(())
+        } else {
+            Err(CoreError::InvalidParameter(format!(
+                "{powerclip_id} is not a PowerClip"
+            )))
+        }
+    }
+
+    /// Transforms object `id` by `affine` in world/parent space, keeping unlocked PowerClip
+    /// contents anchored in place when `lock_contents == false`.
+    pub fn transform_object(&mut self, id: ObjectId, affine: Affine2D) -> CoreResult<()> {
+        if !affine.is_finite() {
+            return Err(CoreError::InvalidGeometry(
+                "transform contains non-finite entries".into(),
+            ));
+        }
+        let (old_xf, unlocked_contents) = {
+            let obj = self
+                .objects
+                .get_mut(&id)
+                .ok_or(CoreError::ObjectNotFound(id))?;
+            if obj.locked {
+                return Err(CoreError::ObjectLocked(id));
+            }
+            let old = obj.transform;
+            obj.transform = affine.compose(&old);
+            let unlocked = match &obj.payload {
+                NodePayload::PowerClip {
+                    lock_contents: false,
+                    contents,
+                    ..
+                } => contents.clone(),
+                _ => Vec::new(),
+            };
+            (old, unlocked)
+        };
+        if !unlocked_contents.is_empty() {
+            let new_xf = self.objects[&id].transform;
+            if let Some(inv_new) = new_xf.inverse() {
+                let compensate = inv_new.compose(&old_xf);
+                for cid in unlocked_contents {
+                    if let Some(child) = self.objects.get_mut(&cid) {
+                        child.transform = compensate.compose(&child.transform);
+                    }
+                }
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
     /// Extracts all clipped contents from `powerclip_id` back into its enclosing layer
-    /// or parent container and restores `powerclip_id` to an ordinary [`NodePayload::Path`].
+    /// or parent container and restores `powerclip_id` to its original parametric shape (if any)
+    /// or an ordinary [`NodePayload::Path`].
     pub fn extract_powerclip(&mut self, powerclip_id: ObjectId) -> CoreResult<Vec<ObjectId>> {
         let obj = self
             .objects
@@ -1461,6 +1604,8 @@ impl Document {
             .ok_or(CoreError::ObjectNotFound(powerclip_id))?;
         let NodePayload::PowerClip {
             container,
+            container_parametric,
+            lock_contents: _,
             contents,
         } = obj.payload
         else {
@@ -1478,7 +1623,10 @@ impl Document {
         }
 
         if let Some(target) = self.objects.get_mut(&powerclip_id) {
-            target.payload = NodePayload::Path(*container);
+            target.payload = match container_parametric {
+                Some(shape) => NodePayload::Shape(shape),
+                None => NodePayload::Path(*container),
+            };
         }
 
         self.insert_siblings_after(powerclip_id, &contents);
@@ -1539,6 +1687,7 @@ impl Document {
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 orphaned_contents = contents.clone();
                 (**container).clone()
@@ -1634,11 +1783,24 @@ impl Document {
     }
 
     /// Computes the world-space axis-aligned bounding box of `id`, accounting for its
-    /// transform and any nested group children. Returns `None` if empty, cyclic, or non-finite.
+    /// own `transform` and any nested group children (without walking ancestor containers;
+    /// use [`Self::world_object_bounds`] when `id` may live inside a Group/PowerClip).
     #[must_use]
     pub fn object_bounds(&self, id: ObjectId) -> Option<Rect2D> {
         let mut visiting = HashSet::new();
         self.object_bounds_inner(id, &Affine2D::IDENTITY, 0, &mut visiting)
+    }
+
+    /// Computes the full world-space axis-aligned bounding box of `id`, including any
+    /// enclosing ancestor `Group` or `PowerClip` container transforms.
+    #[must_use]
+    pub fn world_object_bounds(&self, id: ObjectId) -> Option<Rect2D> {
+        let parent_xf = self
+            .parent_container_of(id)
+            .and_then(|pid| self.world_transform_of(pid))
+            .unwrap_or(Affine2D::IDENTITY);
+        let mut visiting = HashSet::new();
+        self.object_bounds_inner(id, &parent_xf, 0, &mut visiting)
     }
 
     fn object_bounds_inner(
@@ -1834,6 +1996,34 @@ impl Document {
         };
         let mut entries = Vec::new();
         let mut z = 0usize;
+        // Include cross-page shared Desktop / AllPages layers from other pages, plus this page's layers.
+        for (p_idx, p) in self.pages.iter().enumerate() {
+            if p_idx == page_index {
+                continue;
+            }
+            for layer in &p.layers {
+                if !layer.visible
+                    || !(layer.is_desktop_layer || layer.master_scope == MasterLayerScope::AllPages)
+                {
+                    continue;
+                }
+                for &oid in &layer.objects {
+                    if let Some(obj) = self.objects.get(&oid) {
+                        if obj.visible {
+                            if let Some(bounds) = self.object_bounds(oid).filter(|b| b.is_finite())
+                            {
+                                entries.push(SpatialObjectEntry {
+                                    id: oid,
+                                    z_order: z,
+                                    bounds,
+                                });
+                            }
+                        }
+                    }
+                    z += 1;
+                }
+            }
+        }
         for layer in &page.layers {
             if !layer.visible {
                 continue;
@@ -2059,6 +2249,66 @@ impl Document {
         }
         self.touch();
         Ok(())
+    }
+
+    /// Finds the cross-page shared `"Desktop"` layer ID, if present.
+    #[must_use]
+    pub fn desktop_layer_id(&self) -> Option<LayerId> {
+        self.pages
+            .iter()
+            .flat_map(|p| &p.layers)
+            .find(|l| l.is_desktop_layer || l.name.eq_ignore_ascii_case("Desktop"))
+            .map(|l| l.id)
+    }
+
+    /// Returns an existing `"Desktop"` layer or creates a cross-page shared `"Desktop"`
+    /// layer on Page 0 (`is_desktop_layer = true`, `master_scope = AllPages`).
+    pub fn ensure_desktop_layer(&mut self) -> LayerId {
+        if let Some(id) = self.desktop_layer_id() {
+            if let Some(l) = self.find_layer_mut(id) {
+                l.is_desktop_layer = true;
+                l.master_scope = MasterLayerScope::AllPages;
+            }
+            return id;
+        }
+        let lid = LayerId(self.alloc_id());
+        if let Some(p0) = self.pages.first_mut() {
+            p0.layers.push(Layer::desktop(lid));
+        }
+        self.touch();
+        lid
+    }
+
+    /// Moves `id` to the cross-page shared `"Desktop"` layer so it remains accessible across pages.
+    pub fn move_object_to_desktop_layer(&mut self, id: ObjectId) -> CoreResult<LayerId> {
+        if !self.objects.contains_key(&id) {
+            return Err(CoreError::ObjectNotFound(id));
+        }
+        let desktop_id = self.ensure_desktop_layer();
+        let mut set = HashSet::new();
+        set.insert(id);
+        self.detach_from_parents(&set);
+        if let Some(layer) = self.find_layer_mut(desktop_id) {
+            if !layer.objects.contains(&id) {
+                layer.objects.push(id);
+            }
+        }
+        self.touch();
+        Ok(desktop_id)
+    }
+
+    /// Validates and attaches a custom binary ICC profile (`.icc` / `.icm`) to this document.
+    pub fn set_custom_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<crate::icc::IccProfile> {
+        let prof = crate::icc::IccProfile::from_bytes(&bytes)?;
+        let desc = if prof.description.trim().is_empty() {
+            "Custom ICC Profile".to_owned()
+        } else {
+            prof.description.clone()
+        };
+        self.custom_icc_name = Some(desc);
+        self.custom_icc_profile = Some(bytes);
+        self.touch();
+        Ok(prof)
     }
 
     /// Adds a new guide line and returns its guide ID.

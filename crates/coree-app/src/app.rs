@@ -2,9 +2,9 @@
 
 //! `eframe 0.37` desktop application shell wrapping [`StudioApp`].
 
-use crate::shortcuts::poll_egui_shortcuts;
+use crate::shortcuts::poll_egui_shortcuts_custom;
 use crate::state::StudioApp;
-use crate::theme::{apply_theme, configure_arabic_capable_fonts};
+use crate::theme::{apply_theme, configure_arabic_capable_fonts_for_language};
 use crate::ui::{
     canvas::show_canvas_and_status, command_palette::show_command_palette, dialogs::show_dialogs,
     dockers::show_dockers_panel, menu_bar::show_menu_bar_and_tabs, palette_bar::show_palette_bar,
@@ -198,8 +198,19 @@ fn circle_path(radius: f64) -> BezierPath {
     .to_bezier_path()
 }
 
-/// Launches the native desktop `eframe` window (`Wayland` / `X11` / `Win32`).
+/// Launches the native desktop `eframe` window (`Wayland` / `X11` / `Win32`), binding
+/// the single-instance IPC listener by default.
 pub fn run_desktop_gui(initial_files: Vec<PathBuf>) -> Result<(), String> {
+    run_desktop_gui_with_options(initial_files, false)
+}
+
+/// Launches the native desktop `eframe` window (`Wayland` / `X11` / `Win32`).
+/// When `new_window` is `false`, binds the single-instance IPC server so double-clicked
+/// files in subsequent launches open as new tabs in this studio window.
+pub fn run_desktop_gui_with_options(
+    initial_files: Vec<PathBuf>,
+    new_window: bool,
+) -> Result<(), String> {
     let app_icon = Arc::new(build_app_icon_data());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -217,7 +228,11 @@ pub fn run_desktop_gui(initial_files: Vec<PathBuf>) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             let mut app = StudioApp::new_desktop(initial_files);
-            configure_arabic_capable_fonts(&cc.egui_ctx);
+            if !new_window {
+                app.ipc_server =
+                    crate::ipc::IpcServer::bind_default_with_wake(Some(cc.egui_ctx.clone())).ok();
+            }
+            configure_arabic_capable_fonts_for_language(&cc.egui_ctx, app.ui_language);
             app.fonts_configured = true;
             apply_theme(&cc.egui_ctx, app.theme);
             app.theme_dirty = false;
@@ -233,7 +248,7 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
 
         if !self.fonts_configured {
-            configure_arabic_capable_fonts(&ctx);
+            configure_arabic_capable_fonts_for_language(&ctx, self.ui_language);
             self.fonts_configured = true;
         }
         if self.theme_dirty {
@@ -241,10 +256,25 @@ impl StudioApp {
             self.theme_dirty = false;
         }
 
-        // Poll async background jobs, prune expired toasts, tick crash-recovery autosave
+        // Poll async background jobs, incoming single-instance IPC files, toasts, autosave
         self.tick_background_jobs();
         self.prune_toasts();
         self.tick_autosave();
+        let ipc_batches = self
+            .ipc_server
+            .as_ref()
+            .map(crate::ipc::IpcServer::try_recv_batches)
+            .unwrap_or_default();
+        if !ipc_batches.is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            for batch in ipc_batches {
+                for path in batch {
+                    if let Err(err) = self.open_file_path(&path) {
+                        self.push_toast(err, true);
+                    }
+                }
+            }
+        }
 
         // Keep repainting smoothly while background jobs are running
         if !self.active_jobs.is_empty() {
@@ -268,7 +298,8 @@ impl StudioApp {
 
         // Process global keyboard shortcuts (unless Command Palette is open and consuming keys)
         if !self.command_palette.open {
-            let actions = poll_egui_shortcuts(&ctx, self.shortcut_profile);
+            let actions =
+                poll_egui_shortcuts_custom(&ctx, self.shortcut_profile, &self.custom_shortcuts);
             for act in actions {
                 self.handle_shortcut(act);
             }

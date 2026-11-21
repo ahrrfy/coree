@@ -8,6 +8,8 @@ pub mod app;
 pub mod cdr_bridge;
 pub mod cli;
 pub mod io_bridge;
+pub mod ipc;
+pub mod printing;
 pub mod shortcuts;
 pub mod state;
 pub mod theme;

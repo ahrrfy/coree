@@ -1477,6 +1477,7 @@ fn collect_laser_polylines_recursive(
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 if is_selected {
                     let world_path = container.transformed(&world_xf);

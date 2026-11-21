@@ -11,6 +11,10 @@ description = "Native cross-platform desktop UI binary for coree."
 name = "coree"
 path = "src/main.rs"
 
+[[bin]]
+name = "coree-cli"
+path = "src/bin/coree_cli.rs"
+
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
@@ -28,4 +32,8 @@ rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+unicode-bidi = "0.3.18"
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

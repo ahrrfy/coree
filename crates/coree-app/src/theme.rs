@@ -88,6 +88,71 @@ impl StudioLanguage {
             Self::Arabic => ar,
         }
     }
+
+    /// Selects `en` or `ar` and applies UAX #9 visual run ordering for mixed-script UI labels.
+    #[must_use]
+    pub fn tr_ui(self, en: &'static str, ar: &'static str) -> String {
+        match self {
+            Self::English => en.to_owned(),
+            Self::Arabic => shape_mixed_ui_bidi(ar),
+        }
+    }
+}
+
+fn is_arabic_or_hebrew(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x05FF | 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF
+    )
+}
+
+/// Reorders top-level UAX #9 BiDi script runs in mixed Arabic + Latin UI strings so `epaint`'s
+/// left-to-right font-run compositor places RTL and LTR segments in natural reading order while
+/// keeping contiguous Arabic words in logical order for single-run `harfrust` RTL shaping.
+#[must_use]
+pub fn shape_mixed_ui_bidi(text: &str) -> String {
+    let has_rtl = text.chars().any(is_arabic_or_hebrew);
+    let has_ltr = text.chars().any(|c| c.is_ascii_alphabetic());
+    if !has_rtl || !has_ltr {
+        return text.to_owned();
+    }
+
+    let bidi = unicode_bidi::BidiInfo::new(text, Some(unicode_bidi::Level::rtl()));
+    let Some(para) = bidi.paragraphs.first() else {
+        return text.to_owned();
+    };
+    let (levels, runs) = bidi.visual_runs(para, para.range.clone());
+    if runs.len() <= 1 {
+        return text.to_owned();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (idx, run) in runs.iter().enumerate() {
+        let slice = &text[run.clone()];
+        let is_rtl_run = levels.get(run.start).is_some_and(|l| l.is_rtl());
+        if is_rtl_run {
+            // Inside a single RTL run, preserve character order so HarfBuzz/harfrust shapes &
+            // reverses the Arabic glyphs once; mirror paired ASCII delimiters manually.
+            for ch in slice.chars() {
+                out.push(match ch {
+                    '(' => ')',
+                    ')' => '(',
+                    '[' => ']',
+                    ']' => '[',
+                    _ => ch,
+                });
+            }
+        } else {
+            out.push_str(slice);
+        }
+        if idx + 1 < runs.len() && !out.ends_with(' ') {
+            let next_slice = &text[runs[idx + 1].clone()];
+            if !next_slice.starts_with(' ') && !slice.ends_with(' ') {
+                // Keep exact whitespace already captured inside runs; avoid inventing spaces.
+            }
+        }
+    }
+    out
 }
 
 /// Complete semantic color palette consumed by all `coree-app` widgets (zero raw hex literals in widgets).
@@ -329,9 +394,19 @@ pub fn dock_style(tokens: &ThemeTokens, egui_style: &egui::Style) -> egui_dock::
 }
 
 /// Searches standard system font paths for an Arabic-capable font (`Noto Sans Arabic`,
-/// `Noto Naskh Arabic`, `DejaVu Sans`, etc.) and appends it as a fallback to `egui`'s
+/// `Noto Naskh Arabic`, `DejaVu Sans`, etc.) and configures it inside `egui`'s
 /// `Proportional` and `Monospace` font families. Fails softly when unavailable.
 pub fn configure_arabic_capable_fonts(ctx: &egui::Context) -> Option<PathBuf> {
+    configure_arabic_capable_fonts_for_language(ctx, StudioLanguage::English)
+}
+
+/// Configures Arabic system fonts according to `lang`: when `StudioLanguage::Arabic` is
+/// active, places the Arabic-capable face at index `0` so spaces inside Arabic labels stay in
+/// the same single `harfrust` RTL run instead of splitting onto Latin fallback fonts.
+pub fn configure_arabic_capable_fonts_for_language(
+    ctx: &egui::Context,
+    lang: StudioLanguage,
+) -> Option<PathBuf> {
     let font_path = find_arabic_system_font()?;
     let bytes = std::fs::read(&font_path).ok()?;
     let mut defs = FontDefinitions::default();
@@ -339,7 +414,11 @@ pub fn configure_arabic_capable_fonts(ctx: &egui::Context) -> Option<PathBuf> {
     defs.font_data
         .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
     if let Some(fam) = defs.families.get_mut(&FontFamily::Proportional) {
-        fam.push(key.clone());
+        if lang == StudioLanguage::Arabic {
+            fam.insert(0, key.clone());
+        } else {
+            fam.push(key.clone());
+        }
     }
     if let Some(fam) = defs.families.get_mut(&FontFamily::Monospace) {
         fam.push(key);
@@ -428,4 +507,18 @@ pub fn core_color_to_egui(c: &Color) -> Color32 {
 #[must_use]
 pub fn egui_color_to_core(c: Color32) -> Color {
     Color::rgba8(c.r(), c.g(), c.b(), c.a())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bidi_helper_preserves_pure_arabic_and_reorders_mixed_runs() {
+        assert_eq!(shape_mixed_ui_bidi("File"), "File");
+        assert_eq!(shape_mixed_ui_bidi("حفظ باسم"), "حفظ باسم");
+        let mixed = shape_mixed_ui_bidi("العربية Arabic");
+        assert!(mixed.starts_with("Arabic"));
+        assert!(mixed.contains("العربية"));
+    }
 }

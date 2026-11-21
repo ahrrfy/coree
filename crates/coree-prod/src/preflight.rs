@@ -403,6 +403,7 @@ fn check_object_recursive(
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 let container_bb = container.transformed(&world_xf).bounding_box();
                 let child_clip = match (clip_bounds, container_bb) {

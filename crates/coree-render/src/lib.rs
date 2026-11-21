@@ -29,6 +29,7 @@ pub use backend::{
     BackendPaint, CanvasBackend, FillRule, PaintShader, PixelRect, RgbaBuffer, StrokeParams,
     TinySkiaBackend,
 };
+pub use effects_render::lower_effects_to_primitives;
 pub use error::{RenderError, RenderResult};
 pub use export_render::{
     render_isolated_object_to_rgba, render_page_to_rgba, render_page_to_rgba_with_options,

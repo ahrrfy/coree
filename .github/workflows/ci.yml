@@ -44,7 +44,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --package coree-app --bins
 
       - name: Smoke test release binary & packaging metadata (Linux)
         if: runner.os == 'Linux'
@@ -52,6 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           ./target/release/coree --diagnostics
+          ./target/release/coree-cli --diagnostics
           bash -n packaging/linux/install-linux.sh packaging/linux/build-deb.sh packaging/linux/build-appimage.sh
           python3 - <<'PY'
           import xml.etree.ElementTree as ET
@@ -73,4 +74,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          .\target\release\coree.exe --diagnostics
+          Copy-Item ".\target\release\coree-cli.exe" ".\target\release\coree.com" -Force
+          & .\target\release\coree.com --diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "coree.com --diagnostics failed with exit code $LASTEXITCODE" }
+          $guiProc = Start-Process -FilePath ".\target\release\coree.exe" -ArgumentList "--diagnostics" -NoNewWindow -Wait -PassThru
+          if ($guiProc.ExitCode -ne 0) { throw "coree.exe GUI launcher exited with code $($guiProc.ExitCode)" }

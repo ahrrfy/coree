@@ -13,9 +13,10 @@ use crate::state::{
 };
 use crate::theme::{core_color_to_egui, PAGE_TABS_HEIGHT, RULER_THICKNESS, STATUS_BAR_HEIGHT};
 use coree_core::{
-    Affine2D, BezierPath, BooleanOp, Color, CommandOp, Effect, EllipseMode, Fill, GuideOrientation,
-    LiveSketch, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, ParametricShape, Point2D,
-    Rect2D, SceneObject, SmartDrawing, TransformMode, TransparencyMode, Vec2D, ZOrderOp,
+    Affine2D, BezierPath, BooleanOp, Color, CommandOp, Effect, EllipseMode, Fill, GradientStop,
+    GuideOrientation, LiveSketch, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle,
+    ParametricShape, Point2D, Rect2D, SceneObject, SmartDrawing, TransformMode, TransparencyMode,
+    Vec2D, ZOrderOp,
 };
 use coree_prod::{simulate_overprint_rgba, LaserOperationKind};
 use coree_render::{
@@ -935,6 +936,29 @@ fn handle_canvas_interaction(
                     }
                     return;
                 }
+                ToolId::InteractiveFill => {
+                    let inserted = app.active_tab().and_then(|tab| {
+                        let oid = *tab.selection.objects.first()?;
+                        if !is_object_editable_in_doc(&tab.document, oid) {
+                            return None;
+                        }
+                        let obj = tab.document.objects.get(&oid)?;
+                        let new_fill = try_insert_gradient_stop_on_ray(canvas_rect, tab, obj, pos)?;
+                        Some((oid, new_fill))
+                    });
+                    if let Some((oid, new_fill)) = inserted {
+                        if app
+                            .execute_command(CommandOp::SetFill {
+                                ids: vec![oid],
+                                fill: new_fill,
+                            })
+                            .is_ok()
+                        {
+                            app.push_toast("Inserted gradient color stop on fill ray", false);
+                        }
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1680,160 +1704,76 @@ fn start_canvas_drag(
             if let Some(&oid) = tab.selection.objects.first() {
                 if is_object_editable_in_doc(&tab.document, oid) {
                     if let Some(obj) = tab.document.objects.get(&oid) {
-                        match &obj.fill {
-                            Fill::LinearGradient { start, end, stops } => {
-                                let s_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(*start),
-                                );
-                                let e_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(*end),
-                                );
-                                if s_pos.distance(screen_pos) <= 10.0 {
+                        if let Fill::RadialGradient { center, focal, .. } = &obj.fill {
+                            let f_pos = world_to_screen(
+                                canvas_rect,
+                                tab,
+                                obj.transform.transform_point(*focal),
+                            );
+                            if (*focal - *center).length() > 0.2
+                                && f_pos.distance(screen_pos) <= 10.0
+                            {
+                                tab.drag_state = CanvasDragState::DraggingGradientFocal {
+                                    object_id: oid,
+                                    orig_fill: obj.fill.clone(),
+                                };
+                                return;
+                            }
+                        }
+                        if let Some((start_l, end_l, stops)) = gradient_ray_local(&obj.fill) {
+                            let s_pos = world_to_screen(
+                                canvas_rect,
+                                tab,
+                                obj.transform.transform_point(start_l),
+                            );
+                            let e_pos = world_to_screen(
+                                canvas_rect,
+                                tab,
+                                obj.transform.transform_point(end_l),
+                            );
+                            if s_pos.distance(screen_pos) <= 10.0 {
+                                if shift && matches!(obj.fill, Fill::RadialGradient { .. }) {
+                                    tab.drag_state = CanvasDragState::DraggingGradientFocal {
+                                        object_id: oid,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                } else {
                                     tab.drag_state = CanvasDragState::DraggingGradientHandle {
                                         object_id: oid,
                                         is_end: false,
                                         orig_fill: obj.fill.clone(),
                                     };
-                                    return;
                                 }
-                                if e_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: true,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
-                                }
-                                // Check intermediate stops along `[start..end]`
-                                for (s_idx, st) in stops.iter().enumerate() {
-                                    if s_idx == 0 || s_idx + 1 == stops.len() {
-                                        continue;
-                                    }
-                                    let t = f64::from(st.offset);
-                                    let w_pt = obj.transform.transform_point(Point2D::new(
-                                        start.x + (end.x - start.x) * t,
-                                        start.y + (end.y - start.y) * t,
-                                    ));
-                                    if world_to_screen(canvas_rect, tab, w_pt).distance(screen_pos)
-                                        <= 9.0
-                                    {
-                                        tab.drag_state = CanvasDragState::DraggingGradientStop {
-                                            object_id: oid,
-                                            stop_index: s_idx,
-                                            orig_fill: obj.fill.clone(),
-                                        };
-                                        return;
-                                    }
-                                }
+                                return;
                             }
-                            Fill::RadialGradient { center, radius, .. } => {
-                                let c_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(*center),
-                                );
-                                let r_pt = Point2D::new(center.x + radius.max(1.0), center.y);
-                                let r_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(r_pt),
-                                );
-                                if c_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: false,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
+                            if e_pos.distance(screen_pos) <= 10.0 {
+                                tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                    object_id: oid,
+                                    is_end: true,
+                                    orig_fill: obj.fill.clone(),
+                                };
+                                return;
+                            }
+                            for (s_idx, st) in stops.iter().enumerate() {
+                                if s_idx == 0 || s_idx + 1 == stops.len() {
+                                    continue;
                                 }
-                                if r_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                let t = f64::from(st.offset);
+                                let w_pt = obj.transform.transform_point(Point2D::new(
+                                    start_l.x + (end_l.x - start_l.x) * t,
+                                    start_l.y + (end_l.y - start_l.y) * t,
+                                ));
+                                if world_to_screen(canvas_rect, tab, w_pt).distance(screen_pos)
+                                    <= 9.0
+                                {
+                                    tab.drag_state = CanvasDragState::DraggingGradientStop {
                                         object_id: oid,
-                                        is_end: true,
+                                        stop_index: s_idx,
                                         orig_fill: obj.fill.clone(),
                                     };
                                     return;
                                 }
                             }
-                            Fill::ConicalGradient {
-                                center, angle_deg, ..
-                            } => {
-                                let c_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(*center),
-                                );
-                                let rad = angle_deg.to_radians();
-                                let a_pt = Point2D::new(
-                                    center.x + 25.0 * rad.cos(),
-                                    center.y + 25.0 * rad.sin(),
-                                );
-                                let a_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(a_pt),
-                                );
-                                if c_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: false,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
-                                }
-                                if a_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: true,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
-                                }
-                            }
-                            Fill::SquareGradient {
-                                center,
-                                size,
-                                angle_deg,
-                                ..
-                            } => {
-                                let c_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(*center),
-                                );
-                                let rad = angle_deg.to_radians();
-                                let half = (size.max(2.0)) * 0.5;
-                                let e_pt = Point2D::new(
-                                    center.x + half * rad.cos(),
-                                    center.y + half * rad.sin(),
-                                );
-                                let e_pos = world_to_screen(
-                                    canvas_rect,
-                                    tab,
-                                    obj.transform.transform_point(e_pt),
-                                );
-                                if c_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: false,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
-                                }
-                                if e_pos.distance(screen_pos) <= 10.0 {
-                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                        object_id: oid,
-                                        is_end: true,
-                                        orig_fill: obj.fill.clone(),
-                                    };
-                                    return;
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -2490,6 +2430,19 @@ fn update_canvas_drag(
                 }
             }
         }
+        CanvasDragState::DraggingGradientFocal { object_id, .. } => {
+            if is_object_editable_in_doc(&tab.document, *object_id) {
+                if let Some(obj) = tab.document.objects.get_mut(object_id) {
+                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let local_pt = inv.transform_point(pt);
+                    if let Fill::RadialGradient { focal, .. } = &mut obj.fill {
+                        *focal = local_pt;
+                        tab.tile_cache.mark_all_dirty();
+                        tab.needs_rerender = true;
+                    }
+                }
+            }
+        }
         CanvasDragState::DraggingGradientStop {
             object_id,
             stop_index,
@@ -2499,10 +2452,10 @@ fn update_canvas_drag(
                 if let Some(obj) = tab.document.objects.get_mut(object_id) {
                     let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
                     let local_pt = inv.transform_point(pt);
-                    if let Fill::LinearGradient { start, end, stops } = &mut obj.fill {
-                        let v = *end - *start;
+                    if let Some((start, end, stops)) = gradient_stops_mut(&mut obj.fill) {
+                        let v = end - start;
                         let len_sq = v.length_sq().max(1e-6);
-                        let t = ((local_pt - *start).dot(v) / len_sq).clamp(0.01, 0.99) as f32;
+                        let t = ((local_pt - start).dot(v) / len_sq).clamp(0.01, 0.99) as f32;
                         if let Some(st) = stops.get_mut(*stop_index) {
                             st.offset = t;
                         }
@@ -2897,6 +2850,10 @@ fn finish_canvas_drag(app: &mut StudioApp, active_tool: ToolId, ctrl: bool, shif
             orig_fill,
             ..
         }
+        | CanvasDragState::DraggingGradientFocal {
+            object_id,
+            orig_fill,
+        }
         | CanvasDragState::DraggingGradientStop {
             object_id,
             orig_fill,
@@ -2909,7 +2866,10 @@ fn finish_canvas_drag(app: &mut StudioApp, active_tool: ToolId, ctrl: bool, shif
         } => {
             let final_fill = app.active_tab_mut().and_then(|tab| {
                 let obj = tab.document.objects.get_mut(&object_id)?;
-                let edited = obj.fill.clone();
+                let mut edited = obj.fill.clone();
+                if let Some((_, _, stops)) = gradient_stops_mut(&mut edited) {
+                    stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+                }
                 obj.fill = orig_fill;
                 Some(edited)
             });
@@ -4170,24 +4130,15 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         let b =
                             world_to_screen(canvas_rect, tab, obj.transform.transform_point(*end));
                         painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
-                        for (s_idx, st) in stops.iter().enumerate() {
-                            if s_idx == 0 || s_idx + 1 == stops.len() {
-                                continue;
-                            }
-                            let t = f64::from(st.offset);
-                            let w_pt = obj.transform.transform_point(Point2D::new(
-                                start.x + (end.x - start.x) * t,
-                                start.y + (end.y - start.y) * t,
-                            ));
-                            let sp = world_to_screen(canvas_rect, tab, w_pt);
-                            painter.rect(
-                                Rect::from_center_size(sp, vec2(8.0, 8.0)),
-                                CornerRadius::same(1),
-                                core_color_to_egui(&st.color),
-                                Stroke::new(1.5, Color32::WHITE),
-                                StrokeKind::Inside,
-                            );
-                        }
+                        draw_gradient_mid_stops(
+                            &painter,
+                            canvas_rect,
+                            tab,
+                            &obj.transform,
+                            *start,
+                            *end,
+                            stops,
+                        );
                         painter.rect(
                             Rect::from_center_size(a, vec2(9.0, 9.0)),
                             CornerRadius::same(2),
@@ -4197,7 +4148,12 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         );
                         painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
                     }
-                    Fill::RadialGradient { center, radius, .. } => {
+                    Fill::RadialGradient {
+                        center,
+                        radius,
+                        focal,
+                        stops,
+                    } => {
                         let a = world_to_screen(
                             canvas_rect,
                             tab,
@@ -4209,6 +4165,36 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         let r_px = a.distance(b).max(2.0);
                         painter.circle_stroke(a, r_px, Stroke::new(1.2, tokens.accent));
                         painter.line_segment([a, b], Stroke::new(1.8, tokens.accent));
+                        draw_gradient_mid_stops(
+                            &painter,
+                            canvas_rect,
+                            tab,
+                            &obj.transform,
+                            *center,
+                            r_pt,
+                            stops,
+                        );
+                        if (*focal - *center).length() > 0.2 {
+                            let f = world_to_screen(
+                                canvas_rect,
+                                tab,
+                                obj.transform.transform_point(*focal),
+                            );
+                            paint_dashed_line(
+                                &painter,
+                                a,
+                                f,
+                                4.0,
+                                3.0,
+                                Stroke::new(1.2, tokens.accent_secondary),
+                            );
+                            painter.circle(
+                                f,
+                                4.5,
+                                tokens.accent_secondary,
+                                Stroke::new(1.5, Color32::WHITE),
+                            );
+                        }
                         painter.rect(
                             Rect::from_center_size(a, vec2(9.0, 9.0)),
                             CornerRadius::same(2),
@@ -4219,7 +4205,9 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
                     }
                     Fill::ConicalGradient {
-                        center, angle_deg, ..
+                        center,
+                        angle_deg,
+                        stops,
                     } => {
                         let a = world_to_screen(
                             canvas_rect,
@@ -4237,6 +4225,15 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                             Stroke::new(1.2, tokens.accent),
                         );
                         painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
+                        draw_gradient_mid_stops(
+                            &painter,
+                            canvas_rect,
+                            tab,
+                            &obj.transform,
+                            *center,
+                            e_pt,
+                            stops,
+                        );
                         painter.rect(
                             Rect::from_center_size(a, vec2(9.0, 9.0)),
                             CornerRadius::same(2),
@@ -4250,7 +4247,7 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         center,
                         size,
                         angle_deg,
-                        ..
+                        stops,
                     } => {
                         let a = world_to_screen(
                             canvas_rect,
@@ -4264,6 +4261,15 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                         let b =
                             world_to_screen(canvas_rect, tab, obj.transform.transform_point(e_pt));
                         painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
+                        draw_gradient_mid_stops(
+                            &painter,
+                            canvas_rect,
+                            tab,
+                            &obj.transform,
+                            *center,
+                            e_pt,
+                            stops,
+                        );
                         painter.rect(
                             Rect::from_center_size(a, vec2(9.0, 9.0)),
                             CornerRadius::same(2),
@@ -5081,5 +5087,250 @@ fn interactive_effect_handle_points(
             Some((center, target_c))
         }
         _ => None,
+    }
+}
+
+fn gradient_ray_local(fill: &Fill) -> Option<(Point2D, Point2D, &[GradientStop])> {
+    match fill {
+        Fill::LinearGradient { start, end, stops } => Some((*start, *end, stops.as_slice())),
+        Fill::RadialGradient {
+            center,
+            radius,
+            stops,
+            ..
+        } => Some((
+            *center,
+            Point2D::new(center.x + radius.max(1.0), center.y),
+            stops.as_slice(),
+        )),
+        Fill::ConicalGradient {
+            center,
+            angle_deg,
+            stops,
+        } => {
+            let rad = angle_deg.to_radians();
+            Some((
+                *center,
+                Point2D::new(center.x + 25.0 * rad.cos(), center.y + 25.0 * rad.sin()),
+                stops.as_slice(),
+            ))
+        }
+        Fill::SquareGradient {
+            center,
+            size,
+            angle_deg,
+            stops,
+        } => {
+            let rad = angle_deg.to_radians();
+            let half = size.max(2.0) * 0.5;
+            Some((
+                *center,
+                Point2D::new(center.x + half * rad.cos(), center.y + half * rad.sin()),
+                stops.as_slice(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn gradient_stops_mut(fill: &mut Fill) -> Option<(Point2D, Point2D, &mut Vec<GradientStop>)> {
+    match fill {
+        Fill::LinearGradient { start, end, stops } => Some((*start, *end, stops)),
+        Fill::RadialGradient {
+            center,
+            radius,
+            stops,
+            ..
+        } => Some((
+            *center,
+            Point2D::new(center.x + radius.max(1.0), center.y),
+            stops,
+        )),
+        Fill::ConicalGradient {
+            center,
+            angle_deg,
+            stops,
+        } => {
+            let rad = angle_deg.to_radians();
+            Some((
+                *center,
+                Point2D::new(center.x + 25.0 * rad.cos(), center.y + 25.0 * rad.sin()),
+                stops,
+            ))
+        }
+        Fill::SquareGradient {
+            center,
+            size,
+            angle_deg,
+            stops,
+        } => {
+            let rad = angle_deg.to_radians();
+            let half = size.max(2.0) * 0.5;
+            Some((
+                *center,
+                Point2D::new(center.x + half * rad.cos(), center.y + half * rad.sin()),
+                stops,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn interpolate_gradient_stop_color(stops: &[GradientStop], t: f32) -> Color {
+    if stops.is_empty() {
+        return Color::KEY_BLACK;
+    }
+    let mut sorted: Vec<&GradientStop> = stops.iter().collect();
+    sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if t <= sorted[0].offset {
+        return sorted[0].color.clone();
+    }
+    if t >= sorted[sorted.len() - 1].offset {
+        return sorted[sorted.len() - 1].color.clone();
+    }
+    for win in sorted.windows(2) {
+        let (a, b) = (win[0], win[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-6);
+            let frac = ((t - a.offset) / span).clamp(0.0, 1.0);
+            let [r1, g1, b1, a1] = a.color.to_rgba_f32();
+            let [r2, g2, b2, a2] = b.color.to_rgba_f32();
+            return Color::Rgba {
+                r: r1 + (r2 - r1) * frac,
+                g: g1 + (g2 - g1) * frac,
+                b: b1 + (b2 - b1) * frac,
+                a: a1 + (a2 - a1) * frac,
+            };
+        }
+    }
+    sorted[0].color.clone()
+}
+
+fn try_insert_gradient_stop_on_ray(
+    canvas_rect: Rect,
+    tab: &crate::state::DocumentTab,
+    obj: &SceneObject,
+    screen_pos: Pos2,
+) -> Option<Fill> {
+    let (start_l, end_l, stops) = gradient_ray_local(&obj.fill)?;
+    let a = world_to_screen(canvas_rect, tab, obj.transform.transform_point(start_l));
+    let b = world_to_screen(canvas_rect, tab, obj.transform.transform_point(end_l));
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq < 4.0 {
+        return None;
+    }
+    let t = (screen_pos - a).dot(ab) / len_sq;
+    if !(0.02..=0.98).contains(&t) {
+        return None;
+    }
+    let closest = a + ab * t;
+    if closest.distance(screen_pos) > 10.0 {
+        return None;
+    }
+    for st in stops {
+        let st_pt = a + ab * st.offset;
+        if st_pt.distance(screen_pos) <= 7.0 {
+            return None;
+        }
+    }
+    let color = interpolate_gradient_stop_color(stops, t);
+    let mut updated = obj.fill.clone();
+    if let Some((_, _, stops_mut)) = gradient_stops_mut(&mut updated) {
+        stops_mut.push(GradientStop::new(t, color));
+        stops_mut.sort_by(|x, y| x.offset.total_cmp(&y.offset));
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+fn draw_gradient_mid_stops(
+    painter: &egui::Painter,
+    canvas_rect: Rect,
+    tab: &crate::state::DocumentTab,
+    xf: &Affine2D,
+    start_l: Point2D,
+    end_l: Point2D,
+    stops: &[GradientStop],
+) {
+    for (s_idx, st) in stops.iter().enumerate() {
+        if s_idx == 0 || s_idx + 1 == stops.len() {
+            continue;
+        }
+        let t = f64::from(st.offset);
+        let w_pt = xf.transform_point(Point2D::new(
+            start_l.x + (end_l.x - start_l.x) * t,
+            start_l.y + (end_l.y - start_l.y) * t,
+        ));
+        let sp = world_to_screen(canvas_rect, tab, w_pt);
+        painter.rect(
+            Rect::from_center_size(sp, vec2(8.0, 8.0)),
+            CornerRadius::same(1),
+            core_color_to_egui(&st.color),
+            Stroke::new(1.5, Color32::WHITE),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// Inserts an interpolated color stop at normalized ray fraction `t` across any of the 4
+/// interactive fountain fill gradient types.
+#[cfg(test)]
+fn insert_stop_on_fill_ray(fill: &Fill, t: f32) -> Option<Fill> {
+    let clamped = t.clamp(0.02, 0.98);
+    let mut updated = fill.clone();
+    let (_, _, stops) = gradient_stops_mut(&mut updated)?;
+    let color = interpolate_gradient_stop_color(stops, clamped);
+    stops.push(GradientStop::new(clamped, color));
+    stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    Some(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_fill_inserts_interpolated_stops_across_all_four_gradient_types() {
+        let base_stops = vec![
+            GradientStop::new(0.0, Color::rgba8(255, 0, 0, 255)),
+            GradientStop::new(1.0, Color::rgba8(0, 0, 255, 255)),
+        ];
+        let variants = [
+            Fill::LinearGradient {
+                start: Point2D::ZERO,
+                end: Point2D::new(40.0, 0.0),
+                stops: base_stops.clone(),
+            },
+            Fill::RadialGradient {
+                center: Point2D::ZERO,
+                radius: 25.0,
+                focal: Point2D::ZERO,
+                stops: base_stops.clone(),
+            },
+            Fill::ConicalGradient {
+                center: Point2D::ZERO,
+                angle_deg: 0.0,
+                stops: base_stops.clone(),
+            },
+            Fill::SquareGradient {
+                center: Point2D::ZERO,
+                size: 30.0,
+                angle_deg: 45.0,
+                stops: base_stops,
+            },
+        ];
+        for fill in variants {
+            let next = insert_stop_on_fill_ray(&fill, 0.5).expect("gradient fill accepts mid stop");
+            let (_, _, stops) = gradient_ray_local(&next).unwrap();
+            assert_eq!(stops.len(), 3);
+            assert!((stops[1].offset - 0.5).abs() < 1e-6);
+            let [r, _g, b, _] = stops[1].color.to_rgba8();
+            assert!(
+                r > 100 && b > 100,
+                "midpoint color interpolated: r={r}, b={b}"
+            );
+        }
     }
 }

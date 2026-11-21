@@ -4,7 +4,7 @@
 //! `Object`, `Effects`, `Bitmaps`, `Text`, `Table`, `Tools`, `Laser`, `Window`,
 //! `Help`) plus the multi-document tab strip.
 
-use crate::shortcuts::{shortcut_label, ShortcutAction, ShortcutProfile};
+use crate::shortcuts::{shortcut_label, shortcut_label_for, ShortcutAction, ShortcutProfile};
 use crate::state::{DockerTab, LensDockerState, PropertiesSubTab, StudioApp, WorkspacePreset};
 use crate::theme::{StudioLanguage, StudioTheme, MENUBAR_HEIGHT};
 use crate::ui::dialogs::{
@@ -110,8 +110,21 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         ui.close();
                     }
                     ui.separator();
+                    if menu_item(
+                        ui,
+                        "Print...",
+                        &shortcut_label_for(
+                            profile,
+                            &app.custom_shortcuts,
+                            ShortcutAction::PrintDocument,
+                        ),
+                    ) {
+                        app.handle_shortcut(ShortcutAction::PrintDocument);
+                        ui.close();
+                    }
                     if menu_item(ui, "Print Preview & Imposition...", "") {
                         app.show_print_preview_dialog = true;
+                        app.refresh_system_printers();
                         ui.close();
                     }
                     if menu_item(ui, "Preflight Audit...", "") {
@@ -585,7 +598,31 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             app.extract_selected_powerclip();
                             ui.close();
                         }
+                        if menu_item(
+                            ui,
+                            "Lock / Unlock Contents to PowerClip",
+                            &shortcut_label_for(
+                                profile,
+                                &app.custom_shortcuts,
+                                ShortcutAction::TogglePowerClipLock,
+                            ),
+                        ) {
+                            app.set_powerclip_lock_selected(None);
+                            ui.close();
+                        }
                     });
+                    if menu_item(
+                        ui,
+                        "Move to Cross-Page Desktop Layer",
+                        &shortcut_label_for(
+                            profile,
+                            &app.custom_shortcuts,
+                            ShortcutAction::MoveToDesktop,
+                        ),
+                    ) {
+                        app.move_selection_to_desktop_layer();
+                        ui.close();
+                    }
                     if menu_item(ui, "Lock / Unlock Selection", "") {
                         app.toggle_lock_selection();
                         ui.close();

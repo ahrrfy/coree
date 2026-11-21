@@ -908,12 +908,11 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
                 ts.fill = c;
             }
         }
-        // Prefer `latin` or `RTL` block for font family/size/weight/italic
-        let font_block = ch
-            .get("latin")
-            .and_then(Value::as_object)
-            .or_else(|| ch.get("RTL").and_then(Value::as_object));
-        if let Some(fb) = font_block {
+        // Read both `latin` and `RTL` script blocks independently (supporting separate Latin vs Arabic fonts)
+        let latin_block = ch.get("latin").and_then(Value::as_object);
+        let rtl_block = ch.get("RTL").and_then(Value::as_object);
+        let primary_block = latin_block.or(rtl_block);
+        if let Some(fb) = primary_block {
             if let Some(fname) = fb.get("font").and_then(Value::as_str) {
                 if !fname.trim().is_empty() {
                     ts.font_family = fname.trim().to_owned();
@@ -927,7 +926,19 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
                 }
             }
             if let Some(w) = json_u32(fb, "weight") {
-                ts.bold = w >= 128 || w >= 600;
+                // Corel weight can be Windows LOGFONT (100..=900) or OS/2 class (e.g. 400=normal, 700=bold)
+                let norm_w = if w <= 12 {
+                    match w {
+                        0..=2 => 300,
+                        3 | 4 => 400,
+                        5 | 6 => 600,
+                        7 | 8 => 700,
+                        _ => 900,
+                    }
+                } else {
+                    w.clamp(100, 900)
+                };
+                ts.set_weight(norm_w as u16);
             }
             if let Some(it) = json_bool(fb, "italic") {
                 ts.italic = it;
@@ -941,6 +952,22 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
             if let Some(cs) = json_u32(fb, "charset") {
                 if cs == 178 {
                     ts.direction = TextDirection::Rtl;
+                }
+            }
+        }
+        if let Some(rb) = rtl_block {
+            if let Some(fname) = rb.get("font").and_then(Value::as_str) {
+                let trimmed = fname.trim();
+                if !trimmed.is_empty() {
+                    ts.bidi_font_family = Some(trimmed.to_owned());
+                    ts.direction = TextDirection::Auto;
+                }
+            }
+            if latin_block.is_none() {
+                if let Some(cs) = json_u32(rb, "charset") {
+                    if cs == 178 {
+                        ts.direction = TextDirection::Rtl;
+                    }
                 }
             }
         }
@@ -1776,5 +1803,28 @@ mod tests {
 
         let cyc = sheet.resolve("cycA").unwrap();
         assert!((cyc.outline_width_mm.unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cdss_parses_latin_and_rtl_character_blocks_with_numeric_weight() {
+        let json = br##"{
+          "version": 2400,
+          "style": {
+            "heading": {
+              "character": {
+                "latin": { "font": "Inter", "weight": 700, "size": "84667" },
+                "RTL": { "font": "Noto Sans Arabic", "charset": 178 }
+              }
+            }
+          }
+        }"##;
+        let sheet = parse_document_cdss(json);
+        let style = sheet.resolve("heading").unwrap();
+        let ts = style.text_style.expect("character TextStyle parsed");
+        assert_eq!(ts.font_family, "Inter");
+        assert_eq!(ts.effective_weight(), 700);
+        assert!(ts.bold);
+        assert_eq!(ts.bidi_font_family.as_deref(), Some("Noto Sans Arabic"));
+        assert!((ts.font_size_pt - 24.0).abs() < 0.2);
     }
 }

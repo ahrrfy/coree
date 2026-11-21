@@ -130,6 +130,13 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
         if ui.small_button("+ Master").clicked() {
             app.add_layer_active("Master".to_owned(), false, MasterLayerScope::AllPages);
         }
+        if ui
+            .small_button("Desktop")
+            .on_hover_text("Move selection to persistent cross-page Desktop layer")
+            .clicked()
+        {
+            app.move_selection_to_desktop_layer();
+        }
     });
     ui.horizontal(|ui| {
         if ui.small_button("⬆ Front").clicked() {
@@ -181,13 +188,14 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
                             l.locked,
                             l.printable,
                             l.is_cut_layer,
+                            l.is_desktop_layer,
                             l.master_scope,
                             l.objects.clone(),
                         )
                     })
                     .collect();
 
-                for (lid, lname, vis, lck, prn, is_cut, scope, objs) in layer_ids {
+                for (lid, lname, vis, lck, prn, is_cut, is_desktop, scope, objs) in layer_ids {
                     ui.horizontal(|ui| {
                         let is_act_layer = tab.active_layer_id == Some(lid);
                         if ui
@@ -200,7 +208,9 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
                         if is_cut {
                             ui.label(RichText::new("CUT").size(9.5).color(tokens.cutcontour));
                         }
-                        if scope != MasterLayerScope::None {
+                        if is_desktop {
+                            ui.label(RichText::new("DESKTOP").size(9.5).color(tokens.accent));
+                        } else if scope != MasterLayerScope::None {
                             ui.label(
                                 RichText::new("MASTER")
                                     .size(9.5)
@@ -843,58 +853,13 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         let mut changed = false;
                         if let Some(run) = art.runs.first_mut() {
                             changed |= ui.text_edit_multiline(&mut run.text).changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Font:");
-                                changed |= ui
-                                    .text_edit_singleline(&mut run.style.font_family)
-                                    .changed();
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.font_size_pt, 6.0..=200.0)
-                                        .text("Size (pt)"),
-                                )
-                                .changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Direction:");
-                                for dir in
-                                    [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl]
-                                {
-                                    if ui
-                                        .selectable_label(art.direction == dir, format!("{dir:?}"))
-                                        .clicked()
-                                    {
-                                        art.direction = dir;
-                                        run.style.direction = dir;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Align:");
-                                for al in [
-                                    TextAlign::Left,
-                                    TextAlign::Center,
-                                    TextAlign::Right,
-                                    TextAlign::Justify,
-                                    TextAlign::ForceJustifyKashida,
-                                ] {
-                                    if ui
-                                        .selectable_label(art.align == al, format!("{al:?}"))
-                                        .clicked()
-                                    {
-                                        art.align = al;
-                                        run.style.align = al;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.kashida_stretch, 0.0..=2.0)
-                                        .text("Kashida Stretch"),
-                                )
-                                .changed();
+                            changed |= render_docker_text_style_fields(
+                                ui,
+                                &mut run.style,
+                                Some(&mut art.direction),
+                                Some(&mut art.align),
+                                "art",
+                            );
                         }
                         if changed {
                             let _ = app.execute_command(CommandOp::EditText {
@@ -908,58 +873,13 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         let mut changed = false;
                         if let Some(run) = para.runs.first_mut() {
                             changed |= ui.text_edit_multiline(&mut run.text).changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Font:");
-                                changed |= ui
-                                    .text_edit_singleline(&mut run.style.font_family)
-                                    .changed();
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.font_size_pt, 6.0..=200.0)
-                                        .text("Size (pt)"),
-                                )
-                                .changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Direction:");
-                                for dir in
-                                    [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl]
-                                {
-                                    if ui
-                                        .selectable_label(para.direction == dir, format!("{dir:?}"))
-                                        .clicked()
-                                    {
-                                        para.direction = dir;
-                                        run.style.direction = dir;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Align:");
-                                for al in [
-                                    TextAlign::Left,
-                                    TextAlign::Center,
-                                    TextAlign::Right,
-                                    TextAlign::Justify,
-                                    TextAlign::ForceJustifyKashida,
-                                ] {
-                                    if ui
-                                        .selectable_label(para.align == al, format!("{al:?}"))
-                                        .clicked()
-                                    {
-                                        para.align = al;
-                                        run.style.align = al;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.kashida_stretch, 0.0..=2.0)
-                                        .text("Kashida Stretch"),
-                                )
-                                .changed();
+                            changed |= render_docker_text_style_fields(
+                                ui,
+                                &mut run.style,
+                                Some(&mut para.direction),
+                                Some(&mut para.align),
+                                "para",
+                            );
                         }
                         ui.horizontal(|ui| {
                             ui.label("Frame:");
@@ -1006,42 +926,13 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         let mut changed = false;
                         if let Some(run) = top.text.runs.first_mut() {
                             changed |= ui.text_edit_singleline(&mut run.text).changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Font:");
-                                changed |= ui
-                                    .text_edit_singleline(&mut run.style.font_family)
-                                    .changed();
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.font_size_pt, 6.0..=200.0)
-                                        .text("Size (pt)"),
-                                )
-                                .changed();
-                            ui.horizontal(|ui| {
-                                ui.label("Direction:");
-                                for dir in
-                                    [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl]
-                                {
-                                    if ui
-                                        .selectable_label(
-                                            top.text.direction == dir,
-                                            format!("{dir:?}"),
-                                        )
-                                        .clicked()
-                                    {
-                                        top.text.direction = dir;
-                                        run.style.direction = dir;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut run.style.kashida_stretch, 0.0..=2.0)
-                                        .text("Kashida Stretch"),
-                                )
-                                .changed();
+                            changed |= render_docker_text_style_fields(
+                                ui,
+                                &mut run.style,
+                                Some(&mut top.text.direction),
+                                Some(&mut top.text.align),
+                                "top",
+                            );
                         }
                         ui.horizontal(|ui| {
                             changed |= ui
@@ -1084,23 +975,143 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     .color(tokens.text_muted),
                 );
                 ui.text_edit_singleline(&mut app.tool_settings.text_insert_draft);
-                ui.horizontal(|ui| {
-                    ui.label("Font:");
-                    ui.text_edit_singleline(&mut app.default_text_style.font_family);
-                });
-                ui.add(
-                    egui::Slider::new(&mut app.default_text_style.font_size_pt, 8.0..=144.0)
-                        .text("Size (pt)"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut app.default_text_style.kashida_stretch, 0.0..=2.0)
-                        .text("Kashida"),
+                let _ = render_docker_text_style_fields(
+                    ui,
+                    &mut app.default_text_style,
+                    None,
+                    None,
+                    "default_txt",
                 );
             }
             ui.separator();
             ui_glyphs_browser(ui, app, "props_text_glyphs");
         }
     }
+}
+
+fn render_docker_text_style_fields(
+    ui: &mut Ui,
+    style: &mut coree_core::TextStyle,
+    mut direction: Option<&mut TextDirection>,
+    mut align: Option<&mut TextAlign>,
+    salt: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Font:");
+        changed |= ui.text_edit_singleline(&mut style.font_family).changed();
+    });
+    let mut bidi_buf = style.bidi_font_family.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("RTL BiDi Font:");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut bidi_buf).hint_text("Auto (e.g. Noto Sans Arabic)"),
+            )
+            .changed()
+        {
+            let trimmed = bidi_buf.trim();
+            style.bidi_font_family = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+            changed = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Weight:");
+        let mut w = style.effective_weight();
+        ComboBox::from_id_salt(("docker_txt_w", salt))
+            .width(120.0)
+            .selected_text(format!("{w}"))
+            .show_ui(ui, |ui| {
+                for (wt, lbl) in [
+                    (100, "100 Thin"),
+                    (200, "200 ExtraLight"),
+                    (300, "300 Light"),
+                    (400, "400 Regular"),
+                    (500, "500 Medium"),
+                    (600, "600 SemiBold"),
+                    (700, "700 Bold"),
+                    (800, "800 ExtraBold"),
+                    (900, "900 Black"),
+                ] {
+                    if ui.selectable_label(w == wt, lbl).clicked() {
+                        style.set_weight(wt);
+                        changed = true;
+                    }
+                }
+            });
+        if ui
+            .add(DragValue::new(&mut w).range(100..=900).speed(10.0))
+            .changed()
+        {
+            style.set_weight(w);
+            changed = true;
+        }
+    });
+    changed |= ui
+        .add(egui::Slider::new(&mut style.font_size_pt, 6.0..=200.0).text("Size (pt)"))
+        .changed();
+    if let Some(ref mut dir_ref) = direction {
+        ui.horizontal(|ui| {
+            ui.label("Direction:");
+            for dir in [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl] {
+                if ui
+                    .selectable_label(**dir_ref == dir, format!("{dir:?}"))
+                    .clicked()
+                {
+                    **dir_ref = dir;
+                    style.direction = dir;
+                    changed = true;
+                }
+            }
+        });
+    }
+    if let Some(ref mut align_ref) = align {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Align:");
+            for al in [
+                TextAlign::Left,
+                TextAlign::Center,
+                TextAlign::Right,
+                TextAlign::Justify,
+                TextAlign::ForceJustifyKashida,
+            ] {
+                if ui
+                    .selectable_label(**align_ref == al, format!("{al:?}"))
+                    .clicked()
+                {
+                    **align_ref = al;
+                    style.align = al;
+                    changed = true;
+                }
+            }
+        });
+    }
+    changed |= ui
+        .add(egui::Slider::new(&mut style.kashida_stretch, 0.0..=2.0).text("Kashida Stretch"))
+        .changed();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("OpenType:");
+        changed |= ui
+            .checkbox(&mut style.opentype_features.liga, "liga")
+            .changed();
+        changed |= ui
+            .checkbox(&mut style.opentype_features.calt, "calt")
+            .changed();
+        changed |= ui
+            .checkbox(&mut style.opentype_features.kern, "kern")
+            .changed();
+        changed |= ui
+            .checkbox(&mut style.opentype_features.dlig, "dlig")
+            .changed();
+        changed |= ui
+            .checkbox(&mut style.opentype_features.smcp, "smcp")
+            .changed();
+    });
+    changed
 }
 
 enum LineJoinCapHelper {
@@ -1373,15 +1384,36 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
     }
 
     ui.separator();
-    ui.label(RichText::new("PowerClip").strong());
-    ui.horizontal(|ui| {
+    ui.label(RichText::new("PowerClip & Desktop Layer").strong());
+    ui.horizontal_wrapped(|ui| {
         if ui.button("Place Inside Frame").clicked() {
             app.create_powerclip_from_selection();
         }
         if ui.button("Extract Contents").clicked() {
             app.extract_selected_powerclip();
         }
+        if ui.button("Move to Desktop Layer").clicked() {
+            app.move_selection_to_desktop_layer();
+        }
     });
+    let selected_pc_lock = app.active_tab().and_then(|t| {
+        t.selection.objects.iter().find_map(|id| {
+            let obj = t.document.objects.get(id)?;
+            if let NodePayload::PowerClip { lock_contents, .. } = &obj.payload {
+                Some(*lock_contents)
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(mut locked) = selected_pc_lock {
+        if ui
+            .checkbox(&mut locked, "Lock Contents to PowerClip")
+            .changed()
+        {
+            app.set_powerclip_lock_selected(Some(locked));
+        }
+    }
 }
 
 // =============================================================================

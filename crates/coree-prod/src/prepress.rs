@@ -373,6 +373,7 @@ fn rasterize_object_separation(
         NodePayload::PowerClip {
             container,
             contents,
+            ..
         } => {
             let world_container = container.transformed(&world_xf);
             // Paint container fill/stroke first if any

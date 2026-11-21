@@ -22,11 +22,11 @@ use crate::text_layout::TextEngine;
 use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
-    apply_soft_proof_rgba, Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode,
-    BuiltinIccProfile, Color, DimensionKind, DimensionObject, Document, Fill, GuideOrientation,
-    Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page,
-    PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject,
-    SpatialIndex, Subpath, SymbolDef, Vec2D, VectorTable,
+    apply_soft_proof_rgba_with_profile, Affine2D, ArrowheadStyle, ArtisticText, BezierPath,
+    BlendMode, BuiltinIccProfile, Color, DimensionKind, DimensionObject, Document, Fill,
+    GuideOrientation, IccProfile, Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId,
+    OutlineStyle, Page, PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D,
+    RenderingIntent, SceneObject, SpatialIndex, Subpath, SymbolDef, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -282,7 +282,8 @@ impl SceneRenderer {
                 let mut set: HashSet<ObjectId> = index.query_rect(expanded).into_iter().collect();
                 // Always include master-layer objects & objects with Blend/Lens/Viewpoint/Symmetry
                 for layer in &layers {
-                    let is_master = layer.master_scope != MasterLayerScope::None;
+                    let is_master =
+                        layer.is_desktop_layer || layer.master_scope != MasterLayerScope::None;
                     for &oid in &layer.objects {
                         if is_master {
                             set.insert(oid);
@@ -340,8 +341,13 @@ impl SceneRenderer {
         if (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe {
             let mut buf = backend.snapshot_rgba();
             if !buf.is_empty() {
-                apply_soft_proof_rgba(
+                let custom_icc = doc
+                    .custom_icc_profile
+                    .as_deref()
+                    .and_then(|bytes| IccProfile::from_bytes(bytes).ok());
+                apply_soft_proof_rgba_with_profile(
                     &mut buf.rgba,
+                    custom_icc.as_ref(),
                     options.proof_profile,
                     options.proof_intent,
                     options.soft_proof_cmyk,
@@ -832,6 +838,7 @@ impl SceneRenderer {
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 let deformed_container = apply_geometry_effects(container, &obj.effects);
                 if view_mode == ViewMode::Wireframe {
@@ -2599,12 +2606,13 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
 
     for page in &doc.pages {
         for layer in &page.layers {
-            let applies = match layer.master_scope {
-                MasterLayerScope::None => false,
-                MasterLayerScope::AllPages => true,
-                MasterLayerScope::OddPages => is_odd,
-                MasterLayerScope::EvenPages => !is_odd,
-            };
+            let applies = layer.is_desktop_layer
+                || match layer.master_scope {
+                    MasterLayerScope::None => false,
+                    MasterLayerScope::AllPages => true,
+                    MasterLayerScope::OddPages => is_odd,
+                    MasterLayerScope::EvenPages => !is_odd,
+                };
             if applies && seen.insert(layer.id) {
                 out.push(layer);
             }
@@ -2612,7 +2620,10 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
     }
     if let Some(page) = doc.pages.get(page_index) {
         for layer in &page.layers {
-            if layer.master_scope == MasterLayerScope::None && seen.insert(layer.id) {
+            if !layer.is_desktop_layer
+                && layer.master_scope == MasterLayerScope::None
+                && seen.insert(layer.id)
+            {
                 out.push(layer);
             }
         }

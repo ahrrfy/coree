@@ -35,12 +35,13 @@ pub use color::{
     default_cmyk_palette, default_rgb_palette, Color, ColorHarmony, ColorMode, ColorPalette,
     ColorStyle, ColorStyleId, ColorSwatch,
 };
-pub use command::{apply_command, run_rhai_macro, CommandHistory, CommandOp};
+pub use command::{apply_command, rhai_array_to_ids, run_rhai_macro, CommandHistory, CommandOp};
 pub use dimension::{AnchorPoint, ConnectorObject, ConnectorStyle, DimensionKind, DimensionObject};
 pub use document::{
-    AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig, Guide, GuideOrientation, Layer,
-    MasterLayerScope, NodePayload, Page, PathMetrics, PerspectiveGridConfig, PerspectiveGridMode,
-    RasterAsset, RasterLayerData, SceneObject, SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
+    decode_base64, encode_base64, AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig,
+    Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload, Page, PathMetrics,
+    PerspectiveGridConfig, PerspectiveGridMode, RasterAsset, RasterLayerData, SceneObject,
+    SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
 };
 pub use effects::{
     ContourMode, DistortKind, Effect, EnvelopeMode, FeatherDirection, RasterFilter,
@@ -53,10 +54,11 @@ pub use geometry::{
     LiveSketch, NodeKind, ParametricShape, PathNode, RecognizedShape, SmartDrawing, Subpath,
 };
 pub use icc::{
-    apply_soft_proof_rgba, convert_cmyk_to_rgb_icc, convert_rgb_between_builtin_profiles,
-    convert_rgb_to_cmyk_icc, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk, BuiltinIccProfile,
-    IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass, IccProfileHeader, IccTagEntry,
-    IccToneCurve, RenderingIntent, MAX_ICC_PROFILE_BYTES,
+    apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile, convert_cmyk_to_rgb_icc,
+    convert_rgb_between_builtin_profiles, convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2,
+    generate_minimal_srgb_icc_v2, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk,
+    BuiltinIccProfile, IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass,
+    IccProfileHeader, IccTagEntry, IccToneCurve, RenderingIntent, MAX_ICC_PROFILE_BYTES,
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
@@ -68,8 +70,8 @@ pub use style::{
 };
 pub use table::{TableCell, VectorTable};
 pub use text::{
-    ArtisticText, DropCapConfig, ParagraphText, TextAlign, TextDirection, TextOnPath, TextRun,
-    TextStyle, TextWrapMode,
+    ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphText, TextAlign, TextDirection,
+    TextOnPath, TextRun, TextStyle, TextWrapMode,
 };
 
 #[cfg(test)]

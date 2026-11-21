@@ -10,10 +10,10 @@ use crate::raster::{
     decode_raster_bytes_with_limits, export_raster_to_bytes, RasterExportOptions, RasterFormat,
 };
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Effect, Fill,
-    GradientStop, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId,
-    OutlineStyle, Point2D, RasterLayerData, SceneObject, TextAlign, TextDirection, TextRun,
-    TextStyle, Unit,
+    encode_base64, Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document,
+    Effect, Fill, GradientStop, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload,
+    ObjectId, OutlineStyle, Point2D, RasterLayerData, SceneObject, TextAlign, TextDirection,
+    TextRun, TextStyle, Unit,
 };
 use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
 use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba};
@@ -1109,12 +1109,13 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
             continue;
         }
         for layer in &p.layers {
-            let include = match layer.master_scope {
-                MasterLayerScope::None => false,
-                MasterLayerScope::AllPages => true,
-                MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
-                MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
-            };
+            let include = layer.is_desktop_layer
+                || match layer.master_scope {
+                    MasterLayerScope::None => false,
+                    MasterLayerScope::AllPages => true,
+                    MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
+                    MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
+                };
             if include {
                 layers_to_emit.push(layer);
             }
@@ -1601,6 +1602,7 @@ fn write_svg_object(
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 *def_counter += 1;
                 let clip_id = format!("clip-{}", *def_counter);
@@ -2076,38 +2078,6 @@ fn escape_xml_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = if chunk.len() > 1 {
-            u32::from(chunk[1])
-        } else {
-            0
-        };
-        let b2 = if chunk.len() > 2 {
-            u32::from(chunk[2])
-        } else {
-            0
-        };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((triple >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(triple & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[cfg(test)]

@@ -74,6 +74,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.0" date="2026-11-22">
+      <description>
+        <p>
+          Wave D complete architectural parity release: ISO 32000-1 PDF /OutputIntents ICC v2
+          embedding, custom .icc/.icm document proofing &amp; loader UI, CDR legacy v7–v15
+          fild/outl/arrw/bmpf/vpat/clrs handlers &amp; ZCF character.RTL/latin numeric font
+          weights, persistent cross-page Desktop layer, PowerClip Lock Contents &amp; parametric
+          extract restoration, compact delta Undo/Redo history, Ctrl+K effect decomposition into
+          editable primitives, Rayon parallel dirty-tile rendering &amp; cached fontdb, single-instance
+          IPC file handoff (--new-window), native OS Print Studio (Ctrl+P), full v2 workspace &amp;
+          custom shortcut remapping, InteractiveFill 4-type stop insertion &amp; focal handle,
+          bilingual Arabic UAX #9 BiDi UI shaping, and synchronous Windows coree.com Console CLI
+          companion.
+        </p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-11-22">
       <description>
         <p>

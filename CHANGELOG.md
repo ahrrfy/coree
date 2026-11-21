@@ -4,6 +4,30 @@ All notable changes to **`coree`** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-22
+
+### Added & Hardened (Wave D — Deep Parity, Performance, Print & OS Integration)
+- **Color Management & Print Fidelity (`coree-core`, `coree-io`, `coree-render`, `coree-app`):**
+  - Added clean-room ICC v2 sRGB (`generate_minimal_srgb_icc_v2`) and Output CMYK (`generate_minimal_cmyk_icc_v2` with `A2B0`/`B2A0` LUTs) generators + ISO 32000-1 `/Catalog /OutputIntents` embedding in PDF export (`coree-io/src/pdf.rs`).
+  - Added per-document `custom_icc_profile` support across `Document`, live `SoftProofLut3D::build_from_profile` canvas soft-proofing, PDF `/OutputIntents`, and `Options -> Color Management` file picker (`.icc` / `.icm`).
+  - Added **Native OS Print Studio (`Ctrl+P`)** in `coree-app/src/printing.rs` & Print dialog with CUPS (`lpstat`/`lp`/`lpr`) and Windows Spooler (`Get-Printer`/`Start-Process -Verb PrintTo`) support, page-range filtering, copies, fit-to-page, collate, and prepress sheet imposition.
+- **CDR / ZCF Codec Depth (`coree-cdr`):**
+  - Implemented legacy RIFF v7–v15 `arrw` arrowhead, `bmpf` bitmap pattern, `vpat` vector pattern, and `clrs` color style handlers plus legacy binary `fild`/`outl` fallbacks.
+  - Upgraded ZCF `styles/document.cdss` parser to extract both `character.latin` and `character.RTL` fonts (`bidi_font_family`) with numeric `font_weight` (`100..=900`), and preserved `ParametricShape` across `PowerClip` extract/roundtrip.
+- **Scene Graph, Memory & Effects (`coree-core`, `coree-render`, `coree-app`):**
+  - Added CorelDRAW's persistent cross-page **`Desktop` layer** (`Layer::is_desktop_layer`, `CommandOp::MoveToDesktopLayer`) indexed across pages and included in canvas, PDF, EPS, and SVG output.
+  - Added `PowerClip` **`lock_contents`** behavior (`CommandOp::SetPowerClipLock`), UI checkbox & command-palette integration.
+  - Replaced full 2× `BTreeMap` document cloning per Undo step with compact `DocumentDelta` / `ObjectDelta` diffing (`coree-core/src/command.rs`).
+  - Implemented **`lower_effects_to_primitives`** (`coree-render`) and wired `Ctrl+K` (*Break Apart*) to decompose live Shadows, Contours, 2.5D Extrudes, Blends, and Symmetry into editable vector primitives atomically.
+  - Added process-wide `OnceLock<fontdb::Database>` caching (`TextEngine`), OpenType `liga`/`calt`/`kern`/`dlig`/`smcp` + numeric `font_weight` + `bidi_font_family` controls, and **Rayon parallel dirty-tile rendering** (`DirtyTileCache`).
+- **Studio UX, Single-Instance IPC & Windows Dual Binary (`coree-app`, CI/Packaging):**
+  - Modularized monolithic `state.rs` into cohesive `crates/coree-app/src/state/{mod,types,tab,editing,production,canvas_tools,helpers}.rs`.
+  - Added pure-Rust single-instance TCP loopback IPC + lockfile (`coree-app/src/ipc.rs`, `--new-window`) so Explorer/Desktop file opens focus and open tabs in the existing window cleanly.
+  - Added full v2 `.coreews` `WorkspaceBundle` serialization (including `egui_dock` tree with finite-rect sanitization, toolbox active tools, UI language, and `CustomShortcutMap`) + SQLite persistence and live Custom Shortcut Editor (`Ctrl+J`).
+  - Extended `InteractiveFill` canvas tool with Radial Focal point handle, intermediate stop handles across Linear/Radial/Conical/Square gradients, and double-click stop insertion.
+  - Fixed multi-word Arabic UI run splitting (`configure_arabic_capable_fonts_for_language` prioritizing Arabic face in Arabic mode) and added `unicode-bidi` visual ordering helper (`shape_mixed_ui_bidi`).
+  - Fixed Windows Release CLI (`#136994479287`): added Console-subsystem `coree-cli` shipped beside `coree.exe` as `coree.com` in WiX MSI & portable ZIP + synchronous `Start-Process` GUI smoke checks.
+
 ## [0.2.1] - 2026-11-22
 
 ### Fixed & Added (Wave C Deep Atomic Audit — `BUG-089`–`BUG-097`)

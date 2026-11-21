@@ -11,11 +11,19 @@ use coree_core::{
     TextAlign, TextDirection, TextOnPath, TextRun, TextStyle, Vec2D,
 };
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Command, Family, FontSystem, Metrics, Shaping,
-    Style, SwashCache, SwashContent, Weight, Wrap,
+    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Command, Family, FeatureTag, FontFeatures,
+    FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight, Wrap,
 };
 use kurbo::BezPath;
 use std::sync::{Mutex, OnceLock};
+
+fn shared_base_font_db() -> &'static (String, cosmic_text::fontdb::Database) {
+    static BASE_DB: OnceLock<(String, cosmic_text::fontdb::Database)> = OnceLock::new();
+    BASE_DB.get_or_init(|| {
+        let fs = FontSystem::new();
+        (fs.locale().to_owned(), fs.db().clone())
+    })
+}
 
 /// Internal layout resolution scale (logical pixels per millimeter) used during
 /// unhinted glyph outline extraction so coordinates convert cleanly back to mm.
@@ -42,10 +50,11 @@ impl Default for TextEngine {
 }
 
 impl TextEngine {
-    /// Initializes the text engine and discovers installed system fonts.
+    /// Initializes the text engine reusing the cached OS font catalog (sub-millisecond per tab/worker).
     #[must_use]
     pub fn new() -> Self {
-        let font_system = FontSystem::new();
+        let (locale, db) = shared_base_font_db();
+        let font_system = FontSystem::new_with_locale_and_db(locale.clone(), db.clone());
         let arabic_fallback_family = detect_arabic_font_family(&font_system);
         Self {
             font_system,
@@ -237,14 +246,26 @@ impl TextEngine {
             b.set_size(Some(generous_width), None);
         }
 
-        let default_family = self.resolve_family(&default_style.font_family, has_arabic);
+        let default_family = self.resolve_family(
+            default_style.family_for_direction(if has_arabic {
+                TextDirection::Rtl
+            } else {
+                TextDirection::Ltr
+            }),
+            has_arabic,
+        );
         let default_attrs = build_attrs(&default_style, default_family, 0);
         let spans: Vec<(&str, Attrs<'_>)> = processed_runs
             .iter()
             .enumerate()
             .map(|(idx, run)| {
                 let run_ar = has_arabic || contains_arabic(&run.text);
-                let fam = self.resolve_family(&run.style.font_family, run_ar);
+                let target_fam = run.style.family_for_direction(if run_ar {
+                    TextDirection::Rtl
+                } else {
+                    TextDirection::Ltr
+                });
+                let fam = self.resolve_family(target_fam, run_ar);
                 (run.text.as_str(), build_attrs(&run.style, fam, idx))
             })
             .collect();
@@ -298,14 +319,26 @@ impl TextEngine {
             b.set_size(Some(col_w_px), None);
         }
 
-        let default_family = self.resolve_family(&default_style.font_family, has_arabic);
+        let default_family = self.resolve_family(
+            default_style.family_for_direction(if has_arabic {
+                TextDirection::Rtl
+            } else {
+                TextDirection::Ltr
+            }),
+            has_arabic,
+        );
         let default_attrs = build_attrs(&default_style, default_family, 0);
         let spans: Vec<(&str, Attrs<'_>)> = processed_runs
             .iter()
             .enumerate()
             .map(|(idx, run)| {
                 let run_ar = has_arabic || contains_arabic(&run.text);
-                let fam = self.resolve_family(&run.style.font_family, run_ar);
+                let target_fam = run.style.family_for_direction(if run_ar {
+                    TextDirection::Rtl
+                } else {
+                    TextDirection::Ltr
+                });
+                let fam = self.resolve_family(target_fam, run_ar);
                 (run.text.as_str(), build_attrs(&run.style, fam, idx))
             })
             .collect();
@@ -423,14 +456,26 @@ impl TextEngine {
             b.set_size(None, None);
         }
 
-        let default_family = self.resolve_family(&default_style.font_family, has_arabic);
+        let default_family = self.resolve_family(
+            default_style.family_for_direction(if has_arabic {
+                TextDirection::Rtl
+            } else {
+                TextDirection::Ltr
+            }),
+            has_arabic,
+        );
         let default_attrs = build_attrs(&default_style, default_family, 0);
         let spans: Vec<(&str, Attrs<'_>)> = processed_runs
             .iter()
             .enumerate()
             .map(|(idx, run)| {
                 let run_ar = has_arabic || contains_arabic(&run.text);
-                let fam = self.resolve_family(&run.style.font_family, run_ar);
+                let target_fam = run.style.family_for_direction(if run_ar {
+                    TextDirection::Rtl
+                } else {
+                    TextDirection::Ltr
+                });
+                let fam = self.resolve_family(target_fam, run_ar);
                 (run.text.as_str(), build_attrs(&run.style, fam, idx))
             })
             .collect();
@@ -893,18 +938,38 @@ fn draw_text_pieces(
 }
 
 fn build_attrs<'a>(style: &TextStyle, family: Family<'a>, run_idx: usize) -> Attrs<'a> {
+    let mut ff = FontFeatures::new();
+    if style.opentype_features.liga {
+        ff.enable(FeatureTag::STANDARD_LIGATURES);
+    } else {
+        ff.disable(FeatureTag::STANDARD_LIGATURES);
+    }
+    if style.opentype_features.calt {
+        ff.enable(FeatureTag::CONTEXTUAL_ALTERNATES);
+    } else {
+        ff.disable(FeatureTag::CONTEXTUAL_ALTERNATES);
+    }
+    if style.opentype_features.kern {
+        ff.enable(FeatureTag::KERNING);
+    } else {
+        ff.disable(FeatureTag::KERNING);
+    }
+    if style.opentype_features.dlig {
+        ff.enable(FeatureTag::DISCRETIONARY_LIGATURES);
+    }
+    if style.opentype_features.smcp {
+        ff.enable(FeatureTag::SMALL_CAPS);
+    }
+
     let mut attrs = Attrs::new()
         .family(family)
-        .weight(if style.bold {
-            Weight::BOLD
-        } else {
-            Weight::NORMAL
-        })
+        .weight(Weight(style.effective_weight()))
         .style(if style.italic {
             Style::Italic
         } else {
             Style::Normal
         })
+        .font_features(ff)
         .metadata(run_idx);
 
     let font_px = (style.font_size_mm() as f32 * LAYOUT_UNITS_PER_MM).max(4.0);
@@ -1272,10 +1337,10 @@ fn list_glyphs_with_font_system(
         return Vec::new();
     }
 
-    // Resolve matching font face IDs to inspect actual cmap glyph support
+    // Resolve matching font face IDs & actual face weights to inspect true cmap glyph coverage
     let trimmed_fam = font_family.map(str::trim).filter(|s| !s.is_empty());
-    let candidate_ids: Vec<cosmic_text::fontdb::ID> = if let Some(fam) = trimmed_fam {
-        let exact: Vec<_> = font_system
+    let candidate_faces: Vec<(cosmic_text::fontdb::ID, Weight)> = if let Some(fam) = trimmed_fam {
+        let mut exact: Vec<_> = font_system
             .db()
             .faces()
             .filter(|f| {
@@ -1283,29 +1348,29 @@ fn list_glyphs_with_font_system(
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case(fam))
             })
-            .map(|f| f.id)
-            .take(8)
+            .map(|f| (f.id, f.weight))
             .collect();
+        exact.sort_by_key(|(_, w)| (w.0 as i32 - 400).abs());
+        exact.truncate(8);
         if exact.is_empty() {
-            // Fall back to checking a small set of general system fonts if requested family isn't installed
-            font_system.db().faces().map(|f| f.id).take(16).collect()
+            let mut general: Vec<_> = font_system.db().faces().map(|f| (f.id, f.weight)).collect();
+            general.sort_by_key(|(_, w)| (w.0 as i32 - 400).abs());
+            general.truncate(16);
+            general
         } else {
             exact
         }
     } else {
-        // Sample representative system faces (preferring regular faces across Latin/Arabic/Symbol fonts)
-        font_system
-            .db()
-            .faces()
-            .filter(|f| f.weight == Weight::NORMAL)
-            .map(|f| f.id)
-            .take(32)
-            .collect()
+        // Sample representative faces across all weights (preferring regular first without dropping thin/bold-only faces)
+        let mut faces: Vec<_> = font_system.db().faces().map(|f| (f.id, f.weight)).collect();
+        faces.sort_by_key(|(_, w)| (w.0 as i32 - 400).abs());
+        faces.truncate(40);
+        faces
     };
 
-    let loaded_fonts: Vec<_> = candidate_ids
+    let loaded_fonts: Vec<_> = candidate_faces
         .into_iter()
-        .filter_map(|id| font_system.get_font(id, Weight::NORMAL))
+        .filter_map(|(id, weight)| font_system.get_font(id, weight))
         .collect();
 
     let is_supported = |ch: char| -> bool {

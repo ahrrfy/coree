@@ -5,7 +5,7 @@
 //! `coree_core::brand::BrandInfo`).
 
 use crate::io_bridge::{read_text_file_bounded, MAX_TEXT_READ_BYTES};
-use crate::shortcuts::ShortcutProfile;
+use crate::shortcuts::{shortcut_label_for, ShortcutAction, ShortcutProfile};
 use crate::state::{StudioApp, WorkspacePreset};
 use crate::theme::{core_color_to_egui, StudioLanguage, StudioTheme};
 use coree_cdr::CdrWriteVersion;
@@ -480,13 +480,90 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
     if !app.show_print_preview_dialog {
         return;
     }
+    let tokens = app.theme.tokens();
     let mut open = app.show_print_preview_dialog;
-    egui::Window::new("Print Preview, Imposition & Separations")
+    let mut print_now = false;
+    let mut refresh_printers = false;
+    egui::Window::new("Print Studio, Native OS Spooler & Imposition (Ctrl+P)")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size(egui::vec2(520.0, 340.0))
+        .default_size(egui::vec2(560.0, 440.0))
         .show(ctx, |ui| {
+            ui.label(RichText::new("Native OS Print Queue (CUPS / Windows Spooler)").strong());
+            ui.horizontal(|ui| {
+                ui.label("Printer:");
+                let current_printer = app
+                    .print_job_config
+                    .printer_name
+                    .clone()
+                    .unwrap_or_else(|| "System Default Printer".to_owned());
+                ComboBox::from_id_salt("print_os_printer_combo")
+                    .width(260.0)
+                    .selected_text(&current_printer)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                app.print_job_config.printer_name.is_none(),
+                                "System Default Printer",
+                            )
+                            .clicked()
+                        {
+                            app.print_job_config.printer_name = None;
+                        }
+                        for p in &app.available_printers {
+                            let label = if p.is_default {
+                                format!("{} (Default · {})", p.name, p.status)
+                            } else {
+                                format!("{} ({})", p.name, p.status)
+                            };
+                            if ui
+                                .selectable_label(
+                                    app.print_job_config.printer_name.as_deref() == Some(&p.name),
+                                    label,
+                                )
+                                .clicked()
+                            {
+                                app.print_job_config.printer_name = Some(p.name.clone());
+                            }
+                        }
+                    });
+                if ui.button("Refresh").clicked() {
+                    refresh_printers = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Copies:");
+                ui.add(DragValue::new(&mut app.print_job_config.copies).range(1..=999));
+                ui.label("Pages:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.print_job_config.page_range)
+                        .desired_width(100.0)
+                        .hint_text("all or 1,3-5"),
+                );
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut app.print_job_config.force_cmyk, "CMYK Press Output");
+                ui.checkbox(&mut app.print_job_config.fit_to_page, "Fit to Page");
+                ui.checkbox(&mut app.print_job_config.crop_marks, "Crop Marks");
+                ui.checkbox(&mut app.print_job_config.collate, "Collate");
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("Print Document Now").strong())
+                    .clicked()
+                {
+                    print_now = true;
+                }
+                if let Some(ref status) = app.printers_status {
+                    ui.label(RichText::new(status).size(11.0).color(tokens.text_muted));
+                }
+            });
+
+            ui.separator();
             ui.label(RichText::new("Prepress Sheet & Separation Studio").strong());
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut app.production_state.imposition_kind, 0, "N-Up Grid");
@@ -548,6 +625,12 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                 }
             }
         });
+    if refresh_printers {
+        app.refresh_system_printers();
+    }
+    if print_now {
+        app.print_active_document_os();
+    }
     app.show_print_preview_dialog = open;
 }
 
@@ -702,6 +785,62 @@ fn show_options_appearance_workspace(
             {
                 app.set_shortcut_profile(prof);
             }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Custom Shortcut Overrides").strong());
+    let remappable = ShortcutAction::REMAPPABLE_ACTIONS;
+    if app.shortcut_editor_idx >= remappable.len() {
+        app.shortcut_editor_idx = 0;
+    }
+    let (sel_action, sel_name) = remappable[app.shortcut_editor_idx];
+    let current_binding =
+        shortcut_label_for(app.shortcut_profile, &app.custom_shortcuts, sel_action);
+    ui.horizontal_wrapped(|ui| {
+        ComboBox::from_id_salt("opt_custom_shortcut_action")
+            .width(230.0)
+            .selected_text(format!("{sel_name} [{current_binding}]"))
+            .show_ui(ui, |ui| {
+                for (i, &(act, name)) in remappable.iter().enumerate() {
+                    let lbl = shortcut_label_for(app.shortcut_profile, &app.custom_shortcuts, act);
+                    let display = if lbl.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{name} [{lbl}]")
+                    };
+                    if ui
+                        .selectable_value(&mut app.shortcut_editor_idx, i, display)
+                        .clicked()
+                    {
+                        app.shortcut_editor_combo = lbl;
+                    }
+                }
+            });
+        ui.add(
+            egui::TextEdit::singleline(&mut app.shortcut_editor_combo)
+                .desired_width(130.0)
+                .hint_text("Ctrl+Alt+B"),
+        );
+        if ui.button("Assign").clicked() {
+            let combo = app.shortcut_editor_combo.clone();
+            match app.custom_shortcuts.set_binding(sel_action, &combo) {
+                Ok(norm) => {
+                    app.shortcut_editor_combo = norm.clone();
+                    app.push_toast(format!("Bound {sel_name} -> {norm}"), false);
+                }
+                Err(err) => app.push_toast(format!("Invalid shortcut: {err}"), true),
+            }
+        }
+        if ui.button("Reset Key").clicked() {
+            app.custom_shortcuts.clear_binding(sel_action);
+            app.shortcut_editor_combo.clear();
+            app.push_toast(format!("Reset {sel_name} to profile default"), false);
+        }
+        if !app.custom_shortcuts.is_empty() && ui.button("Reset All Custom").clicked() {
+            app.custom_shortcuts.bindings.clear();
+            app.shortcut_editor_combo.clear();
+            app.push_toast("Cleared all custom shortcut overrides", false);
         }
     });
 
@@ -902,6 +1041,95 @@ fn show_options_color_management(
     if changed {
         app.sync_proof_options_to_tabs();
     }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(RichText::new("Document Embedded / Custom ICC Profile (.icc / .icm)").strong());
+    let custom_desc = app
+        .active_tab()
+        .and_then(|t| t.document.custom_icc_name.clone());
+    let custom_len = app
+        .active_tab()
+        .and_then(|t| t.document.custom_icc_profile.as_ref().map(Vec::len));
+    match (custom_desc, custom_len) {
+        (Some(name), Some(bytes_len)) => {
+            ui.label(
+                RichText::new(format!(
+                    "Active custom profile: {name} ({:.1} KiB)",
+                    bytes_len as f64 / 1024.0
+                ))
+                .size(11.5)
+                .color(tokens.accent),
+            );
+        }
+        _ => {
+            ui.label(
+                RichText::new("No external .icc/.icm profile attached to active document (using built-in D50 LUT).")
+                    .size(11.5)
+                    .color(tokens.text_muted),
+            );
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Load Custom .icc / .icm Profile...").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Load External ICC / ICM Color Profile")
+                .add_filter("ICC Profiles", &["icc", "ICC", "icm", "ICM"])
+                .add_filter("All Files", &["*"])
+                .pick_file()
+            {
+                const MAX_ICC_BYTES: u64 = 16 * 1024 * 1024;
+                let read_res = std::fs::metadata(&path)
+                    .map_err(|e| format!("failed to inspect ICC profile: {e}"))
+                    .and_then(|meta| {
+                        if meta.len() > MAX_ICC_BYTES {
+                            Err("ICC profile exceeds 16 MiB safety limit".to_owned())
+                        } else {
+                            std::fs::read(&path)
+                                .map_err(|e| format!("failed to read ICC profile: {e}"))
+                        }
+                    });
+                match read_res {
+                    Ok(bytes) => {
+                        let attached = app.active_tab_mut().map(|tab| {
+                            let res = tab.document.set_custom_icc_profile(bytes);
+                            if res.is_ok() {
+                                tab.dirty = true;
+                                tab.needs_rerender = true;
+                            }
+                            res
+                        });
+                        match attached {
+                            Some(Ok(prof)) => {
+                                app.soft_proof_cmyk = true;
+                                app.sync_proof_options_to_tabs();
+                                app.push_toast(
+                                    format!("Attached custom ICC profile: {}", prof.description),
+                                    false,
+                                );
+                            }
+                            Some(Err(err)) => {
+                                app.push_toast(format!("Invalid ICC profile: {err}"), true);
+                            }
+                            None => app.push_toast("No active document", true),
+                        }
+                    }
+                    Err(err) => app.push_toast(err, true),
+                }
+            }
+        }
+        if custom_len.is_some() && ui.button("Clear Custom ICC").clicked() {
+            if let Some(tab) = app.active_tab_mut() {
+                tab.document.custom_icc_profile = None;
+                tab.document.custom_icc_name = None;
+                tab.document.touch();
+                tab.dirty = true;
+                tab.needs_rerender = true;
+            }
+            app.sync_proof_options_to_tabs();
+            app.push_toast("Cleared custom document ICC profile", false);
+        }
+    });
 }
 
 fn show_options_laser_plugins(

@@ -1252,9 +1252,30 @@ fn render_text_style_strip(
         .selectable_label(style.bold, RichText::new("B").strong())
         .clicked()
     {
-        style.bold = !style.bold;
+        style.set_weight(if style.bold { 400 } else { 700 });
         changed = true;
     }
+    let cur_w = style.effective_weight();
+    ComboBox::from_id_salt((combo_salt, "weight"))
+        .width(64.0)
+        .selected_text(format!("w{cur_w}"))
+        .show_ui(ui, |ui| {
+            for (w, lbl) in [
+                (100, "100 Thin"),
+                (300, "300 Light"),
+                (400, "400 Regular"),
+                (500, "500 Medium"),
+                (600, "600 SemiBold"),
+                (700, "700 Bold"),
+                (800, "800 ExtraBold"),
+                (900, "900 Black"),
+            ] {
+                if ui.selectable_label(cur_w == w, lbl).clicked() {
+                    style.set_weight(w);
+                    changed = true;
+                }
+            }
+        });
     if ui
         .selectable_label(style.italic, RichText::new("I").italics())
         .clicked()
@@ -1267,6 +1288,59 @@ fn render_text_style_strip(
         .clicked()
     {
         style.underline = !style.underline;
+        changed = true;
+    }
+    let bidi_cur = style.bidi_font_family.as_deref().unwrap_or("Auto");
+    ComboBox::from_id_salt((combo_salt, "bidi_font"))
+        .width(96.0)
+        .selected_text(format!("RTL:{bidi_cur}"))
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(style.bidi_font_family.is_none(), "Auto (Primary)")
+                .clicked()
+            {
+                style.bidi_font_family = None;
+                changed = true;
+            }
+            for f in [
+                "Noto Sans Arabic",
+                "Noto Naskh Arabic",
+                "Amiri",
+                "Cairo",
+                "Tahoma",
+                "Arial",
+            ] {
+                if ui
+                    .selectable_label(style.bidi_font_family.as_deref() == Some(f), f)
+                    .clicked()
+                {
+                    style.bidi_font_family = Some(f.to_owned());
+                    changed = true;
+                }
+            }
+        });
+    if ui
+        .selectable_label(style.opentype_features.liga, "liga")
+        .on_hover_text("OpenType Standard Ligatures")
+        .clicked()
+    {
+        style.opentype_features.liga = !style.opentype_features.liga;
+        changed = true;
+    }
+    if ui
+        .selectable_label(style.opentype_features.calt, "calt")
+        .on_hover_text("OpenType Contextual Alternates (Arabic contextual joining)")
+        .clicked()
+    {
+        style.opentype_features.calt = !style.opentype_features.calt;
+        changed = true;
+    }
+    if ui
+        .selectable_label(style.opentype_features.kern, "kern")
+        .on_hover_text("OpenType Kerning")
+        .clicked()
+    {
+        style.opentype_features.kern = !style.opentype_features.kern;
         changed = true;
     }
     ui.separator();

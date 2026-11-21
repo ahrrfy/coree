@@ -1226,10 +1226,27 @@ pub fn apply_soft_proof_rgba(
     soft_proof: bool,
     gamut_warning: bool,
 ) {
+    apply_soft_proof_rgba_with_profile(rgba, None, profile, intent, soft_proof, gamut_warning);
+}
+
+/// Real-time soft-proofing and out-of-gamut overlay supporting arbitrary loaded custom
+/// [`IccProfile`] profiles (falling back to `fallback` built-in press when `custom_profile`
+/// lacks forward/inverse CMYK or RGB transforms).
+pub fn apply_soft_proof_rgba_with_profile(
+    rgba: &mut [u8],
+    custom_profile: Option<&IccProfile>,
+    fallback: BuiltinIccProfile,
+    intent: RenderingIntent,
+    soft_proof: bool,
+    gamut_warning: bool,
+) {
     if !soft_proof && !gamut_warning {
         return;
     }
-    let lut = cached_soft_proof_lut(profile.as_cmyk_press(), intent);
+    let custom_lut = custom_profile.and_then(|p| SoftProofLut3D::build_from_profile(p, intent));
+    let lut = custom_lut
+        .as_ref()
+        .unwrap_or_else(|| cached_soft_proof_lut(fallback.as_cmyk_press(), intent));
     for px in rgba.as_chunks_mut::<4>().0 {
         if px[3] == 0 {
             continue;
@@ -1315,6 +1332,54 @@ impl SoftProofLut3D {
             }
         }
         Self { grid: g, data }
+    }
+
+    fn build_from_profile(profile: &IccProfile, intent: RenderingIntent) -> Option<Self> {
+        let can_cmyk = profile.header.color_space == IccColorSpace::Cmyk
+            && (profile.a2b0.is_some() && profile.b2a0.is_some()
+                || profile.builtin_kind.is_some_and(BuiltinIccProfile::is_cmyk));
+        let can_rgb = profile.header.color_space == IccColorSpace::Rgb
+            && (profile.a2b0.is_some()
+                || (profile.rgb_to_xyz_matrix.is_some() && profile.b2a0.is_none())
+                || (profile.b2a0.is_some() && profile.a2b0.is_some()));
+        if !can_cmyk && !can_rgb {
+            return None;
+        }
+        let g = SOFT_PROOF_LUT_GRID;
+        let mut data = Vec::with_capacity(g * g * g);
+        let denom = (g - 1) as f64;
+        for ir in 0..g {
+            let r = (ir as f64) / denom;
+            for ig in 0..g {
+                let gv = (ig as f64) / denom;
+                for ib in 0..g {
+                    let b = (ib as f64) / denom;
+                    let xyz_in = srgb_to_xyz_d50([r, gv, b]);
+                    let lab_in = xyz_d50_to_lab(xyz_in);
+                    let xyz_proof = if can_cmyk {
+                        let cmyk = profile.pcs_xyz_to_cmyk(xyz_in)?;
+                        profile.cmyk_to_pcs_xyz(cmyk)?
+                    } else {
+                        let rgb_dev = profile.pcs_xyz_to_rgb(xyz_in)?;
+                        profile.rgb_to_pcs_xyz(rgb_dev)?
+                    };
+                    let _ = intent;
+                    let proof_rgb = xyz_d50_to_srgb(xyz_proof);
+                    let lab_out = xyz_d50_to_lab(xyz_proof);
+                    let dl = lab_in[0] - lab_out[0];
+                    let da = lab_in[1] - lab_out[1];
+                    let db = lab_in[2] - lab_out[2];
+                    let de_norm = ((dl * dl + da * da + db * db).sqrt() / 100.0).clamp(0.0, 2.0);
+                    data.push([
+                        proof_rgb[0] as f32,
+                        proof_rgb[1] as f32,
+                        proof_rgb[2] as f32,
+                        de_norm as f32,
+                    ]);
+                }
+            }
+        }
+        Some(Self { grid: g, data })
     }
 
     #[inline]
@@ -2485,14 +2550,240 @@ fn parse_lut_tag(tag: &[u8]) -> CoreResult<IccLut> {
     })
 }
 
+fn push_s15_fixed16(buf: &mut Vec<u8>, v: f64) {
+    let fixed = (v * 65_536.0).round() as i32;
+    buf.extend_from_slice(&fixed.to_be_bytes());
+}
+
+fn encode_icc_profile_bytes(
+    version_major: u8,
+    profile_class: &[u8; 4],
+    color_space: &[u8; 4],
+    pcs: &[u8; 4],
+    intent: u32,
+    tags: &[(&[u8; 4], Vec<u8>)],
+) -> Vec<u8> {
+    let mut header = vec![0u8; 128];
+    header[4..8].copy_from_slice(b"core");
+    header[8] = version_major;
+    header[9] = 0x20;
+    header[12..16].copy_from_slice(profile_class);
+    header[16..20].copy_from_slice(color_space);
+    header[20..24].copy_from_slice(pcs);
+    header[36..40].copy_from_slice(b"acsp");
+    header[64..68].copy_from_slice(&intent.to_be_bytes());
+    let mut ill = Vec::new();
+    push_s15_fixed16(&mut ill, D50_WHITE[0]);
+    push_s15_fixed16(&mut ill, D50_WHITE[1]);
+    push_s15_fixed16(&mut ill, D50_WHITE[2]);
+    header[68..80].copy_from_slice(&ill);
+
+    let tag_table_len = 4 + tags.len() * 12;
+    let mut offset = 128 + tag_table_len;
+    let mut table = Vec::with_capacity(tag_table_len);
+    table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+    let mut body = Vec::new();
+
+    for (sig, data) in tags {
+        table.extend_from_slice(*sig);
+        table.extend_from_slice(&(offset as u32).to_be_bytes());
+        table.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        offset = 128 + tag_table_len + body.len();
+    }
+
+    let total = 128 + table.len() + body.len();
+    header[0..4].copy_from_slice(&(total as u32).to_be_bytes());
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&table);
+    out.extend_from_slice(&body);
+    out
+}
+
+fn encode_xyz_tag(xyz: [f64; 3]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"XYZ ");
+    v.extend_from_slice(&0u32.to_be_bytes());
+    push_s15_fixed16(&mut v, xyz[0]);
+    push_s15_fixed16(&mut v, xyz[1]);
+    push_s15_fixed16(&mut v, xyz[2]);
+    v
+}
+
+fn encode_desc_tag(name: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"desc");
+    v.extend_from_slice(&0u32.to_be_bytes());
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.push(0);
+    v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    v.extend_from_slice(&bytes);
+    v
+}
+
+fn encode_curv_gamma_tag(gamma: f64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"curv");
+    v.extend_from_slice(&0u32.to_be_bytes());
+    v.extend_from_slice(&1u32.to_be_bytes());
+    let u8f8 = (gamma * 256.0).round() as u16;
+    v.extend_from_slice(&u8f8.to_be_bytes());
+    v
+}
+
+/// Generates a compact standards-compliant ICC v2 Matrix+TRC RGB profile (e.g., for PDF `/OutputIntents`).
+#[must_use]
+pub fn generate_minimal_srgb_icc_v2(description: &str) -> Vec<u8> {
+    encode_icc_profile_bytes(
+        2,
+        b"mntr",
+        b"RGB ",
+        b"XYZ ",
+        0,
+        &[
+            (b"desc", encode_desc_tag(description)),
+            (b"wtpt", encode_xyz_tag(D65_WHITE)),
+            (
+                b"rXYZ",
+                encode_xyz_tag([
+                    SRGB_TO_XYZ_D50[0][0],
+                    SRGB_TO_XYZ_D50[1][0],
+                    SRGB_TO_XYZ_D50[2][0],
+                ]),
+            ),
+            (
+                b"gXYZ",
+                encode_xyz_tag([
+                    SRGB_TO_XYZ_D50[0][1],
+                    SRGB_TO_XYZ_D50[1][1],
+                    SRGB_TO_XYZ_D50[2][1],
+                ]),
+            ),
+            (
+                b"bXYZ",
+                encode_xyz_tag([
+                    SRGB_TO_XYZ_D50[0][2],
+                    SRGB_TO_XYZ_D50[1][2],
+                    SRGB_TO_XYZ_D50[2][2],
+                ]),
+            ),
+            (b"rTRC", encode_curv_gamma_tag(2.2)),
+            (b"gTRC", encode_curv_gamma_tag(2.2)),
+            (b"bTRC", encode_curv_gamma_tag(2.2)),
+        ],
+    )
+}
+
+/// Generates a compact standards-compliant ICC v2 Output CMYK profile with 4D->3D `A2B0`
+/// and 3D->4D `B2A0` `mft1` lookup tables derived from `builtin` (suitable for PDF `/OutputIntents`).
+#[must_use]
+pub fn generate_minimal_cmyk_icc_v2(description: &str, builtin: BuiltinIccProfile) -> Vec<u8> {
+    let press = builtin.as_cmyk_press();
+
+    let encode_mft1 = |in_ch: u8, out_ch: u8, grid: u8, clut: &[u8]| -> Vec<u8> {
+        let mut tag =
+            Vec::with_capacity(48 + (in_ch as usize) * 256 + clut.len() + (out_ch as usize) * 256);
+        tag.extend_from_slice(b"mft1");
+        tag.extend_from_slice(&0u32.to_be_bytes());
+        tag.push(in_ch);
+        tag.push(out_ch);
+        tag.push(grid);
+        tag.push(0);
+        // 3x3 identity matrix in s15Fixed16
+        for row in 0..3 {
+            for col in 0..3 {
+                push_s15_fixed16(&mut tag, if row == col { 1.0 } else { 0.0 });
+            }
+        }
+        for _ in 0..in_ch {
+            for v in 0..=255u8 {
+                tag.push(v);
+            }
+        }
+        tag.extend_from_slice(clut);
+        for _ in 0..out_ch {
+            for v in 0..=255u8 {
+                tag.push(v);
+            }
+        }
+        tag
+    };
+
+    // 5x5x5x5 CMYK -> Lab (v2 mft1 Lab encoding: L* = byte/255 * 100, a* = byte - 128, b* = byte - 128)
+    let mut a2b_clut = Vec::with_capacity(625 * 3);
+    for ic in 0..5 {
+        let c = f64::from(ic) / 4.0;
+        for im in 0..5 {
+            let m = f64::from(im) / 4.0;
+            for iy in 0..5 {
+                let y = f64::from(iy) / 4.0;
+                for ik in 0..5 {
+                    let k = f64::from(ik) / 4.0;
+                    let xyz =
+                        press.cmyk_to_xyz_d50([c, m, y, k], RenderingIntent::RelativeColorimetric);
+                    let lab = xyz_d50_to_lab(xyz);
+                    a2b_clut.push((lab[0] * 2.55).round().clamp(0.0, 255.0) as u8);
+                    a2b_clut.push((lab[1] + 128.0).round().clamp(0.0, 255.0) as u8);
+                    a2b_clut.push((lab[2] + 128.0).round().clamp(0.0, 255.0) as u8);
+                }
+            }
+        }
+    }
+
+    // 7x7x7 Lab -> CMYK
+    let mut b2a_clut = Vec::with_capacity(343 * 4);
+    for il in 0..7 {
+        let l = (f64::from(il) / 6.0) * 100.0;
+        for ia in 0..7 {
+            let a = (f64::from(ia) / 6.0) * 255.0 - 128.0;
+            for ib in 0..7 {
+                let b = (f64::from(ib) / 6.0) * 255.0 - 128.0;
+                let fy = (l + 16.0) / 116.0;
+                let fx = a / 500.0 + fy;
+                let fz = fy - b / 200.0;
+                let lab_f_inv = |t: f64| -> f64 {
+                    if t * t * t > LAB_EPSILON {
+                        t * t * t
+                    } else {
+                        (116.0 * t - 16.0) / LAB_KAPPA
+                    }
+                };
+                let xyz = [
+                    D50_WHITE[0] * lab_f_inv(fx),
+                    D50_WHITE[1] * lab_f_inv(fy),
+                    D50_WHITE[2] * lab_f_inv(fz),
+                ];
+                let cmyk = press.xyz_d50_to_cmyk(xyz, RenderingIntent::RelativeColorimetric);
+                for ch in cmyk {
+                    b2a_clut.push((ch * 255.0).round().clamp(0.0, 255.0) as u8);
+                }
+            }
+        }
+    }
+
+    encode_icc_profile_bytes(
+        2,
+        b"prtr",
+        b"CMYK",
+        b"Lab ",
+        1,
+        &[
+            (b"desc", encode_desc_tag(description)),
+            (b"wtpt", encode_xyz_tag(press.paper_white_xyz())),
+            (b"A2B0", encode_mft1(4, 3, 5, &a2b_clut)),
+            (b"B2A0", encode_mft1(3, 4, 7, &b2a_clut)),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn push_s15_fixed16(buf: &mut Vec<u8>, v: f64) {
-        let fixed = (v * 65_536.0).round() as i32;
-        buf.extend_from_slice(&fixed.to_be_bytes());
-    }
 
     /// Helper to assemble a valid binary ICC v2 or v4 profile from tags for parser tests.
     fn build_synthetic_icc_bytes(
@@ -2503,68 +2794,19 @@ mod tests {
         intent: u32,
         tags: &[(&[u8; 4], Vec<u8>)],
     ) -> Vec<u8> {
-        let mut header = vec![0u8; 128];
-        header[4..8].copy_from_slice(b"core");
-        header[8] = version_major;
-        header[9] = 0x20;
-        header[12..16].copy_from_slice(profile_class);
-        header[16..20].copy_from_slice(color_space);
-        header[20..24].copy_from_slice(pcs);
-        header[36..40].copy_from_slice(b"acsp");
-        header[64..68].copy_from_slice(&intent.to_be_bytes());
-        let mut ill = Vec::new();
-        push_s15_fixed16(&mut ill, D50_WHITE[0]);
-        push_s15_fixed16(&mut ill, D50_WHITE[1]);
-        push_s15_fixed16(&mut ill, D50_WHITE[2]);
-        header[68..80].copy_from_slice(&ill);
-
-        let tag_table_len = 4 + tags.len() * 12;
-        let mut offset = 128 + tag_table_len;
-        let mut table = Vec::with_capacity(tag_table_len);
-        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
-        let mut body = Vec::new();
-
-        for (sig, data) in tags {
-            table.extend_from_slice(*sig);
-            table.extend_from_slice(&(offset as u32).to_be_bytes());
-            table.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            body.extend_from_slice(data);
-            // 4-byte ICC alignment padding
-            while !body.len().is_multiple_of(4) {
-                body.push(0);
-            }
-            offset = 128 + tag_table_len + body.len();
-        }
-
-        let total = 128 + table.len() + body.len();
-        header[0..4].copy_from_slice(&(total as u32).to_be_bytes());
-
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&table);
-        out.extend_from_slice(&body);
-        out
+        encode_icc_profile_bytes(version_major, profile_class, color_space, pcs, intent, tags)
     }
 
     fn make_xyz_tag(xyz: [f64; 3]) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"XYZ ");
-        v.extend_from_slice(&0u32.to_be_bytes());
-        push_s15_fixed16(&mut v, xyz[0]);
-        push_s15_fixed16(&mut v, xyz[1]);
-        push_s15_fixed16(&mut v, xyz[2]);
-        v
+        encode_xyz_tag(xyz)
     }
 
     fn make_desc_tag(name: &str) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"desc");
-        v.extend_from_slice(&0u32.to_be_bytes());
-        let mut bytes = name.as_bytes().to_vec();
-        bytes.push(0);
-        v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        v.extend_from_slice(&bytes);
-        v
+        encode_desc_tag(name)
+    }
+
+    fn make_curv_gamma_tag(gamma: f64) -> Vec<u8> {
+        encode_curv_gamma_tag(gamma)
     }
 
     fn make_mluc_tag(name: &str) -> Vec<u8> {
@@ -2590,16 +2832,6 @@ mod tests {
         for p in [2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045] {
             push_s15_fixed16(&mut v, p);
         }
-        v
-    }
-
-    fn make_curv_gamma_tag(gamma: f64) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"curv");
-        v.extend_from_slice(&0u32.to_be_bytes());
-        v.extend_from_slice(&1u32.to_be_bytes());
-        let u8f8 = (gamma * 256.0).round() as u16;
-        v.extend_from_slice(&u8f8.to_be_bytes());
         v
     }
 
@@ -3238,5 +3470,34 @@ mod tests {
         let bad_unknown =
             build_synthetic_icc_bytes(4, b"mntr", b"RGB ", b"XYZ ", 0, &[(b"A2B0", bad_sig)]);
         assert!(IccProfile::from_bytes(&bad_unknown).is_err());
+    }
+
+    #[test]
+    fn generated_minimal_icc_profiles_parse_and_soft_proof_cleanly() {
+        let srgb_bytes = generate_minimal_srgb_icc_v2("Test sRGB");
+        let srgb = IccProfile::from_bytes(&srgb_bytes).expect("minimal sRGB ICC v2 parses");
+        assert_eq!(srgb.header.color_space, IccColorSpace::Rgb);
+
+        let cmyk_bytes =
+            generate_minimal_cmyk_icc_v2("Test ISO CMYK", BuiltinIccProfile::IsoCoatedV2Cmyk);
+        let cmyk = IccProfile::from_bytes(&cmyk_bytes).expect("minimal CMYK ICC v2 parses");
+        assert_eq!(cmyk.header.color_space, IccColorSpace::Cmyk);
+        assert!(cmyk.a2b0.is_some());
+        assert!(cmyk.b2a0.is_some());
+
+        assert!(
+            SoftProofLut3D::build_from_profile(&cmyk, RenderingIntent::RelativeColorimetric)
+                .is_some()
+        );
+        let mut px = vec![0u8, 174u8, 239u8, 255u8];
+        apply_soft_proof_rgba_with_profile(
+            &mut px,
+            Some(&cmyk),
+            BuiltinIccProfile::IsoCoatedV2Cmyk,
+            RenderingIntent::RelativeColorimetric,
+            true,
+            false,
+        );
+        assert_eq!(px[3], 255);
     }
 }

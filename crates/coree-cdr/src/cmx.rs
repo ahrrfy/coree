@@ -1246,6 +1246,7 @@ fn emit_cmx_object(
         NodePayload::PowerClip {
             container,
             contents,
+            ..
         } => {
             emit_cmx_polycurve(obj, container, tables, stream)?;
             for &cid in contents {

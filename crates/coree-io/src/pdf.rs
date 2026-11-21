@@ -9,8 +9,9 @@
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult};
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Effect, Fill,
-    GradientStop, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page,
+    generate_minimal_cmyk_icc_v2, generate_minimal_srgb_icc_v2, Affine2D, ArtisticText, BezierPath,
+    BlendMode, BuiltinIccProfile, Color, ColorMode, Document, Effect, Fill, GradientStop,
+    IccProfile, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page,
     Point2D, SceneObject, TextDirection,
 };
 use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
@@ -306,12 +307,13 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
                 if !layer.visible || !layer.printable {
                     continue;
                 }
-                let include = match layer.master_scope {
-                    MasterLayerScope::None => false,
-                    MasterLayerScope::AllPages => true,
-                    MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
-                    MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
-                };
+                let include = layer.is_desktop_layer
+                    || match layer.master_scope {
+                        MasterLayerScope::None => false,
+                        MasterLayerScope::AllPages => true,
+                        MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
+                        MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
+                    };
                 if include {
                     ordered_layers.push(layer);
                 }
@@ -450,7 +452,66 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
     );
     store.set(pages_root_id, pages_dict.into_bytes());
 
-    let catalog_dict = format!("<< /Type /Catalog /Pages {pages_root_id} 0 R >>");
+    // Embed ISO 32000-1 /OutputIntents ICC profile stream (custom doc ICC or clean-room CMYK/sRGB ICC v2)
+    let raw_icc = if let Some(ref bytes) = doc.custom_icc_profile {
+        bytes.clone()
+    } else if use_cmyk {
+        generate_minimal_cmyk_icc_v2(
+            "ISO Coated v2 CMYK (coree Clean-Room)",
+            BuiltinIccProfile::IsoCoatedV2Cmyk,
+        )
+    } else {
+        generate_minimal_srgb_icc_v2("sRGB IEC61966-2.1 (coree Clean-Room)")
+    };
+    let parsed_icc = IccProfile::from_bytes(&raw_icc).ok();
+    let icc_n = parsed_icc
+        .as_ref()
+        .map_or(if use_cmyk { 4 } else { 3 }, |p| {
+            p.header.color_space.channel_count().clamp(1, 4)
+        });
+    let icc_info = parsed_icc
+        .as_ref()
+        .map(|p| p.description.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if use_cmyk {
+                "ISO Coated v2 CMYK".to_owned()
+            } else {
+                "sRGB IEC61966-2.1".to_owned()
+            }
+        });
+    let icc_cond = if icc_n == 4 { "FOGRA39" } else { "sRGB" };
+
+    let mut compressed_icc = Vec::new();
+    let mut enc_icc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    let icc_obj_bytes = if enc_icc.write_all(&raw_icc).is_ok()
+        && enc_icc.finish().map(|v| compressed_icc = v).is_ok()
+    {
+        let mut buf = format!(
+            "<< /N {icc_n} /Length {} /Filter /FlateDecode >>\nstream\n",
+            compressed_icc.len()
+        )
+        .into_bytes();
+        buf.extend_from_slice(&compressed_icc);
+        buf.extend_from_slice(b"\nendstream");
+        buf
+    } else {
+        let mut buf = format!("<< /N {icc_n} /Length {} >>\nstream\n", raw_icc.len()).into_bytes();
+        buf.extend_from_slice(&raw_icc);
+        buf.extend_from_slice(b"\nendstream");
+        buf
+    };
+    let icc_stream_id = store.add(icc_obj_bytes);
+    let oi_dict = format!(
+        "<< /Type /OutputIntent /S /GTS_PDFX /OutputConditionIdentifier ({cond}) /Info ({info}) /RegistryName (http://www.color.org) /DestOutputProfile {icc_stream_id} 0 R >>",
+        cond = escape_pdf_string(icc_cond),
+        info = escape_pdf_string(&icc_info),
+    );
+    let output_intent_id = store.add(oi_dict.into_bytes());
+
+    let catalog_dict = format!(
+        "<< /Type /Catalog /Pages {pages_root_id} 0 R /OutputIntents [{output_intent_id} 0 R] >>"
+    );
     store.set(catalog_id, catalog_dict.into_bytes());
 
     let info_dict = format!(
@@ -887,6 +948,7 @@ fn emit_pdf_object(
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 let clip_path =
                     apply_geometry_effects(container, &obj.effects).transformed(&world_xf);
@@ -2188,5 +2250,44 @@ mod tests {
         // Complex shadow composite emitted as RGBA Image XObject + SMask
         assert!(text.contains("/Subtype /Image"));
         assert!(text.contains("/SMask"));
+        // ISO 32000-1 /OutputIntents CMYK ICC v2 embedding in /Catalog
+        assert!(text.contains("/OutputIntents"));
+        assert!(text.contains("/GTS_PDFX"));
+        assert!(text.contains("/DestOutputProfile"));
+    }
+
+    #[test]
+    fn pdf_embeds_custom_icc_profile_and_exports_desktop_layer_across_pages() {
+        let mut doc = Document::new_a4("Desktop & Custom ICC");
+        doc.add_page("Page 2", 210.0, 297.0, 3.0);
+        let srgb_icc = coree_core::generate_minimal_srgb_icc_v2("Custom Studio sRGB");
+        doc.set_custom_icc_profile(srgb_icc).unwrap();
+
+        let desk_rect = SceneObject::new(
+            ObjectId(0),
+            "Desktop Swatch Strip",
+            NodePayload::Shape(coree_core::ParametricShape::Rectangle {
+                width: 30.0,
+                height: 15.0,
+                corner_radii: [0.0; 4],
+                corner_style: coree_core::CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::cmyk(0.95, 0.0, 0.0, 0.0)));
+        let did = doc.add_object(desk_rect, None).unwrap();
+        doc.move_object_to_desktop_layer(did).unwrap();
+
+        let opts = PdfExportOptions {
+            compress_streams: false,
+            pages: Some(vec![1]),
+            ..PdfExportOptions::default()
+        };
+        let bytes = export_pdf_to_bytes(&doc, &opts).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/OutputIntents"));
+        assert!(text.contains("Custom") || text.contains("sRGB"));
+        // Desktop layer rect appears cleanly even when exporting ONLY Page 2 (`pages: Some(vec![1])`)!
+        assert!(text.contains("0.9500 0.0000 0.0000 0.0000 k"));
     }
 }

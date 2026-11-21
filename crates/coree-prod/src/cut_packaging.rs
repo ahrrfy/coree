@@ -1046,6 +1046,7 @@ fn accumulate_object_metrics(
         NodePayload::PowerClip {
             container,
             contents,
+            ..
         } => {
             let path = container.transformed(&world_xf);
             let container_bb = path.bounding_box();

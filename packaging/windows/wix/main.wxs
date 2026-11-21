@@ -5,6 +5,9 @@
   <?ifndef BinaryPath?>
     <?define BinaryPath = "target\release\coree.exe"?>
   <?endif?>
+  <?ifndef ComPath?>
+    <?define ComPath = "target\release\coree.com"?>
+  <?endif?>
   <?ifndef IconPath?>
     <?define IconPath = "packaging\windows\coree.ico"?>
   <?endif?>
@@ -12,7 +15,7 @@
     <?define RepoRoot = "."?>
   <?endif?>
   <?ifndef Version?>
-    <?define Version = "0.2.1"?>
+    <?define Version = "0.3.0"?>
   <?endif?>
 
   <Package
@@ -51,6 +54,11 @@
             Id="CoreeExe"
             Source="$(var.BinaryPath)"
             KeyPath="yes"
+            Checksum="yes" />
+        <File
+            Id="CoreeCom"
+            Name="coree.com"
+            Source="$(var.ComPath)"
             Checksum="yes" />
 
         <Environment

@@ -138,6 +138,13 @@ pub enum CommandOp {
     ExtractPowerClip {
         powerclip_id: ObjectId,
     },
+    SetPowerClipLock {
+        id: ObjectId,
+        lock_contents: bool,
+    },
+    MoveToDesktopLayer {
+        id: ObjectId,
+    },
     ConvertToCurves {
         id: ObjectId,
     },
@@ -190,6 +197,8 @@ impl CommandOp {
             Self::EditTable { .. } => "Edit Table".to_owned(),
             Self::CreatePowerClip { .. } => "Create PowerClip".to_owned(),
             Self::ExtractPowerClip { .. } => "Extract PowerClip".to_owned(),
+            Self::SetPowerClipLock { .. } => "Toggle PowerClip Lock Contents".to_owned(),
+            Self::MoveToDesktopLayer { .. } => "Move to Desktop Layer".to_owned(),
             Self::ConvertToCurves { .. } => "Convert to Curves".to_owned(),
             Self::UpdateRaster { .. } => "Update Raster".to_owned(),
             Self::Batch(ops) => format!("Batch ({} ops)", ops.len()),
@@ -224,16 +233,8 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                 ));
             }
             for &id in ids {
-                let obj = doc
-                    .objects
-                    .get_mut(&id)
-                    .ok_or(CoreError::ObjectNotFound(id))?;
-                if obj.locked {
-                    return Err(CoreError::ObjectLocked(id));
-                }
-                obj.transform = affine.compose(&obj.transform);
+                doc.transform_object(id, *affine)?;
             }
-            doc.touch();
         }
         CommandOp::SetFill { ids, fill } => {
             for &id in ids {
@@ -506,6 +507,12 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
         CommandOp::ExtractPowerClip { powerclip_id } => {
             doc.extract_powerclip(*powerclip_id)?;
         }
+        CommandOp::SetPowerClipLock { id, lock_contents } => {
+            doc.set_powerclip_lock_contents(*id, *lock_contents)?;
+        }
+        CommandOp::MoveToDesktopLayer { id } => {
+            doc.move_object_to_desktop_layer(*id)?;
+        }
         CommandOp::ConvertToCurves { id } => {
             let obj = doc.objects.get(id).ok_or(CoreError::ObjectNotFound(*id))?;
             if obj.locked {
@@ -533,7 +540,27 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
     Ok(())
 }
 
-/// Lightweight scene snapshot that omits heavy binary `assets` bytes unless modified.
+/// Compact reversible scene delta stored on the undo/redo stack instead of duplicating
+/// the entire object table twice per edit.
+#[derive(Debug, Clone)]
+struct ObjectDelta {
+    id: ObjectId,
+    before: Option<SceneObject>,
+    after: Option<SceneObject>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentDelta {
+    title: Option<(String, String)>,
+    pages: Option<(Vec<crate::document::Page>, Vec<crate::document::Page>)>,
+    active_page_index: Option<(usize, usize)>,
+    multipage_view: Option<(bool, bool)>,
+    guides: Option<(Vec<crate::document::Guide>, Vec<crate::document::Guide>)>,
+    next_id: Option<(u64, u64)>,
+    objects: Vec<ObjectDelta>,
+}
+
+/// Full rollback snapshot kept temporarily during an active command/transaction.
 #[derive(Debug, Clone)]
 struct DocumentStateSnapshot {
     title: String,
@@ -568,14 +595,119 @@ impl DocumentStateSnapshot {
         doc.next_id = self.next_id;
         doc.touch();
     }
+
+    fn into_delta(self, after: &Document) -> DocumentDelta {
+        let mut object_deltas = Vec::new();
+        for (id, before_obj) in &self.objects {
+            match after.objects.get(id) {
+                Some(after_obj) if after_obj == before_obj => {}
+                Some(after_obj) => object_deltas.push(ObjectDelta {
+                    id: *id,
+                    before: Some(before_obj.clone()),
+                    after: Some(after_obj.clone()),
+                }),
+                None => object_deltas.push(ObjectDelta {
+                    id: *id,
+                    before: Some(before_obj.clone()),
+                    after: None,
+                }),
+            }
+        }
+        for (id, after_obj) in &after.objects {
+            if !self.objects.contains_key(id) {
+                object_deltas.push(ObjectDelta {
+                    id: *id,
+                    before: None,
+                    after: Some(after_obj.clone()),
+                });
+            }
+        }
+
+        DocumentDelta {
+            title: (self.title != after.title).then(|| (self.title, after.title.clone())),
+            pages: (self.pages != after.pages).then(|| (self.pages, after.pages.clone())),
+            active_page_index: (self.active_page_index != after.active_page_index)
+                .then_some((self.active_page_index, after.active_page_index)),
+            multipage_view: (self.multipage_view != after.multipage_view)
+                .then_some((self.multipage_view, after.multipage_view)),
+            guides: (self.guides != after.guides).then(|| (self.guides, after.guides.clone())),
+            next_id: (self.next_id != after.next_id).then_some((self.next_id, after.next_id)),
+            objects: object_deltas,
+        }
+    }
+}
+
+impl DocumentDelta {
+    fn apply_before(&self, doc: &mut Document) {
+        if let Some((b, _)) = &self.title {
+            doc.title = b.clone();
+        }
+        if let Some((b, _)) = &self.pages {
+            doc.pages = b.clone();
+        }
+        if let Some((b, _)) = self.active_page_index {
+            doc.active_page_index = b;
+        }
+        if let Some((b, _)) = self.multipage_view {
+            doc.multipage_view = b;
+        }
+        if let Some((b, _)) = &self.guides {
+            doc.guides = b.clone();
+        }
+        if let Some((b, _)) = self.next_id {
+            doc.next_id = b;
+        }
+        for d in &self.objects {
+            match &d.before {
+                Some(obj) => {
+                    doc.objects.insert(d.id, obj.clone());
+                }
+                None => {
+                    doc.objects.remove(&d.id);
+                }
+            }
+        }
+        doc.touch();
+    }
+
+    fn apply_after(&self, doc: &mut Document) {
+        if let Some((_, a)) = &self.title {
+            doc.title = a.clone();
+        }
+        if let Some((_, a)) = &self.pages {
+            doc.pages = a.clone();
+        }
+        if let Some((_, a)) = self.active_page_index {
+            doc.active_page_index = a;
+        }
+        if let Some((_, a)) = self.multipage_view {
+            doc.multipage_view = a;
+        }
+        if let Some((_, a)) = &self.guides {
+            doc.guides = a.clone();
+        }
+        if let Some((_, a)) = self.next_id {
+            doc.next_id = a;
+        }
+        for d in &self.objects {
+            match &d.after {
+                Some(obj) => {
+                    doc.objects.insert(d.id, obj.clone());
+                }
+                None => {
+                    doc.objects.remove(&d.id);
+                }
+            }
+        }
+        doc.touch();
+    }
 }
 
 #[derive(Debug, Clone)]
 struct HistoryEntry {
     label: String,
     op: CommandOp,
-    before: DocumentStateSnapshot,
-    after: DocumentStateSnapshot,
+    delta: DocumentDelta,
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +751,16 @@ impl CommandHistory {
 
     /// Executes `op` on `doc`, recording it in the undo history (or active transaction).
     pub fn execute(&mut self, doc: &mut Document, op: CommandOp) -> CoreResult<()> {
+        if let Some(tx) = self.active_tx.as_mut() {
+            let rollback = DocumentStateSnapshot::capture(doc);
+            if let Err(err) = apply_command(doc, &op) {
+                rollback.restore_into(doc);
+                return Err(err);
+            }
+            tx.ops.push(op);
+            return Ok(());
+        }
+
         let before = DocumentStateSnapshot::capture(doc);
         if let Err(err) = apply_command(doc, &op) {
             // Roll back partial mutation on error (e.g. failed batch or locked object)
@@ -626,22 +768,12 @@ impl CommandHistory {
             return Err(err);
         }
 
-        if let Some(tx) = self.active_tx.as_mut() {
-            tx.ops.push(op);
-            return Ok(());
-        }
-
-        let after = DocumentStateSnapshot::capture(doc);
+        let delta = before.into_delta(doc);
         if self.recording_macro {
             self.recorded_ops.push(op.clone());
         }
         let label = op.default_label();
-        self.push_entry(HistoryEntry {
-            label,
-            op,
-            before,
-            after,
-        });
+        self.push_entry(HistoryEntry { label, op, delta });
         Ok(())
     }
 
@@ -680,12 +812,11 @@ impl CommandHistory {
         if self.recording_macro {
             self.recorded_ops.push(merged_op.clone());
         }
-        let after = DocumentStateSnapshot::capture(doc);
+        let delta = tx.before.into_delta(doc);
         self.push_entry(HistoryEntry {
             label: tx.label,
             op: merged_op,
-            before: tx.before,
-            after,
+            delta,
         });
         Ok(())
     }
@@ -717,7 +848,7 @@ impl CommandHistory {
         }
         let entry = self.undo_stack.pop().ok_or(CoreError::EmptyUndoStack)?;
         let label = entry.label.clone();
-        entry.before.restore_into(doc);
+        entry.delta.apply_before(doc);
         self.redo_stack.push(entry);
         Ok(label)
     }
@@ -731,7 +862,7 @@ impl CommandHistory {
         }
         let entry = self.redo_stack.pop().ok_or(CoreError::EmptyRedoStack)?;
         let label = entry.label.clone();
-        entry.after.restore_into(doc);
+        entry.delta.apply_after(doc);
         self.undo_stack.push(entry);
         Ok(label)
     }
@@ -899,7 +1030,9 @@ fn emit_op_rhai(op: &CommandOp, out: &mut String) {
     }
 }
 
-fn rhai_array_to_ids(arr: rhai::Array) -> Vec<ObjectId> {
+/// Converts a Rhai integer array into typed [`ObjectId`] values (skipping negatives).
+#[must_use]
+pub fn rhai_array_to_ids(arr: rhai::Array) -> Vec<ObjectId> {
     arr.into_iter()
         .filter_map(|v: Dynamic| v.as_int().ok().map(|n| ObjectId(n.max(0) as u64)))
         .collect()
@@ -1241,5 +1374,90 @@ mod tests {
         );
         assert!(bad.is_err());
         assert_eq!(doc2.object_bounds(id).unwrap(), before_bb);
+    }
+
+    #[test]
+    fn delta_history_powerclip_unlock_and_desktop_layer_roundtrip() {
+        let mut doc = Document::new_a4("Delta & Desktop");
+        doc.add_page("Page 2", 210.0, 297.0, 3.0);
+        let mut hist = CommandHistory::default();
+
+        // Populate 200 background objects to verify delta storage does not bloat per command
+        let mut created_ids = Vec::with_capacity(200);
+        for i in 0..200 {
+            let mut r = sample_rect(&format!("R{i}"), 20.0, 20.0);
+            r.transform = Affine2D::translate(f64::from(i), 10.0);
+            let obj_id = doc.add_object(r, None).unwrap();
+            created_ids.push(obj_id);
+        }
+
+        // Single object move -> compact ObjectDelta only tracks that single changed ID
+        let moved_id = created_ids[0];
+        let orig_x = doc.object_bounds(moved_id).unwrap().min_x;
+        hist.execute(
+            &mut doc,
+            CommandOp::TransformObjects {
+                ids: vec![moved_id],
+                affine: Affine2D::translate(25.0, 0.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(hist.undo_stack.len(), 1);
+        assert_eq!(hist.undo_stack[0].delta.objects.len(), 1);
+        assert!((doc.object_bounds(moved_id).unwrap().min_x - (orig_x + 25.0)).abs() < 1e-6);
+
+        hist.undo(&mut doc).unwrap();
+        assert!((doc.object_bounds(moved_id).unwrap().min_x - orig_x).abs() < 1e-6);
+
+        // Move object to cross-page Desktop layer -> visible in page 1 spatial index too
+        let desktop_obj = created_ids[1];
+        hist.execute(&mut doc, CommandOp::MoveToDesktopLayer { id: desktop_obj })
+            .unwrap();
+        let desktop_lid = doc.desktop_layer_id().expect("desktop layer created");
+        assert_eq!(doc.layer_of_object(desktop_obj), Some(desktop_lid));
+        let idx_page1 = doc.build_spatial_index(1);
+        assert!(!idx_page1.is_empty());
+        doc.active_page_index = 1;
+        assert_eq!(
+            doc.hit_test(doc.object_bounds(desktop_obj).unwrap().center(), 1.0),
+            Some(desktop_obj)
+        );
+        doc.active_page_index = 0;
+
+        // PowerClip lock_contents = false keeps child anchored in world space when container moves
+        let child_id = created_ids[2];
+        let container_id = created_ids[3];
+        let child_bb_before = doc.world_object_bounds(child_id).unwrap();
+        let child_xf_before = doc.world_transform_of(child_id).unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::CreatePowerClip {
+                container_id,
+                content_ids: vec![child_id],
+            },
+        )
+        .unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetPowerClipLock {
+                id: container_id,
+                lock_contents: false,
+            },
+        )
+        .unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::TransformObjects {
+                ids: vec![container_id],
+                affine: Affine2D::translate(40.0, 15.0),
+            },
+        )
+        .unwrap();
+        let child_bb_after = doc.world_object_bounds(child_id).unwrap();
+        let child_xf_after = doc.world_transform_of(child_id).unwrap();
+        assert!((child_bb_after.min_x - child_bb_before.min_x).abs() < 1e-4);
+        assert!((child_bb_after.min_y - child_bb_before.min_y).abs() < 1e-4);
+        assert!((child_xf_after.m[4] - child_xf_before.m[4]).abs() < 1e-4);
+        assert!((child_xf_after.m[5] - child_xf_before.m[5]).abs() < 1e-4);
     }
 }

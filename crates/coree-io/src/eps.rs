@@ -82,12 +82,13 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
             if !layer.visible || !layer.printable {
                 continue;
             }
-            let include = match layer.master_scope {
-                MasterLayerScope::None => false,
-                MasterLayerScope::AllPages => true,
-                MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
-                MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
-            };
+            let include = layer.is_desktop_layer
+                || match layer.master_scope {
+                    MasterLayerScope::None => false,
+                    MasterLayerScope::AllPages => true,
+                    MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
+                    MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
+                };
             if include {
                 ordered_layers.push(layer);
             }
@@ -487,6 +488,7 @@ fn emit_eps_object(
             NodePayload::PowerClip {
                 container,
                 contents,
+                ..
             } => {
                 let clip_path =
                     apply_geometry_effects(container, &obj.effects).transformed(&world_xf);

@@ -510,6 +510,10 @@ struct ParseContext<'a> {
     outlines_explicit_none: HashSet<u32>,
     styles: HashMap<u32, ParsedStyleEntry>,
     bitmaps: HashMap<u32, ImageAssetId>,
+    arrows: HashMap<u32, ArrowheadStyle>,
+    pattern_bitmaps: HashMap<u32, ImageAssetId>,
+    vector_patterns: HashMap<u32, Fill>,
+    color_styles: HashMap<u32, coree_core::Color>,
     text_streams: HashMap<u32, Vec<u8>>,
     master_layers: Vec<Layer>,
     warnings: Vec<String>,
@@ -615,6 +619,10 @@ pub(crate) fn parse_cdr_riff_tree(
         outlines_explicit_none: HashSet::new(),
         styles: HashMap::new(),
         bitmaps: HashMap::new(),
+        arrows: HashMap::new(),
+        pattern_bitmaps: HashMap::new(),
+        vector_patterns: HashMap::new(),
+        color_styles: HashMap::new(),
         text_streams: HashMap::new(),
         master_layers: Vec::new(),
         warnings: Vec::new(),
@@ -776,7 +784,9 @@ fn parse_doc_list(
                 b"mcfg" => parse_doc_mcfg(data, doc, ctx),
                 b"plte" => parse_plte_chunk(data, doc, ctx),
                 b"fild" => {
-                    if let Ok((id, fill, is_norm)) = parse_fild_chunk(data, ctx.is_zcf) {
+                    if let Ok((id, fill, is_norm)) =
+                        parse_fild_chunk_with_ctx(data, ctx.is_zcf, Some(ctx))
+                    {
                         if is_norm {
                             ctx.normalized_fills.insert(id);
                         }
@@ -784,7 +794,9 @@ fn parse_doc_list(
                     }
                 }
                 b"outl" => {
-                    if let Ok((id, outl, is_none)) = parse_outl_chunk(data, ctx.is_zcf) {
+                    if let Ok((id, outl, is_none)) =
+                        parse_outl_chunk_with_ctx(data, ctx.is_zcf, Some(ctx))
+                    {
                         if is_none {
                             ctx.outlines_explicit_none.insert(id);
                         }
@@ -818,7 +830,8 @@ fn parse_doc_list(
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"fild" {
-                                if let Ok((id, fill, is_norm)) = parse_fild_chunk(data, ctx.is_zcf)
+                                if let Ok((id, fill, is_norm)) =
+                                    parse_fild_chunk_with_ctx(data, ctx.is_zcf, Some(ctx))
                                 {
                                     if is_norm {
                                         ctx.normalized_fills.insert(id);
@@ -833,7 +846,8 @@ fn parse_doc_list(
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"outl" {
-                                if let Ok((id, outl, is_none)) = parse_outl_chunk(data, ctx.is_zcf)
+                                if let Ok((id, outl, is_none)) =
+                                    parse_outl_chunk_with_ctx(data, ctx.is_zcf, Some(ctx))
                                 {
                                     if is_none {
                                         ctx.outlines_explicit_none.insert(id);
@@ -884,7 +898,11 @@ fn parse_doc_list(
                         }
                     }
                 }
-                b"page" | b"arrw" | b"bmpf" | b"osmk" | b"vpat" | b"ppdt" | b"clrs" => {}
+                b"arrw" => parse_arrw_list(list_ch, ctx),
+                b"bmpf" => parse_bmpf_list(list_ch, doc, ctx)?,
+                b"vpat" => parse_vpat_list(list_ch, doc, ctx),
+                b"clrs" => parse_clrs_list(list_ch, doc, ctx),
+                b"osmk" | b"ppdt" | b"page" => {}
                 _ => {
                     // Preserve unknown document-level LIST verbatim!
                     let raw = serialize_list_body(list_type, list_ch, ctx.endian)?;
@@ -913,6 +931,101 @@ fn parse_doc_list(
     }
 
     Ok(())
+}
+
+fn parse_arrw_list(children: &[RiffNode], ctx: &mut ParseContext<'_>) {
+    for node in children {
+        if let RiffNode::Chunk { data, .. } = node {
+            if data.len() >= 8 {
+                let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let arrow_style = if data.len() >= 10 {
+                    let node_cnt = usize::from(u16::from_le_bytes([data[4], data[5]]));
+                    match node_cnt {
+                        3 => ArrowheadStyle::Triangle,
+                        4 => ArrowheadStyle::Diamond,
+                        _ if data.get(6).is_some_and(|&v| v != 0) => decode_arrow(data[6]),
+                        _ => ArrowheadStyle::Triangle,
+                    }
+                } else {
+                    decode_arrow(data[4])
+                };
+                if !matches!(arrow_style, ArrowheadStyle::None) {
+                    ctx.arrows.insert(id, arrow_style);
+                }
+            }
+        }
+    }
+}
+
+fn parse_bmpf_list(
+    children: &[RiffNode],
+    doc: &mut Document,
+    ctx: &mut ParseContext<'_>,
+) -> CdrResult<()> {
+    for node in children {
+        match node {
+            RiffNode::Chunk { fourcc, data, .. } if fourcc == b"bmp " || fourcc == b"bmpf" => {
+                if data.len() >= 8 {
+                    let pat_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let before_len = doc.assets.len();
+                    if register_bmp_chunk_payload(data, Some(pat_id), doc, ctx).is_ok()
+                        && (doc.assets.len() > before_len || ctx.bitmaps.contains_key(&pat_id))
+                    {
+                        if let Some(&aid) = ctx.bitmaps.get(&pat_id) {
+                            ctx.pattern_bitmaps.insert(pat_id, aid);
+                        }
+                    }
+                }
+            }
+            RiffNode::List { children: sub, .. } => parse_bmpf_list(sub, doc, ctx)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_vpat_list(children: &[RiffNode], doc: &mut Document, ctx: &mut ParseContext<'_>) {
+    for node in children {
+        if let RiffNode::Chunk { data, .. } = node {
+            if data.len() >= 12 {
+                let pat_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let fg = find_embedded_corel_color(&data[4..]).unwrap_or(coree_core::Color::BLACK);
+                let tile_obj = SceneObject::new(
+                    ObjectId(doc.alloc_id()),
+                    format!("VectorPattern Tile {pat_id}"),
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 8.0, 8.0))),
+                )
+                .with_fill(Fill::Solid(fg))
+                .with_outline(OutlineStyle::none());
+                let sym = coree_core::SymbolDef::new(format!("VPAT {pat_id}"), vec![tile_obj]);
+                let symbol_id = sym.id;
+                doc.symbols.insert(symbol_id, sym);
+                let fill = Fill::VectorPattern {
+                    symbol_id,
+                    tile_w: 10.0,
+                    tile_h: 10.0,
+                };
+                ctx.vector_patterns.insert(pat_id, fill);
+            }
+        }
+    }
+}
+
+fn parse_clrs_list(children: &[RiffNode], doc: &mut Document, ctx: &mut ParseContext<'_>) {
+    for node in children {
+        if let RiffNode::Chunk { data, .. } = node {
+            if data.len() >= 16 {
+                let color_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                if let Some(color) = find_embedded_corel_color(&data[4..])
+                    .or_else(|| decode_real_corel_color_record(&data[4..16]))
+                {
+                    let label = format!("Color Style {color_id}");
+                    doc.document_palette.add_unique(label, color.clone());
+                    ctx.color_styles.insert(color_id, color);
+                }
+            }
+        }
+    }
 }
 
 fn parse_doc_mcfg(data: &[u8], doc: &mut Document, ctx: &mut ParseContext<'_>) {
@@ -1255,6 +1368,10 @@ fn parse_layer_to_struct(
                                     | CDR_CTYPE_LAYER_DESKTOP
                             ) {
                                 is_system_layer = true;
+                                if ctype == CDR_CTYPE_LAYER_DESKTOP {
+                                    layer.is_desktop_layer = true;
+                                    layer.master_scope = MasterLayerScope::AllPages;
+                                }
                                 if ctype == CDR_CTYPE_LAYER_GRID || ctype == CDR_CTYPE_LAYER_GUIDES
                                 {
                                     layer.printable = false;
@@ -1322,6 +1439,10 @@ fn parse_layer_to_struct(
                                         | CDR_CTYPE_LAYER_DESKTOP
                                 ) {
                                     is_system_layer = true;
+                                    if ctype == CDR_CTYPE_LAYER_DESKTOP {
+                                        layer.is_desktop_layer = true;
+                                        layer.master_scope = MasterLayerScope::AllPages;
+                                    }
                                     if ctype == CDR_CTYPE_LAYER_GRID
                                         || ctype == CDR_CTYPE_LAYER_GUIDES
                                     {
@@ -1670,7 +1791,7 @@ fn parse_object_list(
                     }
                 }
             }
-            b"fild" => match parse_fild_chunk(data, ctx.is_zcf) {
+            b"fild" => match parse_fild_chunk_with_ctx(data, ctx.is_zcf, Some(ctx)) {
                 Ok((id, fill, is_norm)) => {
                     if id != 0 {
                         if is_norm {
@@ -1683,7 +1804,7 @@ fn parse_object_list(
                 }
                 Err(e) => ctx.warnings.push(format!("malformed fild chunk: {e}")),
             },
-            b"outl" => match parse_outl_chunk(data, ctx.is_zcf) {
+            b"outl" => match parse_outl_chunk_with_ctx(data, ctx.is_zcf, Some(ctx)) {
                 Ok((id, outl, is_none)) => {
                     if id != 0 {
                         if is_none {
@@ -1864,6 +1985,8 @@ fn parse_object_list(
             .unwrap_or_else(|| BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0)));
         Some(NodePayload::PowerClip {
             container: Box::new(container),
+            container_parametric: resolved_shape,
+            lock_contents: true,
             contents: powerclip_children,
         })
     } else if let Some(shape) = resolved_shape {
@@ -3509,6 +3632,114 @@ fn parse_fild_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, Fill, bool)> {
     Ok((fill_id, fill, false))
 }
 
+fn parse_fild_chunk_with_ctx(
+    data: &[u8],
+    is_zcf: bool,
+    ctx: Option<&ParseContext<'_>>,
+) -> CdrResult<(u32, Fill, bool)> {
+    if is_zcf
+        || (data.len() >= 14 && u16::from_le_bytes([data[4], data[5]]) > 16)
+        || (data.len() == 22 && u16::from_le_bytes([data[4], data[5]]) == 0x0514)
+    {
+        return parse_real_fild_v16_with_ctx(data, ctx);
+    }
+
+    if let Ok(parsed) = parse_fild_chunk(data, is_zcf) {
+        return Ok(parsed);
+    }
+
+    // Legacy CorelDRAW v7–v15 RIFF binary fill fallback (fixed Corel color records instead of tagged colors)
+    if data.len() >= 20 {
+        let fill_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let fill_type = u16::from_le_bytes([data[4], data[5]]);
+        if fill_type == 0 {
+            return Ok((fill_id, Fill::None, false));
+        }
+        if let Some(c) = find_embedded_corel_color(&data[4..])
+            .or_else(|| {
+                (data.len() >= 24)
+                    .then(|| decode_real_corel_color_record(&data[12..24]))
+                    .flatten()
+            })
+            .or_else(|| decode_real_corel_color_record(&data[8..20]))
+        {
+            if fill_type == 2 {
+                let mut cols = Vec::new();
+                let mut i = 4usize;
+                while i + 12 <= data.len() && cols.len() < 8 {
+                    if data.get(i..i + 5) == Some(&[0x01, 0x0C, 0x00, 0x00, 0x00])
+                        && i + 17 <= data.len()
+                    {
+                        if let Some(gc) = decode_real_corel_color_record(&data[i + 5..i + 17]) {
+                            cols.push(gc);
+                        }
+                        i += 17;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if cols.len() >= 2 {
+                    let last = (cols.len() - 1) as f32;
+                    let stops = cols
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, col)| GradientStop::new(idx as f32 / last, col))
+                        .collect();
+                    return Ok((
+                        fill_id,
+                        Fill::LinearGradient {
+                            start: Point2D::new(0.0, 0.5),
+                            end: Point2D::new(1.0, 0.5),
+                            stops,
+                        },
+                        true,
+                    ));
+                }
+            }
+            return Ok((fill_id, Fill::Solid(c), false));
+        }
+    }
+    parse_fild_chunk(data, is_zcf)
+}
+
+fn parse_real_fild_v16_with_ctx(
+    data: &[u8],
+    ctx: Option<&ParseContext<'_>>,
+) -> CdrResult<(u32, Fill, bool)> {
+    let (fill_id, mut fill, is_norm) = parse_real_fild_v16(data)?;
+    if let Some(pctx) = ctx {
+        if data.len() >= 18 {
+            let sub_tag = u16::from_le_bytes([data[4], data[5]]);
+            let fill_type = if sub_tag > 16 || data.len() == 22 {
+                u16::from_le_bytes([data[12], data[13]])
+            } else {
+                sub_tag
+            };
+            if matches!(fill_type, 7 | 9 | 10 | 11) {
+                let pat_id = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+                if let Some(&image_id) = pctx
+                    .pattern_bitmaps
+                    .get(&pat_id)
+                    .or_else(|| pctx.pattern_bitmaps.get(&fill_id))
+                {
+                    fill = Fill::BitmapPattern {
+                        image_id,
+                        tile_w: 15.0,
+                        tile_h: 15.0,
+                    };
+                } else if let Some(vp) = pctx
+                    .vector_patterns
+                    .get(&pat_id)
+                    .or_else(|| pctx.vector_patterns.get(&fill_id))
+                {
+                    fill = vp.clone();
+                }
+            }
+        }
+    }
+    Ok((fill_id, fill, is_norm))
+}
+
 fn is_real_outl_v16(data: &[u8]) -> bool {
     if data.len() < 90 {
         return false;
@@ -3603,6 +3834,40 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
         }
     }
 
+    let mut start_arrow = ArrowheadStyle::None;
+    let mut end_arrow = ArrowheadStyle::None;
+    let dash_bytes = if (line_type & 0x0004) != 0 && base + 28 <= data.len() {
+        let count = usize::from(u16::from_le_bytes([data[base + 24], data[base + 25]]));
+        if (1..=32).contains(&count) && base + 26 + count * 2 <= data.len() {
+            2 + count * 2
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let arr_off = base + 24 + dash_bytes;
+    if arr_off + 8 <= data.len() {
+        let s_id = u32::from_le_bytes([
+            data[arr_off],
+            data[arr_off + 1],
+            data[arr_off + 2],
+            data[arr_off + 3],
+        ]);
+        let e_id = u32::from_le_bytes([
+            data[arr_off + 4],
+            data[arr_off + 5],
+            data[arr_off + 6],
+            data[arr_off + 7],
+        ]);
+        if (1..=6).contains(&s_id) {
+            start_arrow = decode_arrow(s_id as u8);
+        }
+        if (1..=6).contains(&e_id) {
+            end_arrow = decode_arrow(e_id as u8);
+        }
+    }
+
     Ok((
         outline_id,
         OutlineStyle {
@@ -3613,8 +3878,8 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
             join,
             miter_limit,
             dash_pattern,
-            start_arrow: ArrowheadStyle::None,
-            end_arrow: ArrowheadStyle::None,
+            start_arrow,
+            end_arrow,
             behind_fill: (line_type & 0x0010) != 0,
             scale_with_object: (line_type & 0x0020) != 0,
             overprint: (line_type & 0x0040) != 0,
@@ -3627,6 +3892,65 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
         },
         false,
     ))
+}
+
+fn parse_outl_chunk_with_ctx(
+    data: &[u8],
+    is_zcf: bool,
+    ctx: Option<&ParseContext<'_>>,
+) -> CdrResult<(u32, OutlineStyle, bool)> {
+    let mut parsed = if is_real_outl_v16(data) {
+        parse_real_outl_v16(data)?
+    } else if let Ok(p) = parse_outl_chunk(data, is_zcf) {
+        p
+    } else if data.len() >= 24 {
+        // Legacy CorelDRAW v7–v15 RIFF binary outline record fallback
+        let outline_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let line_type = u16::from_le_bytes([data[4], data[5]]);
+        if (line_type & 0x0001) != 0 && (line_type & 0x0006) == 0 {
+            return Ok((outline_id, OutlineStyle::none(), true));
+        }
+        let width_mm =
+            cdr32_to_mm(i32::from_le_bytes([data[12], data[13], data[14], data[15]])).max(0.0);
+        let color = find_embedded_corel_color(&data[16..])
+            .or_else(|| {
+                (data.len() >= 36)
+                    .then(|| decode_real_corel_color_record(&data[24..36]))
+                    .flatten()
+            })
+            .unwrap_or(coree_core::Color::BLACK);
+        (
+            outline_id,
+            OutlineStyle {
+                color,
+                width_mm,
+                is_hairline: width_mm > 0.0 && width_mm <= 0.08,
+                behind_fill: (line_type & 0x0010) != 0,
+                scale_with_object: (line_type & 0x0020) != 0,
+                overprint: (line_type & 0x0040) != 0,
+                ..OutlineStyle::default()
+            },
+            false,
+        )
+    } else {
+        return parse_outl_chunk(data, is_zcf);
+    };
+
+    if let Some(pctx) = ctx {
+        if !pctx.arrows.is_empty() && data.len() >= 12 {
+            // Check trailing pair of arrow resource IDs when `arrw` resource list populated
+            let tail = &data[data.len() - 8..];
+            let s_id = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+            let e_id = u32::from_le_bytes([tail[4], tail[5], tail[6], tail[7]]);
+            if let Some(a) = pctx.arrows.get(&s_id) {
+                parsed.1.start_arrow = a.clone();
+            }
+            if let Some(a) = pctx.arrows.get(&e_id) {
+                parsed.1.end_arrow = a.clone();
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 fn parse_outl_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, OutlineStyle, bool)> {
@@ -3731,6 +4055,7 @@ fn parse_stlt_body(r: &mut ByteReader<'_>) -> CdrResult<ParsedStyleEntry> {
             },
             font_size_pt,
             bold: (flags & 0x01) != 0,
+            font_weight: if (flags & 0x01) != 0 { 700 } else { 400 },
             italic: (flags & 0x02) != 0,
             underline: (flags & 0x04) != 0,
             strikethrough: (flags & 0x08) != 0,
@@ -3740,6 +4065,7 @@ fn parse_stlt_body(r: &mut ByteReader<'_>) -> CdrResult<ParsedStyleEntry> {
             direction,
             align,
             kashida_stretch,
+            ..TextStyle::default()
         },
         codepage: (codepage_raw != 0).then_some(codepage_raw),
         charset: (charset_raw != 0).then_some(charset_raw),
@@ -4326,6 +4652,7 @@ fn encode_scene_object(
         NodePayload::PowerClip {
             container,
             contents,
+            ..
         } => {
             loda_args.push((LODA_ARG_CURVE, encode_loda_curve_arg(container)));
             let mut pwr_nodes = Vec::new();
@@ -5166,5 +5493,99 @@ mod tests {
         // Truncated v16 outl must error cleanly without out-of-bounds panic
         let short_outl = vec![0u8; 16];
         assert!(parse_real_outl_v16(&short_outl).is_err());
+    }
+
+    #[test]
+    fn legacy_arrw_vpat_clrs_and_v7_outl_fallbacks_decode_cleanly() {
+        let mut doc = Document::new_a4("Legacy CDR Tables");
+        let limits = CodecLimits::default();
+        let mut budget = limits.max_uncompressed_bytes;
+        let zcf = ZcfContext::default();
+        let mut ctx = ParseContext {
+            limits: &limits,
+            budget_remaining: &mut budget,
+            endian: RiffEndian::Little,
+            version: 1200,
+            is_zcf: false,
+            doc_page_width_mm: 210.0,
+            doc_page_height_mm: 297.0,
+            current_page_w_mm: 210.0,
+            current_page_h_mm: 297.0,
+            zcf: &zcf,
+            fills: HashMap::new(),
+            normalized_fills: HashSet::new(),
+            outlines: HashMap::new(),
+            outlines_explicit_none: HashSet::new(),
+            styles: HashMap::new(),
+            bitmaps: HashMap::new(),
+            arrows: HashMap::new(),
+            pattern_bitmaps: HashMap::new(),
+            vector_patterns: HashMap::new(),
+            color_styles: HashMap::new(),
+            text_streams: HashMap::new(),
+            master_layers: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        // 1. Arrowhead table (`arrw`) entry id=12, 4 nodes -> Diamond
+        let mut arrw_bytes = Vec::new();
+        arrw_bytes.extend_from_slice(&12u32.to_le_bytes());
+        arrw_bytes.extend_from_slice(&4u16.to_le_bytes());
+        arrw_bytes.extend_from_slice(&[0u8; 6]);
+        parse_arrw_list(
+            &[RiffNode::Chunk {
+                fourcc: *b"arrw",
+                compressed: false,
+                data: arrw_bytes,
+            }],
+            &mut ctx,
+        );
+        assert_eq!(ctx.arrows.get(&12), Some(&ArrowheadStyle::Diamond));
+
+        // 2. Vector pattern (`vpat`) registers a SymbolDef + Fill::VectorPattern
+        let mut vpat_bytes = vec![0u8; 24];
+        vpat_bytes[0..4].copy_from_slice(&5u32.to_le_bytes());
+        parse_vpat_list(
+            &[RiffNode::Chunk {
+                fourcc: *b"vpat",
+                compressed: false,
+                data: vpat_bytes,
+            }],
+            &mut doc,
+            &mut ctx,
+        );
+        assert!(matches!(
+            ctx.vector_patterns.get(&5),
+            Some(Fill::VectorPattern { .. })
+        ));
+
+        // 3. Color style (`clrs`) populates doc palette + ctx.color_styles
+        let mut clrs_bytes = vec![0u8; 16];
+        clrs_bytes[0..4].copy_from_slice(&9u32.to_le_bytes());
+        clrs_bytes[4..6].copy_from_slice(&5u16.to_le_bytes()); // RGB model
+        clrs_bytes[12..16].copy_from_slice(&[20, 140, 220, 255]);
+        parse_clrs_list(
+            &[RiffNode::Chunk {
+                fourcc: *b"clrs",
+                compressed: false,
+                data: clrs_bytes,
+            }],
+            &mut doc,
+            &mut ctx,
+        );
+        assert!(ctx.color_styles.contains_key(&9));
+        assert!(!doc.document_palette.swatches.is_empty());
+
+        // 4. Legacy 24-byte `outl` resolves trailing arrow ID `12` via `ParseContext::arrows`
+        let mut leg_outl = vec![0u8; 28];
+        leg_outl[0..4].copy_from_slice(&33u32.to_le_bytes());
+        leg_outl[4..6].copy_from_slice(&0x0012u16.to_le_bytes()); // solid + behind_fill
+        leg_outl[12..16].copy_from_slice(&10_000i32.to_le_bytes()); // 1.0 mm
+        leg_outl[24..28].copy_from_slice(&12u32.to_le_bytes()); // trailing end_arrow id = 12
+        let (oid, outl, is_none) = parse_outl_chunk_with_ctx(&leg_outl, false, Some(&ctx)).unwrap();
+        assert_eq!(oid, 33);
+        assert!(!is_none);
+        assert!(outl.behind_fill);
+        assert_eq!(outl.end_arrow, ArrowheadStyle::Diamond);
     }
 }

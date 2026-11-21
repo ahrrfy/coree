@@ -523,6 +523,13 @@ fn render_block_shadow(
         anti_alias,
     };
 
+    let swept = build_block_shadow_geometry(world_path, delta);
+    if !swept.is_empty() {
+        backend.fill_path(&swept, &paint, FillRule::Winding, page_to_screen);
+    }
+}
+
+fn build_block_shadow_geometry(world_path: &BezierPath, delta: Vec2D) -> BezierPath {
     let mut subpaths = Vec::new();
     for poly in world_path.flatten(0.2) {
         if poly.len() < 2 {
@@ -553,8 +560,7 @@ fn render_block_shadow(
             }
         }
     }
-    let swept = BezierPath { subpaths };
-    backend.fill_path(&swept, &paint, FillRule::Winding, page_to_screen);
+    BezierPath { subpaths }
 }
 
 fn signed_poly_area(pts: &[Point2D]) -> f64 {
@@ -568,6 +574,57 @@ fn signed_poly_area(pts: &[Point2D]) -> f64 {
         area2 += a.x * b.y - b.x * a.y;
     }
     0.5 * area2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_contour_rings(
+    world_path: &BezierPath,
+    mode: ContourMode,
+    steps: u32,
+    offset_mm: f64,
+    base_fill: &Color,
+    target_fill: &Color,
+    base_outline: &OutlineStyle,
+    target_outline: &Color,
+) -> Vec<(u32, BezierPath, Color, Color)> {
+    let step_mm = sanitize_f64(offset_mm, 1.0).abs().max(0.05);
+    let max_steps = steps.clamp(1, 48);
+    let sign = match mode {
+        ContourMode::Outside => 1.0,
+        ContourMode::Inside | ContourMode::ToCenter => -1.0,
+    };
+
+    let mut rings: Vec<(u32, BezierPath)> = Vec::new();
+    for k in 1..=max_steps {
+        let delta = sign * step_mm * f64::from(k);
+        if let Ok(ring) = offset_polygon(world_path, delta) {
+            if ring.is_empty() {
+                if mode == ContourMode::ToCenter {
+                    break;
+                }
+                continue;
+            }
+            rings.push((k, ring));
+        } else if mode == ContourMode::ToCenter {
+            break;
+        }
+    }
+    if mode == ContourMode::Outside {
+        rings.reverse();
+    }
+    let max_k = rings.iter().map(|(k, _)| *k).max().unwrap_or(1) as f32;
+    rings
+        .into_iter()
+        .map(|(k, ring)| {
+            let t = (k as f32 / max_k.max(1.0)).clamp(0.0, 1.0);
+            (
+                k,
+                ring,
+                base_fill.lerp(target_fill, t),
+                base_outline.color.lerp(target_outline, t),
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,51 +643,27 @@ fn render_contour_steps(
     anti_alias: bool,
     backend: &mut dyn CanvasBackend,
 ) {
-    let step_mm = sanitize_f64(offset_mm, 1.0).abs().max(0.05);
-    let max_steps = match mode {
-        ContourMode::ToCenter | ContourMode::Inside | ContourMode::Outside => steps.clamp(1, 48),
-    };
-    let sign = match mode {
-        ContourMode::Outside => 1.0,
-        ContourMode::Inside | ContourMode::ToCenter => -1.0,
-    };
-
-    // Build stepped polygons
-    let mut rings: Vec<(u32, BezierPath)> = Vec::new();
-    for k in 1..=max_steps {
-        let delta = sign * step_mm * f64::from(k);
-        if let Ok(ring) = offset_polygon(world_path, delta) {
-            if ring.is_empty() {
-                if mode == ContourMode::ToCenter {
-                    break;
-                }
-                continue;
-            }
-            rings.push((k, ring));
-        } else if mode == ContourMode::ToCenter {
-            break;
-        }
-    }
-
+    let rings = compute_contour_rings(
+        world_path,
+        mode,
+        steps,
+        offset_mm,
+        &base_fill,
+        target_fill,
+        base_outline,
+        target_outline,
+    );
     if rings.is_empty() {
         return;
     }
 
-    // Outside contours draw outermost first (back-to-front); inside contours draw step 1..N
-    if mode == ContourMode::Outside {
-        rings.reverse();
-    }
-
-    let max_k = rings.iter().map(|(k, _)| *k).max().unwrap_or(1) as f32;
     let stroke_w = if base_outline.is_visible() {
         (base_outline.effective_width_mm() as f32).max((1.0 / px_per_mm.max(1e-3)) as f32)
     } else {
         0.0
     };
 
-    for (k, ring) in rings {
-        let t = (k as f32 / max_k.max(1.0)).clamp(0.0, 1.0);
-        let step_fill = base_fill.lerp(target_fill, t);
+    for (_k, ring, step_fill, out_col) in rings {
         let paint = BackendPaint {
             shader: crate::backend::PaintShader::Solid(step_fill),
             opacity,
@@ -640,7 +673,6 @@ fn render_contour_steps(
         backend.fill_path(&ring, &paint, FillRule::EvenOdd, page_to_screen);
 
         if stroke_w > 0.0 || target_outline.alpha() > 1e-4 {
-            let out_col = base_outline.color.lerp(target_outline, t);
             let mut st = StrokeParams::from_outline(
                 base_outline,
                 stroke_w.max(0.25),
@@ -652,6 +684,53 @@ fn render_contour_steps(
             backend.stroke_path(&ring, &st, page_to_screen);
         }
     }
+}
+
+fn compute_extrude_25d_faces(
+    world_path: &BezierPath,
+    base_color: Color,
+    vanishing_point: Point2D,
+    depth: f64,
+    shade_color: &Color,
+    light_dir: [f32; 3],
+) -> Vec<([Point2D; 4], Color)> {
+    if world_path.is_empty() || !vanishing_point.is_finite() {
+        return Vec::new();
+    }
+    let d = sanitize_f64(depth, 10.0).max(0.5);
+    let extrude_frac = (d / (d + 40.0)).clamp(0.05, 0.92);
+    let lx = sanitize_f32(light_dir[0], 0.4);
+    let ly = sanitize_f32(light_dir[1], -0.6);
+    let lz = sanitize_f32(light_dir[2], 0.7);
+    let l_len = (lx * lx + ly * ly + lz * lz).sqrt().max(1e-5);
+    let ldir = [lx / l_len, ly / l_len, lz / l_len];
+
+    let mut faces = Vec::new();
+    for poly in world_path.flatten(0.3) {
+        if poly.len() < 2 {
+            continue;
+        }
+        for win in poly.windows(2) {
+            let p0 = win[0];
+            let p1 = win[1];
+            if p0.distance_to(p1) <= 1e-6 {
+                continue;
+            }
+            let q0 = p0.lerp(vanishing_point, extrude_frac);
+            let q1 = p1.lerp(vanishing_point, extrude_frac);
+            let edge = (p1 - p0).normalize_or_zero();
+            let normal_2d = Vec2D::new(edge.y, -edge.x);
+            let ndotl =
+                (normal_2d.x as f32 * ldir[0] + normal_2d.y as f32 * ldir[1] + 0.35 * ldir[2])
+                    .clamp(-1.0, 1.0);
+            let lit_t = (0.5 + 0.5 * ndotl).clamp(0.0, 1.0);
+            let face_col = shade_color.lerp(&base_color, lit_t * 0.85);
+            let mid = p0.midpoint(p1).midpoint(q0.midpoint(q1));
+            faces.push(([p0, p1, q1, q0], mid.distance_to(vanishing_point), face_col));
+        }
+    }
+    faces.sort_by(|a, b| a.1.total_cmp(&b.1));
+    faces.into_iter().map(|(q, _, c)| (q, c)).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -667,63 +746,17 @@ fn render_extrude_25d(
     anti_alias: bool,
     backend: &mut dyn CanvasBackend,
 ) {
-    if world_path.is_empty() || !vanishing_point.is_finite() {
-        return;
-    }
-    let d = sanitize_f64(depth, 10.0).max(0.5);
-    let extrude_frac = (d / (d + 40.0)).clamp(0.05, 0.92);
-
-    // Normalize directional light vector
-    let lx = sanitize_f32(light_dir[0], 0.4);
-    let ly = sanitize_f32(light_dir[1], -0.6);
-    let lz = sanitize_f32(light_dir[2], 0.7);
-    let l_len = (lx * lx + ly * ly + lz * lz).sqrt().max(1e-5);
-    let ldir = [lx / l_len, ly / l_len, lz / l_len];
-
-    struct SideFace {
-        quad: [Point2D; 4],
-        dist_to_vp: f64,
-        color: Color,
-    }
-
-    let mut faces = Vec::new();
-    for poly in world_path.flatten(0.3) {
-        if poly.len() < 2 {
-            continue;
-        }
-        for win in poly.windows(2) {
-            let p0 = win[0];
-            let p1 = win[1];
-            if p0.distance_to(p1) <= 1e-6 {
-                continue;
-            }
-            let q0 = p0.lerp(vanishing_point, extrude_frac);
-            let q1 = p1.lerp(vanishing_point, extrude_frac);
-
-            let edge = (p1 - p0).normalize_or_zero();
-            let normal_2d = Vec2D::new(edge.y, -edge.x);
-            let ndotl =
-                (normal_2d.x as f32 * ldir[0] + normal_2d.y as f32 * ldir[1] + 0.35 * ldir[2])
-                    .clamp(-1.0, 1.0);
-            let lit_t = (0.5 + 0.5 * ndotl).clamp(0.0, 1.0);
-            let face_col = shade_color.lerp(&base_color, lit_t * 0.85);
-
-            let mid = p0.midpoint(p1).midpoint(q0.midpoint(q1));
-            faces.push(SideFace {
-                quad: [p0, p1, q1, q0],
-                dist_to_vp: mid.distance_to(vanishing_point),
-                color: face_col,
-            });
-        }
-    }
-
-    // Painter's sort: faces closest to vanishing point (farthest back) draw first
-    faces.sort_by(|a, b| a.dist_to_vp.total_cmp(&b.dist_to_vp));
-
-    for face in faces {
-        let quad_path = BezierPath::from_polygon(face.quad, true);
+    for (quad, color) in compute_extrude_25d_faces(
+        world_path,
+        base_color,
+        vanishing_point,
+        depth,
+        shade_color,
+        light_dir,
+    ) {
+        let quad_path = BezierPath::from_polygon(quad, true);
         let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(face.color),
+            shader: crate::backend::PaintShader::Solid(color),
             opacity,
             blend_mode: BlendMode::Normal,
             anti_alias,
@@ -732,8 +765,15 @@ fn render_extrude_25d(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_blend_effect(
+struct ComputedBlendStep {
+    path: BezierPath,
+    fill: Color,
+    opacity: f32,
+    outline_width_mm: Option<f64>,
+    outline_color: Color,
+}
+
+fn compute_blend_steps(
     doc: &Document,
     src_obj: &SceneObject,
     src_world_path: &BezierPath,
@@ -741,25 +781,21 @@ fn render_blend_effect(
     steps: u32,
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
-    page_to_screen: Affine2D,
-    px_per_mm: f64,
-    anti_alias: bool,
-    backend: &mut dyn CanvasBackend,
-) {
+) -> Vec<ComputedBlendStep> {
     let n_steps = steps.clamp(1, 64);
     let Some(target_obj) = doc.objects.get(&target_id) else {
-        return;
+        return Vec::new();
     };
     let Some(target_world_path) = doc.world_path_of(target_id) else {
-        return;
+        return Vec::new();
     };
 
     const SAMPLES: usize = 64;
     let Some(src_ring) = resample_primary_contour(src_world_path, SAMPLES) else {
-        return;
+        return Vec::new();
     };
     let Some(dst_ring) = resample_primary_contour(&target_world_path, SAMPLES) else {
-        return;
+        return Vec::new();
     };
     let src_center = centroid(&src_ring);
     let dst_center = centroid(&dst_ring);
@@ -768,7 +804,9 @@ fn render_blend_effect(
     let src_fill = primary_fill_color(&src_obj.fill);
     let dst_fill = primary_fill_color(&target_obj.fill);
     let rot_total_rad = sanitize_f64(rotation_deg, 0.0).to_radians();
+    let has_outline = src_obj.outline.is_visible() || target_obj.outline.is_visible();
 
+    let mut out = Vec::with_capacity(n_steps as usize);
     for i in 1..=n_steps {
         let t = f64::from(i) / f64::from(n_steps + 1);
         let tf = t as f32;
@@ -795,30 +833,65 @@ fn render_blend_effect(
             pts.push(target_center + rotated);
         }
 
-        let morph_path = BezierPath::from_polygon(pts, true);
-        let step_fill = src_fill.lerp(&dst_fill, tf);
-        let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(step_fill),
+        let w_mm = if has_outline {
+            let w = src_obj.outline.effective_width_mm() * (1.0 - t)
+                + target_obj.outline.effective_width_mm() * t;
+            (w > 1e-5).then_some(w)
+        } else {
+            None
+        };
+        out.push(ComputedBlendStep {
+            path: BezierPath::from_polygon(pts, true),
+            fill: src_fill.lerp(&dst_fill, tf),
             opacity: src_obj.opacity + (target_obj.opacity - src_obj.opacity) * tf,
+            outline_width_mm: w_mm,
+            outline_color: src_obj.outline.color.lerp(&target_obj.outline.color, tf),
+        });
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_blend_effect(
+    doc: &Document,
+    src_obj: &SceneObject,
+    src_world_path: &BezierPath,
+    target_id: coree_core::ObjectId,
+    steps: u32,
+    rotation_deg: f64,
+    along_path: Option<coree_core::ObjectId>,
+    page_to_screen: Affine2D,
+    px_per_mm: f64,
+    anti_alias: bool,
+    backend: &mut dyn CanvasBackend,
+) {
+    for step in compute_blend_steps(
+        doc,
+        src_obj,
+        src_world_path,
+        target_id,
+        steps,
+        rotation_deg,
+        along_path,
+    ) {
+        let paint = BackendPaint {
+            shader: crate::backend::PaintShader::Solid(step.fill),
+            opacity: step.opacity,
             blend_mode: src_obj.blend_mode,
             anti_alias,
         };
-        backend.fill_path(&morph_path, &paint, FillRule::Winding, page_to_screen);
+        backend.fill_path(&step.path, &paint, FillRule::Winding, page_to_screen);
 
-        if src_obj.outline.is_visible() || target_obj.outline.is_visible() {
-            let w_mm = src_obj.outline.effective_width_mm() * (1.0 - t)
-                + target_obj.outline.effective_width_mm() * t;
-            if w_mm > 1e-5 {
-                let mut st = StrokeParams::from_outline(
-                    &src_obj.outline,
-                    (w_mm as f32).max((0.5 / px_per_mm.max(1e-3)) as f32),
-                    paint.opacity,
-                    src_obj.blend_mode,
-                    anti_alias,
-                );
-                st.color = src_obj.outline.color.lerp(&target_obj.outline.color, tf);
-                backend.stroke_path(&morph_path, &st, page_to_screen);
-            }
+        if let Some(w_mm) = step.outline_width_mm {
+            let mut st = StrokeParams::from_outline(
+                &src_obj.outline,
+                (w_mm as f32).max((0.5 / px_per_mm.max(1e-3)) as f32),
+                step.opacity,
+                src_obj.blend_mode,
+                anti_alias,
+            );
+            st.color = step.outline_color;
+            backend.stroke_path(&step.path, &st, page_to_screen);
         }
     }
 }
@@ -1082,4 +1155,406 @@ pub fn sanitize_bezier_path(path: BezierPath) -> BezierPath {
         })
         .collect();
     BezierPath { subpaths }
+}
+
+/// Breaks all non-destructive [`Effect`]s on `obj` apart into standalone editable vector
+/// [`SceneObject`] primitives (underlay shadows/extrusions/contours/blends, deformed base shape,
+/// overlay inside-contours/bevels, and Symmetry copies), matching CorelDRAW `Ctrl+K` (*Break
+/// Effect Group Apart*).
+///
+/// If `obj` has no effects, returns an empty vector.
+#[must_use]
+pub fn lower_effects_to_primitives(
+    doc: &Document,
+    obj: &SceneObject,
+    world_xf: Affine2D,
+    alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
+) -> Vec<SceneObject> {
+    if obj.effects.is_empty() {
+        return Vec::new();
+    }
+    let Some(local_base) = extract_local_geometry_path(obj) else {
+        return Vec::new();
+    };
+    let deformed_local = sanitize_bezier_path(apply_geometry_effects(&local_base, &obj.effects));
+    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    let mut out = Vec::new();
+
+    for (sym_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
+        let effective_world_xf = sym_xf.compose(&world_xf);
+        let world_path = deformed_local.transformed(&effective_world_xf);
+        let suffix = if sym_idx > 0 {
+            format!(" #{sym_idx}")
+        } else {
+            String::new()
+        };
+
+        // 1. Underlay primitives (DropShadow soft vector approximation, BlockShadow, Contour::Outside, Extrude25D, Blend)
+        for eff in &obj.effects {
+            match eff {
+                Effect::DropShadow {
+                    dx_mm,
+                    dy_mm,
+                    blur_mm,
+                    opacity,
+                    color,
+                    ..
+                } => {
+                    let shadow_xf =
+                        Affine2D::translate(sanitize_f64(*dx_mm, 0.0), sanitize_f64(*dy_mm, 0.0));
+                    let spread = sanitize_f64(*blur_mm, 0.0).max(0.0) * 0.25;
+                    let shadow_path = if spread > 0.05 {
+                        offset_polygon(&world_path, spread)
+                            .unwrap_or_else(|_| world_path.clone())
+                            .transformed(&shadow_xf)
+                    } else {
+                        world_path.transformed(&shadow_xf)
+                    };
+                    let mut sh = SceneObject::new(
+                        alloc_id(),
+                        format!("{} DropShadow{suffix}", obj.name),
+                        NodePayload::Path(shadow_path),
+                    );
+                    sh.fill = Fill::Solid(color.clone());
+                    sh.outline = OutlineStyle::none();
+                    sh.opacity = (obj.opacity * sanitize_f32(*opacity, 0.5)).clamp(0.05, 1.0);
+                    out.push(sh);
+                }
+                Effect::BlockShadow {
+                    dx_mm,
+                    dy_mm,
+                    color,
+                    overprint,
+                    ..
+                } => {
+                    let delta = Vec2D::new(sanitize_f64(*dx_mm, 0.0), sanitize_f64(*dy_mm, 0.0));
+                    let swept = build_block_shadow_geometry(&world_path, delta);
+                    if !swept.is_empty() {
+                        let mut bs = SceneObject::new(
+                            alloc_id(),
+                            format!("{} BlockShadow{suffix}", obj.name),
+                            NodePayload::Path(swept),
+                        );
+                        bs.fill = Fill::Solid(color.clone());
+                        bs.outline = OutlineStyle::none();
+                        bs.opacity = obj.opacity;
+                        if *overprint {
+                            bs.blend_mode = BlendMode::Multiply;
+                        }
+                        out.push(bs);
+                    }
+                }
+                Effect::Contour {
+                    mode: ContourMode::Outside,
+                    steps,
+                    offset_mm,
+                    fill_color,
+                    outline_color,
+                } => {
+                    emit_lowered_contour_objects(
+                        &world_path,
+                        ContourMode::Outside,
+                        *steps,
+                        *offset_mm,
+                        obj,
+                        fill_color,
+                        outline_color,
+                        &suffix,
+                        alloc_id,
+                        &mut out,
+                    );
+                }
+                Effect::Extrude25D {
+                    vanishing_point,
+                    depth,
+                    shade_color,
+                    light_dir,
+                    ..
+                } => {
+                    emit_lowered_extrude_objects(
+                        &world_path,
+                        obj,
+                        *vanishing_point,
+                        *depth,
+                        shade_color,
+                        *light_dir,
+                        &suffix,
+                        alloc_id,
+                        &mut out,
+                    );
+                }
+                Effect::Blend {
+                    target_id,
+                    steps,
+                    rotation_deg,
+                    along_path,
+                } => {
+                    emit_lowered_blend_objects(
+                        doc,
+                        obj,
+                        &world_path,
+                        *target_id,
+                        *steps,
+                        *rotation_deg,
+                        *along_path,
+                        &suffix,
+                        alloc_id,
+                        &mut out,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Primary object converted to deformed editable Path with live effects cleared
+        let mut base = SceneObject::new(
+            alloc_id(),
+            format!("{}{suffix}", obj.name),
+            NodePayload::Path(world_path.clone()),
+        );
+        base.fill = obj.fill.clone();
+        base.outline = obj.outline.clone();
+        base.lens = obj.lens.clone();
+        base.blend_mode = obj.blend_mode;
+        base.opacity = obj.opacity;
+        base.visible = obj.visible;
+        base.locked = obj.locked;
+        base.printable = obj.printable;
+        base.style_id = obj.style_id;
+        out.push(base);
+
+        // 3. Overlay primitives (Contour::Inside / ToCenter, Extrude25D bevel highlight)
+        for eff in &obj.effects {
+            match eff {
+                Effect::Contour {
+                    mode: mode @ (ContourMode::Inside | ContourMode::ToCenter),
+                    steps,
+                    offset_mm,
+                    fill_color,
+                    outline_color,
+                } => {
+                    emit_lowered_contour_objects(
+                        &world_path,
+                        *mode,
+                        *steps,
+                        *offset_mm,
+                        obj,
+                        fill_color,
+                        outline_color,
+                        &suffix,
+                        alloc_id,
+                        &mut out,
+                    );
+                }
+                Effect::Extrude25D { bevel_depth, .. } => {
+                    let bevel = sanitize_f64(*bevel_depth, 0.0).max(0.0);
+                    if bevel > 0.05 && !world_path.is_empty() {
+                        if let Ok(inner) = offset_polygon(&world_path, -bevel.min(4.0)) {
+                            if !inner.is_empty() {
+                                let base_color = primary_fill_color(&obj.fill);
+                                let mut bv = SceneObject::new(
+                                    alloc_id(),
+                                    format!("{} Bevel{suffix}", obj.name),
+                                    NodePayload::Path(inner),
+                                );
+                                bv.fill = Fill::Solid(base_color.lerp(&Color::WHITE, 0.35));
+                                bv.outline = OutlineStyle::none();
+                                bv.opacity = obj.opacity * 0.75;
+                                out.push(bv);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lowered_contour_objects(
+    world_path: &BezierPath,
+    mode: ContourMode,
+    steps: u32,
+    offset_mm: f64,
+    obj: &SceneObject,
+    target_fill: &Color,
+    target_outline: &Color,
+    suffix: &str,
+    alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
+    out: &mut Vec<SceneObject>,
+) {
+    let base_fill = primary_fill_color(&obj.fill);
+    for (k, ring, step_fill, out_col) in compute_contour_rings(
+        world_path,
+        mode,
+        steps,
+        offset_mm,
+        &base_fill,
+        target_fill,
+        &obj.outline,
+        target_outline,
+    ) {
+        let mut co = SceneObject::new(
+            alloc_id(),
+            format!("{} Contour {k}{suffix}", obj.name),
+            NodePayload::Path(ring),
+        );
+        co.fill = Fill::Solid(step_fill);
+        co.outline = if obj.outline.is_visible() || target_outline.alpha() > 1e-4 {
+            let mut st = obj.outline.clone();
+            st.color = out_col;
+            st.width_mm = st.width_mm.max(0.25);
+            st
+        } else {
+            OutlineStyle::none()
+        };
+        co.opacity = obj.opacity;
+        out.push(co);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lowered_extrude_objects(
+    world_path: &BezierPath,
+    obj: &SceneObject,
+    vanishing_point: Point2D,
+    depth: f64,
+    shade_color: &Color,
+    light_dir: [f32; 3],
+    suffix: &str,
+    alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
+    out: &mut Vec<SceneObject>,
+) {
+    let base_color = primary_fill_color(&obj.fill);
+    for (idx, (quad, col)) in compute_extrude_25d_faces(
+        world_path,
+        base_color,
+        vanishing_point,
+        depth,
+        shade_color,
+        light_dir,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let mut ex = SceneObject::new(
+            alloc_id(),
+            format!("{} Extrude {}{suffix}", obj.name, idx + 1),
+            NodePayload::Path(BezierPath::from_polygon(quad, true)),
+        );
+        ex.fill = Fill::Solid(col);
+        ex.outline = OutlineStyle::none();
+        ex.opacity = obj.opacity;
+        out.push(ex);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lowered_blend_objects(
+    doc: &Document,
+    src_obj: &SceneObject,
+    src_world_path: &BezierPath,
+    target_id: coree_core::ObjectId,
+    steps: u32,
+    rotation_deg: f64,
+    along_path: Option<coree_core::ObjectId>,
+    suffix: &str,
+    alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
+    out: &mut Vec<SceneObject>,
+) {
+    for (i, step) in compute_blend_steps(
+        doc,
+        src_obj,
+        src_world_path,
+        target_id,
+        steps,
+        rotation_deg,
+        along_path,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let mut bo = SceneObject::new(
+            alloc_id(),
+            format!("{} Blend {}{suffix}", src_obj.name, i + 1),
+            NodePayload::Path(step.path),
+        );
+        bo.fill = Fill::Solid(step.fill);
+        bo.opacity = step.opacity;
+        bo.blend_mode = src_obj.blend_mode;
+        if let Some(w_mm) = step.outline_width_mm {
+            let mut st = src_obj.outline.clone();
+            st.width_mm = w_mm;
+            st.color = step.outline_color;
+            bo.outline = st;
+        } else {
+            bo.outline = OutlineStyle::none();
+        }
+        out.push(bo);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coree_core::{CornerStyle, ObjectId, ParametricShape};
+
+    #[test]
+    fn lower_effects_to_primitives_decomposes_shadow_contour_and_symmetry() {
+        let mut doc = Document::new_a4("Effects Lowering");
+        let mut next_id = 100u64;
+        let mut obj = SceneObject::new(
+            ObjectId(1),
+            "Logo Badge",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 40.0,
+                height: 20.0,
+                corner_radii: [2.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        );
+        obj.effects.push(Effect::DropShadow {
+            dx_mm: 2.0,
+            dy_mm: 2.0,
+            blur_mm: 1.5,
+            opacity: 0.6,
+            color: Color::BLACK,
+            feather_direction: coree_core::FeatherDirection::Outside,
+        });
+        obj.effects.push(Effect::Contour {
+            mode: ContourMode::Outside,
+            steps: 2,
+            offset_mm: 2.5,
+            fill_color: Color::CYAN,
+            outline_color: Color::BLACK,
+        });
+        obj.effects.push(Effect::Symmetry {
+            axes: 2,
+            mirror: false,
+            origin: Point2D::ZERO,
+        });
+        doc.add_object(obj.clone(), None).unwrap();
+
+        let pieces = lower_effects_to_primitives(
+            &doc,
+            &doc.objects[&obj.id],
+            Affine2D::IDENTITY,
+            &mut || {
+                let id = ObjectId(next_id);
+                next_id += 1;
+                id
+            },
+        );
+        // Symmetry=2 * (DropShadow + 2 Contour rings + base Path) = 8 independent vector objects
+        assert_eq!(pieces.len(), 8);
+        assert!(pieces.iter().all(|p| p.effects.is_empty()));
+        assert!(pieces
+            .iter()
+            .any(|p| p.name.contains("DropShadow") && matches!(p.payload, NodePayload::Path(_))));
+        assert!(pieces.iter().any(|p| p.name.contains("Contour")));
+    }
 }

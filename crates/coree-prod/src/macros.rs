@@ -11,8 +11,8 @@
 use crate::cut_packaging::generate_cut_contour;
 use crate::error::{ProdError, ProdResult};
 use coree_core::{
-    apply_command, Affine2D, AlignOp, Color, CommandHistory, CommandOp, Document, Fill,
-    NodePayload, ObjectId, OutlineStyle, Point2D,
+    apply_command, rhai_array_to_ids, Affine2D, AlignOp, Color, CommandHistory, CommandOp,
+    Document, Fill, NodePayload, ObjectId, OutlineStyle, Point2D,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use serde::{Deserialize, Serialize};
@@ -183,17 +183,6 @@ fn dyn_to_f64(v: Dynamic, field: &str) -> Result<f64, Box<EvalAltResult>> {
     v.as_float()
         .or_else(|_| v.as_int().map(|n| n as f64))
         .map_err(|_| format!("'{field}' must be numeric").into())
-}
-
-fn rhai_array_to_ids(arr: rhai::Array) -> Vec<ObjectId> {
-    arr.into_iter()
-        .filter_map(|v| {
-            v.as_int()
-                .ok()
-                .filter(|&n| n > 0)
-                .map(|n| ObjectId(n as u64))
-        })
-        .collect()
 }
 
 /// Runs a production Rhai automation script against `doc` inside a strict sandbox.
