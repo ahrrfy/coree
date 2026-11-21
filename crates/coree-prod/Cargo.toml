@@ -1,0 +1,24 @@
+[package]
+name = "coree-prod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Prepress imposition, preflight, CutContour, parametric dielines, path meter, barcodes, print merge, find & replace, collect for output, and sandboxed macros."
+
+[dependencies]
+coree-core.workspace = true
+i_overlay.workspace = true
+image.workspace = true
+kurbo.workspace = true
+qrcode.workspace = true
+rayon.workspace = true
+rhai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "coree-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Spatial R-Tree dirty-tile vector renderer, Arabic RTL/Kashida text shaping, live lenses, and bitmap effects."
+
+[dependencies]
+coree-core.workspace = true
+cosmic-text.workspace = true
+image.workspace = true
+kurbo.workspace = true
+rayon.workspace = true
+resvg.workspace = true
+rstar.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
+usvg.workspace = true

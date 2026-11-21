@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: MPL-2.0
+#![forbid(unsafe_code)]
+
+//! Hardened vector, print, CAD/plotter, raster, palette, and native `.coree` I/O
+//! pipelines with atomic writes and Zip-Bomb / Zip-Slip / depth / dimension safeguards.
+
+pub mod atomic;
+pub mod cad_plot;
+pub mod eps;
+pub mod error;
+pub mod native;
+pub mod palette_io;
+pub mod pdf;
+pub mod raster;
+pub mod svg;
+
+/// Crate identifier used during workspace initialization and diagnostics.
+pub const CRATE_NAME: &str = "coree-io";
+
+// Ergonomic top-level re-exports
+pub use atomic::{atomic_write_bytes, atomic_write_with};
+pub use cad_plot::{
+    export_dxf, export_dxf_to_string, export_dxf_to_string_with_options, export_dxf_with_options,
+    export_plt, export_plt_to_string, export_plt_to_string_with_options, export_plt_with_options,
+    DxfExportOptions, PltExportOptions, HPGL_UNITS_PER_MM,
+};
+pub use eps::{export_eps, export_eps_to_string};
+pub use error::{sanitize_zip_path, IoError, IoLimits, IoResult};
+pub use native::{
+    load_coree, load_coree_from_reader, load_coree_with_limits, read_coree_manifest,
+    read_coree_preview, save_coree, save_coree_with_preview, CoreeManifest, COREE_FORMAT_VERSION,
+};
+pub use palette_io::{
+    export_ase, export_gpl, export_pal, export_palette_file, import_ase, import_gpl, import_pal,
+    import_palette_file,
+};
+pub use pdf::{export_pdf, export_pdf_to_bytes, PdfColorSpace, PdfExportOptions};
+pub use raster::{
+    decode_raster_bytes_with_limits, export_raster, export_raster_to_bytes, import_raster,
+    import_raster_with_limits, inject_png_phys_chunk, parse_png_phys_dpi,
+    validate_raster_dimensions, RasterExportOptions, RasterFormat,
+};
+pub use svg::{
+    export_svg, export_svg_to_string, import_svg, import_svg_str, import_svg_str_with_limits,
+    import_svg_with_limits,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_metadata_is_valid() {
+        assert_eq!(CRATE_NAME, "coree-io");
+    }
+}
