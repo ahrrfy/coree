@@ -330,16 +330,18 @@ fn submit_pdf_to_os_spooler(spool_pdf: &Path, cfg: &PrintJobConfig) -> Result<St
     #[cfg(target_os = "windows")]
     {
         let copies = cfg.copies.clamp(1, 999);
-        let target_label = cfg
+        let sanitized_printer = cfg
             .printer_name
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            .map(sanitize_printer_name)
+            .transpose()?
+            .map(str::to_owned);
+        let target_label = sanitized_printer
+            .as_deref()
             .unwrap_or("default Windows printer");
 
-        let mut script_ok = true;
-        let ps_cmd = if let Some(ref printer) = cfg.printer_name {
-            let safe = sanitize_printer_name(printer)?;
-            let _ = safe;
+        let ps_cmd = if sanitized_printer.is_some() {
             "Start-Process -FilePath $env:COREE_PRINT_PDF -Verb PrintTo -ArgumentList $env:COREE_PRINTER"
         } else {
             "Start-Process -FilePath $env:COREE_PRINT_PDF -Verb Print"
@@ -349,14 +351,14 @@ fn submit_pdf_to_os_spooler(spool_pdf: &Path, cfg: &PrintJobConfig) -> Result<St
             let mut cmd = Command::new("powershell");
             cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd]);
             cmd.env("COREE_PRINT_PDF", spool_pdf);
-            if let Some(ref printer) = cfg.printer_name {
-                cmd.env("COREE_PRINTER", sanitize_printer_name(printer)?);
+            if let Some(ref printer) = sanitized_printer {
+                cmd.env("COREE_PRINTER", printer);
             }
             let out = cmd
                 .output()
                 .map_err(|e| format!("failed to invoke Windows spooler: {e}"))?;
             if !out.status.success() {
-                script_ok = false;
+                let _ = std::fs::remove_file(spool_pdf);
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
                 return Err(if err.is_empty() {
                     "Windows print verb failed (ensure a PDF handler or printer is configured)"
@@ -366,7 +368,6 @@ fn submit_pdf_to_os_spooler(spool_pdf: &Path, cfg: &PrintJobConfig) -> Result<St
                 });
             }
         }
-        let _ = script_ok;
         Ok(format!(
             "Submitted {copies} copy/copies of '{}' to {target_label}",
             spool_pdf.display()
