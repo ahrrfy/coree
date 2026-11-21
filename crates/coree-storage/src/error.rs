@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Unified error type for local offline SQLite persistence, crash recovery,
 //! font indexing, and background job execution.

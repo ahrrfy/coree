@@ -1,0 +1,4 @@
+[Thumbnailer Entry]
+TryExec=coree
+Exec=coree thumbnail %i %o --size %s
+MimeType=application/vnd.corel-draw;application/x-cdr;application/x-coree;application/x-cdt;application/x-cmx;application/x-cpt;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Dirty-Tile viewport rasterization cache (`256 × 256` tiles) with spatial
 //! R-Tree frustum culling (`coree_core::SpatialIndex`) and LOD drag degradation.

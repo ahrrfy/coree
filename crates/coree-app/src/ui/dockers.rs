@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Rearrangeable, tabbable, splittable, and floatable studio Dockers powered by
 //! `egui_dock 0.22` covering all 14 production panels:
@@ -8,24 +8,37 @@
 //! `CDR Inspector`.
 
 use crate::io_bridge::{read_text_file_bounded, MAX_TEXT_READ_BYTES};
-use crate::state::{BitmapDockerState, DockerTab, LensDockerState, PropertiesSubTab, StudioApp};
+use crate::state::{
+    BitmapDockerState, DockerTab, LensDockerState, PropertiesSubTab, RasterBrushOp, StudioApp,
+};
 use crate::theme::{
     core_color_to_egui, dock_style, egui_color_to_core, DOCKER_DEFAULT_WIDTH, DOCKER_MAX_WIDTH,
     DOCKER_MIN_WIDTH,
 };
+use crate::ui::dialogs::{
+    cached_detect_executable, install_sample_plugin_action, reload_plugins_action,
+};
 use coree_core::{
     Affine2D, AlignOp, ArrowheadStyle, BlendMode, BooleanOp, Color, ColorMapMode, CommandOp,
     ContourMode, DistortKind, DistributeOp, EnvelopeMode, Fill, GradientStop, LineCap, LineJoin,
-    MasterLayerScope, NodePayload, ObjectId, ObjectStyle, OutlineStyle, Point2D, Rect2D,
-    SceneObject, SymbolDef, TextAlign, TextDirection, Vec2D, ZOrderOp,
+    MasterLayerScope, NodePayload, ObjectId, ObjectStyle, OutlineStyle, Point2D,
+    PostScriptFillPreset, Rect2D, SceneObject, SymbolDef, TextAlign, TextDirection, Vec2D,
+    ZOrderOp,
 };
 use coree_prod::{
-    builtin_macros, BarcodeSymbology, FindScope, LensKindFilter, ObjectKindFilter,
-    PreflightSeverity, QrErrorCorrection, ReplaceAction,
+    builtin_macros, default_laser_layer_rules, export_laser_dxf_r12, export_laser_gcode,
+    export_laser_plt, export_laser_svg, plan_laser_toolpath, run_rhai_plugin, BarcodeSymbology,
+    FindScope, GcodeDialect, LaserLayerRule, LaserOperationKind, LaserOrigin, LensKindFilter,
+    MacroSandboxConfig, ObjectKindFilter, PluginKind, PluginManifest, PreflightSeverity,
+    QrErrorCorrection, ReplaceAction,
 };
-use coree_render::OutlinePreset;
-use egui::{ComboBox, DragValue, Frame, Id, Margin, RichText, Stroke, Ui, WidgetText};
+use coree_render::{list_glyphs_for_block, GlyphBlockFilter, OutlinePreset, ToneRange};
+use egui::{
+    vec2, Color32, ComboBox, CornerRadius, DragValue, Frame, Id, Margin, RichText, Stroke, Ui,
+    WidgetText,
+};
 use egui_dock::{DockArea, DockState, TabViewer};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Renders the right resizable `egui_dock::DockArea` panel containing all open studio dockers.
@@ -393,8 +406,16 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         tile_h: 8.0,
                     });
                 }
+                let is_ps_fill = matches!(
+                    &cur_fill,
+                    Fill::TextureFill { preset, .. }
+                        if PostScriptFillPreset::from_preset_str(preset).is_some()
+                );
                 if ui
-                    .selectable_label(matches!(cur_fill, Fill::TextureFill { .. }), "Texture")
+                    .selectable_label(
+                        matches!(cur_fill, Fill::TextureFill { .. }) && !is_ps_fill,
+                        "Texture",
+                    )
                     .clicked()
                 {
                     app.apply_fill(Fill::TextureFill {
@@ -403,6 +424,14 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         fg: Color::CYAN,
                         bg: Color::WHITE,
                     });
+                }
+                if ui.selectable_label(is_ps_fill, "PostScript").clicked() {
+                    let fg = cur_fill
+                        .referenced_colors()
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Color::KEY_BLACK);
+                    app.apply_fill(PostScriptFillPreset::Hatch.to_fill(fg, Color::WHITE, 1));
                 }
                 if ui
                     .selectable_label(matches!(cur_fill, Fill::MeshFill { .. }), "Mesh")
@@ -555,6 +584,64 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         app.apply_fill(updated);
                     }
                 });
+            }
+
+            // PostScript Procedural Pattern Fill editor (all 10 clean-room presets)
+            if let Fill::TextureFill {
+                ref preset,
+                mut seed,
+                ref fg,
+                ref bg,
+            } = cur_fill
+            {
+                if let Some(mut active_ps) = PostScriptFillPreset::from_preset_str(preset) {
+                    ui.separator();
+                    ui.label(
+                        RichText::new("PostScript Procedural Pattern")
+                            .strong()
+                            .color(tokens.accent),
+                    );
+                    let mut ps_changed = false;
+                    let mut next_fg = fg.clone();
+                    let mut next_bg = bg.clone();
+
+                    ui.horizontal_wrapped(|ui| {
+                        for p in PostScriptFillPreset::ALL {
+                            if ui
+                                .selectable_label(active_ps == p, p.display_name())
+                                .clicked()
+                            {
+                                active_ps = p;
+                                ps_changed = true;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("FG:");
+                        let mut fg32 = core_color_to_egui(&next_fg);
+                        if ui.color_edit_button_srgba(&mut fg32).changed() {
+                            next_fg = egui_color_to_core(fg32);
+                            ps_changed = true;
+                        }
+                        ui.label("BG:");
+                        let mut bg32 = core_color_to_egui(&next_bg);
+                        if ui.color_edit_button_srgba(&mut bg32).changed() {
+                            next_bg = egui_color_to_core(bg32);
+                            ps_changed = true;
+                        }
+                        ui.label("Seed:");
+                        if ui.add(DragValue::new(&mut seed).range(0..=9999)).changed() {
+                            ps_changed = true;
+                        }
+                        if ui.small_button("↻").on_hover_text("Next seed").clicked() {
+                            seed = seed.wrapping_add(1) % 10_000;
+                            ps_changed = true;
+                        }
+                    });
+                    if ps_changed {
+                        app.apply_fill(active_ps.to_fill(next_fg, next_bg, seed));
+                    }
+                }
             }
         }
         PropertiesSubTab::Outline => {
@@ -726,6 +813,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
         }
         PropertiesSubTab::Text => {
             ui.label(RichText::new("Typography & Arabic RTL / Kashida").strong());
+            let mut edited_selected_text = false;
             if let Some(id) = sel_id {
                 let text_edit_payload = app
                     .active_tab()
@@ -795,7 +883,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 payload: NodePayload::ArtisticText(art),
                             });
                         }
-                        return;
+                        edited_selected_text = true;
                     }
                     Some(NodePayload::ParagraphText(mut para)) => {
                         let mut changed = false;
@@ -893,7 +981,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 payload: NodePayload::ParagraphText(para),
                             });
                         }
-                        return;
+                        edited_selected_text = true;
                     }
                     Some(NodePayload::TextOnPath(mut top)) => {
                         let mut changed = false;
@@ -964,30 +1052,34 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 payload: NodePayload::TextOnPath(top),
                             });
                         }
-                        return;
+                        edited_selected_text = true;
                     }
                     _ => {}
                 }
             }
-            ui.label(
-                RichText::new(
-                    "Select an Artistic/Paragraph Text object, or configure defaults below:",
-                )
-                .color(tokens.text_muted),
-            );
-            ui.text_edit_singleline(&mut app.tool_settings.text_insert_draft);
-            ui.horizontal(|ui| {
-                ui.label("Font:");
-                ui.text_edit_singleline(&mut app.default_text_style.font_family);
-            });
-            ui.add(
-                egui::Slider::new(&mut app.default_text_style.font_size_pt, 8.0..=144.0)
-                    .text("Size (pt)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut app.default_text_style.kashida_stretch, 0.0..=2.0)
-                    .text("Kashida"),
-            );
+            if !edited_selected_text {
+                ui.label(
+                    RichText::new(
+                        "Select an Artistic/Paragraph Text object, or configure defaults below:",
+                    )
+                    .color(tokens.text_muted),
+                );
+                ui.text_edit_singleline(&mut app.tool_settings.text_insert_draft);
+                ui.horizontal(|ui| {
+                    ui.label("Font:");
+                    ui.text_edit_singleline(&mut app.default_text_style.font_family);
+                });
+                ui.add(
+                    egui::Slider::new(&mut app.default_text_style.font_size_pt, 8.0..=144.0)
+                        .text("Size (pt)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut app.default_text_style.kashida_stretch, 0.0..=2.0)
+                        .text("Kashida"),
+                );
+            }
+            ui.separator();
+            ui_glyphs_browser(ui, app, "props_text_glyphs");
         }
     }
 }
@@ -1490,9 +1582,17 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
     });
 
     ui.separator();
-    ui.label(RichText::new("Brush / Eraser / Smudge").strong());
+    ui.label(RichText::new("Interactive Raster Brush & Fill (8 Ops)").strong());
+    ComboBox::from_id_salt("bitmap_docker_raster_op")
+        .width(190.0)
+        .selected_text(app.tool_settings.raster_op.label())
+        .show_ui(ui, |ui| {
+            for op in RasterBrushOp::ALL {
+                ui.selectable_value(&mut app.tool_settings.raster_op, op, op.label());
+            }
+        });
     ui.add(
-        egui::Slider::new(&mut app.tool_settings.brush_radius_px, 1.0..=120.0).text("Radius px"),
+        egui::Slider::new(&mut app.tool_settings.brush_radius_px, 1.0..=150.0).text("Radius px"),
     );
     ui.add(egui::Slider::new(&mut app.tool_settings.brush_hardness, 0.0..=1.0).text("Hardness"));
     let mut bc = core_color_to_egui(&app.tool_settings.brush_color);
@@ -1502,6 +1602,45 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
             app.tool_settings.brush_color = egui_color_to_core(bc);
         }
     });
+    match app.tool_settings.raster_op {
+        RasterBrushOp::Dodge | RasterBrushOp::Burn => {
+            ui.horizontal(|ui| {
+                ui.label("Tone:");
+                ui.selectable_value(
+                    &mut app.tool_settings.dodge_burn_tone,
+                    ToneRange::Shadows,
+                    "Shadows",
+                );
+                ui.selectable_value(
+                    &mut app.tool_settings.dodge_burn_tone,
+                    ToneRange::Midtones,
+                    "Midtones",
+                );
+                ui.selectable_value(
+                    &mut app.tool_settings.dodge_burn_tone,
+                    ToneRange::Highlights,
+                    "Highlights",
+                );
+            });
+            ui.add(
+                egui::Slider::new(&mut app.tool_settings.dodge_burn_exposure, 0.05..=1.0)
+                    .text("Exposure"),
+            );
+        }
+        RasterBrushOp::FloodFill => {
+            ui.add(
+                egui::Slider::new(&mut app.tool_settings.flood_tolerance, 0..=255)
+                    .text("Tolerance"),
+            );
+        }
+        RasterBrushOp::Smudge => {
+            ui.add(
+                egui::Slider::new(&mut app.tool_settings.smudge_strength, 0.05..=1.0)
+                    .text("Smudge"),
+            );
+        }
+        _ => {}
+    }
 
     ui.separator();
     ui.label(RichText::new("19 Non-Destructive Filters").strong());
@@ -1549,6 +1688,11 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
 fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
     ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(
+            &mut app.production_state.sub_section,
+            5,
+            RichText::new("⚡ Laser & Plugins").color(tokens.accent_secondary),
+        );
         ui.selectable_value(&mut app.production_state.sub_section, 0, "Preflight");
         ui.selectable_value(&mut app.production_state.sub_section, 1, "Prepress");
         ui.selectable_value(&mut app.production_state.sub_section, 2, "Cut & Box");
@@ -1558,6 +1702,9 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
     ui.separator();
 
     match app.production_state.sub_section {
+        5 => {
+            ui_laser_plugins_studio(ui, app);
+        }
         0 => {
             // Preflight Inspector with click-to-select offending object!
             ui.horizontal(|ui| {
@@ -2145,6 +2292,9 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         });
     }
+
+    ui.separator();
+    ui_glyphs_browser(ui, app, "font_mgr_glyphs");
 }
 
 // =============================================================================
@@ -2344,5 +2494,762 @@ fn ui_cdr_inspector_docker(ui: &mut Ui, app: &mut StudioApp) {
                 }
             },
         );
+    }
+}
+
+// =============================================================================
+// 15. Laser Cutting, Engraving & Plugins Studio (`Production` -> Laser & Plugins)
+// =============================================================================
+
+fn ui_laser_plugins_studio(ui: &mut Ui, app: &mut StudioApp) {
+    let tokens = app.theme.tokens();
+
+    // Section A: Built-in & Custom Laser / Plotter Plugins Grid
+    ui.label(
+        RichText::new("Laser, Fiber & Plotter Plugins")
+            .strong()
+            .color(tokens.accent),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("＋ Install Sample Plugin").clicked() {
+            install_sample_plugin_action(app);
+        }
+        if ui.small_button("↻ Reload Plugins").clicked() {
+            reload_plugins_action(app);
+        }
+    });
+    ui.add_space(4.0);
+
+    let plugins = app.plugin_registry.plugins().to_vec();
+    let mut pending_send: Option<(String, bool)> = None;
+    let mut pending_run_rhai: Option<coree_prod::PluginManifest> = None;
+
+    for plugin in &plugins {
+        Frame::NONE
+            .fill(tokens.surface_elevated)
+            .stroke(Stroke::new(1.0, tokens.border))
+            .corner_radius(CornerRadius::same(5))
+            .inner_margin(Margin::same(7))
+            .show(ui, |ui| match &plugin.kind {
+                PluginKind::ExternalBridge { export_format, .. } => {
+                    let override_entry = app
+                        .plugin_exec_overrides
+                        .entry(plugin.id.clone())
+                        .or_default();
+                    let detected = cached_detect_executable(ui.ctx(), plugin, override_entry);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&plugin.name).strong());
+                        ui.label(
+                            RichText::new(format!(
+                                "[{}]",
+                                export_format.file_extension().to_uppercase()
+                            ))
+                            .size(10.0)
+                            .color(tokens.accent),
+                        );
+                        if let Some(ref exe) = detected {
+                            ui.label(RichText::new("● Ready").size(10.0).color(tokens.success))
+                                .on_hover_text(exe.display().to_string());
+                        } else {
+                            ui.label(
+                                RichText::new("○ Export Only")
+                                    .size(10.0)
+                                    .color(tokens.text_muted),
+                            )
+                            .on_hover_text(
+                                "Executable not found on PATH; set custom path or export file",
+                            );
+                        }
+                    });
+                    ui.label(
+                        RichText::new(&plugin.description)
+                            .size(10.5)
+                            .color(tokens.text_muted),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(override_entry)
+                                .hint_text("Custom app path (optional)...")
+                                .desired_width(168.0),
+                        );
+                        if ui
+                            .small_button("…")
+                            .on_hover_text("Browse for executable")
+                            .clicked()
+                        {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .set_title(format!("Select {} Executable", plugin.name))
+                                .pick_file()
+                            {
+                                *override_entry = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button(RichText::new("⚡ Send / Launch").color(tokens.accent))
+                            .clicked()
+                        {
+                            pending_send = Some((plugin.id.clone(), true));
+                        }
+                        if ui.small_button("Export File Only").clicked() {
+                            pending_send = Some((plugin.id.clone(), false));
+                        }
+                    });
+                }
+                PluginKind::RhaiScript { entry_label, .. } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&plugin.name).strong());
+                        ui.label(
+                            RichText::new("[Rhai Custom]")
+                                .size(10.0)
+                                .color(tokens.accent_secondary),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(&plugin.description)
+                            .size(10.5)
+                            .color(tokens.text_muted),
+                    );
+                    if ui
+                        .small_button(
+                            RichText::new(format!("▶ {entry_label}")).color(tokens.success),
+                        )
+                        .clicked()
+                    {
+                        pending_run_rhai = Some(plugin.clone());
+                    }
+                }
+            });
+        ui.add_space(4.0);
+    }
+
+    if let Some((pid, launch)) = pending_send {
+        app.send_to_laser_plugin(&pid, launch);
+    }
+    if let Some(plugin) = pending_run_rhai {
+        run_rhai_plugin_undoable(app, &plugin);
+    }
+
+    if let Some(ref last_path) = app.last_plugin_export_path {
+        ui.label(
+            RichText::new(format!("Last export: {}", last_path.display()))
+                .size(10.0)
+                .monospace()
+                .color(tokens.text_muted),
+        );
+    }
+
+    ui.separator();
+
+    // Section B: Color-to-Operation Laser Layers Table
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "Color-to-Operation Laser Layers ({})",
+            app.laser_config.rules.len()
+        ))
+        .strong(),
+    )
+    .id_salt("laser_layers_table_hdr")
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.small_button("+ Add Layer Rule").clicked() {
+                let n = app.laser_config.rules.len() + 1;
+                app.laser_config.rules.push(LaserLayerRule {
+                    name: format!("Custom Layer {n}"),
+                    match_rgb: [255, 136, 0],
+                    color_tolerance: 40,
+                    match_cut_layer: false,
+                    operation: LaserOperationKind::VectorEngrave,
+                    speed_mm_s: 100.0,
+                    min_power_pct: 25.0,
+                    max_power_pct: 40.0,
+                    passes: 1,
+                    air_assist: false,
+                    kerf_mm: 0.0,
+                    z_step_mm: 0.0,
+                    frequency_khz: 20.0,
+                    hatch_spacing_mm: 0.15,
+                    hatch_angle_deg: 45.0,
+                    cross_hatch: false,
+                    enabled: true,
+                });
+            }
+            if ui.small_button("Reset Defaults").clicked() {
+                app.laser_config.rules = default_laser_layer_rules();
+            }
+        });
+        ui.add_space(3.0);
+
+        let mut remove_idx: Option<usize> = None;
+        let rule_count = app.laser_config.rules.len();
+        for (idx, rule) in app.laser_config.rules.iter_mut().enumerate() {
+            Frame::NONE
+                .fill(tokens.surface_elevated)
+                .stroke(Stroke::new(1.0, tokens.border))
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut rule.enabled, "");
+                        let mut c32 = Color32::from_rgb(
+                            rule.match_rgb[0],
+                            rule.match_rgb[1],
+                            rule.match_rgb[2],
+                        );
+                        if ui.color_edit_button_srgba(&mut c32).changed() {
+                            rule.match_rgb = [c32.r(), c32.g(), c32.b()];
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut rule.name).desired_width(132.0));
+                        if rule_count > 1 && ui.small_button("×").clicked() {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ComboBox::from_id_salt(("laser_op_rule", idx))
+                            .width(106.0)
+                            .selected_text(laser_op_label(rule.operation))
+                            .show_ui(ui, |ui| {
+                                for op in [
+                                    LaserOperationKind::Cut,
+                                    LaserOperationKind::VectorEngrave,
+                                    LaserOperationKind::HatchEngrave,
+                                    LaserOperationKind::Perforate,
+                                    LaserOperationKind::Ignore,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut rule.operation,
+                                        op,
+                                        laser_op_label(op),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            DragValue::new(&mut rule.speed_mm_s)
+                                .range(0.5..=2000.0)
+                                .speed(1.0)
+                                .prefix("Spd: ")
+                                .suffix(" mm/s"),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            DragValue::new(&mut rule.max_power_pct)
+                                .range(0.0..=100.0)
+                                .prefix("Pwr: ")
+                                .suffix("%"),
+                        );
+                        ui.add(
+                            DragValue::new(&mut rule.passes)
+                                .range(1..=50)
+                                .prefix("Pass: "),
+                        );
+                        ui.add(
+                            DragValue::new(&mut rule.kerf_mm)
+                                .range(-2.0..=2.0)
+                                .speed(0.01)
+                                .prefix("Kerf: ")
+                                .suffix(" mm"),
+                        );
+                        ui.checkbox(&mut rule.air_assist, "Air");
+                    });
+                    if rule.operation == LaserOperationKind::HatchEngrave {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(
+                                DragValue::new(&mut rule.hatch_spacing_mm)
+                                    .range(0.02..=5.0)
+                                    .speed(0.01)
+                                    .prefix("Hatch: ")
+                                    .suffix(" mm"),
+                            );
+                            ui.add(
+                                DragValue::new(&mut rule.hatch_angle_deg)
+                                    .range(0.0..=180.0)
+                                    .prefix("Ang: ")
+                                    .suffix("°"),
+                            );
+                            ui.checkbox(&mut rule.cross_hatch, "Cross");
+                        });
+                    }
+                });
+            ui.add_space(3.0);
+        }
+        if let Some(i) = remove_idx {
+            app.laser_config.rules.remove(i);
+        }
+    });
+
+    ui.separator();
+
+    // Section C: Laser Job Prep & Toolpath Simulator
+    ui.label(RichText::new("Job Prep & Toolpath Simulator").strong());
+    ui.horizontal(|ui| {
+        ui.label("Origin:");
+        ComboBox::from_id_salt("laser_origin_combo")
+            .width(105.0)
+            .selected_text(format!("{:?}", app.laser_config.origin))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut app.laser_config.origin,
+                    LaserOrigin::TopLeft,
+                    "TopLeft",
+                );
+                ui.selectable_value(
+                    &mut app.laser_config.origin,
+                    LaserOrigin::BottomLeft,
+                    "BottomLeft",
+                );
+                ui.selectable_value(&mut app.laser_config.origin, LaserOrigin::Center, "Center");
+            });
+        ComboBox::from_id_salt("laser_dialect_combo")
+            .width(96.0)
+            .selected_text(match app.laser_config.dialect {
+                GcodeDialect::Grbl11 => "GRBL 1.1",
+                GcodeDialect::Marlin => "Marlin",
+                GcodeDialect::RuidaGcode => "Ruida",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut app.laser_config.dialect,
+                    GcodeDialect::Grbl11,
+                    "GRBL 1.1",
+                );
+                ui.selectable_value(
+                    &mut app.laser_config.dialect,
+                    GcodeDialect::Marlin,
+                    "Marlin",
+                );
+                ui.selectable_value(
+                    &mut app.laser_config.dialect,
+                    GcodeDialect::RuidaGcode,
+                    "Ruida",
+                );
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.add(
+            DragValue::new(&mut app.laser_config.dedupe_tolerance_mm)
+                .range(0.0..=2.0)
+                .speed(0.01)
+                .prefix("Dedupe: ")
+                .suffix(" mm"),
+        );
+        ui.add(
+            DragValue::new(&mut app.laser_config.join_tolerance_mm)
+                .range(0.0..=5.0)
+                .speed(0.01)
+                .prefix("Join: ")
+                .suffix(" mm"),
+        );
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut app.laser_config.inner_first, "Inner Loops First");
+        ui.checkbox(&mut app.laser_config.optimize_travel, "Optimize Travel");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut app.laser_config.add_weeding_box, "Weeding Box");
+        if app.laser_config.add_weeding_box {
+            ui.add(
+                DragValue::new(&mut app.laser_config.weeding_margin_mm)
+                    .range(0.5..=50.0)
+                    .prefix("Margin: ")
+                    .suffix(" mm"),
+            );
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button(
+                RichText::new("⚡ Compute & Preview Toolpath")
+                    .strong()
+                    .color(tokens.accent),
+            )
+            .clicked()
+        {
+            app.refresh_laser_plan_preview();
+        }
+        if ui
+            .checkbox(&mut app.show_laser_toolpath_overlay, "Overlay")
+            .changed()
+            && app.show_laser_toolpath_overlay
+            && app.laser_plan_preview.is_none()
+        {
+            app.refresh_laser_plan_preview();
+        }
+    });
+
+    if let Some(ref plan) = app.laser_plan_preview {
+        ui.add_space(4.0);
+        Frame::NONE
+            .fill(tokens.bg)
+            .stroke(Stroke::new(1.0, tokens.border))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::same(6))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Cuts: {} · Segments: {} · Est. Time: {:.1}s",
+                        plan.cut_count,
+                        plan.segments.len(),
+                        plan.estimated_seconds
+                    ))
+                    .strong()
+                    .size(11.0)
+                    .color(tokens.success),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Dupes Removed: {} · Curves Joined: {}",
+                        plan.duplicate_segments_removed, plan.curves_joined
+                    ))
+                    .size(10.5)
+                    .color(tokens.text_muted),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Cut: {:.1} mm · Engrave: {:.1} mm · Rapid: {:.1} mm",
+                        plan.total_cut_mm, plan.total_engrave_mm, plan.total_rapid_mm
+                    ))
+                    .size(10.5)
+                    .color(tokens.text),
+                );
+            });
+    }
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Direct Machine Export").strong());
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("Export G-Code (.gcode)").clicked() {
+            direct_laser_export(app, "gcode");
+        }
+        if ui.small_button("Export DXF R12 (.dxf)").clicked() {
+            direct_laser_export(app, "dxf");
+        }
+        if ui.small_button("Export HPGL (.plt)").clicked() {
+            direct_laser_export(app, "plt");
+        }
+        if ui.small_button("Export Laser SVG (.svg)").clicked() {
+            direct_laser_export(app, "svg");
+        }
+    });
+}
+
+fn direct_laser_export(app: &mut StudioApp, ext: &str) {
+    let Some(tab) = app.active_tab() else {
+        app.push_toast("No active document to export", true);
+        return;
+    };
+    let page_idx = tab.document.active_page_index;
+    let sel = if tab.selection.is_empty() {
+        None
+    } else {
+        Some(tab.selection.objects.as_slice())
+    };
+    let plan = match plan_laser_toolpath(&tab.document, page_idx, sel, &app.laser_config) {
+        Ok(p) => p,
+        Err(e) => {
+            app.push_toast(format!("Laser plan failed: {e}"), true);
+            return;
+        }
+    };
+    let default_name = format!("laser_job.{ext}");
+    if let Some(path) = rfd::FileDialog::new()
+        .set_title(format!("Export Laser {}", ext.to_uppercase()))
+        .set_file_name(&default_name)
+        .add_filter(ext.to_uppercase(), &[ext])
+        .save_file()
+    {
+        let payload = match ext {
+            "gcode" => export_laser_gcode(&plan, &app.laser_config),
+            "dxf" => export_laser_dxf_r12(&plan),
+            "plt" => export_laser_plt(&plan),
+            _ => export_laser_svg(&plan),
+        };
+        match coree_io::atomic_write_bytes(&path, payload.as_bytes()) {
+            Ok(()) => {
+                app.laser_plan_preview = Some(plan);
+                app.push_toast(
+                    format!(
+                        "Exported {} ({} B) -> {}",
+                        ext.to_uppercase(),
+                        payload.len(),
+                        path.display()
+                    ),
+                    false,
+                );
+            }
+            Err(e) => app.push_toast(format!("Laser export failed: {e}"), true),
+        }
+    }
+}
+
+fn laser_op_label(op: LaserOperationKind) -> &'static str {
+    match op {
+        LaserOperationKind::Cut => "Cut",
+        LaserOperationKind::VectorEngrave => "Vector Engrave",
+        LaserOperationKind::HatchEngrave => "Hatch Engrave",
+        LaserOperationKind::Perforate => "Perforate",
+        LaserOperationKind::Ignore => "Ignore",
+    }
+}
+
+// =============================================================================
+// 16. Interactive Glyphs Browser (Embedded in Text Properties & Font Manager)
+// =============================================================================
+
+fn ui_glyphs_browser(ui: &mut Ui, app: &mut StudioApp, id_salt: &str) {
+    let tokens = app.theme.tokens();
+    egui::CollapsingHeader::new(
+        RichText::new("¶ Interactive Glyphs Browser")
+            .strong()
+            .color(tokens.accent),
+    )
+    .id_salt(id_salt)
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ComboBox::from_id_salt((id_salt, "block"))
+                .width(138.0)
+                .selected_text(app.glyph_block_filter.label())
+                .show_ui(ui, |ui| {
+                    for block in GlyphBlockFilter::ALL_FILTERS {
+                        ui.selectable_value(&mut app.glyph_block_filter, block, block.label());
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut app.glyph_search)
+                    .hint_text("Search glyph / U+...")
+                    .desired_width(110.0),
+            );
+        });
+
+        let active_font = if app.default_text_style.font_family.trim().is_empty() {
+            None
+        } else {
+            Some(app.default_text_style.font_family.as_str())
+        };
+        let glyphs =
+            list_glyphs_for_block(active_font, app.glyph_block_filter, &app.glyph_search, 120);
+        ui.label(
+            RichText::new(format!(
+                "{} glyph(s) · Click any tile to insert",
+                glyphs.len()
+            ))
+            .size(10.5)
+            .color(tokens.text_muted),
+        );
+
+        let mut insert_glyph: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt((id_salt, "grid_scroll"))
+            .max_height(185.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+                    for entry in &glyphs {
+                        let glyph_str = entry.ch.to_string();
+                        let text_color = if entry.supported_by_font {
+                            tokens.text
+                        } else {
+                            tokens.text_muted
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(&glyph_str).size(15.0).color(text_color),
+                        )
+                        .min_size(vec2(28.0, 28.0));
+                        let tip = format!(
+                            "{}\n{} · {}\nClick to insert",
+                            entry.name,
+                            entry.codepoint_hex,
+                            entry.block.label()
+                        );
+                        if ui.add(btn).on_hover_text(tip).clicked() {
+                            insert_glyph = Some(glyph_str);
+                        }
+                    }
+                });
+            });
+
+        if let Some(g) = insert_glyph {
+            app.insert_glyph_at_selection(&g);
+        }
+    });
+}
+
+/// Runs a sandboxed `PluginKind::RhaiScript` plugin inside a `CommandHistory` transaction so
+/// `Ctrl+Z` / `Ctrl+Shift+Z` cleanly undo & redo all document mutations (and errors roll back).
+pub(crate) fn run_rhai_plugin_undoable(app: &mut StudioApp, plugin: &PluginManifest) {
+    let outcome = app.active_tab_mut().map(|tab| {
+        let tx_started = tab
+            .history
+            .begin_transaction(&tab.document, format!("Plugin: {}", plugin.name))
+            .is_ok();
+        let res = run_rhai_plugin(
+            &mut tab.document,
+            plugin,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        );
+        match res {
+            Ok(exec) => {
+                if tx_started {
+                    let _ = tab.history.execute(
+                        &mut tab.document,
+                        CommandOp::TransformObjects {
+                            ids: Vec::new(),
+                            affine: Affine2D::IDENTITY,
+                        },
+                    );
+                    let _ = tab.history.commit_transaction(&tab.document);
+                }
+                tab.mark_modified();
+                Ok(exec)
+            }
+            Err(err) => {
+                if tx_started {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                }
+                Err(err)
+            }
+        }
+    });
+
+    match outcome {
+        Some(Ok(exec)) => {
+            app.checkpoint_wal_snapshot_active();
+            let summary = exec
+                .logs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| format!("Plugin '{}' completed", plugin.name));
+            app.push_toast(summary, false);
+        }
+        Some(Err(e)) => app.push_toast(format!("Plugin failed: {e}"), true),
+        None => app.push_toast("No active document for plugin", true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::dialogs::{cached_detect_executable, invalidate_plugin_detect_cache};
+    use coree_prod::{install_sample_plugin_template, PluginCategory, PluginRegistry};
+
+    #[test]
+    fn cached_plugin_detection_avoids_repeated_fs_probes_and_invalidates_cleanly() {
+        let ctx = egui::Context::default();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("coree_plugin_cache_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let fake_exe = tmp_dir.join("fake_laser_bridge");
+        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").expect("write fake exe");
+
+        let plugin = PluginRegistry::builtin_presets()
+            .into_iter()
+            .next()
+            .expect("builtin preset");
+        let override_str = fake_exe.to_string_lossy().into_owned();
+
+        // 1. First probe finds the fake executable and caches it
+        let first = cached_detect_executable(&ctx, &plugin, &override_str);
+        assert_eq!(first.as_deref(), Some(fake_exe.as_path()));
+
+        // 2. Delete file on disk: cached probe must STILL return cached Some without hitting fs
+        std::fs::remove_file(&fake_exe).expect("remove fake exe");
+        let second = cached_detect_executable(&ctx, &plugin, &override_str);
+        assert_eq!(second.as_deref(), Some(fake_exe.as_path()));
+
+        // 3. Changing override path immediately re-probes the new key
+        let missing_override = tmp_dir
+            .join("nonexistent_bin")
+            .to_string_lossy()
+            .into_owned();
+        assert!(cached_detect_executable(&ctx, &plugin, &missing_override).is_none());
+
+        // 4. Invalidating the cache causes the original key to re-probe and see removal
+        invalidate_plugin_detect_cache();
+        assert!(cached_detect_executable(&ctx, &plugin, &override_str).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn rhai_plugin_execution_is_undoable_redoable_and_rolls_back_on_error() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("coree_rhai_undo_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let plugin_dir = install_sample_plugin_template(&tmp_dir).expect("install sample plugin");
+        let mut reg = PluginRegistry::empty();
+        let loaded = reg.load_discovered(std::slice::from_ref(&tmp_dir));
+        assert_eq!(loaded, 1);
+        let sample_plugin = reg
+            .find("custom-laser-example")
+            .expect("custom-laser-example")
+            .clone();
+
+        let mut app = StudioApp::new_headless();
+        app.new_sample_document();
+        let count_before = app.active_tab().unwrap().document.objects.len();
+        assert!(count_before > 0);
+
+        // Run custom Rhai plugin -> adds a CutContour halo object inside a CommandHistory transaction
+        run_rhai_plugin_undoable(&mut app, &sample_plugin);
+        let count_after = app.active_tab().unwrap().document.objects.len();
+        assert!(
+            count_after > count_before,
+            "sample Rhai plugin should add CutContour object"
+        );
+        assert!(app.active_tab().unwrap().history.can_undo());
+
+        // Undo cleanly restores exact pre-plugin object count
+        app.undo().expect("undo plugin transaction");
+        assert_eq!(
+            app.active_tab().unwrap().document.objects.len(),
+            count_before
+        );
+
+        // Redo cleanly restores exact post-plugin object count
+        app.redo().expect("redo plugin transaction");
+        assert_eq!(
+            app.active_tab().unwrap().document.objects.len(),
+            count_after
+        );
+
+        // Failing Rhai plugin after a mutation rolls back cleanly via cancel_transaction
+        let bad_dir = tmp_dir.join("bad-plugin");
+        std::fs::create_dir_all(&bad_dir).expect("create bad dir");
+        std::fs::write(
+            bad_dir.join("bad.rhai"),
+            "let ids = non_cut_object_ids(); generate_cut_contour(ids, 1.0, \"CutContour\"); throw \"boom\";",
+        )
+        .expect("write bad rhai");
+        let bad_plugin = PluginManifest {
+            id: "bad-plugin".to_owned(),
+            name: "Bad Plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            author: "test".to_owned(),
+            description: "fails after mutating".to_owned(),
+            category: PluginCategory::Laser,
+            kind: PluginKind::RhaiScript {
+                script_file: "bad.rhai".to_owned(),
+                entry_label: "Fail".to_owned(),
+            },
+            source_dir: Some(bad_dir),
+            builtin: false,
+        };
+        run_rhai_plugin_undoable(&mut app, &bad_plugin);
+        assert_eq!(
+            app.active_tab().unwrap().document.objects.len(),
+            count_after,
+            "failed Rhai plugin must roll back partial mutations"
+        );
+
+        let _ = std::fs::remove_dir_all(&plugin_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

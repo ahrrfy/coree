@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Backend-agnostic 2D canvas rendering trait ([`CanvasBackend`]) and its Pure-Rust
 //! CPU reference implementation ([`TinySkiaBackend`]).

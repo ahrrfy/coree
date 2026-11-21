@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Print Preflight Inspector: detects RGB-in-CMYK color mismatches, low-DPI raster
 //! placements, live non-curved text, hairline outlines on non-cut layers, missing bleed

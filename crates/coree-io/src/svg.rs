@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Hardened SVG import (via `usvg` with depth/size limits, converting into millimeter
 //! `coree_core::Document`) and clean pure-Rust SVG 1.1 export preserving layers, `<defs>`

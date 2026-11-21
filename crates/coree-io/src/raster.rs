@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Hardened raster import & export (PNG, JPEG, WebP, TIFF, BMP) with dimension guards,
 //! PNG `pHYs` DPI metadata round-trip, and crash-safe atomic writes.

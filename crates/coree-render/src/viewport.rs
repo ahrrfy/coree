@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Canvas viewport camera model (`pan`, `zoom`, `rotation`, `DPI`, `LOD`, `Multipage View`)
 //! and display [`ViewMode`] settings.

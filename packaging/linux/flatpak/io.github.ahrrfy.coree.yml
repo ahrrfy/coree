@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Flatpak manifest for coree (strict offline security sandbox — NO --share=network).
+id: io.github.ahrrfy.coree
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: coree
+
+# Rename exported desktop integration files to match Flatpak reverse-DNS App ID.
+rename-desktop-file: coree.desktop
+rename-icon: coree
+rename-mime-file: coree-mime.xml
+
+finish-args:
+  # Wayland native with X11 fallback
+  - --socket=wayland
+  - --socket=fallback-x11
+  # Hardware-accelerated OpenGL / Mesa rendering
+  - --device=dri
+  # Access user design files (.cdr, .pdf, .psd, .dxf, .svg, fonts)
+  - --filesystem=home
+  # Required for X11 MIT-SHM
+  - --share=ipc
+  # Intentionally NO --share=network: coree is 100% offline with zero telemetry.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/coree/cargo
+    RUST_BACKTRACE: '1'
+
+modules:
+  - name: coree
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked --offline
+      - install -Dm755 target/release/coree /app/bin/coree
+      - install -Dm644 packaging/linux/coree.desktop /app/share/applications/coree.desktop
+      # Rewrite icon names inside the exported MIME XML to the Flatpak App ID so
+      # flatpak build-export only exports App-ID-prefixed icons and MIME definitions.
+      # (Note: Flatpak does not export /app/share/thumbnailers; native .deb and
+      # install-linux.sh install coree.thumbnailer and MIME-type icons directly.)
+      - install -dm755 /app/share/mime/packages
+      - |
+        sed -e 's|<icon name="coree"/>|<icon name="io.github.ahrrfy.coree"/>|g' \
+            -e 's|<generic-icon name="coree"/>|<generic-icon name="io.github.ahrrfy.coree"/>|g' \
+            packaging/linux/coree-mime.xml > /app/share/mime/packages/coree-mime.xml
+      - install -Dm644 packaging/linux/coree.svg /app/share/icons/hicolor/scalable/apps/coree.svg
+      - install -Dm644 packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml /app/share/metainfo/io.github.ahrrfy.coree.metainfo.xml
+      - install -Dm644 LICENSE-MIT /app/share/licenses/coree/LICENSE-MIT
+      - install -Dm644 LICENSE-APACHE /app/share/licenses/coree/LICENSE-APACHE
+      - install -Dm644 NOTICE /app/share/licenses/coree/NOTICE
+    sources:
+      - type: dir
+        path: ../../..

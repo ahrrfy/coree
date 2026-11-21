@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Multilingual text models supporting LTR, Arabic/Hebrew RTL, Kashida justification,
 //! linked paragraph text frames, and text fitted along vector paths.

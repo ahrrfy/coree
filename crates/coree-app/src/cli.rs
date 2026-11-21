@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Production command-line interface (`clap`) for headless batch conversion,
-//! high-DPI rendering, structural inspection, preflight, print merge,
+//! high-DPI rendering, OS thumbnail generation, laser/CNC toolpath planning &
+//! plugin bridges, structural inspection, preflight, print merge,
 //! collect-for-output, bitmap vectorization, and sandboxed Rhai macros.
 
-use crate::cdr_bridge::inspect_any_file;
+use crate::cdr_bridge::{
+    extract_file_thumbnail_png, inspect_any_file, read_png_dimensions, MAX_THUMBNAIL_SIZE_PX,
+};
 use crate::io_bridge::{
     export_any_document, open_any_document, read_text_file_bounded, UniversalExportOptions,
     MAX_TEXT_READ_BYTES,
@@ -14,10 +17,14 @@ use coree_cdr::{generate_sample_document, CdrWriteVersion};
 use coree_core::brand::BrandInfo;
 use coree_core::math::MM_PER_INCH;
 use coree_core::{ColorMode, Document, Fill, NodePayload, ObjectId, OutlineStyle, SceneObject};
-use coree_io::import_raster;
+use coree_io::{atomic_write_bytes, import_raster};
 use coree_prod::{
-    apply_print_merge, collect_for_output, find_builtin_macro, run_macro, run_preflight,
-    CollectOptions, MacroSandboxConfig, PreflightRules, PrintMergeOptions, PrintMergeTable,
+    apply_print_merge, collect_for_output, default_plugin_dirs, detect_executable,
+    export_for_plugin, export_laser_dxf_r12, export_laser_eps, export_laser_gcode,
+    export_laser_plt, export_laser_svg, find_builtin_macro, launch_external_bridge,
+    plan_laser_toolpath, run_macro, run_preflight, CollectOptions, GcodeDialect, LaserJobConfig,
+    LaserOperationKind, LaserToolpathPlan, MacroSandboxConfig, PluginKind, PluginRegistry,
+    PreflightRules, PrintMergeOptions, PrintMergeTable,
 };
 use coree_render::{
     compute_page_layouts, render_page_to_rgba, trace_raster_to_mm, CanvasBackend, OutlinePreset,
@@ -25,21 +32,22 @@ use coree_render::{
 };
 use coree_storage::StorageDb;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Command-line arguments for the `coree` desktop studio and headless CLI.
 #[derive(Debug, Parser)]
 #[command(
     name = "coree",
     version,
-    about = "Clean-room vector graphics, multipage layout & print production studio (MPL-2.0)"
+    args_conflicts_with_subcommands = true,
+    about = "Clean-room vector graphics, multipage layout, laser & print production studio (MIT OR Apache-2.0)"
 )]
 pub struct Cli {
-    /// Print build version, license, supported formats, and local font count, then exit.
+    /// Print build version, license, supported formats, built-in plugins, and local font count, then exit.
     #[arg(long)]
     pub diagnostics: bool,
 
-    /// Optional document file(s) to open directly as tabs in the desktop GUI.
+    /// Optional document file(s) to open directly as tabs in the desktop GUI (supports `Exec=coree %F` and Windows file associations).
     #[arg(value_name = "FILES")]
     pub files: Vec<PathBuf>,
 
@@ -108,6 +116,65 @@ pub enum TraceModeArg {
     Centerline,
 }
 
+/// Output format for `coree laser --format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaserFormatArg {
+    Gcode,
+    Dxf,
+    Plt,
+    Svg,
+    Eps,
+}
+
+impl LaserFormatArg {
+    fn infer_from_path(path: &Path) -> Result<Self, String> {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match ext.as_str() {
+            "gcode" | "nc" => Ok(Self::Gcode),
+            "dxf" => Ok(Self::Dxf),
+            "plt" | "hpgl" => Ok(Self::Plt),
+            "svg" => Ok(Self::Svg),
+            "eps" | "ps" => Ok(Self::Eps),
+            "" => Ok(Self::Gcode),
+            other => Err(format!(
+                "unrecognized laser output extension '.{other}' (use --format gcode|dxf|plt|svg|eps)"
+            )),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Gcode => "G-Code",
+            Self::Dxf => "DXF R12",
+            Self::Plt => "HPGL PLT",
+            Self::Svg => "Laser SVG",
+            Self::Eps => "Laser EPS",
+        }
+    }
+}
+
+/// Target CNC/laser G-Code firmware dialect for `coree laser --dialect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GcodeDialectArg {
+    Grbl,
+    Marlin,
+    Ruida,
+}
+
+impl From<GcodeDialectArg> for GcodeDialect {
+    fn from(value: GcodeDialectArg) -> Self {
+        match value {
+            GcodeDialectArg::Grbl => Self::Grbl11,
+            GcodeDialectArg::Marlin => Self::Marlin,
+            GcodeDialectArg::Ruida => Self::RuidaGcode,
+        }
+    }
+}
+
 /// Subcommands available in headless CLI mode.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
@@ -119,7 +186,7 @@ pub enum Commands {
         #[arg(long, value_enum)]
         format: Option<SampleFormatArg>,
     },
-    /// Structurally inspect a `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.coree`, or `.svg` file.
+    /// Structurally inspect any `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.coree`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, or `.psd` file.
     Inspect {
         /// Input file path.
         input_path: PathBuf,
@@ -127,7 +194,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Universal offline converter across `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.png`, `.jpg`, `.webp`, `.tiff`, `.bmp`.
+    /// Universal offline converter across `.coree`, `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, `.psd`, `.gcode`, `.png`, `.jpg`, `.webp`, `.tiff`, `.bmp`.
     Convert {
         /// Input document or image path.
         input_path: PathBuf,
@@ -164,6 +231,59 @@ pub enum Commands {
         /// Render all pages side-by-side in Multipage View.
         #[arg(long)]
         multipage: bool,
+    },
+    /// Fast, bounded OS thumbnail generator (used by desktop file managers for `.cdr`, `.coree`, `.svg`, `.pdf`, etc.).
+    Thumbnail {
+        /// Input document or image path.
+        input_path: PathBuf,
+        /// Output PNG thumbnail path (written atomically).
+        output_png: PathBuf,
+        /// Maximum width/height in pixels (`1..=4096`).
+        #[arg(long, default_value_t = 256)]
+        size: u32,
+    },
+    /// Laser cutting, engraving & plotter toolpath planner + machine exporter (`G-Code`, `DXF R12`, `PLT`, `SVG`, `EPS`) and external plugin bridge.
+    Laser {
+        /// Input vector document path (`.coree`, `.cdr`, `.cdr.zip`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`).
+        input_path: PathBuf,
+        /// Output laser/CNC file path.
+        output_path: PathBuf,
+        /// Target laser export format (inferred from `output_path` extension when omitted).
+        #[arg(long, value_enum)]
+        format: Option<LaserFormatArg>,
+        /// Target G-Code controller firmware dialect.
+        #[arg(long, value_enum, default_value_t = GcodeDialectArg::Grbl)]
+        dialect: GcodeDialectArg,
+        /// Zero-based page index to plan.
+        #[arg(long, default_value_t = 0)]
+        page: usize,
+        /// Duplicate overlapping segment removal tolerance in mm (`0.0` disables).
+        #[arg(long, default_value_t = 0.05)]
+        dedupe: f64,
+        /// Open-curve endpoint stitching tolerance in mm (`0.0` disables).
+        #[arg(long, default_value_t = 0.05)]
+        join: f64,
+        /// Geometric kerf compensation offset in mm (positive = outward, negative = inward).
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        kerf: f64,
+        /// Override hatch engraving line spacing in mm (`0.0` keeps rule default).
+        #[arg(long, default_value_t = 0.0)]
+        hatch_spacing: f64,
+        /// Hatch engraving scanline angle in degrees.
+        #[arg(long, default_value_t = 45.0, allow_hyphen_values = true)]
+        hatch_angle: f64,
+        /// Enable 90-degree cross-hatch engraving pass.
+        #[arg(long)]
+        cross_hatch: bool,
+        /// Add an outer vinyl/laser weeding box around the planned job bounds.
+        #[arg(long)]
+        weeding_box: bool,
+        /// Export via a built-in or user-installed bridge plugin ID (e.g., `lightburn-bridge`, `rdworks-ruida`, `ezcad-fiber`, `lasergrbl-bridge`).
+        #[arg(long)]
+        plugin: Option<String>,
+        /// After exporting with `--plugin`, launch the detected external bridge application safely (no shell invocation).
+        #[arg(long)]
+        launch: bool,
     },
     /// Run print-production Preflight audit and report errors/warnings.
     Preflight {
@@ -232,7 +352,12 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
     }
 
     let Some(cmd) = &cli.command else {
-        return Ok(CliOutcome::LaunchGui(cli.files.clone()));
+        let normalized = cli
+            .files
+            .iter()
+            .map(|p| normalize_desktop_file_arg(p))
+            .collect();
+        return Ok(CliOutcome::LaunchGui(normalized));
     };
 
     match cmd {
@@ -426,11 +551,68 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
                 )))
             }
         }
+        Commands::Thumbnail {
+            input_path,
+            output_png,
+            size,
+        } => {
+            if *size == 0 || *size > MAX_THUMBNAIL_SIZE_PX {
+                return Err(format!(
+                    "invalid thumbnail --size {size} (must be between 1 and {MAX_THUMBNAIL_SIZE_PX})"
+                ));
+            }
+            let normalized_input = normalize_desktop_file_arg(input_path);
+            let png_bytes = extract_file_thumbnail_png(&normalized_input, *size)?;
+            atomic_write_bytes(output_png, &png_bytes)
+                .map_err(|e| format!("failed to write thumbnail PNG: {e}"))?;
+            let (w, h) = read_png_dimensions(&png_bytes).unwrap_or((*size, *size));
+            Ok(CliOutcome::Printed(format!(
+                "Generated thumbnail ({w}x{h}, {} bytes) at {}",
+                png_bytes.len(),
+                output_png.display()
+            )))
+        }
+        Commands::Laser {
+            input_path,
+            output_path,
+            format,
+            dialect,
+            page,
+            dedupe,
+            join,
+            kerf,
+            hatch_spacing,
+            hatch_angle,
+            cross_hatch,
+            weeding_box,
+            plugin,
+            launch,
+        } => execute_laser_command(
+            input_path,
+            output_path,
+            *format,
+            *dialect,
+            *page,
+            *dedupe,
+            *join,
+            *kerf,
+            *hatch_spacing,
+            *hatch_angle,
+            *cross_hatch,
+            *weeding_box,
+            plugin.as_deref(),
+            *launch,
+        ),
         Commands::Preflight {
             input_path,
             min_dpi,
             json,
         } => {
+            if !min_dpi.is_finite() || *min_dpi <= 0.0 {
+                return Err(format!(
+                    "invalid --min-dpi value: {min_dpi} (must be finite and > 0)"
+                ));
+            }
             let opened = open_any_document(input_path)?;
             let rules = PreflightRules {
                 min_dpi: *min_dpi,
@@ -572,17 +754,255 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
     }
 }
 
-/// Builds the `--diagnostics` summary string with version, license, formats, crates, and local font count.
+#[allow(clippy::too_many_arguments)]
+fn execute_laser_command(
+    input_path: &Path,
+    output_path: &Path,
+    format: Option<LaserFormatArg>,
+    dialect: GcodeDialectArg,
+    page: usize,
+    dedupe: f64,
+    join: f64,
+    kerf: f64,
+    hatch_spacing: f64,
+    hatch_angle: f64,
+    cross_hatch: bool,
+    weeding_box: bool,
+    plugin_id: Option<&str>,
+    launch: bool,
+) -> Result<CliOutcome, String> {
+    if !dedupe.is_finite() || dedupe < 0.0 {
+        return Err(format!(
+            "invalid --dedupe tolerance: {dedupe} (must be finite and >= 0)"
+        ));
+    }
+    if !join.is_finite() || join < 0.0 {
+        return Err(format!(
+            "invalid --join tolerance: {join} (must be finite and >= 0)"
+        ));
+    }
+    if !kerf.is_finite() || kerf.abs() > 50.0 {
+        return Err(format!(
+            "invalid --kerf offset: {kerf} (must be finite and within -50..=50 mm)"
+        ));
+    }
+    if !hatch_spacing.is_finite() || hatch_spacing < 0.0 {
+        return Err(format!(
+            "invalid --hatch-spacing: {hatch_spacing} (must be finite and >= 0)"
+        ));
+    }
+    if !hatch_angle.is_finite() {
+        return Err(format!(
+            "invalid --hatch-angle: {hatch_angle} (must be finite)"
+        ));
+    }
+    if launch && plugin_id.is_none() {
+        return Err("--launch requires --plugin <plugin_id>".to_owned());
+    }
+
+    let opened = open_any_document(input_path)?;
+
+    let mut cfg = LaserJobConfig {
+        dialect: dialect.into(),
+        dedupe_tolerance_mm: dedupe,
+        join_tolerance_mm: join,
+        add_weeding_box: weeding_box,
+        ..LaserJobConfig::default()
+    };
+    for rule in &mut cfg.rules {
+        if kerf != 0.0 && rule.operation != LaserOperationKind::Ignore {
+            rule.kerf_mm = kerf;
+        }
+        if rule.operation == LaserOperationKind::HatchEngrave {
+            if hatch_spacing > 0.0 {
+                rule.hatch_spacing_mm = hatch_spacing;
+                rule.enabled = true;
+            }
+            rule.hatch_angle_deg = hatch_angle;
+            if cross_hatch {
+                rule.cross_hatch = true;
+            }
+        }
+    }
+
+    if let Some(pid) = plugin_id {
+        let mut registry = PluginRegistry::with_builtins();
+        registry.load_discovered(&default_plugin_dirs());
+        let manifest = registry.find(pid).ok_or_else(|| {
+            let ids: Vec<&str> = registry.plugins().iter().map(|p| p.id.as_str()).collect();
+            format!("unknown plugin '{pid}' (available: {})", ids.join(", "))
+        })?;
+        let outcome = export_for_plugin(&opened.document, page, None, manifest, &cfg, output_path)
+            .map_err(|e| format!("plugin export '{pid}' failed: {e}"))?;
+
+        let mut summary = format_laser_metrics(
+            &format!("Plugin '{}' ({:?})", manifest.name, outcome.format),
+            &outcome.plan,
+            outcome.bytes_written,
+            &outcome.output_path,
+        );
+
+        if launch {
+            let PluginKind::ExternalBridge {
+                ref args_template,
+                ref target_app,
+                ..
+            } = manifest.kind
+            else {
+                return Err(format!(
+                    "plugin '{}' is not an external bridge application",
+                    manifest.id
+                ));
+            };
+            let exe = detect_executable(manifest, None).ok_or_else(|| {
+                format!(
+                    "exported to {}, but external bridge executable '{}' was not found on this system",
+                    outcome.output_path.display(),
+                    target_app
+                )
+            })?;
+            let child_pid = launch_external_bridge(&exe, args_template, &outcome.output_path)
+                .map_err(|e| format!("failed to launch '{}': {e}", exe.display()))?;
+            summary.push_str(&format!(
+                "\nLaunched bridge '{}' (PID {child_pid})",
+                exe.display()
+            ));
+        }
+
+        return Ok(CliOutcome::Printed(summary));
+    }
+
+    let target_fmt = match format {
+        Some(f) => f,
+        None => LaserFormatArg::infer_from_path(output_path)?,
+    };
+
+    let plan = plan_laser_toolpath(&opened.document, page, None, &cfg)
+        .map_err(|e| format!("laser toolpath planning failed: {e}"))?;
+
+    let content = match target_fmt {
+        LaserFormatArg::Gcode => export_laser_gcode(&plan, &cfg),
+        LaserFormatArg::Dxf => export_laser_dxf_r12(&plan),
+        LaserFormatArg::Plt => export_laser_plt(&plan),
+        LaserFormatArg::Svg => export_laser_svg(&plan),
+        LaserFormatArg::Eps => export_laser_eps(&plan),
+    };
+
+    atomic_write_bytes(output_path, content.as_bytes()).map_err(|e| {
+        format!(
+            "failed to write laser output '{}': {e}",
+            output_path.display()
+        )
+    })?;
+
+    let header = match target_fmt {
+        LaserFormatArg::Gcode => format!("{} ({:?})", target_fmt.label(), cfg.dialect),
+        _ => target_fmt.label().to_owned(),
+    };
+
+    Ok(CliOutcome::Printed(format_laser_metrics(
+        &header,
+        &plan,
+        content.len(),
+        output_path,
+    )))
+}
+
+fn format_laser_metrics(
+    target_label: &str,
+    plan: &LaserToolpathPlan,
+    bytes_written: usize,
+    output_path: &Path,
+) -> String {
+    format!(
+        "Laser job exported [{target_label}] -> {} ({bytes_written} bytes)\n\
+         Cuts: {} | Segments: {} | Duplicates Removed: {} | Curves Joined: {}\n\
+         Cut: {:.2} mm | Engrave: {:.2} mm | Rapid: {:.2} mm | Est. Time: {:.1} s",
+        output_path.display(),
+        plan.cut_count,
+        plan.segments.len(),
+        plan.duplicate_segments_removed,
+        plan.curves_joined,
+        plan.total_cut_mm,
+        plan.total_engrave_mm,
+        plan.total_rapid_mm,
+        plan.estimated_seconds
+    )
+}
+
+/// Normalizes desktop `file://` URIs passed by OS launchers while preserving regular paths verbatim.
+fn normalize_desktop_file_arg(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let uri_path = raw
+        .strip_prefix("file://localhost/")
+        .or_else(|| raw.strip_prefix("file:///"))
+        .map(|rest| format!("/{rest}"));
+    let Some(encoded) = uri_path else {
+        return path.to_path_buf();
+    };
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let decoded = percent_decode_utf8(&encoded);
+    #[cfg(windows)]
+    {
+        // Strip leading slash on Windows drive paths like `/C:/path/file.cdr`
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            return PathBuf::from(&decoded[1..]);
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Builds the `--diagnostics` summary string with version, license, formats, crates,
+/// built-in laser/plotter plugin count, and local font count.
 #[must_use]
 pub fn build_diagnostics_report() -> String {
     let brand = BrandInfo::current();
     let font_count = discover_local_font_count();
+    let builtin_plugins = PluginRegistry::builtin_presets();
+    let plugin_ids: Vec<&str> = builtin_plugins.iter().map(|p| p.id.as_str()).collect();
     format!(
         "{} v{} ({})\n\
          Repository: {}\n\
          Workspace Crates: {}, {}, {}, {}, {}, {}\n\
-         Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025), .cdt, .cmx (16/32-bit), .cpt, .svg, .svgz, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal\n\
-         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .plt (HPGL), .png, .jpg, .webp, .tiff, .bmp\n\
+         Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025 / .cdr.zip), .cdt (.cdt.zip), .cmx (16/32-bit), .cpt, .svg, .svgz, .pdf, .ai, .eps, .dxf, .plt (HPGL), .psd, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal\n\
+         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .plt (HPGL), .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
+         Built-in Laser & Plotter Plugins: {} ({})\n\
          Local System Fonts Indexed: {}\n\
          Mode: 100% Offline Pure-Rust (#![forbid(unsafe_code)])",
         brand.display_name,
@@ -595,6 +1015,8 @@ pub fn build_diagnostics_report() -> String {
         coree_storage::CRATE_NAME,
         coree_render::CRATE_NAME,
         coree_prod::CRATE_NAME,
+        builtin_plugins.len(),
+        plugin_ids.join(", "),
         font_count
     )
 }
@@ -606,4 +1028,113 @@ fn discover_local_font_count() -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_positional_files_including_arabic_and_multiple_args() {
+        let single = Cli::try_parse_from(["coree", "/tmp/درع الشكر/sample.cdr.zip"]).unwrap();
+        assert_eq!(
+            execute_cli(&single).unwrap(),
+            CliOutcome::LaunchGui(vec![PathBuf::from("/tmp/درع الشكر/sample.cdr.zip")])
+        );
+
+        let multi = Cli::try_parse_from(["coree", "a.cdr", "b.pdf", "c.dxf"]).unwrap();
+        assert_eq!(
+            execute_cli(&multi).unwrap(),
+            CliOutcome::LaunchGui(vec![
+                PathBuf::from("a.cdr"),
+                PathBuf::from("b.pdf"),
+                PathBuf::from("c.dxf"),
+            ])
+        );
+
+        let uri = Cli::try_parse_from(["coree", "file:///tmp/my%20shield.cdr"]).unwrap();
+        assert_eq!(
+            execute_cli(&uri).unwrap(),
+            CliOutcome::LaunchGui(vec![PathBuf::from("/tmp/my shield.cdr")])
+        );
+    }
+
+    #[test]
+    fn cli_diagnostics_lists_all_v02_formats_and_plugins() {
+        let diag = build_diagnostics_report();
+        for token in [
+            ".coree",
+            ".cdr",
+            ".cdt",
+            ".cmx",
+            ".cpt",
+            ".svg",
+            ".svgz",
+            ".pdf",
+            ".ai",
+            ".eps",
+            ".dxf",
+            ".plt",
+            ".psd",
+            ".png",
+            ".jpg",
+            ".webp",
+            ".tiff",
+            ".bmp",
+            ".gcode",
+            "Built-in Laser & Plotter Plugins: 7",
+            "lightburn-bridge",
+        ] {
+            assert!(
+                diag.contains(token),
+                "diagnostics missing '{token}':\n{diag}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_laser_and_thumbnail_validate_bad_arguments() {
+        let bad_thumb =
+            Cli::try_parse_from(["coree", "thumbnail", "in.cdr", "out.png", "--size", "0"])
+                .unwrap();
+        assert!(execute_cli(&bad_thumb).is_err());
+
+        let launch_no_plugin =
+            Cli::try_parse_from(["coree", "laser", "in.cdr", "out.gcode", "--launch"]).unwrap();
+        assert!(execute_cli(&launch_no_plugin).is_err());
+
+        let bad_dedupe =
+            Cli::try_parse_from(["coree", "laser", "in.cdr", "out.gcode", "--dedupe=NaN"]).unwrap();
+        assert!(execute_cli(&bad_dedupe).is_err());
+
+        for bad_dpi in ["NaN", "inf", "0", "-150"] {
+            let flag = format!("--min-dpi={bad_dpi}");
+            let bad_preflight =
+                Cli::try_parse_from(["coree", "preflight", "in.cdr", &flag]).unwrap();
+            assert!(
+                execute_cli(&bad_preflight).is_err(),
+                "preflight with {flag} must return Err"
+            );
+        }
+
+        let neg_kerf = Cli::try_parse_from([
+            "coree",
+            "laser",
+            "in.cdr",
+            "out.gcode",
+            "--kerf",
+            "-0.15",
+            "--hatch-angle",
+            "-45.0",
+        ])
+        .unwrap();
+        assert!(matches!(
+            neg_kerf.command,
+            Some(Commands::Laser {
+                kerf,
+                hatch_angle,
+                ..
+            }) if (kerf + 0.15).abs() < 1e-9 && (hatch_angle + 45.0).abs() < 1e-9
+        ));
+    }
 }

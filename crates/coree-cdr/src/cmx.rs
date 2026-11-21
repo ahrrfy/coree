@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room `.cmx` 16-bit and 32-bit (`CMX1`/`CMX2`) RIFF/RIFX parser and
 //! writer supporting `cont`, `ccmm`, `pack`, `page`, `rclr`, `rpen`, `rlin`,

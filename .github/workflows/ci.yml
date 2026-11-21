@@ -46,10 +46,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Smoke test release binary (Linux)
+      - name: Smoke test release binary & packaging metadata (Linux)
         if: runner.os == 'Linux'
-        run: ./target/release/coree --diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/coree --diagnostics
+          bash -n packaging/linux/install-linux.sh packaging/linux/build-deb.sh packaging/linux/build-appimage.sh
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          for path in (
+              "packaging/linux/coree-mime.xml",
+              "packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml",
+              "packaging/windows/wix/main.wxs",
+              "packaging/windows/coree.exe.manifest",
+          ):
+              ET.parse(path)
+          print("All Linux & Windows XML manifests parsed cleanly.")
+          PY
+          if command -v desktop-file-validate >/dev/null 2>&1; then
+            desktop-file-validate packaging/linux/coree.desktop
+          fi
 
       - name: Smoke test release binary (Windows)
         if: runner.os == 'Windows'
-        run: .\target\release\coree.exe --diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\target\release\coree.exe --diagnostics

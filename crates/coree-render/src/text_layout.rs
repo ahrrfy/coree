@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Multilingual text shaping, Arabic RTL/BiDi/Kashida justification, multi-column
 //! paragraph layout, Fit Text to Path, and Text-to-Curves vector outline extraction.

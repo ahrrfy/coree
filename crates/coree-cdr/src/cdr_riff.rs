@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room RIFF CDR (v4–v13 / X3) parser and writer with `LIST cmpr` Zlib
 //! support, full geometry/style/11-Lens/text/bitmap fidelity, CP1256 legacy

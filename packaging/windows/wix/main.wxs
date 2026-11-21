@@ -1,12 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 <!-- WiX Toolset v4 MSI Installer Manifest for coree (64-bit Windows) -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <?ifndef BinaryPath?>
     <?define BinaryPath = "target\release\coree.exe"?>
   <?endif?>
+  <?ifndef IconPath?>
+    <?define IconPath = "packaging\windows\coree.ico"?>
+  <?endif?>
+  <?ifndef RepoRoot?>
+    <?define RepoRoot = "."?>
+  <?endif?>
   <?ifndef Version?>
-    <?define Version = "0.1.0"?>
+    <?define Version = "0.2.0"?>
   <?endif?>
 
   <Package
@@ -18,11 +24,15 @@
       Compressed="yes">
 
     <SummaryInformation
-        Description="coree — Clean-room offline vector graphics, multipage layout &amp; print production studio (MPL-2.0)"
+        Description="coree — Clean-room offline vector graphics, multipage layout, laser production &amp; print studio (MIT OR Apache-2.0)"
         Manufacturer="coree contributors" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of coree is already installed." />
     <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="coree.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="coree.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ahrrfy/coree" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="coree" />
@@ -32,8 +42,10 @@
       <Directory Id="CoreeProgramMenuDir" Name="coree" />
     </StandardDirectory>
 
+    <StandardDirectory Id="DesktopFolder" />
+
     <ComponentGroup Id="CoreeComponents" Directory="INSTALLFOLDER">
-      <!-- Primary binary + CLI PATH + file associations -->
+      <!-- Primary binary + CLI PATH + Windows Registry ProgID & OpenWithProgids -->
       <Component Id="CoreeMainBinary" Guid="4B9D2A77-31E8-4F62-9C0A-7D51E83A21F4">
         <File
             Id="CoreeExe"
@@ -50,51 +62,164 @@
             Action="set"
             System="yes" />
 
-        <ProgId Id="coree.coree" Description="coree Vector Graphics Document">
-          <Extension Id="coree" ContentType="application/x-coree">
-            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
-          </Extension>
-        </ProgId>
+        <!-- Canonical Windows ProgID: coree.Document -->
+        <RegistryKey Root="HKLM" Key="Software\Classes\coree.Document">
+          <RegistryValue Type="string" Value="coree Vector Graphics Document" />
+          <RegistryKey Key="DefaultIcon">
+            <RegistryValue Type="string" Value="[INSTALLFOLDER]coree.ico,0" />
+          </RegistryKey>
+          <RegistryKey Key="shell\open">
+            <RegistryValue Type="string" Value="Open with coree" />
+            <RegistryKey Key="command">
+              <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]coree.exe&quot; &quot;%1&quot;" />
+            </RegistryKey>
+          </RegistryKey>
+        </RegistryKey>
 
-        <ProgId Id="coree.cdr" Description="CDR Vector Graphics Document">
-          <Extension Id="cdr" ContentType="application/x-cdr">
-            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
-          </Extension>
-        </ProgId>
+        <!-- Applications entry so Windows Open With dialog always lists coree -->
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\coree.exe">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="coree Vector Graphics Studio" />
+          <RegistryKey Key="DefaultIcon">
+            <RegistryValue Type="string" Value="[INSTALLFOLDER]coree.ico,0" />
+          </RegistryKey>
+          <RegistryKey Key="shell\open\command">
+            <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]coree.exe&quot; &quot;%1&quot;" />
+          </RegistryKey>
+          <RegistryKey Key="SupportedTypes">
+            <RegistryValue Name=".coree" Type="string" Value="" />
+            <RegistryValue Name=".cdr" Type="string" Value="" />
+            <RegistryValue Name=".cdt" Type="string" Value="" />
+            <RegistryValue Name=".cmx" Type="string" Value="" />
+            <RegistryValue Name=".cpt" Type="string" Value="" />
+            <RegistryValue Name=".svg" Type="string" Value="" />
+            <RegistryValue Name=".pdf" Type="string" Value="" />
+            <RegistryValue Name=".eps" Type="string" Value="" />
+            <RegistryValue Name=".dxf" Type="string" Value="" />
+            <RegistryValue Name=".plt" Type="string" Value="" />
+            <RegistryValue Name=".psd" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
 
-        <ProgId Id="coree.cdt" Description="CDT Vector Graphics Template">
-          <Extension Id="cdt" ContentType="application/x-cdt">
-            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
-          </Extension>
-        </ProgId>
+        <!-- Primary design formats: default ProgID + OpenWithProgids -->
+        <RegistryKey Root="HKLM" Key="Software\Classes\.coree">
+          <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryValue Name="Content Type" Type="string" Value="application/x-coree" />
+          <RegistryKey Key="OpenWithProgids">
+            <RegistryValue Name="coree.Document" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
 
-        <ProgId Id="coree.cmx" Description="CMX Vector Exchange Document">
-          <Extension Id="cmx" ContentType="application/x-cmx">
-            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
-          </Extension>
-        </ProgId>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cdr">
+          <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryKey Key="OpenWithProgids">
+            <RegistryValue Name="coree.Document" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
 
-        <ProgId Id="coree.cpt" Description="CPT Multi-Layer Raster Image">
-          <Extension Id="cpt" ContentType="application/x-cpt">
-            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
-          </Extension>
-        </ProgId>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cdt">
+          <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryValue Name="Content Type" Type="string" Value="application/x-cdt" />
+          <RegistryKey Key="OpenWithProgids">
+            <RegistryValue Name="coree.Document" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cmx">
+          <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryValue Name="Content Type" Type="string" Value="application/x-cmx" />
+          <RegistryKey Key="OpenWithProgids">
+            <RegistryValue Name="coree.Document" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cpt">
+          <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryValue Name="Content Type" Type="string" Value="application/x-cpt" />
+          <RegistryKey Key="OpenWithProgids">
+            <RegistryValue Name="coree.Document" Type="string" Value="" />
+          </RegistryKey>
+        </RegistryKey>
+
+        <!-- Interchange & production formats: non-invasive OpenWithProgids -->
+        <RegistryKey Root="HKLM" Key="Software\Classes\.svg\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.pdf\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.eps\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.dxf\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.plt\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+
+        <RegistryKey Root="HKLM" Key="Software\Classes\.psd\OpenWithProgids">
+          <RegistryValue Name="coree.Document" Type="string" Value="" />
+        </RegistryKey>
+      </Component>
+
+      <Component Id="CoreeIconAsset" Guid="C1D53E09-2B4A-49C3-8A1E-5D87F024B611">
+        <File Id="CoreeIcoFile" Source="$(var.IconPath)" KeyPath="yes" />
+      </Component>
+
+      <Component Id="CoreeLicenseMit" Guid="E47B8C12-90F5-4D1A-B73E-1A62C498D502">
+        <File Id="LicenseMitFile" Source="$(var.RepoRoot)\LICENSE-MIT" KeyPath="yes" />
+      </Component>
+
+      <Component Id="CoreeLicenseApache" Guid="F58C9D23-A106-4E2B-C84F-2B73D5A9E613">
+        <File Id="LicenseApacheFile" Source="$(var.RepoRoot)\LICENSE-APACHE" KeyPath="yes" />
+      </Component>
+
+      <Component Id="CoreeNotice" Guid="A69DAE34-B217-4F3C-D950-3C84E6BAF724">
+        <File Id="NoticeFile" Source="$(var.RepoRoot)\NOTICE" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
-    <ComponentGroup Id="CoreeShortcuts" Directory="CoreeProgramMenuDir">
-      <Component Id="CoreeStartMenuShortcut" Guid="9E3C6F12-5A84-4B7D-8E21-6C4A9B0D3E75">
+    <ComponentGroup Id="CoreeShortcuts">
+      <Component
+          Id="CoreeStartMenuShortcut"
+          Directory="CoreeProgramMenuDir"
+          Guid="9E3C6F12-5A84-4B7D-8E21-6C4A9B0D3E75">
         <Shortcut
             Id="StartMenuCoreeShortcut"
             Name="coree"
-            Description="Clean-room offline vector graphics &amp; print production studio"
+            Description="Clean-room offline vector graphics, laser production &amp; print studio"
             Target="[#CoreeExe]"
+            Icon="coree.ico"
             WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="RemoveCoreeProgramMenuDir" On="uninstall" />
         <RegistryValue
             Root="HKCU"
             Key="Software\coree\Install"
             Name="StartMenuInstalled"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+
+      <Component
+          Id="CoreeDesktopShortcut"
+          Directory="DesktopFolder"
+          Guid="7D2B5E01-4973-4A6C-9D10-5B398A9C2D64">
+        <Shortcut
+            Id="DesktopCoreeShortcut"
+            Name="coree"
+            Description="Clean-room offline vector graphics, laser production &amp; print studio"
+            Target="[#CoreeExe]"
+            Icon="coree.ico"
+            WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\coree\Install"
+            Name="DesktopShortcutInstalled"
             Type="integer"
             Value="1"
             KeyPath="yes" />

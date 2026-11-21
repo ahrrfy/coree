@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CAD & cutting-plotter importers and exporters:
 //! - AutoCAD ASCII **DXF** (`R12` / `R2000+` `AC1015` with `HEADER`, `$INSUNITS`, `TABLES`/`LAYER`,

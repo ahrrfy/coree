@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust Local Font Manager scanner & SQLite `font_index` repository.
 //!

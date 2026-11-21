@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Comprehensive integration and regression test suite for:
 //! - Laser Cutting, Engraving & Plotter Toolpath Engine (`laser_plugin`)

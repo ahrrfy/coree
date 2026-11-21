@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Robust vector boolean path operations backed by `i_overlay`'s integer sweep engine.
 //!

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room CorelDRAW Template (`.cdt`) reader and writer supporting both
 //! RIFF (`CDT*`) and ZIP/OPC (`X4–X5` / `X6+`) template containers.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Error types for clean-room CorelDRAW (`.cdr`, `.cdt`, `.cmx`, `.cpt`) codecs.
 

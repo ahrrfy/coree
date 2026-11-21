@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Cut, laser, CNC, and packaging production engine:
 //! - One-click welded `CutContour` spot hairline generator with outward bleed/offset

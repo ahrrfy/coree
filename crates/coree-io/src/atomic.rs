@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Crash-safe atomic file persistence (`NamedTempFile` + `sync_all` + atomic `persist`).
 

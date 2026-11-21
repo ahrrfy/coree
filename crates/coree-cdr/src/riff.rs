@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room RIFF / RIFX binary container reader and writer, including
 //! Corel `LIST cmpr` Zlib-compressed block streams with `CPng` chunk-size tables.

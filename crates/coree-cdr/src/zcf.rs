@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room ZCF (CorelDRAW X6–2025, v16–26) indirect pointer resolution,
 //! JSON style sheet (`styles/document.cdss` & `loda` `0x00C9`) decoding,

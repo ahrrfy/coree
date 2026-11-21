@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust PostScript / EPS Level 3 writer (`%!PS-Adobe-3.0 EPSF-3.0`) and
 //! hardened EPS / PostScript vector & text importer.

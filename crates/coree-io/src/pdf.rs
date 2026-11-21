@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust print-ready PDF 1.7 writer supporting multipage vector artwork, true
 //! `DeviceCMYK` (`k`/`K`) and `DeviceRGB` (`rg`/`RG`) color spaces, `ExtGState`

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Programmatic clean-room binary fixture generators for valid CDR RIFF v12,
 //! CDR X4 ZIP, CDR X6+ ZIP, CDT, CMX (16/32-bit), CPT (multi-layer & RIFF),

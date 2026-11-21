@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `Collect for Output`: packages a complete print-production handoff directory containing
 //! the serialized document JSON, extracted raster PNG assets (`images/`), font inventory

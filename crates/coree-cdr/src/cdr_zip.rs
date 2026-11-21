@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room ZIP/OPC CorelDRAW container reader and writer supporting:
 //! - **CDR X4–X5** (`mimetype`, `content/riffData.cdr`, `metadata/metadata.xml`, `color/`, `preview/`)

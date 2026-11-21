@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Spatial R-Tree accelerated hit-testing (`hit_test_point`, `hit_test_rect`,
 //! `hit_test_node`) and intelligent multi-target [`SnapEngine`] emitting

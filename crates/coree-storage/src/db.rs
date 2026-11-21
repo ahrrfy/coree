@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Embedded offline-first SQLite database (`rusqlite` bundled), WAL mode,
 //! strict foreign keys, schema version tracking, and automatic execution of

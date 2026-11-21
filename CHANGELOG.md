@@ -4,6 +4,54 @@ All notable changes to **`coree`** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-21
+
+### Changed
+- **Open-Source Community Dual License (`MIT OR Apache-2.0`):** Transitioned project licensing from `MPL-2.0` to the Rust ecosystem gold-standard `MIT OR Apache-2.0` dual license ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE), [NOTICE](NOTICE)) — combining MIT's maximum global adoption with Apache-2.0's explicit patent grant and trademark non-grant.
+
+### Added
+- **Authentic ZCF `.cdr` X6–2025 (v16–26) Codec & Preview Extractor (`coree-cdr`):**
+  - Complete ZCF 16-byte indirect pointer detection and bounded dereferencing (`zcf.rs`) across `content/dataFileList.dat` pools with anti-aliasing cumulative budgets.
+  - Native `styles/document.cdss` JSON style sheet, `loda 0x00C9` style override, `color/docPalette.xml`, `color/color.xml`, `META-INF/textinfo.xml`, and `META-INF/metadata.xml` XMP parsers.
+  - Accurate v16–26 geometry & matrix conversion (center-origin Y-up `0.1 µm` to top-left Y-down `mm`, `0xC0` cubic Bézier control handles, chamfered/rounded/scalloped rectangles, ellipses, and authentic UTF-16LE / CP1256 Arabic text).
+  - Pure-Rust `extract_cdr_preview_png` extracting embedded ZIP thumbnails (`previews/thumbnail.png`, `previews/page1.png`, `preview/thumbnail.bmp`) and RIFF `DISP` DIB previews into valid RGBA8 PNGs.
+  - Magic-byte file detection and transparent `.cdr.zip` / `.cdt.zip` opening.
+- **Universal Pro Vector & Raster Importers (`coree-io`):**
+  - **PDF 1.0–2.0 & PDF-compatible `.ai` Importer:** Traditional `xref` + incremental `/Prev` + PDF 1.5+ `/XRef` & `/ObjStm` streams, bounded `/FlateDecode`/`/ASCII85Decode`/`/ASCIIHexDecode`/`/RunLengthDecode` + TIFF/PNG `/Predictor`, full multipage `/Pages` & content stream interpreter (RGB/CMYK/Gray/ICCBased/Separation, Form & Image XObjects, `/ToUnicode` CMap & UTF-16BE text). Verified on real 44 MB 60-page PDFs.
+  - **EPS / PostScript Importer:** DOS binary EPS (`C5 D0 D3 C6`) unwrapping + bounded PostScript tokenizer/interpreter with step and stack-node guards.
+  - **DXF (R12/R2000+) & HPGL (`.plt`) Importers:** Full DXF `$INSUNITS`, `TABLES`/`LAYER` (`CutContour`, ACI & 24-bit color), cycle-guarded `BLOCKS`/`INSERT`, `LINE`/`LWPOLYLINE` (bulge arcs)/`POLYLINE`/`CIRCLE`/`ARC`/`ELLIPSE`/`SPLINE`/`SOLID`/`TEXT`/`MTEXT`; HPGL 40 units/mm pen commands & arcs.
+  - **Multi-Layer Adobe Photoshop `.psd` / `.psb` Importer:** Streaming `Read + Seek` parser for 1/8/16-bit Bitmap/Grayscale/Indexed/RGB/CMYK/Lab with DPI extraction, all 16 blend modes, Unicode layer names, RAW/PackBits/ZIP decoding, and 256 MiB bounded streaming RGBA downscaling. Verified on real 295 MB 9-layer PSDs.
+- **Pure-Rust ICC v2/v4 Color Management & Live CMYK Soft-Proofing (`coree-core`, `coree-render`):**
+  - Bounded ICC v2/v4 parser (`desc`/`mluc`, `wtpt`, `rXYZ`/`gXYZ`/`bXYZ`, `curv`/`para` TRCs, `mft1`/`mft2` 3D Sakamoto tetrahedral & 4D quadrilinear LUTs, v4 `mAB `/`mBA ` compatibility) verified across 52/52 real system ICC profiles.
+  - Built-in Bradford D50 + Yule-Nielsen Neugebauer offset-press profiles (`sRGB`, `Display P3`, `ISO Coated v2 CMYK`, `US Web Coated SWOP CMYK`), all 4 rendering intents, cached `17×17×17` soft-proof LUT, and out-of-gamut overlay warning.
+- **Raster Studio Brushes, PostScript Fills, Autofit Page & Glyphs API (`coree-core`, `coree-render`):**
+  - BT.709 YCbCr **Healing Brush**, Shadows/Midtones/Highlights **Dodge & Burn**, and iterative scanline BFS **Raster Flood Fill**.
+  - 10 resolution-independent analytic SDF **PostScript Procedural Fills** (`Hatch`, `CrossHatch`, `Checker`, `PolkaDots`, `Waves`, `Bricks`, `RadialBurst`, `HexGrid`, `Woodgrain`, `HalftoneDots`).
+  - One-click **Autofit Page to Content** (`Document::autofit_page_to_content`).
+  - Live OpenType/TrueType **Glyphs Catalog API** (`GlyphBlockFilter` incl. Arabic, Presentation Forms, Latin, Symbols, Arrows, Geometric, Math, Punctuation) with cmap coverage detection and click-to-insert Glyphs Docker.
+- **Production Laser Cutting, Engraving & Plotter Plugin System (`coree-prod`):**
+  - Full laser toolpath engine: duplicate-segment removal, open-curve joining, winding-invariant miter-limited kerf offset, rotated/cross scanline hatch fill with hole nesting, inner-loops-first cut ordering, nearest-neighbor travel optimization, optional weeding box, and job time/distance estimation.
+  - Direct exporters for GRBL 1.1 / Marlin / Ruida G-Code (`.gcode`), Laser DXF R12 (`AC1009`), HPGL `.plt`, color-coded SVG, and EPS.
+  - Extensible Plugin Registry (`plugin.json` / `plugin.toml` + Rhai scripts) with 7 built-in ready-to-use bridge presets: **LightBurn**, **RDWorks / Ruida CO2**, **EZCad Fiber**, **LaserDRW / M2 Nano**, **LaserGRBL**, **InkCut / VisiCut**, and **Vinyl Cutter / Plotter (HPGL)** — using safe direct `Command::args` execution (zero shell injection).
+- **62 Real Interactive Tools, Studio Workspaces & Muscle-Memory Shortcuts (`coree-app`):**
+  - All 62 tools across 15 Toolbox flyout groups live and non-stubbed, plus live laser toolpath canvas preview overlay and right-click canvas context menu.
+  - 6 Studio Workspace Presets (`DefaultClassic`, `Lite`, `Illustration`, `PageLayout`, `LaserSignStudio`, `TouchCompact`) with `.coreews` JSON export/import and full muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2`/`F3`/`F4`/`F9`, `Space`, `Ctrl+K`/`L`/`Q`/`D`/`R`/`J`, `Shift/Ctrl+PageUp/PageDown`, Nudge/Super-Nudge/Micro-Nudge).
+  - New CLI subcommands: `coree thumbnail` (fast OS file-manager thumbnailer) and `coree laser` (toolpath planning, G-Code/DXF/PLT/SVG/EPS export & external plugin launch).
+  - Embedded native window icon (Linux Wayland/X11 & Windows) and `build.rs` Win32 resource compilation.
+- **Complete Linux & Windows Packaging & Multi-Format Release CI:**
+  - **Linux OS Integration Fix (Zero More ZIP Icons for `.cdr`):** Canonical `application/vnd.corel-draw` MIME extension with `<sub-class-of type="application/zip"/>` and priority-90 magic rules for X6–2025 ZCF, X4–X5 ZIP, and RIFF/RIFX `.cdr`, MIME-type icons, GNOME/freedesktop `coree.thumbnailer`, upgraded `install-linux.sh` (`xdg-mime default`), offline-sandboxed **Flatpak** (`io.github.ahrrfy.coree.yml` + validated AppStream Metainfo), native zero-sudo **`.deb`** builder (`build-deb.sh`), and updated **`.AppImage`** builder (`build-appimage.sh`).
+  - **Windows Native Packaging:** Multi-size `coree.ico` (`16`/`32`/`48`/`256` PNG-in-ICO), `coree.exe.manifest` (`PerMonitorV2` DPI + `<activeCodePage>UTF-8</activeCodePage>` for seamless Arabic filenames), `coree.rc`, upgraded WiX v4 `.msi` manifest (`wix/main.wxs` with Start Menu & Desktop shortcuts, PATH, `coree.Document` ProgID + `OpenWithProgids` for 11 formats), and zero-admin portable `register-file-associations.cmd`.
+  - **Multi-Format GitHub Actions Release Pipeline:** Automated Linux (`.deb`, `.AppImage`, `.tar.gz`, SHA-256) and Windows (WiX v4 `.msi`, portable `.zip` + Arabic UTF-8 filename verification, SHA-256) builds and publishing.
+
+### Fixed
+- **Wave A Deep Adversarial Audit (28 S1/S2 Security, Codec & Geometry Bugs Fixed & Re-Verified):**
+  - `coree-prod` (7 fixes): hatch scanline overflow, perforate dash hang/OOM, short-chord curve dedupe shredding, premature loop collapse, travel-optimizer `Inf`/`NaN` drop, G-Code newline injection & world-transformed connectors, and plugin `selection_only`/single-pass argv/`target_app` traversal/JSON spoof hardening.
+  - `coree-core` & `coree-render` (4 fixes): ICC `mluc`/`desc` allocation-churn DoS, `profile_size` bounds slicing, missing-TRC `NaN` propagation, ICC v4 `mAB `/`mBA ` compatibility, plus lens `remove_face` warp, Arabic `TextOnPath` combining-mark anchoring, and nested PowerClip transforms.
+  - `coree-io` (13 fixes): PSD mask/spot layer desync & composite RLE pre-alloc OOM; PDF delimiter hang, `/Length` cycle stack overflow, non-standard BPC underflow, filter/ASCII85/RLE/`/Contents` amplification; EPS unmatched `)` hang, extreme arc hang, empty `repeat` & exponential `dup` array bomb; HPGL UTF-8 boundary panic, DXF `inf` angle hang, block DAG bomb, and `i32::MIN.abs()` overflow.
+  - `coree-cdr` (4 fixes): `trfd`/`convert_real_corel_rect`/`ellipse` `NaN`/`Inf` clamp panic, `loda` overlapping/decreasing offset 512x–1024x amplification + `0x00C9` JSON cap, off-by-one on 29-byte v16 `fild` color tail, and `extract_rdf_li_list` single-pass XML unescaping.
+
+---
+
 ## [0.1.0] - 2026-11-21
 
 ### Added

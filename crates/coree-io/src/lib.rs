@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![forbid(unsafe_code)]
 
 //! Hardened vector, print, CAD/plotter, raster, palette, and native `.coree` I/O

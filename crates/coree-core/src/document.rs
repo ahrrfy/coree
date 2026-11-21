@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Complete scene graph, multipage/layer document model, unknown-chunk passthrough,
 //! spatial R-Tree indexing, and document manipulation operations.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Isolated brand identity and clean-room trademark metadata for `coree`.
 //!
@@ -17,7 +17,7 @@ pub const DISPLAY_NAME: &str = "coree";
 pub const NATIVE_EXT: &str = "coree";
 
 /// SPDX license identifier.
-pub const LICENSE: &str = "MPL-2.0";
+pub const LICENSE: &str = "MIT OR Apache-2.0";
 
 /// Public source repository URL.
 pub const REPO_URL: &str = "https://github.com/ahrrfy/coree";
@@ -28,7 +28,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Clean-room independence and trademark disclaimer notice.
 pub const TRADEMARK_NOTICE: &str = "\
 coree is an independent, clean-room open-source vector graphics and print \
-production suite licensed under MPL-2.0. It is NOT affiliated with, endorsed \
+production suite licensed under MIT OR Apache-2.0. It is NOT affiliated with, endorsed \
 by, sponsored by, or connected in any way to Corel Corporation, Alludo, or \
 Pantone LLC. Corel, CorelDRAW, Corel PHOTO-PAINT, and PowerTRACE are \
 trademarks or registered trademarks of Corel Corporation and/or Alludo. \
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(APP_NAME, "coree");
         assert_eq!(DISPLAY_NAME, "coree");
         assert_eq!(NATIVE_EXT, "coree");
-        assert_eq!(LICENSE, "MPL-2.0");
+        assert_eq!(LICENSE, "MIT OR Apache-2.0");
         assert_eq!(REPO_URL, "https://github.com/ahrrfy/coree");
         assert!(TRADEMARK_NOTICE.contains("clean-room"));
         assert!(TRADEMARK_NOTICE.contains("NOT affiliated"));

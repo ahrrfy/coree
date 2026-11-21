@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![forbid(unsafe_code)]
 
 //! Wave 4 End-to-End Cross-Crate Integration Test Suite for `coree`.
@@ -127,7 +127,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
     // Real CLI binary --diagnostics verification
     let diag = run_coree_bin(&["--diagnostics"]);
     assert!(diag.contains("coree"));
-    assert!(diag.contains("MPL-2.0"));
+    assert!(diag.contains("MIT OR Apache-2.0"));
     assert!(diag.contains("coree-core"));
     assert!(diag.contains("coree-cdr"));
     assert!(diag.contains("coree-render"));

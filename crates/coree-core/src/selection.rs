@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Object and node selection state, dual-click transform handle modes, and movable rotation pivot.
 

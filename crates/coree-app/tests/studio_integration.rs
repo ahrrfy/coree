@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![forbid(unsafe_code)]
 
 //! Comprehensive headless CLI, studio state machine, 11-Lens, shortcut profile,
@@ -61,7 +61,7 @@ fn run_cli_args(args: &[&str]) -> String {
 fn cli_diagnostics_and_gui_launch_parsing() {
     let diag = run_cli_args(&["coree", "--diagnostics"]);
     assert!(diag.contains("coree"));
-    assert!(diag.contains("MPL-2.0"));
+    assert!(diag.contains("MIT OR Apache-2.0"));
     assert!(diag.contains("coree-core"));
     assert!(diag.contains("coree-cdr"));
     assert!(diag.contains("coree-prod"));

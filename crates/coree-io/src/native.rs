@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `.coree` open native lossless ZIP container with externalized PNG raster assets,
 //! optional preview thumbnail, atomic saves, and Zip-Bomb / Zip-Slip hardening.

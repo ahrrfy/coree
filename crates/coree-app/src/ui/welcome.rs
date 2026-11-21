@@ -1,9 +1,11 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Welcome & Recovery Hub (`S01`): New Document templates, Showcase Sample, Open file,
+//! Welcome & Recovery Hub (`S01`): New Document templates, Studio Workspace presets,
+//! Showcase Sample, Open file across all supported vector/CAD/print/raster formats,
 //! SQLite Recent Documents list, and Crash Recovery Banner when unclean sessions exist.
 
-use crate::state::StudioApp;
+use crate::state::{StudioApp, WorkspacePreset};
+use coree_core::brand::BrandInfo;
 use coree_core::{ColorMode, Document};
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke, Ui};
 use std::path::PathBuf;
@@ -11,6 +13,7 @@ use std::path::PathBuf;
 /// Renders the Welcome & Crash Recovery Hub inside the central workspace area.
 pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let brand = BrandInfo::current();
 
     egui::CentralPanel::default()
         .frame(
@@ -20,23 +23,31 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
         )
         .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.set_max_width(980.0);
+                ui.set_max_width(1020.0);
 
                 // Header
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("coree Studio")
+                            RichText::new(format!("{} Studio v{}", brand.display_name, brand.version))
                                 .size(28.0)
                                 .strong()
                                 .color(tokens.text),
                         );
                         ui.label(
-                            RichText::new(
-                                "100% Offline Pure-Rust Vector Graphics, Multipage Layout & Print Production Suite (MPL-2.0)",
-                            )
+                            RichText::new(format!(
+                                "100% Offline Pure-Rust Vector Graphics, Multipage Layout, Laser & Print Production Suite ({})",
+                                brand.license
+                            ))
                             .size(13.0)
                             .color(tokens.text_muted),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Native & Exchange Formats: CDR X6–2025 · CDT · CMX · CPT · PDF/AI · EPS · DXF · PLT · PSD · SVG · G-Code · coree",
+                            )
+                            .size(11.5)
+                            .color(tokens.accent),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -129,11 +140,80 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                     {
                         app.new_doc_dialog.open = true;
                     }
-                    if ui.button(RichText::new("📂 Open File (CDR/CDT/CMX/CPT/SVG/coree)").size(13.5)).clicked() {
+                    if ui
+                        .button(
+                            RichText::new("📂 Open File (CDR / PDF / AI / EPS / DXF / PLT / PSD / SVG)")
+                                .size(13.5),
+                        )
+                        .clicked()
+                    {
                         app.open_file_dialog();
                     }
-                    if ui.button(RichText::new("★ Open Showcase Sample").size(13.5)).clicked() {
+                    if ui
+                        .button(RichText::new("★ Open Showcase Sample").size(13.5))
+                        .clicked()
+                    {
                         app.new_sample_document();
+                    }
+                    if ui
+                        .button(RichText::new("⚙ Studio Options (Ctrl+J)").size(13.0))
+                        .clicked()
+                    {
+                        app.show_options_dialog = true;
+                    }
+                });
+
+                ui.add_space(20.0);
+
+                // Quick Workspace Preset Selector Cards
+                ui.label(
+                    RichText::new("Studio Workspaces")
+                        .size(15.0)
+                        .strong()
+                        .color(tokens.text),
+                );
+                ui.label(
+                    RichText::new("Pick a classic studio layout tailored to vector illustration, page layout, or laser & sign production:")
+                        .size(11.5)
+                        .color(tokens.text_muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for preset in WorkspacePreset::ALL {
+                        let active = app.active_workspace_preset == preset;
+                        Frame::NONE
+                            .fill(if active {
+                                tokens.surface_elevated
+                            } else {
+                                tokens.surface
+                            })
+                            .stroke(Stroke::new(
+                                if active { 1.5 } else { 1.0 },
+                                if active { tokens.accent } else { tokens.border },
+                            ))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(154.0);
+                                ui.set_max_width(154.0);
+                                ui.label(
+                                    RichText::new(preset.label())
+                                        .strong()
+                                        .color(if active { tokens.accent } else { tokens.text }),
+                                );
+                                ui.label(
+                                    RichText::new(preset.description())
+                                        .size(10.5)
+                                        .color(tokens.text_muted),
+                                );
+                                ui.add_space(4.0);
+                                if ui
+                                    .small_button(if active { "✓ Active" } else { "Select" })
+                                    .clicked()
+                                {
+                                    app.apply_workspace_preset(preset);
+                                }
+                            });
                     }
                 });
 
@@ -152,6 +232,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                         ("A4 Print (CMYK)", 210.0, 297.0, ColorMode::Cmyk, 300.0),
                         ("A3 Poster (CMYK)", 297.0, 420.0, ColorMode::Cmyk, 300.0),
                         ("Business Card", 85.0, 55.0, ColorMode::Cmyk, 300.0),
+                        ("Laser & Vinyl Bed", 300.0, 200.0, ColorMode::Rgb, 300.0),
                         ("Packaging Box Sheet", 320.0, 450.0, ColorMode::Cmyk, 300.0),
                         ("Web 1920×1080 (RGB)", 508.0, 285.75, ColorMode::Rgb, 96.0),
                     ];
@@ -162,7 +243,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(Margin::same(12))
                             .show(ui, |ui| {
-                                ui.set_min_width(165.0);
+                                ui.set_min_width(154.0);
                                 ui.label(RichText::new(name).strong().color(tokens.text));
                                 ui.label(
                                     RichText::new(format!("{w:.0} × {h:.0} mm · {mode:?} {dpi:.0} DPI"))
@@ -208,7 +289,11 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                             .strong()
                                             .color(tokens.accent),
                                     );
-                                    ui.label(RichText::new(&rec.display_name).strong().color(tokens.text));
+                                    ui.label(
+                                        RichText::new(&rec.display_name)
+                                            .strong()
+                                            .color(tokens.text),
+                                    );
                                     ui.label(
                                         RichText::new(&rec.file_path)
                                             .size(11.0)

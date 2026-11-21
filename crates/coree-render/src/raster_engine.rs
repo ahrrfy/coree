@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Raster Studio Engine: brushes, eraser, clone stamp, smudge,
 //! selection masks (Rectangle, Lasso, Magic Wand, Cutout background removal),

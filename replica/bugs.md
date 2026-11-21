@@ -1,24 +1,31 @@
 # Bug & Audit Remediation Register — `coree`
 
-Every crate underwent independent adversarial code, security, geometry, and runtime auditing by `@verifier` prior to milestone sign-off. All **46 bugs** identified across Waves 1–3 were fixed, covered by targeted regression tests, and independently re-verified before landing on `main`.
+Every crate underwent independent adversarial code, security, geometry, codec, packaging, and runtime auditing by `@verifier` (Waves 1–3) and `@senior-verifier` (v0.2 Wave A & Wave B) prior to milestone sign-off. All **88 bugs** (`46` across Waves 1–3 + `28` across v0.2 Wave A + `14` across v0.2 Wave B) were fixed by their owning architects, covered by targeted automated regression tests, and independently re-verified.
 
 - **Open S1 (Critical / Crash / Security) bugs:** **0**
 - **Open S2 (High / Functional / Data Integrity) bugs:** **0**
-- **Total Resolved Bugs Across Waves 1–3:** **46** (all covered by automated regression tests)
+- **Total Resolved Bugs (Waves 1–3 + v0.2 Waves A & B):** **88** (all covered by automated regression tests)
 
 ---
 
-## Summary by Wave & Commit
+## Summary by Wave
 
-| Wave | Crate(s) | Commit SHA | Bugs Fixed | Verification Status |
-| --- | --- | --- | --- | --- |
-| Wave 1 | `coree-core` | `c5edb05` | 9 | Verified (`44/44` tests pass) |
-| Wave 2 | `coree-prod` | `8cb7354` | 9 | Verified (`36/36` tests pass) |
-| Wave 2 | `coree-cdr` | `8cb7354` | 6 | Verified (`31/31` tests pass) |
-| Wave 2 | `coree-io`, `coree-storage` | `8cb7354` | 7 (4 + 3) | Verified (`31/31` + `18/18` tests pass) |
-| Wave 2 | `coree-render` | `8cb7354` | 7 | Verified (`19/19` tests pass) |
-| Wave 3 | `coree-app` | `b44ba59` | 8 | Verified (`23/23` tests pass incl. Wave 4 E2E) |
-| **Total** | **All 7 Crates** | `c5edb05`..`b44ba59` | **46** | **0 open S1/S2 — `202/202` workspace tests pass** |
+| Wave | Crate(s) / Scope | Bugs Fixed | Verification Status |
+| --- | --- | ---: | --- |
+| Wave 1 | `coree-core` (`c5edb05`) | 9 | Verified (`44/44` -> `55/55` tests pass) |
+| Wave 2 | `coree-prod` (`8cb7354`) | 9 | Verified (`36/36` -> `61/61` tests pass) |
+| Wave 2 | `coree-cdr` (`8cb7354`) | 6 | Verified (`31/31` -> `40/40` tests pass) |
+| Wave 2 | `coree-io`, `coree-storage` (`8cb7354`) | 7 (4 + 3) | Verified (`31/31` -> `52/52` + `18/18` tests pass) |
+| Wave 2 | `coree-render` (`8cb7354`) | 7 | Verified (`19/19` -> `24/24` tests pass) |
+| Wave 3 | `coree-app` (`b44ba59`) | 8 | Verified (`23/23` -> `48/48` tests pass) |
+| **v0.2 Wave A** | **`coree-prod` (Laser & Plugins)** | **7** | **Re-verified by `@senior-verifier` (`61/61` tests pass)** |
+| **v0.2 Wave A** | **`coree-core` + `coree-render` (ICC v2/v4 & Render)** | **4** | **Re-verified by `@senior-verifier` (`79/79` tests pass)** |
+| **v0.2 Wave A** | **`coree-io` (PDF/AI, EPS, DXF, PLT, PSD)** | **13** | **Re-verified by `@senior-verifier` (`52/52` tests pass)** |
+| **v0.2 Wave A** | **`coree-cdr` (ZCF X6–2025 & Previews)** | **4** | **Re-verified by `@senior-verifier` (`40/40` tests pass)** |
+| **v0.2 Wave B** | **`packaging/` & `.github/workflows/` (`#81`->`#83`)** | **4** | **Fixed & verified (`0` unsafe YAML expressions, MIME/Flatpak/Windows clean)** |
+| **v0.2 Wave B** | **`coree-app` Bridge, CLI & `build.rs` (`#85`->`#86`)** | **5** | **Fixed & verified (`48/48` `coree-app` tests, `0` brand hits)** |
+| **v0.2 Wave B** | **`coree-app` Canvas, 65 Tools & State (`#84`->`#87`)** | **5** | **Fixed & verified (`16/16` `tools_62_audit` tests incl. regressions)** |
+| **Total** | **All 7 Crates + Packaging/CI** | **88** | **0 open S1/S2 — `298/298` workspace tests pass** |
 
 ---
 
@@ -107,3 +114,80 @@ Every crate underwent independent adversarial code, security, geometry, and runt
 | BUG-044 | S2 | `coree-app/src/cli.rs`, `io_bridge.rs`, `ui/dockers.rs` | `generate-sample --format coree` ignored explicit format if extension differed; `render --multipage` accepted `NaN`/negative DPI and cropped layouts > 16384px; CSV/Rhai reads were unbounded. | Honored explicit `--format coree`, validated finite positive DPI + auto-scaled oversized multipage renders, and enforced 64 MiB `read_text_file_bounded` (`regression_cli_format_override_dpi_validation_and_bounded_read`). |
 | BUG-045 | S2 | `coree-app/src/ui/canvas.rs`, `dockers.rs`, `state.rs`, `menu_bar.rs` | Eraser only erased final point; Knife left deleted ID in selection; Transform "Apply to Duplicate" added +5mm offset before step; Text tab ignored `ParagraphText`/`TextOnPath`; CDR Inspector cached stale report. | Iterated full Eraser stroke, updated Knife selection, added `duplicate_selection_with_offset(Vec2D::ZERO)`, supported all text payloads, and refreshed CDR Inspector unconditionally. |
 | BUG-046 | S2 | `coree-app/src/shortcuts.rs`, `ui/palette_bar.rs`, `dialogs.rs`, `command_palette.rs` | `Ctrl+Z/Y/D/G/U/Q/L` fired during text editing; compact palette right-click import wasn't wired; Export dialog dropped parent directory/page index/`.webp`; Command Palette arrows moved past 60 rendered rows. | Gated editing shortcuts by `!text_focus`, wired right-click palette import, fixed Export dialog path/page/WebP handling, and clamped Command Palette navigation (`regression_shortcuts_gated_when_text_focused`). |
+
+---
+
+## v0.2 Wave A — `coree-prod` Laser & Plugins (7 Fixes, Re-Verified by `@senior-verifier`)
+
+| ID | Severity | Location | Defect Summary | Resolution & Regression Coverage |
+| --- | --- | --- | --- | --- |
+| BUG-047 | S1 | `coree-prod/src/laser_plugin.rs` | `hatch_pass_at_angle` cast overflowing `span_y / spacing_mm` to `usize`, bypassing `MAX_HATCH_SCANLINES` on huge/non-finite coordinates. | Rejected non-finite/non-positive `span_y`, compared ratio in `f64`, guarded `y.is_finite()`, and bounded output by `MAX_PLAN_POLYLINES` (`regression_1_hatch_large_coords_no_overflow_or_panic`). |
+| BUG-048 | S1 | `coree-prod/src/laser_plugin.rs` | `dash_polyline` could stall or OOM on non-finite segment lengths or unbounded perforate dash counts across segments. | Rejected non-finite `total_seg_len`, switched to parametric `pos` with ULP-stall guard, and enforced shared `MAX_PLAN_POLYLINES` budget (`regression_2_*`). |
+| BUG-049 | S2 | `coree-prod/src/laser_plugin.rs` | `remove_duplicate_segments` shredded short consecutive chords on tight circles, fillets, and glyph curves when chord length `< dedupe_tolerance_mm`. | Stored segment length in spatial grid and bounded per-pair tolerance to `tol.min(len_p * 0.45).min(len_q * 0.45)` (`regression_3_*`). |
+| BUG-050 | S2 | `coree-prod/src/laser_plugin.rs` | `is_polyline_closed` & `join_open_curves` prematurely collapsed short 3-point polylines into closed loops. | Raised closed-loop minimum to `len >= 4` and required `is_genuine_closed_loop` (`max_excursion > eps && arc_len > 2.5 * eps`) (`regression_4_*`). |
+| BUG-051 | S2 | `coree-prod/src/laser_plugin.rs` | `order_and_optimize_segments` initialized `best_idx = 0`, silently dropping valid segments when distance was `Inf`/`NaN`. | Replaced with `best_idx: Option<usize>` seeded from first remaining segment and updated only on finite `d < best_dist` (`regression_5_*`). |
+| BUG-052 | S1 | `coree-prod/src/laser_plugin.rs`, `scene_helpers.rs`, `prepress.rs`, `cut_packaging.rs` | Raw rule names allowed `\r`/`\n` G-Code command injection in comments; `NaN` coords could leak to laser exporters; connectors ignored world transforms. | Added `sanitize_gcode_comment`, `finite_or` float sanitization across all 5 laser exporters, and `resolve_connector_endpoints_with_transform` (`regression_6_*`). |
+| BUG-053 | S1 | `coree-prod/src/plugins.rs` | `export_for_plugin` allowed empty selection when `selection_only = true`; `substitute_bridge_args` could double-expand placeholders; `target_app` allowed path traversal in `PATH` lookup; `from_json_str` could spoof `builtin`/`source_dir`. | Rejected empty `selection_ids` on `selection_only`, implemented single-pass placeholder expansion, validated `target_app` against `/`, `\`, `..`, and reset `source_dir = None` / `builtin = false` (`regression_7_plugins_selection_only_single_pass_target_app_and_json_spoof`). |
+
+---
+
+## v0.2 Wave A — `coree-core` & `coree-render` ICC v2/v4 & Engine (4 Fixes, Re-Verified by `@senior-verifier`)
+
+| ID | Severity | Location | Defect Summary | Resolution & Regression Coverage |
+| --- | --- | --- | --- | --- |
+| BUG-054 | S2 | `coree-core/src/icc.rs` | Crafted `mluc`/`desc` ICC tags could cause allocation-churn DoS or integer overflow in record offset calculations. | Capped per-record strings (`MAX_ICC_DESC_BYTES = 65_536`), cumulative `mluc` scan (`262_144`), and switched to `checked_mul`/`checked_add`. |
+| BUG-055 | S2 | `coree-core/src/icc.rs` | `IccProfile::from_bytes` did not enforce header `profile_size` bounds before tag slicing. | Required `132 <= profile_size <= bytes.len()`, sliced `&bytes[..profile_size]`, and validated every tag `[start..end]`. |
+| BUG-056 | S2 | `coree-core/src/icc.rs` | Missing-TRC fallbacks and matrix/LUT conversions could propagate `NaN`/`±Inf` through color transforms. | Added `clamp_unit_finite` and `sanitize_finite` across all TRC, matrix, PCS, and LUT evaluation paths. |
+| BUG-057 | S2 | `coree-core/src/icc.rs` | Valid ICC v4 `mAB `/`mBA ` LUT tags caused real system ICC v4 profiles to fail parsing instead of falling back cleanly to `A2B1`/matrix+TRC. | Returned `Ok(None)` for valid `>= 32`-byte `mAB `/`mBA ` tags while still rejecting truncated/unknown LUTs; verified **52/52** real system ICC profiles under `/usr/share/color/icc/`. |
+
+---
+
+## v0.2 Wave A — `coree-io` Pro Importers: PSD, PDF/AI, EPS, DXF, PLT (13 Fixes, Re-Verified by `@senior-verifier`)
+
+| ID | Severity | Location | Defect Summary | Resolution & Regression Coverage |
+| --- | --- | --- | --- | --- |
+| BUG-058 | S1 | `coree-io/src/psd.rs` | Skipped PSD user masks (`-2`/`-3`), spot channels (`>=4`), or padded RLE channels desynchronized stream offset for Layer `i+1`. | Recorded `layer_end`, bounded each channel read with `.take(payload_len)`, and sought back to `layer_end` (`psd_multilayer_with_user_mask_and_spot_channel_does_not_desync_next_layer`). |
+| BUG-059 | S1 | `coree-io/src/psd.rs` | Crafted PSD composite PackBits RLE row-count table triggered unbounded pre-allocation OOM before reading data. | Validated `total_rows * count_bytes_per_row <= remaining_file_len` prior to allocation (`psd_crafted_composite_rle_table_overflow_is_rejected_without_oom`). |
+| BUG-060 | S1 | `coree-io/src/pdf_import.rs` | Unexpected PDF delimiters (`<< ] >>`, `[ ) ]`) could stall `parse_obj_from_slice` or `tokenize_content_stream` in an infinite loop. | Guaranteed strict forward progress (`*pos += 1`) and capped collection items (`250_000`) & content tokens (`4_000_000`) (`pdf_adversarial_malformed_delims_length_cycle_bad_bpc_and_amplification`). |
+| BUG-061 | S1 | `coree-io/src/pdf_import.rs` | Self-referential indirect `/Length 1 0 R` cycles caused unbounded recursion stack overflow in `resolve()`. | Added `resolving_objs: HashSet<u32>` cycle guard and threaded `depth + 1` across indirect resolution helpers. |
+| BUG-062 | S1 | `coree-io/src/pdf_import.rs` | Non-standard `/BitsPerComponent` values caused bit-shift underflow panics in `unpack_bpc_samples`. | Restricted `/BitsPerComponent` to ISO 32000-1 `{1, 2, 4, 8, 16}` and hardened shifts with `saturating_sub`. |
+| BUG-063 | S1 | `coree-io/src/pdf_import.rs` | Chained `/Filter` arrays, `/ASCII85Decode`/`/ASCIIHexDecode`/`/RunLengthDecode`, and `/Contents` arrays bypassed cumulative memory budgets. | Capped `/Filter` chains (`16`), charged all decoders against the 128 MiB `charge_cumulative_bytes()` cap, and bounded `/Contents` (`2_048` entries / `32 MiB`). |
+| BUG-064 | S1 | `coree-io/src/eps.rs` | Unmatched `)` in PostScript stream could hang `tokenize_ps_inner` indefinitely. | Handled unmatched `)` explicitly with forward-progress guard and `MAX_PS_TOKENS = 2_000_000` (`eps_adversarial_unmatched_paren_extreme_arc_empty_repeat_and_array_bomb`). |
+| BUG-065 | S1 | `coree-io/src/eps.rs` | Extreme or non-finite angles in `append_ps_arc` caused unbounded `while` loop hangs. | Replaced loops with O(1) `.rem_euclid(360.0)` normalization and finiteness guards. |
+| BUG-066 | S1 | `coree-io/src/eps.rs` | Nested empty `repeat` loops hung CPU and exponential `[1 2] 30 { dup [ exch dup ] } repeat` arrays caused OOM. | Charged `charge_step()` per `repeat` iteration and enforced `MAX_PS_STACK_LEN = 4_096` + `MAX_PS_STACK_NODES = 100_000` before cloning. |
+| BUG-067 | S1 | `coree-io/src/cad_plot.rs` | HPGL `LB`/`DT`/arg parsing sliced UTF-8 strings by raw byte offset, panicking on multibyte characters. | Switched to UTF-8-safe `String::from_utf8_lossy` and full-char boundary stepping (`cad_adversarial_hpgl_utf8_dxf_inf_angles_dag_bomb_and_aci_min`). |
+| BUG-068 | S1 | `coree-io/src/cad_plot.rs` | Non-finite (`inf`/`NaN`) DXF `ARC`/`ELLIPSE` angles hung `while` loops indefinitely. | Enforced `parse_finite_f64` across DXF parsers and O(1) `.rem_euclid` angle normalization. |
+| BUG-069 | S1 | `coree-io/src/cad_plot.rs` | Exponentially nested DXF `BLOCKS`/`INSERT` DAGs ("Billion Laughs") caused CPU/RAM exhaustion. | Enforced `MAX_DXF_EXPANDED_ENTITIES = 250_000` and `MAX_DXF_EXPAND_STEPS = 1_000_000` in `expand_dxf_entity`. |
+| BUG-070 | S2 | `coree-io/src/cad_plot.rs` | `aci.abs()` on `i32::MIN` panicked with signed integer overflow in DXF table/entity color lookup. | Replaced with `aci.saturating_abs()`. |
+
+---
+
+## v0.2 Wave A — `coree-cdr` ZCF X6–2025 & Previews (4 Fixes, Re-Verified by `@senior-verifier`)
+
+| ID | Severity | Location | Defect Summary | Resolution & Regression Coverage |
+| --- | --- | --- | --- | --- |
+| BUG-071 | S1 | `coree-cdr/src/cdr_riff.rs` | `RealCorelMatrix` `NaN`/`Inf` overflow propagated into `convert_real_corel_rect` (`clamp(0.0, NaN)` panic) and `convert_real_corel_ellipse`. | Added `RealCorelMatrix::is_finite()`/`sanitized()`, `checked_add` on offsets, and sanitized finite `>= 0.0` rect/ellipse geometry before clamping (`regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape`). |
+| BUG-072 | S1 | `coree-cdr/src/cdr_riff.rs`, `zcf.rs` | Overlapping/decreasing `loda` arg offsets enabled 512x–1024x re-parse CPU/RAM amplification; `0x00C9` JSON override lacked size cap. | Enforced strictly monotonic non-overlapping arg offsets, cumulative parsed byte cap `<= data.len()`, and `MAX_C9_STYLE_JSON_BYTES = 256 KiB`. |
+| BUG-073 | S2 | `coree-cdr/src/cdr_riff.rs` | Off-by-one scan bound in `find_embedded_corel_color` missed 17-byte color blocks sitting at the exact tail of 29/31-byte v16 solid `fild` chunks. | Guarded `slice.len() >= 17` and switched loop to inclusive `0..=slice.len() - 17`. |
+| BUG-074 | S2 | `coree-cdr/src/zcf.rs` | `extract_rdf_li_list` unescaped XML before scanning `<rdf:li>`, causing double-unescaping and tag truncation on `&lt;/rdf:li&gt;`. | Split `extract_xml_tag_raw` and unescaped each leaf `<rdf:li>` exactly once. |
+
+---
+
+## v0.2 Wave B — Packaging, Release CI, Bridge/CLI & Interactive Tools (14 Fixes, `#81`–`#87`)
+
+| ID | Severity | Location | Defect Summary | Resolution & Regression Coverage |
+| --- | --- | --- | --- | --- |
+| BUG-075 | S1 | `.github/workflows/release.yml` | `${{ github.event.inputs.tag }}` and step outputs were interpolated directly inside `bash`/`pwsh` `run:` scripts under `permissions: contents: write` (GitHub Actions script injection). | Routed all inputs/outputs strictly through step `env:` blocks and enforced `^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$` tag validation (`0` `${{` in any `run:` block). |
+| BUG-076 | S2 | `packaging/windows/register-file-associations.cmd` | `:unregister` deleted `coree.Document` without clearing `(Default)` on `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt` (leaving dangling ProgIDs), and lacked `chcp 65001` for Arabic/Unicode install paths. | Added `chcp 65001 >nul 2>&1` at startup and locale-safe `reg query /ve` cleanup deleting `(Default)` on all 5 extensions when pointing to `coree.Document`. |
+| BUG-077 | S2 | `packaging/linux/install-linux.sh`, `build-deb.sh` | Unquoted `sed` substitution in `install-linux.sh` broke on `$HOME` containing spaces/`&`/`|` (and `xdg-mime` failed if `~/.config` missing); `build-deb.sh` crashed under `set -u` on missing flag values and hardcoded `/usr/bin/dpkg-deb`. | Quoted & escaped `Exec=` paths via `awk` `ENVIRON`, created `$XDG_CONFIG_HOME` before `xdg-mime default`, added `[[ $# -lt 2 ]]` guards, and resolved `dpkg-deb` via `command -v`. |
+| BUG-078 | S2 | `packaging/linux/coree-mime.xml`, `flatpak/io.github.ahrrfy.coree.{metainfo.xml,yml}`, `.github/PULL_REQUEST_TEMPLATE.md` | X4–X5 CDT (`application/x-vnd.corel.draw.template`) misclassified as `.cdr`; `metainfo.xml` omitted `application/vnd.corel-draw`; Flatpak manifest installed unprefixed MIME icons & unexported thumbnailer; PR template still listed `MPL-2.0`. | Added X4–X5 CDT magic rule (verified via `gio info`), added `<mediatype>application/vnd.corel-draw</mediatype>`, fixed Flatpak App-ID-only exports & icon rewrite, and updated PR template to `MIT OR Apache-2.0`. |
+| BUG-079 | S1 | `coree-app/src/cdr_bridge.rs`, `io_bridge.rs` | Brand sweep flagged 17 hits (`MagicKind::RiffCorel`, `open_binary_corel_doc`, doc comments). | Renamed to `MagicKind::RiffCdr` / `open_binary_cdr_doc` and scrubbed comments (`sweep.py crates/coree-app`: `0` hits). |
+| BUG-080 | S1 | `coree-app/src/cli.rs` | Unit test `cli_parses_positional_files_including_arabic_and_multiple_args` contained a personal local machine path. | Replaced with synthetic Arabic test path `"/tmp/درع الشكر/sample.cdr.zip"`. |
+| BUG-081 | S2 | `coree-app/src/cdr_bridge.rs` | `render_page0_thumbnail_png` deep-cloned the entire `Document` (including 100+ MiB `assets` RGBA buffers) just to switch page index. | Changed `render_page0_thumbnail_png` to mutate `&mut Document` in place (zero `Document::clone`). |
+| BUG-082 | S2 | `coree-app/build.rs` | MinGW `gnu` target passed `.res` instead of COFF `.o` to `gcc`, omitted `--target=pe-x86-64`/`pe-i386` for `windres`, and searched bare `"rc"` on Unix `PATH`. | Emits `$OUT_DIR/coree_res.o` on non-MSVC targets, passes explicit `--target` to `windres`, and searches strictly for `"rc.exe"`. |
+| BUG-083 | S2 | `coree-app/src/cli.rs` | `Commands::Preflight` lacked validation for non-finite or `<= 0.0` `--min-dpi`. | Added strict finite positive validation + unit regression tests covering `NaN`, `inf`, `0`, and `-150`. |
+| BUG-084 | S1 | `coree-app/src/ui/canvas.rs` | `show_inline_text_editor_overlay` panicked (`min > max` in `.clamp()`) when canvas width `< 186px` or height `< 86px`. | Clamped `avail_w`/`avail_h` safely (`>= 24px`) with `max >= min` and finiteness guards (`tools_62_audit`). |
+| BUG-085 | S1 | `coree-app/src/state.rs` | Cut/Copy+Paste of `Group` & `PowerClip` only cloned top-level objects, losing descendants on Cut+Paste and aliasing child IDs on Copy+Paste. | Deep-cloned full descendant subtrees + `RasterAsset`s into `ClipboardSnapshot` and remapped all IDs on paste (`tools_62_audit`). |
+| BUG-086 | S1 | `coree-app/src/state.rs` | `apply_raster_tool_stroke` panicked in `FloodFill` on `0×0` `RasterAsset` and mutated buffers in place bypassing `CommandHistory` (breaking Undo/Redo on all 8 raster ops). | Guarded zero dims and committed cloned `RasterAsset` via `CommandOp::UpdateRaster` so `Ctrl+Z`/`Ctrl+Shift+Z` restores pixels cleanly (`tools_62_audit`). |
+| BUG-087 | S1 | `coree-app/src/state.rs`, `ui/canvas.rs` | Left-Drag + Right-Click stamp duplicate captured uncommitted mid-drag transforms into `CommandHistory` `before` snapshots, corrupting Undo/Esc rollback. | Temporarily restores exact pre-drag transforms before stamping via `stamp_duplicate_with_affine` and immediately reapplies live preview (`tools_62_audit`). |
+| BUG-088 | S2 | `coree-app/src/state.rs`, `ui/canvas.rs` | `apply_crop_rect` ignored `layer.locked`; `ensure_raster_target_at` painted on locked/hidden layers; `commit_parametric_shape_edit` duplicated nested `Group`/`PowerClip` shapes onto top layers; Gradient/Transparency/Envelope/Mesh handle drags mutated locked objects. | Enforced unified `is_object_editable_in_doc` checks across Crop/Raster/Handle drags and updated nested container shapes in-place transactionally (`tools_62_audit`). |

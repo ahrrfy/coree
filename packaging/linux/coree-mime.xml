@@ -1,15 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- freedesktop.org shared-mime-info rules for coree & CDR/CDT/CMX/CPT files -->
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
-  <mime-type type="application/x-coree">
-    <comment>coree Vector Graphics Document</comment>
-    <sub-class-of type="application/zip"/>
-    <glob pattern="*.coree"/>
-    <icon name="coree"/>
-  </mime-type>
-
-  <mime-type type="application/x-cdr">
+  <!-- Extend canonical freedesktop MIME type for .cdr so ZIP-based X4-2025 .cdr files
+       are NEVER misclassified as plain application/zip with an archive icon. -->
+  <mime-type type="application/vnd.corel-draw">
     <comment>CDR Vector Graphics Document</comment>
-    <magic priority="60">
+    <sub-class-of type="application/zip"/>
+    <magic priority="90">
+      <!-- Modern ZCF X6-2025 ZIP-based .cdr (uncompressed ZCF mimetype entry) -->
+      <match type="string" value="PK\x03\x04" offset="0">
+        <match type="string" value="application/x-vnd.corel" offset="30:120"/>
+      </match>
+      <!-- ZIP/OPC X4-X5 .cdr (content/riffData.cdr header entry) -->
+      <match type="string" value="PK\x03\x04" offset="0">
+        <match type="string" value="content/riffData.cdr" offset="26:120"/>
+      </match>
+      <!-- Classic RIFF/RIFX v4-X3 .cdr -->
       <match type="string" value="RIFF" offset="0">
         <match type="string" value="CDR" offset="8"/>
       </match>
@@ -17,13 +24,31 @@
         <match type="string" value="CDR" offset="8"/>
       </match>
     </magic>
-    <glob pattern="*.cdr"/>
+    <glob pattern="*.cdr" weight="80"/>
+    <glob pattern="*.CDR" weight="80"/>
+    <glob pattern="*.cdr.zip" weight="80"/>
     <icon name="coree"/>
+    <generic-icon name="coree"/>
+  </mime-type>
+
+  <mime-type type="application/x-coree">
+    <comment>coree Vector Graphics Document</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.coree" weight="80"/>
+    <icon name="coree"/>
+    <generic-icon name="coree"/>
   </mime-type>
 
   <mime-type type="application/x-cdt">
     <comment>CDT Vector Graphics Template</comment>
-    <magic priority="60">
+    <sub-class-of type="application/zip"/>
+    <magic priority="92">
+      <match type="string" value="PK\x03\x04" offset="0">
+        <match type="string" value="application/x-vnd.corel.zcf.draw.template" offset="30:120"/>
+      </match>
+      <match type="string" value="PK\x03\x04" offset="0">
+        <match type="string" value="application/x-vnd.corel.draw.template" offset="30:120"/>
+      </match>
       <match type="string" value="RIFF" offset="0">
         <match type="string" value="CDT" offset="8"/>
       </match>
@@ -31,13 +56,16 @@
         <match type="string" value="CDT" offset="8"/>
       </match>
     </magic>
-    <glob pattern="*.cdt"/>
+    <glob pattern="*.cdt" weight="80"/>
+    <glob pattern="*.CDT" weight="80"/>
+    <glob pattern="*.cdt.zip" weight="80"/>
     <icon name="coree"/>
+    <generic-icon name="coree"/>
   </mime-type>
 
   <mime-type type="application/x-cmx">
     <comment>CMX Vector Exchange Document</comment>
-    <magic priority="60">
+    <magic priority="70">
       <match type="string" value="RIFF" offset="0">
         <match type="string" value="CMX" offset="8"/>
       </match>
@@ -45,21 +73,28 @@
         <match type="string" value="CMX" offset="8"/>
       </match>
     </magic>
-    <glob pattern="*.cmx"/>
+    <glob pattern="*.cmx" weight="80"/>
+    <glob pattern="*.CMX" weight="80"/>
     <icon name="coree"/>
+    <generic-icon name="coree"/>
   </mime-type>
 
   <mime-type type="application/x-cpt">
     <comment>CPT Multi-Layer Raster Image</comment>
-    <magic priority="60">
+    <magic priority="70">
       <match type="string" value="CPT7FILE" offset="0"/>
       <match type="string" value="CPT8FILE" offset="0"/>
       <match type="string" value="CPT9FILE" offset="0"/>
       <match type="string" value="RIFF" offset="0">
         <match type="string" value="CPT " offset="8"/>
       </match>
+      <match type="string" value="RIFX" offset="0">
+        <match type="string" value="CPT " offset="8"/>
+      </match>
     </magic>
-    <glob pattern="*.cpt"/>
+    <glob pattern="*.cpt" weight="80"/>
+    <glob pattern="*.CPT" weight="80"/>
     <icon name="coree"/>
+    <generic-icon name="coree"/>
   </mime-type>
 </mime-info>

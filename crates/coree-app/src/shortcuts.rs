@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Switchable keyboard shortcut profiles:
 //! - **`ClassicStudio`** (default muscle memory: `Space` toggle Pick, `F2`/`Z` Zoom, `F3` Zoom Out,
@@ -44,6 +44,7 @@ pub enum ShortcutAction {
     SelectPick,
     SelectShapeNode,
     SelectZoom,
+    SelectOneShotZoom,
     SelectPan,
     SelectFreehand,
     SelectPen,
@@ -63,7 +64,9 @@ pub enum ShortcutAction {
     ZoomOut,
     ZoomToAll,
     ZoomToPage,
+    ZoomToSelected,
     ZoomActual,
+    ToggleFullScreenPreview,
     PrevPage,
     NextPage,
 
@@ -76,6 +79,7 @@ pub enum ShortcutAction {
     ExportFile,
     ToggleCommandPalette,
     OpenFindReplace,
+    OpenOptions,
     ToggleDockerObjects,
     ToggleDockerProperties,
     ToggleDockerLens,
@@ -83,7 +87,12 @@ pub enum ShortcutAction {
     // Editing & Scene ops
     Undo,
     Redo,
+    Cut,
+    Copy,
+    Paste,
     Duplicate,
+    DuplicateInPlace,
+    RepeatLastCommand,
     DeleteSelection,
     SelectAll,
     EscapeCancel,
@@ -98,6 +107,10 @@ pub enum ShortcutAction {
         dx_steps: i32,
         dy_steps: i32,
         mult: i32,
+    },
+    MicroNudge {
+        dx_steps: i32,
+        dy_steps: i32,
     },
 }
 
@@ -119,16 +132,23 @@ pub fn resolve_shortcut(
     // Always-available command-modified & function shortcuts
     if ctrl && !alt {
         match (key, shift) {
-            (Key::Space, false) => return Some(ShortcutAction::ToggleCommandPalette),
+            (Key::Space, false) | (Key::P, true) => {
+                return Some(ShortcutAction::ToggleCommandPalette);
+            }
             (Key::N, false) => return Some(ShortcutAction::NewDocument),
             (Key::O, false) => return Some(ShortcutAction::OpenDocument),
             (Key::S, false) => return Some(ShortcutAction::SaveDocument),
             (Key::S, true) => return Some(ShortcutAction::SaveDocumentAs),
             (Key::I, false) => return Some(ShortcutAction::ImportFile),
             (Key::E, false) => return Some(ShortcutAction::ExportFile),
+            (Key::J, false) => return Some(ShortcutAction::OpenOptions),
             (Key::Z, false) if !text_focus => return Some(ShortcutAction::Undo),
             (Key::Z, true) | (Key::Y, false) if !text_focus => return Some(ShortcutAction::Redo),
+            (Key::X, false) if !text_focus => return Some(ShortcutAction::Cut),
+            (Key::C, false) if !text_focus => return Some(ShortcutAction::Copy),
+            (Key::V, false) if !text_focus => return Some(ShortcutAction::Paste),
             (Key::D, false) if !text_focus => return Some(ShortcutAction::Duplicate),
+            (Key::R, false) if !text_focus => return Some(ShortcutAction::RepeatLastCommand),
             (Key::G, false) if !text_focus => return Some(ShortcutAction::Group),
             (Key::U, false) if !text_focus => return Some(ShortcutAction::Ungroup),
             (Key::G, true) if !text_focus && profile == ShortcutProfile::StandardVector => {
@@ -152,6 +172,31 @@ pub fn resolve_shortcut(
             (Key::Num0, false) => return Some(ShortcutAction::ZoomActual),
             (Key::PageUp, false) => return Some(ShortcutAction::ZOrder(ZOrderOp::BringForward)),
             (Key::PageDown, false) => return Some(ShortcutAction::ZOrder(ZOrderOp::SendBackward)),
+            // Ctrl+Arrow = Micro-Nudge (0.5x)
+            (Key::ArrowLeft, false) if !text_focus => {
+                return Some(ShortcutAction::MicroNudge {
+                    dx_steps: -1,
+                    dy_steps: 0,
+                });
+            }
+            (Key::ArrowRight, false) if !text_focus => {
+                return Some(ShortcutAction::MicroNudge {
+                    dx_steps: 1,
+                    dy_steps: 0,
+                });
+            }
+            (Key::ArrowUp, false) if !text_focus => {
+                return Some(ShortcutAction::MicroNudge {
+                    dx_steps: 0,
+                    dy_steps: -1,
+                });
+            }
+            (Key::ArrowDown, false) if !text_focus => {
+                return Some(ShortcutAction::MicroNudge {
+                    dx_steps: 0,
+                    dy_steps: 1,
+                });
+            }
             _ => {}
         }
     }
@@ -175,13 +220,16 @@ pub fn resolve_shortcut(
         return None;
     }
 
-    // Z-Order Shift+PageUp / Shift+PageDown and page navigation
+    // Z-Order Shift+PageUp / Shift+PageDown, page navigation, Numpad + duplicate, Full-screen F9, and Nudge
     if !ctrl && !alt {
         match (key, shift) {
             (Key::PageUp, true) => return Some(ShortcutAction::ZOrder(ZOrderOp::BringToFront)),
             (Key::PageDown, true) => return Some(ShortcutAction::ZOrder(ZOrderOp::SendToBack)),
             (Key::PageUp, false) => return Some(ShortcutAction::PrevPage),
             (Key::PageDown, false) => return Some(ShortcutAction::NextPage),
+            (Key::F9, false) => return Some(ShortcutAction::ToggleFullScreenPreview),
+            (Key::F2, true) => return Some(ShortcutAction::ZoomToSelected),
+            (Key::Plus, false) => return Some(ShortcutAction::DuplicateInPlace),
             (Key::Delete, false) | (Key::Backspace, false) => {
                 return Some(ShortcutAction::DeleteSelection);
             }
@@ -189,28 +237,28 @@ pub fn resolve_shortcut(
                 return Some(ShortcutAction::Nudge {
                     dx_steps: -1,
                     dy_steps: 0,
-                    mult: if shift { 10 } else { 1 },
+                    mult: if shift { 2 } else { 1 },
                 });
             }
             (Key::ArrowRight, _) => {
                 return Some(ShortcutAction::Nudge {
                     dx_steps: 1,
                     dy_steps: 0,
-                    mult: if shift { 10 } else { 1 },
+                    mult: if shift { 2 } else { 1 },
                 });
             }
             (Key::ArrowUp, _) => {
                 return Some(ShortcutAction::Nudge {
                     dx_steps: 0,
                     dy_steps: -1,
-                    mult: if shift { 10 } else { 1 },
+                    mult: if shift { 2 } else { 1 },
                 });
             }
             (Key::ArrowDown, _) => {
                 return Some(ShortcutAction::Nudge {
                     dx_steps: 0,
                     dy_steps: 1,
-                    mult: if shift { 10 } else { 1 },
+                    mult: if shift { 2 } else { 1 },
                 });
             }
             _ => {}
@@ -222,7 +270,8 @@ pub fn resolve_shortcut(
         match profile {
             ShortcutProfile::ClassicStudio => match (key, shift) {
                 (Key::Space, false) => Some(ShortcutAction::TogglePickSpace),
-                (Key::F2, false) | (Key::Z, false) => Some(ShortcutAction::SelectZoom),
+                (Key::F2, false) => Some(ShortcutAction::SelectOneShotZoom),
+                (Key::Z, false) => Some(ShortcutAction::SelectZoom),
                 (Key::F3, false) => Some(ShortcutAction::ZoomOut),
                 (Key::F4, false) => Some(ShortcutAction::ZoomToAll),
                 (Key::F4, true) => Some(ShortcutAction::ZoomToPage),
@@ -254,6 +303,7 @@ pub fn resolve_shortcut(
                 (Key::Space, false) => Some(ShortcutAction::TogglePickSpace),
                 (Key::N, false) | (Key::A, false) => Some(ShortcutAction::SelectShapeNode),
                 (Key::Z, false) => Some(ShortcutAction::SelectZoom),
+                (Key::F2, false) => Some(ShortcutAction::SelectOneShotZoom),
                 (Key::H, false) => Some(ShortcutAction::SelectPan),
                 (Key::P, false) => Some(ShortcutAction::SelectPen),
                 (Key::B, false) => Some(ShortcutAction::SelectFreehand),
@@ -306,8 +356,9 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::StandardVector, ShortcutAction::SelectPick) => "V",
         (ShortcutProfile::ClassicStudio, ShortcutAction::SelectShapeNode) => "F10",
         (ShortcutProfile::StandardVector, ShortcutAction::SelectShapeNode) => "N",
-        (ShortcutProfile::ClassicStudio, ShortcutAction::SelectZoom) => "F2 / Z",
+        (ShortcutProfile::ClassicStudio, ShortcutAction::SelectZoom) => "Z",
         (ShortcutProfile::StandardVector, ShortcutAction::SelectZoom) => "Z",
+        (_, ShortcutAction::SelectOneShotZoom) => "F2",
         (_, ShortcutAction::SelectPan) => "H",
         (ShortcutProfile::ClassicStudio, ShortcutAction::SelectFreehand) => "F5",
         (ShortcutProfile::StandardVector, ShortcutAction::SelectFreehand) => "B",
@@ -335,7 +386,9 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::StandardVector, ShortcutAction::ZoomOut) => "Ctrl+-",
         (_, ShortcutAction::ZoomToAll) => "F4",
         (_, ShortcutAction::ZoomToPage) => "Shift+F4",
+        (_, ShortcutAction::ZoomToSelected) => "Shift+F2",
         (_, ShortcutAction::ZoomActual) => "Ctrl+0",
+        (_, ShortcutAction::ToggleFullScreenPreview) => "F9",
         (_, ShortcutAction::PrevPage) => "PgUp",
         (_, ShortcutAction::NextPage) => "PgDn",
         (_, ShortcutAction::NewDocument) => "Ctrl+N",
@@ -347,12 +400,18 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::ClassicStudio, ShortcutAction::ToggleCommandPalette) => "Ctrl+Space",
         (ShortcutProfile::StandardVector, ShortcutAction::ToggleCommandPalette) => "Ctrl+K",
         (_, ShortcutAction::OpenFindReplace) => "Ctrl+F",
+        (_, ShortcutAction::OpenOptions) => "Ctrl+J",
         (_, ShortcutAction::ToggleDockerObjects) => "Alt+Shift+O",
         (_, ShortcutAction::ToggleDockerProperties) => "Alt+Enter",
         (_, ShortcutAction::ToggleDockerLens) => "Alt+F3",
         (_, ShortcutAction::Undo) => "Ctrl+Z",
         (_, ShortcutAction::Redo) => "Ctrl+Shift+Z",
+        (_, ShortcutAction::Cut) => "Ctrl+X",
+        (_, ShortcutAction::Copy) => "Ctrl+C",
+        (_, ShortcutAction::Paste) => "Ctrl+V",
         (_, ShortcutAction::Duplicate) => "Ctrl+D",
+        (_, ShortcutAction::DuplicateInPlace) => "Num +",
+        (_, ShortcutAction::RepeatLastCommand) => "Ctrl+R",
         (_, ShortcutAction::DeleteSelection) => "Del",
         (_, ShortcutAction::SelectAll) => "Ctrl+A",
         (_, ShortcutAction::EscapeCancel) => "Esc",
@@ -376,5 +435,6 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::ClassicStudio, ShortcutAction::Align(AlignOp::CenterPage)) => "P",
         (ShortcutProfile::StandardVector, ShortcutAction::Align(_)) => "",
         (_, ShortcutAction::Nudge { .. }) => "Arrows",
+        (_, ShortcutAction::MicroNudge { .. }) => "Ctrl+Arrows",
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Prepress engine: CMYK + Spot color separations, subtractive overprint simulation,
 //! print imposition (`N-Up`, `BookletSaddleStitch`, `Tiling`), and vector print marks

@@ -1,8 +1,28 @@
-coree — Clean-Room Vector Graphics & Print Production Suite
+coree — Clean-Room Vector Graphics, Multipage Layout & Print Production Suite
 Copyright (c) 2026 coree contributors
 
-This project is licensed under the Mozilla Public License Version 2.0 (MPL-2.0).
-See the LICENSE file in the repository root for the full license text.
+================================================================================
+DUAL OPEN-SOURCE LICENSE (MIT OR Apache-2.0)
+================================================================================
+
+This project is dual-licensed under your choice of either:
+
+  - The MIT License (see LICENSE-MIT in the repository root), OR
+  - The Apache License, Version 2.0 (see LICENSE-APACHE in the repository root).
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+Why MIT OR Apache-2.0?
+This dual license is the gold standard of the Rust open-source ecosystem:
+  1. MIT provides maximum global adoption, simplicity, and compatibility with
+     virtually every open-source and commercial project.
+  2. Apache-2.0 provides an explicit patent license grant (Section 3) and an
+     explicit trademark non-grant (Section 6), protecting both users and
+     contributors worldwide.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in `coree` by you, as defined in the Apache-2.0 license, shall be
+dual-licensed as above, without any additional terms or conditions.
 
 ================================================================================
 CLEAN-ROOM & TRADEMARK NOTICE
@@ -14,9 +34,15 @@ Alludo in Canada, the United States, and/or other countries.
 
 PANTONE® and other Pantone trademarks are the property of Pantone LLC.
 
+Adobe®, Illustrator®, Photoshop®, and PostScript® are registered trademarks or
+trademarks of Adobe Inc. AutoCAD® and DXF™ are trademarks of Autodesk, Inc.
+LightBurn, RDWorks, EZCad, LaserDRW, LaserGRBL, InkCut, and VisiCut are the
+property of their respective owners.
+
 `coree` is an independent, clean-room open-source software project. It is NOT
 affiliated with, endorsed by, sponsored by, or connected in any way to Corel
-Corporation, Alludo, or Pantone LLC.
+Corporation, Alludo, Pantone LLC, Adobe Inc., Autodesk, Inc., or any external
+laser/plotter software vendor.
 
 All source code, user interface designs, icons, documentation, and file format
 parsers/encoders in `coree` are authored independently from scratch using
@@ -26,6 +52,6 @@ artwork, fonts, clip art, templates, or proprietary color books (such as Pantone
 color libraries) are included in this repository.
 
 Any references to third-party file formats (such as `.cdr`, `.cdt`, `.cmx`,
-`.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`) or industry terminology are
-strictly nominative and solely for the purpose of interoperability and user
-familiarity.
+`.cpt`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, `.psd`, `.gcode`) or
+industry terminology are strictly nominative and solely for the purpose of
+interoperability and user familiarity.

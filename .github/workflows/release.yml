@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Dry-run release tag (e.g. v0.2.0)'
+        required: false
+        default: 'v0.2.0'
 
 permissions:
   contents: write
@@ -16,82 +22,381 @@ jobs:
     name: Package Linux (x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve and validate release version
+        id: ver
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${REF_NAME}"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${INPUT_TAG}"
+          fi
+          if [[ ! "${TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$ ]]; then
+            echo "Error: invalid release tag format: ${TAG}" >&2
+            exit 1
+          fi
+          SEMVER="${TAG#v}"
+          printf 'tag=%s\n' "${TAG}" >> "${GITHUB_OUTPUT}"
+          printf 'semver=%s\n' "${SEMVER}" >> "${GITHUB_OUTPUT}"
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Smoke test binary
-        run: ./target/release/coree --diagnostics
-
-      - name: Assemble Linux release archive
+      - name: Atomic CLI verification (Linux)
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          PKG="coree-${TAG}-x86_64-unknown-linux-gnu"
-          mkdir -p "dist/${PKG}/packaging/linux"
-          cp target/release/coree "dist/${PKG}/coree"
-          cp packaging/linux/coree.svg packaging/linux/coree.desktop packaging/linux/coree-mime.xml packaging/linux/install-linux.sh "dist/${PKG}/packaging/linux/"
-          cp LICENSE NOTICE README.md CHANGELOG.md "dist/${PKG}/"
-          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-          sha256sum "dist/${PKG}.tar.gz" > "dist/${PKG}.tar.gz.sha256"
+          set -euo pipefail
+          BIN="./target/release/coree"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "${TMP}"' EXIT
 
-      - name: Upload Linux artifact
+          "${BIN}" --diagnostics
+          "${BIN}" generate-sample "${TMP}/sample.coree" --format coree
+          "${BIN}" generate-sample "${TMP}/sample.cdr" --format cdr-x6
+          "${BIN}" inspect "${TMP}/sample.cdr" --json > "${TMP}/inspect.json"
+          test -s "${TMP}/inspect.json"
+
+          "${BIN}" convert "${TMP}/sample.coree" "${TMP}/out.cdr" --cdr-version x6
+          "${BIN}" convert "${TMP}/sample.cdr" "${TMP}/out.pdf" --cmyk --crop-marks
+          "${BIN}" convert "${TMP}/sample.cdr" "${TMP}/out.eps"
+          "${BIN}" convert "${TMP}/sample.cdr" "${TMP}/out.dxf"
+          "${BIN}" convert "${TMP}/sample.cdr" "${TMP}/out.plt"
+          "${BIN}" convert "${TMP}/sample.cdr" "${TMP}/out.svg"
+
+          "${BIN}" render "${TMP}/sample.cdr" "${TMP}/page0.png" --page 0 --dpi 150
+          "${BIN}" thumbnail "${TMP}/sample.cdr" "${TMP}/thumb.png" --size 256
+          "${BIN}" laser "${TMP}/sample.cdr" "${TMP}/job.gcode" --format gcode --dialect grbl
+          "${BIN}" laser "${TMP}/sample.cdr" "${TMP}/job_laser.dxf" --format dxf
+
+          for f in out.cdr out.pdf out.eps out.dxf out.plt out.svg page0.png thumb.png job.gcode job_laser.dxf; do
+            test -s "${TMP}/${f}"
+          done
+          python3 -c 'import sys; assert open(sys.argv[1], "rb").read(8) == b"\x89PNG\r\n\x1a\n"' "${TMP}/thumb.png"
+          echo "Linux atomic CLI verification passed."
+
+      - name: Validate Linux packaging & Flatpak metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n packaging/linux/install-linux.sh packaging/linux/build-deb.sh packaging/linux/build-appimage.sh
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          ET.parse("packaging/linux/coree-mime.xml")
+          ET.parse("packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml")
+          try:
+              import yaml
+              manifest = yaml.safe_load(open("packaging/linux/flatpak/io.github.ahrrfy.coree.yml"))
+              assert manifest["id"] == "io.github.ahrrfy.coree"
+              assert "--share=network" not in manifest.get("finish-args", [])
+          except ImportError:
+              pass
+          print("MIME XML, AppStream Metainfo, and Flatpak manifest verified.")
+          PY
+          if command -v desktop-file-validate >/dev/null 2>&1; then
+            desktop-file-validate packaging/linux/coree.desktop
+          fi
+          if command -v appstreamcli >/dev/null 2>&1; then
+            appstreamcli validate --no-net packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml
+          fi
+
+      - name: Build native Debian/Ubuntu .deb package
+        shell: bash
+        env:
+          VER: ${{ steps.ver.outputs.semver }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ./packaging/linux/build-deb.sh --version "${VER}" --no-build --out-dir dist
+          (cd dist && sha256sum "coree_${VER}_amd64.deb" > "coree_${VER}_amd64.deb.sha256")
+          dpkg-deb --info "dist/coree_${VER}_amd64.deb"
+
+      - name: Assemble Linux .tar.gz archive
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PKG="coree-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${PKG}/packaging/linux/flatpak"
+          cp target/release/coree "dist/${PKG}/coree"
+          cp packaging/linux/coree.svg \
+             packaging/linux/coree.desktop \
+             packaging/linux/coree-mime.xml \
+             packaging/linux/coree.thumbnailer \
+             packaging/linux/install-linux.sh \
+             "dist/${PKG}/packaging/linux/"
+          cp packaging/linux/flatpak/io.github.ahrrfy.coree.yml \
+             packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml \
+             "dist/${PKG}/packaging/linux/flatpak/"
+          cp LICENSE-MIT LICENSE-APACHE NOTICE README.md CHANGELOG.md "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+
+      - name: Build Linux .AppImage (with graceful AppDir fallback)
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          APPDIR="dist/AppDir"
+          OUT_APPIMAGE="dist/coree-${TAG}-x86_64.AppImage"
+          ./packaging/linux/build-appimage.sh "${APPDIR}" "${OUT_APPIMAGE}"
+
+          TOOL_BIN="/tmp/appimagetool-x86_64.AppImage"
+          if curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+              -o "${TOOL_BIN}" \
+              "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"; then
+            chmod +x "${TOOL_BIN}"
+            if ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "${TOOL_BIN}" --no-appstream "${APPDIR}" "${OUT_APPIMAGE}"; then
+              chmod +x "${OUT_APPIMAGE}"
+              (cd dist && sha256sum "$(basename "${OUT_APPIMAGE}")" > "$(basename "${OUT_APPIMAGE}").sha256")
+              echo "Built AppImage: ${OUT_APPIMAGE}"
+            else
+              echo "::warning::appimagetool execution failed; packaging portable AppDir tarball fallback."
+              FALLBACK="coree-${TAG}-x86_64-AppDir.tar.gz"
+              tar -C dist -czf "dist/${FALLBACK}" AppDir
+              (cd dist && sha256sum "${FALLBACK}" > "${FALLBACK}.sha256")
+            fi
+          else
+            echo "::warning::Could not download appimagetool; packaging portable AppDir tarball fallback."
+            FALLBACK="coree-${TAG}-x86_64-AppDir.tar.gz"
+            tar -C dist -czf "dist/${FALLBACK}" AppDir
+            (cd dist && sha256sum "${FALLBACK}" > "${FALLBACK}.sha256")
+          fi
+
+      - name: Upload Linux release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-linux
           path: |
+            dist/*.deb
             dist/*.tar.gz
+            dist/*.AppImage
             dist/*.sha256
 
   package-windows:
     name: Package Windows (x86_64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Build release binary
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve and validate release version
+        id: ver
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:REF_NAME
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $tag = $env:INPUT_TAG
+          }
+          if ($tag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$') {
+            throw "Invalid release tag format: $tag"
+          }
+          $semver = $tag -replace '^v', ''
+          # MSI Package Version requires numeric Major.Minor.Patch (no prerelease suffix)
+          $msiVer = ($semver -split '-')[0]
+          if ($msiVer -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            $msiVer = "0.2.0"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "semver=$semver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "msi_version=$msiVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Run full workspace tests on Windows
+        run: cargo test --workspace --all-targets
+
+      - name: Build release binary (with embedded coree.ico & UTF-8/DPI manifest)
         run: cargo build --release
 
-      - name: Smoke test binary
-        run: .\target\release\coree.exe --diagnostics
-
-      - name: Assemble Windows release archive
+      - name: Atomic Windows CLI & Arabic UTF-8 filename verification
         shell: pwsh
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $pkg = "coree-$tag-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
-          Copy-Item "target/release/coree.exe" "dist/$pkg/coree.exe"
-          Copy-Item "LICENSE", "NOTICE", "README.md", "CHANGELOG.md" "dist/$pkg/"
-          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip" -Force
-          $hash = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $pkg.zip" | Out-File -Encoding ascii "dist/$pkg.zip.sha256"
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $exe = ".\target\release\coree.exe"
+          $tmp = Join-Path $env:RUNNER_TEMP "coree-win-verify"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
-      - name: Upload Windows artifact
+          & $exe --diagnostics
+          if ($LASTEXITCODE -ne 0) { throw "diagnostics failed" }
+
+          & $exe generate-sample "$tmp\sample.coree" --format coree
+          if ($LASTEXITCODE -ne 0) { throw "generate-sample .coree failed" }
+
+          & $exe generate-sample "$tmp\sample.cdr" --format cdr-x6
+          if ($LASTEXITCODE -ne 0) { throw "generate-sample .cdr failed" }
+
+          & $exe inspect "$tmp\sample.cdr" --json | Out-File -Encoding utf8 "$tmp\inspect.json"
+          if ($LASTEXITCODE -ne 0) { throw "inspect failed" }
+
+          & $exe convert "$tmp\sample.cdr" "$tmp\out.pdf" --cmyk --crop-marks
+          if ($LASTEXITCODE -ne 0) { throw "convert pdf failed" }
+
+          & $exe convert "$tmp\sample.cdr" "$tmp\out.dxf"
+          if ($LASTEXITCODE -ne 0) { throw "convert dxf failed" }
+
+          & $exe convert "$tmp\sample.cdr" "$tmp\out.plt"
+          if ($LASTEXITCODE -ne 0) { throw "convert plt failed" }
+
+          & $exe convert "$tmp\sample.cdr" "$tmp\out.svg"
+          if ($LASTEXITCODE -ne 0) { throw "convert svg failed" }
+
+          & $exe render "$tmp\sample.cdr" "$tmp\page0.png" --page 0 --dpi 150
+          if ($LASTEXITCODE -ne 0) { throw "render failed" }
+
+          & $exe thumbnail "$tmp\sample.cdr" "$tmp\thumb.png" --size 256
+          if ($LASTEXITCODE -ne 0) { throw "thumbnail failed" }
+
+          & $exe laser "$tmp\sample.cdr" "$tmp\job.gcode" --format gcode --dialect grbl
+          if ($LASTEXITCODE -ne 0) { throw "laser gcode failed" }
+
+          & $exe laser "$tmp\sample.cdr" "$tmp\job_laser.dxf" --format dxf
+          if ($LASTEXITCODE -ne 0) { throw "laser dxf failed" }
+
+          # Arabic UTF-8 filename smoke test (validates activeCodePage UTF-8 manifest)
+          $arabicCdr = Join-Path $tmp ([char]0x062F + [char]0x0631 + [char]0x0639 + "_" + [char]0x0627 + [char]0x0644 + [char]0x0634 + [char]0x0643 + [char]0x0631 + ".cdr")
+          $arabicThumb = Join-Path $tmp ([char]0x062F + [char]0x0631 + [char]0x0639 + "_thumb.png")
+          $arabicGcode = Join-Path $tmp ([char]0x062F + [char]0x0631 + [char]0x0639 + "_laser.gcode")
+          & $exe generate-sample $arabicCdr --format cdr-x6
+          if ($LASTEXITCODE -ne 0) { throw "Arabic filename generate-sample failed" }
+          & $exe inspect $arabicCdr --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Arabic filename inspect failed" }
+          & $exe thumbnail $arabicCdr $arabicThumb --size 256
+          if ($LASTEXITCODE -ne 0) { throw "Arabic filename thumbnail failed" }
+          & $exe laser $arabicCdr $arabicGcode --format gcode --dialect grbl
+          if ($LASTEXITCODE -ne 0) { throw "Arabic filename laser failed" }
+
+          foreach ($f in @("sample.coree","sample.cdr","inspect.json","out.pdf","out.dxf","out.plt","out.svg","page0.png","thumb.png","job.gcode","job_laser.dxf")) {
+            $full = Join-Path $tmp $f
+            if (-not (Test-Path $full) -or (Get-Item $full).Length -le 0) {
+              throw "Missing or empty verification output: $f"
+            }
+          }
+          foreach ($full in @($arabicCdr, $arabicThumb, $arabicGcode)) {
+            if (-not (Test-Path $full) -or (Get-Item $full).Length -le 0) {
+              throw "Missing or empty Arabic filename verification output: $full"
+            }
+          }
+          Remove-Item -Recurse -Force $tmp
+          Write-Host "Windows atomic CLI & Arabic UTF-8 verification passed."
+
+      - name: Install WiX Toolset v4 CLI & build Windows .msi installer
+        shell: pwsh
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          MSI_VER: ${{ steps.ver.outputs.msi_version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet tool install --global wix --version 4.*
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          $tag = $env:TAG
+          $msiVer = $env:MSI_VER
+          $msiName = "coree-$tag-x86_64-windows-setup.msi"
+          $msiPath = "dist\$msiName"
+
+          wix build packaging\windows\wix\main.wxs `
+            -arch x64 `
+            -d BinaryPath="target\release\coree.exe" `
+            -d IconPath="packaging\windows\coree.ico" `
+            -d RepoRoot="." `
+            -d Version="$msiVer" `
+            -o "$msiPath"
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+
+          $hash = (Get-FileHash $msiPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $msiName" | Out-File -Encoding ascii "$msiPath.sha256"
+
+      - name: Assemble Windows portable .zip archive
+        shell: pwsh
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:TAG
+          $pkg = "coree-$tag-x86_64-windows-portable"
+          $stage = "dist\$pkg"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item "target\release\coree.exe" "$stage\coree.exe"
+          Copy-Item "packaging\windows\coree.ico" "$stage\coree.ico"
+          Copy-Item "packaging\windows\register-file-associations.cmd" "$stage\register-file-associations.cmd"
+          Copy-Item "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "README.md", "CHANGELOG.md" "$stage\"
+
+          $zipName = "$pkg.zip"
+          $zipPath = "dist\$zipName"
+          Compress-Archive -Path $stage -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zipName" | Out-File -Encoding ascii "$zipPath.sha256"
+
+      - name: Upload Windows release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-windows
           path: |
+            dist/*.msi
             dist/*.zip
             dist/*.sha256
 
   publish-release:
     name: Publish GitHub Release
     needs: [package-linux, package-windows]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Build combined SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release-assets && cat *.sha256 | sort -k2 > SHA256SUMS.txt)
+          cat release-assets/SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            ## coree ${{ github.ref_name }} (`MIT OR Apache-2.0`)
+
+            Clean-room, 100% offline, pure-Rust (`#![forbid(unsafe_code)]`) vector graphics, multipage layout, laser cutting/engraving, and print production studio.
+
+            ### Downloads
+            - **Linux (Ubuntu / Debian):** `coree_*_amd64.deb` — native system install with canonical `.cdr` MIME rules, icons & GNOME thumbnailer
+            - **Linux (Portable Universal):** `coree-*-x86_64.AppImage` (or portable AppDir `.tar.gz`)
+            - **Linux (Tarball + Zero-Sudo Installer):** `coree-*-x86_64-unknown-linux-gnu.tar.gz` (run `./packaging/linux/install-linux.sh`)
+            - **Windows (Installer):** `coree-*-x86_64-windows-setup.msi` (Start Menu + Desktop shortcuts, PATH, file associations, embedded icon & UTF-8 Arabic filename support)
+            - **Windows (Portable, Zero Admin):** `coree-*-x86_64-windows-portable.zip` (includes 1-click `register-file-associations.cmd`)
+
+            Verify downloads against `SHA256SUMS.txt` or per-file `.sha256` checksums.
           files: release-assets/*

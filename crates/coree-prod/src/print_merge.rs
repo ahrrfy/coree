@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Variable Data / Print Merge engine:
 //! - RFC-4180 compliant CSV and TSV parser (quoted commas, escaped quotes, embedded newlines,

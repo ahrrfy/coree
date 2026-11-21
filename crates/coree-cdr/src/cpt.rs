@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room Corel PHOTO-PAINT (`.cpt`) multi-layer raster container reader
 //! (and test fixture writer), supporting `CPT7FILE`, `CPT8FILE`, `CPT9FILE`,

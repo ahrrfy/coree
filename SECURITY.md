@@ -2,15 +2,16 @@
 
 ## Architectural Security Guarantees
 
-`coree` is built as an offline-first, zero-telemetry desktop graphics and print
-production suite designed to safely handle untrusted legacy and third-party
-design documents (`.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.dxf`, `.plt`,
-`.zip`-packaged archives, raster images, and macro scripts).
+`coree` is built as an offline-first, zero-telemetry desktop graphics, laser
+production, and print-prepress suite (dual-licensed `MIT OR Apache-2.0`)
+designed to safely handle untrusted legacy and third-party design documents
+(`.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.pdf`, `.ai`, `.eps`, `.svg`,
+`.svgz`, `.dxf`, `.plt`, `.psd`, `.psb`, `.icc`, `.zip`-packaged archives,
+raster images, laser plugin manifests, and automation scripts).
 
 ### Memory Safety (`#![forbid(unsafe_code)]`)
 
-All core engine, file-format codec, I/O, storage, rendering, and print
-production crates enforce `#![forbid(unsafe_code)]`:
+All 7 workspace crates enforce `#![forbid(unsafe_code)]`:
 
 - `crates/coree-core`
 - `crates/coree-cdr`
@@ -18,35 +19,48 @@ production crates enforce `#![forbid(unsafe_code)]`:
 - `crates/coree-storage`
 - `crates/coree-render`
 - `crates/coree-prod`
+- `crates/coree-app` (including `build.rs`)
 
-Unsafe code is never permitted in parsers, decoders, layout engines, or
-rendering pipelines.
+Unsafe code is never permitted in parsers, decoders, layout engines, laser
+planners, or rendering pipelines.
 
-### Parser & Archive Hardening
+### Parser, Archive & Plugin Hardening
 
-Because design files from print shops and archives may be malformed or
-maliciously crafted, all decoders in `coree-cdr` and `coree-io` enforce strict
-resource bounds:
+Because design files from print shops, signage studios, and client archives may
+be malformed or maliciously crafted, all decoders in `coree-cdr`, `coree-io`,
+`coree-core`, and `coree-prod` enforce strict resource bounds:
 
-- **Zip-Bomb protection:** Bounded decompression limits (maximum uncompressed
-  entry size, total archive expansion cap, and compression-ratio guardrails) on
-  ZIP-based `.cdr`/`.cdt`/`.cpt` containers and compressed RIFF sub-streams.
-- **Zip-Slip protection:** Archive entry paths are strictly validated; path
-  traversal components (`..`), absolute paths, and symlink/device entries are
-  rejected before any access.
-- **Parser recursion & allocation bounds:** Explicit limits on RIFF chunk
-  nesting depth, SVG/DOM tree depth, Bezier path segment counts, bitmap
-  dimensions, and memory allocations prior to allocation (`try_reserve` /
-  explicit caps) to prevent stack overflows and OOM crashes.
+- **Zip-Bomb & Zlib-Bomb protection:** Bounded decompression limits (maximum
+  uncompressed entry size, cumulative archive expansion caps, and incremental
+  compression-ratio guardrails) on ZIP-based `.cdr`/`.cdt`/`.cpt`/`.coree`
+  containers, compressed RIFF `LIST cmpr` sub-streams, `.svgz`, and PDF
+  `/FlateDecode` / `/ASCII85Decode` / `/RunLengthDecode` filter chains.
+- **Zip-Slip & Path Traversal protection:** Archive entry paths and custom
+  plugin manifests (`plugin.json` / `plugin.toml`) are strictly validated;
+  path traversal components (`..`), absolute paths, backslashes in relative
+  paths, and symlink escapes are rejected before any filesystem access.
+- **ZCF Indirect Pointer & Codec Amplification guards:** Strictly monotonic
+  `loda` offset validation, cumulative ZCF dereference budgets, PDF indirect
+  `/Length` cycle guards, PostScript stack-node/repeat caps, DXF block-DAG
+  expansion limits, streaming bounded PSD/PSB layer RGBA downscaling, and
+  bounded ICC v2/v4 `mluc`/`desc`/CLUT parsing prevent CPU hangs and OOM bombs.
 - **Unknown-chunk preservation without execution:** Unrecognized binary chunks
-  are preserved opaquely for round-trip fidelity and never interpreted as code.
+  in `.cdr`/`.cdt`/`.cmx` files are preserved opaquely for round-trip fidelity
+  and never interpreted as code.
+- **Safe Laser & Plotter Plugin Execution:** External bridge plugins
+  (`LightBurn`, `RDWorks`, `EZCad`, `LaserDRW`, `LaserGRBL`, `InkCut/VisiCut`,
+  `HPGL Plotter`) invoke executables via direct `std::process::Command::args`
+  with single-pass placeholder substitution (`{file}`, `{dir}`, `{stem}`) —
+  never via `sh -c` or `cmd /c` (eliminating shell command injection). G-Code
+  comments strip control characters (`\r`, `\n`).
 - **Sandboxed scripting:** Automation macros run inside a bounded Rhai engine
-  with operation limits and no arbitrary filesystem/network escape outside
-  explicitly exposed document APIs.
+  with operation caps (`max_operations`) and no arbitrary filesystem or network
+  escape outside explicitly exposed document APIs.
 - **Atomic local persistence:** Saves and autosave snapshots write to temporary
   files and atomically rename into place, preventing document corruption.
-- **Zero network / zero telemetry:** `coree` operates 100% locally and makes no
-  outbound network connections.
+- **Zero network / zero telemetry & Flatpak isolation:** `coree` operates 100%
+  locally with zero outbound network connections; the official Flatpak manifest
+  omits `--share=network` to enforce OS-level offline sandboxing.
 
 ## Supported Versions
 

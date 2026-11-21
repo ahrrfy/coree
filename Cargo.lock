@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "coree-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "coree-cdr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "coree-core",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "coree-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "i_overlay",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "coree-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "coree-core",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "coree-prod"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coree-core",
  "i_overlay",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "coree-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coree-core",
  "cosmic-text",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "coree-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "coree-core",

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Sandboxed local automation engine powered by `rhai`:
 //! - Strict resource limits (`max_operations`, expression depth, call depth, string/array/map caps,

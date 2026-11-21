@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<component type="desktop-application">
+  <id>io.github.ahrrfy.coree</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>coree</name>
+  <summary>Clean-room offline vector graphics, multipage layout, laser production, and print studio</summary>
+  <developer id="io.github.ahrrfy">
+    <name>coree contributors</name>
+  </developer>
+  <launchable type="desktop-id">coree.desktop</launchable>
+
+  <description>
+    <p>
+      coree is a clean-room, open-source vector illustration, multipage layout,
+      integrated raster studio, laser cutting and engraving, and commercial
+      print-production suite written in 100% pure Rust. It operates completely
+      offline with zero accounts, zero subscriptions, and zero telemetry.
+    </p>
+    <p>Key capabilities include:</p>
+    <ul>
+      <li>Native CDR (RIFF v4–v13, ZIP X4–X5, ZCF X6–2025), CDT, CMX, and CPT support with unknown-chunk passthrough and embedded preview extraction.</li>
+      <li>Pro format import and export: PDF/AI, EPS, AutoCAD DXF, HPGL PLT, multi-layer PSD/PSB, SVG/SVGZ, and high-DPI raster formats.</li>
+      <li>Pure-Rust ICC v2/v4 color management with live CMYK soft-proofing and out-of-gamut warning.</li>
+      <li>62 interactive vector, node-sculpting, optical lens, effect, mesh-fill, and raster tools (including Healing Brush, Dodge/Burn, Flood Fill, and 10 procedural PostScript fills).</li>
+      <li>Native Arabic RTL/BiDi typography, Kashida elongation, Glyphs Docker, and legacy CP1256 text decoding.</li>
+      <li>Laser cutting, engraving, and vinyl plotter toolpath engine (dedupe, curve join, kerf offset, hatch fill, G-Code, DXF R12, HPGL) with extensible plugins for LightBurn, RDWorks, EZCad, LaserDRW, LaserGRBL, and InkCut.</li>
+      <li>Prepress separations, imposition, print marks, Preflight, Collect for Output, CutContour, parametric packaging dielines, vector QR/barcodes, CSV Print Merge, and sandboxed Rhai macros.</li>
+    </ul>
+  </description>
+
+  <url type="homepage">https://github.com/ahrrfy/coree</url>
+  <url type="bugtracker">https://github.com/ahrrfy/coree/issues</url>
+  <url type="vcs-browser">https://github.com/ahrrfy/coree</url>
+
+  <categories>
+    <category>Graphics</category>
+    <category>VectorGraphics</category>
+    <category>2DGraphics</category>
+  </categories>
+
+  <keywords>
+    <keyword>vector</keyword>
+    <keyword>graphics</keyword>
+    <keyword>illustration</keyword>
+    <keyword>prepress</keyword>
+    <keyword>cmyk</keyword>
+    <keyword>cdr</keyword>
+    <keyword>svg</keyword>
+    <keyword>pdf</keyword>
+    <keyword>dxf</keyword>
+    <keyword>laser</keyword>
+    <keyword>engraving</keyword>
+    <keyword>arabic</keyword>
+  </keywords>
+
+  <provides>
+    <binary>coree</binary>
+    <mediatype>application/x-coree</mediatype>
+    <mediatype>application/vnd.corel-draw</mediatype>
+    <mediatype>application/x-cdr</mediatype>
+    <mediatype>application/x-cdt</mediatype>
+    <mediatype>application/x-cmx</mediatype>
+    <mediatype>application/x-cpt</mediatype>
+    <mediatype>image/svg+xml</mediatype>
+    <mediatype>application/pdf</mediatype>
+    <mediatype>application/postscript</mediatype>
+    <mediatype>image/vnd.dxf</mediatype>
+    <mediatype>application/vnd.hp-hpgl</mediatype>
+    <mediatype>image/vnd.adobe.photoshop</mediatype>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.2.0" date="2026-11-21">
+      <description>
+        <p>
+          Dual-licensed MIT OR Apache-2.0 release featuring authentic ZCF CDR X6–2025
+          decoding, PDF/AI/EPS/DXF/PLT/PSD importers, pure-Rust ICC v2/v4 soft-proofing,
+          Laser &amp; Engraving plugins, 62 verified interactive tools, Studio Workspaces,
+          and full Linux (Flatpak, DEB, AppImage, MIME/thumbnailer) and Windows (MSI,
+          portable ZIP, UTF-8 manifest) packaging.
+        </p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-11-21">
+      <description>
+        <p>Initial clean-room 7-crate Rust release with multipage vector studio, 11 live lenses, Arabic RTL/Kashida, and print-production pipeline.</p>
+      </description>
+    </release>
+  </releases>
+</component>

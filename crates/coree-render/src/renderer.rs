@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Full scene graph renderer supporting single-page and Multipage View, Master
 //! layers (`AllPages`/`OddPages`/`EvenPages`), all 11 [`Fill`] variants (including

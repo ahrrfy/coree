@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Color spaces, conversions, harmonies, and clean-room procedural palettes.
 //!

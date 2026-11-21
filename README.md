@@ -1,11 +1,11 @@
 # coree
 
-**Clean-Room Open-Source Vector Graphics, Multipage Layout & Print Production Studio — Linux-First, Cross-Platform, 100% Offline**
+**Clean-Room Open-Source Vector Graphics, Multipage Layout, Laser Production & Print Studio — Linux-First, Cross-Platform, 100% Offline**
 
-**كورِي (`coree`) — حزمة رسوميات متجهية وتخطيط صفحات وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر — لينكس أولاً، تعمل محلياً دون اتصال بالإنترنت**
+**كورِي (`coree`) — حزمة رسوميات متجهية وتخطيط صفحات وإنتاج طباعي وقص بالليزر مفتوحة المصدر ومبنية بالكامل من الصفر — لينكس أولاً، تعمل محلياً دون اتصال بالإنترنت**
 
 [![CI](https://github.com/ahrrfy/coree/actions/workflows/ci.yml/badge.svg)](https://github.com/ahrrfy/coree/actions/workflows/ci.yml)
-[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-3ea6ff.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-3ea6ff.svg)](LICENSE-MIT)
 [![Rust: #![forbid(unsafe_code)]](https://img.shields.io/badge/Rust-forbid(unsafe__code)-f6ad3c.svg)](SECURITY.md)
 
 ---
@@ -22,85 +22,121 @@ All images below are rendered directly by `coree render` (verified 100.0% pixel-
 
 ## English Overview
 
-`coree` is a clean-room, open-source desktop vector illustration, multipage layout, integrated raster studio, vector tracing, and commercial print-production suite written in pure Rust under the **MPL-2.0** license. Built for print shops, sign makers, packaging/laser/vinyl workshops, Arabic/MENA & international designers on **Linux** and **Windows**, `coree` runs **100% offline** with **zero subscriptions, zero accounts, zero cloud lock-in, and zero telemetry**.
+`coree` is a clean-room, open-source desktop vector illustration, multipage layout, integrated raster studio, vector tracing, laser/engraving plugin, and commercial print-production suite written in pure Rust and dual-licensed under **`MIT OR Apache-2.0`**. Built for print shops, laser cutting & fiber engraving workshops, sign makers, packaging/vinyl studios, Arabic/MENA & international designers on **Linux** and **Windows**, `coree` runs **100% offline** with **zero subscriptions, zero accounts, zero cloud lock-in, and zero telemetry**.
 
 - **Repository:** [https://github.com/ahrrfy/coree](https://github.com/ahrrfy/coree)
-- **License:** Mozilla Public License 2.0 ([LICENSE](LICENSE))
-- **Verified Quality:** **202/202** automated tests passing across all 7 crates (`0` failed, `0` ignored), `cargo clippy --workspace --all-targets -- -D warnings` clean, `#![forbid(unsafe_code)]` across all 7 crates, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
+- **License:** Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) (Rust ecosystem gold standard: MIT's maximum global adoption + Apache-2.0's explicit patent grant & trademark non-grant; see [NOTICE](NOTICE))
+- **Feature Parity:** **100.0 / 100** (`68/68` must-have capabilities complete across all 13 feature areas — see [replica/parity.md](replica/parity.md))
+- **Verified Quality:** `#![forbid(unsafe_code)]` across all 7 crates, **298/298** automated unit/integration/E2E/adversarial tests passing (`0` open S1/S2 bugs across 88 verified audit fixes), `cargo clippy --workspace --all-targets -- -D warnings` clean, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
+
+---
+
+### What's New in `v0.2.0`
+
+- **Authentic ZCF `.cdr` X6–2025 (v16–26) Codec:** Full indirect pointer dereferencing (`content/dataFileList.dat`), `styles/document.cdss`, `color/docPalette.xml`, UTF-16LE & CP1256 Arabic text, embedded PNG thumbnail extraction (`extract_cdr_preview_png`), and transparent `.cdr.zip` / `.cdt.zip` magic-byte opening (verified on real v23 CorelDRAW 2021 artwork with 4,746 cubic Bézier handles!).
+- **Pro Industry Importers & Exporters:** Native pure-Rust **PDF 1.0–2.0 & PDF-compatible `.ai`** importer (verified on real 44 MB 60-page PDFs), **EPS / PostScript** importer (DOS binary & PS), **AutoCAD DXF (R12/R2000+) & HPGL `.plt`** importers, and streaming multi-layer **Photoshop `.psd`/`.psb`** importer (verified on real 295 MB 9-layer PSDs).
+- **Pure-Rust ICC v2/v4 Color Management & Live Soft-Proofing:** Real ICC v2/v4 profile parsing (verified on 52/52 real system ICC profiles), built-in `sRGB`, `Display P3`, `ISO Coated v2 CMYK`, and `US Web Coated SWOP CMYK` profiles, live CMYK soft-proofing, and out-of-gamut warning overlay.
+- **Laser Cutting, Engraving & Plotter Plugins:** Dedicated toolpath planner (duplicate-line removal, curve joining, kerf compensation, rotated/cross hatch fill, inner-loops-first ordering, travel optimization, weeding box, GRBL/Marlin/Ruida G-Code & DXF R12/PLT/SVG/EPS export) + extensible `plugin.json`/`plugin.toml`/Rhai architecture with **7 built-in bridge presets**: **LightBurn**, **RDWorks / Ruida**, **EZCad Fiber**, **LaserDRW / M2 Nano**, **LaserGRBL**, **InkCut / VisiCut**, and **Vinyl Plotter (HPGL)**.
+- **62 Real Interactive Tools & Studio Workspaces:** Every single tool across all 15 Toolbox flyout groups live and verified (including **Healing Brush**, **Dodge/Burn**, **Raster Flood Fill**, **10 PostScript Procedural Fills**, **Autofit Page to Content**, and **Glyphs Docker**), plus 6 Workspace Presets (`DefaultClassic`, `Lite`, `Illustration`, `PageLayout`, `LaserSignStudio`, `TouchCompact`), right-click context menu, and muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2`/`F3`/`F4`/`F9`, `Space`, `Ctrl+K`/`L`/`Q`/`D`/`R`/`J`).
+- **Native OS Integration (Linux & Windows):** Fixes Linux `.cdr` ZIP-icon misclassification via canonical `application/vnd.corel-draw` `<sub-class-of type="application/zip"/>` + GNOME `coree.thumbnailer`, adds **Flatpak**, native **`.deb`**, and **`.AppImage`** packages on Linux, and ships **Windows `.msi`** + **Portable `.zip`** (with embedded `coree.ico`, `PerMonitorV2` DPI + `UTF-8` Arabic filename manifest, and 1-click `register-file-associations.cmd`).
 
 ---
 
 ### Architecture (7-Crate Pure-Rust Workspace)
 
-| Crate | Purpose | Automated Tests |
-| --- | --- | ---: |
-| [`crates/coree-core`](crates/coree-core) | Document scene graph, 8 units (`mm`..`CdrTenthMicron`), 6 color models, 8 parametric shapes, 9 `i_overlay` Boolean ops, all 11 Lens definitions, 10 live vector effects, 19 raster filters, Arabic RTL/Kashida model, `VectorTable`, dimensions/connectors, R-Tree `SpatialIndex`, 28 serializable `CommandOp`s, transactional undo/redo | 44 |
-| [`crates/coree-cdr`](crates/coree-cdr) | Clean-room `.cdr` (RIFF v4–v13, ZIP/OPC X4–X5, X6–2025), `.cdt`, `.cmx` (16/32-bit RIFF & RIFX), and `.cpt` (multi-layer v7–v9 & RIFF) codecs, byte-exact **Unknown-Chunk Passthrough**, **CP1256** legacy Arabic decoder, **CDR Structural Inspector**, and Zip-Bomb/Zip-Slip/depth hardening | 31 |
-| [`crates/coree-io`](crates/coree-io) | Native `.coree` archive, SVG/SVGZ import & export, native DeviceCMYK/RGB PDF 1.7 + print marks export, EPS export, DXF (R12/R2000+) & HPGL `.plt` plotter export, PNG/JPEG/WebP/TIFF/BMP + PNG `pHYs` DPI, palette `.gpl`/`.ase`/`.pal` I/O, and atomic temp-file + `fsync` saves | 31 |
-| [`crates/coree-storage`](crates/coree-storage) | Bundled SQLite 3 (WAL mode, 10-table schema), SHA-256 autosave snapshots, deterministic `command_journal` crash recovery, recents/palettes/templates/layouts/preferences, local SFNT font scanner (Arabic/Kashida detection), and non-blocking Rayon background job pool | 18 |
-| [`crates/coree-render`](crates/coree-render) | Backend-agnostic `CanvasBackend` (`tiny-skia`), Rayon 256×256 `DirtyTileCache`, `cosmic-text` Arabic RTL/BiDi/Kashida shaping & real glyph curve extraction, all 11 live optical Lenses (with Frozen/Viewpoint/RemoveFace), all 10 vector effects, integrated Raster Studio (brushes/masks/19 filters/cutout/resample), Quick/Outline/Centerline Vector Trace, Smart Fill, and hit-testing/snapping | 19 |
-| [`crates/coree-prod`](crates/coree-prod) | CMYK + Spot color separations & overprint simulation, N-Up / Saddle-Stitch Booklet / Tiling imposition, vector Print Marks, Document Preflight, Collect for Output, one-click `CutContour`, 4 Parametric Packaging Dielines (`TuckEndBox`, `Envelope`, `ShoppingBag`, `StickerSheet`), Path Length & Area Meter, vector QR & 1D Barcodes (`EAN-13`/`EAN-8`/`UPC-A`/`Code128`/`Code39`), bilingual CSV Print Merge, CIE76 Find & Replace, and sandboxed Rhai macros | 36 |
-| [`crates/coree-app`](crates/coree-app) | Native cross-platform desktop UI (`eframe 0.37` / `egui 0.37` / `egui_dock 0.22`, pure-Rust `rfd` XDG Portal dialogs), 15 Toolbox Flyout groups (62 tools), dockers, Command Palette (`Ctrl+K`), ClassicStudio & StandardVector shortcut profiles, WCAG AA Dark/Light/HighContrast themes, and production headless CLI (`coree` binary) | 23 |
-| **Total** | **`#![forbid(unsafe_code)]` across all 7 crates** | **202** |
+| Crate | Purpose |
+| --- | --- |
+| [`crates/coree-core`](crates/coree-core) | Scene graph, 8 physical units (`mm`..`CdrTenthMicron`), 6 color models, pure-Rust **ICC v2/v4** engine (`sRGB`/`DisplayP3`/`ISO Coated v2`/`SWOP`), 10 analytic **PostScript fills**, 8 parametric shapes, 9 `i_overlay` Boolean ops, all 11 Lenses, 10 live vector effects, 19 raster filters, Arabic RTL/Kashida model, `VectorTable`, Dimensions/Connectors, **Autofit Page**, R-Tree `SpatialIndex`, 28 serializable `CommandOp`s, transactional undo/redo |
+| [`crates/coree-cdr`](crates/coree-cdr) | Clean-room `.cdr` (RIFF v4–v13, ZIP/OPC X4–X5, **ZCF X6–2025 v16–26** indirect pointer dereferencing, `document.cdss`, `docPalette.xml`), `.cdt`, `.cmx` (16/32-bit RIFF & RIFX), and `.cpt` codecs, byte-exact **Unknown-Chunk Passthrough**, **CP1256** legacy Arabic decoder, **Embedded Thumbnail Extractor**, **CDR Inspector**, and Zip-Bomb/Zip-Slip/amplification hardening |
+| [`crates/coree-io`](crates/coree-io) | Native `.coree` archive, **PDF 1.0–2.0 / `.ai`** import + DeviceCMYK/RGB PDF 1.7 print-marks export, **EPS** import & export, **DXF (R12/R2000+)** & **HPGL `.plt`** import & export, streaming multi-layer **PSD/PSB** import, SVG/SVGZ import & export, PNG/JPEG/WebP/TIFF/BMP + PNG `pHYs` DPI, palette `.gpl`/`.ase`/`.pal` I/O, atomic `fsync` saves |
+| [`crates/coree-storage`](crates/coree-storage) | Bundled SQLite 3 (WAL mode, 10-table schema), SHA-256 autosave snapshots, deterministic `command_journal` crash recovery, recents/palettes/templates/layouts/preferences, local SFNT font scanner (Arabic/Kashida detection), non-blocking Rayon background job pool |
+| [`crates/coree-render`](crates/coree-render) | Backend-agnostic `CanvasBackend` (`tiny-skia`), Rayon 256×256 `DirtyTileCache`, live **ICC Soft-Proofing & Gamut Warning**, `cosmic-text` Arabic RTL/BiDi/Kashida shaping + **Glyphs Catalog API** + real glyph curves, all 11 live optical Lenses, all 10 vector effects, 10 SDF PostScript fills, Raster Studio (Paint/Eraser/Clone/Smudge/**Healing**/**Dodge/Burn**/**Flood Fill**/masks/19 filters/cutout/resample), 3-mode Vector Trace, Smart Fill, hit-testing & snapping |
+| [`crates/coree-prod`](crates/coree-prod) | **Laser Cutting, Engraving & Plotter Engine** (dedupe, join, kerf, hatch, inner-first ordering, travel optimization, weeding box, GRBL/Marlin/Ruida G-Code & DXF/PLT/SVG/EPS) + **7 Built-in Laser/Plotter Plugins** (`LightBurn`, `RDWorks`, `EZCad`, `LaserDRW`, `LaserGRBL`, `InkCut/VisiCut`, `HPGL Plotter`) + custom JSON/TOML/Rhai plugins, CMYK/Spot separations & overprint, N-Up/Booklet/Tiling imposition, Print Marks, Preflight, Collect for Output, `CutContour`, 4 Parametric Dielines, Path Meter, QR & 1D Barcodes, bilingual CSV Print Merge, CIE76 Find & Replace, sandboxed Rhai macros |
+| [`crates/coree-app`](crates/coree-app) | Native cross-platform desktop UI (`eframe 0.37` / `egui 0.37` / `egui_dock 0.22`, pure-Rust `rfd` XDG Portal), **62 real interactive tools** in 15 Toolbox flyout groups, 6 Studio Workspace Presets, Glyphs Docker, Laser & Plugins Docker, right-click context menu, full muscle-memory shortcuts, WCAG AA Dark/Light/HighContrast themes, native window icon & Win32 `build.rs` resources, and 11-subcommand headless CLI (`coree`) |
 
 ---
 
-### Installation & Building
+### Installation & Packaging
 
-#### Prerequisites
-- Rust stable toolchain (`rustc`, `cargo`, `clippy`, `rustfmt`) via [rustup.rs](https://rustup.rs)
+#### Option 1 — Linux: Prebuilt Packages (GitHub Releases)
+Download the latest release assets from [GitHub Releases](https://github.com/ahrrfy/coree/releases):
 
-#### Linux (Zero-Sudo Local Install — Ubuntu / Debian / Fedora / Arch)
-`coree` dynamically loads Wayland/X11/OpenGL runtime libraries, bundles SQLite, and uses pure-Rust XDG Desktop Portals (`rfd` `xdg-portal`) — **no `-dev` C header packages (`libgtk-3-dev`, `libx11-dev`, `libfontconfig-dev`) are required**; only `gcc` (`build-essential`) and standard desktop runtime libraries are needed.
+- **Ubuntu / Debian (`.deb` — Recommended for Debian/Ubuntu/Mint/Pop!_OS):**
+  ```bash
+  sudo apt install ./coree_0.2.0_amd64.deb
+  ```
+  Installs `/usr/bin/coree`, desktop entry, canonical `application/vnd.corel-draw` MIME rules (eliminates ZIP icons on `.cdr` files!), SVG app & MIME icons, GNOME/freedesktop `coree.thumbnailer`, and AppStream metainfo.
+- **Universal Portable `.AppImage` (Any Linux distro, zero install):**
+  ```bash
+  chmod +x coree-v0.2.0-x86_64.AppImage
+  ./coree-v0.2.0-x86_64.AppImage
+  ```
+- **Offline-Sandboxed Flatpak:**
+  Build locally from [packaging/linux/flatpak/io.github.ahrrfy.coree.yml](packaging/linux/flatpak/io.github.ahrrfy.coree.yml) (strictly sandboxed with Wayland/X11/DRI and **no network access**):
+  ```bash
+  flatpak-builder --user --install --force-clean build-dir packaging/linux/flatpak/io.github.ahrrfy.coree.yml
+  flatpak run io.github.ahrrfy.coree
+  ```
+
+#### Option 2 — Linux: Build from Source & Zero-Sudo Local Install
+`coree` dynamically loads Wayland/X11/OpenGL runtime libraries, bundles SQLite, and uses pure-Rust XDG Desktop Portals (`rfd`) — **no `-dev` C header packages (`libgtk-3-dev`, `libx11-dev`, `libfontconfig-dev`) are required**; only Rust stable ([rustup.rs](https://rustup.rs)) and `gcc` (`build-essential`).
 
 ```bash
 git clone https://github.com/ahrrfy/coree.git
 cd coree
 
-# Builds release binary and installs ~/.local/bin/coree, icon, desktop entry & MIME types (no sudo)
+# Builds release binary & installs ~/.local/bin/coree, app + MIME icons,
+# desktop entry, canonical .cdr MIME rules, GNOME thumbnailer & xdg-mime defaults (no sudo)
 ./packaging/linux/install-linux.sh
 
 # Verify local installation
 ~/.local/bin/coree --diagnostics
 ```
 
-To stage a portable Linux AppDir (and build an `.AppImage` when `appimagetool` is present):
-
+Build native `.deb` or `.AppImage` locally without `sudo`:
 ```bash
+./packaging/linux/build-deb.sh
 ./packaging/linux/build-appimage.sh
 ```
 
-#### Windows (`x86_64-pc-windows-msvc` / `x86_64-pc-windows-gnu` + WiX v4 MSI)
-See the dedicated Windows build and MSI installer guide at [packaging/windows/build-windows.md](packaging/windows/build-windows.md) and WiX v4 manifest at [packaging/windows/wix/main.wxs](packaging/windows/wix/main.wxs).
+#### Option 3 — Windows (`x86_64`): MSI Installer or Portable ZIP
+Download from [GitHub Releases](https://github.com/ahrrfy/coree/releases):
+- **Windows Installer (`.msi`):** Double-click `coree-v0.2.0-x86_64-windows-setup.msi` — installs `coree.exe` (with embedded `coree.ico`, `PerMonitorV2` HiDPI & `UTF-8` Arabic filename manifest), Start Menu & Desktop shortcuts, `PATH` entry, and full Windows Registry file associations (`coree.Document` + `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.psd`).
+- **Portable `.zip` (Zero Admin):** Extract `coree-v0.2.0-x86_64-windows-portable.zip` anywhere and run `coree.exe`. Optionally double-click `register-file-associations.cmd` to register `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt`/`.svg`/`.dxf`/`.plt` in `HKCU` without Administrator privileges!
 
-```powershell
-cargo build --release
-.\target\release\coree.exe --diagnostics
-```
+To build from source on Windows (MSVC, MinGW-w64, or WiX v4 `.msi`), see [packaging/windows/build-windows.md](packaging/windows/build-windows.md).
 
 ---
 
 ### Headless CLI Reference
 
-Launching `coree` with no subcommand opens the native desktop studio GUI (optionally passing files to open in tabs: `coree artwork.cdr layout.coree`). All production pipelines are also exposed directly as fast offline CLI subcommands:
+Launching `coree` with no subcommand opens the native desktop studio GUI (optionally passing files to open directly as tabs: `coree artwork.cdr layout.coree`). All production pipelines are also available offline via CLI:
 
 ```bash
-# Print build version, license, supported formats, and indexed local font count
+# Print build version, license, supported formats, plugin count, and indexed local fonts
 coree --diagnostics
 
 # Generate a rich showcase sample (.coree, cdr-riff, cdr-x4, cdr-x6, cdt, cmx, svg)
 coree generate-sample demo.cdr --format cdr-x6
 
-# Inspect .cdr/.cdt/.cmx/.cpt/.coree/.svg structure, chunk tree & preserved unknown chunks
+# Inspect .cdr/.cdr.zip/.cdt/.cmx/.cpt/.coree/.svg/.pdf/.ai/.eps/.dxf/.plt/.psd structure
 coree inspect demo.cdr --json
 
-# Universal offline converter (.coree, .cdr, .cdt, .cmx, .svg, .pdf, .eps, .dxf, .plt, .png, .jpg, .webp, .tiff, .bmp)
+# Universal offline converter (.coree, .cdr, .cdt, .cmx, .svg, .pdf, .ai, .eps, .dxf, .plt, .psd, .gcode, rasters)
 coree convert demo.cdr press_ready.pdf --cmyk --crop-marks
-coree convert demo.cdr cut_job.dxf
+coree convert brochure.pdf editable.coree
+coree convert design.psd preview.png --dpi 300
 
 # Deterministic headless renderer (single page or side-by-side Multipage View)
 coree render demo.coree page0.png --page 0 --dpi 150 --view enhanced
 coree render brochure.coree spread.png --multipage --dpi 120
+
+# Fast OS thumbnail extractor (uses embedded CDR/coree previews or renders Page 0)
+coree thumbnail artwork.cdr preview.png --size 256
+
+# Laser Cutting, Engraving & Plotter toolpath export (GRBL/Marlin/Ruida G-Code, DXF R12, PLT, SVG, EPS)
+coree laser sign.cdr cut_job.gcode --format gcode --dialect grbl --dedupe 0.05 --join 0.05 --kerf 0.15
+coree laser shield.cdr.zip lightburn_ready.dxf --plugin lightburn-bridge --weeding-box
 
 # Print-production Preflight audit (text or JSON)
 coree preflight press_ready.coree --min-dpi 300 --json
@@ -133,30 +169,34 @@ cargo fmt --all -- --check
 
 ## نظرة عامة بالعربية
 
-**`coree`** حزمة رسوميات متجهية وتخطيط صفحات متعددة وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر (Clean-Room) بلغة **Rust** وتحت رخصة **MPL-2.0**. صُمّمت لمطابع الأوفست والديجيتال ومشاغل اللافتات والقص بالليزر والفينيل ومصممي العبوات والخط العربي على **لينكس** و**ويندوز**، وتعمل **محلياً بالكامل بنسبة 100%** دون اشتراكات أو حسابات أو سحابة إجبارية أو تتبع.
+**`coree`** حزمة رسوميات متجهية وتخطيط صفحات متعددة واستوديو صور نقطية وقص ونقش بالليزر وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر (Clean-Room) بلغة **Rust** وبترخيص مزدوج **`MIT OR Apache-2.0`**. صُمّمت لمطابع الأوفست والديجيتال وورش القص بالليزر والفايبر والراوتر والفينيل ومصممي اللافتات والعبوات والخط العربي على **لينكس** و**ويندوز**، وتعمل **محلياً بالكامل بنسبة 100%** دون اشتراكات أو حسابات أو سحابة إجبارية أو تتبع.
 
-### أبرز المزايا
-- **محرك متجهات وصفحات متعددة (`coree-core`)**: 8 وحدات قياس، 6 نماذج لونية (CMYK/RGB/Lab/HSL/Gray/Spot)، 9 عمليات منطقية (`i_overlay`)، 11 عدسة بصرية حيّة، 10 مؤثرات متجهية، جداول متجهية، خطوط أبعاد وموصلات، وفهرس مكاني `rstar` مع سجل أوامر متسلسل مقاوم للأعطال.
-- **قراءة وفحص صيغ التصميم (`coree-cdr`, `coree-io`)**: دعم كامل لملفات `.cdr` (RIFF وZIP X4 وX6–2025) و`.cdt` و`.cmx` و`.cpt` مع **تمرير المقاطع غير المعروفة بايت-ببايت (Unknown-Chunk Passthrough)** وأداة **فاحص CDR** واستعادة النصوص العربية القديمة بترميز **CP1256**، بالإضافة إلى تصدير PDF بنظام CMYK مع علامات القص وSVG وEPS وDXF وHPGL `.plt` والصور النقطية.
-- **دعم أصيل للغة العربية (`coree-render`)**: اتجاه RTL وتشكيل حروف أصيل و**تطويل الكشيدة** والكتابة على المسار وتحويل النص إلى منحنيات حقيقية، مع استوديو نقطي مدمج وتتبع متجهي (Quick / Outline / Centerline).
-- **أدوات ما قبل الطباعة والتغليف (`coree-prod`)**: فصل ألوان CMYK وSpot، المونتاج الطباعي (N-Up / كتيّب / تبليط)، الفحص المسبق Preflight، جمع ملفات الطباعة، مسار قص **CutContour** بضغطة واحدة، 4 قوالب تغليف بارامترية (**Dielines**)، مقياس طول ومساحة القص (**Path Meter**)، باركود وQR متجهية، دمج الطباعة من CSV عربي/إنجليزي، وماكرو Rhai معزول أمنياً.
-- **أمان واستقرار (`coree-storage`)**: منع كامل للشيفرة غير الآمنة `#![forbid(unsafe_code)]` في جميع الحزم السبع، حماية ضد قنابل الضغط (Zip-Bomb) واختراق المسارات (Zip-Slip)، حفظ ذري، واستعادة فورية من الأعطال عبر SQLite WAL.
+### أبرز مزايا الإصدار `v0.2.0`
+- **دعم حقيقي وكامل لملفات `.cdr` الحديثة (ZCF X6–2025) والقديمة (`coree-cdr`):** فكّ مؤشرات ZCF غير المباشرة وملفات التنسيق `document.cdss` ولوحات الألوان `docPalette.xml`، واستعادة النصوص العربية (UTF-16LE وCP1256)، واستخراج الصور المصغّرة المدمجة، والفتح المباشر لملفات `.cdr.zip` و`.cdt` و`.cmx` و`.cpt` مع تمرير المقاطع غير المعروفة بايت-ببايت.
+- **استيراد وتصدير شامل لجميع صيغ السوق (`coree-io`):** استيراد حقيقي لملفات **PDF / Adobe Illustrator (`.ai`)** و**EPS** و**AutoCAD DXF** و**HPGL `.plt`** و**Photoshop `.psd`/`.psb` متعددة الطبقات**، إضافة إلى **SVG** وتصدير **PDF بنظام CMYK مع علامات القص** والصور النقطية.
+- **إدارة ألوان ICC v2/v4 ومعاينة طباعية حيّة (`coree-core`, `coree-render`):** محرك ICC نقي بلغة Rust مع ملفات `sRGB` و`Display P3` و`ISO Coated v2 CMYK` و`US Web Coated SWOP` ومعاينة فورية للألوان خارج النطاق الطباعي (Gamut Warning).
+- **بلاجنات القص بالليزر والنقش والبلوتر (`coree-prod`):** محرك مسارات ليزر احترافي (حذف الخطوط المكررة، وصل المسارات المفتوحة، تعويض سماكة الشعاع Kerf، التهشير Hatch/Cross-Hatch للنقش، قص الثقوب الداخلية أولاً، تقليل حركة الانتقال، مربع التفريغ Weeding Box، وتصدير **G-Code** لـ GRBL/Marlin/Ruida و**DXF R12** و**PLT**) مع **7 إضافات جاهزة**: **LightBurn** و**RDWorks / Ruida** و**EZCad Fiber** و**LaserDRW** و**LaserGRBL** و**InkCut / VisiCut** و**HPGL Vinyl Plotter**، وإمكانية إضافة بلاجنات مخصصة بصيغة JSON/TOML أو سكربتات Rhai.
+- **62 أداة تفاعلية حقيقية ومساحات عمل احترافية (`coree-app`):** تشمل فرشاة المعالجة (Healing) والتفتيح/التغميق (Dodge/Burn) والتعبئة النقطية (Flood Fill) و10 تعبئات PostScript إجرائية، وملاءمة الصفحة للمحتوى بضغطة واحدة (Autofit Page)، ولوحة الرموز والخطوط (Glyphs Docker)، و6 مساحات عمل جاهزة واختصارات لوحة المفاتيح الاحترافية.
+- **تكامل كامل مع لينكس وويندوز:** إنهاء مشكلة ظهور ملفات `.cdr` كملفات ZIP على لينكس مع معاينة مصغّرة حقيقية في مدير الملفات، وتوفير حزم **Flatpak** و**`.deb`** و**`.AppImage`** على لينكس، ومثبّت **`.msi`** ونسخة **`.zip` محمولة** على ويندوز مع دعم كامل لأسماء الملفات العربية (`UTF-8`).
 
-### التثبيت المحلي على لينكس (بدون `sudo`)
+### التثبيت على لينكس وويندوز
 
-```bash
-git clone https://github.com/ahrrfy/coree.git
-cd coree
-./packaging/linux/install-linux.sh
-~/.local/bin/coree --diagnostics
-```
+- **لينكس (Ubuntu/Debian `.deb`):** `sudo apt install ./coree_0.2.0_amd64.deb`
+- **لينكس (التثبيت المحلي من المصدر بدون `sudo`):**
+  ```bash
+  git clone https://github.com/ahrrfy/coree.git
+  cd coree
+  ./packaging/linux/install-linux.sh
+  ~/.local/bin/coree --diagnostics
+  ```
+- **ويندوز:** شغّل المثبّت `coree-v0.2.0-x86_64-windows-setup.msi` أو فك ضغط النسخة المحمولة `coree-v0.2.0-x86_64-windows-portable.zip` (مع سكربت ربط الملفات بضغطة واحدة `register-file-associations.cmd`).
 
 ---
 
 ## License & Trademark Disclaimer
 
-Licensed under the **Mozilla Public License Version 2.0 (MPL-2.0)**. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Dual-licensed under the **MIT License** ([LICENSE-MIT](LICENSE-MIT)) or the **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE)), at your option. See [NOTICE](NOTICE) for full attribution and trademark notices.
 
-> **Trademark Disclaimer:** Corel®, CorelDRAW®, PHOTO-PAINT®, and PowerTRACE® are registered trademarks of Corel Corporation / Alludo. `coree` is an independent clean-room open-source project and is **not** affiliated with, endorsed by, or sponsored by Corel Corporation or Alludo.
+> **Trademark Disclaimer:** Corel®, CorelDRAW®, PHOTO-PAINT®, and PowerTRACE® are registered trademarks of Corel Corporation / Alludo. Adobe®, Illustrator®, and Photoshop® are registered trademarks of Adobe Inc. `coree` is an independent clean-room open-source project and is **not** affiliated with, endorsed by, or sponsored by Corel Corporation, Alludo, Adobe Inc., or any external laser/plotter software vendor.
 >
 > **إخلاء مسؤولية العلامات التجارية:** Corel® وCorelDRAW® علامتان تجاريتان مسجلتان لشركة Corel Corporation / Alludo. مشروع `coree` هو مشروع مستقل مفتوح المصدر ومبني من الصفر ولا يرتبط بأي شكل بشركة Corel أو Alludo.

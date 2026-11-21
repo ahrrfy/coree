@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pure-Rust bounded PDF 1.0–2.0 (and PDF-compatible Adobe Illustrator `.ai`) importer.
 //!

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Internal helpers shared across `coree-prod` modules for safe scene-graph traversal,
 //! deep page/object cloning with ID remapping, and `tiny-skia` path conversion.

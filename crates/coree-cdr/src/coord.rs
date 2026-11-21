@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room coordinate conversions (0.1 µm CDR units & 16/32-bit CMX units),
 //! Corel color model codecs (`CMYK255`, `CMYK100`, `RGB`, `BGR`, `Gray`, `Lab`,

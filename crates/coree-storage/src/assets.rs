@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Typed offline CRUD for `recent_documents`, `custom_palettes`, `palette_swatches`,
 //! `templates`, `workspace_layouts`, `brush_presets`, and `app_preferences`.

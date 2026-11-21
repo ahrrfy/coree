@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room pure-Rust Adobe Photoshop `.psd` (v1) and `.psb` (v2) multi-layer importer.
 //!

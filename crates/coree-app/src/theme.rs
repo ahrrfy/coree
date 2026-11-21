@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Clean-room design system tokens (`Dark Studio`, `Classic Light`, `High Contrast`),
+//! Clean-room design system tokens (`Dark Studio`, `Light Studio`, `High Contrast`),
 //! WCAG AA semantic palette, layout metrics, `egui` / `egui_dock` theme application,
 //! and runtime Arabic-capable system font loader.
 
@@ -12,15 +12,15 @@ use std::sync::Arc;
 
 /// Exact layout metrics from `replica/design/tokens.json`.
 pub const MENUBAR_HEIGHT: f32 = 28.0;
-pub const PROPERTY_BAR_HEIGHT: f32 = 34.0;
+pub const PROPERTY_BAR_HEIGHT: f32 = 36.0;
 pub const TOOLBOX_WIDTH: f32 = 44.0;
 pub const RULER_THICKNESS: f32 = 20.0;
 pub const PAGE_TABS_HEIGHT: f32 = 26.0;
 pub const STATUS_BAR_HEIGHT: f32 = 26.0;
 pub const PALETTE_BAR_WIDTH: f32 = 32.0;
-pub const DOCKER_DEFAULT_WIDTH: f32 = 300.0;
-pub const DOCKER_MIN_WIDTH: f32 = 240.0;
-pub const DOCKER_MAX_WIDTH: f32 = 520.0;
+pub const DOCKER_DEFAULT_WIDTH: f32 = 312.0;
+pub const DOCKER_MIN_WIDTH: f32 = 248.0;
+pub const DOCKER_MAX_WIDTH: f32 = 540.0;
 
 /// Selectable studio visual theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -28,7 +28,7 @@ pub enum StudioTheme {
     /// Default color-neutral Dark Studio (`bg=#111318`, Electric Cobalt accent `#3ea6ff`).
     #[default]
     DarkStudio,
-    /// Bright daylight Classic Light studio theme.
+    /// Bright daylight Classic Light Studio theme with crisp neutral panel dividers.
     ClassicLight,
     /// WCAG AAA High Contrast accessibility theme.
     HighContrast,
@@ -36,14 +36,14 @@ pub enum StudioTheme {
 
 impl StudioTheme {
     /// All available themes in UI menu order.
-    pub const ALL: [Self; 3] = [Self::DarkStudio, Self::ClassicLight, Self::HighContrast];
+    pub const ALL: [Self; 3] = [Self::ClassicLight, Self::DarkStudio, Self::HighContrast];
 
-    /// Display label for menus & Preferences.
+    /// Display label for menus & Options.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::DarkStudio => "Dark Studio",
-            Self::ClassicLight => "Classic Light",
+            Self::ClassicLight => "Light Studio",
             Self::HighContrast => "High Contrast",
         }
     }
@@ -114,21 +114,21 @@ impl ThemeTokens {
         }
     }
 
-    /// Neutral daylight Classic Light studio theme with Electric Cobalt focus accent.
+    /// Neutral daylight Light Studio theme with crisp classic desktop contrast & Electric Cobalt accent.
     #[must_use]
     pub const fn classic_light() -> Self {
         Self {
             is_dark: false,
-            bg: Color32::from_rgb(0xf0, 0xf2, 0xf5),
-            canvas_well: Color32::from_rgb(0xdc, 0xe0, 0xe8),
-            surface: Color32::from_rgb(0xf8, 0xf9, 0xfb),
+            bg: Color32::from_rgb(0xeb, 0xee, 0xf3),
+            canvas_well: Color32::from_rgb(0xd5, 0xda, 0xe3),
+            surface: Color32::from_rgb(0xf6, 0xf7, 0xfa),
             surface_elevated: Color32::from_rgb(0xff, 0xff, 0xff),
-            border: Color32::from_rgb(0xc8, 0xd0, 0xdc),
-            border_input: Color32::from_rgb(0x64, 0x70, 0x85),
-            text: Color32::from_rgb(0x14, 0x18, 0x20),
-            text_muted: Color32::from_rgb(0x4b, 0x55, 0x67),
+            border: Color32::from_rgb(0xc2, 0xca, 0xd8),
+            border_input: Color32::from_rgb(0x5e, 0x6b, 0x80),
+            text: Color32::from_rgb(0x13, 0x17, 0x20),
+            text_muted: Color32::from_rgb(0x49, 0x54, 0x68),
             accent: Color32::from_rgb(0x0b, 0x66, 0xc2),
-            accent_hover: Color32::from_rgb(0x1d, 0x7b, 0xd8),
+            accent_hover: Color32::from_rgb(0x1a, 0x7b, 0xd8),
             on_accent: Color32::from_rgb(0xff, 0xff, 0xff),
             accent_secondary: Color32::from_rgb(0xb4, 0x53, 0x09),
             on_accent_secondary: Color32::from_rgb(0xff, 0xff, 0xff),
@@ -199,52 +199,64 @@ pub fn apply_theme(ctx: &egui::Context, theme: StudioTheme) {
     visuals.extreme_bg_color = t.bg;
     visuals.faint_bg_color = t.surface;
     visuals.code_bg_color = t.bg;
+    let hover_bg = if t.is_dark {
+        Color32::from_rgb(
+            t.surface_elevated.r().saturating_add(12),
+            t.surface_elevated.g().saturating_add(14),
+            t.surface_elevated.b().saturating_add(20),
+        )
+    } else {
+        Color32::from_rgb(0xe8, 0xf1, 0xfb)
+    };
+
     visuals.window_stroke = Stroke::new(1.0, t.border_input);
-    visuals.window_corner_radius = CornerRadius::same(8);
-    visuals.menu_corner_radius = CornerRadius::same(6);
+    visuals.window_corner_radius = CornerRadius::same(6);
+    visuals.menu_corner_radius = CornerRadius::same(4);
     visuals.hyperlink_color = t.accent;
     visuals.warn_fg_color = t.warning;
     visuals.error_fg_color = t.danger;
 
-    visuals.selection.bg_fill = t.accent.gamma_multiply(0.32);
-    visuals.selection.stroke = Stroke::new(1.5, t.accent);
+    visuals.selection.bg_fill = t.accent.gamma_multiply(0.28);
+    visuals.selection.stroke = Stroke::new(1.2, t.accent);
 
     visuals.widgets.noninteractive.bg_fill = t.surface;
     visuals.widgets.noninteractive.weak_bg_fill = t.surface;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
-    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(4);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(3);
 
     visuals.widgets.inactive.bg_fill = t.surface_elevated;
     visuals.widgets.inactive.weak_bg_fill = t.surface_elevated;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, t.border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(5);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(4);
 
-    visuals.widgets.hovered.bg_fill = t.surface_elevated;
-    visuals.widgets.hovered.weak_bg_fill = t.surface_elevated;
+    visuals.widgets.hovered.bg_fill = hover_bg;
+    visuals.widgets.hovered.weak_bg_fill = hover_bg;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, t.accent);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.2, t.text);
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(5);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.1, t.text);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.active.bg_fill = t.accent;
     visuals.widgets.active.weak_bg_fill = t.accent;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.5, t.accent_hover);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5, t.on_accent);
-    visuals.widgets.active.corner_radius = CornerRadius::same(5);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.2, t.accent_hover);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.2, t.on_accent);
+    visuals.widgets.active.corner_radius = CornerRadius::same(4);
 
-    visuals.widgets.open.bg_fill = t.surface_elevated;
-    visuals.widgets.open.weak_bg_fill = t.surface_elevated;
+    visuals.widgets.open.bg_fill = hover_bg;
+    visuals.widgets.open.weak_bg_fill = hover_bg;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, t.accent);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0, t.text);
-    visuals.widgets.open.corner_radius = CornerRadius::same(5);
+    visuals.widgets.open.corner_radius = CornerRadius::same(4);
 
     ctx.set_visuals(visuals);
     let egui_theme = ctx.theme();
     ctx.style_mut_of(egui_theme, |style| {
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(6.0, 3.0);
+        style.spacing.item_spacing = egui::vec2(5.0, 4.0);
+        style.spacing.button_padding = egui::vec2(6.0, 2.5);
         style.spacing.window_margin = Margin::same(8);
+        style.spacing.interact_size = egui::vec2(32.0, 20.0);
+        style.spacing.combo_width = 96.0;
     });
 }
 
@@ -258,7 +270,7 @@ pub fn dock_style(tokens: &ThemeTokens, egui_style: &egui::Style) -> egui_dock::
 
     style.tab_bar.bg_fill = tokens.bg;
     style.tab_bar.hline_color = tokens.border;
-    style.tab_bar.height = 28.0;
+    style.tab_bar.height = 26.0;
 
     style.tab.tab_body.bg_fill = tokens.surface;
     style.tab.tab_body.stroke = Stroke::new(1.0, tokens.border);

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! End-to-end integration tests for `coree-cdr`:
 //! - Round-trip fidelity across CDR RIFF v12, CDR X4 ZIP, CDR X6+ ZIP, CDT, and CMX (16/32-bit)
