@@ -230,9 +230,12 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
     }
 }
 
-/// Draws crisp, distinct clean-room geometric vector glyphs for every tool using `egui::Painter`.
+/// Draws crisp 2-tone clean-room geometric vector glyphs for every tool using `egui::Painter`.
 fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color32) {
+    let accent = Color32::from_rgb(0x2D, 0xD4, 0xBF);
+    let amber = Color32::from_rgb(0xF5, 0x9E, 0x0B);
     let s = Stroke::new(1.45, color);
+    let accent_s = Stroke::new(1.25, accent);
     let thin = Stroke::new(1.1, color);
     let c = r.center();
     let w = r.width();
@@ -248,9 +251,10 @@ fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color3
             ];
             painter.add(Shape::convex_polygon(
                 pts.clone(),
-                color.gamma_multiply(0.18),
+                color.gamma_multiply(0.82),
                 s,
             ));
+            painter.circle_filled(pts[0], 1.6, accent);
         }
         ToolId::FreehandPick => {
             painter.circle_stroke(pos2(c.x - w * 0.1, c.y - h * 0.1), w * 0.32, thin);
@@ -269,18 +273,18 @@ fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color3
             painter.line_segment([r.right_bottom(), r.right_bottom() - vec2(0.0, 4.0)], s);
         }
         ToolId::ShapeNode => {
-            // Bézier curve node with tangent handle line and square anchor
+            // Two-tone Bézier curve node with tangent handles and teal anchor square
             painter.line_segment(
                 [
                     pos2(r.left() + 1.0, r.bottom() - 2.0),
                     pos2(r.right() - 1.0, r.top() + 2.0),
                 ],
-                thin,
+                accent_s,
             );
-            painter.circle_filled(pos2(r.left() + 2.0, r.bottom() - 2.0), 1.8, color);
-            painter.circle_filled(pos2(r.right() - 2.0, r.top() + 2.0), 1.8, color);
+            painter.circle_filled(pos2(r.left() + 2.0, r.bottom() - 2.0), 1.8, accent);
+            painter.circle_filled(pos2(r.right() - 2.0, r.top() + 2.0), 1.8, accent);
             painter.rect_filled(
-                Rect::from_center_size(c, vec2(5.2, 5.2)),
+                Rect::from_center_size(c, vec2(5.4, 5.4)),
                 CornerRadius::ZERO,
                 color,
             );
@@ -433,13 +437,19 @@ fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color3
             painter.add(Shape::line(pts, s));
         }
         ToolId::Rectangle | ToolId::ThreePointRectangle => {
+            painter.rect_filled(
+                r.shrink(2.2),
+                CornerRadius::same(1),
+                accent.gamma_multiply(0.24),
+            );
             painter.rect_stroke(r.shrink(1.5), CornerRadius::same(1), s, StrokeKind::Inside);
             if tool == ToolId::ThreePointRectangle {
-                painter.circle_filled(r.left_bottom() + vec2(2.0, -2.0), 1.8, color);
-                painter.circle_filled(r.right_bottom() + vec2(-2.0, -2.0), 1.8, color);
+                painter.circle_filled(r.left_bottom() + vec2(2.0, -2.0), 1.9, amber);
+                painter.circle_filled(r.right_bottom() + vec2(-2.0, -2.0), 1.9, amber);
             }
         }
         ToolId::Ellipse | ToolId::ThreePointEllipse => {
+            painter.circle_filled(c, w.min(h) * 0.42, accent.gamma_multiply(0.22));
             painter.circle_stroke(c, w.min(h) * 0.44, s);
         }
         ToolId::Polygon => {
@@ -618,7 +628,8 @@ fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color3
                 r.left_top() + vec2(w * 0.34, h * 0.34),
                 vec2(w * 0.62, h * 0.62),
             );
-            painter.rect_filled(r2, CornerRadius::same(1), color.gamma_multiply(0.38));
+            painter.rect_filled(r2, CornerRadius::same(1), accent.gamma_multiply(0.45));
+            painter.rect_filled(r1, CornerRadius::same(1), color.gamma_multiply(0.18));
             painter.rect_stroke(r1, CornerRadius::same(1), s, StrokeKind::Inside);
         }
         ToolId::ColorEyedropper | ToolId::AttributesEyedropper => {
@@ -629,26 +640,29 @@ fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color3
                 ],
                 Stroke::new(1.8, color),
             );
-            painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 3.0, color);
+            painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 3.1, amber);
         }
         ToolId::MeshFill => {
             let g = r.shrink(1.5);
+            painter.rect_filled(g, CornerRadius::same(1), accent.gamma_multiply(0.18));
             painter.rect_stroke(g, CornerRadius::same(1), thin, StrokeKind::Inside);
-            painter.line_segment([pos2(g.left(), c.y), pos2(g.right(), c.y)], thin);
-            painter.line_segment([pos2(c.x, g.top()), pos2(c.x, g.bottom())], thin);
-            painter.circle_filled(c, 2.2, color);
+            painter.line_segment([pos2(g.left(), c.y), pos2(g.right(), c.y)], accent_s);
+            painter.line_segment([pos2(c.x, g.top()), pos2(c.x, g.bottom())], accent_s);
+            painter.circle_filled(c, 2.4, amber);
         }
         ToolId::InteractiveFill | ToolId::SmartFill => {
-            painter.rect_stroke(r.shrink(1.5), CornerRadius::same(1), s, StrokeKind::Inside);
+            let g = r.shrink(1.5);
+            painter.rect_filled(g, CornerRadius::same(1), accent.gamma_multiply(0.25));
+            painter.rect_stroke(g, CornerRadius::same(1), s, StrokeKind::Inside);
             painter.line_segment(
                 [
                     r.left_bottom() + vec2(3.5, -3.5),
                     r.right_top() + vec2(-3.5, 3.5),
                 ],
-                s,
+                accent_s,
             );
-            painter.circle_filled(r.left_bottom() + vec2(3.5, -3.5), 2.1, color);
-            painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 2.1, color);
+            painter.circle_filled(r.left_bottom() + vec2(3.5, -3.5), 2.2, color);
+            painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 2.2, amber);
         }
         ToolId::LensTool => {
             painter.circle_stroke(c, w.min(h) * 0.44, s);

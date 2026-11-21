@@ -6,7 +6,7 @@
 
 use crate::shortcuts::{shortcut_label, ShortcutAction, ShortcutProfile};
 use crate::state::{DockerTab, LensDockerState, PropertiesSubTab, StudioApp, WorkspacePreset};
-use crate::theme::{StudioTheme, MENUBAR_HEIGHT};
+use crate::theme::{StudioLanguage, StudioTheme, MENUBAR_HEIGHT};
 use crate::ui::dialogs::{
     export_workspace_dialog, import_workspace_dialog, install_sample_plugin_action,
     EXPORT_FMT_GCODE,
@@ -20,6 +20,7 @@ use egui::{CornerRadius, Frame, Margin, MenuBar, RichText, Stroke, Ui};
 pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
     let profile = app.shortcut_profile;
+    let lang = app.ui_language;
 
     egui::Panel::top("coree_menu_bar")
         .exact_size(MENUBAR_HEIGHT)
@@ -32,7 +33,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
         .show(ui, |ui| {
             MenuBar::new().ui(ui, |ui| {
                 // 1. File
-                ui.menu_button("File", |ui| {
+                ui.menu_button(lang.tr("File", "ملف"), |ui| {
                     if menu_item(
                         ui,
                         "New...",
@@ -127,7 +128,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 2. Edit
-                ui.menu_button("Edit", |ui| {
+                ui.menu_button(lang.tr("Edit", "تحرير"), |ui| {
                     if menu_item(ui, "Undo", shortcut_label(profile, ShortcutAction::Undo)) {
                         let _ = app.undo();
                         ui.close();
@@ -202,7 +203,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 3. View
-                ui.menu_button("View", |ui| {
+                ui.menu_button(lang.tr("View", "عرض"), |ui| {
                     if let Some(tab) = app.active_tab_mut() {
                         for (mode, label) in [
                             (ViewMode::Wireframe, "Wireframe"),
@@ -350,7 +351,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 4. Layout
-                ui.menu_button("Layout", |ui| {
+                ui.menu_button(lang.tr("Layout", "تخطيط"), |ui| {
                     if menu_item(ui, "Insert Page", "") {
                         let (w, h, b, next_num) = app
                             .active_tab()
@@ -447,7 +448,24 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 5. Object
-                ui.menu_button("Object", |ui| {
+                ui.menu_button(lang.tr("Object", "كائن"), |ui| {
+                    if menu_item(
+                        ui,
+                        lang.tr("Edit Fill...", "تحرير التعبئة..."),
+                        shortcut_label(profile, ShortcutAction::OpenEditFill),
+                    ) {
+                        app.open_edit_fill_dialog();
+                        ui.close();
+                    }
+                    if menu_item(
+                        ui,
+                        lang.tr("Outline Pen...", "قلم الحدود..."),
+                        shortcut_label(profile, ShortcutAction::FocusOutlinePen),
+                    ) {
+                        app.open_outline_pen_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.menu_button("Order", |ui| {
                         for (op, label) in [
                             (ZOrderOp::BringToFront, "To Front of Layer"),
@@ -590,7 +608,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 6. Effects
-                ui.menu_button("Effects", |ui| {
+                ui.menu_button(lang.tr("Effects", "تأثيرات"), |ui| {
                     ui.menu_button("Apply Lens (All 11 Lenses)", |ui| {
                         for (idx, name) in LensDockerState::NAMES.iter().enumerate() {
                             if ui.button(*name).clicked() {
@@ -642,7 +660,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 7. Bitmaps
-                ui.menu_button("Bitmaps", |ui| {
+                ui.menu_button(lang.tr("Bitmaps", "صور نقطية"), |ui| {
                     if menu_item(ui, "Convert Selection to Bitmap...", "") {
                         app.convert_selection_to_bitmap();
                         ui.close();
@@ -666,7 +684,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 8. Text
-                ui.menu_button("Text", |ui| {
+                ui.menu_button(lang.tr("Text", "نص"), |ui| {
                     if menu_item(ui, "Text & Arabic RTL / Kashida Properties", "") {
                         app.properties_state.active_tab = PropertiesSubTab::Text;
                         app.focus_docker(DockerTab::Properties);
@@ -698,7 +716,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 9. Table
-                ui.menu_button("Table", |ui| {
+                ui.menu_button(lang.tr("Table", "جدول"), |ui| {
                     if menu_item(ui, "Insert 3x3 Table", "") {
                         app.insert_table(3, 3);
                         ui.close();
@@ -714,7 +732,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 10. Tools
-                ui.menu_button("Tools", |ui| {
+                ui.menu_button(lang.tr("Tools", "أدوات"), |ui| {
                     if menu_item(
                         ui,
                         "Options...",
@@ -793,7 +811,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 11. Laser (Dedicated Laser Cutting, Engraving & Plotter Plugins Menu!)
-                ui.menu_button("Laser", |ui| {
+                ui.menu_button(lang.tr("Laser", "ليزر"), |ui| {
                     if menu_item(ui, "Laser & Plugins Studio Docker", "") {
                         app.production_state.sub_section = 5;
                         app.focus_docker(DockerTab::Production);
@@ -882,7 +900,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
                 // 12. Window
-                ui.menu_button("Window", |ui| {
+                ui.menu_button(lang.tr("Window", "نافذة"), |ui| {
                     ui.menu_button("Workspaces", |ui| {
                         for (preset, label) in [
                             (WorkspacePreset::DefaultClassic, "Default (Classic Studio)"),
@@ -970,18 +988,47 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             }
                         }
                     });
+                    ui.menu_button(
+                        lang.tr("Language / اللغة", "اللغة / Language"),
+                        |ui| {
+                            for l in StudioLanguage::ALL {
+                                if ui
+                                    .selectable_label(app.ui_language == l, l.label())
+                                    .clicked()
+                                {
+                                    app.set_ui_language(l);
+                                    ui.close();
+                                }
+                            }
+                        },
+                    );
                 });
 
                 // 13. Help
-                ui.menu_button("Help", |ui| {
+                ui.menu_button(lang.tr("Help", "مساعدة"), |ui| {
                     if menu_item(ui, "About coree & Clean-Room Notice", "") {
                         app.show_about_dialog = true;
                         ui.close();
                     }
                 });
 
-                // Right-aligned quick Command Palette button + Proof/Offline indicators
+                // Right-aligned quick Command Palette + Language toggle + Proof/Offline indicators
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let next_lang = match app.ui_language {
+                        StudioLanguage::English => StudioLanguage::Arabic,
+                        StudioLanguage::Arabic => StudioLanguage::English,
+                    };
+                    let lang_pill = match app.ui_language {
+                        StudioLanguage::English => "EN | ع",
+                        StudioLanguage::Arabic => "عربية | EN",
+                    };
+                    if ui
+                        .small_button(lang_pill)
+                        .on_hover_text("Toggle English / العربية interface labels")
+                        .clicked()
+                    {
+                        app.set_ui_language(next_lang);
+                    }
                     let cmd_btn = ui.button(
                         RichText::new(format!(
                             "⌘ Commands ({})",

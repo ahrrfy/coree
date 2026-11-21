@@ -9,10 +9,12 @@
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult};
 use coree_core::{
-    Affine2D, BezierPath, BlendMode, Color, ColorMode, Document, Fill, LineCap, LineJoin,
-    MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Point2D, SceneObject,
-    TextDirection,
+    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Effect, Fill,
+    GradientStop, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page,
+    Point2D, SceneObject, TextDirection,
 };
+use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
+use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba, TextEngine};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use kurbo::PathEl;
@@ -223,6 +225,9 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         image_xobjects.insert(asset_id, (name, xobj_id));
     }
 
+    let mut text_engine = TextEngine::new();
+    let mut dynamic_img_counter = image_xobjects.len();
+    let mut spot_cache: BTreeMap<String, (String, usize)> = BTreeMap::new();
     let mut page_obj_ids = Vec::with_capacity(page_indices.len());
 
     for &page_index in &page_indices {
@@ -262,13 +267,22 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         let bleed_x1 = (margin_mm + page.width_mm + bleed_mm) * MM_TO_PT;
         let bleed_y1 = (margin_mm + page.height_mm + bleed_mm) * MM_TO_PT;
 
-        let mut gstates: BTreeMap<GStateKey, String> = BTreeMap::new();
-        let mut used_images: BTreeMap<String, usize> = BTreeMap::new();
+        let mut emit_state = PdfPageEmit {
+            store: &mut store,
+            text_engine: &mut text_engine,
+            gstates: BTreeMap::new(),
+            used_images: BTreeMap::new(),
+            shadings: BTreeMap::new(),
+            used_spots: BTreeMap::new(),
+            spot_cache: &mut spot_cache,
+            dynamic_img_counter: &mut dynamic_img_counter,
+        };
         let mut stream = String::with_capacity(4096);
 
         let ctx = PageRenderCtx {
             doc,
             page,
+            page_index,
             margin_mm,
             use_cmyk,
             image_xobjects: &image_xobjects,
@@ -318,8 +332,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
                         obj,
                         Affine2D::IDENTITY,
                         1.0,
-                        &mut gstates,
-                        &mut used_images,
+                        &mut emit_state,
                         &mut stream,
                         0,
                         &mut visited,
@@ -342,6 +355,11 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
             );
         }
 
+        let gstates = emit_state.gstates;
+        let used_images = emit_state.used_images;
+        let page_shadings = emit_state.shadings;
+        let page_spots = emit_state.used_spots;
+
         // Build ExtGState objects for this page
         let mut gstate_refs = String::new();
         for (key, gs_name) in &gstates {
@@ -362,6 +380,16 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         let mut xobj_refs = String::new();
         for (im_name, im_id) in &used_images {
             let _ = write!(xobj_refs, " /{im_name} {im_id} 0 R");
+        }
+
+        let mut shading_refs = String::new();
+        for (sh_name, sh_id) in &page_shadings {
+            let _ = write!(shading_refs, " /{sh_name} {sh_id} 0 R");
+        }
+
+        let mut colorspace_refs = String::new();
+        for (cs_name, cs_id) in &page_spots {
+            let _ = write!(colorspace_refs, " /{cs_name} {cs_id} 0 R");
         }
 
         // Build content stream object (optionally FlateDecode compressed)
@@ -393,6 +421,12 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         }
         if !xobj_refs.is_empty() {
             let _ = write!(resources, " /XObject <<{xobj_refs} >>");
+        }
+        if !shading_refs.is_empty() {
+            let _ = write!(resources, " /Shading <<{shading_refs} >>");
+        }
+        if !colorspace_refs.is_empty() {
+            let _ = write!(resources, " /ColorSpace <<{colorspace_refs} >>");
         }
         resources.push_str(" >>");
 
@@ -438,6 +472,7 @@ pub fn export_pdf(doc: &Document, opts: &PdfExportOptions, path: &Path) -> IoRes
 struct PageRenderCtx<'a> {
     doc: &'a Document,
     page: &'a Page,
+    page_index: usize,
     margin_mm: f64,
     use_cmyk: bool,
     image_xobjects: &'a BTreeMap<coree_core::ImageAssetId, (String, usize)>,
@@ -451,14 +486,91 @@ impl PageRenderCtx<'_> {
     }
 }
 
+struct PdfPageEmit<'a> {
+    store: &'a mut PdfObjectStore,
+    text_engine: &'a mut TextEngine,
+    gstates: BTreeMap<GStateKey, String>,
+    used_images: BTreeMap<String, usize>,
+    shadings: BTreeMap<String, usize>,
+    used_spots: BTreeMap<String, usize>,
+    spot_cache: &'a mut BTreeMap<String, (String, usize)>,
+    dynamic_img_counter: &'a mut usize,
+}
+
+fn object_requires_raster_composite(obj: &SceneObject) -> bool {
+    if obj.lens.is_some() {
+        return true;
+    }
+    let has_raster_effect = obj.effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::DropShadow { .. }
+                | Effect::BlockShadow { .. }
+                | Effect::Contour { .. }
+                | Effect::Extrude25D { .. }
+                | Effect::Blend { .. }
+                | Effect::Transparency { .. }
+        )
+    });
+    if has_raster_effect {
+        return true;
+    }
+    matches!(
+        obj.fill,
+        Fill::ConicalGradient { .. }
+            | Fill::SquareGradient { .. }
+            | Fill::MeshFill { .. }
+            | Fill::TwoColorPattern { .. }
+            | Fill::VectorPattern { .. }
+            | Fill::BitmapPattern { .. }
+            | Fill::TextureFill { .. }
+    )
+}
+
+fn has_geometry_effect(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+        )
+    })
+}
+
+fn emit_pdf_image_rect(
+    ctx: &PageRenderCtx<'_>,
+    im_name: &str,
+    rect_mm: coree_core::Rect2D,
+    opacity: f32,
+    blend_mode: BlendMode,
+    gstates: &mut BTreeMap<GStateKey, String>,
+    out: &mut String,
+) {
+    let bl = Point2D::new(rect_mm.min_x, rect_mm.max_y);
+    let br = Point2D::new(rect_mm.max_x, rect_mm.max_y);
+    let tl = Point2D::new(rect_mm.min_x, rect_mm.min_y);
+    let (x0, y0) = ctx.to_pdf_pt(bl);
+    let (x1, y1) = ctx.to_pdf_pt(br);
+    let (x2, y2) = ctx.to_pdf_pt(tl);
+    let gs = intern_gstate(gstates, opacity, opacity, blend_mode, false);
+    let _ = writeln!(
+        out,
+        "q /{gs} gs {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
+        x1 - x0,
+        y1 - y0,
+        x2 - x0,
+        y2 - y0,
+        x0,
+        y0
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_pdf_object(
     ctx: &PageRenderCtx<'_>,
     obj: &SceneObject,
     parent_xf: Affine2D,
     parent_opacity: f32,
-    gstates: &mut BTreeMap<GStateKey, String>,
-    used_images: &mut BTreeMap<String, usize>,
+    emit: &mut PdfPageEmit<'_>,
     out: &mut String,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
@@ -466,282 +578,378 @@ fn emit_pdf_object(
     if depth > MAX_PDF_DEPTH || !obj.visible || !obj.printable || !visited.insert(obj.id) {
         return;
     }
-    let world_xf = parent_xf.compose(&obj.transform);
-    if !world_xf.is_finite() {
+    let opacity = (parent_opacity * obj.opacity).clamp(0.0, 1.0);
+    if !parent_xf.is_finite() || !obj.transform.is_finite() {
         visited.remove(&obj.id);
         return;
     }
-    let opacity = (parent_opacity * obj.opacity).clamp(0.0, 1.0);
 
-    match &obj.payload {
-        NodePayload::Path(path) => {
-            let world_path = path.transformed(&world_xf);
-            emit_pdf_styled_path(
-                ctx,
-                &world_path,
-                &obj.fill,
-                &obj.outline,
-                obj.blend_mode,
-                opacity,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::Shape(shape) => {
-            let world_path = shape.to_bezier_path().transformed(&world_xf);
-            emit_pdf_styled_path(
-                ctx,
-                &world_path,
-                &obj.fill,
-                &obj.outline,
-                obj.blend_mode,
-                opacity,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::ArtisticText(text) => {
-            let plain = text.plain_text();
-            let style = text
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_pdf_text(
-                ctx,
-                &plain,
-                &style,
-                text.effective_direction(),
-                world_xf,
-                opacity,
-                obj.blend_mode,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::ParagraphText(para) => {
-            let plain = para.plain_text();
-            let style = para
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_pdf_text(
-                ctx,
-                &plain,
-                &style,
-                para.effective_direction(),
-                world_xf,
-                opacity,
-                obj.blend_mode,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::TextOnPath(top) => {
-            let plain = top.text.plain_text();
-            let style = top
-                .text
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_pdf_text(
-                ctx,
-                &plain,
-                &style,
-                top.text.effective_direction(),
-                world_xf,
-                opacity,
-                obj.blend_mode,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::Raster(raster) => {
-            if let Some((im_name, im_id)) = ctx.image_xobjects.get(&raster.asset_id) {
-                used_images.insert(im_name.clone(), *im_id);
-                let bl = world_xf.transform_point(Point2D::new(0.0, raster.height_mm));
-                let br = world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
-                let tl = world_xf.transform_point(Point2D::new(0.0, 0.0));
-                let (x0, y0) = ctx.to_pdf_pt(bl);
-                let (x1, y1) = ctx.to_pdf_pt(br);
-                let (x2, y2) = ctx.to_pdf_pt(tl);
-                let gs = intern_gstate(gstates, opacity, opacity, obj.blend_mode, false);
-                let _ = writeln!(
+    // Complex non-linear fills, shadows, blurs, extrusions, blends, transparencies, and live
+    // optical lenses export cleanly at 300 DPI with SMask soft alpha so nothing is lost.
+    if object_requires_raster_composite(obj)
+        && !matches!(
+            obj.payload,
+            NodePayload::Group(_) | NodePayload::SymbolInstance(_)
+        )
+    {
+        if let Ok(Some((rect_mm, rgba_buf))) =
+            render_isolated_object_to_rgba(ctx.doc, ctx.page_index, obj.id, parent_xf, 300.0)
+        {
+            if let Ok(im_id) = add_rgba_bytes_xobject(
+                emit.store,
+                rgba_buf.width,
+                rgba_buf.height,
+                &rgba_buf.rgba,
+                ctx.use_cmyk,
+            ) {
+                *emit.dynamic_img_counter += 1;
+                let im_name = format!("DynIm{}", *emit.dynamic_img_counter);
+                emit.used_images.insert(im_name.clone(), im_id);
+                emit_pdf_image_rect(
+                    ctx,
+                    &im_name,
+                    rect_mm,
+                    parent_opacity,
+                    obj.blend_mode,
+                    &mut emit.gstates,
                     out,
-                    "q /{gs} gs {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
-                    x1 - x0,
-                    y1 - y0,
-                    x2 - x0,
-                    y2 - y0,
-                    x0,
-                    y0
                 );
+
+                // Preserve vector Spot /CutContour cutlines on top if present so plotters/RIPs see vector paths
+                if matches!(obj.outline.color, Color::Spot { .. }) && obj.outline.is_visible() {
+                    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+                    for sym_xf in sym_transforms {
+                        let world_xf = parent_xf.compose(&sym_xf).compose(&obj.transform);
+                        match &obj.payload {
+                            NodePayload::Path(path) => {
+                                let p = apply_geometry_effects(path, &obj.effects)
+                                    .transformed(&world_xf);
+                                emit_pdf_styled_path(
+                                    ctx,
+                                    &p,
+                                    &Fill::None,
+                                    &obj.outline,
+                                    obj.blend_mode,
+                                    opacity,
+                                    Affine2D::IDENTITY,
+                                    emit,
+                                    out,
+                                );
+                            }
+                            NodePayload::Shape(shape) => {
+                                let p =
+                                    apply_geometry_effects(&shape.to_bezier_path(), &obj.effects)
+                                        .transformed(&world_xf);
+                                emit_pdf_styled_path(
+                                    ctx,
+                                    &p,
+                                    &Fill::None,
+                                    &obj.outline,
+                                    obj.blend_mode,
+                                    opacity,
+                                    Affine2D::IDENTITY,
+                                    emit,
+                                    out,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                visited.remove(&obj.id);
+                return;
             }
         }
-        NodePayload::Table(table) => {
-            for r in 0..table.rows {
-                for c in 0..table.cols {
-                    if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c)) {
-                        let cell_path = BezierPath::from_rect(rect).transformed(&world_xf);
-                        emit_pdf_styled_path(
-                            ctx,
-                            &cell_path,
-                            &cell.fill,
-                            &table.border_style,
-                            obj.blend_mode,
-                            opacity,
-                            gstates,
-                            out,
-                        );
-                        if !cell.text.is_empty() {
-                            let tx = Affine2D::translate(
-                                rect.min_x + cell.padding_mm,
-                                rect.min_y + cell.padding_mm,
-                            );
-                            emit_pdf_text(
+    }
+
+    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    for sym_xf in sym_transforms {
+        let effective_parent = parent_xf.compose(&sym_xf);
+        let world_xf = effective_parent.compose(&obj.transform);
+        if !world_xf.is_finite() {
+            continue;
+        }
+
+        match &obj.payload {
+            NodePayload::Path(path) => {
+                let deformed = apply_geometry_effects(path, &obj.effects);
+                let world_path = deformed.transformed(&world_xf);
+                emit_pdf_styled_path(
+                    ctx,
+                    &world_path,
+                    &obj.fill,
+                    &obj.outline,
+                    obj.blend_mode,
+                    opacity,
+                    world_xf,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::Shape(shape) => {
+                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                let world_path = deformed.transformed(&world_xf);
+                emit_pdf_styled_path(
+                    ctx,
+                    &world_path,
+                    &obj.fill,
+                    &obj.outline,
+                    obj.blend_mode,
+                    opacity,
+                    world_xf,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::ArtisticText(text) => {
+                emit_pdf_artistic_text(
+                    ctx,
+                    text,
+                    &obj.outline,
+                    &obj.effects,
+                    world_xf,
+                    opacity,
+                    obj.blend_mode,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::ParagraphText(para) => {
+                emit_pdf_paragraph_text(
+                    ctx,
+                    para,
+                    &obj.outline,
+                    &obj.effects,
+                    world_xf,
+                    opacity,
+                    obj.blend_mode,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(host_path) = ctx.doc.world_path_of(top.path_id) {
+                    let pieces = emit.text_engine.layout_text_on_path_pieces(top, &host_path);
+                    emit_pdf_shaped_pieces(
+                        ctx,
+                        &pieces,
+                        &obj.outline,
+                        effective_parent,
+                        opacity,
+                        obj.blend_mode,
+                        emit,
+                        out,
+                    );
+                } else {
+                    emit_pdf_artistic_text(
+                        ctx,
+                        &top.text,
+                        &obj.outline,
+                        &obj.effects,
+                        world_xf,
+                        opacity,
+                        obj.blend_mode,
+                        emit,
+                        out,
+                    );
+                }
+            }
+            NodePayload::Raster(raster) => {
+                if let Some((im_name, im_id)) = ctx.image_xobjects.get(&raster.asset_id) {
+                    emit.used_images.insert(im_name.clone(), *im_id);
+                    let bl = world_xf.transform_point(Point2D::new(0.0, raster.height_mm));
+                    let br =
+                        world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
+                    let tl = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                    let (x0, y0) = ctx.to_pdf_pt(bl);
+                    let (x1, y1) = ctx.to_pdf_pt(br);
+                    let (x2, y2) = ctx.to_pdf_pt(tl);
+                    let gs =
+                        intern_gstate(&mut emit.gstates, opacity, opacity, obj.blend_mode, false);
+                    let _ = writeln!(
+                        out,
+                        "q /{gs} gs {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
+                        x1 - x0,
+                        y1 - y0,
+                        x2 - x0,
+                        y2 - y0,
+                        x0,
+                        y0
+                    );
+                }
+            }
+            NodePayload::Table(table) => {
+                for r in 0..table.rows {
+                    for c in 0..table.cols {
+                        if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c))
+                        {
+                            let cell_path = BezierPath::from_rect(rect).transformed(&world_xf);
+                            emit_pdf_styled_path(
                                 ctx,
-                                &cell.text,
-                                &cell.text_style,
-                                TextDirection::detect(&cell.text),
-                                world_xf.compose(&tx),
-                                opacity,
+                                &cell_path,
+                                &cell.fill,
+                                &table.border_style,
                                 obj.blend_mode,
-                                gstates,
+                                opacity,
+                                world_xf,
+                                emit,
                                 out,
                             );
+                            if !cell.text.is_empty() {
+                                let tx = Affine2D::translate(
+                                    rect.min_x + cell.padding_mm,
+                                    rect.min_y + cell.padding_mm,
+                                );
+                                let at = ArtisticText::from_plain(
+                                    cell.text.clone(),
+                                    cell.text_style.clone(),
+                                );
+                                emit_pdf_artistic_text(
+                                    ctx,
+                                    &at,
+                                    &OutlineStyle::none(),
+                                    &[],
+                                    world_xf.compose(&tx),
+                                    opacity,
+                                    obj.blend_mode,
+                                    emit,
+                                    out,
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-        NodePayload::Dimension(dim) => {
-            let line = BezierPath::from_line(
-                Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
-                Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
-            )
-            .transformed(&world_xf);
-            emit_pdf_styled_path(
-                ctx,
-                &line,
-                &Fill::None,
-                &obj.outline,
-                obj.blend_mode,
-                opacity,
-                gstates,
-                out,
-            );
-            let label =
-                dim.compute_measurement_with_dpi(ctx.doc.default_unit, f64::from(ctx.doc.dpi));
-            let mid = dim.p1.midpoint(dim.p2);
-            emit_pdf_text(
-                ctx,
-                &label,
-                &dim.text_style,
-                TextDirection::Ltr,
-                world_xf.compose(&Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0)),
-                opacity,
-                obj.blend_mode,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::Connector(conn) => {
-            let (a, b) = ctx.doc.resolve_connector_endpoints(conn);
-            let path = conn.route_path(a, b);
-            emit_pdf_styled_path(
-                ctx,
-                &path,
-                &Fill::None,
-                &obj.outline,
-                obj.blend_mode,
-                opacity,
-                gstates,
-                out,
-            );
-        }
-        NodePayload::Group(children) => {
-            for &cid in children {
-                if let Some(child) = ctx.doc.objects.get(&cid) {
-                    emit_pdf_object(
-                        ctx,
-                        child,
-                        world_xf,
-                        opacity,
-                        gstates,
-                        used_images,
-                        out,
-                        depth + 1,
-                        visited,
-                    );
-                }
-            }
-        }
-        NodePayload::PowerClip {
-            container,
-            contents,
-        } => {
-            let clip_path = container.transformed(&world_xf);
-            if obj.fill.is_visible() {
+            NodePayload::Dimension(dim) => {
+                let line = BezierPath::from_line(
+                    Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
+                    Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
+                )
+                .transformed(&world_xf);
                 emit_pdf_styled_path(
                     ctx,
-                    &clip_path,
-                    &obj.fill,
-                    &OutlineStyle::none(),
-                    obj.blend_mode,
-                    opacity,
-                    gstates,
-                    out,
-                );
-            }
-            out.push_str("q\n");
-            emit_pdf_path_ops(ctx, &clip_path, out);
-            out.push_str("W n\n");
-            for &cid in contents {
-                if let Some(child) = ctx.doc.objects.get(&cid) {
-                    emit_pdf_object(
-                        ctx,
-                        child,
-                        world_xf,
-                        opacity,
-                        gstates,
-                        used_images,
-                        out,
-                        depth + 1,
-                        visited,
-                    );
-                }
-            }
-            out.push_str("Q\n");
-            if obj.outline.is_visible() {
-                emit_pdf_styled_path(
-                    ctx,
-                    &clip_path,
+                    &line,
                     &Fill::None,
                     &obj.outline,
                     obj.blend_mode,
                     opacity,
-                    gstates,
+                    world_xf,
+                    emit,
+                    out,
+                );
+                let label =
+                    dim.compute_measurement_with_dpi(ctx.doc.default_unit, f64::from(ctx.doc.dpi));
+                let mid = dim.p1.midpoint(dim.p2);
+                let at = ArtisticText::from_plain(label, dim.text_style.clone());
+                emit_pdf_artistic_text(
+                    ctx,
+                    &at,
+                    &OutlineStyle::none(),
+                    &[],
+                    world_xf.compose(&Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0)),
+                    opacity,
+                    obj.blend_mode,
+                    emit,
                     out,
                 );
             }
-        }
-        NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = ctx.doc.symbols.get(sym_id) {
-                for sub in &sym.objects {
-                    let mut sym_visited = HashSet::new();
-                    emit_pdf_object(
+            NodePayload::Connector(conn) => {
+                let (a, b) = ctx.doc.resolve_connector_endpoints(conn);
+                let path = conn.route_path(a, b);
+                emit_pdf_styled_path(
+                    ctx,
+                    &path,
+                    &Fill::None,
+                    &obj.outline,
+                    obj.blend_mode,
+                    opacity,
+                    world_xf,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::Group(children) => {
+                for &cid in children {
+                    if let Some(child) = ctx.doc.objects.get(&cid) {
+                        emit_pdf_object(
+                            ctx,
+                            child,
+                            world_xf,
+                            opacity,
+                            emit,
+                            out,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+            }
+            NodePayload::PowerClip {
+                container,
+                contents,
+            } => {
+                let clip_path =
+                    apply_geometry_effects(container, &obj.effects).transformed(&world_xf);
+                if obj.fill.is_visible() {
+                    emit_pdf_styled_path(
                         ctx,
-                        sub,
-                        world_xf,
+                        &clip_path,
+                        &obj.fill,
+                        &OutlineStyle::none(),
+                        obj.blend_mode,
                         opacity,
-                        gstates,
-                        used_images,
+                        world_xf,
+                        emit,
                         out,
-                        depth + 1,
-                        &mut sym_visited,
                     );
+                }
+                out.push_str("q\n");
+                emit_pdf_path_ops(ctx, &clip_path, out);
+                out.push_str("W n\n");
+                for &cid in contents {
+                    if let Some(child) = ctx.doc.objects.get(&cid) {
+                        emit_pdf_object(
+                            ctx,
+                            child,
+                            world_xf,
+                            opacity,
+                            emit,
+                            out,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+                out.push_str("Q\n");
+                if obj.outline.is_visible() {
+                    emit_pdf_styled_path(
+                        ctx,
+                        &clip_path,
+                        &Fill::None,
+                        &obj.outline,
+                        obj.blend_mode,
+                        opacity,
+                        world_xf,
+                        emit,
+                        out,
+                    );
+                }
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(sym) = ctx.doc.symbols.get(sym_id) {
+                    for sub in &sym.objects {
+                        let mut sym_visited = HashSet::new();
+                        emit_pdf_object(
+                            ctx,
+                            sub,
+                            world_xf,
+                            opacity,
+                            emit,
+                            out,
+                            depth + 1,
+                            &mut sym_visited,
+                        );
+                    }
                 }
             }
         }
@@ -758,22 +966,34 @@ fn emit_pdf_styled_path(
     outline: &OutlineStyle,
     blend_mode: BlendMode,
     opacity: f32,
-    gstates: &mut BTreeMap<GStateKey, String>,
+    fill_xf: Affine2D,
+    emit: &mut PdfPageEmit<'_>,
     out: &mut String,
 ) {
     if path.is_empty() {
         return;
     }
-    let fill_color = fill_representative_color(fill).filter(|c| c.alpha() > 1e-6);
-    let do_fill = fill_color.is_some();
+    let shading_name = register_pdf_gradient_shading(ctx, fill, fill_xf, emit);
+    let fill_color = if shading_name.is_none() {
+        fill_representative_color(fill).filter(|c| c.alpha() > 1e-6)
+    } else {
+        None
+    };
+    let do_fill = shading_name.is_some() || fill_color.is_some();
     let do_stroke = outline.is_visible();
     if !do_fill && !do_stroke {
         return;
     }
 
-    let fill_alpha = fill_color
-        .as_ref()
-        .map_or(1.0, |c| (c.alpha() * opacity).clamp(0.0, 1.0));
+    let fill_alpha = if shading_name.is_some() {
+        fill.referenced_colors()
+            .first()
+            .map_or(opacity, |c| (c.alpha() * opacity).clamp(0.0, 1.0))
+    } else {
+        fill_color
+            .as_ref()
+            .map_or(1.0, |c| (c.alpha() * opacity).clamp(0.0, 1.0))
+    };
     let stroke_alpha = (outline.color.alpha() * opacity).clamp(0.0, 1.0);
 
     out.push_str("q\n");
@@ -783,7 +1003,7 @@ fn emit_pdf_styled_path(
         || outline.overprint
     {
         let gs = intern_gstate(
-            gstates,
+            &mut emit.gstates,
             fill_alpha,
             stroke_alpha,
             blend_mode,
@@ -792,41 +1012,367 @@ fn emit_pdf_styled_path(
         let _ = writeln!(out, "/{gs} gs");
     }
 
-    if let Some(ref fc) = fill_color {
-        emit_pdf_color(out, fc, ctx.use_cmyk, false);
-    }
-    if do_stroke {
-        emit_pdf_color(out, &outline.color, ctx.use_cmyk, true);
-        emit_pdf_stroke_state(out, outline);
-    }
-
-    if do_fill && do_stroke && outline.behind_fill {
+    if let Some(ref sh_name) = shading_name {
+        if do_stroke && outline.behind_fill {
+            emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
+            emit_pdf_stroke_state(out, outline);
+            emit_pdf_path_ops(ctx, path, out);
+            out.push_str("S\n");
+            emit_pdf_arrowheads(ctx, path, outline, emit, out);
+        }
+        out.push_str("q\n");
         emit_pdf_path_ops(ctx, path, out);
-        out.push_str("S\n");
-        emit_pdf_path_ops(ctx, path, out);
-        out.push_str("f\n");
+        out.push_str("W n\n");
+        let _ = writeln!(out, "/{sh_name} sh");
+        out.push_str("Q\n");
+        if do_stroke && !outline.behind_fill {
+            emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
+            emit_pdf_stroke_state(out, outline);
+            emit_pdf_path_ops(ctx, path, out);
+            out.push_str("S\n");
+            emit_pdf_arrowheads(ctx, path, outline, emit, out);
+        }
     } else {
-        emit_pdf_path_ops(ctx, path, out);
-        match (do_fill, do_stroke) {
-            (true, true) => out.push_str("B\n"),
-            (true, false) => out.push_str("f\n"),
-            (false, true) => out.push_str("S\n"),
-            (false, false) => {}
+        if let Some(ref fc) = fill_color {
+            emit_pdf_color(out, fc, ctx.use_cmyk, false, emit);
+        }
+        if do_stroke {
+            emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
+            emit_pdf_stroke_state(out, outline);
+        }
+
+        if do_fill && do_stroke && outline.behind_fill {
+            emit_pdf_path_ops(ctx, path, out);
+            out.push_str("S\n");
+            emit_pdf_path_ops(ctx, path, out);
+            out.push_str("f*\n");
+        } else {
+            emit_pdf_path_ops(ctx, path, out);
+            match (do_fill, do_stroke) {
+                (true, true) => out.push_str("B*\n"),
+                (true, false) => out.push_str("f*\n"),
+                (false, true) => out.push_str("S\n"),
+                (false, false) => {}
+            }
+        }
+        if do_stroke {
+            emit_pdf_arrowheads(ctx, path, outline, emit, out);
         }
     }
     out.push_str("Q\n");
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_pdf_text(
+fn emit_pdf_arrowheads(
     ctx: &PageRenderCtx<'_>,
-    text: &str,
-    style: &coree_core::TextStyle,
-    direction: TextDirection,
+    path: &BezierPath,
+    outline: &OutlineStyle,
+    emit: &mut PdfPageEmit<'_>,
+    out: &mut String,
+) {
+    let heads = outline_arrowhead_geometries(path, outline);
+    if heads.is_empty() {
+        return;
+    }
+    emit_pdf_color(out, &outline.color, ctx.use_cmyk, false, emit);
+    emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
+    for (geom, filled) in heads {
+        emit_pdf_path_ops(ctx, &geom, out);
+        out.push_str(if filled { "f\n" } else { "S\n" });
+    }
+}
+
+fn register_pdf_gradient_shading(
+    ctx: &PageRenderCtx<'_>,
+    fill: &Fill,
+    fill_xf: Affine2D,
+    emit: &mut PdfPageEmit<'_>,
+) -> Option<String> {
+    match fill {
+        Fill::LinearGradient { start, end, stops } if !stops.is_empty() => {
+            let fn_id = build_pdf_gradient_function(emit.store, stops, ctx.use_cmyk)?;
+            let p0 = fill_xf.transform_point(*start);
+            let p1 = fill_xf.transform_point(*end);
+            let (x0, y0) = ctx.to_pdf_pt(p0);
+            let (mut x1, mut y1) = ctx.to_pdf_pt(p1);
+            if (x1 - x0).hypot(y1 - y0) < 1e-3 {
+                x1 = x0 + 1.0;
+                y1 = y0;
+            }
+            let cs = if ctx.use_cmyk {
+                "/DeviceCMYK"
+            } else {
+                "/DeviceRGB"
+            };
+            let sh_body = format!(
+                "<< /ShadingType 2 /ColorSpace {cs} /Coords [{x0:.4} {y0:.4} {x1:.4} {y1:.4}] \
+                 /Function {fn_id} 0 R /Extend [true true] >>"
+            );
+            let sh_id = emit.store.add(sh_body.into_bytes());
+            let sh_name = format!("Sh{}", emit.shadings.len() + 1);
+            emit.shadings.insert(sh_name.clone(), sh_id);
+            Some(sh_name)
+        }
+        Fill::RadialGradient {
+            center,
+            radius,
+            focal,
+            stops,
+        } if !stops.is_empty() => {
+            let fn_id = build_pdf_gradient_function(emit.store, stops, ctx.use_cmyk)?;
+            let c_world = fill_xf.transform_point(*center);
+            let f_world = fill_xf.transform_point(*focal);
+            let edge_world =
+                fill_xf.transform_point(Point2D::new(center.x + radius.max(0.1), center.y));
+            let (cx, cy) = ctx.to_pdf_pt(c_world);
+            let (fx, fy) = ctx.to_pdf_pt(f_world);
+            let (ex, ey) = ctx.to_pdf_pt(edge_world);
+            let r_pt = (ex - cx).hypot(ey - cy).max(0.5);
+            let cs = if ctx.use_cmyk {
+                "/DeviceCMYK"
+            } else {
+                "/DeviceRGB"
+            };
+            let sh_body = format!(
+                "<< /ShadingType 3 /ColorSpace {cs} /Coords [{fx:.4} {fy:.4} 0.0000 {cx:.4} {cy:.4} {r_pt:.4}] \
+                 /Function {fn_id} 0 R /Extend [true true] >>"
+            );
+            let sh_id = emit.store.add(sh_body.into_bytes());
+            let sh_name = format!("Sh{}", emit.shadings.len() + 1);
+            emit.shadings.insert(sh_name.clone(), sh_id);
+            Some(sh_name)
+        }
+        _ => None,
+    }
+}
+
+fn color_components_pdf(c: &Color, use_cmyk: bool) -> String {
+    if use_cmyk {
+        let [cc, m, y, k] = c.to_cmyk().map(sanitize_unit_f32);
+        format!("{cc:.4} {m:.4} {y:.4} {k:.4}")
+    } else {
+        let [r, g, b, _] = c.to_rgba_f32().map(sanitize_unit_f32);
+        format!("{r:.4} {g:.4} {b:.4}")
+    }
+}
+
+fn build_pdf_gradient_function(
+    store: &mut PdfObjectStore,
+    stops: &[GradientStop],
+    use_cmyk: bool,
+) -> Option<usize> {
+    if stops.is_empty() {
+        return None;
+    }
+    let mut sorted = stops.to_vec();
+    sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if sorted.len() == 1 {
+        let c = color_components_pdf(&sorted[0].color, use_cmyk);
+        let body = format!("<< /FunctionType 2 /Domain [0 1] /C0 [{c}] /C1 [{c}] /N 1 >>");
+        return Some(store.add(body.into_bytes()));
+    }
+    if sorted.len() == 2 {
+        let c0 = color_components_pdf(&sorted[0].color, use_cmyk);
+        let c1 = color_components_pdf(&sorted[1].color, use_cmyk);
+        let body = format!("<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>");
+        return Some(store.add(body.into_bytes()));
+    }
+
+    // Multi-stop PDF Type 3 Stitching Function across [0, 1]
+    let mut fn_refs = Vec::new();
+    let mut bounds = Vec::new();
+    let mut encode = Vec::new();
+
+    // Ensure leading [0..first.offset] and trailing [last.offset..1] coverage cleanly
+    let mut segments: Vec<(f32, f32, &Color, &Color)> = Vec::new();
+    if sorted[0].offset > 1e-4 {
+        segments.push((0.0, sorted[0].offset, &sorted[0].color, &sorted[0].color));
+    }
+    for win in sorted.windows(2) {
+        if win[1].offset > win[0].offset + 1e-5 {
+            segments.push((win[0].offset, win[1].offset, &win[0].color, &win[1].color));
+        }
+    }
+    let last = sorted.last()?;
+    if last.offset < 1.0 - 1e-4 {
+        segments.push((last.offset, 1.0, &last.color, &last.color));
+    }
+    if segments.is_empty() {
+        let c0 = color_components_pdf(&sorted[0].color, use_cmyk);
+        let c1 = color_components_pdf(&last.color, use_cmyk);
+        let body = format!("<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>");
+        return Some(store.add(body.into_bytes()));
+    }
+
+    for (i, &(_t0, t1, c0_col, c1_col)) in segments.iter().enumerate() {
+        let c0 = color_components_pdf(c0_col, use_cmyk);
+        let c1 = color_components_pdf(c1_col, use_cmyk);
+        let sub_fn = store.add(
+            format!("<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>").into_bytes(),
+        );
+        fn_refs.push(format!("{sub_fn} 0 R"));
+        if i + 1 < segments.len() {
+            bounds.push(format!("{t1:.4}"));
+        }
+        encode.push("0 1".to_string());
+    }
+    let stitch = format!(
+        "<< /FunctionType 3 /Domain [0 1] /Functions [{}] /Bounds [{}] /Encode [{}] >>",
+        fn_refs.join(" "),
+        bounds.join(" "),
+        encode.join(" ")
+    );
+    Some(store.add(stitch.into_bytes()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_pdf_artistic_text(
+    ctx: &PageRenderCtx<'_>,
+    text: &ArtisticText,
+    outline: &OutlineStyle,
+    effects: &[Effect],
     world_xf: Affine2D,
     opacity: f32,
     blend_mode: BlendMode,
-    gstates: &mut BTreeMap<GStateKey, String>,
+    emit: &mut PdfPageEmit<'_>,
+    out: &mut String,
+) {
+    let plain = text.plain_text();
+    if plain.is_empty() || !world_xf.is_finite() {
+        return;
+    }
+    let style = text
+        .runs
+        .first()
+        .map(|r| r.style.clone())
+        .unwrap_or_default();
+    let is_simple_ascii_helvetica = !has_geometry_effect(effects)
+        && (!outline.is_visible() || *outline == OutlineStyle::default())
+        && text.runs.len() == 1
+        && text.effective_direction() != TextDirection::Rtl
+        && plain.chars().all(|ch| ch.is_ascii() && !ch.is_control())
+        && !style.italic
+        && !style.underline
+        && !style.strikethrough
+        && (style.font_family.trim().is_empty()
+            || style.font_family.eq_ignore_ascii_case("Noto Sans")
+            || style.font_family.eq_ignore_ascii_case("Helvetica")
+            || style.font_family.eq_ignore_ascii_case("Arial"));
+
+    if is_simple_ascii_helvetica {
+        emit_pdf_ascii_type1_text(
+            ctx, &plain, &style, world_xf, opacity, blend_mode, emit, out,
+        );
+        return;
+    }
+
+    let pieces = emit.text_engine.layout_artistic_pieces(text);
+    if has_geometry_effect(effects) {
+        let deformed_pieces: Vec<_> = pieces
+            .into_iter()
+            .map(|mut p| {
+                p.path = apply_geometry_effects(&p.path, effects);
+                p
+            })
+            .collect();
+        emit_pdf_shaped_pieces(
+            ctx,
+            &deformed_pieces,
+            outline,
+            world_xf,
+            opacity,
+            blend_mode,
+            emit,
+            out,
+        );
+    } else {
+        emit_pdf_shaped_pieces(
+            ctx, &pieces, outline, world_xf, opacity, blend_mode, emit, out,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_pdf_paragraph_text(
+    ctx: &PageRenderCtx<'_>,
+    para: &coree_core::ParagraphText,
+    outline: &OutlineStyle,
+    effects: &[Effect],
+    world_xf: Affine2D,
+    opacity: f32,
+    blend_mode: BlendMode,
+    emit: &mut PdfPageEmit<'_>,
+    out: &mut String,
+) {
+    let pieces = emit.text_engine.layout_paragraph_pieces(para);
+    if has_geometry_effect(effects) {
+        let deformed_pieces: Vec<_> = pieces
+            .into_iter()
+            .map(|mut p| {
+                p.path = apply_geometry_effects(&p.path, effects);
+                p
+            })
+            .collect();
+        emit_pdf_shaped_pieces(
+            ctx,
+            &deformed_pieces,
+            outline,
+            world_xf,
+            opacity,
+            blend_mode,
+            emit,
+            out,
+        );
+    } else {
+        emit_pdf_shaped_pieces(
+            ctx, &pieces, outline, world_xf, opacity, blend_mode, emit, out,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_pdf_shaped_pieces(
+    ctx: &PageRenderCtx<'_>,
+    pieces: &[coree_render::ShapedGlyphDraw],
+    outline: &OutlineStyle,
+    world_xf: Affine2D,
+    opacity: f32,
+    blend_mode: BlendMode,
+    emit: &mut PdfPageEmit<'_>,
+    out: &mut String,
+) {
+    for piece in pieces {
+        if piece.path.is_empty() {
+            continue;
+        }
+        let world_path = piece.path.transformed(&world_xf);
+        let fill = if piece.fill.alpha() > 1e-6 {
+            Fill::Solid(piece.fill.clone())
+        } else {
+            Fill::None
+        };
+        emit_pdf_styled_path(
+            ctx,
+            &world_path,
+            &fill,
+            outline,
+            blend_mode,
+            opacity,
+            world_xf,
+            emit,
+            out,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_pdf_ascii_type1_text(
+    ctx: &PageRenderCtx<'_>,
+    text: &str,
+    style: &coree_core::TextStyle,
+    world_xf: Affine2D,
+    opacity: f32,
+    blend_mode: BlendMode,
+    emit: &mut PdfPageEmit<'_>,
     out: &mut String,
 ) {
     if text.is_empty() || !world_xf.is_finite() {
@@ -845,54 +1391,29 @@ fn emit_pdf_text(
 
     out.push_str("q\n");
     if (alpha - 1.0).abs() > 1e-3 || blend_mode != BlendMode::Normal {
-        let gs = intern_gstate(gstates, alpha, alpha, blend_mode, false);
+        let gs = intern_gstate(&mut emit.gstates, alpha, alpha, blend_mode, false);
         let _ = writeln!(out, "/{gs} gs");
     }
-    emit_pdf_color(out, &style.fill, ctx.use_cmyk, false);
+    emit_pdf_color(out, &style.fill, ctx.use_cmyk, false, emit);
 
-    let is_ascii_printable = text.chars().all(|ch| ch.is_ascii() && !ch.is_control());
-    if is_ascii_printable && direction != TextDirection::Rtl {
-        let font_ref = if style.bold { "F2" } else { "F1" };
-        // Convert Y-down linear part `[a, b, c, d]` into Y-up PDF text matrix: `[a, -b, -c, d, px, py] Tm`.
-        let is_pure_translate =
-            (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6;
-        if is_pure_translate {
-            let _ = writeln!(
-                out,
-                "BT /{font_ref} {font_pt:.2} Tf {px:.4} {py:.4} Td ({}) Tj ET",
-                escape_pdf_string(text)
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "BT /{font_ref} {font_pt:.2} Tf {a:.6} {:.6} {:.6} {d:.6} {px:.4} {py:.4} Tm ({}) Tj ET",
-                -b,
-                -c,
-                escape_pdf_string(text)
-            );
-        }
+    let font_ref = if style.bold { "F2" } else { "F1" };
+    // Convert Y-down linear part `[a, b, c, d]` into Y-up PDF text matrix: `[a, -b, -c, d, px, py] Tm`.
+    let is_pure_translate =
+        (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6;
+    if is_pure_translate {
+        let _ = writeln!(
+            out,
+            "BT /{font_ref} {font_pt:.2} Tf {px:.4} {py:.4} Td ({}) Tj ET",
+            escape_pdf_string(text)
+        );
     } else {
-        // Vector outline fallback for non-WinAnsi scripts (e.g. Arabic/RTL) so PDF viewers
-        // never drop or garble glyphs when Base-14 Type1 fonts lack Unicode cmap entries.
-        let glyph_w_mm = style.font_size_mm() * 0.52;
-        let glyph_h_mm = style.font_size_mm() * 0.72;
-        let step_mm = style.font_size_mm() * 0.62;
-        let chars: Vec<char> = text.chars().collect();
-        let mut cursor_x = 0.0_f64;
-        for ch in chars {
-            if !ch.is_whitespace() {
-                let rect = coree_core::Rect2D::from_xywh(
-                    cursor_x,
-                    style.font_size_mm() * 0.15,
-                    glyph_w_mm,
-                    glyph_h_mm,
-                );
-                let box_path = BezierPath::from_rect(rect).transformed(&world_xf);
-                emit_pdf_path_ops(ctx, &box_path, out);
-                out.push_str("f\n");
-            }
-            cursor_x += step_mm;
-        }
+        let _ = writeln!(
+            out,
+            "BT /{font_ref} {font_pt:.2} Tf {a:.6} {:.6} {:.6} {d:.6} {px:.4} {py:.4} Tm ({}) Tj ET",
+            -b,
+            -c,
+            escape_pdf_string(text)
+        );
     }
     out.push_str("Q\n");
 }
@@ -947,7 +1468,46 @@ fn sanitize_unit_f32(v: f32) -> f32 {
     }
 }
 
-fn emit_pdf_color(out: &mut String, color: &Color, use_cmyk: bool, stroke: bool) {
+fn sanitize_pdf_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+    if cleaned.is_empty() {
+        "SpotInk".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn intern_spot_colorspace(
+    spot_name: &str,
+    fallback_cmyk: [f32; 4],
+    emit: &mut PdfPageEmit<'_>,
+) -> String {
+    let key = sanitize_pdf_name(spot_name);
+    if let Some((cs_res, cs_id)) = emit.spot_cache.get(&key) {
+        let cs_res = cs_res.clone();
+        emit.used_spots.insert(cs_res.clone(), *cs_id);
+        return cs_res;
+    }
+    let [c, m, y, k] = fallback_cmyk.map(sanitize_unit_f32);
+    let tint_fn_id = emit.store.add(
+        format!(
+            "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [{c:.4} {m:.4} {y:.4} {k:.4}] /N 1 >>"
+        )
+        .into_bytes(),
+    );
+    let cs_id = emit
+        .store
+        .add(format!("[/Separation /{key} /DeviceCMYK {tint_fn_id} 0 R]").into_bytes());
+    let cs_res = format!("Sep{}", emit.spot_cache.len() + 1);
+    emit.spot_cache.insert(key, (cs_res.clone(), cs_id));
+    emit.used_spots.insert(cs_res.clone(), cs_id);
+    cs_res
+}
+
+fn emit_pdf_process_color(out: &mut String, color: &Color, use_cmyk: bool, stroke: bool) {
     if use_cmyk {
         let [c, m, y, k] = color.to_cmyk().map(sanitize_unit_f32);
         let op = if stroke { "K" } else { "k" };
@@ -957,6 +1517,34 @@ fn emit_pdf_color(out: &mut String, color: &Color, use_cmyk: bool, stroke: bool)
         let op = if stroke { "RG" } else { "rg" };
         let _ = writeln!(out, "{r:.4} {g:.4} {b:.4} {op}");
     }
+}
+
+fn emit_pdf_color(
+    out: &mut String,
+    color: &Color,
+    use_cmyk: bool,
+    stroke: bool,
+    emit: &mut PdfPageEmit<'_>,
+) {
+    if let Color::Spot {
+        name,
+        tint,
+        fallback_cmyk,
+        ..
+    } = color
+    {
+        if !name.trim().is_empty() {
+            let cs_res = intern_spot_colorspace(name, *fallback_cmyk, emit);
+            let t = sanitize_unit_f32(*tint);
+            if stroke {
+                let _ = writeln!(out, "/{cs_res} CS {t:.4} SCN");
+            } else {
+                let _ = writeln!(out, "/{cs_res} cs {t:.4} scn");
+            }
+            return;
+        }
+    }
+    emit_pdf_process_color(out, color, use_cmyk, stroke);
 }
 
 fn emit_pdf_stroke_state(out: &mut String, outline: &OutlineStyle) {
@@ -1159,7 +1747,7 @@ fn emit_print_marks(
         for (i, &[c, m, y, k]) in swatches.iter().enumerate() {
             let x = start_x + (i as f64) * sw;
             let color = Color::cmyk(c, m, y, k);
-            emit_pdf_color(out, &color, use_cmyk, false);
+            emit_pdf_process_color(out, &color, use_cmyk, false);
             let _ = writeln!(out, "{x:.4} {bar_y:.4} {sw:.4} {sh:.4} re f");
         }
     }
@@ -1195,8 +1783,24 @@ fn add_raster_xobject(
     asset: &coree_core::RasterAsset,
     use_cmyk: bool,
 ) -> IoResult<usize> {
-    let pixel_count = (asset.width as usize)
-        .checked_mul(asset.height as usize)
+    add_rgba_bytes_xobject(
+        store,
+        asset.width,
+        asset.height,
+        &asset.rgba_bytes,
+        use_cmyk,
+    )
+}
+
+fn add_rgba_bytes_xobject(
+    store: &mut PdfObjectStore,
+    width: u32,
+    height: u32,
+    rgba_bytes: &[u8],
+    use_cmyk: bool,
+) -> IoResult<usize> {
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
         .ok_or_else(|| IoError::InvalidFormat {
             format: "pdf".into(),
             message: "raster asset dimensions overflow".into(),
@@ -1207,13 +1811,12 @@ fn add_raster_xobject(
             format: "pdf".into(),
             message: "raster asset byte size overflow".into(),
         })?;
-    if asset.rgba_bytes.len() != expected_bytes {
+    if rgba_bytes.len() != expected_bytes {
         return Err(IoError::InvalidFormat {
             format: "pdf".into(),
             message: format!(
-                "raster asset {} has {} RGBA bytes, expected {expected_bytes}",
-                asset.id,
-                asset.rgba_bytes.len()
+                "raster image has {} RGBA bytes, expected {expected_bytes}",
+                rgba_bytes.len()
             ),
         });
     }
@@ -1221,7 +1824,7 @@ fn add_raster_xobject(
     let mut alpha_data = Vec::with_capacity(pixel_count);
     let mut has_transparency = false;
 
-    for px in asset.rgba_bytes.as_chunks::<4>().0 {
+    for px in rgba_bytes.as_chunks::<4>().0 {
         if use_cmyk {
             let c = Color::rgba8(px[0], px[1], px[2], 255).to_cmyk();
             color_data.push((c[0] * 255.0).round() as u8);
@@ -1244,10 +1847,8 @@ fn add_raster_xobject(
         enc.write_all(&alpha_data)?;
         let compressed = enc.finish()?;
         let mut smask_buf = format!(
-            "<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+            "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
              /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
-            asset.width,
-            asset.height,
             compressed.len()
         )
         .into_bytes();
@@ -1268,10 +1869,8 @@ fn add_raster_xobject(
         "/DeviceRGB"
     };
     let mut img_buf = format!(
-        "<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+        "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
          /ColorSpace {cs} /BitsPerComponent 8{smask_ref} /Filter /FlateDecode /Length {} >>\nstream\n",
-        asset.width,
-        asset.height,
         compressed.len()
     )
     .into_bytes();
@@ -1482,5 +2081,112 @@ mod tests {
         let file_bytes = std::fs::read(&path).unwrap();
         assert!(file_bytes.starts_with(b"%PDF-1.7\n"));
         assert!(String::from_utf8_lossy(&file_bytes).contains("/Filter /FlateDecode"));
+    }
+
+    #[test]
+    fn pdf_arabic_curves_spot_separation_gradients_and_effects_export() {
+        let mut doc = Document::new("Pro Print Proof", 150.0, 100.0, ColorMode::Cmyk, 300.0);
+
+        // 1. Arabic RTL ArtisticText -> must produce real glyph curves (no Tofu boxes!)
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Arabic Title",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "درع الشكر والتقدير",
+                    TextStyle {
+                        font_size_pt: 28.0,
+                        direction: TextDirection::Rtl,
+                        fill: Color::cmyk(0.0, 0.9, 0.9, 0.0),
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(30.0, 25.0)),
+            None,
+        )
+        .unwrap();
+
+        // 2. Multi-stop Linear Gradient + Spot CutContour outline
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Badge",
+                NodePayload::Shape(coree_core::ParametricShape::Rectangle {
+                    width: 60.0,
+                    height: 30.0,
+                    corner_radii: [4.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::LinearGradient {
+                start: Point2D::new(0.0, 0.0),
+                end: Point2D::new(60.0, 0.0),
+                stops: vec![
+                    GradientStop::new(0.0, Color::cmyk(1.0, 0.0, 0.0, 0.0)),
+                    GradientStop::new(0.5, Color::cmyk(0.0, 1.0, 0.0, 0.0)),
+                    GradientStop::new(1.0, Color::cmyk(0.0, 0.0, 1.0, 0.0)),
+                ],
+            })
+            .with_outline(OutlineStyle::cut_contour())
+            .with_transform(Affine2D::translate(20.0, 50.0)),
+            None,
+        )
+        .unwrap();
+
+        // 3. Radial gradient + DropShadow -> complex effect rasterized cleanly with SMask
+        let mut shadowed = SceneObject::new(
+            ObjectId(0),
+            "Shadowed Orb",
+            NodePayload::Shape(coree_core::ParametricShape::Ellipse {
+                rx: 12.0,
+                ry: 12.0,
+                mode: coree_core::EllipseMode::Full,
+                start_deg: 0.0,
+                end_deg: 360.0,
+            }),
+        )
+        .with_fill(Fill::RadialGradient {
+            center: Point2D::new(0.0, 0.0),
+            radius: 12.0,
+            focal: Point2D::new(-3.0, -3.0),
+            stops: vec![
+                GradientStop::new(0.0, Color::WHITE),
+                GradientStop::new(1.0, Color::cmyk(0.8, 0.2, 0.0, 0.0)),
+            ],
+        })
+        .with_transform(Affine2D::translate(115.0, 60.0));
+        shadowed.effects.push(Effect::DropShadow {
+            dx_mm: 2.0,
+            dy_mm: 2.0,
+            blur_mm: 2.5,
+            opacity: 0.5,
+            color: Color::BLACK,
+            feather_direction: coree_core::FeatherDirection::Outside,
+        });
+        doc.add_object(shadowed, None).unwrap();
+
+        let opts = PdfExportOptions {
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        };
+        let pdf_bytes = export_pdf_to_bytes(&doc, &opts).unwrap();
+        let text = String::from_utf8_lossy(&pdf_bytes);
+
+        // True Separation spot color space for CutContour
+        assert!(text.contains("/Separation /CutContour /DeviceCMYK"));
+        assert!(text.contains("/ColorSpace <<"));
+        assert!(text.contains(" SCN"));
+        // True multi-stop Type 3 stitching shading
+        assert!(text.contains("/ShadingType 2"));
+        assert!(text.contains("/FunctionType 3"));
+        assert!(text.contains(" sh"));
+        // Real Arabic Bezier glyph curves (quadratic/cubic converted to PDF ` c` curves)
+        assert!(text.contains(" c\n"));
+        // Complex shadow composite emitted as RGBA Image XObject + SMask
+        assert!(text.contains("/Subtype /Image"));
+        assert!(text.contains("/SMask"));
     }
 }

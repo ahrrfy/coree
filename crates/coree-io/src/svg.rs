@@ -10,10 +10,13 @@ use crate::raster::{
     decode_raster_bytes_with_limits, export_raster_to_bytes, RasterExportOptions, RasterFormat,
 };
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Fill, GradientStop,
-    LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Point2D,
-    RasterLayerData, SceneObject, TextAlign, TextDirection, TextRun, TextStyle, Unit,
+    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Effect, Fill,
+    GradientStop, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId,
+    OutlineStyle, Point2D, RasterLayerData, SceneObject, TextAlign, TextDirection, TextRun,
+    TextStyle, Unit,
 };
+use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
+use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba};
 use kurbo::{BezPath, PathEl};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -1143,6 +1146,7 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
             if let Some(obj) = doc.objects.get(&oid) {
                 write_svg_object(
                     doc,
+                    page_index,
                     obj,
                     Affine2D::IDENTITY,
                     &mut defs,
@@ -1180,9 +1184,72 @@ pub fn export_svg(doc: &Document, page_index: usize, path: &Path) -> IoResult<()
     atomic_write_bytes(path, svg.as_bytes())
 }
 
+fn svg_requires_raster_composite(obj: &SceneObject) -> bool {
+    if obj.lens.is_some() {
+        return true;
+    }
+    if obj.effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::DropShadow { .. }
+                | Effect::BlockShadow { .. }
+                | Effect::Contour { .. }
+                | Effect::Extrude25D { .. }
+                | Effect::Blend { .. }
+                | Effect::Transparency { .. }
+        )
+    }) {
+        return true;
+    }
+    matches!(
+        obj.fill,
+        Fill::ConicalGradient { .. }
+            | Fill::SquareGradient { .. }
+            | Fill::MeshFill { .. }
+            | Fill::TextureFill { .. }
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_svg_arrowheads(
+    path: &BezierPath,
+    outline: &OutlineStyle,
+    xf_attr: &str,
+    op_attr: &str,
+    blend_attr: &str,
+    vis_attr: &str,
+    body: &mut String,
+    pad: &str,
+) {
+    let heads = outline_arrowhead_geometries(path, outline);
+    if heads.is_empty() {
+        return;
+    }
+    let hex = color_to_svg_rgb(&outline.color);
+    for (geom, filled) in heads {
+        let d = bezier_to_svg_d(&geom);
+        if d.is_empty() {
+            continue;
+        }
+        if filled {
+            let _ = writeln!(
+                body,
+                "{pad}<path d=\"{d}\" fill=\"{hex}\" stroke=\"none\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+            );
+        } else {
+            let _ = writeln!(
+                body,
+                "{pad}<path d=\"{d}\" fill=\"none\" stroke=\"{hex}\" stroke-width=\"{:.4}\" stroke-linecap=\"round\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
+                outline.effective_width_mm().max(0.2)
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_svg_object(
     doc: &Document,
+    page_index: usize,
     obj: &SceneObject,
     parent_xf: Affine2D,
     defs: &mut String,
@@ -1196,10 +1263,8 @@ fn write_svg_object(
         return;
     }
 
-    let world_xf = parent_xf.compose(&obj.transform);
     let pad = " ".repeat(indent);
     let vis_attr = if obj.visible { "" } else { " display=\"none\"" };
-    let xf_attr = format_svg_transform(obj.transform);
     let safe_opacity = if obj.opacity.is_finite() {
         obj.opacity.clamp(0.0, 1.0)
     } else {
@@ -1212,94 +1277,69 @@ fn write_svg_object(
     };
     let blend_attr = format_svg_blend_style(obj.blend_mode);
 
-    match &obj.payload {
-        NodePayload::Path(path) => {
-            let paint_attrs = format_svg_paint_attrs(&obj.fill, &obj.outline, defs, def_counter);
-            let d = bezier_to_svg_d(path);
-            let _ = writeln!(
-                body,
-                "{pad}<path id=\"obj-{}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
-                obj.id.0
-            );
-        }
-        NodePayload::Shape(shape) => {
-            let path = shape.to_bezier_path();
-            let paint_attrs = format_svg_paint_attrs(&obj.fill, &obj.outline, defs, def_counter);
-            let d = bezier_to_svg_d(&path);
-            let _ = writeln!(
-                body,
-                "{pad}<path id=\"obj-{}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
-                obj.id.0
-            );
-        }
-        NodePayload::ArtisticText(text) => {
-            write_svg_artistic_text(
-                obj.id,
-                text,
-                &xf_attr,
-                &op_attr,
-                &blend_attr,
-                vis_attr,
-                body,
-                &pad,
-            );
-        }
-        NodePayload::ParagraphText(para) => {
-            let artistic = ArtisticText {
-                runs: para.runs.clone(),
-                direction: para.direction,
-                align: para.align,
-            };
-            write_svg_artistic_text(
-                obj.id,
-                &artistic,
-                &xf_attr,
-                &op_attr,
-                &blend_attr,
-                vis_attr,
-                body,
-                &pad,
-            );
-        }
-        NodePayload::TextOnPath(top) => {
-            if let Some(world_host_path) = doc.world_path_of(top.path_id) {
-                // Convert world path back into parent group's local space so ancestor `<g transform>`
-                // does not double-transform the textPath host geometry.
-                let local_host = parent_xf.inverse().map_or(world_host_path.clone(), |inv| {
-                    world_host_path.transformed(&inv)
-                });
-                *def_counter += 1;
-                let path_def_id = format!("textpath-{}", *def_counter);
-                let _ = writeln!(
-                    defs,
-                    "    <path id=\"{path_def_id}\" d=\"{}\"/>",
-                    bezier_to_svg_d(&local_host)
-                );
-                let dir_attr = if top.text.effective_direction() == TextDirection::Rtl {
-                    " direction=\"rtl\" unicode-bidi=\"embed\""
-                } else {
-                    ""
-                };
-                let first_style = top
-                    .text
-                    .runs
-                    .first()
-                    .map(|r| r.style.clone())
-                    .unwrap_or_default();
-                let font_mm = first_style.font_size_mm();
+    if svg_requires_raster_composite(obj)
+        && !matches!(
+            obj.payload,
+            NodePayload::Group(_) | NodePayload::SymbolInstance(_)
+        )
+    {
+        if let Ok(Some((rect_mm, rgba_buf))) =
+            render_isolated_object_to_rgba(doc, page_index, obj.id, parent_xf, 150.0)
+        {
+            if let Ok(png) = export_raster_to_bytes(
+                rgba_buf.width,
+                rgba_buf.height,
+                &rgba_buf.rgba,
+                &RasterExportOptions::new(RasterFormat::Png, 150.0),
+            ) {
+                let b64 = encode_base64(&png);
+                // Express world rect inside parent group's local coordinates if inside a group
+                let local_inv = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                let inv_attr = format_svg_transform(local_inv);
                 let _ = writeln!(
                     body,
-                    "{pad}<text id=\"obj-{}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}{op_attr}{blend_attr}{vis_attr}><textPath href=\"#{path_def_id}\">{}</textPath></text>",
+                    "{pad}<image id=\"obj-{}\" x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{inv_attr}{vis_attr}/>",
                     obj.id.0,
-                    escape_xml_attr(&first_style.font_family),
-                    font_mm,
-                    color_to_svg_rgb(&first_style.fill),
-                    escape_xml_text(&top.text.plain_text())
+                    rect_mm.min_x,
+                    rect_mm.min_y,
+                    rect_mm.width(),
+                    rect_mm.height(),
                 );
-            } else {
-                write_svg_artistic_text(
-                    obj.id,
-                    &top.text,
+                visited.remove(&obj.id);
+                return;
+            }
+        }
+    }
+
+    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    for (sym_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
+        let effective_local_xf = sym_xf.compose(&obj.transform);
+        let world_xf = parent_xf.compose(&effective_local_xf);
+        let xf_attr = format_svg_transform(effective_local_xf);
+        let id_suffix = if sym_idx == 0 {
+            format!("obj-{}", obj.id.0)
+        } else {
+            format!("obj-{}-sym{sym_idx}", obj.id.0)
+        };
+
+        match &obj.payload {
+            NodePayload::Path(path) => {
+                let deformed = apply_geometry_effects(path, &obj.effects);
+                let paint_attrs = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &obj.fill,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let d = bezier_to_svg_d(&deformed);
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                );
+                write_svg_arrowheads(
+                    &deformed,
+                    &obj.outline,
                     &xf_attr,
                     &op_attr,
                     &blend_attr,
@@ -1308,204 +1348,335 @@ fn write_svg_object(
                     &pad,
                 );
             }
-        }
-        NodePayload::Raster(raster) => {
-            if let Some(asset) = doc.assets.get(&raster.asset_id) {
-                if let Ok(png) = export_raster_to_bytes(
-                    asset.width,
-                    asset.height,
-                    &asset.rgba_bytes,
-                    &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
-                ) {
-                    let b64 = encode_base64(&png);
+            NodePayload::Shape(shape) => {
+                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                let paint_attrs = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &obj.fill,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let d = bezier_to_svg_d(&deformed);
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                );
+                write_svg_arrowheads(
+                    &deformed,
+                    &obj.outline,
+                    &xf_attr,
+                    &op_attr,
+                    &blend_attr,
+                    vis_attr,
+                    body,
+                    &pad,
+                );
+            }
+            NodePayload::ArtisticText(text) => {
+                write_svg_artistic_text(
+                    obj.id,
+                    text,
+                    &xf_attr,
+                    &op_attr,
+                    &blend_attr,
+                    vis_attr,
+                    body,
+                    &pad,
+                );
+            }
+            NodePayload::ParagraphText(para) => {
+                let artistic = ArtisticText {
+                    runs: para.runs.clone(),
+                    direction: para.direction,
+                    align: para.align,
+                };
+                write_svg_artistic_text(
+                    obj.id,
+                    &artistic,
+                    &xf_attr,
+                    &op_attr,
+                    &blend_attr,
+                    vis_attr,
+                    body,
+                    &pad,
+                );
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(world_host_path) = doc.world_path_of(top.path_id) {
+                    let local_host = parent_xf.inverse().map_or(world_host_path.clone(), |inv| {
+                        world_host_path.transformed(&inv)
+                    });
+                    *def_counter += 1;
+                    let path_def_id = format!("textpath-{}", *def_counter);
+                    let _ = writeln!(
+                        defs,
+                        "    <path id=\"{path_def_id}\" d=\"{}\"/>",
+                        bezier_to_svg_d(&local_host)
+                    );
+                    let dir_attr = if top.text.effective_direction() == TextDirection::Rtl {
+                        " direction=\"rtl\" unicode-bidi=\"embed\""
+                    } else {
+                        ""
+                    };
+                    let first_style = top
+                        .text
+                        .runs
+                        .first()
+                        .map(|r| r.style.clone())
+                        .unwrap_or_default();
+                    let font_mm = first_style.font_size_mm();
                     let _ = writeln!(
                         body,
-                        "{pad}<image id=\"obj-{}\" x=\"0\" y=\"0\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
-                        obj.id.0, raster.width_mm, raster.height_mm
+                        "{pad}<text id=\"{id_suffix}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}{op_attr}{blend_attr}{vis_attr}><textPath href=\"#{path_def_id}\">{}</textPath></text>",
+                        escape_xml_attr(&first_style.font_family),
+                        font_mm,
+                        color_to_svg_rgb(&first_style.fill),
+                        escape_xml_text(&top.text.plain_text())
+                    );
+                } else {
+                    write_svg_artistic_text(
+                        obj.id,
+                        &top.text,
+                        &xf_attr,
+                        &op_attr,
+                        &blend_attr,
+                        vis_attr,
+                        body,
+                        &pad,
                     );
                 }
             }
-        }
-        NodePayload::Table(table) => {
-            let _ = writeln!(
-                body,
-                "{pad}<g id=\"obj-{}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-                obj.id.0
-            );
-            for r in 0..table.rows {
-                for c in 0..table.cols {
-                    if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c)) {
-                        let cell_paint = format_svg_paint_attrs(
-                            &cell.fill,
-                            &table.border_style,
-                            defs,
-                            def_counter,
-                        );
+            NodePayload::Raster(raster) => {
+                if let Some(asset) = doc.assets.get(&raster.asset_id) {
+                    if let Ok(png) = export_raster_to_bytes(
+                        asset.width,
+                        asset.height,
+                        &asset.rgba_bytes,
+                        &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
+                    ) {
+                        let b64 = encode_base64(&png);
                         let _ = writeln!(
                             body,
-                            "{pad}  <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\"{cell_paint}/>",
-                            rect.min_x,
-                            rect.min_y,
-                            rect.width(),
-                            rect.height()
+                            "{pad}<image id=\"{id_suffix}\" x=\"0\" y=\"0\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
+                            raster.width_mm, raster.height_mm
                         );
-                        if !cell.text.is_empty() {
-                            let tx = rect.min_x + cell.padding_mm;
-                            let ty = rect.min_y + cell.padding_mm + cell.text_style.font_size_mm();
-                            let dir_attr =
-                                if TextDirection::detect(&cell.text) == TextDirection::Rtl {
-                                    " direction=\"rtl\" unicode-bidi=\"embed\""
-                                } else {
-                                    ""
-                                };
-                            let _ = writeln!(
-                                body,
-                                "{pad}  <text x=\"{tx:.4}\" y=\"{ty:.4}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}>{}</text>",
-                                escape_xml_attr(&cell.text_style.font_family),
-                                cell.text_style.font_size_mm(),
-                                color_to_svg_rgb(&cell.text_style.fill),
-                                escape_xml_text(&cell.text)
-                            );
-                        }
                     }
                 }
             }
-            let _ = writeln!(body, "{pad}</g>");
-        }
-        NodePayload::Dimension(dim) => {
-            let paint = format_svg_paint_attrs(&Fill::None, &obj.outline, defs, def_counter);
-            let label = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
-            let mid = dim.p1.midpoint(dim.p2);
-            let _ = writeln!(
-                body,
-                "{pad}<g id=\"obj-{}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-                obj.id.0
-            );
-            let _ = writeln!(
-                body,
-                "{pad}  <line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\"{paint}/>",
-                dim.p1.x,
-                dim.p1.y - dim.offset_mm,
-                dim.p2.x,
-                dim.p2.y - dim.offset_mm
-            );
-            let _ = writeln!(
-                body,
-                "{pad}  <text x=\"{:.4}\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{:.4}\" text-anchor=\"middle\" fill=\"{}\">{}</text>",
-                mid.x,
-                mid.y - dim.offset_mm - 1.5,
-                escape_xml_attr(&dim.text_style.font_family),
-                dim.text_style.font_size_mm(),
-                color_to_svg_rgb(&dim.text_style.fill),
-                escape_xml_text(&label)
-            );
-            let _ = writeln!(body, "{pad}</g>");
-        }
-        NodePayload::Connector(conn) => {
-            let (a, b) = doc.resolve_connector_endpoints(conn);
-            let world_path = conn.route_path(a, b);
-            // Express connector route in enclosing group's local coordinates to prevent double-transform.
-            let local_path = parent_xf
-                .inverse()
-                .map_or(world_path.clone(), |inv| world_path.transformed(&inv));
-            let paint = format_svg_paint_attrs(&Fill::None, &obj.outline, defs, def_counter);
-            let _ = writeln!(
-                body,
-                "{pad}<path id=\"obj-{}\" d=\"{}\"{paint}{op_attr}{blend_attr}{vis_attr}/>",
-                obj.id.0,
-                bezier_to_svg_d(&local_path)
-            );
-        }
-        NodePayload::Group(children) => {
-            let _ = writeln!(
-                body,
-                "{pad}<g id=\"obj-{}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-                obj.id.0
-            );
-            for &cid in children {
-                if let Some(child) = doc.objects.get(&cid) {
-                    write_svg_object(
-                        doc,
-                        child,
-                        world_xf,
-                        defs,
-                        body,
-                        def_counter,
-                        indent + 2,
-                        depth + 1,
-                        visited,
-                    );
-                }
-            }
-            let _ = writeln!(body, "{pad}</g>");
-        }
-        NodePayload::PowerClip {
-            container,
-            contents,
-        } => {
-            *def_counter += 1;
-            let clip_id = format!("clip-{}", *def_counter);
-            let container_d = bezier_to_svg_d(container);
-            let _ = writeln!(
-                defs,
-                "    <clipPath id=\"{clip_id}\"><path d=\"{container_d}\"/></clipPath>"
-            );
-            let _ = writeln!(
-                body,
-                "{pad}<g id=\"obj-{}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-                obj.id.0
-            );
-            if obj.fill.is_visible() {
-                let fill_only =
-                    format_svg_paint_attrs(&obj.fill, &OutlineStyle::none(), defs, def_counter);
-                let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{fill_only}/>");
-            }
-            let _ = writeln!(body, "{pad}  <g clip-path=\"url(#{clip_id})\">");
-            for &cid in contents {
-                if let Some(child) = doc.objects.get(&cid) {
-                    write_svg_object(
-                        doc,
-                        child,
-                        world_xf,
-                        defs,
-                        body,
-                        def_counter,
-                        indent + 4,
-                        depth + 1,
-                        visited,
-                    );
-                }
-            }
-            let _ = writeln!(body, "{pad}  </g>");
-            if obj.outline.is_visible() {
-                let stroke_only =
-                    format_svg_paint_attrs(&Fill::None, &obj.outline, defs, def_counter);
-                let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{stroke_only}/>");
-            }
-            let _ = writeln!(body, "{pad}</g>");
-        }
-        NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
+            NodePayload::Table(table) => {
                 let _ = writeln!(
                     body,
-                    "{pad}<g id=\"obj-{}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-                    obj.id.0
+                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
                 );
-                for sub in &sym.objects {
-                    let mut sym_visited = HashSet::new();
-                    write_svg_object(
-                        doc,
-                        sub,
-                        world_xf,
-                        defs,
-                        body,
-                        def_counter,
-                        indent + 2,
-                        depth + 1,
-                        &mut sym_visited,
-                    );
+                for r in 0..table.rows {
+                    for c in 0..table.cols {
+                        if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c))
+                        {
+                            let cell_paint = format_svg_paint_attrs_with_doc(
+                                doc,
+                                &cell.fill,
+                                &table.border_style,
+                                defs,
+                                def_counter,
+                            );
+                            let _ = writeln!(
+                                body,
+                                "{pad}  <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\"{cell_paint}/>",
+                                rect.min_x,
+                                rect.min_y,
+                                rect.width(),
+                                rect.height()
+                            );
+                            if !cell.text.is_empty() {
+                                let tx = rect.min_x + cell.padding_mm;
+                                let ty =
+                                    rect.min_y + cell.padding_mm + cell.text_style.font_size_mm();
+                                let dir_attr =
+                                    if TextDirection::detect(&cell.text) == TextDirection::Rtl {
+                                        " direction=\"rtl\" unicode-bidi=\"embed\""
+                                    } else {
+                                        ""
+                                    };
+                                let _ = writeln!(
+                                    body,
+                                    "{pad}  <text x=\"{tx:.4}\" y=\"{ty:.4}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}>{}</text>",
+                                    escape_xml_attr(&cell.text_style.font_family),
+                                    cell.text_style.font_size_mm(),
+                                    color_to_svg_rgb(&cell.text_style.fill),
+                                    escape_xml_text(&cell.text)
+                                );
+                            }
+                        }
+                    }
                 }
                 let _ = writeln!(body, "{pad}</g>");
+            }
+            NodePayload::Dimension(dim) => {
+                let paint = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &Fill::None,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let label = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
+                let mid = dim.p1.midpoint(dim.p2);
+                let _ = writeln!(
+                    body,
+                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
+                );
+                let _ = writeln!(
+                    body,
+                    "{pad}  <line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\"{paint}/>",
+                    dim.p1.x,
+                    dim.p1.y - dim.offset_mm,
+                    dim.p2.x,
+                    dim.p2.y - dim.offset_mm
+                );
+                let _ = writeln!(
+                    body,
+                    "{pad}  <text x=\"{:.4}\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{:.4}\" text-anchor=\"middle\" fill=\"{}\">{}</text>",
+                    mid.x,
+                    mid.y - dim.offset_mm - 1.5,
+                    escape_xml_attr(&dim.text_style.font_family),
+                    dim.text_style.font_size_mm(),
+                    color_to_svg_rgb(&dim.text_style.fill),
+                    escape_xml_text(&label)
+                );
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            NodePayload::Connector(conn) => {
+                let (a, b) = doc.resolve_connector_endpoints(conn);
+                let world_path = conn.route_path(a, b);
+                let local_path = parent_xf
+                    .inverse()
+                    .map_or(world_path.clone(), |inv| world_path.transformed(&inv));
+                let paint = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &Fill::None,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{}\"{paint}{op_attr}{blend_attr}{vis_attr}/>",
+                    bezier_to_svg_d(&local_path)
+                );
+                write_svg_arrowheads(
+                    &local_path,
+                    &obj.outline,
+                    "",
+                    &op_attr,
+                    &blend_attr,
+                    vis_attr,
+                    body,
+                    &pad,
+                );
+            }
+            NodePayload::Group(children) => {
+                let _ = writeln!(
+                    body,
+                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
+                );
+                for &cid in children {
+                    if let Some(child) = doc.objects.get(&cid) {
+                        write_svg_object(
+                            doc,
+                            page_index,
+                            child,
+                            world_xf,
+                            defs,
+                            body,
+                            def_counter,
+                            indent + 2,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            NodePayload::PowerClip {
+                container,
+                contents,
+            } => {
+                *def_counter += 1;
+                let clip_id = format!("clip-{}", *def_counter);
+                let deformed_container = apply_geometry_effects(container, &obj.effects);
+                let container_d = bezier_to_svg_d(&deformed_container);
+                let _ = writeln!(
+                    defs,
+                    "    <clipPath id=\"{clip_id}\"><path d=\"{container_d}\"/></clipPath>"
+                );
+                let _ = writeln!(
+                    body,
+                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
+                );
+                if obj.fill.is_visible() {
+                    let fill_only = format_svg_paint_attrs_with_doc(
+                        doc,
+                        &obj.fill,
+                        &OutlineStyle::none(),
+                        defs,
+                        def_counter,
+                    );
+                    let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{fill_only}/>");
+                }
+                let _ = writeln!(body, "{pad}  <g clip-path=\"url(#{clip_id})\">");
+                for &cid in contents {
+                    if let Some(child) = doc.objects.get(&cid) {
+                        write_svg_object(
+                            doc,
+                            page_index,
+                            child,
+                            world_xf,
+                            defs,
+                            body,
+                            def_counter,
+                            indent + 4,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+                let _ = writeln!(body, "{pad}  </g>");
+                if obj.outline.is_visible() {
+                    let stroke_only = format_svg_paint_attrs_with_doc(
+                        doc,
+                        &Fill::None,
+                        &obj.outline,
+                        defs,
+                        def_counter,
+                    );
+                    let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{stroke_only}/>");
+                }
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(sym) = doc.symbols.get(sym_id) {
+                    let _ = writeln!(
+                        body,
+                        "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
+                    );
+                    for sub in &sym.objects {
+                        let mut sym_visited = HashSet::new();
+                        write_svg_object(
+                            doc,
+                            page_index,
+                            sub,
+                            world_xf,
+                            defs,
+                            body,
+                            def_counter,
+                            indent + 2,
+                            depth + 1,
+                            &mut sym_visited,
+                        );
+                    }
+                    let _ = writeln!(body, "{pad}</g>");
+                }
             }
         }
     }
@@ -1576,7 +1747,8 @@ fn write_svg_artistic_text(
     body.push_str("</text>\n");
 }
 
-fn format_svg_paint_attrs(
+fn format_svg_paint_attrs_with_doc(
+    doc: &Document,
     fill: &Fill,
     outline: &OutlineStyle,
     defs: &mut String,
@@ -1637,19 +1809,126 @@ fn format_svg_paint_attrs(
             defs.push_str("    </radialGradient>\n");
             let _ = write!(s, " fill=\"url(#{gid})\"");
         }
+        Fill::TwoColorPattern {
+            fg,
+            bg,
+            pattern_name: _,
+            tile_w,
+            tile_h,
+        } => {
+            *def_counter += 1;
+            let pid = format!("pat-{}", *def_counter);
+            let tw = tile_w.max(1.0);
+            let th = tile_h.max(1.0);
+            let _ = writeln!(
+                defs,
+                "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\">"
+            );
+            let _ = writeln!(
+                defs,
+                "      <rect width=\"{tw:.4}\" height=\"{th:.4}\" fill=\"{}\"/>",
+                color_to_svg_rgb(bg)
+            );
+            let _ = writeln!(
+                defs,
+                "      <rect width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\"/>",
+                tw * 0.5,
+                th * 0.5,
+                color_to_svg_rgb(fg)
+            );
+            let _ = writeln!(
+                defs,
+                "      <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\"/>",
+                tw * 0.5,
+                th * 0.5,
+                tw * 0.5,
+                th * 0.5,
+                color_to_svg_rgb(fg)
+            );
+            defs.push_str("    </pattern>\n");
+            let _ = write!(s, " fill=\"url(#{pid})\"");
+        }
+        Fill::BitmapPattern {
+            image_id,
+            tile_w,
+            tile_h,
+        } => {
+            if let Some(asset) = doc.assets.get(image_id) {
+                if let Ok(png) = export_raster_to_bytes(
+                    asset.width,
+                    asset.height,
+                    &asset.rgba_bytes,
+                    &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
+                ) {
+                    *def_counter += 1;
+                    let pid = format!("bpat-{}", *def_counter);
+                    let tw = tile_w.max(1.0);
+                    let th = tile_h.max(1.0);
+                    let b64 = encode_base64(&png);
+                    let _ = writeln!(
+                        defs,
+                        "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\">"
+                    );
+                    let _ = writeln!(
+                        defs,
+                        "      <image x=\"0\" y=\"0\" width=\"{tw:.4}\" height=\"{th:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"/>"
+                    );
+                    defs.push_str("    </pattern>\n");
+                    let _ = write!(s, " fill=\"url(#{pid})\"");
+                } else {
+                    s.push_str(" fill=\"none\"");
+                }
+            } else {
+                s.push_str(" fill=\"none\"");
+            }
+        }
+        Fill::VectorPattern {
+            symbol_id,
+            tile_w,
+            tile_h,
+        } => {
+            if let Some(sym) = doc.symbols.get(symbol_id) {
+                *def_counter += 1;
+                let pid = format!("vpat-{}", *def_counter);
+                let tw = tile_w.max(1.0);
+                let th = tile_h.max(1.0);
+                let mut pat_body = String::new();
+                let mut visited = HashSet::new();
+                for sub in &sym.objects {
+                    write_svg_object(
+                        doc,
+                        0,
+                        sub,
+                        Affine2D::IDENTITY,
+                        defs,
+                        &mut pat_body,
+                        def_counter,
+                        6,
+                        0,
+                        &mut visited,
+                    );
+                }
+                let _ = writeln!(
+                    defs,
+                    "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\">"
+                );
+                defs.push_str(&pat_body);
+                defs.push_str("    </pattern>\n");
+                let _ = write!(s, " fill=\"url(#{pid})\"");
+            } else {
+                s.push_str(" fill=\"none\"");
+            }
+        }
         Fill::ConicalGradient { stops, .. } | Fill::SquareGradient { stops, .. } => {
             let fallback = stops.first().map_or(Color::BLACK, |st| st.color.clone());
             let _ = write!(s, " fill=\"{}\"", color_to_svg_rgb(&fallback));
         }
-        Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } => {
+        Fill::TextureFill { fg, .. } => {
             let _ = write!(s, " fill=\"{}\"", color_to_svg_rgb(fg));
         }
         Fill::MeshFill { nodes, .. } => {
             let fallback = nodes.first().map_or(Color::BLACK, |n| n.color.clone());
             let _ = write!(s, " fill=\"{}\"", color_to_svg_rgb(&fallback));
-        }
-        Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => {
-            s.push_str(" fill=\"none\"");
         }
     }
 
@@ -1956,5 +2235,54 @@ mod tests {
         };
         let err = import_svg_str_with_limits(&svg, &limits).unwrap_err();
         assert!(matches!(err, IoError::LimitExceeded { .. }));
+    }
+
+    #[test]
+    fn svg_patterns_symmetry_and_arrowheads_export() {
+        let mut doc = Document::new("SVG Effects", 120.0, 90.0, ColorMode::Rgb, 96.0);
+        let asset =
+            RasterAsset::new(2, 2, [255, 128, 0, 255].repeat(4), 96.0, ColorMode::Rgb).unwrap();
+        let asset_id = doc.register_asset(asset);
+
+        let mut line = SceneObject::new(
+            ObjectId(0),
+            "Arrow",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(10.0, 10.0),
+                Point2D::new(40.0, 10.0),
+            )),
+        )
+        .with_outline(OutlineStyle {
+            end_arrow: coree_core::ArrowheadStyle::Triangle,
+            ..OutlineStyle::solid(Color::BLACK, 1.0)
+        });
+        line.effects.push(Effect::Symmetry {
+            axes: 2,
+            mirror: false,
+            origin: Point2D::new(50.0, 40.0),
+        });
+        doc.add_object(line, None).unwrap();
+
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "PatBox",
+                NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                    60.0, 20.0, 30.0, 30.0,
+                ))),
+            )
+            .with_fill(Fill::BitmapPattern {
+                image_id: asset_id,
+                tile_w: 5.0,
+                tile_h: 5.0,
+            }),
+            None,
+        )
+        .unwrap();
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(svg.contains("<pattern id=\"bpat-"));
+        assert!(svg.contains("fill=\"url(#bpat-"));
+        assert!(svg.contains("-sym1\""));
     }
 }

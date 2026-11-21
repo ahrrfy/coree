@@ -505,6 +505,7 @@ struct ParseContext<'a> {
     current_page_h_mm: f64,
     zcf: &'a ZcfContext,
     fills: HashMap<u32, Fill>,
+    normalized_fills: HashSet<u32>,
     outlines: HashMap<u32, OutlineStyle>,
     outlines_explicit_none: HashSet<u32>,
     styles: HashMap<u32, ParsedStyleEntry>,
@@ -609,6 +610,7 @@ pub(crate) fn parse_cdr_riff_tree(
         current_page_h_mm: init_h,
         zcf,
         fills: HashMap::new(),
+        normalized_fills: HashSet::new(),
         outlines: HashMap::new(),
         outlines_explicit_none: HashSet::new(),
         styles: HashMap::new(),
@@ -774,7 +776,10 @@ fn parse_doc_list(
                 b"mcfg" => parse_doc_mcfg(data, doc, ctx),
                 b"plte" => parse_plte_chunk(data, doc, ctx),
                 b"fild" => {
-                    if let Ok((id, fill)) = parse_fild_chunk(data, ctx.is_zcf) {
+                    if let Ok((id, fill, is_norm)) = parse_fild_chunk(data, ctx.is_zcf) {
+                        if is_norm {
+                            ctx.normalized_fills.insert(id);
+                        }
                         ctx.fills.insert(id, fill);
                     }
                 }
@@ -813,7 +818,11 @@ fn parse_doc_list(
                     for ch in list_ch {
                         if let RiffNode::Chunk { fourcc, data, .. } = ch {
                             if fourcc == b"fild" {
-                                if let Ok((id, fill)) = parse_fild_chunk(data, ctx.is_zcf) {
+                                if let Ok((id, fill, is_norm)) = parse_fild_chunk(data, ctx.is_zcf)
+                                {
+                                    if is_norm {
+                                        ctx.normalized_fills.insert(id);
+                                    }
                                     ctx.fills.insert(id, fill);
                                 }
                             }
@@ -1557,6 +1566,7 @@ fn parse_object_list(
     let mut synthetic_transform = Affine2D::IDENTITY;
     let mut real_trfd: Option<RealCorelMatrix> = None;
     let mut inline_fill: Option<Fill> = None;
+    let mut inline_fill_normalized = false;
     let mut inline_outline: Option<OutlineStyle> = None;
     let mut inline_outline_explicit_none = false;
     let mut inline_style: Option<ParsedStyleEntry> = None;
@@ -1661,10 +1671,14 @@ fn parse_object_list(
                 }
             }
             b"fild" => match parse_fild_chunk(data, ctx.is_zcf) {
-                Ok((id, fill)) => {
+                Ok((id, fill, is_norm)) => {
                     if id != 0 {
+                        if is_norm {
+                            ctx.normalized_fills.insert(id);
+                        }
                         ctx.fills.insert(id, fill.clone());
                     }
+                    inline_fill_normalized = is_norm;
                     inline_fill = Some(fill);
                 }
                 Err(e) => ctx.warnings.push(format!("malformed fild chunk: {e}")),
@@ -1716,12 +1730,28 @@ fn parse_object_list(
     let loda = loda_data.unwrap_or_default();
 
     // Resolve fill: inline `fild`, then `fill_id` lookup, then `0x00C9` JSON explicit fill type
+    let mut fill_is_normalized = if inline_fill.is_some() {
+        inline_fill_normalized
+    } else {
+        loda.fill_id
+            .is_some_and(|id| ctx.normalized_fills.contains(&id))
+    };
     let mut fill = inline_fill
         .or_else(|| loda.fill_id.and_then(|id| ctx.fills.get(&id).cloned()))
         .unwrap_or(Fill::None);
     if let Some(ref c9) = loda.style_json {
         if let Some(explicit_fill) = c9.explicit_fill() {
             fill = explicit_fill;
+            fill_is_normalized = true;
+        }
+    } else if matches!(fill, Fill::None) {
+        if let Some(sid) = loda.style_id {
+            if let Some(resolved_style) = ctx.zcf.stylesheet.resolve(&sid.to_string()) {
+                if let Some(st_fill) = resolved_style.explicit_fill() {
+                    fill = st_fill;
+                    fill_is_normalized = true;
+                }
+            }
         }
     }
 
@@ -1847,6 +1877,18 @@ fn parse_object_list(
         doc.unknown_doc_chunks.extend(unknown_chunks);
         return Ok(None);
     };
+
+    if fill_is_normalized {
+        let local_bb = match &payload {
+            NodePayload::Path(p) => p.bounding_box(),
+            NodePayload::Shape(s) => s.to_bezier_path().bounding_box(),
+            NodePayload::PowerClip { container, .. } => container.bounding_box(),
+            _ => None,
+        };
+        if let Some(bb) = local_bb {
+            rescale_normalized_fill_to_bounds(&mut fill, bb);
+        }
+    }
 
     let oid = doc.alloc_object_id();
     let props = loda.props.unwrap_or_else(|| {
@@ -3153,17 +3195,67 @@ fn decode_real_corel_color_record(raw: &[u8]) -> Option<coree_core::Color> {
     decode_cdr_color(model_id, channels, None).ok()
 }
 
-fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill)> {
+fn rescale_normalized_fill_to_bounds(fill: &mut Fill, bb: Rect2D) {
+    let w = bb.width().max(1e-3);
+    let h = bb.height().max(1e-3);
+    match fill {
+        Fill::LinearGradient { start, end, .. } => {
+            *start = Point2D::new(bb.min_x + start.x * w, bb.min_y + start.y * h);
+            *end = Point2D::new(bb.min_x + end.x * w, bb.min_y + end.y * h);
+        }
+        Fill::RadialGradient {
+            center,
+            radius,
+            focal,
+            ..
+        } => {
+            *center = Point2D::new(bb.min_x + center.x * w, bb.min_y + center.y * h);
+            *focal = Point2D::new(bb.min_x + focal.x * w, bb.min_y + focal.y * h);
+            *radius = (*radius * w.max(h)).max(0.5);
+        }
+        Fill::ConicalGradient { center, .. } => {
+            *center = Point2D::new(bb.min_x + center.x * w, bb.min_y + center.y * h);
+        }
+        Fill::SquareGradient { center, size, .. } => {
+            *center = Point2D::new(bb.min_x + center.x * w, bb.min_y + center.y * h);
+            *size = (*size * w.max(h)).max(0.5);
+        }
+        _ => {}
+    }
+}
+
+fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill, bool)> {
     let mut r = ByteReader::new(data);
     let fill_id = r.read_u32_le("real fild id")?;
     if data.len() < 14 {
-        return Ok((fill_id, Fill::None));
+        return Ok((fill_id, Fill::None, true));
     }
     let sub_tag = u16::from_le_bytes([data[4], data[5]]);
     let fill_type = if sub_tag > 16 || data.len() == 22 {
         u16::from_le_bytes([data[12], data[13]])
     } else {
         sub_tag
+    };
+
+    let collect_embedded_colors = |slice: &[u8], limit: usize| -> Vec<coree_core::Color> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 17 <= slice.len() && out.len() < limit {
+            if slice[pos] == 0x01
+                && slice[pos + 1] == 0x0C
+                && slice[pos + 2] == 0x00
+                && slice[pos + 3] == 0x00
+                && slice[pos + 4] == 0x00
+            {
+                if let Some(c) = decode_real_corel_color_record(&slice[pos + 5..pos + 17]) {
+                    out.push(c);
+                }
+                pos += 17;
+            } else {
+                pos += 1;
+            }
+        }
+        out
     };
 
     let fill = match fill_type {
@@ -3182,35 +3274,59 @@ fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill)> {
             Fill::Solid(color)
         }
         2 => {
-            // Fountain fill: collect up to two embedded color stops as fallback gradient
-            let mut stops = Vec::new();
-            let mut pos = 14usize;
-            while pos + 17 <= data.len() && stops.len() < 8 {
-                if data[pos] == 0x01
-                    && data[pos + 1] == 0x0C
-                    && data[pos + 2] == 0x00
-                    && data[pos + 3] == 0x00
-                    && data[pos + 4] == 0x00
-                {
-                    if let Some(c) = decode_real_corel_color_record(&data[pos + 5..pos + 17]) {
-                        stops.push(c);
-                    }
-                    pos += 17;
+            // Fountain fill: extract subtype (`0` linear, `1` radial, `2` conical, `3` square),
+            // embedded rotation angle, and up to 16 embedded gradient stops.
+            let fountain_sub = if data.len() >= 20 {
+                u16::from_le_bytes([data[16], data[17]])
+            } else {
+                0
+            };
+            let angle_deg = if data.len() >= 28 {
+                let raw_a = i32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+                let deg = f64::from(raw_a) / 1_000_000.0;
+                if deg.is_finite() && deg.abs() <= 360.0 {
+                    deg
                 } else {
-                    pos += 1;
+                    0.0
                 }
-            }
+            } else {
+                0.0
+            };
+            let stops = collect_embedded_colors(&data[14..], 16);
             if stops.len() >= 2 {
                 let last = (stops.len() - 1) as f32;
-                let grad_stops = stops
+                let grad_stops: Vec<GradientStop> = stops
                     .into_iter()
                     .enumerate()
                     .map(|(i, c)| GradientStop::new(i as f32 / last, c))
                     .collect();
-                Fill::LinearGradient {
-                    start: Point2D::new(0.0, 0.5),
-                    end: Point2D::new(1.0, 0.5),
-                    stops: grad_stops,
+                match fountain_sub {
+                    1 | 4 => Fill::RadialGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        radius: 0.5,
+                        focal: Point2D::new(0.5, 0.5),
+                        stops: grad_stops,
+                    },
+                    2 => Fill::ConicalGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        angle_deg,
+                        stops: grad_stops,
+                    },
+                    3 => Fill::SquareGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        size: 1.0,
+                        angle_deg,
+                        stops: grad_stops,
+                    },
+                    _ => {
+                        let rad = angle_deg.to_radians();
+                        let (s, c) = rad.sin_cos();
+                        Fill::LinearGradient {
+                            start: Point2D::new(0.5 - 0.5 * c, 0.5 - 0.5 * s),
+                            end: Point2D::new(0.5 + 0.5 * c, 0.5 + 0.5 * s),
+                            stops: grad_stops,
+                        }
+                    }
                 }
             } else if let Some(c) = stops.into_iter().next() {
                 Fill::Solid(c)
@@ -3218,9 +3334,38 @@ fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill)> {
                 Fill::None
             }
         }
+        6 => {
+            // Two-color pattern fill: extract fg & bg embedded colors instead of dropping to None
+            let cols = collect_embedded_colors(&data[14..], 2);
+            let fg = cols.first().cloned().unwrap_or(coree_core::Color::BLACK);
+            let bg = cols.get(1).cloned().unwrap_or(coree_core::Color::WHITE);
+            Fill::TwoColorPattern {
+                fg,
+                bg,
+                pattern_name: "Checker".to_owned(),
+                tile_w: 8.0,
+                tile_h: 8.0,
+            }
+        }
+        7 | 9 | 10 | 11 => {
+            // Procedural Texture / Full-color Pattern fill: extract embedded palette colors cleanly
+            let cols = collect_embedded_colors(&data[14..], 2);
+            if cols.is_empty() {
+                Fill::None
+            } else {
+                let fg = cols[0].clone();
+                let bg = cols.get(1).cloned().unwrap_or(coree_core::Color::WHITE);
+                Fill::TextureFill {
+                    preset: "marble".to_owned(),
+                    seed: u64::from(fill_id).max(1),
+                    fg,
+                    bg,
+                }
+            }
+        }
         _ => Fill::None,
     };
-    Ok((fill_id, fill))
+    Ok((fill_id, fill, true))
 }
 
 fn find_embedded_corel_color(slice: &[u8]) -> Option<coree_core::Color> {
@@ -3242,7 +3387,7 @@ fn find_embedded_corel_color(slice: &[u8]) -> Option<coree_core::Color> {
     None
 }
 
-fn parse_fild_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, Fill)> {
+fn parse_fild_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, Fill, bool)> {
     if is_zcf
         || (data.len() >= 14 && u16::from_le_bytes([data[4], data[5]]) > 16)
         || (data.len() == 22 && u16::from_le_bytes([data[4], data[5]]) == 0x0514)
@@ -3361,7 +3506,7 @@ fn parse_fild_chunk(data: &[u8], is_zcf: bool) -> CdrResult<(u32, Fill)> {
         }
         _ => Fill::None,
     };
-    Ok((fill_id, fill))
+    Ok((fill_id, fill, false))
 }
 
 fn is_real_outl_v16(data: &[u8]) -> bool {
@@ -3378,6 +3523,13 @@ fn is_real_outl_v16(data: &[u8]) -> bool {
 }
 
 fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
+    if data.len() < 42 {
+        return Err(CdrError::UnexpectedEof {
+            context: "real outl v16 header",
+            needed: 42,
+            available: data.len(),
+        });
+    }
     let outline_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let miter_e6 = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
     let miter_limit = if miter_e6 > 0 {
@@ -3388,7 +3540,16 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
     let color_block_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
     let color = decode_real_corel_color_record(&data[29..41]).unwrap_or(coree_core::Color::BLACK);
 
-    let base = 24 + color_block_len;
+    let Some(base) = 24usize.checked_add(color_block_len) else {
+        return Ok((outline_id, OutlineStyle::none(), true));
+    };
+    if base.saturating_add(24) > data.len() {
+        return Err(CdrError::UnexpectedEof {
+            context: "real outl v16 body",
+            needed: base.saturating_add(24),
+            available: data.len(),
+        });
+    }
     let line_type = u16::from_le_bytes([data[base + 8], data[base + 9]]);
     let caps_raw = u16::from_le_bytes([data[base + 10], data[base + 11]]);
     let join_raw = u16::from_le_bytes([data[base + 12], data[base + 13]]);
@@ -3422,11 +3583,25 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
         2 => LineJoin::Bevel,
         _ => LineJoin::Miter,
     };
-    let dash_pattern = if (line_type & 0x0004) != 0 {
-        vec![2.0, 1.0]
-    } else {
-        Vec::new()
-    };
+    let mut dash_pattern = Vec::new();
+    if (line_type & 0x0004) != 0 {
+        // Check optional dash segment table `[u16 count, u16 seg0, u16 seg1, ...]` after `base + 24`
+        if base + 28 <= data.len() {
+            let count = usize::from(u16::from_le_bytes([data[base + 24], data[base + 25]]));
+            if (1..=32).contains(&count) && base + 26 + count * 2 <= data.len() {
+                for i in 0..count {
+                    let seg =
+                        u16::from_le_bytes([data[base + 26 + i * 2], data[base + 27 + i * 2]]);
+                    if seg > 0 {
+                        dash_pattern.push((f64::from(seg) * 0.25).max(0.25));
+                    }
+                }
+            }
+        }
+        if dash_pattern.is_empty() {
+            dash_pattern = vec![2.0, 1.0];
+        }
+    }
 
     Ok((
         outline_id,
@@ -3442,7 +3617,7 @@ fn parse_real_outl_v16(data: &[u8]) -> CdrResult<(u32, OutlineStyle, bool)> {
             end_arrow: ArrowheadStyle::None,
             behind_fill: (line_type & 0x0010) != 0,
             scale_with_object: (line_type & 0x0020) != 0,
-            overprint: false,
+            overprint: (line_type & 0x0040) != 0,
             calligraphy_angle_deg: f64::from(angle_e6) / 1_000_000.0,
             calligraphy_stretch: if stretch_raw > 0 {
                 (f64::from(stretch_raw) / 100.0).clamp(0.01, 10.0)
@@ -4936,5 +5111,60 @@ fn decode_text_align(v: u8) -> TextAlign {
         3 => TextAlign::Justify,
         4 => TextAlign::ForceJustifyKashida,
         _ => TextAlign::Left,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_zcf_gradient_rescales_onto_object_local_millimeter_bounds() {
+        let mut fill = Fill::LinearGradient {
+            start: Point2D::new(0.0, 0.5),
+            end: Point2D::new(1.0, 0.5),
+            stops: vec![
+                GradientStop::new(0.0, coree_core::Color::rgb(1.0, 0.0, 0.0)),
+                GradientStop::new(1.0, coree_core::Color::rgb(0.0, 0.0, 1.0)),
+            ],
+        };
+        let bb = Rect2D::from_xywh(10.0, 20.0, 120.0, 60.0);
+        rescale_normalized_fill_to_bounds(&mut fill, bb);
+        match fill {
+            Fill::LinearGradient { start, end, .. } => {
+                assert!((start.x - 10.0).abs() < 1e-6);
+                assert!((start.y - 50.0).abs() < 1e-6);
+                assert!((end.x - 130.0).abs() < 1e-6);
+                assert!((end.y - 50.0).abs() < 1e-6);
+            }
+            _ => panic!("expected LinearGradient"),
+        }
+    }
+
+    #[test]
+    fn parse_real_fild_v16_and_outl_v16_handle_subtypes_and_truncated_inputs_safely() {
+        // Real v16 Type 2 Radial gradient with two embedded RGB stops
+        let mut chunk = vec![0u8; 64];
+        chunk[0..4].copy_from_slice(&7u32.to_le_bytes()); // fill_id
+        chunk[4..6].copy_from_slice(&0x0514u16.to_le_bytes());
+        chunk[12..14].copy_from_slice(&2u16.to_le_bytes()); // Fountain fill
+        chunk[16..18].copy_from_slice(&1u16.to_le_bytes()); // Radial subtype
+                                                            // Stop 1 @ offset 20 (`01 0c 00 00 00` + 12-byte RGB)
+        chunk[20..25].copy_from_slice(&[0x01, 0x0C, 0, 0, 0]);
+        chunk[25..27].copy_from_slice(&5u16.to_le_bytes()); // RGB model
+        chunk[33..37].copy_from_slice(&[255, 0, 0, 255]);
+        // Stop 2 @ offset 40
+        chunk[40..45].copy_from_slice(&[0x01, 0x0C, 0, 0, 0]);
+        chunk[45..47].copy_from_slice(&5u16.to_le_bytes()); // RGB model
+        chunk[53..57].copy_from_slice(&[0, 0, 255, 255]);
+
+        let (id, fill, is_norm) = parse_real_fild_v16(&chunk).unwrap();
+        assert_eq!(id, 7);
+        assert!(is_norm);
+        assert!(matches!(fill, Fill::RadialGradient { .. }));
+
+        // Truncated v16 outl must error cleanly without out-of-bounds panic
+        let short_outl = vec![0u8; 16];
+        assert!(parse_real_outl_v16(&short_outl).is_err());
     }
 }

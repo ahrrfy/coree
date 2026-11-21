@@ -113,6 +113,16 @@ pub enum CommandOp {
         orientation: GuideOrientation,
         locked: bool,
     },
+    MoveGuide {
+        id: u64,
+        orientation: GuideOrientation,
+    },
+    RemoveGuide {
+        id: u64,
+    },
+    ToggleGuideLock {
+        id: u64,
+    },
     EditText {
         id: ObjectId,
         payload: NodePayload,
@@ -173,6 +183,9 @@ impl CommandOp {
             Self::AddLayer { name, .. } => format!("Add Layer {name}"),
             Self::SetLayerFlags { .. } => "Update Layer Flags".to_owned(),
             Self::AddGuide { .. } => "Add Guide".to_owned(),
+            Self::MoveGuide { .. } => "Move Guide".to_owned(),
+            Self::RemoveGuide { .. } => "Remove Guide".to_owned(),
+            Self::ToggleGuideLock { .. } => "Toggle Guide Lock".to_owned(),
             Self::EditText { .. } => "Edit Text".to_owned(),
             Self::EditTable { .. } => "Edit Table".to_owned(),
             Self::CreatePowerClip { .. } => "Create PowerClip".to_owned(),
@@ -434,6 +447,23 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             locked,
         } => {
             doc.add_guide(*orientation, *locked);
+        }
+        CommandOp::MoveGuide { id, orientation } => {
+            if let Some(g) = doc.guides.iter_mut().find(|g| g.id == *id) {
+                if !g.locked {
+                    g.orientation = *orientation;
+                    doc.touch();
+                }
+            }
+        }
+        CommandOp::RemoveGuide { id } => {
+            let _ = doc.remove_guide(*id);
+        }
+        CommandOp::ToggleGuideLock { id } => {
+            if let Some(g) = doc.guides.iter_mut().find(|g| g.id == *id) {
+                g.locked = !g.locked;
+                doc.touch();
+            }
         }
         CommandOp::EditText { id, payload } => {
             if !matches!(

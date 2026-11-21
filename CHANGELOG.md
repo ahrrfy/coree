@@ -4,6 +4,24 @@ All notable changes to **`coree`** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-22
+
+### Fixed & Added (Wave C Deep Atomic Audit — `BUG-089`–`BUG-097`)
+- **Vector Print & Web Export Fidelity (`coree-io`, `coree-render`):**
+  - Replaced non-WinAnsi / Arabic RTL solid-rectangle fallback "Tofu" boxes in **PDF** and **EPS** exporters with real cubic Bézier glyph outlines via `coree_render::TextEngine` (`artistic_text_to_curves` / `paragraph_text_to_curves` / `text_on_path_to_curves`).
+  - Added ISO 32000-1 `/Separation /<Spot> /DeviceCMYK` Spot color spaces (preserving cut-layer vector CutContour strokes over artwork), native `/ShadingType 2/3` axial/radial gradients, arrowheads, `Symmetry` clones, geometry deformations, and isolated 300-DPI `/SMask` RGBA XObjects for complex fills, live Lenses, and stacked effects in PDF.
+  - Fixed EPS `NodePayload::Raster` (`ASCIIHexDecode` Level 2/3 `/ImageType 1` export + importer stream reader so inline hex streams re-import cleanly), `shfill` gradients, arrowheads, and effects.
+  - Added SVG `<pattern>` emitters for `TwoColorPattern`, `BitmapPattern`, and `VectorPattern`, SVG arrowheads, and 150-DPI embedded PNG `<image>` fallback for lenses and non-SVG gradients/effects.
+- **ZCF & `.CDR` Fidelity (`coree-cdr`):**
+  - Fixed `[0..1]` normalized vs local-millimeter gradient mismatch (`normalized_fills` + `rescale_normalized_fill_to_bounds`), added cycle-guarded `CdssStyleSheet::resolve()` `"parent"` inheritance, expanded `parse_real_fild_v16` (Radial/Conical/Square/angle/patterns), and bounds-hardened `parse_real_outl_v16`.
+- **Interactive Studio, HiDPI & Persistence (`coree-app`, `coree-core`):**
+  - Added classic modal **Edit Fill (`F11`)** & **Outline Pen (`F12`)** dialogs with live gradient stop strip, calligraphy nib preview, arrowhead swap, and pre-press Overprint toggles.
+  - Added interactive canvas manipulation for Radial/Conical/Square/Mid-Stop gradient handles, live Effect control handles, and selectable/draggable/deletable canvas `Guidelines` (`CommandOp::{MoveGuide, RemoveGuide, ToggleGuideLock}`).
+  - Added live bilingual **English / العربية** (`EN | ع`) studio switcher and fixed silent SQLite `CHECK (category = 'ui')` failure so theme, shortcut profile, and language persist across sessions.
+  - Fixed HiDPI (`pixels_per_point()`) canvas rendering, Frame-0 `CentralPanel` bounds clamping, `physical_key` shortcut lookup on Arabic keyboard layouts, and avoided R-Tree rebuilds on pure Pan/Zoom frames (`DirtyTileCache`).
+- **Release Packaging & Native Binaries:**
+  - Enabled stripped thin-LTO `[profile.release]` in `Cargo.toml`, added `windows_subsystem = "windows"` for release GUI builds on Windows (`main.rs`), `%WINDIR%\Fonts` discovery (`theme.rs`), and `.cdr` `Content Type` registration in `wix/main.wxs`.
+
 ## [0.2.0] - 2026-11-21
 
 ### Changed

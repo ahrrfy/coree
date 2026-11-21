@@ -6,10 +6,12 @@
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Fill, LineCap, LineJoin,
-    MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Point2D, SceneObject,
-    TextDirection, TextStyle,
+    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Effect, Fill, GradientStop,
+    LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Point2D,
+    SceneObject, TextDirection, TextStyle,
 };
+use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
+use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba, TextEngine};
 use kurbo::{BezPath, PathEl};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -97,6 +99,7 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
         }
     }
 
+    let mut text_engine = TextEngine::new();
     for layer in ordered_layers {
         let _ = writeln!(out, "% Layer: {}", sanitize_dsc_comment(&layer.name));
         let mut visited = HashSet::new();
@@ -105,9 +108,11 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
                 emit_eps_object(
                     doc,
                     page,
+                    page_index,
                     obj,
                     Affine2D::IDENTITY,
                     use_cmyk,
+                    &mut text_engine,
                     &mut out,
                     0,
                     &mut visited,
@@ -128,13 +133,140 @@ pub fn export_eps(doc: &Document, page_index: usize, path: &Path) -> IoResult<()
     atomic_write_bytes(path, eps.as_bytes())
 }
 
+fn eps_requires_raster_composite(obj: &SceneObject) -> bool {
+    if obj.lens.is_some() {
+        return true;
+    }
+    if obj.effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::DropShadow { .. }
+                | Effect::BlockShadow { .. }
+                | Effect::Contour { .. }
+                | Effect::Extrude25D { .. }
+                | Effect::Blend { .. }
+                | Effect::Transparency { .. }
+        )
+    }) {
+        return true;
+    }
+    matches!(
+        obj.fill,
+        Fill::ConicalGradient { .. }
+            | Fill::SquareGradient { .. }
+            | Fill::MeshFill { .. }
+            | Fill::TwoColorPattern { .. }
+            | Fill::VectorPattern { .. }
+            | Fill::BitmapPattern { .. }
+            | Fill::TextureFill { .. }
+    )
+}
+
+fn eps_has_geometry_effect(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_eps_rgba_image(
+    page: &Page,
+    width: u32,
+    height: u32,
+    rgba_bytes: &[u8],
+    bl: Point2D,
+    br: Point2D,
+    tl: Point2D,
+    use_cmyk: bool,
+    out: &mut String,
+) {
+    if width == 0 || height == 0 || rgba_bytes.len() < (width as usize) * (height as usize) * 4 {
+        return;
+    }
+    let (x0, y0) = to_eps_pt(page, bl);
+    let (x1, y1) = to_eps_pt(page, br);
+    let (x2, y2) = to_eps_pt(page, tl);
+
+    out.push_str("gsave\n");
+    let _ = writeln!(
+        out,
+        "[{:.4} {:.4} {:.4} {:.4} {:.4} {:.4}] concat",
+        x1 - x0,
+        y1 - y0,
+        x2 - x0,
+        y2 - y0,
+        x0,
+        y0
+    );
+    if use_cmyk {
+        out.push_str("/DeviceCMYK setcolorspace\n");
+    } else {
+        out.push_str("/DeviceRGB setcolorspace\n");
+    }
+    let decode = if use_cmyk {
+        "[0 1 0 1 0 1 0 1]"
+    } else {
+        "[0 1 0 1 0 1]"
+    };
+    let _ = writeln!(
+        out,
+        "<<\n  /ImageType 1\n  /Width {width}\n  /Height {height}\n  /BitsPerComponent 8\n  /Decode {decode}\n  /ImageMatrix [{width} 0 0 -{height} 0 {height}]\n  /DataSource currentfile /ASCIIHexDecode filter\n>> image"
+    );
+
+    let mut hex_line_len = 0usize;
+    let total_px = (width as usize) * (height as usize);
+    for px in rgba_bytes[..total_px * 4].as_chunks::<4>().0 {
+        // Composite over opaque paper white since PostScript has no native alpha channel
+        let a = f32::from(px[3]) / 255.0;
+        let r = (f32::from(px[0]) * a + 255.0 * (1.0 - a))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let g = (f32::from(px[1]) * a + 255.0 * (1.0 - a))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let b = (f32::from(px[2]) * a + 255.0 * (1.0 - a))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        if use_cmyk {
+            let c = Color::rgba8(r, g, b, 255).to_cmyk();
+            for ch in c {
+                let byte = (ch * 255.0).round().clamp(0.0, 255.0) as u8;
+                let _ = write!(out, "{byte:02X}");
+                hex_line_len += 2;
+                if hex_line_len >= 76 {
+                    out.push('\n');
+                    hex_line_len = 0;
+                }
+            }
+        } else {
+            for byte in [r, g, b] {
+                let _ = write!(out, "{byte:02X}");
+                hex_line_len += 2;
+                if hex_line_len >= 76 {
+                    out.push('\n');
+                    hex_line_len = 0;
+                }
+            }
+        }
+    }
+    if hex_line_len > 0 {
+        out.push('\n');
+    }
+    out.push_str(">\ngrestore\n");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_eps_object(
     doc: &Document,
     page: &Page,
+    page_index: usize,
     obj: &SceneObject,
     parent_xf: Affine2D,
     use_cmyk: bool,
+    text_engine: &mut TextEngine,
     out: &mut String,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
@@ -142,185 +274,451 @@ fn emit_eps_object(
     if depth > MAX_EPS_DEPTH || !obj.visible || !obj.printable || !visited.insert(obj.id) {
         return;
     }
-    let world_xf = parent_xf.compose(&obj.transform);
-    if !world_xf.is_finite() {
+    if !parent_xf.is_finite() || !obj.transform.is_finite() {
         visited.remove(&obj.id);
         return;
     }
 
-    match &obj.payload {
-        NodePayload::Path(path) => {
-            emit_eps_styled_path(
+    if eps_requires_raster_composite(obj)
+        && !matches!(
+            obj.payload,
+            NodePayload::Group(_) | NodePayload::SymbolInstance(_)
+        )
+    {
+        if let Ok(Some((rect_mm, rgba_buf))) =
+            render_isolated_object_to_rgba(doc, page_index, obj.id, parent_xf, 300.0)
+        {
+            emit_eps_rgba_image(
                 page,
-                &path.transformed(&world_xf),
-                &obj.fill,
-                &obj.outline,
+                rgba_buf.width,
+                rgba_buf.height,
+                &rgba_buf.rgba,
+                Point2D::new(rect_mm.min_x, rect_mm.max_y),
+                Point2D::new(rect_mm.max_x, rect_mm.max_y),
+                Point2D::new(rect_mm.min_x, rect_mm.min_y),
                 use_cmyk,
                 out,
             );
+            visited.remove(&obj.id);
+            return;
         }
-        NodePayload::Shape(shape) => {
-            emit_eps_styled_path(
-                page,
-                &shape.to_bezier_path().transformed(&world_xf),
-                &obj.fill,
-                &obj.outline,
-                use_cmyk,
-                out,
-            );
+    }
+
+    let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    for sym_xf in sym_transforms {
+        let effective_parent = parent_xf.compose(&sym_xf);
+        let world_xf = effective_parent.compose(&obj.transform);
+        if !world_xf.is_finite() {
+            continue;
         }
-        NodePayload::ArtisticText(text) => {
-            let style = text
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_eps_text(
-                page,
-                &text.plain_text(),
-                &style,
-                text.effective_direction(),
-                world_xf,
-                use_cmyk,
-                out,
-            );
-        }
-        NodePayload::ParagraphText(para) => {
-            let style = para
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_eps_text(
-                page,
-                &para.plain_text(),
-                &style,
-                para.effective_direction(),
-                world_xf,
-                use_cmyk,
-                out,
-            );
-        }
-        NodePayload::TextOnPath(top) => {
-            let style = top
-                .text
-                .runs
-                .first()
-                .map(|r| r.style.clone())
-                .unwrap_or_default();
-            emit_eps_text(
-                page,
-                &top.text.plain_text(),
-                &style,
-                top.text.effective_direction(),
-                world_xf,
-                use_cmyk,
-                out,
-            );
-        }
-        NodePayload::Table(table) => {
-            for r in 0..table.rows {
-                for c in 0..table.cols {
-                    if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c)) {
-                        emit_eps_styled_path(
-                            page,
-                            &BezierPath::from_rect(rect).transformed(&world_xf),
-                            &cell.fill,
-                            &table.border_style,
-                            use_cmyk,
-                            out,
-                        );
-                    }
-                }
-            }
-        }
-        NodePayload::Dimension(dim) => {
-            let line = BezierPath::from_line(
-                Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
-                Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
-            )
-            .transformed(&world_xf);
-            emit_eps_styled_path(page, &line, &Fill::None, &obj.outline, use_cmyk, out);
-        }
-        NodePayload::Connector(conn) => {
-            let (a, b) = doc.resolve_connector_endpoints(conn);
-            let path = conn.route_path(a, b);
-            emit_eps_styled_path(page, &path, &Fill::None, &obj.outline, use_cmyk, out);
-        }
-        NodePayload::Group(children) => {
-            for &cid in children {
-                if let Some(child) = doc.objects.get(&cid) {
-                    emit_eps_object(
-                        doc,
-                        page,
-                        child,
-                        world_xf,
-                        use_cmyk,
-                        out,
-                        depth + 1,
-                        visited,
-                    );
-                }
-            }
-        }
-        NodePayload::PowerClip {
-            container,
-            contents,
-        } => {
-            let clip_path = container.transformed(&world_xf);
-            if obj.fill.is_visible() {
+
+        match &obj.payload {
+            NodePayload::Path(path) => {
+                let deformed = apply_geometry_effects(path, &obj.effects);
                 emit_eps_styled_path(
                     page,
-                    &clip_path,
+                    &deformed.transformed(&world_xf),
                     &obj.fill,
-                    &OutlineStyle::none(),
+                    &obj.outline,
+                    world_xf,
                     use_cmyk,
                     out,
                 );
             }
-            out.push_str("gsave\n");
-            emit_eps_path_ops(page, &clip_path, out);
-            out.push_str("clip newpath\n");
-            for &cid in contents {
-                if let Some(child) = doc.objects.get(&cid) {
-                    emit_eps_object(
-                        doc,
+            NodePayload::Shape(shape) => {
+                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                emit_eps_styled_path(
+                    page,
+                    &deformed.transformed(&world_xf),
+                    &obj.fill,
+                    &obj.outline,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+            }
+            NodePayload::ArtisticText(text) => {
+                emit_eps_artistic_text(
+                    page,
+                    text,
+                    &obj.outline,
+                    &obj.effects,
+                    world_xf,
+                    use_cmyk,
+                    text_engine,
+                    out,
+                );
+            }
+            NodePayload::ParagraphText(para) => {
+                let pieces = text_engine.layout_paragraph_pieces(para);
+                emit_eps_shaped_pieces(
+                    page,
+                    &pieces,
+                    &obj.outline,
+                    &obj.effects,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(host_path) = doc.world_path_of(top.path_id) {
+                    let pieces = text_engine.layout_text_on_path_pieces(top, &host_path);
+                    emit_eps_shaped_pieces(
                         page,
-                        child,
-                        world_xf,
+                        &pieces,
+                        &obj.outline,
+                        &obj.effects,
+                        effective_parent,
                         use_cmyk,
                         out,
-                        depth + 1,
-                        visited,
+                    );
+                } else {
+                    emit_eps_artistic_text(
+                        page,
+                        &top.text,
+                        &obj.outline,
+                        &obj.effects,
+                        world_xf,
+                        use_cmyk,
+                        text_engine,
+                        out,
                     );
                 }
             }
-            out.push_str("grestore\n");
-            if obj.outline.is_visible() {
-                emit_eps_styled_path(page, &clip_path, &Fill::None, &obj.outline, use_cmyk, out);
+            NodePayload::Table(table) => {
+                for r in 0..table.rows {
+                    for c in 0..table.cols {
+                        if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c))
+                        {
+                            emit_eps_styled_path(
+                                page,
+                                &BezierPath::from_rect(rect).transformed(&world_xf),
+                                &cell.fill,
+                                &table.border_style,
+                                world_xf,
+                                use_cmyk,
+                                out,
+                            );
+                            if !cell.text.is_empty() {
+                                let tx = Affine2D::translate(
+                                    rect.min_x + cell.padding_mm,
+                                    rect.min_y + cell.padding_mm,
+                                );
+                                let at = ArtisticText::from_plain(
+                                    cell.text.clone(),
+                                    cell.text_style.clone(),
+                                );
+                                emit_eps_artistic_text(
+                                    page,
+                                    &at,
+                                    &OutlineStyle::none(),
+                                    &[],
+                                    world_xf.compose(&tx),
+                                    use_cmyk,
+                                    text_engine,
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
             }
-        }
-        NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
-                for sub in &sym.objects {
-                    let mut sym_visited = HashSet::new();
-                    emit_eps_object(
-                        doc,
+            NodePayload::Dimension(dim) => {
+                let line = BezierPath::from_line(
+                    Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
+                    Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
+                )
+                .transformed(&world_xf);
+                emit_eps_styled_path(
+                    page,
+                    &line,
+                    &Fill::None,
+                    &obj.outline,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+                let label = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
+                let mid = dim.p1.midpoint(dim.p2);
+                let at = ArtisticText::from_plain(label, dim.text_style.clone());
+                emit_eps_artistic_text(
+                    page,
+                    &at,
+                    &OutlineStyle::none(),
+                    &[],
+                    world_xf.compose(&Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0)),
+                    use_cmyk,
+                    text_engine,
+                    out,
+                );
+            }
+            NodePayload::Connector(conn) => {
+                let (a, b) = doc.resolve_connector_endpoints(conn);
+                let path = conn.route_path(a, b);
+                emit_eps_styled_path(
+                    page,
+                    &path,
+                    &Fill::None,
+                    &obj.outline,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+            }
+            NodePayload::Group(children) => {
+                for &cid in children {
+                    if let Some(child) = doc.objects.get(&cid) {
+                        emit_eps_object(
+                            doc,
+                            page,
+                            page_index,
+                            child,
+                            world_xf,
+                            use_cmyk,
+                            text_engine,
+                            out,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+            }
+            NodePayload::PowerClip {
+                container,
+                contents,
+            } => {
+                let clip_path =
+                    apply_geometry_effects(container, &obj.effects).transformed(&world_xf);
+                if obj.fill.is_visible() {
+                    emit_eps_styled_path(
                         page,
-                        sub,
+                        &clip_path,
+                        &obj.fill,
+                        &OutlineStyle::none(),
                         world_xf,
                         use_cmyk,
                         out,
-                        depth + 1,
-                        &mut sym_visited,
+                    );
+                }
+                out.push_str("gsave\n");
+                emit_eps_path_ops(page, &clip_path, out);
+                out.push_str("clip newpath\n");
+                for &cid in contents {
+                    if let Some(child) = doc.objects.get(&cid) {
+                        emit_eps_object(
+                            doc,
+                            page,
+                            page_index,
+                            child,
+                            world_xf,
+                            use_cmyk,
+                            text_engine,
+                            out,
+                            depth + 1,
+                            visited,
+                        );
+                    }
+                }
+                out.push_str("grestore\n");
+                if obj.outline.is_visible() {
+                    emit_eps_styled_path(
+                        page,
+                        &clip_path,
+                        &Fill::None,
+                        &obj.outline,
+                        world_xf,
+                        use_cmyk,
+                        out,
+                    );
+                }
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(sym) = doc.symbols.get(sym_id) {
+                    for sub in &sym.objects {
+                        let mut sym_visited = HashSet::new();
+                        emit_eps_object(
+                            doc,
+                            page,
+                            page_index,
+                            sub,
+                            world_xf,
+                            use_cmyk,
+                            text_engine,
+                            out,
+                            depth + 1,
+                            &mut sym_visited,
+                        );
+                    }
+                }
+            }
+            NodePayload::Raster(raster) => {
+                if let Some(asset) = doc.assets.get(&raster.asset_id) {
+                    let bl = world_xf.transform_point(Point2D::new(0.0, raster.height_mm));
+                    let br =
+                        world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
+                    let tl = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                    emit_eps_rgba_image(
+                        page,
+                        asset.width,
+                        asset.height,
+                        &asset.rgba_bytes,
+                        bl,
+                        br,
+                        tl,
+                        use_cmyk,
+                        out,
                     );
                 }
             }
         }
-        NodePayload::Raster(_) => {}
     }
 
     visited.remove(&obj.id);
+}
+
+fn format_eps_color_comps(c: &Color, use_cmyk: bool) -> String {
+    match c {
+        Color::Cmyk { .. } | Color::Spot { .. } => {
+            let [cc, m, y, k] = c.to_cmyk().map(sanitize_unit_f32);
+            format!("{cc:.4} {m:.4} {y:.4} {k:.4}")
+        }
+        _ if use_cmyk => {
+            let [cc, m, y, k] = c.to_cmyk().map(sanitize_unit_f32);
+            format!("{cc:.4} {m:.4} {y:.4} {k:.4}")
+        }
+        _ => {
+            let [r, g, b, _] = c.to_rgba_f32().map(sanitize_unit_f32);
+            format!("{r:.4} {g:.4} {b:.4}")
+        }
+    }
+}
+
+fn build_eps_gradient_function_dict(stops: &[GradientStop], use_cmyk: bool) -> Option<String> {
+    if stops.is_empty() {
+        return None;
+    }
+    let mut sorted = stops.to_vec();
+    sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if sorted.len() == 1 {
+        let c = format_eps_color_comps(&sorted[0].color, use_cmyk);
+        return Some(format!(
+            "<< /FunctionType 2 /Domain [0 1] /C0 [{c}] /C1 [{c}] /N 1 >>"
+        ));
+    }
+    if sorted.len() == 2 {
+        let c0 = format_eps_color_comps(&sorted[0].color, use_cmyk);
+        let c1 = format_eps_color_comps(&sorted[1].color, use_cmyk);
+        return Some(format!(
+            "<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>"
+        ));
+    }
+    let mut segments: Vec<(f32, f32, &Color, &Color)> = Vec::new();
+    if sorted[0].offset > 1e-4 {
+        segments.push((0.0, sorted[0].offset, &sorted[0].color, &sorted[0].color));
+    }
+    for win in sorted.windows(2) {
+        if win[1].offset > win[0].offset + 1e-5 {
+            segments.push((win[0].offset, win[1].offset, &win[0].color, &win[1].color));
+        }
+    }
+    let last = sorted.last()?;
+    if last.offset < 1.0 - 1e-4 {
+        segments.push((last.offset, 1.0, &last.color, &last.color));
+    }
+    if segments.is_empty() {
+        let c0 = format_eps_color_comps(&sorted[0].color, use_cmyk);
+        let c1 = format_eps_color_comps(&last.color, use_cmyk);
+        return Some(format!(
+            "<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>"
+        ));
+    }
+    let mut fns = Vec::new();
+    let mut bounds = Vec::new();
+    let mut encode = Vec::new();
+    for (i, &(_t0, t1, c0_col, c1_col)) in segments.iter().enumerate() {
+        let c0 = format_eps_color_comps(c0_col, use_cmyk);
+        let c1 = format_eps_color_comps(c1_col, use_cmyk);
+        fns.push(format!(
+            "<< /FunctionType 2 /Domain [0 1] /C0 [{c0}] /C1 [{c1}] /N 1 >>"
+        ));
+        if i + 1 < segments.len() {
+            bounds.push(format!("{t1:.4}"));
+        }
+        encode.push("0 1".to_string());
+    }
+    Some(format!(
+        "<< /FunctionType 3 /Domain [0 1] /Functions [{}] /Bounds [{}] /Encode [{}] >>",
+        fns.join(" "),
+        bounds.join(" "),
+        encode.join(" ")
+    ))
+}
+
+fn emit_eps_gradient_fill(
+    page: &Page,
+    path: &BezierPath,
+    fill: &Fill,
+    fill_xf: Affine2D,
+    use_cmyk: bool,
+    out: &mut String,
+) -> bool {
+    let cs = if use_cmyk {
+        "/DeviceCMYK"
+    } else {
+        "/DeviceRGB"
+    };
+    match fill {
+        Fill::LinearGradient { start, end, stops } if !stops.is_empty() => {
+            let Some(func_dict) = build_eps_gradient_function_dict(stops, use_cmyk) else {
+                return false;
+            };
+            let (x0, y0) = to_eps_pt(page, fill_xf.transform_point(*start));
+            let (mut x1, mut y1) = to_eps_pt(page, fill_xf.transform_point(*end));
+            if (x1 - x0).hypot(y1 - y0) < 1e-3 {
+                x1 = x0 + 1.0;
+                y1 = y0;
+            }
+            out.push_str("gsave\n");
+            emit_eps_path_ops(page, path, out);
+            out.push_str("eoclip newpath\n");
+            let _ = writeln!(
+                out,
+                "<< /ShadingType 2 /ColorSpace {cs} /Coords [{x0:.4} {y0:.4} {x1:.4} {y1:.4}] \
+                 /Function {func_dict} /Extend [true true] >> shfill"
+            );
+            out.push_str("grestore\n");
+            true
+        }
+        Fill::RadialGradient {
+            center,
+            radius,
+            focal,
+            stops,
+        } if !stops.is_empty() => {
+            let Some(func_dict) = build_eps_gradient_function_dict(stops, use_cmyk) else {
+                return false;
+            };
+            let (cx, cy) = to_eps_pt(page, fill_xf.transform_point(*center));
+            let (fx, fy) = to_eps_pt(page, fill_xf.transform_point(*focal));
+            let (ex, ey) = to_eps_pt(
+                page,
+                fill_xf.transform_point(Point2D::new(center.x + radius.max(0.1), center.y)),
+            );
+            let r_pt = (ex - cx).hypot(ey - cy).max(0.5);
+            out.push_str("gsave\n");
+            emit_eps_path_ops(page, path, out);
+            out.push_str("eoclip newpath\n");
+            let _ = writeln!(
+                out,
+                "<< /ShadingType 3 /ColorSpace {cs} /Coords [{fx:.4} {fy:.4} 0.0000 {cx:.4} {cy:.4} {r_pt:.4}] \
+                 /Function {func_dict} /Extend [true true] >> shfill"
+            );
+            out.push_str("grestore\n");
+            true
+        }
+        _ => false,
+    }
 }
 
 fn emit_eps_styled_path(
@@ -328,31 +726,18 @@ fn emit_eps_styled_path(
     path: &BezierPath,
     fill: &Fill,
     outline: &OutlineStyle,
+    fill_xf: Affine2D,
     use_cmyk: bool,
     out: &mut String,
 ) {
     if path.is_empty() {
         return;
     }
-    let fill_color = match fill {
-        Fill::None | Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => None,
-        Fill::Solid(c) => Some(c.clone()),
-        Fill::LinearGradient { stops, .. }
-        | Fill::RadialGradient { stops, .. }
-        | Fill::ConicalGradient { stops, .. }
-        | Fill::SquareGradient { stops, .. } => stops.first().map(|s| s.color.clone()),
-        Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } => Some(fg.clone()),
-        Fill::MeshFill { nodes, .. } => nodes.first().map(|n| n.color.clone()),
-    };
 
-    if let Some(ref fc) = fill_color.filter(|c| c.alpha() > 1e-6) {
-        out.push_str("gsave\n");
-        emit_eps_color(out, fc, use_cmyk);
-        emit_eps_path_ops(page, path, out);
-        out.push_str("fill\ngrestore\n");
-    }
-
-    if outline.is_visible() {
+    let emit_stroke_block = |out: &mut String| {
+        if !outline.is_visible() {
+            return;
+        }
         out.push_str("gsave\n");
         if outline.overprint {
             out.push_str("true setoverprint\n");
@@ -395,15 +780,118 @@ fn emit_eps_styled_path(
             }
         }
         emit_eps_path_ops(page, path, out);
-        out.push_str("stroke\ngrestore\n");
+        out.push_str("stroke\n");
+        for (geom, filled) in outline_arrowhead_geometries(path, outline) {
+            emit_eps_path_ops(page, &geom, out);
+            out.push_str(if filled { "fill\n" } else { "stroke\n" });
+        }
+        out.push_str("grestore\n");
+    };
+
+    if outline.behind_fill {
+        emit_stroke_block(out);
+    }
+
+    if !emit_eps_gradient_fill(page, path, fill, fill_xf, use_cmyk, out) {
+        let fill_color = match fill {
+            Fill::None | Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => None,
+            Fill::Solid(c) => Some(c.clone()),
+            Fill::LinearGradient { stops, .. }
+            | Fill::RadialGradient { stops, .. }
+            | Fill::ConicalGradient { stops, .. }
+            | Fill::SquareGradient { stops, .. } => stops.first().map(|s| s.color.clone()),
+            Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } => Some(fg.clone()),
+            Fill::MeshFill { nodes, .. } => nodes.first().map(|n| n.color.clone()),
+        };
+        if let Some(ref fc) = fill_color.filter(|c| c.alpha() > 1e-6) {
+            out.push_str("gsave\n");
+            emit_eps_color(out, fc, use_cmyk);
+            emit_eps_path_ops(page, path, out);
+            out.push_str("eofill\ngrestore\n");
+        }
+    }
+
+    if !outline.behind_fill {
+        emit_stroke_block(out);
     }
 }
 
-fn emit_eps_text(
+#[allow(clippy::too_many_arguments)]
+fn emit_eps_artistic_text(
+    page: &Page,
+    text: &ArtisticText,
+    outline: &OutlineStyle,
+    effects: &[Effect],
+    world_xf: Affine2D,
+    use_cmyk: bool,
+    text_engine: &mut TextEngine,
+    out: &mut String,
+) {
+    let plain = text.plain_text();
+    if plain.is_empty() || !world_xf.is_finite() {
+        return;
+    }
+    let style = text
+        .runs
+        .first()
+        .map(|r| r.style.clone())
+        .unwrap_or_default();
+    let is_simple_ascii_helvetica = !eps_has_geometry_effect(effects)
+        && (!outline.is_visible() || *outline == OutlineStyle::default())
+        && text.runs.len() == 1
+        && text.effective_direction() != TextDirection::Rtl
+        && plain.chars().all(|ch| ch.is_ascii() && !ch.is_control())
+        && !style.italic
+        && !style.underline
+        && !style.strikethrough
+        && (style.font_family.trim().is_empty()
+            || style.font_family.eq_ignore_ascii_case("Noto Sans")
+            || style.font_family.eq_ignore_ascii_case("Helvetica")
+            || style.font_family.eq_ignore_ascii_case("Arial"));
+
+    if is_simple_ascii_helvetica {
+        emit_eps_ascii_type1_text(page, &plain, &style, world_xf, use_cmyk, out);
+        return;
+    }
+
+    let pieces = text_engine.layout_artistic_pieces(text);
+    emit_eps_shaped_pieces(page, &pieces, outline, effects, world_xf, use_cmyk, out);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_eps_shaped_pieces(
+    page: &Page,
+    pieces: &[coree_render::ShapedGlyphDraw],
+    outline: &OutlineStyle,
+    effects: &[Effect],
+    world_xf: Affine2D,
+    use_cmyk: bool,
+    out: &mut String,
+) {
+    let has_geom = eps_has_geometry_effect(effects);
+    for piece in pieces {
+        if piece.path.is_empty() {
+            continue;
+        }
+        let local = if has_geom {
+            apply_geometry_effects(&piece.path, effects)
+        } else {
+            piece.path.clone()
+        };
+        let world_path = local.transformed(&world_xf);
+        let fill = if piece.fill.alpha() > 1e-6 {
+            Fill::Solid(piece.fill.clone())
+        } else {
+            Fill::None
+        };
+        emit_eps_styled_path(page, &world_path, &fill, outline, world_xf, use_cmyk, out);
+    }
+}
+
+fn emit_eps_ascii_type1_text(
     page: &Page,
     text: &str,
-    style: &coree_core::TextStyle,
-    direction: TextDirection,
+    style: &TextStyle,
     world_xf: Affine2D,
     use_cmyk: bool,
     out: &mut String,
@@ -421,49 +909,27 @@ fn emit_eps_text(
     };
     out.push_str("gsave\n");
     emit_eps_color(out, &style.fill, use_cmyk);
-    if direction != TextDirection::Rtl && text.chars().all(|ch| ch.is_ascii() && !ch.is_control()) {
-        let ps_font = if style.bold {
-            "Helvetica-Bold"
-        } else {
-            "Helvetica"
-        };
-        let is_pure_translate =
-            (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6;
-        if is_pure_translate {
-            let _ = writeln!(
-                out,
-                "/{ps_font} findfont {font_pt:.2} scalefont setfont {x:.4} {y:.4} moveto ({}) show",
-                escape_ps_string(text)
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "[{a:.6} {:.6} {:.6} {d:.6} {x:.4} {y:.4}] concat /{ps_font} findfont {font_pt:.2} scalefont setfont 0 0 moveto ({}) show",
-                -b,
-                -c,
-                escape_ps_string(text)
-            );
-        }
+    let ps_font = if style.bold {
+        "Helvetica-Bold"
     } else {
-        // Vector outline fallback for non-ASCII / Arabic RTL text so glyphs are preserved in EPS.
-        let glyph_w_mm = style.font_size_mm() * 0.52;
-        let glyph_h_mm = style.font_size_mm() * 0.72;
-        let step_mm = style.font_size_mm() * 0.62;
-        let mut cursor_x = 0.0_f64;
-        for ch in text.chars() {
-            if !ch.is_whitespace() {
-                let rect = coree_core::Rect2D::from_xywh(
-                    cursor_x,
-                    style.font_size_mm() * 0.15,
-                    glyph_w_mm,
-                    glyph_h_mm,
-                );
-                let box_path = BezierPath::from_rect(rect).transformed(&world_xf);
-                emit_eps_path_ops(page, &box_path, out);
-                out.push_str("fill\n");
-            }
-            cursor_x += step_mm;
-        }
+        "Helvetica"
+    };
+    let is_pure_translate =
+        (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6;
+    if is_pure_translate {
+        let _ = writeln!(
+            out,
+            "/{ps_font} findfont {font_pt:.2} scalefont setfont {x:.4} {y:.4} moveto ({}) show",
+            escape_ps_string(text)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "[{a:.6} {:.6} {:.6} {d:.6} {x:.4} {y:.4}] concat /{ps_font} findfont {font_pt:.2} scalefont setfont 0 0 moveto ({}) show",
+            -b,
+            -c,
+            escape_ps_string(text)
+        );
     }
     out.push_str("grestore\n");
 }
@@ -768,6 +1234,41 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 .with_transform(text_xf);
                 doc.add_object(obj, None)?;
             }
+            EpsEmitted::Raster {
+                width,
+                height,
+                rgba_bytes,
+                ctm,
+            } => {
+                if let Ok(asset) =
+                    coree_core::RasterAsset::new(width, height, rgba_bytes, 300.0, doc.color_mode)
+                {
+                    let asset_id = doc.register_asset(asset);
+                    // PostScript image maps [0,1]x[0,1] bottom-to-top in CTM -> convert corners via `eps_to_mm * ctm`
+                    let world_xf = eps_to_mm.compose(&ctm);
+                    let tl_mm = world_xf.transform_point(Point2D::new(0.0, 1.0));
+                    let br_x_mm = world_xf.transform_point(Point2D::new(1.0, 1.0));
+                    let bl_mm = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                    let w_mm = (br_x_mm - tl_mm).length().max(0.1);
+                    let h_mm = (bl_mm - tl_mm).length().max(0.1);
+                    let raster_xf = Affine2D::translate(tl_mm.x, tl_mm.y);
+                    let obj = SceneObject::new(
+                        ObjectId(0),
+                        format!("EPS Raster {}", idx + 1),
+                        NodePayload::Raster(coree_core::RasterLayerData {
+                            asset_id,
+                            width_mm: w_mm,
+                            height_mm: h_mm,
+                            filters: Vec::new(),
+                            crop_rect: None,
+                        }),
+                    )
+                    .with_fill(Fill::None)
+                    .with_outline(OutlineStyle::none())
+                    .with_transform(raster_xf);
+                    doc.add_object(obj, None)?;
+                }
+            }
         }
     }
 
@@ -878,6 +1379,7 @@ enum PsVal {
     Null,
     Mark,
     Array(Vec<PsVal>),
+    Dict(Vec<(String, PsVal)>),
     Proc(Vec<PsToken>),
     Font {
         family: String,
@@ -901,6 +1403,16 @@ impl PsVal {
                 let mut total = 1usize;
                 for item in items {
                     total = total.saturating_add(item.node_count(limit.saturating_sub(total)));
+                    if total > limit {
+                        return total;
+                    }
+                }
+                total
+            }
+            Self::Dict(entries) => {
+                let mut total = 1usize;
+                for (_, val) in entries {
+                    total = total.saturating_add(val.node_count(limit.saturating_sub(total)));
                     if total > limit {
                         return total;
                     }
@@ -942,6 +1454,7 @@ fn tokenize_ps_inner(
     }
     let mut tokens = Vec::new();
     let len = bytes.len();
+    let mut saw_asciihex_datasource = false;
 
     while *pos < len {
         if *total_tokens >= MAX_PS_TOKENS {
@@ -1040,6 +1553,9 @@ fn tokenize_ps_inner(
                 *pos += 1;
             }
             let name = String::from_utf8_lossy(&bytes[start..*pos]).into_owned();
+            if name == "ASCIIHexDecode" {
+                saw_asciihex_datasource = true;
+            }
             *total_tokens += 1;
             tokens.push(PsToken::LiteralName(name));
             continue;
@@ -1057,7 +1573,12 @@ fn tokenize_ps_inner(
         }
         let word = String::from_utf8_lossy(&bytes[start..*pos]);
         *total_tokens += 1;
-        if let Some(num) = parse_ps_number(&word) {
+        if word == "image" && saw_asciihex_datasource {
+            saw_asciihex_datasource = false;
+            let raw_img = read_ps_inline_hex_stream(bytes, pos);
+            tokens.push(PsToken::Str(raw_img));
+            tokens.push(PsToken::ExecName("image".to_owned()));
+        } else if let Some(num) = parse_ps_number(&word) {
             tokens.push(PsToken::Number(num));
         } else if word == "true" {
             tokens.push(PsToken::Bool(true));
@@ -1066,6 +1587,9 @@ fn tokenize_ps_inner(
         } else if word == "null" {
             tokens.push(PsToken::Null);
         } else {
+            if word == "shfill" || word == "colorimage" {
+                saw_asciihex_datasource = false;
+            }
             tokens.push(PsToken::ExecName(word.into_owned()));
         }
     }
@@ -1133,9 +1657,13 @@ fn read_ps_literal_string(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
 }
 
 fn read_ps_hex_string(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
+    *pos += 1; // skip '<'
+    read_ps_inline_hex_stream(bytes, pos)
+}
+
+fn read_ps_inline_hex_stream(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
     let mut out = Vec::new();
     let len = bytes.len();
-    *pos += 1; // skip '<'
     let mut hi: Option<u8> = None;
     while *pos < len {
         let b = bytes[*pos];
@@ -1233,11 +1761,23 @@ enum EpsEmitted {
         ctm: Affine2D,
         origin_eps: Point2D,
     },
+    Raster {
+        width: u32,
+        height: u32,
+        rgba_bytes: Vec<u8>,
+        ctm: Affine2D,
+    },
 }
 
 impl EpsEmitted {
     fn eps_bounds(&self) -> Option<coree_core::Rect2D> {
         match self {
+            Self::Raster { ctm, .. } => {
+                let p0 = ctm.transform_point(Point2D::new(0.0, 0.0));
+                let p1 = ctm.transform_point(Point2D::new(1.0, 1.0));
+                let r = coree_core::Rect2D::from_points(p0, p1);
+                r.is_finite().then_some(r)
+            }
             Self::Path { eps_path, .. } => {
                 if eps_path.is_empty() {
                     None
@@ -1417,12 +1957,29 @@ impl PsInterpreter {
                 self.stack_nodes = 0;
             }
             "mark" | "<<" => self.push(PsVal::Mark)?,
-            "cleartomark" | ">>" => {
+            "cleartomark" => {
                 while let Some(v) = self.pop() {
                     if matches!(v, PsVal::Mark) {
                         break;
                     }
                 }
+            }
+            ">>" => {
+                let mut pairs = Vec::new();
+                let mut collected = Vec::new();
+                while let Some(v) = self.pop() {
+                    if matches!(v, PsVal::Mark) {
+                        break;
+                    }
+                    collected.push(v);
+                }
+                collected.reverse();
+                for chunk in collected.as_chunks::<2>().0 {
+                    if let PsVal::Name(k) = &chunk[0] {
+                        pairs.push((k.clone(), chunk[1].clone()));
+                    }
+                }
+                self.push(PsVal::Dict(pairs))?;
             }
             "count" => {
                 let n = self.stack.len() as f64;
@@ -2011,6 +2568,68 @@ impl PsInterpreter {
                     self.emit_text(&raw);
                 }
             }
+            "shfill" => {
+                let _ = self.pop();
+            }
+            "image" => {
+                let top = self.pop();
+                let (raw_opt, dict_opt) = match top {
+                    Some(PsVal::Str(raw)) => (Some(raw), self.pop()),
+                    other => (None, other),
+                };
+                if let (Some(raw), Some(PsVal::Dict(entries))) = (raw_opt, dict_opt) {
+                    let find_num = |key: &str| {
+                        entries
+                            .iter()
+                            .rev()
+                            .find(|(k, _)| k == key)
+                            .and_then(|(_, v)| v.as_f64())
+                    };
+                    if let (Some(w_f), Some(h_f)) = (find_num("Width"), find_num("Height")) {
+                        let w = (w_f.round() as u32).clamp(1, 4096);
+                        let h = (h_f.round() as u32).clamp(1, 4096);
+                        let px_cnt = (w as usize).saturating_mul(h as usize);
+                        let decode_len = entries
+                            .iter()
+                            .rev()
+                            .find(|(k, _)| k == "Decode")
+                            .and_then(|(_, v)| match v {
+                                PsVal::Array(a) => Some(a.len()),
+                                _ => None,
+                            })
+                            .unwrap_or(6);
+                        let is_cmyk = decode_len >= 8 || raw.len() == px_cnt * 4;
+                        let stride = if is_cmyk { 4 } else { 3 };
+                        if raw.len() >= px_cnt * stride {
+                            let mut rgba = Vec::with_capacity(px_cnt * 4);
+                            for i in 0..px_cnt {
+                                let base = i * stride;
+                                if is_cmyk {
+                                    let c = f32::from(raw[base]) / 255.0;
+                                    let m = f32::from(raw[base + 1]) / 255.0;
+                                    let y = f32::from(raw[base + 2]) / 255.0;
+                                    let k = f32::from(raw[base + 3]) / 255.0;
+                                    let rgb = Color::cmyk(c, m, y, k).to_rgba8();
+                                    rgba.extend_from_slice(&rgb);
+                                } else {
+                                    rgba.extend_from_slice(&[
+                                        raw[base],
+                                        raw[base + 1],
+                                        raw[base + 2],
+                                        255,
+                                    ]);
+                                }
+                            }
+                            self.emitted.push(EpsEmitted::Raster {
+                                width: w,
+                                height: h,
+                                rgba_bytes: rgba,
+                                ctm: self.gstate.ctm,
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2397,5 +3016,68 @@ grestore\n\
         let array_bomb = b"%!PS\n[1 2] 30 { dup [ exch dup ] } repeat\n";
         let err2 = import_eps_bytes(array_bomb, "ArrayBomb").unwrap_err();
         assert!(matches!(err2, IoError::LimitExceeded { .. }));
+    }
+
+    #[test]
+    fn eps_arabic_curves_raster_image_roundtrip_and_shfill() {
+        let mut doc = Document::new("EPS Full", 120.0, 90.0, ColorMode::Rgb, 300.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Arabic",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "كوري",
+                    TextStyle {
+                        font_size_pt: 24.0,
+                        direction: TextDirection::Rtl,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(20.0, 20.0)),
+            None,
+        )
+        .unwrap();
+
+        let asset = coree_core::RasterAsset::new(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+            300.0,
+            ColorMode::Rgb,
+        )
+        .unwrap();
+        let asset_id = doc.register_asset(asset);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Bitmap",
+                NodePayload::Raster(coree_core::RasterLayerData {
+                    asset_id,
+                    width_mm: 20.0,
+                    height_mm: 20.0,
+                    filters: Vec::new(),
+                    crop_rect: None,
+                }),
+            )
+            .with_transform(Affine2D::translate(50.0, 30.0)),
+            None,
+        )
+        .unwrap();
+
+        let eps = export_eps_to_string(&doc, 0).unwrap();
+        assert!(eps.contains("curveto"));
+        assert!(eps.contains("/ImageType 1"));
+        assert!(eps.contains("FF0000"));
+
+        let imported = import_eps_bytes(eps.as_bytes(), "EPS Full").unwrap();
+        assert!(!imported.assets.is_empty());
+        assert!(imported
+            .objects
+            .values()
+            .any(|o| matches!(o.payload, NodePayload::Raster(_))));
     }
 }

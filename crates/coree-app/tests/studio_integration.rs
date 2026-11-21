@@ -12,12 +12,12 @@ use coree_app::shortcuts::{resolve_shortcut, ShortcutAction, ShortcutProfile};
 use coree_app::state::{
     BitmapDockerState, DockerTab, LensDockerState, StudioApp, ToolId, TOOL_GROUPS,
 };
-use coree_app::theme::{apply_theme, StudioTheme};
+use coree_app::theme::{apply_theme, StudioLanguage, StudioTheme};
 use coree_core::{
-    Affine2D, AlignOp, AnchorPoint, ArtisticText, BezierPath, BooleanOp, Color, ColorMode,
-    CommandOp, ConnectorObject, ConnectorStyle, CornerStyle, Document, Effect, Fill, LensKind,
-    NodePayload, ObjectId, OutlineStyle, ParametricShape, Point2D, Rect2D, SceneObject, SymbolDef,
-    TextOnPath, TextStyle, Vec2D, ZOrderOp,
+    Affine2D, AlignOp, AnchorPoint, ArrowheadStyle, ArtisticText, BezierPath, BooleanOp, Color,
+    ColorMode, CommandOp, ConnectorObject, ConnectorStyle, CornerStyle, Document, Effect, Fill,
+    GradientStop, GuideOrientation, LensKind, NodePayload, ObjectId, OutlineStyle, ParametricShape,
+    Point2D, Rect2D, SceneObject, SymbolDef, TextOnPath, TextStyle, Vec2D, ZOrderOp,
 };
 use coree_prod::ReplaceAction;
 use coree_storage::StorageDb;
@@ -850,7 +850,7 @@ fn studio_app_vector_effects_bitmap_studio_trace_macros_and_async_jobs() {
 
     let async_svg = tmp.path().join("async_export.svg");
     app.export_active_async(async_svg.clone(), UniversalExportOptions::default());
-    for _ in 0..200 {
+    for _ in 0..500 {
         app.tick_background_jobs();
         if app.active_jobs.is_empty() {
             break;
@@ -1490,4 +1490,256 @@ fn regression_shortcuts_gated_when_text_focused() {
         ),
         Some(ShortcutAction::ToggleCommandPalette)
     );
+}
+
+#[test]
+fn regression_edit_fill_f11_outline_pen_f12_guide_ops_and_arabic_ui() {
+    let tmp = TempTestDir::new("f11-f12-guides-ar");
+    let db_path = tmp.path().join("prefs.db");
+
+    // 1. Both shortcut profiles resolve F11 -> OpenEditFill and F12 -> FocusOutlinePen
+    assert_eq!(
+        resolve_shortcut(
+            ShortcutProfile::ClassicStudio,
+            Key::F11,
+            Modifiers::NONE,
+            false
+        ),
+        Some(ShortcutAction::OpenEditFill)
+    );
+    assert_eq!(
+        resolve_shortcut(
+            ShortcutProfile::StandardVector,
+            Key::F11,
+            Modifiers::NONE,
+            false
+        ),
+        Some(ShortcutAction::OpenEditFill)
+    );
+    assert_eq!(
+        resolve_shortcut(
+            ShortcutProfile::StandardVector,
+            Key::F12,
+            Modifiers::NONE,
+            false
+        ),
+        Some(ShortcutAction::FocusOutlinePen)
+    );
+
+    // 2. F11 Edit Fill + F12 Outline Pen apply onto selected object with clean undo/redo
+    {
+        let db = StorageDb::open(&db_path).expect("open sqlite db");
+        let mut app = StudioApp::new_with_storage(db);
+        app.select_tool(ToolId::Rectangle);
+        app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 40.0, 30.0));
+        let oid = *app
+            .active_tab()
+            .unwrap()
+            .document
+            .objects
+            .keys()
+            .next()
+            .unwrap();
+        {
+            let tab = app.active_tab_mut().unwrap();
+            tab.selection.select_single(&tab.document, oid);
+        }
+
+        // Trigger F11 -> modify draft to ConicalGradient -> Apply -> Undo -> Redo
+        app.handle_shortcut(ShortcutAction::OpenEditFill);
+        assert!(app.show_edit_fill_dialog);
+        app.edit_fill_draft = Fill::ConicalGradient {
+            center: Point2D::new(20.0, 15.0),
+            angle_deg: 45.0,
+            stops: vec![
+                GradientStop::new(0.0, Color::rgba8(255, 0, 80, 255)),
+                GradientStop::new(1.0, Color::rgba8(0, 120, 255, 255)),
+            ],
+        };
+        app.apply_edit_fill_draft();
+        app.show_edit_fill_dialog = false;
+        assert!(matches!(
+            app.active_tab().unwrap().document.objects[&oid].fill,
+            Fill::ConicalGradient { .. }
+        ));
+        app.undo().expect("undo fill");
+        assert!(!matches!(
+            app.active_tab().unwrap().document.objects[&oid].fill,
+            Fill::ConicalGradient { .. }
+        ));
+        app.redo().expect("redo fill");
+        assert!(matches!(
+            app.active_tab().unwrap().document.objects[&oid].fill,
+            Fill::ConicalGradient { .. }
+        ));
+
+        // Trigger F12 -> modify draft with Calligraphy Nib + End Arrow + Overprint -> Apply -> Undo
+        app.handle_shortcut(ShortcutAction::FocusOutlinePen);
+        assert!(app.show_outline_pen_dialog);
+        app.outline_pen_draft.width_mm = 1.25;
+        app.outline_pen_draft.calligraphy_stretch = 0.55;
+        app.outline_pen_draft.calligraphy_angle_deg = 35.0;
+        app.outline_pen_draft.end_arrow = ArrowheadStyle::Triangle;
+        app.outline_pen_draft.overprint = true;
+        app.apply_outline_pen_draft();
+        app.show_outline_pen_dialog = false;
+        let applied_outline = &app.active_tab().unwrap().document.objects[&oid].outline;
+        assert!((applied_outline.width_mm - 1.25).abs() < 1e-6);
+        assert!((applied_outline.calligraphy_stretch - 0.55).abs() < 1e-6);
+        assert_eq!(applied_outline.end_arrow, ArrowheadStyle::Triangle);
+        assert!(applied_outline.overprint);
+        app.undo().expect("undo outline");
+        assert!(
+            (app.active_tab().unwrap().document.objects[&oid]
+                .outline
+                .width_mm
+                - 1.25)
+                .abs()
+                > 0.1
+        );
+
+        // 3. Guide Move / Lock / Remove command ops roundtrip undo/redo cleanly
+        app.execute_command(CommandOp::AddGuide {
+            orientation: GuideOrientation::Vertical(50.0),
+            locked: false,
+        })
+        .expect("add guide");
+        let gid = app.active_tab().unwrap().document.guides.last().unwrap().id;
+        app.execute_command(CommandOp::MoveGuide {
+            id: gid,
+            orientation: GuideOrientation::Vertical(85.0),
+        })
+        .expect("move guide");
+        assert_eq!(
+            app.active_tab()
+                .unwrap()
+                .document
+                .guides
+                .last()
+                .unwrap()
+                .orientation,
+            GuideOrientation::Vertical(85.0)
+        );
+        app.execute_command(CommandOp::ToggleGuideLock { id: gid })
+            .expect("lock guide");
+        assert!(
+            app.active_tab()
+                .unwrap()
+                .document
+                .guides
+                .last()
+                .unwrap()
+                .locked
+        );
+        app.execute_command(CommandOp::RemoveGuide { id: gid })
+            .expect("remove guide");
+        assert!(!app
+            .active_tab()
+            .unwrap()
+            .document
+            .guides
+            .iter()
+            .any(|g| g.id == gid));
+        app.undo().expect("undo remove guide");
+        assert!(app
+            .active_tab()
+            .unwrap()
+            .document
+            .guides
+            .iter()
+            .any(|g| g.id == gid));
+        app.undo().expect("undo toggle lock");
+        app.undo().expect("undo move guide");
+        assert_eq!(
+            app.active_tab()
+                .unwrap()
+                .document
+                .guides
+                .last()
+                .unwrap()
+                .orientation,
+            GuideOrientation::Vertical(50.0)
+        );
+
+        // 4. Switch to Bilingual Arabic UI + ClassicLight theme + StandardVector shortcuts
+        // and verify headless UI frame renders F11/F12 modals cleanly and persists in SQLite
+        app.set_theme(StudioTheme::ClassicLight);
+        app.set_shortcut_profile(ShortcutProfile::StandardVector);
+        app.set_ui_language(StudioLanguage::Arabic);
+        assert_eq!(app.ui_language, StudioLanguage::Arabic);
+        app.show_welcome = false;
+        app.show_edit_fill_dialog = true;
+        app.show_outline_pen_dialog = true;
+        app.fonts_configured = true;
+        let ctx = egui::Context::default();
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..RawInput::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| app.render_ui(ui));
+        assert!(!out.shapes.is_empty());
+        out.textures_delta.clear();
+        app.shutdown_cleanly();
+    }
+
+    // 5. Reopen SQLite DB -> theme, shortcut profile, and Arabic UI preference persist cleanly
+    let db2 = StorageDb::open(&db_path).expect("reopen sqlite db");
+    let app2 = StudioApp::new_with_storage(db2);
+    assert_eq!(app2.theme, StudioTheme::ClassicLight);
+    assert_eq!(app2.shortcut_profile, ShortcutProfile::StandardVector);
+    assert_eq!(app2.ui_language, StudioLanguage::Arabic);
+
+    // 6. HiDPI (pixels_per_point = 2.0) scales canvas texture & DPI cleanly to native monitor resolution
+    //    AND `physical_key` resolves shortcuts even if OS layout emits non-Latin `key`.
+    let hidpi_ctx = egui::Context::default();
+    let mut hidpi_app = StudioApp::new_headless();
+    hidpi_app.show_welcome = false;
+    hidpi_app.fonts_configured = true;
+    let mut hidpi_in = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1280.0, 800.0),
+        )),
+        events: vec![egui::Event::Key {
+            key: Key::Questionmark,
+            physical_key: Some(Key::Z),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        }],
+        ..RawInput::default()
+    };
+    hidpi_in
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .native_pixels_per_point = Some(2.0);
+    let mut hidpi_out = hidpi_ctx.run_ui(hidpi_in.clone(), |ui| {
+        hidpi_app.render_ui(ui);
+    });
+    hidpi_out.textures_delta.clear();
+    let actions =
+        coree_app::shortcuts::poll_egui_shortcuts(&hidpi_ctx, ShortcutProfile::ClassicStudio);
+    assert_eq!(actions, vec![ShortcutAction::Undo]);
+    let tab = hidpi_app.active_tab().unwrap();
+    let content_r = hidpi_ctx.content_rect();
+    assert!(
+        tab.viewport.dpi > 180.0,
+        "2x HiDPI viewport must render at ~192 DPI instead of 96 DPI: dpi={}, w={}, h={}, ctx_ppp={}, reported_max={}, content_rect={:?}",
+        tab.viewport.dpi,
+        tab.viewport.width_px,
+        tab.viewport.height_px,
+        hidpi_ctx.pixels_per_point(),
+        hidpi_ctx.input(|i| i.max_texture_side),
+        content_r,
+    );
+    assert!(
+        tab.viewport.width_px > 1280,
+        "2x HiDPI backing texture must exceed logical canvas width: {}",
+        tab.viewport.width_px
+    );
+    let _ = &mut hidpi_in;
 }

@@ -12,7 +12,7 @@
     <?define RepoRoot = "."?>
   <?endif?>
   <?ifndef Version?>
-    <?define Version = "0.2.0"?>
+    <?define Version = "0.2.1"?>
   <?endif?>
 
   <Package
@@ -111,6 +111,7 @@
 
         <RegistryKey Root="HKLM" Key="Software\Classes\.cdr">
           <RegistryValue Type="string" Value="coree.Document" />
+          <RegistryValue Name="Content Type" Type="string" Value="application/vnd.corel-draw" />
           <RegistryKey Key="OpenWithProgids">
             <RegistryValue Name="coree.Document" Type="string" Value="" />
           </RegistryKey>

@@ -246,6 +246,24 @@ fn extra_ui_commands(app: &StudioApp) -> Vec<PaletteCommand> {
             category: "Tools".into(),
             shortcut: String::new(),
         },
+        PaletteCommand {
+            id: "ui.object.edit_fill".into(),
+            title: "Edit Fill Dialog (Uniform, Fountain, Pattern, Mesh)...".into(),
+            category: "Object".into(),
+            shortcut: shortcut_label(p, ShortcutAction::OpenEditFill).into(),
+        },
+        PaletteCommand {
+            id: "ui.object.outline_pen".into(),
+            title: "Outline Pen Dialog (Width, Arrows, Calligraphy, Behind Fill)...".into(),
+            category: "Object".into(),
+            shortcut: shortcut_label(p, ShortcutAction::FocusOutlinePen).into(),
+        },
+        PaletteCommand {
+            id: "ui.view.toggle_lang".into(),
+            title: "Toggle UI Language (English / العربية)".into(),
+            category: "Window".into(),
+            shortcut: String::new(),
+        },
     ];
 
     for (idx, preset) in WorkspacePreset::ALL.iter().enumerate() {
@@ -334,6 +352,19 @@ fn execute_extra_ui_command(app: &mut StudioApp, id: &str) -> bool {
         "ui.tools.icc" => {
             app.options_tab = 2;
             app.show_options_dialog = true;
+        }
+        "ui.object.edit_fill" => {
+            app.open_edit_fill_dialog();
+        }
+        "ui.object.outline_pen" => {
+            app.open_outline_pen_dialog();
+        }
+        "ui.view.toggle_lang" => {
+            let next = match app.ui_language {
+                crate::theme::StudioLanguage::English => crate::theme::StudioLanguage::Arabic,
+                crate::theme::StudioLanguage::Arabic => crate::theme::StudioLanguage::English,
+            };
+            app.set_ui_language(next);
         }
         other => {
             if let Some(plugin_id) = other.strip_prefix("ui.laser.send.") {

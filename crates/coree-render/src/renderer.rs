@@ -431,7 +431,7 @@ impl SceneRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_scene_object(
+    pub(crate) fn render_scene_object(
         &mut self,
         doc: &Document,
         page: Option<&Page>,
@@ -2044,6 +2044,130 @@ fn draw_calligraphic_outline(
     }
 }
 
+/// Builds the geometry `(path, is_filled)` for an arrowhead at `tip` pointing along `forward_dir`.
+#[must_use]
+pub fn arrowhead_geometry(
+    tip: Point2D,
+    forward_dir: Vec2D,
+    style: &ArrowheadStyle,
+    stroke_w_mm: f32,
+) -> Option<(BezierPath, bool)> {
+    if *style == ArrowheadStyle::None {
+        return None;
+    }
+    let dir = forward_dir.normalized().unwrap_or(Vec2D::new(1.0, 0.0));
+    let perp = dir.perp();
+    let size = (f64::from(stroke_w_mm) * 4.5).max(1.5);
+    let half_w = size * 0.45;
+
+    match style {
+        ArrowheadStyle::None => None,
+        ArrowheadStyle::Triangle | ArrowheadStyle::Custom(_) => {
+            let base = tip - dir * size;
+            Some((
+                BezierPath::from_polygon([tip, base + perp * half_w, base - perp * half_w], true),
+                true,
+            ))
+        }
+        ArrowheadStyle::Stealth => {
+            let base = tip - dir * size;
+            let notch = tip - dir * (size * 0.65);
+            Some((
+                BezierPath::from_polygon(
+                    [tip, base + perp * half_w, notch, base - perp * half_w],
+                    true,
+                ),
+                true,
+            ))
+        }
+        ArrowheadStyle::OpenVee => {
+            let base = tip - dir * size;
+            Some((
+                BezierPath::from_polygon([base + perp * half_w, tip, base - perp * half_w], false),
+                false,
+            ))
+        }
+        ArrowheadStyle::Diamond => {
+            let mid = tip - dir * (size * 0.5);
+            let back = tip - dir * size;
+            Some((
+                BezierPath::from_polygon(
+                    [tip, mid + perp * half_w, back, mid - perp * half_w],
+                    true,
+                ),
+                true,
+            ))
+        }
+        ArrowheadStyle::Circle => {
+            let center = tip - dir * half_w;
+            let mut circle = coree_core::ParametricShape::Ellipse {
+                rx: half_w,
+                ry: half_w,
+                mode: coree_core::EllipseMode::Full,
+                start_deg: 0.0,
+                end_deg: 360.0,
+            }
+            .to_bezier_path();
+            circle.transform(&Affine2D::translate(center.x, center.y));
+            Some((circle, true))
+        }
+        ArrowheadStyle::Square => {
+            let back = tip - dir * (half_w * 2.0);
+            Some((
+                BezierPath::from_polygon(
+                    [
+                        tip + perp * half_w,
+                        tip - perp * half_w,
+                        back - perp * half_w,
+                        back + perp * half_w,
+                    ],
+                    true,
+                ),
+                true,
+            ))
+        }
+    }
+}
+
+/// Collects all start and end arrowhead `(path, is_filled)` geometries for open subpaths of `path`.
+#[must_use]
+pub fn outline_arrowhead_geometries(
+    path: &BezierPath,
+    outline: &OutlineStyle,
+) -> Vec<(BezierPath, bool)> {
+    let mut out = Vec::new();
+    if outline.start_arrow == ArrowheadStyle::None && outline.end_arrow == ArrowheadStyle::None {
+        return out;
+    }
+    let width_mm = outline.effective_width_mm() as f32;
+    for sp in &path.subpaths {
+        if sp.closed || sp.nodes.len() < 2 {
+            continue;
+        }
+        let single = BezierPath::from_subpath(sp.clone());
+        let total_len = single.path_length_mm();
+        if total_len <= 1e-6 {
+            continue;
+        }
+        if outline.start_arrow != ArrowheadStyle::None {
+            if let Some((pt, tangent)) = single.point_and_tangent_at(0.0) {
+                if let Some(geom) = arrowhead_geometry(pt, -tangent, &outline.start_arrow, width_mm)
+                {
+                    out.push(geom);
+                }
+            }
+        }
+        if outline.end_arrow != ArrowheadStyle::None {
+            if let Some((pt, tangent)) = single.point_and_tangent_at(total_len) {
+                if let Some(geom) = arrowhead_geometry(pt, tangent, &outline.end_arrow, width_mm) {
+                    out.push(geom);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_arrowhead(
     tip: Point2D,
@@ -2057,91 +2181,31 @@ fn draw_arrowhead(
     anti_alias: bool,
     backend: &mut dyn CanvasBackend,
 ) {
-    if *style == ArrowheadStyle::None {
+    let Some((geom, filled)) = arrowhead_geometry(tip, forward_dir, style, stroke_w_mm) else {
         return;
-    }
-    let dir = forward_dir.normalized().unwrap_or(Vec2D::new(1.0, 0.0));
-    let perp = dir.perp();
-    let size = (f64::from(stroke_w_mm) * 4.5).max(1.5);
-    let half_w = size * 0.45;
-
-    let paint = BackendPaint {
-        shader: PaintShader::Solid(color.clone()),
-        opacity,
-        blend_mode,
-        anti_alias,
     };
-
-    match style {
-        ArrowheadStyle::None => {}
-        ArrowheadStyle::Triangle | ArrowheadStyle::Custom(_) => {
-            let base = tip - dir * size;
-            let tri =
-                BezierPath::from_polygon([tip, base + perp * half_w, base - perp * half_w], true);
-            backend.fill_path(&tri, &paint, FillRule::Winding, transform);
-        }
-        ArrowheadStyle::Stealth => {
-            let base = tip - dir * size;
-            let notch = tip - dir * (size * 0.65);
-            let poly = BezierPath::from_polygon(
-                [tip, base + perp * half_w, notch, base - perp * half_w],
-                true,
-            );
-            backend.fill_path(&poly, &paint, FillRule::Winding, transform);
-        }
-        ArrowheadStyle::OpenVee => {
-            let base = tip - dir * size;
-            let vee =
-                BezierPath::from_polygon([base + perp * half_w, tip, base - perp * half_w], false);
-            let st = StrokeParams {
-                color: color.clone(),
-                width: stroke_w_mm.max(0.2),
-                cap: coree_core::LineCap::Round,
-                join: coree_core::LineJoin::Miter,
-                miter_limit: 4.0,
-                dash_pattern: Vec::new(),
-                dash_offset: 0.0,
-                opacity,
-                blend_mode,
-                anti_alias,
-            };
-            backend.stroke_path(&vee, &st, transform);
-        }
-        ArrowheadStyle::Diamond => {
-            let mid = tip - dir * (size * 0.5);
-            let back = tip - dir * size;
-            let dia = BezierPath::from_polygon(
-                [tip, mid + perp * half_w, back, mid - perp * half_w],
-                true,
-            );
-            backend.fill_path(&dia, &paint, FillRule::Winding, transform);
-        }
-        ArrowheadStyle::Circle => {
-            let center = tip - dir * (half_w);
-            let mut circle = coree_core::ParametricShape::Ellipse {
-                rx: half_w,
-                ry: half_w,
-                mode: coree_core::EllipseMode::Full,
-                start_deg: 0.0,
-                end_deg: 360.0,
-            }
-            .to_bezier_path();
-            circle.transform(&Affine2D::translate(center.x, center.y));
-            backend.fill_path(&circle, &paint, FillRule::Winding, transform);
-        }
-        ArrowheadStyle::Square => {
-            let back = tip - dir * (half_w * 2.0);
-            let sq = BezierPath::from_polygon(
-                [
-                    tip + perp * half_w,
-                    tip - perp * half_w,
-                    back - perp * half_w,
-                    back + perp * half_w,
-                ],
-                true,
-            );
-            backend.fill_path(&sq, &paint, FillRule::Winding, transform);
-        }
+    if filled {
+        let paint = BackendPaint {
+            shader: PaintShader::Solid(color.clone()),
+            opacity,
+            blend_mode,
+            anti_alias,
+        };
+        backend.fill_path(&geom, &paint, FillRule::Winding, transform);
+    } else {
+        let st = StrokeParams {
+            color: color.clone(),
+            width: stroke_w_mm.max(0.2),
+            cap: coree_core::LineCap::Round,
+            join: coree_core::LineJoin::Miter,
+            miter_limit: 4.0,
+            dash_pattern: Vec::new(),
+            dash_offset: 0.0,
+            opacity,
+            blend_mode,
+            anti_alias,
+        };
+        backend.stroke_path(&geom, &st, transform);
     }
 }
 

@@ -246,9 +246,16 @@ impl DirtyTileCache {
     ) -> usize {
         let key = ViewportKey::from(doc, viewport, view_mode, options);
         if self.last_key.as_ref() != Some(&key) {
+            if self.last_key.as_ref().is_none_or(|prev| {
+                prev.multipage_view != key.multipage_view
+                    || prev.page_count != key.page_count
+                    || prev.active_page_index != key.active_page_index
+                    || prev.pages_hash != key.pages_hash
+            }) {
+                self.spatial_dirty = true;
+            }
             self.rebuild_grid(viewport);
             self.last_key = Some(key);
-            self.spatial_dirty = true;
         }
 
         if self.dirty_tile_count() == 0 {

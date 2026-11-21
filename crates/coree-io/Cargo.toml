@@ -10,6 +10,7 @@ description = "Hardened SVG, PDF, DXF, PLT, and raster import/export codecs for 
 [dependencies]
 chrono.workspace = true
 coree-core.workspace = true
+coree-render.workspace = true
 flate2.workspace = true
 image.workspace = true
 kurbo.workspace = true

@@ -57,6 +57,7 @@ pub enum ShortcutAction {
     SelectInteractiveFill,
     SelectMeshFill,
     SelectEyedropper,
+    OpenEditFill,
     FocusOutlinePen,
 
     // Viewport navigation
@@ -286,6 +287,7 @@ pub fn resolve_shortcut(
                 (Key::F10, false) => Some(ShortcutAction::SelectShapeNode),
                 (Key::G, false) => Some(ShortcutAction::SelectInteractiveFill),
                 (Key::M, false) => Some(ShortcutAction::SelectMeshFill),
+                (Key::F11, false) => Some(ShortcutAction::OpenEditFill),
                 (Key::F12, false) => Some(ShortcutAction::FocusOutlinePen),
                 (Key::I, false) => Some(ShortcutAction::SelectEyedropper),
                 // Classic Studio single-key Alignment & Center to Page!
@@ -316,6 +318,8 @@ pub fn resolve_shortcut(
                 (Key::I, false) => Some(ShortcutAction::SelectEyedropper),
                 (Key::F4, false) => Some(ShortcutAction::ZoomToAll),
                 (Key::F4, true) => Some(ShortcutAction::ZoomToPage),
+                (Key::F11, false) => Some(ShortcutAction::OpenEditFill),
+                (Key::F12, false) => Some(ShortcutAction::FocusOutlinePen),
                 _ => None,
             },
         }
@@ -333,12 +337,14 @@ pub fn poll_egui_shortcuts(ctx: &egui::Context, profile: ShortcutProfile) -> Vec
         for ev in &input.events {
             if let egui::Event::Key {
                 key,
+                physical_key,
                 pressed: true,
                 modifiers,
                 ..
             } = *ev
             {
-                if let Some(act) = resolve_shortcut(profile, key, modifiers, text_focus) {
+                let effective_key = physical_key.unwrap_or(key);
+                if let Some(act) = resolve_shortcut(profile, effective_key, modifiers, text_focus) {
                     actions.push(act);
                 }
             }
@@ -379,6 +385,7 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::ClassicStudio, ShortcutAction::SelectMeshFill) => "M",
         (ShortcutProfile::StandardVector, ShortcutAction::SelectMeshFill) => "U",
         (_, ShortcutAction::SelectEyedropper) => "I",
+        (_, ShortcutAction::OpenEditFill) => "F11",
         (ShortcutProfile::ClassicStudio, ShortcutAction::FocusOutlinePen) => "F12",
         (ShortcutProfile::StandardVector, ShortcutAction::FocusOutlinePen) => "",
         (_, ShortcutAction::ZoomIn) => "Ctrl++",

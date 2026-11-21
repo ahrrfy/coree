@@ -45,8 +45,10 @@ pub struct ZcfContext {
 /// or per-object `loda` `0x00C9` JSON override.
 #[derive(Debug, Clone, Default)]
 pub struct CdssStyle {
-    /// Explicit fill type (`Some(0)` = None, `Some(1)` = Solid, `Some(2)` = Fountain).
+    /// Explicit fill type (`Some(0)` = None, `Some(1)` = Solid, `Some(2)` = Fountain, `Some(6)` = TwoColor, `Some(7)` = Texture).
     pub fill_type: Option<u32>,
+    /// Fountain sub-type (`0` = Linear, `1` = Radial, `2` = Conical, `3` = Square).
+    pub fill_fountain_type: Option<u32>,
     pub fill_primary: Option<Color>,
     pub fill_secondary: Option<Color>,
     pub fill_stops: Vec<GradientStop>,
@@ -59,6 +61,7 @@ pub struct CdssStyle {
     pub outline_cap: Option<LineCap>,
     pub outline_join: Option<LineJoin>,
     pub outline_miter_limit: Option<f64>,
+    pub outline_dash: Vec<f64>,
     pub outline_behind_fill: Option<bool>,
     pub outline_scale_with_object: Option<bool>,
     pub outline_overprint: Option<bool>,
@@ -70,6 +73,8 @@ pub struct CdssStyle {
 
 impl CdssStyle {
     /// Converts this style's explicit fill fields into a [`Fill`] when `fill_type` is present.
+    /// Gradient coordinates are emitted normalized in `[0.0..=1.0]` space; object assembly
+    /// rescales them onto the target geometry's local millimeter bounds.
     #[must_use]
     pub fn explicit_fill(&self) -> Option<Fill> {
         match self.fill_type? {
@@ -83,14 +88,49 @@ impl CdssStyle {
                     let c1 = self.fill_secondary.clone().unwrap_or(Color::WHITE);
                     vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)]
                 };
-                let rad = self.fill_angle_deg.unwrap_or(0.0).to_radians();
-                let (s, c) = rad.sin_cos();
-                Some(Fill::LinearGradient {
-                    start: Point2D::new(0.5 - 0.5 * c, 0.5 - 0.5 * s),
-                    end: Point2D::new(0.5 + 0.5 * c, 0.5 + 0.5 * s),
-                    stops,
-                })
+                let angle_deg = self.fill_angle_deg.unwrap_or(0.0);
+                match self.fill_fountain_type.unwrap_or(0) {
+                    1 => Some(Fill::RadialGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        radius: 0.5,
+                        focal: Point2D::new(0.5, 0.5),
+                        stops,
+                    }),
+                    2 => Some(Fill::ConicalGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        angle_deg,
+                        stops,
+                    }),
+                    3 => Some(Fill::SquareGradient {
+                        center: Point2D::new(0.5, 0.5),
+                        size: 1.0,
+                        angle_deg,
+                        stops,
+                    }),
+                    _ => {
+                        let rad = angle_deg.to_radians();
+                        let (s, c) = rad.sin_cos();
+                        Some(Fill::LinearGradient {
+                            start: Point2D::new(0.5 - 0.5 * c, 0.5 - 0.5 * s),
+                            end: Point2D::new(0.5 + 0.5 * c, 0.5 + 0.5 * s),
+                            stops,
+                        })
+                    }
+                }
             }
+            6 => Some(Fill::TwoColorPattern {
+                fg: self.fill_primary.clone().unwrap_or(Color::BLACK),
+                bg: self.fill_secondary.clone().unwrap_or(Color::WHITE),
+                pattern_name: "Checker".to_owned(),
+                tile_w: 8.0,
+                tile_h: 8.0,
+            }),
+            7 => Some(Fill::TextureFill {
+                preset: "marble".to_owned(),
+                seed: 1,
+                fg: self.fill_primary.clone().unwrap_or(Color::BLACK),
+                bg: self.fill_secondary.clone().unwrap_or(Color::WHITE),
+            }),
             _ => None,
         }
     }
@@ -129,6 +169,69 @@ impl CdssStyle {
         if let Some(op) = self.outline_overprint {
             base.overprint = op;
         }
+        if !self.outline_dash.is_empty() {
+            base.dash_pattern = self.outline_dash.clone();
+        }
+    }
+
+    fn merge_child(&self, child: &Self) -> Self {
+        let mut out = self.clone();
+        if child.fill_type.is_some() {
+            out.fill_type = child.fill_type;
+        }
+        if child.fill_fountain_type.is_some() {
+            out.fill_fountain_type = child.fill_fountain_type;
+        }
+        if child.fill_primary.is_some() {
+            out.fill_primary = child.fill_primary.clone();
+        }
+        if child.fill_secondary.is_some() {
+            out.fill_secondary = child.fill_secondary.clone();
+        }
+        if !child.fill_stops.is_empty() {
+            out.fill_stops = child.fill_stops.clone();
+        }
+        if child.fill_angle_deg.is_some() {
+            out.fill_angle_deg = child.fill_angle_deg;
+        }
+        if child.fill_overprint.is_some() {
+            out.fill_overprint = child.fill_overprint;
+        }
+        if child.outline_type.is_some() {
+            out.outline_type = child.outline_type;
+        }
+        if child.outline_width_mm.is_some() {
+            out.outline_width_mm = child.outline_width_mm;
+        }
+        if child.outline_color.is_some() {
+            out.outline_color = child.outline_color.clone();
+        }
+        if child.outline_cap.is_some() {
+            out.outline_cap = child.outline_cap;
+        }
+        if child.outline_join.is_some() {
+            out.outline_join = child.outline_join;
+        }
+        if child.outline_miter_limit.is_some() {
+            out.outline_miter_limit = child.outline_miter_limit;
+        }
+        if !child.outline_dash.is_empty() {
+            out.outline_dash = child.outline_dash.clone();
+        }
+        if child.outline_behind_fill.is_some() {
+            out.outline_behind_fill = child.outline_behind_fill;
+        }
+        if child.outline_scale_with_object.is_some() {
+            out.outline_scale_with_object = child.outline_scale_with_object;
+        }
+        if child.outline_overprint.is_some() {
+            out.outline_overprint = child.outline_overprint;
+        }
+        if child.text_style.is_some() {
+            out.text_style = child.text_style.clone();
+        }
+        out.parent = child.parent.clone();
+        out
     }
 }
 
@@ -140,6 +243,28 @@ pub struct CdssStyleSheet {
 }
 
 impl CdssStyleSheet {
+    /// Resolves a style by name, recursively merging its `"parent"` inheritance chain
+    /// up to 16 levels deep with cycle protection.
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<CdssStyle> {
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cur_name = name;
+        while seen.insert(cur_name.to_owned()) && chain.len() < 16 {
+            let st = self.styles.get(cur_name)?;
+            chain.push(st);
+            match st.parent.as_deref() {
+                Some(p) if !p.is_empty() => cur_name = p,
+                _ => break,
+            }
+        }
+        let mut merged = (*chain.last()?).clone();
+        for child in chain.into_iter().rev().skip(1) {
+            merged = merged.merge_child(child);
+        }
+        Some(merged)
+    }
+
     /// Returns the default graphic style (`~graphic~`), if defined.
     #[must_use]
     pub fn default_graphic(&self) -> Option<&CdssStyle> {
@@ -676,6 +801,20 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
 
     if let Some(fill) = obj.get("fill").and_then(Value::as_object) {
         style.fill_type = json_u32(fill, "type");
+        style.fill_fountain_type = json_u32(fill, "fountainType")
+            .or_else(|| json_u32(fill, "gradientType"))
+            .or_else(|| {
+                fill.get("fountainType")
+                    .or_else(|| fill.get("gradientType"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                        "linear" => Some(0),
+                        "radial" | "elliptical" => Some(1),
+                        "conical" => Some(2),
+                        "square" => Some(3),
+                        _ => None,
+                    })
+            });
         style.fill_primary = fill
             .get("primaryColor")
             .and_then(Value::as_str)
@@ -743,6 +882,19 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
         style.outline_behind_fill = json_bool(outl, "behindFill");
         style.outline_scale_with_object = json_bool(outl, "scaleWithObject");
         style.outline_overprint = json_bool(outl, "overprint");
+        if let Some(dashes) = outl
+            .get("dashPattern")
+            .or_else(|| outl.get("dashes"))
+            .and_then(Value::as_array)
+        {
+            for d in dashes {
+                if let Some(v) = d.as_f64().filter(|x| x.is_finite() && *x > 0.0) {
+                    style
+                        .outline_dash
+                        .push((v / coree_core::math::CDR_UNITS_PER_MM).max(0.2));
+                }
+            }
+        }
     }
 
     if let Some(ch) = obj.get("character").and_then(Value::as_object) {
@@ -1592,5 +1744,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err2, CdrError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn cdss_parent_inheritance_resolves_multi_level_and_guards_cycles() {
+        let json = br##"{
+          "version": 2300,
+          "style": {
+            "base": {
+              "fill": { "type": "2", "fountainType": "radial", "primaryColor": "RGB,USER,255,0,0,100", "secondaryColor": "RGB,USER,0,0,255,100" },
+              "outline": { "width": "10000", "overprint": true }
+            },
+            "child": {
+              "parent": "base",
+              "fill": { "angle": "45" }
+            },
+            "cycA": { "parent": "cycB", "outline": { "width": "5000" } },
+            "cycB": { "parent": "cycA" }
+          }
+        }"##;
+        let sheet = parse_document_cdss(json);
+        let resolved = sheet.resolve("child").unwrap();
+        assert_eq!(resolved.fill_type, Some(2));
+        assert_eq!(resolved.fill_fountain_type, Some(1));
+        assert_eq!(resolved.fill_angle_deg, Some(45.0));
+        assert_eq!(resolved.outline_overprint, Some(true));
+        assert!(matches!(
+            resolved.explicit_fill(),
+            Some(Fill::RadialGradient { .. })
+        ));
+
+        let cyc = sheet.resolve("cycA").unwrap();
+        assert!((cyc.outline_width_mm.unwrap() - 0.5).abs() < 1e-6);
     }
 }

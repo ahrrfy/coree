@@ -31,7 +31,8 @@ pub use backend::{
 };
 pub use error::{RenderError, RenderResult};
 pub use export_render::{
-    render_page_to_rgba, render_page_to_rgba_with_options, render_svg_to_rgba, RenderedImage,
+    render_isolated_object_to_rgba, render_page_to_rgba, render_page_to_rgba_with_options,
+    render_svg_to_rgba, RenderedImage,
 };
 pub use hit_test::{
     hit_test_node, hit_test_point, hit_test_rect, DynamicGuideKind, DynamicGuideLine, NodeHit,
@@ -43,11 +44,15 @@ pub use raster_engine::{
     erase_stroke, paint_brush_stroke, paint_brush_stroke_masked, raster_flood_fill, resample,
     smudge_stroke, DodgeBurnMode, RasterMask, ToneRange,
 };
-pub use renderer::{compute_page_layouts, PageLayout, RenderOptions, SceneRenderer};
+pub use renderer::{
+    arrowhead_geometry, compute_page_layouts, outline_arrowhead_geometries, PageLayout,
+    RenderOptions, SceneRenderer,
+};
 pub use smart_fill::{compute_smart_fill, create_smart_fill_object};
 pub use text_layout::{
     apply_kashida_elongation, contains_arabic, list_glyphs_for_block, paragraph_to_curves,
-    text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, TextEngine,
+    text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, ShapedGlyphDraw,
+    TextEngine,
 };
 pub use tile_cache::{CachedTile, DirtyTileCache, TILE_SIZE_PX};
 pub use trace::{trace_raster, trace_raster_to_mm, OutlinePreset, TraceConfig, TraceMode};

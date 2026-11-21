@@ -205,7 +205,8 @@ impl TextEngine {
         })
     }
 
-    fn layout_artistic_pieces(&mut self, text: &ArtisticText) -> Vec<ShapedGlyphDraw> {
+    #[must_use]
+    pub fn layout_artistic_pieces(&mut self, text: &ArtisticText) -> Vec<ShapedGlyphDraw> {
         if text.runs.is_empty() {
             return Vec::new();
         }
@@ -262,7 +263,8 @@ impl TextEngine {
         self.extract_buffer_glyph_paths(&buffer, &processed_runs, x_shift, 0.0, None)
     }
 
-    fn layout_paragraph_pieces(&mut self, para: &ParagraphText) -> Vec<ShapedGlyphDraw> {
+    #[must_use]
+    pub fn layout_paragraph_pieces(&mut self, para: &ParagraphText) -> Vec<ShapedGlyphDraw> {
         if para.runs.is_empty() {
             return Vec::new();
         }
@@ -392,7 +394,8 @@ impl TextEngine {
         pieces
     }
 
-    fn layout_text_on_path_pieces(
+    #[must_use]
+    pub fn layout_text_on_path_pieces(
         &mut self,
         top: &TextOnPath,
         host_path: &BezierPath,

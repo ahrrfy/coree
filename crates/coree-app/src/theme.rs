@@ -59,6 +59,37 @@ impl StudioTheme {
     }
 }
 
+/// Selectable UI language for bilingual studio menus, toolbars & labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum StudioLanguage {
+    #[default]
+    English,
+    Arabic,
+}
+
+impl StudioLanguage {
+    /// All supported UI languages.
+    pub const ALL: [Self; 2] = [Self::English, Self::Arabic];
+
+    /// Display label in Language switchers.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Arabic => "العربية (Arabic)",
+        }
+    }
+
+    /// Selects `en` or `ar` according to the active language.
+    #[must_use]
+    pub const fn tr(self, en: &'static str, ar: &'static str) -> &'static str {
+        match self {
+            Self::English => en,
+            Self::Arabic => ar,
+        }
+    }
+}
+
 /// Complete semantic color palette consumed by all `coree-app` widgets (zero raw hex literals in widgets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeTokens {
@@ -338,6 +369,16 @@ pub fn find_arabic_system_font() -> Option<PathBuf> {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
+        }
+    }
+
+    if let Some(windir) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
+        let fonts_dir = PathBuf::from(windir).join("Fonts");
+        for name in ["arial.ttf", "tahoma.ttf", "segoeui.ttf", "calibri.ttf"] {
+            let pb = fonts_dir.join(name);
+            if pb.is_file() {
+                return Some(pb);
+            }
         }
     }
 

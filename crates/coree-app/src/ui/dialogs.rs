@@ -7,15 +7,18 @@
 use crate::io_bridge::{read_text_file_bounded, MAX_TEXT_READ_BYTES};
 use crate::shortcuts::ShortcutProfile;
 use crate::state::{StudioApp, WorkspacePreset};
-use crate::theme::StudioTheme;
+use crate::theme::{core_color_to_egui, StudioLanguage, StudioTheme};
 use coree_cdr::CdrWriteVersion;
 use coree_core::brand::BrandInfo;
-use coree_core::{BuiltinIccProfile, ColorMode, Document, RenderingIntent, Unit};
+use coree_core::{
+    ArrowheadStyle, BuiltinIccProfile, Color, ColorMode, Document, Fill, GradientStop, LineCap,
+    LineJoin, OutlineStyle, Point2D, PostScriptFillPreset, RenderingIntent, Unit,
+};
 use coree_prod::{
     default_plugin_dirs, detect_executable, install_sample_plugin_template, GcodeDialect,
     PluginKind, PluginManifest, PluginRegistry,
 };
-use egui::{ComboBox, DragValue, Frame, Id, Margin, RichText, Stroke};
+use egui::{Color32, ComboBox, DragValue, Frame, Id, Margin, RichText, Stroke};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -165,6 +168,8 @@ pub fn show_dialogs(ctx: &egui::Context, app: &mut StudioApp) {
     show_export_dialog(ctx, app);
     show_print_preview_dialog(ctx, app);
     show_options_dialog(ctx, app);
+    show_edit_fill_dialog(ctx, app);
+    show_outline_pen_dialog(ctx, app);
     show_about_dialog(ctx, app);
 }
 
@@ -607,7 +612,7 @@ fn show_options_appearance_workspace(
     app: &mut StudioApp,
     tokens: &crate::theme::ThemeTokens,
 ) {
-    ui.label(RichText::new("Visual Theme").strong());
+    ui.label(RichText::new(app.ui_language.tr("Visual Theme", "المظهر البصري")).strong());
     ui.horizontal(|ui| {
         for theme in StudioTheme::ALL {
             if ui
@@ -615,6 +620,25 @@ fn show_options_appearance_workspace(
                 .clicked()
             {
                 app.set_theme(theme);
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(app.ui_language.tr(
+            "Interface Language / لغة الواجهة",
+            "لغة الواجهة (Interface Language)",
+        ))
+        .strong(),
+    );
+    ui.horizontal(|ui| {
+        for lang in StudioLanguage::ALL {
+            if ui
+                .selectable_label(app.ui_language == lang, lang.label())
+                .clicked()
+            {
+                app.set_ui_language(lang);
             }
         }
     });
@@ -1086,5 +1110,805 @@ fn gcode_dialect_label(dialect: GcodeDialect) -> &'static str {
         GcodeDialect::Grbl11 => "GRBL 1.1+ Laser Mode",
         GcodeDialect::Marlin => "Marlin Laser Firmware",
         GcodeDialect::RuidaGcode => "Ruida G-Code Dialect",
+    }
+}
+
+fn edit_color_compact_sliders(ui: &mut egui::Ui, color: &mut Color, id_salt: &str) -> bool {
+    let mut changed = false;
+    let tokens_surface = ui.visuals().extreme_bg_color;
+    let [r, g, b, a] = color.to_rgba_f32();
+    let mut rgb_u8 = [
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    ];
+    let mut cmyk = color.to_cmyk();
+    let mut c_pct = cmyk[0] * 100.0;
+    let mut m_pct = cmyk[1] * 100.0;
+    let mut y_pct = cmyk[2] * 100.0;
+    let mut k_pct = cmyk[3] * 100.0;
+
+    ui.horizontal(|ui| {
+        let (sw_rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(sw_rect, egui::CornerRadius::same(4), tokens_surface);
+        ui.painter().rect(
+            sw_rect,
+            egui::CornerRadius::same(4),
+            core_color_to_egui(color),
+            Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        ui.vertical(|ui| {
+            let mut eg_col = egui::Color32::from_rgba_unmultiplied(
+                rgb_u8[0],
+                rgb_u8[1],
+                rgb_u8[2],
+                (a * 255.0).round() as u8,
+            );
+            ui.horizontal(|ui| {
+                ui.label("RGB:");
+                if ui.color_edit_button_srgba(&mut eg_col).changed() {
+                    *color = Color::rgba8(eg_col.r(), eg_col.g(), eg_col.b(), eg_col.a());
+                    return;
+                }
+                if ui
+                    .add(DragValue::new(&mut rgb_u8[0]).prefix("R ").range(0..=255))
+                    .changed()
+                    | ui.add(DragValue::new(&mut rgb_u8[1]).prefix("G ").range(0..=255))
+                        .changed()
+                    | ui.add(DragValue::new(&mut rgb_u8[2]).prefix("B ").range(0..=255))
+                        .changed()
+                {
+                    *color =
+                        Color::rgba8(rgb_u8[0], rgb_u8[1], rgb_u8[2], (a * 255.0).round() as u8);
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("CMYK%:");
+                let dc = ui
+                    .add(
+                        DragValue::new(&mut c_pct)
+                            .prefix("C ")
+                            .speed(1.0)
+                            .range(0.0..=100.0),
+                    )
+                    .changed();
+                let dm = ui
+                    .add(
+                        DragValue::new(&mut m_pct)
+                            .prefix("M ")
+                            .speed(1.0)
+                            .range(0.0..=100.0),
+                    )
+                    .changed();
+                let dy = ui
+                    .add(
+                        DragValue::new(&mut y_pct)
+                            .prefix("Y ")
+                            .speed(1.0)
+                            .range(0.0..=100.0),
+                    )
+                    .changed();
+                let dk = ui
+                    .add(
+                        DragValue::new(&mut k_pct)
+                            .prefix("K ")
+                            .speed(1.0)
+                            .range(0.0..=100.0),
+                    )
+                    .changed();
+                if dc || dm || dy || dk {
+                    cmyk = [c_pct / 100.0, m_pct / 100.0, y_pct / 100.0, k_pct / 100.0];
+                    *color = Color::Cmyk {
+                        c: cmyk[0],
+                        m: cmyk[1],
+                        y: cmyk[2],
+                        k: cmyk[3],
+                        a,
+                    };
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                let is_cut = matches!(color, Color::Spot { name, .. } if name == "CutContour");
+                if ui.selectable_label(is_cut, "Spot CutContour").clicked() {
+                    *color = Color::spot("CutContour", 1.0, [0.0, 1.0, 0.0, 0.0]);
+                    changed = true;
+                }
+                if ui.small_button("Key Black").clicked() {
+                    *color = Color::KEY_BLACK;
+                    changed = true;
+                }
+                if ui.small_button("White").clicked() {
+                    *color = Color::WHITE;
+                    changed = true;
+                }
+                let _ = id_salt;
+            });
+        });
+    });
+    changed
+}
+
+/// Classic Studio Modal **Edit Fill Dialog (`F11`)**.
+fn show_edit_fill_dialog(ctx: &egui::Context, app: &mut StudioApp) {
+    if !app.show_edit_fill_dialog {
+        return;
+    }
+    let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let mut open = true;
+    let mut commit_close = false;
+    let mut apply_only = false;
+    let mut cancel_clicked = false;
+
+    egui::Window::new(lang.tr("Edit Fill (F11)", "تحرير التعبئة (F11)"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(egui::vec2(520.0, 440.0))
+        .show(ctx, |ui| {
+            // Fill type tabs for Edit Fill (`F11`) bar
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::None),
+                        lang.tr("No Fill", "بدون تعبئة"),
+                    )
+                    .clicked()
+                {
+                    app.edit_fill_draft = Fill::None;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::Solid(_)),
+                        lang.tr("Uniform Fill", "تعبئة موحدة"),
+                    )
+                    .clicked()
+                {
+                    let c = app
+                        .edit_fill_draft
+                        .referenced_colors()
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Color::CYAN);
+                    app.edit_fill_draft = Fill::Solid(c);
+                }
+                let is_fountain = matches!(
+                    app.edit_fill_draft,
+                    Fill::LinearGradient { .. }
+                        | Fill::RadialGradient { .. }
+                        | Fill::ConicalGradient { .. }
+                        | Fill::SquareGradient { .. }
+                );
+                if ui
+                    .selectable_label(is_fountain, lang.tr("Fountain Fill", "تدرج لوني"))
+                    .clicked()
+                {
+                    let cols = app.edit_fill_draft.referenced_colors();
+                    let c0 = cols.first().cloned().unwrap_or(Color::CYAN);
+                    let c1 = cols.get(1).cloned().unwrap_or(Color::WHITE);
+                    app.edit_fill_draft = Fill::LinearGradient {
+                        start: Point2D::new(0.0, 20.0),
+                        end: Point2D::new(80.0, 20.0),
+                        stops: vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
+                    };
+                    app.edit_fill_selected_stop = 0;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::TwoColorPattern { .. }),
+                        lang.tr("2-Color Pattern", "نمط ثنائي"),
+                    )
+                    .clicked()
+                {
+                    app.edit_fill_draft = Fill::TwoColorPattern {
+                        fg: Color::KEY_BLACK,
+                        bg: Color::WHITE,
+                        pattern_name: "Checker".to_owned(),
+                        tile_w: 8.0,
+                        tile_h: 8.0,
+                    };
+                }
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::TextureFill { .. }),
+                        lang.tr("PostScript / Texture", "بوست سكريبت / نسيج"),
+                    )
+                    .clicked()
+                {
+                    app.edit_fill_draft = Fill::TextureFill {
+                        preset: PostScriptFillPreset::Hatch.preset_str(),
+                        seed: 1,
+                        fg: Color::KEY_BLACK,
+                        bg: Color::WHITE,
+                    };
+                }
+            });
+            ui.separator();
+
+            match &mut app.edit_fill_draft {
+                Fill::None => {
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new(lang.tr(
+                            "Object interior is unfilled (transparent).",
+                            "داخل الكائن فارغ (شفاف بدون لون).",
+                        ))
+                        .color(tokens.text_muted),
+                    );
+                }
+                Fill::Solid(c) => {
+                    ui.label(
+                        RichText::new(lang.tr("Uniform Ink / Color", "لون التعبئة الموحد"))
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    edit_color_compact_sliders(ui, c, "f11_uniform");
+                }
+                Fill::LinearGradient { .. }
+                | Fill::RadialGradient { .. }
+                | Fill::ConicalGradient { .. }
+                | Fill::SquareGradient { .. } => {
+                    // Sub-type switcher (Linear / Radial / Conical / Square)
+                    let cur_sub = match app.edit_fill_draft {
+                        Fill::LinearGradient { .. } => 0,
+                        Fill::RadialGradient { .. } => 1,
+                        Fill::ConicalGradient { .. } => 2,
+                        _ => 3,
+                    };
+                    let mut next_sub = cur_sub;
+                    ui.horizontal(|ui| {
+                        ui.label(lang.tr("Type:", "النوع:"));
+                        ui.selectable_value(&mut next_sub, 0, lang.tr("Linear", "خطي"));
+                        ui.selectable_value(&mut next_sub, 1, lang.tr("Radial", "شعاعي"));
+                        ui.selectable_value(&mut next_sub, 2, lang.tr("Conical", "مخروطي"));
+                        ui.selectable_value(&mut next_sub, 3, lang.tr("Square", "مربع"));
+                    });
+                    if next_sub != cur_sub {
+                        let stops = match &app.edit_fill_draft {
+                            Fill::LinearGradient { stops, .. }
+                            | Fill::RadialGradient { stops, .. }
+                            | Fill::ConicalGradient { stops, .. }
+                            | Fill::SquareGradient { stops, .. } => stops.clone(),
+                            _ => vec![],
+                        };
+                        app.edit_fill_draft = match next_sub {
+                            1 => Fill::RadialGradient {
+                                center: Point2D::new(40.0, 40.0),
+                                radius: 45.0,
+                                focal: Point2D::new(40.0, 40.0),
+                                stops,
+                            },
+                            2 => Fill::ConicalGradient {
+                                center: Point2D::new(40.0, 40.0),
+                                angle_deg: 0.0,
+                                stops,
+                            },
+                            3 => Fill::SquareGradient {
+                                center: Point2D::new(40.0, 40.0),
+                                size: 50.0,
+                                angle_deg: 0.0,
+                                stops,
+                            },
+                            _ => Fill::LinearGradient {
+                                start: Point2D::new(0.0, 20.0),
+                                end: Point2D::new(80.0, 20.0),
+                                stops,
+                            },
+                        };
+                    }
+
+                    // Edit stops & geometry parameters
+                    let stops_mut = match &mut app.edit_fill_draft {
+                        Fill::LinearGradient { stops, .. }
+                        | Fill::RadialGradient { stops, .. }
+                        | Fill::ConicalGradient { stops, .. }
+                        | Fill::SquareGradient { stops, .. } => stops,
+                        _ => unreachable!(),
+                    };
+                    if stops_mut.is_empty() {
+                        stops_mut.push(GradientStop::new(0.0, Color::CYAN));
+                        stops_mut.push(GradientStop::new(1.0, Color::WHITE));
+                    }
+                    app.edit_fill_selected_stop = app
+                        .edit_fill_selected_stop
+                        .min(stops_mut.len().saturating_sub(1));
+
+                    // Live Fountain Gradient Preview Strip + Stop Markers
+                    let (bar_rect, bar_resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(240.0), 26.0),
+                        egui::Sense::click(),
+                    );
+                    let steps = 40usize;
+                    for i in 0..steps {
+                        let t0 = (i as f32) / (steps as f32);
+                        let t1 = ((i + 1) as f32) / (steps as f32);
+                        let col = sample_fountain_stop(stops_mut, (t0 + t1) * 0.5);
+                        let seg_r = egui::Rect::from_min_max(
+                            egui::pos2(bar_rect.left() + bar_rect.width() * t0, bar_rect.top()),
+                            egui::pos2(bar_rect.left() + bar_rect.width() * t1, bar_rect.bottom()),
+                        );
+                        ui.painter().rect_filled(
+                            seg_r,
+                            egui::CornerRadius::ZERO,
+                            core_color_to_egui(&col),
+                        );
+                    }
+                    ui.painter().rect_stroke(
+                        bar_rect,
+                        egui::CornerRadius::same(2),
+                        Stroke::new(1.0, tokens.border_input),
+                        egui::StrokeKind::Inside,
+                    );
+                    for (idx, st) in stops_mut.iter().enumerate() {
+                        let mx = bar_rect.left() + bar_rect.width() * st.offset;
+                        let sel = idx == app.edit_fill_selected_stop;
+                        let marker_r = egui::Rect::from_center_size(
+                            egui::pos2(mx, bar_rect.bottom()),
+                            egui::vec2(if sel { 10.0 } else { 7.0 }, if sel { 10.0 } else { 7.0 }),
+                        );
+                        ui.painter().rect(
+                            marker_r,
+                            egui::CornerRadius::same(1),
+                            core_color_to_egui(&st.color),
+                            Stroke::new(
+                                if sel { 2.0 } else { 1.0 },
+                                if sel { tokens.accent } else { Color32::WHITE },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if bar_resp.clicked() {
+                        if let Some(p) = bar_resp.interact_pointer_pos() {
+                            let click_t = ((p.x - bar_rect.left()) / bar_rect.width().max(1.0))
+                                .clamp(0.0, 1.0);
+                            if let Some((nearest, _)) =
+                                stops_mut.iter().enumerate().min_by(|(_, a), (_, b)| {
+                                    (a.offset - click_t)
+                                        .abs()
+                                        .total_cmp(&(b.offset - click_t).abs())
+                                })
+                            {
+                                app.edit_fill_selected_stop = nearest;
+                            }
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Stop {}/{}:",
+                            app.edit_fill_selected_stop + 1,
+                            stops_mut.len()
+                        ));
+                        for idx in 0..stops_mut.len() {
+                            if ui
+                                .selectable_label(
+                                    app.edit_fill_selected_stop == idx,
+                                    format!("#{}", idx + 1),
+                                )
+                                .clicked()
+                            {
+                                app.edit_fill_selected_stop = idx;
+                            }
+                        }
+                        if ui.button("+ Stop").clicked() && stops_mut.len() < 16 {
+                            let c = sample_fountain_stop(stops_mut, 0.5);
+                            stops_mut.push(GradientStop::new(0.5, c));
+                            app.edit_fill_selected_stop = stops_mut.len() - 1;
+                        }
+                        if ui.button("- Stop").clicked() && stops_mut.len() > 2 {
+                            stops_mut.remove(app.edit_fill_selected_stop);
+                            app.edit_fill_selected_stop =
+                                app.edit_fill_selected_stop.min(stops_mut.len() - 1);
+                        }
+                        if ui.button("Reverse").clicked() {
+                            for st in stops_mut.iter_mut() {
+                                st.offset = (1.0 - st.offset).clamp(0.0, 1.0);
+                            }
+                            stops_mut.reverse();
+                        }
+                    });
+                    if let Some(st) = stops_mut.get_mut(app.edit_fill_selected_stop) {
+                        let mut pct = st.offset * 100.0;
+                        ui.horizontal(|ui| {
+                            ui.label(lang.tr("Node Position:", "موضع العقدة:"));
+                            if ui
+                                .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
+                                .changed()
+                            {
+                                st.offset = (pct / 100.0).clamp(0.0, 1.0);
+                            }
+                        });
+                        edit_color_compact_sliders(ui, &mut st.color, "f11_stop");
+                    }
+                    ui.separator();
+                    match &mut app.edit_fill_draft {
+                        Fill::LinearGradient { start, end, .. } => {
+                            ui.horizontal(|ui| {
+                                ui.label("Start/End mm:");
+                                ui.add(DragValue::new(&mut start.x).prefix("X1 "));
+                                ui.add(DragValue::new(&mut start.y).prefix("Y1 "));
+                                ui.add(DragValue::new(&mut end.x).prefix("X2 "));
+                                ui.add(DragValue::new(&mut end.y).prefix("Y2 "));
+                            });
+                        }
+                        Fill::RadialGradient { center, radius, .. } => {
+                            ui.horizontal(|ui| {
+                                ui.add(DragValue::new(&mut center.x).prefix("CX "));
+                                ui.add(DragValue::new(&mut center.y).prefix("CY "));
+                                ui.add(DragValue::new(radius).prefix("R ").range(0.5..=2000.0));
+                            });
+                        }
+                        Fill::ConicalGradient {
+                            center, angle_deg, ..
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.add(DragValue::new(&mut center.x).prefix("CX "));
+                                ui.add(DragValue::new(&mut center.y).prefix("CY "));
+                                ui.add(egui::Slider::new(angle_deg, -180.0..=180.0).suffix("°"));
+                            });
+                        }
+                        Fill::SquareGradient {
+                            center,
+                            size,
+                            angle_deg,
+                            ..
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.add(DragValue::new(&mut center.x).prefix("CX "));
+                                ui.add(DragValue::new(&mut center.y).prefix("CY "));
+                                ui.add(DragValue::new(size).prefix("Size ").range(1.0..=2000.0));
+                                ui.add(egui::Slider::new(angle_deg, -180.0..=180.0).suffix("°"));
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                Fill::TwoColorPattern {
+                    fg,
+                    bg,
+                    tile_w,
+                    tile_h,
+                    ..
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            DragValue::new(tile_w)
+                                .prefix("Tile W ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                        ui.add(
+                            DragValue::new(tile_h)
+                                .prefix("Tile H ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                    });
+                    ui.label("Foreground Color:");
+                    edit_color_compact_sliders(ui, fg, "f11_pat_fg");
+                    ui.label("Background Color:");
+                    edit_color_compact_sliders(ui, bg, "f11_pat_bg");
+                }
+                Fill::TextureFill { preset, fg, bg, .. } => {
+                    ui.horizontal_wrapped(|ui| {
+                        for p in PostScriptFillPreset::ALL {
+                            let pid = p.preset_str();
+                            if ui
+                                .selectable_label(*preset == pid, p.display_name())
+                                .clicked()
+                            {
+                                *preset = pid;
+                            }
+                        }
+                    });
+                    ui.label("Foreground:");
+                    edit_color_compact_sliders(ui, fg, "f11_tex_fg");
+                    ui.label("Background:");
+                    edit_color_compact_sliders(ui, bg, "f11_tex_bg");
+                }
+                _ => {
+                    ui.label("Vector/Bitmap/Mesh fills can be edited directly via canvas handles.");
+                }
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(lang.tr("Cancel", "إلغاء")).clicked() {
+                        cancel_clicked = true;
+                    }
+                    if ui
+                        .button(RichText::new(lang.tr("OK", "موافق")).strong())
+                        .clicked()
+                    {
+                        commit_close = true;
+                    }
+                    if ui.button(lang.tr("Apply", "تطبيق")).clicked() {
+                        apply_only = true;
+                    }
+                });
+            });
+        });
+
+    if apply_only {
+        app.apply_edit_fill_draft();
+    }
+    if commit_close {
+        app.apply_edit_fill_draft();
+        app.show_edit_fill_dialog = false;
+    } else if !open || cancel_clicked {
+        app.show_edit_fill_dialog = false;
+    }
+}
+
+fn sample_fountain_stop(stops: &[GradientStop], t: f32) -> Color {
+    if stops.is_empty() {
+        return Color::BLACK;
+    }
+    let mut sorted = stops.to_vec();
+    sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if t <= sorted[0].offset {
+        return sorted[0].color.clone();
+    }
+    if let Some(last) = sorted.last() {
+        if t >= last.offset {
+            return last.color.clone();
+        }
+    }
+    for win in sorted.windows(2) {
+        if t >= win[0].offset && t <= win[1].offset {
+            let span = (win[1].offset - win[0].offset).max(1e-5);
+            return win[0].color.lerp(&win[1].color, (t - win[0].offset) / span);
+        }
+    }
+    sorted[0].color.clone()
+}
+
+/// Classic Studio Modal **Outline Pen Dialog (`F12`)**.
+fn show_outline_pen_dialog(ctx: &egui::Context, app: &mut StudioApp) {
+    if !app.show_outline_pen_dialog {
+        return;
+    }
+    let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let mut open = true;
+    let mut commit_close = false;
+    let mut apply_only = false;
+    let mut cancel_clicked = false;
+
+    egui::Window::new(lang.tr("Outline Pen (F12)", "قلم الحدود (F12)"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(egui::vec2(510.0, 480.0))
+        .show(ctx, |ui| {
+            let o = &mut app.outline_pen_draft;
+
+            ui.label(RichText::new(lang.tr("Outline Color", "لون الحد")).strong());
+            edit_color_compact_sliders(ui, &mut o.color, "f12_color");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label(lang.tr("Width:", "السماكة:"));
+                ui.add(
+                    DragValue::new(&mut o.width_mm)
+                        .speed(0.05)
+                        .suffix(" mm")
+                        .range(0.0..=100.0),
+                );
+                if o.width_mm > 0.0 && o.is_hairline && o.width_mm > 0.1 {
+                    o.is_hairline = false;
+                }
+                if ui
+                    .selectable_label(!o.is_visible(), lang.tr("None", "بلا"))
+                    .clicked()
+                {
+                    o.width_mm = 0.0;
+                    o.is_hairline = false;
+                }
+                if ui
+                    .selectable_label(o.is_hairline, lang.tr("Hairline", "خط شعري"))
+                    .clicked()
+                {
+                    o.is_hairline = true;
+                    o.width_mm = 0.0762;
+                }
+                for (lbl, mm) in [
+                    ("0.5pt", 0.176),
+                    ("1pt", 0.353),
+                    ("2pt", 0.706),
+                    ("4pt", 1.411),
+                    ("2mm", 2.0),
+                ] {
+                    if ui.small_button(lbl).clicked() {
+                        o.is_hairline = false;
+                        o.width_mm = mm;
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(lang.tr("Dash Style:", "الخط المتقطع:"));
+                if ui
+                    .selectable_label(o.dash_pattern.is_empty(), "Solid")
+                    .clicked()
+                {
+                    o.dash_pattern.clear();
+                }
+                if ui
+                    .selectable_label(o.dash_pattern == vec![4.0, 2.0], "Dashed")
+                    .clicked()
+                {
+                    o.dash_pattern = vec![4.0, 2.0];
+                }
+                if ui
+                    .selectable_label(o.dash_pattern == vec![0.8, 1.5], "Dotted")
+                    .clicked()
+                {
+                    o.dash_pattern = vec![0.8, 1.5];
+                }
+                if ui
+                    .selectable_label(o.dash_pattern == vec![4.0, 1.5, 1.0, 1.5], "Dash-Dot")
+                    .clicked()
+                {
+                    o.dash_pattern = vec![4.0, 1.5, 1.0, 1.5];
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(lang.tr("Corners:", "الزوايا:"));
+                ui.selectable_value(&mut o.join, LineJoin::Miter, "Miter");
+                ui.selectable_value(&mut o.join, LineJoin::Round, "Round");
+                ui.selectable_value(&mut o.join, LineJoin::Bevel, "Bevel");
+                ui.label("Miter Limit:");
+                ui.add(
+                    DragValue::new(&mut o.miter_limit)
+                        .speed(0.5)
+                        .range(1.0..=90.0),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(lang.tr("Line Caps:", "نهايات الخط:"));
+                ui.selectable_value(&mut o.cap, LineCap::Butt, "Butt");
+                ui.selectable_value(&mut o.cap, LineCap::Round, "Round");
+                ui.selectable_value(&mut o.cap, LineCap::Square, "Square");
+            });
+
+            let arrows = [
+                ArrowheadStyle::None,
+                ArrowheadStyle::Triangle,
+                ArrowheadStyle::Stealth,
+                ArrowheadStyle::OpenVee,
+                ArrowheadStyle::Diamond,
+                ArrowheadStyle::Circle,
+                ArrowheadStyle::Square,
+            ];
+            let arrow_lbl = |a: &ArrowheadStyle| match a {
+                ArrowheadStyle::None => "None",
+                ArrowheadStyle::Triangle => "Triangle",
+                ArrowheadStyle::Stealth => "Stealth",
+                ArrowheadStyle::OpenVee => "Open Vee",
+                ArrowheadStyle::Diamond => "Diamond",
+                ArrowheadStyle::Circle => "Circle",
+                ArrowheadStyle::Square => "Square",
+                ArrowheadStyle::Custom(_) => "Custom",
+            };
+            ui.horizontal(|ui| {
+                ui.label(lang.tr("Start Arrow:", "بداية السهم:"));
+                ComboBox::from_id_salt("f12_start_arrow")
+                    .selected_text(arrow_lbl(&o.start_arrow))
+                    .show_ui(ui, |ui| {
+                        for a in &arrows {
+                            ui.selectable_value(&mut o.start_arrow, a.clone(), arrow_lbl(a));
+                        }
+                    });
+                ui.label(lang.tr("End Arrow:", "نهاية السهم:"));
+                ComboBox::from_id_salt("f12_end_arrow")
+                    .selected_text(arrow_lbl(&o.end_arrow))
+                    .show_ui(ui, |ui| {
+                        for a in &arrows {
+                            ui.selectable_value(&mut o.end_arrow, a.clone(), arrow_lbl(a));
+                        }
+                    });
+                if ui.small_button("Swap").clicked() {
+                    std::mem::swap(&mut o.start_arrow, &mut o.end_arrow);
+                }
+            });
+
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    lang.tr("Calligraphy Nib & Print Flags", "ريشة الخط وخيارات الطباعة"),
+                )
+                .strong(),
+            );
+            ui.horizontal(|ui| {
+                let (nib_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+                ui.painter().rect_stroke(
+                    nib_rect,
+                    egui::CornerRadius::same(4),
+                    Stroke::new(1.0, tokens.border),
+                    egui::StrokeKind::Inside,
+                );
+                let nc = nib_rect.center();
+                let rad = o.calligraphy_angle_deg.to_radians() as f32;
+                let rx = 16.0_f32;
+                let ry = (16.0 / o.calligraphy_stretch.clamp(0.1, 10.0) as f32).clamp(2.5, 18.0);
+                let mut pts = Vec::with_capacity(24);
+                for i in 0..24 {
+                    let th = (i as f32) * std::f32::consts::TAU / 24.0;
+                    let lx = rx * th.cos();
+                    let ly = ry * th.sin();
+                    let px = nc.x + lx * rad.cos() - ly * rad.sin();
+                    let py = nc.y + lx * rad.sin() + ly * rad.cos();
+                    pts.push(egui::pos2(px, py));
+                }
+                ui.painter().add(egui::Shape::convex_polygon(
+                    pts,
+                    tokens.accent.gamma_multiply(0.35),
+                    Stroke::new(1.5, tokens.accent),
+                ));
+
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Nib Angle:");
+                        ui.add(
+                            egui::Slider::new(&mut o.calligraphy_angle_deg, -180.0..=180.0)
+                                .suffix("°"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Stretch:");
+                        ui.add(egui::Slider::new(&mut o.calligraphy_stretch, 0.2..=5.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut o.behind_fill, lang.tr("Behind Fill", "خلف التعبئة"));
+                        ui.checkbox(
+                            &mut o.scale_with_object,
+                            lang.tr("Scale with Object", "تحجيم مع الكائن"),
+                        );
+                        ui.checkbox(&mut o.overprint, lang.tr("Overprint", "طباعة فوقية"));
+                    });
+                });
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(lang.tr("Remove Outline", "إزالة الحد")).clicked() {
+                    app.outline_pen_draft = OutlineStyle::none();
+                    apply_only = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(lang.tr("Cancel", "إلغاء")).clicked() {
+                        cancel_clicked = true;
+                    }
+                    if ui
+                        .button(RichText::new(lang.tr("OK", "موافق")).strong())
+                        .clicked()
+                    {
+                        commit_close = true;
+                    }
+                    if ui.button(lang.tr("Apply", "تطبيق")).clicked() {
+                        apply_only = true;
+                    }
+                });
+            });
+        });
+
+    if apply_only {
+        app.apply_outline_pen_draft();
+    }
+    if commit_close {
+        app.apply_outline_pen_draft();
+        app.show_outline_pen_dialog = false;
+    } else if !open || cancel_clicked {
+        app.show_outline_pen_dialog = false;
     }
 }

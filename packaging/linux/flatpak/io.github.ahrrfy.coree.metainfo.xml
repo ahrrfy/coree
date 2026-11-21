@@ -74,6 +74,19 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.1" date="2026-11-22">
+      <description>
+        <p>
+          Wave C deep atomic audit release: curved Arabic/Unicode PDF &amp; EPS export
+          (zero Tofu boxes), PDF Spot /Separation &amp; /Shading gradients, EPS inline raster
+          export/import, ZCF local-mm gradient rescaling &amp; CDSS parent inheritance,
+          classic modal Edit Fill (F11) &amp; Outline Pen (F12) dialogs, interactive
+          gradient/effect/guide handles, bilingual English/Arabic UI with persistent SQLite
+          preferences, HiDPI canvas scaling, Arabic-layout physical shortcuts, and stripped
+          LTO release binaries.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-21">
       <description>
         <p>

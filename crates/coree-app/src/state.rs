@@ -9,7 +9,7 @@ use crate::io_bridge::{
     export_any_document, import_into_document, open_any_document, UniversalExportOptions,
 };
 use crate::shortcuts::{shortcut_label, ShortcutAction, ShortcutProfile};
-use crate::theme::StudioTheme;
+use crate::theme::{StudioLanguage, StudioTheme};
 use coree_cdr::generate_sample_document;
 use coree_core::{
     Affine2D, AlignOp, AnchorPoint, ArtisticMediaStyle, ArtisticText, ArtisticWidthProfile,
@@ -687,6 +687,20 @@ pub enum CanvasDragState {
         is_end: bool,
         orig_fill: Fill,
     },
+    DraggingGradientStop {
+        object_id: ObjectId,
+        stop_index: usize,
+        orig_fill: Fill,
+    },
+    DraggingEffectHandle {
+        object_id: ObjectId,
+        effect_index: usize,
+        orig_effect: Effect,
+    },
+    DraggingCanvasGuide {
+        guide_id: u64,
+        orig_orientation: GuideOrientation,
+    },
     DraggingTransparencyHandle {
         object_id: ObjectId,
         effect_index: usize,
@@ -747,6 +761,7 @@ pub struct DocumentTab {
     pub renderer: SceneRenderer,
     pub snap_options: SnapOptions,
     pub active_guides: Vec<DynamicGuideLine>,
+    pub selected_guide_id: Option<u64>,
     pub dirty: bool,
     pub source_path: Option<PathBuf>,
     pub last_autosave_at: Instant,
@@ -807,6 +822,7 @@ impl DocumentTab {
             renderer: SceneRenderer::new(),
             snap_options: SnapOptions::default(),
             active_guides: Vec::new(),
+            selected_guide_id: None,
             dirty: false,
             source_path,
             last_autosave_at: Instant::now(),
@@ -966,6 +982,11 @@ impl DocumentTab {
                 orig_fill,
                 ..
             }
+            | CanvasDragState::DraggingGradientStop {
+                object_id,
+                orig_fill,
+                ..
+            }
             | CanvasDragState::DraggingMeshNode {
                 object_id,
                 orig_fill,
@@ -988,6 +1009,11 @@ impl DocumentTab {
                 effect_index,
                 orig_effect,
                 ..
+            }
+            | CanvasDragState::DraggingEffectHandle {
+                object_id,
+                effect_index,
+                orig_effect,
             } => {
                 if let Some(obj) = self.document.objects.get_mut(&object_id) {
                     if let Some(slot) = obj.effects.get_mut(effect_index) {
@@ -995,6 +1021,15 @@ impl DocumentTab {
                     }
                 }
                 self.tile_cache.mark_all_dirty();
+                self.needs_rerender = true;
+            }
+            CanvasDragState::DraggingCanvasGuide {
+                guide_id,
+                orig_orientation,
+            } => {
+                if let Some(g) = self.document.guides.iter_mut().find(|g| g.id == guide_id) {
+                    g.orientation = orig_orientation;
+                }
                 self.needs_rerender = true;
             }
             _ => {}
@@ -1890,6 +1925,7 @@ pub struct StudioApp {
     pub active_tab: usize,
     pub show_welcome: bool,
     pub theme: StudioTheme,
+    pub ui_language: StudioLanguage,
     pub theme_dirty: bool,
     pub fonts_configured: bool,
     pub shortcut_profile: ShortcutProfile,
@@ -1969,6 +2005,11 @@ pub struct StudioApp {
     pub show_about_dialog: bool,
     pub show_preferences_dialog: bool,
     pub show_print_preview_dialog: bool,
+    pub show_edit_fill_dialog: bool,
+    pub edit_fill_draft: Fill,
+    pub edit_fill_selected_stop: usize,
+    pub show_outline_pen_dialog: bool,
+    pub outline_pen_draft: OutlineStyle,
 
     // Feedback
     pub status_message: String,
@@ -2015,6 +2056,14 @@ impl StudioApp {
             .as_ref()
             .and_then(|db| db.get_preference::<StudioTheme>("ui.theme").ok().flatten())
             .unwrap_or_default();
+        let saved_language = storage
+            .as_ref()
+            .and_then(|db| {
+                db.get_preference::<StudioLanguage>("ui.language")
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
         let saved_profile = storage
             .as_ref()
             .and_then(|db| {
@@ -2045,6 +2094,7 @@ impl StudioApp {
             active_tab: 0,
             show_welcome: open_welcome_when_empty && initial_files.is_empty(),
             theme: saved_theme,
+            ui_language: saved_language,
             theme_dirty: true,
             fonts_configured: false,
             shortcut_profile: saved_profile,
@@ -2106,6 +2156,11 @@ impl StudioApp {
             show_about_dialog: false,
             show_preferences_dialog: false,
             show_print_preview_dialog: false,
+            show_edit_fill_dialog: false,
+            edit_fill_draft: Fill::Solid(Color::cmyk(0.75, 0.15, 0.0, 0.0)),
+            edit_fill_selected_stop: 0,
+            show_outline_pen_dialog: false,
+            outline_pen_draft: OutlineStyle::solid(Color::KEY_BLACK, 0.3),
             status_message: "Ready · 100% Offline Local Studio".to_owned(),
             toasts: Vec::new(),
         };
@@ -2409,8 +2464,9 @@ impl StudioApp {
             for tab in &self.tabs {
                 let _ = db.mark_clean_close(&tab.document.id.to_string());
             }
-            let _ = db.set_preference("ui.theme", "appearance", &self.theme);
-            let _ = db.set_preference("ui.shortcut_profile", "shortcuts", &self.shortcut_profile);
+            let _ = db.set_preference("ui.theme", "ui", &self.theme);
+            let _ = db.set_preference("ui.language", "ui", &self.ui_language);
+            let _ = db.set_preference("ui.shortcut_profile", "ui", &self.shortcut_profile);
             if let Some(json) = dock_json {
                 let rec = WorkspaceLayoutRecord {
                     id: "coree-last-session".to_owned(),
@@ -2818,6 +2874,18 @@ impl StudioApp {
             .map(|t| t.selection.objects.clone())
             .unwrap_or_default();
         if ids.is_empty() {
+            let gid = self.active_tab().and_then(|t| t.selected_guide_id);
+            if let Some(guide_id) = gid {
+                if self
+                    .execute_command(CommandOp::RemoveGuide { id: guide_id })
+                    .is_ok()
+                {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.selected_guide_id = None;
+                    }
+                    self.push_toast("Removed selected guide line", false);
+                }
+            }
             return;
         }
         match self.execute_command(CommandOp::DeleteObjects { ids }) {
@@ -4866,7 +4934,7 @@ impl StudioApp {
             tab.tile_cache.mark_all_dirty();
         }
         if let Some(ref db) = self.storage {
-            let _ = db.set_preference("ui.theme", "appearance", &theme);
+            let _ = db.set_preference("ui.theme", "ui", &theme);
         }
     }
 
@@ -4874,9 +4942,63 @@ impl StudioApp {
     pub fn set_shortcut_profile(&mut self, profile: ShortcutProfile) {
         self.shortcut_profile = profile;
         if let Some(ref db) = self.storage {
-            let _ = db.set_preference("ui.shortcut_profile", "shortcuts", &profile);
+            let _ = db.set_preference("ui.shortcut_profile", "ui", &profile);
         }
         self.push_toast(format!("Shortcut profile: {}", profile.label()), false);
+    }
+
+    /// Switches UI studio language (`English` / `العربية`) and persists locally.
+    pub fn set_ui_language(&mut self, language: StudioLanguage) {
+        self.ui_language = language;
+        if let Some(ref db) = self.storage {
+            let _ = db.set_preference("ui.language", "ui", &language);
+        }
+        self.push_toast(
+            match language {
+                StudioLanguage::English => "UI Language: English",
+                StudioLanguage::Arabic => "لغة الواجهة: العربية",
+            },
+            false,
+        );
+    }
+
+    /// Opens the classic modal Edit Fill dialog (`F11`) preloaded from the active selection.
+    pub fn open_edit_fill_dialog(&mut self) {
+        let initial = self
+            .active_tab()
+            .and_then(|t| {
+                let id = t.selection.objects.first()?;
+                t.document.objects.get(id).map(|o| o.fill.clone())
+            })
+            .unwrap_or_else(|| self.default_fill.clone());
+        self.edit_fill_draft = initial;
+        self.edit_fill_selected_stop = 0;
+        self.show_edit_fill_dialog = true;
+    }
+
+    /// Applies the edited fill draft from `Edit Fill (F11)` onto selected objects or default fill.
+    pub fn apply_edit_fill_draft(&mut self) {
+        let fill = self.edit_fill_draft.clone();
+        self.apply_fill(fill);
+    }
+
+    /// Opens the classic modal Outline Pen dialog (`F12`) preloaded from the active selection.
+    pub fn open_outline_pen_dialog(&mut self) {
+        let initial = self
+            .active_tab()
+            .and_then(|t| {
+                let id = t.selection.objects.first()?;
+                t.document.objects.get(id).map(|o| o.outline.clone())
+            })
+            .unwrap_or_else(|| self.default_outline.clone());
+        self.outline_pen_draft = initial;
+        self.show_outline_pen_dialog = true;
+    }
+
+    /// Applies the edited outline draft from `Outline Pen (F12)` onto selected objects or default outline.
+    pub fn apply_outline_pen_draft(&mut self) {
+        let outline = self.outline_pen_draft.clone();
+        self.apply_outline(outline);
     }
 
     /// Executes a resolved [`ShortcutAction`] cleanly (used both by live egui input and headless tests).
@@ -4899,10 +5021,8 @@ impl StudioApp {
             ShortcutAction::SelectInteractiveFill => self.select_tool(ToolId::InteractiveFill),
             ShortcutAction::SelectMeshFill => self.select_tool(ToolId::MeshFill),
             ShortcutAction::SelectEyedropper => self.select_tool(ToolId::ColorEyedropper),
-            ShortcutAction::FocusOutlinePen => {
-                self.properties_state.active_tab = PropertiesSubTab::Outline;
-                self.focus_docker(DockerTab::Properties);
-            }
+            ShortcutAction::OpenEditFill => self.open_edit_fill_dialog(),
+            ShortcutAction::FocusOutlinePen => self.open_outline_pen_dialog(),
             ShortcutAction::ZoomIn => self.zoom_step(1.25),
             ShortcutAction::ZoomOut => self.zoom_step(0.8),
             ShortcutAction::ZoomToAll => {
@@ -5052,6 +5172,10 @@ impl StudioApp {
                 self.open_flyout_group = None;
                 if self.full_screen_preview {
                     self.full_screen_preview = false;
+                } else if self.show_edit_fill_dialog {
+                    self.show_edit_fill_dialog = false;
+                } else if self.show_outline_pen_dialog {
+                    self.show_outline_pen_dialog = false;
                 } else if self.command_palette.open {
                     self.command_palette.open = false;
                 } else if self.show_options_dialog {

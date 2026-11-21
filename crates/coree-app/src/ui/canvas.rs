@@ -9,7 +9,7 @@
 use crate::state::{
     bspline_to_bezier_path, compute_free_transform_affine, is_object_editable_in_doc,
     three_point_arc_path, CanvasDragState, DockerTab, NodeDragPart, ParametricHandleKind,
-    PropertiesSubTab, RasterBrushOp, ScaleHandle, StudioApp, ToolId,
+    RasterBrushOp, ScaleHandle, StudioApp, ToolId,
 };
 use crate::theme::{core_color_to_egui, PAGE_TABS_HEIGHT, RULER_THICKNESS, STATUS_BAR_HEIGHT};
 use coree_core::{
@@ -223,14 +223,11 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         app.focus_docker(DockerTab::Production);
                     }
 
-                    // Active Stroke & Fill mini swatches
-                    let (sw_rect, sw_resp) =
-                        ui.allocate_exact_size(vec2(34.0, 14.0), Sense::click());
-                    let r_fill = Rect::from_min_size(sw_rect.left_top(), vec2(14.0, 14.0));
-                    let r_stroke =
-                        Rect::from_min_size(sw_rect.left_top() + vec2(18.0, 0.0), vec2(14.0, 14.0));
+                    // Active Fill (F11) & Outline (F12) mini swatches
+                    let (fill_rect, fill_resp) =
+                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
                     ui.painter().rect(
-                        r_fill,
+                        fill_rect,
                         CornerRadius::same(2),
                         fill_c
                             .as_ref()
@@ -238,8 +235,14 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         Stroke::new(1.0, tokens.border_input),
                         StrokeKind::Inside,
                     );
+                    if fill_resp.on_hover_text("Edit Fill Dialog (F11)").clicked() {
+                        app.open_edit_fill_dialog();
+                    }
+
+                    let (stroke_rect, stroke_resp) =
+                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
                     ui.painter().rect(
-                        r_stroke,
+                        stroke_rect,
                         CornerRadius::same(2),
                         Color32::TRANSPARENT,
                         Stroke::new(
@@ -248,12 +251,11 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         ),
                         StrokeKind::Inside,
                     );
-                    if sw_resp
-                        .on_hover_text("Active Fill & Outline (click to open Properties)")
+                    if stroke_resp
+                        .on_hover_text("Outline Pen Dialog (F12)")
                         .clicked()
                     {
-                        app.properties_state.active_tab = PropertiesSubTab::Fill;
-                        app.focus_docker(DockerTab::Properties);
+                        app.open_outline_pen_dialog();
                     }
 
                     ui.label(
@@ -453,7 +455,11 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
     egui::CentralPanel::default()
         .frame(Frame::NONE.fill(tokens.canvas_well))
         .show(ui, |ui| {
-            let total_rect = ui.available_rect_before_wrap();
+            let screen_bounds = ui
+                .ctx()
+                .input(|i| i.raw.screen_rect)
+                .unwrap_or_else(|| ui.ctx().content_rect());
+            let total_rect = ui.available_rect_before_wrap().intersect(screen_bounds);
             if total_rect.width() < 60.0 || total_rect.height() < 60.0 {
                 return;
             }
@@ -493,11 +499,26 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                 Sense::click_and_drag(),
             );
 
-            // Sync viewport size & render texture via `coree_render::DirtyTileCache`
-            // (clamped to the GPU / headless backend's `max_texture_side` so textures never panic)
-            let max_tex_side = ui.ctx().input(|i| i.max_texture_side).clamp(256, 4096) as f32;
-            let canvas_w = canvas_rect.width().round().clamp(32.0, max_tex_side) as u32;
-            let canvas_h = canvas_rect.height().round().clamp(32.0, max_tex_side) as u32;
+            // Sync native HiDPI viewport size & render texture via `coree_render::DirtyTileCache`
+            // (multiplying by `pixels_per_point()` while clamping to `max_texture_side` so 2x/4K
+            // monitors render razor-sharp vector curves without ever panicking texture limits)
+            let raw_ppp = ui.ctx().pixels_per_point().clamp(1.0, 4.0);
+            let reported_max = ui.ctx().input(|i| i.max_texture_side);
+            let max_tex_side = (if reported_max <= 256 {
+                4096
+            } else {
+                reported_max
+            })
+            .clamp(512, 8192) as f32;
+            let max_dim = canvas_rect.width().max(canvas_rect.height()).max(1.0);
+            let eff_ppp = raw_ppp.min(max_tex_side / max_dim).max(0.5);
+            let canvas_w = (canvas_rect.width() * eff_ppp)
+                .round()
+                .clamp(32.0, max_tex_side) as u32;
+            let canvas_h = (canvas_rect.height() * eff_ppp)
+                .round()
+                .clamp(32.0, max_tex_side) as u32;
+            let target_dpi = coree_core::math::DEFAULT_DPI * f64::from(eff_ppp);
 
             // Sync soft-proofing & gamut-warning options into active tab's RenderOptions
             let soft_proof = app.soft_proof_cmyk;
@@ -521,9 +542,13 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                     tab.tile_cache.mark_all_dirty();
                     tab.needs_rerender = true;
                 }
-                if tab.viewport.width_px != canvas_w || tab.viewport.height_px != canvas_h {
+                if tab.viewport.width_px != canvas_w
+                    || tab.viewport.height_px != canvas_h
+                    || (tab.viewport.dpi - target_dpi).abs() > 0.01
+                {
                     tab.viewport.width_px = canvas_w;
                     tab.viewport.height_px = canvas_h;
+                    tab.viewport.dpi = target_dpi;
                     if !tab.viewport_initialized {
                         tab.fit_active_page();
                         tab.viewport_initialized = true;
@@ -647,19 +672,31 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
         });
 }
 
+fn screen_to_viewport_local(
+    canvas_rect: Rect,
+    tab: &crate::state::DocumentTab,
+    screen: Pos2,
+) -> Point2D {
+    let sx = f64::from(tab.viewport.width_px) / f64::from(canvas_rect.width().max(1.0));
+    let sy = f64::from(tab.viewport.height_px) / f64::from(canvas_rect.height().max(1.0));
+    Point2D::new(
+        f64::from(screen.x - canvas_rect.left()) * sx,
+        f64::from(screen.y - canvas_rect.top()) * sy,
+    )
+}
+
 fn screen_to_world(canvas_rect: Rect, tab: &crate::state::DocumentTab, screen: Pos2) -> Point2D {
-    let local = Point2D::new(
-        f64::from(screen.x - canvas_rect.left()),
-        f64::from(screen.y - canvas_rect.top()),
-    );
+    let local = screen_to_viewport_local(canvas_rect, tab, screen);
     tab.viewport.screen_to_world(local)
 }
 
 fn world_to_screen(canvas_rect: Rect, tab: &crate::state::DocumentTab, world: Point2D) -> Pos2 {
     let local = tab.viewport.world_to_screen(world);
+    let sx = f64::from(tab.viewport.width_px) / f64::from(canvas_rect.width().max(1.0));
+    let sy = f64::from(tab.viewport.height_px) / f64::from(canvas_rect.height().max(1.0));
     pos2(
-        canvas_rect.left() + local.x as f32,
-        canvas_rect.top() + local.y as f32,
+        canvas_rect.left() + (local.x / sx) as f32,
+        canvas_rect.top() + (local.y / sy) as f32,
     )
 }
 
@@ -738,10 +775,7 @@ fn handle_canvas_interaction(
         let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll_y.abs() > 0.5 {
             if let Some(tab) = app.active_tab_mut() {
-                let local = Point2D::new(
-                    f64::from(hover.x - canvas_rect.left()),
-                    f64::from(hover.y - canvas_rect.top()),
-                );
+                let local = screen_to_viewport_local(canvas_rect, tab, hover);
                 let factor = if scroll_y > 0.0 { 1.12 } else { 1.0 / 1.12 };
                 tab.viewport.zoom_at_screen_point(local, factor);
                 tab.needs_rerender = true;
@@ -761,7 +795,7 @@ fn handle_canvas_interaction(
         let delta = ui.input(|i| i.pointer.delta());
         if delta.length_sq() > 0.0 {
             if let Some(tab) = app.active_tab_mut() {
-                let s = tab.viewport.px_per_mm().max(1e-4);
+                let s = tab.viewport.logical_px_per_mm().max(1e-4);
                 tab.viewport.pan_mm.x -= f64::from(delta.x) / s;
                 tab.viewport.pan_mm.y -= f64::from(delta.y) / s;
                 tab.viewport.lod_dragging = true;
@@ -796,7 +830,7 @@ fn handle_canvas_interaction(
                 | ToolId::ParagraphText => {
                     let hit_text = app.active_tab().and_then(|tab| {
                         let pt = screen_to_world(canvas_rect, tab, pos);
-                        let tol = (6.0 / tab.viewport.px_per_mm()).max(1.2);
+                        let tol = (6.0 / tab.viewport.logical_px_per_mm()).max(1.2);
                         let oid = app.hit_test_canvas_point(pt, tol)?;
                         let obj = tab.document.objects.get(&oid)?;
                         if matches!(
@@ -943,7 +977,7 @@ fn handle_canvas_interaction(
                 ToolId::Pick | ToolId::FreehandPick | ToolId::FreeTransform => {
                     let pt_tol = app.active_tab().map(|tab| {
                         let pt = screen_to_world(canvas_rect, tab, pos);
-                        let tol = (6.0 / tab.viewport.px_per_mm()).max(0.8);
+                        let tol = (6.0 / tab.viewport.logical_px_per_mm()).max(0.8);
                         (pt, tol)
                     });
                     if let Some((pt, tol)) = pt_tol {
@@ -960,10 +994,7 @@ fn handle_canvas_interaction(
                 }
                 ToolId::Zoom => {
                     if let Some(tab) = app.active_tab_mut() {
-                        let local = Point2D::new(
-                            f64::from(pos.x - canvas_rect.left()),
-                            f64::from(pos.y - canvas_rect.top()),
-                        );
+                        let local = screen_to_viewport_local(canvas_rect, tab, pos);
                         let factor = if shift { 1.0 / 1.5 } else { 1.5 };
                         tab.viewport.zoom_at_screen_point(local, factor);
                         tab.needs_rerender = true;
@@ -973,7 +1004,7 @@ fn handle_canvas_interaction(
                 ToolId::ArtisticText => {
                     let info = app.active_tab().map(|t| {
                         let pt = screen_to_world(canvas_rect, t, pos);
-                        let tol = (6.0 / t.viewport.px_per_mm()).max(1.2);
+                        let tol = (6.0 / t.viewport.logical_px_per_mm()).max(1.2);
                         let existing_text = app.hit_test_canvas_point(pt, tol).filter(|oid| {
                             t.document.objects.get(oid).is_some_and(|o| {
                                 matches!(
@@ -991,7 +1022,7 @@ fn handle_canvas_interaction(
                 ToolId::ParagraphText => {
                     let info = app.active_tab().map(|t| {
                         let pt = screen_to_world(canvas_rect, t, pos);
-                        let tol = (6.0 / t.viewport.px_per_mm()).max(1.2);
+                        let tol = (6.0 / t.viewport.logical_px_per_mm()).max(1.2);
                         let existing_text = app.hit_test_canvas_point(pt, tol).filter(|oid| {
                             t.document.objects.get(oid).is_some_and(|o| {
                                 matches!(
@@ -1113,7 +1144,7 @@ fn handle_canvas_interaction(
                 ToolId::ShapeNode => {
                     let pt_tol = app.active_tab().map(|tab| {
                         let pt = screen_to_world(canvas_rect, tab, pos);
-                        let tol = (8.0 / tab.viewport.px_per_mm()).max(1.5);
+                        let tol = (8.0 / tab.viewport.logical_px_per_mm()).max(1.5);
                         (pt, tol)
                     });
                     if let Some((pt, tol)) = pt_tol {
@@ -1225,10 +1256,7 @@ fn handle_canvas_interaction(
     if resp.secondary_clicked() && active_tool == ToolId::Zoom {
         if let Some(pos) = resp.interact_pointer_pos() {
             if let Some(tab) = app.active_tab_mut() {
-                let local = Point2D::new(
-                    f64::from(pos.x - canvas_rect.left()),
-                    f64::from(pos.y - canvas_rect.top()),
-                );
+                let local = screen_to_viewport_local(canvas_rect, tab, pos);
                 tab.viewport.zoom_at_screen_point(local, 1.0 / 1.5);
                 tab.needs_rerender = true;
             }
@@ -1318,7 +1346,7 @@ fn start_canvas_drag(
         return;
     };
     let pt = screen_to_world(canvas_rect, tab, screen_pos);
-    let tol_mm = (7.0 / tab.viewport.px_per_mm()).max(1.2);
+    let tol_mm = (7.0 / tab.viewport.logical_px_per_mm()).max(1.2);
 
     match tool {
         ToolId::Pan => {
@@ -1454,6 +1482,7 @@ fn start_canvas_drag(
                 });
 
             if let Some(hit_id) = hit {
+                tab.selected_guide_id = None;
                 if !tab.selection.contains(hit_id) {
                     if shift {
                         tab.selection.toggle_object(&tab.document, hit_id);
@@ -1468,7 +1497,19 @@ fn start_canvas_drag(
                     accum_dy: 0.0,
                 };
                 tab.viewport.lod_dragging = true;
+            } else if let Some((guide_id, orig_orientation, locked)) =
+                hit_test_canvas_guide(&tab.document, pt, tol_mm.max(1.8))
+            {
+                tab.selection.clear();
+                tab.selected_guide_id = Some(guide_id);
+                if !locked {
+                    tab.drag_state = CanvasDragState::DraggingCanvasGuide {
+                        guide_id,
+                        orig_orientation,
+                    };
+                }
             } else {
+                tab.selected_guide_id = None;
                 // 3. Empty pasteboard -> Marquee rubber-band selection
                 tab.drag_state = CanvasDragState::MarqueeSelect {
                     start_mm: pt,
@@ -1639,33 +1680,160 @@ fn start_canvas_drag(
             if let Some(&oid) = tab.selection.objects.first() {
                 if is_object_editable_in_doc(&tab.document, oid) {
                     if let Some(obj) = tab.document.objects.get(&oid) {
-                        if let Fill::LinearGradient { start, end, .. } = &obj.fill {
-                            let s_pos = world_to_screen(
-                                canvas_rect,
-                                tab,
-                                obj.transform.transform_point(*start),
-                            );
-                            let e_pos = world_to_screen(
-                                canvas_rect,
-                                tab,
-                                obj.transform.transform_point(*end),
-                            );
-                            if s_pos.distance(screen_pos) <= 10.0 {
-                                tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                    object_id: oid,
-                                    is_end: false,
-                                    orig_fill: obj.fill.clone(),
-                                };
-                                return;
+                        match &obj.fill {
+                            Fill::LinearGradient { start, end, stops } => {
+                                let s_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(*start),
+                                );
+                                let e_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(*end),
+                                );
+                                if s_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: false,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                                if e_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: true,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                                // Check intermediate stops along `[start..end]`
+                                for (s_idx, st) in stops.iter().enumerate() {
+                                    if s_idx == 0 || s_idx + 1 == stops.len() {
+                                        continue;
+                                    }
+                                    let t = f64::from(st.offset);
+                                    let w_pt = obj.transform.transform_point(Point2D::new(
+                                        start.x + (end.x - start.x) * t,
+                                        start.y + (end.y - start.y) * t,
+                                    ));
+                                    if world_to_screen(canvas_rect, tab, w_pt).distance(screen_pos)
+                                        <= 9.0
+                                    {
+                                        tab.drag_state = CanvasDragState::DraggingGradientStop {
+                                            object_id: oid,
+                                            stop_index: s_idx,
+                                            orig_fill: obj.fill.clone(),
+                                        };
+                                        return;
+                                    }
+                                }
                             }
-                            if e_pos.distance(screen_pos) <= 10.0 {
-                                tab.drag_state = CanvasDragState::DraggingGradientHandle {
-                                    object_id: oid,
-                                    is_end: true,
-                                    orig_fill: obj.fill.clone(),
-                                };
-                                return;
+                            Fill::RadialGradient { center, radius, .. } => {
+                                let c_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(*center),
+                                );
+                                let r_pt = Point2D::new(center.x + radius.max(1.0), center.y);
+                                let r_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(r_pt),
+                                );
+                                if c_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: false,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                                if r_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: true,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
                             }
+                            Fill::ConicalGradient {
+                                center, angle_deg, ..
+                            } => {
+                                let c_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(*center),
+                                );
+                                let rad = angle_deg.to_radians();
+                                let a_pt = Point2D::new(
+                                    center.x + 25.0 * rad.cos(),
+                                    center.y + 25.0 * rad.sin(),
+                                );
+                                let a_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(a_pt),
+                                );
+                                if c_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: false,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                                if a_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: true,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                            }
+                            Fill::SquareGradient {
+                                center,
+                                size,
+                                angle_deg,
+                                ..
+                            } => {
+                                let c_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(*center),
+                                );
+                                let rad = angle_deg.to_radians();
+                                let half = (size.max(2.0)) * 0.5;
+                                let e_pt = Point2D::new(
+                                    center.x + half * rad.cos(),
+                                    center.y + half * rad.sin(),
+                                );
+                                let e_pos = world_to_screen(
+                                    canvas_rect,
+                                    tab,
+                                    obj.transform.transform_point(e_pt),
+                                );
+                                if c_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: false,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                                if e_pos.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingGradientHandle {
+                                        object_id: oid,
+                                        is_end: true,
+                                        orig_fill: obj.fill.clone(),
+                                    };
+                                    return;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1789,6 +1957,29 @@ fn start_canvas_drag(
         | ToolId::Blend
         | ToolId::Distort
         | ToolId::Extrude25D => {
+            // Check persistent interactive effect handles on active selected object first!
+            if let Some(&oid) = tab.selection.objects.first() {
+                if is_object_editable_in_doc(&tab.document, oid) {
+                    if let Some(obj) = tab.document.objects.get(&oid) {
+                        for (eff_idx, eff) in obj.effects.iter().enumerate() {
+                            if let Some((_anchor, knob_world)) =
+                                interactive_effect_handle_points(&tab.document, obj, eff, tool)
+                            {
+                                let kp = world_to_screen(canvas_rect, tab, knob_world);
+                                if kp.distance(screen_pos) <= 10.0 {
+                                    tab.drag_state = CanvasDragState::DraggingEffectHandle {
+                                        object_id: oid,
+                                        effect_index: eff_idx,
+                                        orig_effect: eff.clone(),
+                                    };
+                                    tab.viewport.lod_dragging = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let target = if !tab.selection.objects.is_empty() {
                 tab.selection
                     .objects
@@ -1896,7 +2087,7 @@ fn update_canvas_drag(
             start_screen,
             orig_pan_mm,
         } => {
-            let s = tab.viewport.px_per_mm().max(1e-4);
+            let s = tab.viewport.logical_px_per_mm().max(1e-4);
             let dx_px = f64::from(screen_pos.x - start_screen[0]);
             let dy_px = f64::from(screen_pos.y - start_screen[1]);
             tab.viewport.pan_mm =
@@ -2242,11 +2433,78 @@ fn update_canvas_drag(
                 if let Some(obj) = tab.document.objects.get_mut(object_id) {
                     let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
                     let local_pt = inv.transform_point(pt);
-                    if let Fill::LinearGradient { start, end, .. } = &mut obj.fill {
-                        if *is_end {
-                            *end = local_pt;
-                        } else {
-                            *start = local_pt;
+                    match &mut obj.fill {
+                        Fill::LinearGradient { start, end, .. } => {
+                            if *is_end {
+                                *end = local_pt;
+                            } else {
+                                *start = local_pt;
+                            }
+                        }
+                        Fill::RadialGradient {
+                            center,
+                            radius,
+                            focal,
+                            ..
+                        } => {
+                            if *is_end {
+                                *radius = center.distance_to(local_pt).max(0.5);
+                            } else {
+                                let delta = local_pt - *center;
+                                *center = local_pt;
+                                *focal = *focal + delta;
+                            }
+                        }
+                        Fill::ConicalGradient {
+                            center, angle_deg, ..
+                        } => {
+                            if *is_end {
+                                let d = local_pt - *center;
+                                if d.length() > 1e-3 {
+                                    *angle_deg = d.y.atan2(d.x).to_degrees();
+                                }
+                            } else {
+                                *center = local_pt;
+                            }
+                        }
+                        Fill::SquareGradient {
+                            center,
+                            size,
+                            angle_deg,
+                            ..
+                        } => {
+                            if *is_end {
+                                let d = local_pt - *center;
+                                *size = (d.length() * 2.0).max(1.0);
+                                if d.length() > 1e-3 {
+                                    *angle_deg = d.y.atan2(d.x).to_degrees();
+                                }
+                            } else {
+                                *center = local_pt;
+                            }
+                        }
+                        _ => {}
+                    }
+                    tab.tile_cache.mark_all_dirty();
+                    tab.needs_rerender = true;
+                }
+            }
+        }
+        CanvasDragState::DraggingGradientStop {
+            object_id,
+            stop_index,
+            ..
+        } => {
+            if is_object_editable_in_doc(&tab.document, *object_id) {
+                if let Some(obj) = tab.document.objects.get_mut(object_id) {
+                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let local_pt = inv.transform_point(pt);
+                    if let Fill::LinearGradient { start, end, stops } = &mut obj.fill {
+                        let v = *end - *start;
+                        let len_sq = v.length_sq().max(1e-6);
+                        let t = ((local_pt - *start).dot(v) / len_sq).clamp(0.01, 0.99) as f32;
+                        if let Some(st) = stops.get_mut(*stop_index) {
+                            st.offset = t;
                         }
                         tab.tile_cache.mark_all_dirty();
                         tab.needs_rerender = true;
@@ -2317,6 +2575,65 @@ fn update_canvas_drag(
                             tab.needs_rerender = true;
                         }
                     }
+                }
+            }
+        }
+        CanvasDragState::DraggingEffectHandle {
+            object_id,
+            effect_index,
+            ..
+        } => {
+            if is_object_editable_in_doc(&tab.document, *object_id) {
+                let obj_center = tab
+                    .document
+                    .object_bounds(*object_id)
+                    .map_or(Point2D::ZERO, |b| b.center());
+                if let Some(obj) = tab.document.objects.get_mut(object_id) {
+                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let local_pt = inv.transform_point(pt);
+                    if let Some(eff) = obj.effects.get_mut(*effect_index) {
+                        match eff {
+                            Effect::DropShadow { dx_mm, dy_mm, .. }
+                            | Effect::BlockShadow { dx_mm, dy_mm, .. } => {
+                                *dx_mm = (pt.x - obj_center.x).clamp(-150.0, 150.0);
+                                *dy_mm = (pt.y - obj_center.y).clamp(-150.0, 150.0);
+                            }
+                            Effect::Contour { offset_mm, .. } => {
+                                *offset_mm = obj_center.distance_to(pt).clamp(0.2, 60.0);
+                            }
+                            Effect::Extrude25D {
+                                vanishing_point, ..
+                            } => {
+                                *vanishing_point = pt;
+                            }
+                            Effect::Distort {
+                                amplitude, center, ..
+                            } => {
+                                *amplitude = center.distance_to(local_pt).clamp(0.5, 40.0);
+                            }
+                            Effect::Blend { rotation_deg, .. } => {
+                                let d = pt - obj_center;
+                                if d.length() > 1e-3 {
+                                    *rotation_deg = d.y.atan2(d.x).to_degrees();
+                                }
+                            }
+                            _ => {}
+                        }
+                        tab.tile_cache.mark_all_dirty();
+                        tab.needs_rerender = true;
+                    }
+                }
+            }
+        }
+        CanvasDragState::DraggingCanvasGuide { guide_id, .. } => {
+            if let Some(g) = tab.document.guides.iter_mut().find(|g| g.id == *guide_id) {
+                if !g.locked {
+                    match &mut g.orientation {
+                        GuideOrientation::Horizontal(y) => *y = pt.y,
+                        GuideOrientation::Vertical(x) => *x = pt.x,
+                        GuideOrientation::Angled { origin, .. } => *origin = pt,
+                    }
+                    tab.needs_rerender = true;
                 }
             }
         }
@@ -2580,6 +2897,11 @@ fn finish_canvas_drag(app: &mut StudioApp, active_tool: ToolId, ctrl: bool, shif
             orig_fill,
             ..
         }
+        | CanvasDragState::DraggingGradientStop {
+            object_id,
+            orig_fill,
+            ..
+        }
         | CanvasDragState::DraggingMeshNode {
             object_id,
             orig_fill,
@@ -2609,6 +2931,11 @@ fn finish_canvas_drag(app: &mut StudioApp, active_tool: ToolId, ctrl: bool, shif
             effect_index,
             orig_effect,
             ..
+        }
+        | CanvasDragState::DraggingEffectHandle {
+            object_id,
+            effect_index,
+            orig_effect,
         } => {
             let final_eff = app.active_tab_mut().and_then(|tab| {
                 let obj = tab.document.objects.get_mut(&object_id)?;
@@ -2619,6 +2946,25 @@ fn finish_canvas_drag(app: &mut StudioApp, active_tool: ToolId, ctrl: bool, shif
             });
             if let Some(eff) = final_eff {
                 app.replace_effect_on_object(object_id, Some(effect_index), eff);
+            }
+        }
+        CanvasDragState::DraggingCanvasGuide {
+            guide_id,
+            orig_orientation,
+        } => {
+            let final_ori = app.active_tab_mut().and_then(|tab| {
+                let g = tab.document.guides.iter_mut().find(|g| g.id == guide_id)?;
+                let edited = g.orientation;
+                g.orientation = orig_orientation;
+                Some(edited)
+            });
+            if let Some(orientation) = final_ori {
+                if orientation != orig_orientation {
+                    let _ = app.execute_command(CommandOp::MoveGuide {
+                        id: guide_id,
+                        orientation,
+                    });
+                }
             }
         }
         CanvasDragState::DraggingInteractiveEffect {
@@ -3404,8 +3750,8 @@ fn show_inline_text_editor_overlay(ui: &egui::Ui, app: &mut StudioApp, canvas_re
     let editor_geom = app.active_tab().and_then(|tab| {
         let edit = tab.inline_text_edit.as_ref()?;
         let pos = world_to_screen(canvas_rect, tab, edit.world_pos_mm);
-        let raw_w = (edit.box_size_mm.x * tab.viewport.px_per_mm()) as f32;
-        let raw_h = (edit.box_size_mm.y * tab.viewport.px_per_mm()) as f32;
+        let raw_w = (edit.box_size_mm.x * tab.viewport.logical_px_per_mm()) as f32;
+        let raw_h = (edit.box_size_mm.y * tab.viewport.logical_px_per_mm()) as f32;
         let w_px = if raw_w.is_finite() { raw_w } else { 180.0 };
         let h_px = if raw_h.is_finite() { raw_h } else { 48.0 };
         let avail_w = (canvas_rect.width() - 24.0).max(24.0);
@@ -3761,23 +4107,212 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
         }
     }
 
-    // 4. Interactive Fill, Transparency, Envelope 8-Point Cage, and MeshFill Overlays
+    // 3b. Selected Canvas Guide Highlight & Delete cue
+    if let Some(sel_gid) = tab.selected_guide_id {
+        if let Some(g) = tab.document.guides.iter().find(|g| g.id == sel_gid) {
+            let guide_stroke = Stroke::new(1.6, tokens.danger);
+            match g.orientation {
+                GuideOrientation::Horizontal(y_mm) => {
+                    let sy = world_to_screen(canvas_rect, tab, Point2D::new(0.0, y_mm)).y;
+                    if sy >= canvas_rect.top() && sy <= canvas_rect.bottom() {
+                        painter.line_segment(
+                            [pos2(canvas_rect.left(), sy), pos2(canvas_rect.right(), sy)],
+                            guide_stroke,
+                        );
+                        painter.rect_filled(
+                            Rect::from_center_size(
+                                pos2(canvas_rect.left() + 8.0, sy),
+                                vec2(8.0, 8.0),
+                            ),
+                            CornerRadius::same(1),
+                            tokens.danger,
+                        );
+                    }
+                }
+                GuideOrientation::Vertical(x_mm) => {
+                    let sx = world_to_screen(canvas_rect, tab, Point2D::new(x_mm, 0.0)).x;
+                    if sx >= canvas_rect.left() && sx <= canvas_rect.right() {
+                        painter.line_segment(
+                            [pos2(sx, canvas_rect.top()), pos2(sx, canvas_rect.bottom())],
+                            guide_stroke,
+                        );
+                        painter.rect_filled(
+                            Rect::from_center_size(
+                                pos2(sx, canvas_rect.top() + 8.0),
+                                vec2(8.0, 8.0),
+                            ),
+                            CornerRadius::same(1),
+                            tokens.danger,
+                        );
+                    }
+                }
+                GuideOrientation::Angled { origin, angle_deg } => {
+                    let rad = angle_deg.to_radians();
+                    let p0 = world_to_screen(canvas_rect, tab, origin);
+                    let dir = vec2(rad.cos() as f32, rad.sin() as f32) * 2000.0;
+                    painter.line_segment([p0 - dir, p0 + dir], guide_stroke);
+                }
+            }
+        }
+    }
+
+    // 4. Interactive Fill (all 4 types + mid-stops), Transparency, Persistent Effect Handles, Envelope & Mesh Overlays
     if let Some(&oid) = tab.selection.objects.first() {
         if let Some(obj) = tab.document.objects.get(&oid) {
             if app.active_tool == ToolId::InteractiveFill {
-                if let Fill::LinearGradient { start, end, .. } = &obj.fill {
-                    let a =
-                        world_to_screen(canvas_rect, tab, obj.transform.transform_point(*start));
-                    let b = world_to_screen(canvas_rect, tab, obj.transform.transform_point(*end));
-                    painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
-                    painter.rect(
-                        Rect::from_center_size(a, vec2(9.0, 9.0)),
-                        CornerRadius::same(2),
-                        Color32::WHITE,
-                        Stroke::new(2.0, tokens.accent),
-                        StrokeKind::Inside,
-                    );
-                    painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
+                match &obj.fill {
+                    Fill::LinearGradient { start, end, stops } => {
+                        let a = world_to_screen(
+                            canvas_rect,
+                            tab,
+                            obj.transform.transform_point(*start),
+                        );
+                        let b =
+                            world_to_screen(canvas_rect, tab, obj.transform.transform_point(*end));
+                        painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
+                        for (s_idx, st) in stops.iter().enumerate() {
+                            if s_idx == 0 || s_idx + 1 == stops.len() {
+                                continue;
+                            }
+                            let t = f64::from(st.offset);
+                            let w_pt = obj.transform.transform_point(Point2D::new(
+                                start.x + (end.x - start.x) * t,
+                                start.y + (end.y - start.y) * t,
+                            ));
+                            let sp = world_to_screen(canvas_rect, tab, w_pt);
+                            painter.rect(
+                                Rect::from_center_size(sp, vec2(8.0, 8.0)),
+                                CornerRadius::same(1),
+                                core_color_to_egui(&st.color),
+                                Stroke::new(1.5, Color32::WHITE),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        painter.rect(
+                            Rect::from_center_size(a, vec2(9.0, 9.0)),
+                            CornerRadius::same(2),
+                            Color32::WHITE,
+                            Stroke::new(2.0, tokens.accent),
+                            StrokeKind::Inside,
+                        );
+                        painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
+                    }
+                    Fill::RadialGradient { center, radius, .. } => {
+                        let a = world_to_screen(
+                            canvas_rect,
+                            tab,
+                            obj.transform.transform_point(*center),
+                        );
+                        let r_pt = Point2D::new(center.x + radius.max(1.0), center.y);
+                        let b =
+                            world_to_screen(canvas_rect, tab, obj.transform.transform_point(r_pt));
+                        let r_px = a.distance(b).max(2.0);
+                        painter.circle_stroke(a, r_px, Stroke::new(1.2, tokens.accent));
+                        painter.line_segment([a, b], Stroke::new(1.8, tokens.accent));
+                        painter.rect(
+                            Rect::from_center_size(a, vec2(9.0, 9.0)),
+                            CornerRadius::same(2),
+                            Color32::WHITE,
+                            Stroke::new(2.0, tokens.accent),
+                            StrokeKind::Inside,
+                        );
+                        painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
+                    }
+                    Fill::ConicalGradient {
+                        center, angle_deg, ..
+                    } => {
+                        let a = world_to_screen(
+                            canvas_rect,
+                            tab,
+                            obj.transform.transform_point(*center),
+                        );
+                        let rad = angle_deg.to_radians();
+                        let e_pt =
+                            Point2D::new(center.x + 25.0 * rad.cos(), center.y + 25.0 * rad.sin());
+                        let b =
+                            world_to_screen(canvas_rect, tab, obj.transform.transform_point(e_pt));
+                        painter.circle_stroke(
+                            a,
+                            a.distance(b).max(16.0),
+                            Stroke::new(1.2, tokens.accent),
+                        );
+                        painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
+                        painter.rect(
+                            Rect::from_center_size(a, vec2(9.0, 9.0)),
+                            CornerRadius::same(2),
+                            Color32::WHITE,
+                            Stroke::new(2.0, tokens.accent),
+                            StrokeKind::Inside,
+                        );
+                        painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
+                    }
+                    Fill::SquareGradient {
+                        center,
+                        size,
+                        angle_deg,
+                        ..
+                    } => {
+                        let a = world_to_screen(
+                            canvas_rect,
+                            tab,
+                            obj.transform.transform_point(*center),
+                        );
+                        let rad = angle_deg.to_radians();
+                        let half = size.max(2.0) * 0.5;
+                        let e_pt =
+                            Point2D::new(center.x + half * rad.cos(), center.y + half * rad.sin());
+                        let b =
+                            world_to_screen(canvas_rect, tab, obj.transform.transform_point(e_pt));
+                        painter.line_segment([a, b], Stroke::new(2.0, tokens.accent));
+                        painter.rect(
+                            Rect::from_center_size(a, vec2(9.0, 9.0)),
+                            CornerRadius::same(2),
+                            Color32::WHITE,
+                            Stroke::new(2.0, tokens.accent),
+                            StrokeKind::Inside,
+                        );
+                        painter.circle(b, 5.0, tokens.accent, Stroke::new(1.5, Color32::WHITE));
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(
+                app.active_tool,
+                ToolId::DropShadow
+                    | ToolId::BlockShadow
+                    | ToolId::Contour
+                    | ToolId::Extrude25D
+                    | ToolId::Blend
+                    | ToolId::Distort
+            ) {
+                for eff in &obj.effects {
+                    if let Some((anchor_w, knob_w)) =
+                        interactive_effect_handle_points(&tab.document, obj, eff, app.active_tool)
+                    {
+                        let sa = world_to_screen(canvas_rect, tab, anchor_w);
+                        let sb = world_to_screen(canvas_rect, tab, knob_w);
+                        paint_dashed_line(
+                            &painter,
+                            sa,
+                            sb,
+                            5.0,
+                            3.0,
+                            Stroke::new(1.5, tokens.accent_secondary),
+                        );
+                        painter.rect(
+                            Rect::from_center_size(sa, vec2(7.0, 7.0)),
+                            CornerRadius::same(1),
+                            Color32::WHITE,
+                            Stroke::new(1.5, tokens.accent_secondary),
+                            StrokeKind::Inside,
+                        );
+                        painter.circle(
+                            sb,
+                            5.5,
+                            tokens.accent_secondary,
+                            Stroke::new(1.5, Color32::WHITE),
+                        );
+                    }
                 }
             }
             if app.active_tool == ToolId::Transparency {
@@ -4268,12 +4803,12 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                 | ToolId::Smear
                 | ToolId::Twirl
                 | ToolId::AttractRepel
-                | ToolId::Roughen => {
-                    Some((app.tool_settings.sculpt_radius_mm * tab.viewport.px_per_mm()) as f32)
-                }
-                ToolId::Eraser => {
-                    Some((app.tool_settings.eraser_radius_mm * tab.viewport.px_per_mm()) as f32)
-                }
+                | ToolId::Roughen => Some(
+                    (app.tool_settings.sculpt_radius_mm * tab.viewport.logical_px_per_mm()) as f32,
+                ),
+                ToolId::Eraser => Some(
+                    (app.tool_settings.eraser_radius_mm * tab.viewport.logical_px_per_mm()) as f32,
+                ),
                 ToolId::BitmapBrush
                 | ToolId::BitmapEraser
                 | ToolId::CloneStamp
@@ -4375,7 +4910,7 @@ fn paint_rulers(
         tokens.text_muted,
     );
 
-    let px_per_mm = tab.viewport.px_per_mm().max(0.05);
+    let px_per_mm = tab.viewport.logical_px_per_mm().max(0.05);
     // Choose a clean human tick step in mm based on current zoom
     let step_mm = if px_per_mm >= 8.0 {
         5.0
@@ -4478,5 +5013,73 @@ fn paint_toasts(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
         );
         painter.galley(rect.left_top() + vec2(10.0, 5.0), galley, tokens.text);
         y += box_h + 6.0;
+    }
+}
+
+fn hit_test_canvas_guide(
+    doc: &coree_core::Document,
+    pt_mm: Point2D,
+    tol_mm: f64,
+) -> Option<(u64, GuideOrientation, bool)> {
+    for g in doc.guides.iter().rev() {
+        let hit = match g.orientation {
+            GuideOrientation::Horizontal(y_mm) => (pt_mm.y - y_mm).abs() <= tol_mm,
+            GuideOrientation::Vertical(x_mm) => (pt_mm.x - x_mm).abs() <= tol_mm,
+            GuideOrientation::Angled { origin, angle_deg } => {
+                let rad = angle_deg.to_radians();
+                let nx = -rad.sin();
+                let ny = rad.cos();
+                let dist = ((pt_mm.x - origin.x) * nx + (pt_mm.y - origin.y) * ny).abs();
+                dist <= tol_mm
+            }
+        };
+        if hit {
+            return Some((g.id, g.orientation, g.locked));
+        }
+    }
+    None
+}
+
+fn interactive_effect_handle_points(
+    doc: &coree_core::Document,
+    obj: &SceneObject,
+    eff: &Effect,
+    tool: ToolId,
+) -> Option<(Point2D, Point2D)> {
+    let center = doc
+        .object_bounds(obj.id)
+        .map_or(Point2D::ZERO, |b| b.center());
+    match (tool, eff) {
+        (ToolId::DropShadow, Effect::DropShadow { dx_mm, dy_mm, .. })
+        | (ToolId::BlockShadow, Effect::BlockShadow { dx_mm, dy_mm, .. }) => {
+            Some((center, Point2D::new(center.x + *dx_mm, center.y + *dy_mm)))
+        }
+        (ToolId::Contour, Effect::Contour { offset_mm, .. }) => {
+            Some((center, Point2D::new(center.x + *offset_mm, center.y)))
+        }
+        (
+            ToolId::Extrude25D,
+            Effect::Extrude25D {
+                vanishing_point, ..
+            },
+        ) => Some((center, *vanishing_point)),
+        (
+            ToolId::Distort,
+            Effect::Distort {
+                amplitude,
+                center: lc,
+                ..
+            },
+        ) => {
+            let wc = obj.transform.transform_point(*lc);
+            Some((wc, Point2D::new(wc.x + *amplitude, wc.y)))
+        }
+        (ToolId::Blend, Effect::Blend { target_id, .. }) => {
+            let target_c = doc
+                .object_bounds(*target_id)
+                .map_or(Point2D::new(center.x + 20.0, center.y), |b| b.center());
+            Some((center, target_c))
+        }
+        _ => None,
     }
 }

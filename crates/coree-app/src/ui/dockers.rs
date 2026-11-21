@@ -322,6 +322,16 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                 })
                 .unwrap_or_else(|| app.default_fill.clone());
 
+            if ui
+                .button(
+                    app.ui_language
+                        .tr("Edit Fill Dialog (F11)...", "مربع حوار التعبئة (F11)..."),
+                )
+                .clicked()
+            {
+                app.open_edit_fill_dialog();
+            }
+
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .selectable_label(matches!(cur_fill, Fill::None), "None")
@@ -645,6 +655,15 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         }
         PropertiesSubTab::Outline => {
+            if ui
+                .button(
+                    app.ui_language
+                        .tr("Outline Pen Dialog (F12)...", "مربع قلم الحدود (F12)..."),
+                )
+                .clicked()
+            {
+                app.open_outline_pen_dialog();
+            }
             let mut outline = sel_id
                 .and_then(|id| {
                     app.active_tab()?

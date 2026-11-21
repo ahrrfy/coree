@@ -86,6 +86,14 @@ impl Viewport {
         z * d / MM_PER_INCH
     }
 
+    /// Logical UI points per canonical world millimeter at base `DEFAULT_DPI` (`96 DPI`).
+    /// Use for logical UI hit tolerances, pan deltas, and overlay strokes on HiDPI displays.
+    #[must_use]
+    pub fn logical_px_per_mm(&self) -> f64 {
+        let z = sanitize_f64(self.zoom, 1.0).clamp(0.01, 256.0);
+        z * DEFAULT_DPI / MM_PER_INCH
+    }
+
     /// Affine transform mapping canonical world millimeters -> viewport screen pixels.
     #[must_use]
     pub fn world_to_screen_transform(&self) -> Affine2D {
