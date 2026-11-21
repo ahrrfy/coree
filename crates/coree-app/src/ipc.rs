@@ -285,12 +285,12 @@ mod tests {
     fn ipc_single_instance_handoff_and_stale_cleanup_work() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_path = dir.path().join("instance.lock");
+        let pending_file = dir.path().join("تصميم").join("card.cdr");
+        let arabic_cdr = dir.path().join("شعار").join("poster.cdr");
+        let native_file = dir.path().join("badge.coree");
 
         // No lockfile yet -> handoff returns false.
-        assert!(!try_handoff_at(
-            &lock_path,
-            &[PathBuf::from("/tmp/تصميم/card.cdr")]
-        ));
+        assert!(!try_handoff_at(&lock_path, &[pending_file]));
 
         {
             let server = IpcServer::bind_at(&lock_path).expect("bind IPC server");
@@ -298,24 +298,12 @@ mod tests {
             assert!(lock_path.exists());
 
             // Handoff with Arabic UTF-8 filename delivers paths to server and acknowledges.
-            let handed = try_handoff_at(
-                &lock_path,
-                &[
-                    PathBuf::from("/tmp/شعار/poster.cdr"),
-                    PathBuf::from("/tmp/badge.coree"),
-                ],
-            );
+            let handed = try_handoff_at(&lock_path, &[arabic_cdr.clone(), native_file.clone()]);
             assert!(handed, "live IPC server must acknowledge handoff");
 
             let batches = server.try_recv_batches();
             assert_eq!(batches.len(), 1);
-            assert_eq!(
-                batches[0],
-                vec![
-                    PathBuf::from("/tmp/شعار/poster.cdr"),
-                    PathBuf::from("/tmp/badge.coree"),
-                ]
-            );
+            assert_eq!(batches[0], vec![arabic_cdr, native_file]);
 
             // Empty-file focus ping also hands off cleanly.
             assert!(try_handoff_at(&lock_path, &[]));
