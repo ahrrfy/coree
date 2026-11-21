@@ -1,0 +1,31 @@
+[package]
+name = "coree-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native cross-platform desktop UI binary for coree."
+
+[[bin]]
+name = "coree"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+coree-cdr.workspace = true
+coree-core.workspace = true
+coree-io.workspace = true
+coree-prod.workspace = true
+coree-render.workspace = true
+coree-storage.workspace = true
+dirs.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_dock.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

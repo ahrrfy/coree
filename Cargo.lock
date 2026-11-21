@@ -601,18 +601,17 @@ dependencies = [
 name = "coree-io"
 version = "0.1.0"
 dependencies = [
- "coree-cdr",
+ "chrono",
  "coree-core",
- "encoding_rs",
  "flate2",
  "image",
- "resvg",
+ "kurbo",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "tiny-skia",
  "usvg",
+ "uuid",
  "zip",
 ]
 
@@ -622,11 +621,16 @@ version = "0.1.0"
 dependencies = [
  "coree-core",
  "i_overlay",
+ "image",
  "kurbo",
  "qrcode",
+ "rayon",
+ "rhai",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia",
 ]
 
 [[package]]
@@ -652,6 +656,7 @@ dependencies = [
  "chrono",
  "coree-core",
  "dirs",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
