@@ -1,0 +1,34 @@
+{
+  "_about": "Rebrand sweep configuration for coree. Used with replica-brand/sweep.py to ensure zero leftover Corel brand names, domains, or signature green hex colors leak into coree's shipped source code or assets.",
+  "brand": "coree",
+  "avoid": [
+    "CorelDRAW",
+    "Corel DRAW",
+    "Corel Corporation",
+    "Alludo",
+    "PHOTO-PAINT",
+    "PowerTRACE",
+    "Corel Font Manager",
+    "Corel CAPTURE",
+    "Corel Cloud",
+    "CorelDRAW.app",
+    "Corel"
+  ],
+  "domains": [
+    "corel.com",
+    "coreldraw.com",
+    "alludo.com",
+    "corel.net",
+    "product.corel.com",
+    "learn.corel.com",
+    "community.coreldraw.com"
+  ],
+  "colors": [
+    "#009c4a",
+    "#00a651",
+    "#00843d",
+    "#1b8e3e",
+    "#4eb848",
+    "#009944"
+  ]
+}

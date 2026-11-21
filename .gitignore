@@ -1,0 +1,21 @@
+# Rust / Cargo build outputs
+/target
+**/*.rs.bk
+*.pdb
+
+# OS & Editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Workspace & tooling scratch directories
+.superpowers/
+
+# Generated visual diff & capture artifacts
+replica/screens/
+replica/clone-screens/
+replica/diffs/

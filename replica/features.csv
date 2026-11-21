@@ -1,0 +1,103 @@
+feature,area,priority,original,clone,notes
+Multi-document tabbed workspace with Welcome screen and recent files,workspace,must,yes,no,S01 S02
+Customizable Toolbox flyouts context-sensitive Property Bar and Status Bar,workspace,must,yes,no,S02
+Rearrangeable Dockers (Objects Properties Color Styles Transform Align Shaping Lens Symbols Scripts),workspace,must,yes,no,S02 S05 S06 S07
+Interactive Rulers with movable origin Guidelines Dynamic Guides and Document Grids,workspace,must,yes,no,S02
+Canvas View Modes (Enhanced Normal Wireframe Simple Wireframe Pixels Simulate Overprints),workspace,must,yes,no,S02
+Workspace layout presets and customizable keyboard shortcuts,workspace,should,yes,no,S18
+Multi-page document engine with independent page sizes orientations and bleed,pages,must,yes,no,S02 S03
+Multipage View (Grid Vertical Horizontal Freeform page arrangement and drag reorder),pages,must,yes,no,S03
+Master Layers (All Pages Odd Pages Even Pages) and automatic Page Numbering,pages,must,yes,no,S03 S05
+Facing pages booklet layout and Autofit Page to content,pages,should,yes,no,S03
+Document Templates (.cdt) and printable Page Background settings,pages,should,yes,no,S01 S03
+Pick Freehand Pick and Free Transform tools (move scale rotate skew mirror pivot),selection,must,yes,no,S02
+Zoom and Pan tool (marquee zoom fit page selection 1:1 Navigator popup),selection,must,yes,no,S02
+Find and Replace Objects (by fill stroke type font color model),selection,should,yes,no,S02
+Shape Tool node editing (cusp smooth symmetrical join break reverse auto-close reduce nodes),drawing,must,yes,no,S02 S04
+Sculpting brushes (Smooth Smear Twirl Attract Repel Smudge Roughen),drawing,should,yes,no,S04
+Crop Knife (straight freehand Bezier slice) Virtual Segment Delete and Eraser tools,drawing,must,yes,no,S02 S04
+Freehand 2-Point Line Bezier Pen B-Spline Polyline and 3-Point Curve tools,drawing,must,yes,no,S02 S04
+LiveSketch and Smart Drawing freehand-to-curve recognition,drawing,could,yes,no,S04
+Artistic Media (Preset Brush Sprayer Calligraphic pressure-sensitive strokes),drawing,should,yes,no,S04
+Rectangle and 3-Point Rectangle with independent corner radius scallop and chamfer,drawing,must,yes,no,S02
+Ellipse and 3-Point Ellipse (full pie and arc modes),drawing,must,yes,no,S02
+Polygon Star Spiral Common Shapes Impact and Graph Paper tools,drawing,must,yes,no,S02
+Boolean Shaping engine (Weld Trim Intersect Simplify Front/Back Minus Boundary Combine/Break),drawing,must,yes,no,S04
+Smart Fill tool (flood-fill bounded regions into closed vector shapes),drawing,must,yes,no,S02 S04
+Symmetry Drawing Mode (live multi-axis mirror and radial symmetry),drawing,should,yes,no,S04
+Perspective Drawing Mode (1-point 2-point and 3-point perspective planes),drawing,should,yes,no,S04
+Dimension tools (Parallel Horizontal/Vertical Angular Segment 3-Point Callout with live units),technical,must,yes,no,S02
+Connector tools (Straight-Line Right-Angle Rounded Right-Angle with object anchor snapping),technical,should,yes,no,S02
+Interactive Table tool (grid merge/split cells borders fills cell text CSV/TSV import),technical,must,yes,no,S02
+Uniform Fill and Fountain Fill (Linear Elliptical Conical Rectangular multi-stop gradients),color-fill,must,yes,no,S06
+Vector Pattern Bitmap Pattern Two-Color Pattern Texture and PostScript Fills,color-fill,should,yes,no,S06
+Interactive Mesh Fill (NxM Bezier color mesh grid with node color and opacity),color-fill,must,yes,no,S06
+Interactive Fill tool and Color/Attributes Eyedropper tools,color-fill,must,yes,no,S02 S06
+Outline Pen engine (width hairline joins caps dashes arrowheads calligraphic nib behind fill scale with object),color-fill,must,yes,no,S06
+Color Models (CMYK RGB Lab HSB Grayscale Spot channels) and ICC Color Management,color-fill,must,yes,no,S06 S18
+Color Palette Bar (docked swatch strips Show Color Names Document Palette Custom Palettes Harmonies),color-fill,must,yes,no,S02 S06
+Artistic Text and Paragraph Text frames (linked text flow columns drop caps bullets tabs wrap),typography,must,yes,no,S02 S07
+Fit Text to Path (interactive offset distance orientation mirror),typography,must,yes,no,S07
+OpenType features (ligatures alternates fractions swashes variable axes) and Convert to Curves,typography,must,yes,no,S07
+Glyphs docker and local Font Manager (collections preview search missing-font substitution),typography,should,yes,no,S07
+PowerClip (Place Inside Edit Contents Extract Fit/Center/Stretch Lock Contents),effects,must,yes,no,S02 S05
+Interactive Drop Shadow and Inner Shadow (feather direction color opacity perspective),effects,must,yes,no,S08
+Block Shadow (solid vector extruded shadow for signage and screenprinting),effects,must,yes,no,S08
+Interactive Contour (To Center Inside Outside steps offset color acceleration),effects,must,yes,no,S08
+Interactive Blend (linear path-bound multi-step color and shape morphing),effects,must,yes,no,S08
+Interactive Distort (Push and Pull Zipper Twister),effects,should,yes,no,S08
+Interactive Envelope (Straight Single Arc Double Arc Unconstrained warp and Copy Envelope),effects,must,yes,no,S08
+Interactive Extrude (3D vector extrusion vanishing point bevels rotation lighting),effects,should,yes,no,S08
+Interactive Transparency (Uniform Fountain Pattern Texture and Blend/Merge modes),effects,must,yes,no,S08
+Non-destructive Bitmap Effects stack (Blur Sharpen Color Balance Curves HSL Levels Art Strokes Noise),effects,should,yes,no,S08
+Lens 1: Brighten Lens (non-destructive lighten/darken beneath shape),lenses,must,yes,no,S09
+Lens 2: Color Add Lens (additive light mixing over underlying objects),lenses,must,yes,no,S09
+Lens 3: Color Limit Lens (color channel bandpass filter over underlying objects),lenses,must,yes,no,S09
+Lens 4: Custom Color Map Lens (remap underlying luminance/hue across custom palette ramps),lenses,must,yes,no,S09
+Lens 5: Fish Eye Lens (spherical warp magnification/minification with percentage rate),lenses,must,yes,no,S09
+Lens 6: Heat Map Lens (infrared thermal palette mapping over underlying objects),lenses,must,yes,no,S09
+Lens 7: Invert Lens (complementary CMYK/RGB color inversion beneath lens),lenses,must,yes,no,S09
+Lens 8: Magnify Lens (zoom magnification factor over underlying artwork),lenses,must,yes,no,S09
+Lens 9: Tinted Grayscale Lens (monochrome tinted grayscale remap beneath lens),lenses,must,yes,no,S09
+Lens 10: Transparency Lens (alpha tint overlay with rate and color),lenses,must,yes,no,S09
+Lens 11: Wireframe Lens (override underlying artwork to wireframe outline/fill display),lenses,must,yes,no,S09
+Lens Controls: Frozen state Viewpoint X/Y offset and Remove Face toggle,lenses,must,yes,no,S09
+Integrated Raster Photo Studio workspace (replacing standalone PHOTO-PAINT),photo-studio,must,yes,no,S10
+Pixel Layers with blend modes opacity alpha channels and Clip Masks,photo-studio,must,yes,no,S10
+Raster Selection and Masking tools (Rect Ellipse Lasso Magic Wand Smart Selection Feather/Invert),photo-studio,must,yes,no,S10
+Pixel Paint Eraser Clone Stamp Healing Smudge Dodge/Burn and Flood Fill brushes,photo-studio,must,yes,no,S10
+Photo Tone and Color Adjustments (Levels Curves HSL Color Balance Desaturate Channel Mixer Threshold),photo-studio,must,yes,no,S10
+Image Resample (Bicubic/Lanczos) Crop/Straighten Cutout Lab and Color Mode conversion,photo-studio,should,yes,no,S10
+PowerTRACE Quick Trace and Centerline Trace (Technical Illustration Line Drawing),powertrace,must,yes,no,S11
+PowerTRACE Outline Trace presets (Line Art Logo Detailed Logo Clipart Low/High Quality Image),powertrace,must,yes,no,S11
+PowerTRACE Interactive Controls (Detail Smoothing Corners Color Count Remove Background Split Preview),powertrace,must,yes,no,S11
+Print Dialog and Live Print Preview with Tiling Scaling and Layout,prepress,must,yes,no,S12
+Imposition Layout Engine (N-Up Saddle-Stitch Booklet Perfect Bound Step and Repeat Gutters),prepress,must,yes,no,S12
+Printers Marks (Crop/Fold Registration Densitometer Calibration Bars File Info Bleed Limit),prepress,must,yes,no,S12
+Color Separations (CMYK and Spot plates preview Overprint Black/Fill/Stroke Trapping Mirror/Negative),prepress,must,yes,no,S12
+Document Preflight Inspector (low-DPI bitmaps RGB-in-CMYK hairlines missing fonts overprint/bleed),prepress,must,yes,no,S13
+Print Merge (CSV/TSV data-driven variable text/numbering merge to pages or batch PDF),prepress,must,yes,no,S14
+Built-in Barcode and QR Code Generator (EAN-13 UPC-A Code 128 Code 39 ITF QR vector paths),prepress,must,yes,no,S14
+Collect for Output (bundle document used fonts linked images and PDF/X report),prepress,should,yes,no,S13
+Native .cdr and .cdt RIFF (v3-v13) and ZIP-container (v14/X4-v25+) reader and writer,codecs,must,yes,no,S02 S15
+Corel .cmx (Presentation Exchange) and .cpt (PHOTO-PAINT raster) import and export,codecs,should,yes,no,S10 S15
+PDF and PDF/X-1a / PDF/X-4 native CMYK and Spot Color export and PDF import,codecs,must,yes,no,S12 S15
+SVG 1.1/2.0 and EPS/PostScript import and export,codecs,must,yes,no,S15
+CAD and Plotter codecs: DXF (R12/R2000+) and HPGL .plt export/import,codecs,must,yes,no,S15
+Raster image codecs: PNG JPEG WebP TIFF (CMYK/RGB) BMP and PSD layer import,codecs,must,yes,no,S10 S15
+Corel Cloud storage online file sync and web review comments,cloud,could,yes,skip,offline-first design with zero cloud accounts or remote servers
+CorelDRAW Web browser editor and iPad companion app,cloud,could,yes,skip,desktop-first native Linux and Windows scope only
+User accounts license activation servers and subscription billing,account,could,yes,skip,zero accounts zero DRM MPL-2.0 open-source license
+Licensed Pantone books and proprietary encrypted vendor color libraries,color-fill,could,yes,skip,proprietary trademarked color libraries; users import custom spot palettes instead
+Proprietary Corel clipart stock photos licensed Monotype fonts and cloud AI credits,assets,could,yes,skip,copyrighted commercial content; users bring local fonts and assets
+Windows-only COM/VBA/VSTA macro scripting runtime,automation,could,yes,skip,proprietary Windows COM runtime; replaced by cross-platform Rhai scripting
+Native Linux-first desktop build (Wayland + X11 zero Wine pure Rust xdg-desktop-portal),platforms,must,no,no,Fix 1 from fixes.md
+100% offline-first zero-account zero-telemetry MPL-2.0 operation (never phones home),offline,must,no,no,Fix 2 from fixes.md
+Unknown-Chunk Passthrough in .cdr/.cdt/.cmx round-trip saves (preserve unrecognized chunks verbatim),codecs,must,no,no,Fix 3 from fixes.md
+Live CDR Binary/Chunk Inspector docker (hex/tree view of RIFF/ZIP chunks version codepage warnings),codecs,should,no,no,Fix 3 from fixes.md (S16)
+Native Arabic RTL / HarfBuzz bidirectional text shaping Kashida justification and CP1256 legacy .cdr decoder,typography,must,no,no,Fix 7 from fixes.md (S07)
+First-class CutContour / PerfCutContour / Crease spot presets and Parametric Packaging Dielines (FEFCO),prepress,must,no,no,Fix 6 from fixes.md (S14)
+Live Path Meter HUD (total cut length in mm/m node count bounding area estimated laser/plotter time),prepress,must,no,no,Fix 6 from fixes.md (S02 S14)
+Crash-safe SQLite WAL Serializable Command Journal Atomic File Saves and instant crash recovery,storage,must,no,no,Fix 4 from fixes.md (S17)
+Cross-platform Rhai Macro Recorder and Script Runner (record DocumentCommand log into editable .rhai scripts),automation,should,no,no,Fix 4 from fixes.md (S17)
+R-Tree (rstar) spatial index and Rayon multi-threaded dirty-tile rendering for 10000+ object files,performance,must,no,no,Fix 5 from fixes.md

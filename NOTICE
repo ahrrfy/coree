@@ -1,0 +1,31 @@
+coree — Clean-Room Vector Graphics & Print Production Suite
+Copyright (c) 2026 coree contributors
+
+This project is licensed under the Mozilla Public License Version 2.0 (MPL-2.0).
+See the LICENSE file in the repository root for the full license text.
+
+================================================================================
+CLEAN-ROOM & TRADEMARK NOTICE
+================================================================================
+
+Corel®, CorelDRAW®, Corel PHOTO-PAINT®, PowerTRACE™, and related product names
+and logos are registered trademarks or trademarks of Corel Corporation and/or
+Alludo in Canada, the United States, and/or other countries.
+
+PANTONE® and other Pantone trademarks are the property of Pantone LLC.
+
+`coree` is an independent, clean-room open-source software project. It is NOT
+affiliated with, endorsed by, sponsored by, or connected in any way to Corel
+Corporation, Alludo, or Pantone LLC.
+
+All source code, user interface designs, icons, documentation, and file format
+parsers/encoders in `coree` are authored independently from scratch using
+publicly available specifications, documentation, and interoperability testing.
+No proprietary source code, reverse-engineered proprietary binaries, copyrighted
+artwork, fonts, clip art, templates, or proprietary color books (such as Pantone
+color libraries) are included in this repository.
+
+Any references to third-party file formats (such as `.cdr`, `.cdt`, `.cmx`,
+`.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`) or industry terminology are
+strictly nominative and solely for the purpose of interoperability and user
+familiarity.
