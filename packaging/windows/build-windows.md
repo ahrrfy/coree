@@ -11,7 +11,7 @@ When compiling for Windows (`x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnu`)
   - `PerMonitorV2` HiDPI awareness for sharp canvas and UI rendering on 4K/mixed-DPI displays.
   - `<activeCodePage>UTF-8</activeCodePage>` so Windows CLI & file dialogs handle Arabic and Unicode filenames (such as `درع الشكر والتقدير.cdr`) flawlessly without legacy ANSI codepage corruption.
   - `longPathAware` enabled.
-- **Version Metadata (`VS_VERSION_INFO`):** Product name `coree`, version `0.2.0.0`, and `MIT OR Apache-2.0` copyright metadata.
+- **Version Metadata (`VS_VERSION_INFO`):** Product name `coree`, version `0.3.0.0`, and `MIT OR Apache-2.0` copyright metadata.
 
 ---
 
@@ -30,11 +30,12 @@ cd coree
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Build optimized Windows desktop binary (embeds coree.ico & UTF-8/DPI manifest)
-cargo build --release --target x86_64-pc-windows-msvc
+# Build optimized Windows GUI + Console CLI companion binaries (embeds coree.ico & UTF-8/DPI manifest)
+cargo build --release --package coree-app --bins --target x86_64-pc-windows-msvc
+Copy-Item ".\target\x86_64-pc-windows-msvc\release\coree-cli.exe" ".\target\x86_64-pc-windows-msvc\release\coree.com" -Force
 
-# Atomic CLI smoke checks (including CDR, PDF, DXF, PLT, thumbnail & laser G-Code)
-$exe = ".\target\x86_64-pc-windows-msvc\release\coree.exe"
+# Atomic CLI smoke checks via coree.com (synchronous console stdout + exit codes)
+$exe = ".\target\x86_64-pc-windows-msvc\release\coree.com"
 & $exe --diagnostics
 & $exe generate-sample sample.cdr --format cdr-x6
 & $exe inspect sample.cdr --json
@@ -75,7 +76,7 @@ The standalone executable is emitted at `target/x86_64-pc-windows-gnu/release/co
 
 ## Packaging a Windows MSI Installer with WiX Toolset v4
 
-The manifest at [`packaging/windows/wix/main.wxs`](wix/main.wxs) packages `coree.exe`, `coree.ico`, `LICENSE-MIT`, `LICENSE-APACHE`, and `NOTICE`, creates Start Menu and Desktop shortcuts, adds the install directory to system `PATH`, and registers `coree.Document` (`DefaultIcon` + `shell\open\command`) plus `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, and `.psd`.
+The manifest at [`packaging/windows/wix/main.wxs`](wix/main.wxs) packages `coree.exe`, `coree.com` (Console CLI companion), `coree.ico`, `LICENSE-MIT`, `LICENSE-APACHE`, and `NOTICE`, creates Start Menu and Desktop shortcuts, adds the install directory to system `PATH`, and registers `coree.Document` (`DefaultIcon` + `shell\open\command` + `.cdr` `Content Type`) plus `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, and `.psd`.
 
 ### Prerequisites
 Install the .NET SDK (8.0+) and the WiX v4 CLI tool:
@@ -85,30 +86,32 @@ dotnet tool install --global wix
 
 ### Build the `.msi`
 ```powershell
-# 1. Build the release binary (MSVC default target puts binary at target\release\coree.exe)
-cargo build --release
+# 1. Build both GUI (coree.exe) and Console CLI (coree-cli.exe -> coree.com) release binaries
+cargo build --release --package coree-app --bins
+Copy-Item "target\release\coree-cli.exe" "target\release\coree.com" -Force
 
 # 2. Compile the WiX v4 MSI installer
 wix build packaging\windows\wix\main.wxs `
     -arch x64 `
     -d BinaryPath="target\release\coree.exe" `
+    -d ComPath="target\release\coree.com" `
     -d IconPath="packaging\windows\coree.ico" `
     -d RepoRoot="." `
-    -d Version="0.2.0" `
-    -o dist\coree-v0.2.0-x86_64-windows-setup.msi
+    -d Version="0.3.0" `
+    -o dist\coree-v0.3.0-x86_64-windows-setup.msi
 ```
 
 ### Portable `.zip` Package (Zero Admin)
-Users who prefer a portable install without Administrator privileges can unpack `coree-v0.2.0-x86_64-windows-portable.zip` (containing `coree.exe`, `coree.ico`, [`register-file-associations.cmd`](register-file-associations.cmd), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, and `README.md`) and double-click `register-file-associations.cmd` to register per-user (`HKCU`) file associations and icons.
+Users who prefer a portable install without Administrator privileges can unpack `coree-v0.3.0-x86_64-windows-portable.zip` (containing `coree.exe`, `coree.com`, `coree.ico`, [`register-file-associations.cmd`](register-file-associations.cmd), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, and `README.md`) and double-click `register-file-associations.cmd` to register per-user (`HKCU`) file associations and icons.
 
 ### Silent Enterprise Install / Uninstall Verification
 ```powershell
 # Silent install
-msiexec /i dist\coree-v0.2.0-x86_64-windows-setup.msi /qn /l*v install.log
+msiexec /i dist\coree-v0.3.0-x86_64-windows-setup.msi /qn /l*v install.log
 
-# Verify CLI diagnostics
-& "$env:ProgramFiles\coree\coree.exe" --diagnostics
+# Verify CLI diagnostics via coree.com (synchronous stdout + exit code)
+& "$env:ProgramFiles\coree\coree.com" --diagnostics
 
 # Silent uninstall
-msiexec /x dist\coree-v0.2.0-x86_64-windows-setup.msi /qn
+msiexec /x dist\coree-v0.3.0-x86_64-windows-setup.msi /qn
 ```

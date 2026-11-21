@@ -269,10 +269,13 @@ impl StorageDb {
     pub fn open_with_data_dir(db_path: &Path, data_dir: PathBuf) -> StorageResult<Self> {
         if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
+            harden_dir_permissions(parent)?;
         }
         std::fs::create_dir_all(&data_dir)?;
+        harden_dir_permissions(&data_dir)?;
         let conn = Connection::open(db_path)?;
         configure_and_migrate(&conn, true)?;
+        harden_file_permissions(db_path)?;
         Ok(Self {
             conn,
             data_dir,
@@ -338,8 +341,41 @@ impl StorageDb {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
         }
+        harden_dir_permissions(&dir)?;
         Ok(dir)
     }
+}
+
+/// Enforces owner-only directory permissions (`0700`) on Unix hosts so local
+/// SQLite databases and autosave snapshots are never world-readable or traversable.
+pub(crate) fn harden_dir_permissions(path: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Enforces owner-only file permissions (`0600`) on Unix hosts for SQLite DB
+/// files and persisted autosave blobs.
+pub(crate) fn harden_file_permissions(path: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> StorageResult<()> {
@@ -422,5 +458,36 @@ mod tests {
         drop(db);
         let db2 = StorageDb::open(&db_path).unwrap();
         assert_eq!(db2.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_storage_directories_and_db_have_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("restricted_data");
+        let db_path = data_dir.join("coree.db");
+        let db = StorageDb::open_with_data_dir(&db_path, data_dir.clone()).unwrap();
+        let autosave = db.autosave_dir().unwrap();
+
+        let data_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        let autosave_mode = std::fs::metadata(&autosave).unwrap().permissions().mode() & 0o777;
+        let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(data_mode, 0o700);
+        assert_eq!(autosave_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
+
+        let doc = coree_core::Document::new_a4("Perm Check");
+        let snap = db
+            .save_snapshot(&doc.id.to_string(), "Perm Check", None, &doc)
+            .unwrap();
+        let snap_mode = std::fs::metadata(&snap.snapshot_blob_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(snap_mode, 0o600);
     }
 }

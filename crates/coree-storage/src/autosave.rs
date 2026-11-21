@@ -555,11 +555,19 @@ fn atomic_write_blob(path: &Path, bytes: &[u8]) -> StorageResult<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
+    crate::db::harden_dir_permissions(parent)?;
     let mut tmp = NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     tmp.as_file_mut().write_all(bytes)?;
     tmp.as_file_mut().flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| StorageError::Io(e.error))?;
+    crate::db::harden_file_permissions(path)?;
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 <!-- Windows 10/11 Application Manifest for coree: PerMonitorV2 HiDPI + UTF-8 activeCodePage (Arabic/Unicode filenames) -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-      version="0.2.0.0"
+      version="0.3.0.0"
       processorArchitecture="*"
       name="io.github.ahrrfy.coree"
       type="win32" />

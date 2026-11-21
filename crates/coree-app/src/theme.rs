@@ -127,7 +127,7 @@ pub fn shape_mixed_ui_bidi(text: &str) -> String {
     }
 
     let mut out = String::with_capacity(text.len());
-    for (idx, run) in runs.iter().enumerate() {
+    for run in &runs {
         let slice = &text[run.clone()];
         let is_rtl_run = levels.get(run.start).is_some_and(|l| l.is_rtl());
         if is_rtl_run {
@@ -144,12 +144,6 @@ pub fn shape_mixed_ui_bidi(text: &str) -> String {
             }
         } else {
             out.push_str(slice);
-        }
-        if idx + 1 < runs.len() && !out.ends_with(' ') {
-            let next_slice = &text[runs[idx + 1].clone()];
-            if !next_slice.starts_with(' ') && !slice.ends_with(' ') {
-                // Keep exact whitespace already captured inside runs; avoid inventing spaces.
-            }
         }
     }
     out

@@ -1,0 +1,28 @@
+{
+  "avoid": [
+    "CorelDRAW",
+    "Corel DRAW",
+    "Corel Corporation",
+    "Alludo",
+    "PHOTO-PAINT",
+    "PowerTRACE",
+    "Corel Font Manager",
+    "Corel CAPTURE",
+    "Corel Cloud",
+    "CorelDRAW.app",
+    "Corel"
+  ],
+  "app_store": {
+    "name": "coree Vector Print Studio",
+    "subtitle": "Offline Vector, CAD & Laser",
+    "promotional_text": "Open-source pure-Rust studio for print shops, laser cutters, Arabic typography, and legacy .cdr, .pdf, .psd, and .dxf files — zero accounts or cloud lock-in.",
+    "description": "coree is an offline vector illustration, multipage layout, raster editing, and print/laser production studio built in pure Rust.\n\nDesigned for commercial print shops, sign makers, packaging converters, Arabic RTL studios, and CO2/fiber laser workshops on Linux and Windows:\n\n- Broad Production Format Support: Open and round-trip .cdr (RIFF v4-v13, ZIP X4-X5, ZCF X6-2025), .cdr.zip, .cdt, .cmx, .cpt, .coree, PDF/AI, multi-layer PSD/PSB, EPS, AutoCAD DXF, HPGL .plt, and SVG/SVGZ with unknown-chunk passthrough and CP1256 Arabic text recovery.\n- Press-Ready Output: DeviceCMYK PDF/X export with ISO 32000-1 Spot Separation plates (CutContour, Crease), axial/radial shadings, embedded custom ICC v2/v4 profiles, live CMYK soft-proofing, N-Up/Booklet/Tiling imposition, printer marks, Preflight, Collect for Output, and native CUPS / Windows Spooler printing.\n- Laser & Plotter Bridge System: Built-in toolpath optimization (duplicate-line removal, open-curve joining, kerf offset, cross-hatch fill, inner-first ordering) exporting GRBL/Marlin/Ruida G-Code, DXF R12, and PLT with 7 built-in machine bridge presets.\n- 65 Interactive Tools & 11 Live Lenses: Parametric shapes, Node Editor (F10), Edit Fill (F11), Outline Pen (F12), Boolean shaping, PowerClip lockable containers, Mesh Fill, Break Effect Apart (Ctrl+K), Healing/Dodge/Burn/Flood Fill, Vector Tracing, and live Path Meter.\n- Bilingual Arabic & English Studio: HarfBuzz RTL shaping, Kashida justification, Unicode BiDi mixed-script menus, and OS-physical keyboard shortcuts.",
+    "keywords": "cmyk,prepress,gcode,dxf,cdr,arabic,rtl,cutcontour,svg,dieline,pdf,plotter,icc,kashida,hatch",
+    "whats_new": "v0.3.0 adds Edit Fill (F11), Outline Pen (F12), Native OS Print Studio (Ctrl+P), PDF ICC /OutputIntents, cross-page Desktop layer, PowerClip Lock Contents, Ctrl+K effect lowering, Rayon parallel tiles, single-instance IPC, Unix 0700/0600 storage hardening, and paired Windows console CLI (coree.com)."
+  },
+  "google_play": {
+    "title": "coree Vector Print Studio",
+    "short_description": "Offline vector studio for print prepress, laser cuts, Arabic RTL, and .cdr IO.",
+    "full_description": "coree is a clean-room, open-source vector illustration, multipage page-layout, raster editing, and prepress/laser production studio written in pure Rust under a dual MIT OR Apache-2.0 license.\n\nBuilt to keep workshops working offline without accounts, activation servers, or forced subscriptions:\n\n- Import & Round-Trip Legacy Archives: Open RIFF, ZIP, and ZCF .cdr/.cdr.zip, .cdt, .cmx, .cpt, PDF/AI, EPS, PSD/PSB, DXF, PLT, and SVG files while preserving unrecognized binary chunks.\n- Commercial Print & Packaging: Export curved Arabic & Latin glyphs to DeviceCMYK PDF with Spot /Separation inks (CutContour), custom ICC v2/v4 OutputIntents, imposition layouts, Preflight checks, vector QR/EAN-13 barcodes, parametric FEFCO dielines, CSV Print Merge, and direct CUPS / Windows printing.\n- Laser & Plotter Toolpaths: Remove duplicate lines, join open paths, apply kerf compensation and rotated hatch engraving, and export G-Code (GRBL/Marlin/Ruida), DXF R12, or HPGL .plt.\n- Fast Offline Architecture: R-Tree spatial indexing, Rayon parallel dirty-tile rendering, SQLite WAL command-journal crash recovery, sandboxed Rhai automation macros, and live English / Arabic bilingual workspaces."
+  }
+}

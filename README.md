@@ -27,18 +27,17 @@ All images below are rendered directly by `coree render` (verified 100.0% pixel-
 - **Repository:** [https://github.com/ahrrfy/coree](https://github.com/ahrrfy/coree)
 - **License:** Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) (Rust ecosystem gold standard: MIT's maximum global adoption + Apache-2.0's explicit patent grant & trademark non-grant; see [NOTICE](NOTICE))
 - **Feature Parity:** **100.0 / 100** (`68/68` must-have capabilities complete across all 13 feature areas — see [replica/parity.md](replica/parity.md))
-- **Verified Quality:** `#![forbid(unsafe_code)]` across all 7 crates, **298/298** automated unit/integration/E2E/adversarial tests passing (`0` open S1/S2 bugs across 88 verified audit fixes), `cargo clippy --workspace --all-targets -- -D warnings` clean, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
+- **Verified Quality:** `#![forbid(unsafe_code)]` across all 7 crates, **323/323** automated unit/integration/E2E/adversarial tests passing (`0` open S1/S2 bugs across 105 verified audit fixes), `cargo clippy --workspace --all-targets -- -D warnings` clean, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
 
 ---
 
-### What's New in `v0.2.0`
+### What's New in `v0.3.0` (Including `v0.2.x` Engine Upgrades)
 
-- **Authentic ZCF `.cdr` X6–2025 (v16–26) Codec:** Full indirect pointer dereferencing (`content/dataFileList.dat`), `styles/document.cdss`, `color/docPalette.xml`, UTF-16LE & CP1256 Arabic text, embedded PNG thumbnail extraction (`extract_cdr_preview_png`), and transparent `.cdr.zip` / `.cdt.zip` magic-byte opening (verified on real v23 CorelDRAW 2021 artwork with 4,746 cubic Bézier handles!).
-- **Pro Industry Importers & Exporters:** Native pure-Rust **PDF 1.0–2.0 & PDF-compatible `.ai`** importer (verified on real 44 MB 60-page PDFs), **EPS / PostScript** importer (DOS binary & PS), **AutoCAD DXF (R12/R2000+) & HPGL `.plt`** importers, and streaming multi-layer **Photoshop `.psd`/`.psb`** importer (verified on real 295 MB 9-layer PSDs).
-- **Pure-Rust ICC v2/v4 Color Management & Live Soft-Proofing:** Real ICC v2/v4 profile parsing (verified on 52/52 real system ICC profiles), built-in `sRGB`, `Display P3`, `ISO Coated v2 CMYK`, and `US Web Coated SWOP CMYK` profiles, live CMYK soft-proofing, and out-of-gamut warning overlay.
-- **Laser Cutting, Engraving & Plotter Plugins:** Dedicated toolpath planner (duplicate-line removal, curve joining, kerf compensation, rotated/cross hatch fill, inner-loops-first ordering, travel optimization, weeding box, GRBL/Marlin/Ruida G-Code & DXF R12/PLT/SVG/EPS export) + extensible `plugin.json`/`plugin.toml`/Rhai architecture with **7 built-in bridge presets**: **LightBurn**, **RDWorks / Ruida**, **EZCad Fiber**, **LaserDRW / M2 Nano**, **LaserGRBL**, **InkCut / VisiCut**, and **Vinyl Plotter (HPGL)**.
-- **62 Real Interactive Tools & Studio Workspaces:** Every single tool across all 15 Toolbox flyout groups live and verified (including **Healing Brush**, **Dodge/Burn**, **Raster Flood Fill**, **10 PostScript Procedural Fills**, **Autofit Page to Content**, and **Glyphs Docker**), plus 6 Workspace Presets (`DefaultClassic`, `Lite`, `Illustration`, `PageLayout`, `LaserSignStudio`, `TouchCompact`), right-click context menu, and muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2`/`F3`/`F4`/`F9`, `Space`, `Ctrl+K`/`L`/`Q`/`D`/`R`/`J`).
-- **Native OS Integration (Linux & Windows):** Fixes Linux `.cdr` ZIP-icon misclassification via canonical `application/vnd.corel-draw` `<sub-class-of type="application/zip"/>` + GNOME `coree.thumbnailer`, adds **Flatpak**, native **`.deb`**, and **`.AppImage`** packages on Linux, and ships **Windows `.msi`** + **Portable `.zip`** (with embedded `coree.ico`, `PerMonitorV2` DPI + `UTF-8` Arabic filename manifest, and 1-click `register-file-associations.cmd`).
+- **Print Export Fidelity & Custom ICC Profiles (`coree-io`, `coree-core`, `coree-render`):** Vector glyph curves via `TextEngine` (`cosmic-text` + `swash`) eliminate non-WinAnsi/Arabic Tofu boxes in **PDF** and **EPS** exports; PDF export adds ISO 32000-1 `/Separation` Spot plates (`CutContour`), `/ShadingType 2/3` axial/radial gradients, `/OutputIntents` ICC embedding, custom `.icc`/`.icm` profile loading with live canvas soft-proofing, and cross-page **`Desktop` layer** output.
+- **Native OS Printing (`Ctrl+P`) & Dual Windows CLI/GUI Launcher (`coree-app`):** Built-in CUPS (`lpstat`/`lp`/`lpr`) and Windows Print Spooler (`Get-Printer`/`Start-Process`) job submission; pure-Rust Single-Instance TCP loopback IPC (`--new-window`); and paired Windows Console-subsystem **`coree.com`** beside GUI **`coree.exe`** so PowerShell/CI automation gets synchronous exit codes and UTF-8 Arabic console output without flashing CMD popups.
+- **Classic Interactive Editing, Effects Lowering & Bilingual Arabic UI (`coree-core`, `coree-app`, `coree-render`):** Modal **Edit Fill (`F11`)** and **Outline Pen (`F12`)** dialogs; interactive Linear/Radial/Conical/Square gradient stop & focal handle dragging; `Ctrl+K` (*Break Apart*) decomposition of Shadows/Contours/2.5D Extrudes/Blends/Symmetry via `lower_effects_to_primitives`; **`PowerClip` `lock_contents`**; numeric `font_weight` (`100..900`) + OpenType (`liga`/`calt`/`kern`) + `bidi_font_family`; HiDPI canvas scaling; **Rayon parallel dirty-tile rendering** + `OnceLock` shared font DB; v2 `.coreews` Dock/Shortcut persistence + Custom Shortcut Editor (`Ctrl+J`); and live bilingual **English / العربية** (`EN | ع`) UI with `unicode-bidi` shaping.
+- **Authentic `.cdr` Across Generations (`coree-cdr`):** Direct ZCF X6–2025 (`v16–26`) indirect pointer dereferencing, `[0..1]` vs local-mm gradient rescaling, cycle-guarded `styles/document.cdss` inheritance + RTL/numeric font weights, RIFF `arrw`/`bmpf`/`vpat`/`clrs` resource handlers, legacy `v7–v15` `fild`/`outl` fallbacks, CP1256 Arabic decoding, and embedded preview PNG extraction.
+- **Pro Importers, Laser Plugins & 65 Live Tools (`coree-io`, `coree-prod`, `coree-storage`):** Native **PDF/AI**, **EPS**, **DXF/PLT**, and streaming multi-layer **PSD/PSB** importers; **7 built-in Laser/Plotter Plugins** (**LightBurn**, **RDWorks**, **EZCad**, **LaserDRW**, **LaserGRBL**, **InkCut**, **HPGL Plotter**) + JSON/TOML/Rhai plugins; 65 interactive tools across 15 flyout groups + 6 Workspaces; and Unix owner-only `0700`/`0600` hardening on local SQLite WAL & autosave directories/files.
 
 ---
 
@@ -63,13 +62,13 @@ Download the latest release assets from [GitHub Releases](https://github.com/ahr
 
 - **Ubuntu / Debian (`.deb` — Recommended for Debian/Ubuntu/Mint/Pop!_OS):**
   ```bash
-  sudo apt install ./coree_0.2.0_amd64.deb
+  sudo apt install ./coree_0.3.0_amd64.deb
   ```
   Installs `/usr/bin/coree`, desktop entry, canonical `application/vnd.corel-draw` MIME rules (eliminates ZIP icons on `.cdr` files!), SVG app & MIME icons, GNOME/freedesktop `coree.thumbnailer`, and AppStream metainfo.
 - **Universal Portable `.AppImage` (Any Linux distro, zero install):**
   ```bash
-  chmod +x coree-v0.2.0-x86_64.AppImage
-  ./coree-v0.2.0-x86_64.AppImage
+  chmod +x coree-v0.3.0-x86_64.AppImage
+  ./coree-v0.3.0-x86_64.AppImage
   ```
 - **Offline-Sandboxed Flatpak:**
   Build locally from [packaging/linux/flatpak/io.github.ahrrfy.coree.yml](packaging/linux/flatpak/io.github.ahrrfy.coree.yml) (strictly sandboxed with Wayland/X11/DRI and **no network access**):
@@ -101,8 +100,8 @@ Build native `.deb` or `.AppImage` locally without `sudo`:
 
 #### Option 3 — Windows (`x86_64`): MSI Installer or Portable ZIP
 Download from [GitHub Releases](https://github.com/ahrrfy/coree/releases):
-- **Windows Installer (`.msi`):** Double-click `coree-v0.2.0-x86_64-windows-setup.msi` — installs `coree.exe` (with embedded `coree.ico`, `PerMonitorV2` HiDPI & `UTF-8` Arabic filename manifest), Start Menu & Desktop shortcuts, `PATH` entry, and full Windows Registry file associations (`coree.Document` + `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.psd`).
-- **Portable `.zip` (Zero Admin):** Extract `coree-v0.2.0-x86_64-windows-portable.zip` anywhere and run `coree.exe`. Optionally double-click `register-file-associations.cmd` to register `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt`/`.svg`/`.dxf`/`.plt` in `HKCU` without Administrator privileges!
+- **Windows Installer (`.msi`):** Double-click `coree-v0.3.0-x86_64-windows-setup.msi` — installs GUI `coree.exe` (with embedded `coree.ico`, `PerMonitorV2` HiDPI & `UTF-8` Arabic filename manifest) and CLI companion **`coree.com`**, Start Menu & Desktop shortcuts, `PATH` entry, and full Windows Registry file associations (`coree.Document` + `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.psd`).
+- **Portable `.zip` (Zero Admin):** Extract `coree-v0.3.0-x86_64-windows-portable.zip` anywhere and run `coree.exe` (or `coree.com` from PowerShell/CMD for synchronous CLI output). Optionally double-click `register-file-associations.cmd` to register `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt`/`.svg`/`.dxf`/`.plt` in `HKCU` without Administrator privileges!
 
 To build from source on Windows (MSVC, MinGW-w64, or WiX v4 `.msi`), see [packaging/windows/build-windows.md](packaging/windows/build-windows.md).
 
@@ -171,17 +170,15 @@ cargo fmt --all -- --check
 
 **`coree`** حزمة رسوميات متجهية وتخطيط صفحات متعددة واستوديو صور نقطية وقص ونقش بالليزر وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر (Clean-Room) بلغة **Rust** وبترخيص مزدوج **`MIT OR Apache-2.0`**. صُمّمت لمطابع الأوفست والديجيتال وورش القص بالليزر والفايبر والراوتر والفينيل ومصممي اللافتات والعبوات والخط العربي على **لينكس** و**ويندوز**، وتعمل **محلياً بالكامل بنسبة 100%** دون اشتراكات أو حسابات أو سحابة إجبارية أو تتبع.
 
-### أبرز مزايا الإصدار `v0.2.0`
-- **دعم حقيقي وكامل لملفات `.cdr` الحديثة (ZCF X6–2025) والقديمة (`coree-cdr`):** فكّ مؤشرات ZCF غير المباشرة وملفات التنسيق `document.cdss` ولوحات الألوان `docPalette.xml`، واستعادة النصوص العربية (UTF-16LE وCP1256)، واستخراج الصور المصغّرة المدمجة، والفتح المباشر لملفات `.cdr.zip` و`.cdt` و`.cmx` و`.cpt` مع تمرير المقاطع غير المعروفة بايت-ببايت.
-- **استيراد وتصدير شامل لجميع صيغ السوق (`coree-io`):** استيراد حقيقي لملفات **PDF / Adobe Illustrator (`.ai`)** و**EPS** و**AutoCAD DXF** و**HPGL `.plt`** و**Photoshop `.psd`/`.psb` متعددة الطبقات**، إضافة إلى **SVG** وتصدير **PDF بنظام CMYK مع علامات القص** والصور النقطية.
-- **إدارة ألوان ICC v2/v4 ومعاينة طباعية حيّة (`coree-core`, `coree-render`):** محرك ICC نقي بلغة Rust مع ملفات `sRGB` و`Display P3` و`ISO Coated v2 CMYK` و`US Web Coated SWOP` ومعاينة فورية للألوان خارج النطاق الطباعي (Gamut Warning).
-- **بلاجنات القص بالليزر والنقش والبلوتر (`coree-prod`):** محرك مسارات ليزر احترافي (حذف الخطوط المكررة، وصل المسارات المفتوحة، تعويض سماكة الشعاع Kerf، التهشير Hatch/Cross-Hatch للنقش، قص الثقوب الداخلية أولاً، تقليل حركة الانتقال، مربع التفريغ Weeding Box، وتصدير **G-Code** لـ GRBL/Marlin/Ruida و**DXF R12** و**PLT**) مع **7 إضافات جاهزة**: **LightBurn** و**RDWorks / Ruida** و**EZCad Fiber** و**LaserDRW** و**LaserGRBL** و**InkCut / VisiCut** و**HPGL Vinyl Plotter**، وإمكانية إضافة بلاجنات مخصصة بصيغة JSON/TOML أو سكربتات Rhai.
-- **62 أداة تفاعلية حقيقية ومساحات عمل احترافية (`coree-app`):** تشمل فرشاة المعالجة (Healing) والتفتيح/التغميق (Dodge/Burn) والتعبئة النقطية (Flood Fill) و10 تعبئات PostScript إجرائية، وملاءمة الصفحة للمحتوى بضغطة واحدة (Autofit Page)، ولوحة الرموز والخطوط (Glyphs Docker)، و6 مساحات عمل جاهزة واختصارات لوحة المفاتيح الاحترافية.
-- **تكامل كامل مع لينكس وويندوز:** إنهاء مشكلة ظهور ملفات `.cdr` كملفات ZIP على لينكس مع معاينة مصغّرة حقيقية في مدير الملفات، وتوفير حزم **Flatpak** و**`.deb`** و**`.AppImage`** على لينكس، ومثبّت **`.msi`** ونسخة **`.zip` محمولة** على ويندوز مع دعم كامل لأسماء الملفات العربية (`UTF-8`).
+### أبرز مزايا الإصدار `v0.3.0`
+- **تصدير طباعي دقيق بدون مربعات صماء (`PDF`, `EPS`, `SVG`) + طباعة نظامية (`Ctrl+P`):** تحويل النصوص العربية واللاتينية إلى منحنيات بيزييه حقيقية عبر `cosmic-text`/`swash`، وتصدير `/Separation` لألوان Spot (`CutContour`)، والتدرجات `/ShadingType 2/3`، و`/OutputIntents` مع دعم ملفات `.icc`/`.icm` المخصصة ومعاينة طباعية حية، إضافة إلى إرسال الطباعة مباشرة إلى طابعات Linux (`CUPS`) وWindows.
+- **محرك `.cdr` شامل عبر الأجيال (`coree-cdr`):** دعم قراءة/كتابة RIFF (`v4–v13`) وZIP (`X4–X5`) وZCF الحديث (`X6–2025` / `v16–26`)، وتصحيح مقياس التدرجات المحلي (mm) ووراثة أنماط `document.cdss`، وأوزان الخطوط الرقمية والعربية (`RTL`/`bidi_font_family`/`OpenType`)، وكتل `arrw`/`bmpf`/`vpat`/`clrs`، واستعادة النصوص العربية القديمة `CP1256`.
+- **أدوات تفاعلية كاملة وواجهة عربية/إنجليزية حية:** حوارا **`Edit Fill (F11)`** و**`Outline Pen (F12)`**، ومقابض التدرجات الأربعة وإضافة النقاط بالنقر المزدوج، وتفكيك التأثيرات `Ctrl+K`، وطبقة `Desktop` العابرة للصفحات، وقفل محتوى `PowerClip`، و**65 أداة تفاعلية** مع **7 بلاجنات ليزر وبلوتر** (`LightBurn`, `RDWorks`, `EZCad`, `LaserDRW`, `LaserGRBL`, `InkCut`, `HPGL Plotter`)، ودعم شاشات HiDPI، وتصيير بلاطات متوازٍ عبر `Rayon`، وحفظ كامل لمساحة العمل `.coreews` مع محرر اختصارات مخصصة ودعم لوحة المفاتيح العربية و`unicode-bidi`.
+- **تكامل أصلي متقدم مع Linux وWindows:** فتح التبويبات في نفس النافذة عبر IPC (`--new-window` لنافذة مستقلة)، ومشغّل مزدوج على Windows (`coree.exe` للواجهة و`coree.com` لسطر الأوامر)، وعزل أذونات قواعد البيانات المحلية على Unix (`0700`/`0600`)، وحزم **Flatpak** و**`.deb`** و**`.AppImage`** على Linux ومثبّت **`.msi`** ونسخة **`.zip` محمولة** على Windows.
 
 ### التثبيت على لينكس وويندوز
 
-- **لينكس (Ubuntu/Debian `.deb`):** `sudo apt install ./coree_0.2.0_amd64.deb`
+- **لينكس (Ubuntu/Debian `.deb`):** `sudo apt install ./coree_0.3.0_amd64.deb`
 - **لينكس (التثبيت المحلي من المصدر بدون `sudo`):**
   ```bash
   git clone https://github.com/ahrrfy/coree.git
@@ -189,7 +186,7 @@ cargo fmt --all -- --check
   ./packaging/linux/install-linux.sh
   ~/.local/bin/coree --diagnostics
   ```
-- **ويندوز:** شغّل المثبّت `coree-v0.2.0-x86_64-windows-setup.msi` أو فك ضغط النسخة المحمولة `coree-v0.2.0-x86_64-windows-portable.zip` (مع سكربت ربط الملفات بضغطة واحدة `register-file-associations.cmd`).
+- **ويندوز:** شغّل المثبّت `coree-v0.3.0-x86_64-windows-setup.msi` أو فك ضغط النسخة المحمولة `coree-v0.3.0-x86_64-windows-portable.zip` (تضم `coree.exe` و`coree.com` وسكربت ربط الملفات بضغطة واحدة `register-file-associations.cmd`).
 
 ---
 

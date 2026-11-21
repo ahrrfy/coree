@@ -1,19 +1,19 @@
-# Verification & End-to-End Test Plan — `coree` (`v0.2.0`)
+# Verification & End-to-End Test Plan — `coree` (`v0.3.0`)
 
-All **18 core user flows (`F01`–`F18`)** from [recon.md](recon.md) plus all **v0.2 expansion flows** (`V02-01`–`V02-08`: ZCF CDR X6–2025, PDF/AI/EPS/DXF/PLT/PSD importers, ICC v2/v4 soft-proofing, Raster Healing/Dodge/Burn/FloodFill, PostScript Fills, Autofit Page, Glyphs Docker, Laser & Engraving Plugins, 62-tool live audit, and Linux/Windows OS packaging) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
+All **18 core user flows (`F01`–`F18`)**, **v0.2 expansion flows (`V02-01`–`V02-08`)**, and **v0.2.1 / v0.3.0 deep parity & cross-OS suites (`V03-01`–`V03-07`)** from [recon.md](recon.md) and [bugs.md](bugs.md) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
 
-## Automated Suite Summary (`v0.2.0` Final Verified Workspace)
+## Automated Suite Summary (`v0.3.0+` Verified Workspace)
 
 | Crate | Unit Tests | Integration / E2E Tests | Total Passed | Failed | Ignored |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `coree-core` | 36 | 19 (`comprehensive_engine_tests.rs`, ICC v2/v4, PostScript fills, Autofit Page) | **55** | 0 | 0 |
-| `coree-cdr` | 14 | 26 (`codec_integration.rs`, ZCF v16–26, preview extraction, audit regressions) | **40** | 0 | 0 |
-| `coree-io` | 42 | 10 (`io_integration.rs`, PDF/AI, EPS, DXF, PLT, PSD, adversarial bombs) | **52** | 0 | 0 |
-| `coree-storage` | 11 | 7 (`storage_integration.rs`) | **18** | 0 | 0 |
-| `coree-render` | 1 | 23 (`render_suite.rs`, ICC soft-proof, Healing/Dodge/Burn/FloodFill, PostScript fills, Glyphs) | **24** | 0 | 0 |
+| `coree-core` | 38 | 19 (`comprehensive_engine_tests.rs`, ICC v2/v4 + synthetic sRGB/CMYK, PostScript fills, `Desktop` layer, `PowerClip` lock, delta undo) | **57** | 0 | 0 |
+| `coree-cdr` | 19 | 26 (`codec_integration.rs`, ZCF v16–26, `cdss` inheritance/RTL weights, RIFF `arrw`/`vpat`/`clrs`, v7–v15 fallbacks, audit regressions) | **45** | 0 | 0 |
+| `coree-io` | 46 | 10 (`io_integration.rs`, PDF `/OutputIntents` + Arabic curves + `/Separation` + `/SMask`, EPS inline hex + curves, SVG patterns, DXF, PLT, PSD) | **56** | 0 | 0 |
+| `coree-storage` | 12 | 7 (`storage_integration.rs`, WAL crash recovery + Unix `0700`/`0600` DB & autosave permission hardening) | **19** | 0 | 0 |
+| `coree-render` | 3 | 23 (`render_suite.rs`, Rayon parallel dirty-tile cache, `lower_effects_to_primitives`, shared font DB, soft-proofing, lenses, Arabic/Kashida) | **26** | 0 | 0 |
 | `coree-prod` | 31 | 30 (`integration_production.rs`: 16 + `laser_and_plugins_suite.rs`: 14) | **61** | 0 | 0 |
-| `coree-app` | 9 | 39 (`studio_integration.rs`: 15 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **48** | 0 | 0 |
-| **Workspace Total (`v0.2.0`)** | **144** | **154** | **298** | **0** | **0** |
+| `coree-app` | 18 | 41 (`studio_integration.rs`: 17 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **59** | 0 | 0 |
+| **Workspace Total (`v0.3.0+`)** | **167** | **156** | **323** | **0** | **0** |
 
 Additional verification gates passing with exit code `0`:
 - `cargo test --workspace --doc` — **0 failures**
@@ -95,3 +95,17 @@ Additional verification gates passing with exit code `0`:
 | `V02-06` | 62 Live Tools & Workspaces | Happy | All 62 tools across 15 Toolbox flyout groups, muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2-F4`, `F9`, `Space`, `Ctrl+K/L/Q/D/R/J`), 6 Workspace presets + `.coreews` JSON round-trip | `coree-app::tools_62_audit` (Stage B1) | **PASS** |
 | `V02-07` | Linux OS Integration & Packages | Packaging Gate | `coree-mime.xml` + isolated `gio info` confirms zero ZIP-icon misclassification on X6/X4/RIFF `.cdr` & `.cdr.zip`; `coree.desktop`, `io.github.ahrrfy.coree.metainfo.xml`, `io.github.ahrrfy.coree.yml`, `build-deb.sh` (`dpkg-deb`) validated | `desktop-file-validate`, `appstreamcli validate --no-net`, `update-mime-database`, `dpkg-deb` | **PASS** |
 | `V02-08` | Windows Packaging & Release CI | Packaging Gate | `coree.ico` (4 PNG frames `16/32/48/256`, CRC OK), `coree.exe.manifest` (`PerMonitorV2` + `UTF-8`), `coree.rc`, `wix/main.wxs` XML valid, `register-file-associations.cmd`, `.github/workflows/{ci,release}.yml` YAML valid & 0 brand hits | Python binary/XML/YAML validators + `sweep.py` | **PASS** |
+
+---
+
+## v0.2.1 & v0.3.0+ Deep Audit & Hardening Matrix (`V03-01`–`V03-07`)
+
+| Case ID | Capability | Type | Scenario Verified | Automated / CI Reference | Result |
+| --- | --- | --- | --- | --- | --- |
+| `V03-01` | Print Export, Arabic Curves & ICC `/OutputIntents` | Hardening | Arabic RTL PDF/EPS curved glyphs, `/Separation` Spot inks, `/ShadingType 2/3` gradients, `/SMask` composites, custom `.icc`/`.icm` profile embedding, cross-page `Desktop` layer export | `coree-io::io_integration::pdf_embeds_custom_icc_profile_and_exports_desktop_layer_across_pages` + `pdf_arabic_curves_*` | **PASS** |
+| `V03-02` | Legacy CDR & ZCF `cdss` Deep Decoding | Hardening | RIFF `arrw`/`bmpf`/`vpat`/`clrs` handlers + legacy `v7–v15` `fild`/`outl` fallbacks; `[0..1]` vs local-mm gradient rescaling; cycle-guarded `cdss` inheritance + RTL weights (`100..=900`) | `coree-cdr::codec_integration::legacy_arrw_vpat_clrs_and_v7_outl_fallbacks_decode_cleanly` + `cdss_parses_latin_and_rtl_character_blocks_with_numeric_weight` | **PASS** |
+| `V03-03` | Interactive Fills, `F11`/`F12`, Guides, `Ctrl+K` & `PowerClip` Lock | UI / Engine | Modal `F11`/`F12` editors; 4-type interactive gradient stop insertion & focal drag; `Ctrl+K` `lower_effects_to_primitives`; `PowerClip::lock_contents`; sparse `DocumentDelta` undo | `coree-app::studio_integration::wave_d_v030_*` + `coree-app::lib::interactive_fill_inserts_interpolated_stops_*` | **PASS** |
+| `V03-04` | Parallel Dirty Tiles, Shared Fonts & Arabic BiDi UI | Performance / i18n | `OnceLock<Arc<fontdb::Database>>` shared cache; Rayon `par_iter_mut().for_each_init` matching sequential render pixel-for-pixel; `unicode-bidi` mixed Arabic/Latin reordering + `physical_key` shortcuts | `coree-render::lib::parallel_dirty_tile_cache_matches_sequential_pixel_output` + `coree-app::lib::bidi_helper_*` | **PASS** |
+| `V03-05` | Single-Instance IPC, `.coreews` v2 & Custom Shortcuts | Studio UX | TCP loopback single-instance tab handoff + stale lock cleanup; `DockState` finite-rect sanitization; full `.coreews` v2 & SQLite persistence; live `CustomShortcutMap` editor | `coree-app::lib::ipc_single_instance_handoff_and_stale_cleanup_work` + `custom_shortcut_map_*` | **PASS** |
+| `V03-06` | Native OS Print Spooler (`Ctrl+P`), Dual Windows CLI & Unix Security | OS / Security | CUPS (`lpstat`/`lp`) & Windows Spooler arg/JSON parsing; paired Console `coree-cli`/`coree.com`; Unix `0700` dir & `0600` SQLite/autosave blob permissions | `coree-app::lib::printing::tests::*` + `coree-storage::db::tests::unix_storage_directories_and_db_have_owner_only_permissions` | **PASS** |
+| `V03-07` | Cross-Platform CI & Clean-Room Launch Hygiene | Release / Launch | GitHub Actions `ubuntu-latest` & `windows-latest` CI + WiX MSI + `.deb`/`.AppImage`/`.tar.gz`; `sweep.py` clean; `listing.py` (`0` errors / `0` warnings) | `.github/workflows/{ci,release}.yml` + `listing.py` + `sweep.py` | **PASS** |
