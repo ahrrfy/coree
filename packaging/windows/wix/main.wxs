@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- WiX Toolset v4 MSI Installer Manifest for coree (64-bit Windows) -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?ifndef BinaryPath?>
+    <?define BinaryPath = "target\release\coree.exe"?>
+  <?endif?>
+  <?ifndef Version?>
+    <?define Version = "0.1.0"?>
+  <?endif?>
+
+  <Package
+      Name="coree Vector Graphics Studio"
+      Manufacturer="coree contributors"
+      Version="$(var.Version)"
+      UpgradeCode="8A6E4D1B-7F32-4C9B-A5E1-2B4E9C6F1D08"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <SummaryInformation
+        Description="coree — Clean-room offline vector graphics, multipage layout &amp; print production studio (MPL-2.0)"
+        Manufacturer="coree contributors" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of coree is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="coree" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="CoreeProgramMenuDir" Name="coree" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="CoreeComponents" Directory="INSTALLFOLDER">
+      <!-- Primary binary + CLI PATH + file associations -->
+      <Component Id="CoreeMainBinary" Guid="4B9D2A77-31E8-4F62-9C0A-7D51E83A21F4">
+        <File
+            Id="CoreeExe"
+            Source="$(var.BinaryPath)"
+            KeyPath="yes"
+            Checksum="yes" />
+
+        <Environment
+            Id="CoreePathEnv"
+            Name="PATH"
+            Value="[INSTALLFOLDER]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+
+        <ProgId Id="coree.coree" Description="coree Vector Graphics Document">
+          <Extension Id="coree" ContentType="application/x-coree">
+            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+
+        <ProgId Id="coree.cdr" Description="CDR Vector Graphics Document">
+          <Extension Id="cdr" ContentType="application/x-cdr">
+            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+
+        <ProgId Id="coree.cdt" Description="CDT Vector Graphics Template">
+          <Extension Id="cdt" ContentType="application/x-cdt">
+            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+
+        <ProgId Id="coree.cmx" Description="CMX Vector Exchange Document">
+          <Extension Id="cmx" ContentType="application/x-cmx">
+            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+
+        <ProgId Id="coree.cpt" Description="CPT Multi-Layer Raster Image">
+          <Extension Id="cpt" ContentType="application/x-cpt">
+            <Verb Id="open" Command="Open with coree" TargetFile="CoreeExe" Argument='"%1"' />
+          </Extension>
+        </ProgId>
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="CoreeShortcuts" Directory="CoreeProgramMenuDir">
+      <Component Id="CoreeStartMenuShortcut" Guid="9E3C6F12-5A84-4B7D-8E21-6C4A9B0D3E75">
+        <Shortcut
+            Id="StartMenuCoreeShortcut"
+            Name="coree"
+            Description="Clean-room offline vector graphics &amp; print production studio"
+            Target="[#CoreeExe]"
+            WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveCoreeProgramMenuDir" On="uninstall" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\coree\Install"
+            Name="StartMenuInstalled"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="MainFeature" Title="coree Vector Studio" Level="1">
+      <ComponentGroupRef Id="CoreeComponents" />
+      <ComponentGroupRef Id="CoreeShortcuts" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=coree
+GenericName=Vector Graphics & Print Production Studio
+Comment=Clean-room offline vector illustration, multipage layout, and print production studio
+Exec=coree %F
+Icon=coree
+Terminal=false
+Categories=Graphics;VectorGraphics;2DGraphics;
+MimeType=application/x-coree;application/x-cdr;application/x-cdt;application/x-cmx;application/x-cpt;image/svg+xml;
+Keywords=vector;graphics;illustration;prepress;cmyk;cdr;svg;dxf;packaging;cutcontour;arabic;
+StartupNotify=true
+StartupWMClass=coree

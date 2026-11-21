@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-coree">
+    <comment>coree Vector Graphics Document</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.coree"/>
+    <icon name="coree"/>
+  </mime-type>
+
+  <mime-type type="application/x-cdr">
+    <comment>CDR Vector Graphics Document</comment>
+    <magic priority="60">
+      <match type="string" value="RIFF" offset="0">
+        <match type="string" value="CDR" offset="8"/>
+      </match>
+      <match type="string" value="RIFX" offset="0">
+        <match type="string" value="CDR" offset="8"/>
+      </match>
+    </magic>
+    <glob pattern="*.cdr"/>
+    <icon name="coree"/>
+  </mime-type>
+
+  <mime-type type="application/x-cdt">
+    <comment>CDT Vector Graphics Template</comment>
+    <magic priority="60">
+      <match type="string" value="RIFF" offset="0">
+        <match type="string" value="CDT" offset="8"/>
+      </match>
+      <match type="string" value="RIFX" offset="0">
+        <match type="string" value="CDT" offset="8"/>
+      </match>
+    </magic>
+    <glob pattern="*.cdt"/>
+    <icon name="coree"/>
+  </mime-type>
+
+  <mime-type type="application/x-cmx">
+    <comment>CMX Vector Exchange Document</comment>
+    <magic priority="60">
+      <match type="string" value="RIFF" offset="0">
+        <match type="string" value="CMX" offset="8"/>
+      </match>
+      <match type="string" value="RIFX" offset="0">
+        <match type="string" value="CMX" offset="8"/>
+      </match>
+    </magic>
+    <glob pattern="*.cmx"/>
+    <icon name="coree"/>
+  </mime-type>
+
+  <mime-type type="application/x-cpt">
+    <comment>CPT Multi-Layer Raster Image</comment>
+    <magic priority="60">
+      <match type="string" value="CPT7FILE" offset="0"/>
+      <match type="string" value="CPT8FILE" offset="0"/>
+      <match type="string" value="CPT9FILE" offset="0"/>
+      <match type="string" value="RIFF" offset="0">
+        <match type="string" value="CPT " offset="8"/>
+      </match>
+    </magic>
+    <glob pattern="*.cpt"/>
+    <icon name="coree"/>
+  </mime-type>
+</mime-info>
