@@ -36,7 +36,7 @@ and pull requests that violate this Code of Conduct.
 
 Instances of abusive, harassing, or unacceptable behavior may be reported to
 the project maintainers via the repository issue tracker or GitHub repository
-maintainers at `https://github.com/ahrrfy/corelee`. All reports will be
+maintainers at `https://github.com/ahrrfy/coree`. All reports will be
 reviewed fairly and confidentially.
 
 ## Attribution

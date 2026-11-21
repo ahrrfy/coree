@@ -60,7 +60,7 @@ resource exhaustion on a malformed file, path traversal, or sandbox escape):
 1. **Do not** open a public GitHub issue containing an unpatched exploit or
    weaponized sample file.
 2. Report the issue privately via GitHub Security Advisories on the repository
-   (`https://github.com/ahrrfy/corelee/security/advisories/new`).
+   (`https://github.com/ahrrfy/coree/security/advisories/new`).
 3. Include:
    - Affected crate(s) and commit hash or version
    - Minimal reproduction file or steps

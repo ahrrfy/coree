@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-repository = "https://github.com/ahrrfy/corelee"
+repository = "https://github.com/ahrrfy/coree"
 authors = ["coree contributors"]
 
 [workspace.dependencies]

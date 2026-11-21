@@ -32,7 +32,7 @@ Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](
 
 | candidate | US trademark (`tmsearch.uspto.gov`, class 9 & 42) | EU trademark (`euipo.europa.eu` / TMview) | Canada (`ised-isde.canada.ca`) | Global (WIPO Global Brand DB) | Domain (`whois` / registrar) | Linux / App Stores (Flathub, Snap, MS Store, Mac) | Handles (GitHub, X, Mastodon, YouTube) | Web (`"<name>" vector graphics`) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **`coree`** | **to run** *(flag: assess similarity to `Corel` in Class 9)* | **to run** | **to run** | **to run** | **to run** (`coree.org`, `coree.app`) | **to run** | **to run** (`github.com/ahrrfy/corelee` repo exists; org handle to run) | **to run** |
+| **`coree`** | **to run** *(flag: assess similarity to `Corel` in Class 9)* | **to run** | **to run** | **to run** | **to run** (`coree.org`, `coree.app`) | **to run** | **to run** (`github.com/ahrrfy/coree` repo exists; org handle to run) | **to run** |
 | **`Platen`** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** |
 | **`Burin`** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** |
 | **`NodePress`** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** | **to run** |

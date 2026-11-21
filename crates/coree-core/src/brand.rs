@@ -20,7 +20,7 @@ pub const NATIVE_EXT: &str = "coree";
 pub const LICENSE: &str = "MPL-2.0";
 
 /// Public source repository URL.
-pub const REPO_URL: &str = "https://github.com/ahrrfy/corelee";
+pub const REPO_URL: &str = "https://github.com/ahrrfy/coree";
 
 /// Crate semantic version compiled into the binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(DISPLAY_NAME, "coree");
         assert_eq!(NATIVE_EXT, "coree");
         assert_eq!(LICENSE, "MPL-2.0");
-        assert_eq!(REPO_URL, "https://github.com/ahrrfy/corelee");
+        assert_eq!(REPO_URL, "https://github.com/ahrrfy/coree");
         assert!(TRADEMARK_NOTICE.contains("clean-room"));
         assert!(TRADEMARK_NOTICE.contains("NOT affiliated"));
 

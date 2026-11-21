@@ -952,7 +952,7 @@ mod tests {
             weld_modules: true,
             ..QrCodeOptions::default()
         };
-        let qr = generate_qr_code("https://github.com/ahrrfy/corelee", &opts).unwrap();
+        let qr = generate_qr_code("https://github.com/ahrrfy/coree", &opts).unwrap();
         assert!(qr.module_count >= 21);
         assert_eq!(qr.bounds.width(), 30.0);
         assert_eq!(qr.bounds.height(), 30.0);
