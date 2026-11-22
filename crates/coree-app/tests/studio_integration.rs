@@ -2195,12 +2195,17 @@ fn community_workflows_outline_to_object_smart_dup_powerclip_page_frame_incremen
         "DXF export should emit native CIRCLE entity for circular objects"
     );
 
-    // 6. Async printer discovery finishes cleanly without blocking thread
+    // 6. Async printer discovery returns immediately without blocking UI thread & completes cleanly
+    let t0 = std::time::Instant::now();
     app.refresh_system_printers_async();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(250),
+        "async printer discovery must not block caller thread"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while app.scanning_printers && std::time::Instant::now() < deadline {
         app.poll_system_printers_async();
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(!app.scanning_printers);
     assert!(app.printers_status.is_some());

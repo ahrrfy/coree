@@ -164,7 +164,7 @@ pub fn parse_lpstat_output(lpstat_p: &str, lpstat_d: &str) -> Vec<PrinterInfo> {
     out
 }
 
-/// Parses JSON produced by PowerShell `Get-Printer | Select-Object Name,PrinterStatus | ConvertTo-Json`.
+/// Parses JSON produced by PowerShell `Get-Printer` / `Win32_Printer` `ConvertTo-Json`.
 #[must_use]
 pub fn parse_powershell_printers(json_text: &str) -> Vec<PrinterInfo> {
     let trimmed = json_text.trim();
@@ -186,20 +186,36 @@ pub fn parse_powershell_printers(json_text: &str) -> Vec<PrinterInfo> {
             if name.is_empty() {
                 return None;
             }
-            let status = match v.get("PrinterStatus") {
-                Some(serde_json::Value::Number(n)) => match n.as_u64() {
-                    Some(0) => "Normal".to_owned(),
-                    Some(1) => "Paused".to_owned(),
-                    Some(2) => "Error".to_owned(),
-                    Some(other) => format!("Status({other})"),
-                    None => "Ready".to_owned(),
-                },
-                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
-                _ => "Ready".to_owned(),
+            let is_default = v
+                .get("Default")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let offline = v
+                .get("WorkOffline")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let status = if offline {
+                "Offline".to_owned()
+            } else {
+                match v.get("PrinterStatus") {
+                    Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                        Some(0) => "Normal".to_owned(),
+                        Some(1) => "Paused".to_owned(),
+                        Some(2) => "Error".to_owned(),
+                        Some(3) => "Idle".to_owned(),
+                        Some(4) => "Printing".to_owned(),
+                        Some(other) => format!("Status({other})"),
+                        None => "Ready".to_owned(),
+                    },
+                    Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                        s.trim().to_owned()
+                    }
+                    _ => "Ready".to_owned(),
+                }
             };
             Some(PrinterInfo {
                 name,
-                is_default: false,
+                is_default,
                 status,
             })
         })
@@ -210,12 +226,15 @@ pub fn parse_powershell_printers(json_text: &str) -> Vec<PrinterInfo> {
 pub fn list_system_printers() -> Result<Vec<PrinterInfo>, String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let out = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "Get-Printer | Select-Object Name,PrinterStatus | ConvertTo-Json -Compress",
+                "Get-CimInstance Win32_Printer | Select-Object Name,PrinterStatus,Default,WorkOffline | ConvertTo-Json -Compress",
             ])
             .output()
             .map_err(|e| format!("failed to query Windows printers: {e}"))?;
@@ -228,27 +247,7 @@ pub fn list_system_printers() -> Result<Vec<PrinterInfo>, String> {
             });
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut printers = parse_powershell_printers(&stdout);
-        // Query default printer name cleanly if available.
-        if let Ok(def_out) = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-CimInstance Win32_Printer -Filter 'Default = True' | Select-Object -First 1 -ExpandProperty Name)",
-            ])
-            .output()
-        {
-            let def_name = String::from_utf8_lossy(&def_out.stdout).trim().to_owned();
-            if !def_name.is_empty() {
-                for p in &mut printers {
-                    if p.name == def_name {
-                        p.is_default = true;
-                    }
-                }
-            }
-        }
-        Ok(printers)
+        Ok(parse_powershell_printers(&stdout))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -483,9 +482,11 @@ printer Disabled_Plotter disabled since Mon 20 Nov 2026 -
         assert_eq!(parsed_single[0].name, "Microsoft Print to PDF");
         assert_eq!(parsed_single[0].status, "Normal");
 
-        let arr = r#"[{"Name":"Epson_SureColor","PrinterStatus":0},{"Name":"Zebra_Label","PrinterStatus":1}]"#;
+        let arr = r#"[{"Name":"Epson_SureColor","PrinterStatus":0,"Default":true},{"Name":"Zebra_Label","PrinterStatus":1}]"#;
         let parsed_arr = parse_powershell_printers(arr);
         assert_eq!(parsed_arr.len(), 2);
+        assert!(parsed_arr[0].is_default);
+        assert!(!parsed_arr[1].is_default);
         assert_eq!(parsed_arr[1].status, "Paused");
     }
 
