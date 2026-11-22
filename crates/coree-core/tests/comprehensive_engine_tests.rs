@@ -1245,3 +1245,60 @@ fn regression_nested_powerclip_world_transforms_locked_layer_hit_test_and_zero_i
     .to_bezier_path();
     assert!(zero_impact.is_empty());
 }
+
+#[test]
+fn convert_outline_to_object_and_scale_with_object_work_transactional() {
+    let mut doc = Document::new_a4("Outline Expand Test");
+    let lid = doc.pages[0].layers[0].id;
+    let mut hist = CommandHistory::default();
+
+    // 1. Filled rectangle with thick 4mm scale_with_object outline scaled 2x -> 8mm closed contour placed above fill
+    let red = Color::rgba8(220, 40, 40, 255);
+    let rect_obj = SceneObject::new(ObjectId(0), "Badge", rect_shape(20.0, 10.0))
+        .with_fill(Fill::Solid(Color::CYAN))
+        .with_outline(OutlineStyle {
+            scale_with_object: true,
+            ..OutlineStyle::solid(red.clone(), 4.0)
+        })
+        .with_transform(Affine2D::scale(2.0, 2.0));
+    let badge_id = doc.add_object(rect_obj, Some(lid)).unwrap();
+    let scaled_w = doc.objects[&badge_id]
+        .outline
+        .scaled_width_mm_for_transform(&doc.objects[&badge_id].transform);
+    assert!((scaled_w - 8.0).abs() < 1e-6);
+
+    hist.execute(&mut doc, CommandOp::ConvertOutlineToObject { id: badge_id })
+        .unwrap();
+    assert_eq!(doc.objects.len(), 2);
+    assert!(!doc.objects[&badge_id].outline.is_visible());
+    let new_id = doc.pages[0].layers[0].objects[1];
+    assert_eq!(doc.objects[&new_id].name, "Badge (Outline)");
+    assert_eq!(doc.objects[&new_id].fill, Fill::Solid(red));
+    assert!(!doc.objects[&new_id].outline.is_visible());
+    // 20x10 scaled 2x -> 40x20 + 8mm stroke -> 48x28 bounds
+    let new_bb = doc.object_bounds(new_id).unwrap();
+    assert!((new_bb.width() - 48.0).abs() < 0.25);
+    assert!((new_bb.height() - 28.0).abs() < 0.25);
+
+    hist.undo(&mut doc).unwrap();
+    assert_eq!(doc.objects.len(), 1);
+    assert!(doc.objects[&badge_id].outline.is_visible());
+
+    // 2. Open unfilled line converted in-place cleanly without spawning extra objects
+    let line_obj = SceneObject::new(
+        ObjectId(0),
+        "OpenCut",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::ZERO,
+            Point2D::new(30.0, 0.0),
+        )),
+    )
+    .with_outline(OutlineStyle::solid(Color::BLACK, 2.0));
+    let line_id = doc.add_object(line_obj, Some(lid)).unwrap();
+    hist.execute(&mut doc, CommandOp::ConvertOutlineToObject { id: line_id })
+        .unwrap();
+    assert_eq!(doc.objects[&line_id].fill, Fill::Solid(Color::BLACK));
+    assert!(!doc.objects[&line_id].outline.is_visible());
+    let line_bb = doc.object_bounds(line_id).unwrap();
+    assert!((line_bb.height() - 2.0).abs() < 0.15);
+}

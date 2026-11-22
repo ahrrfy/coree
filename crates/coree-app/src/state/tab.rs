@@ -51,6 +51,8 @@ pub struct DocumentTab {
     pub super_nudge_factor: f64,
     pub micro_nudge_divisor: f64,
     pub duplicate_offset_mm: Vec2D,
+    /// Smart step-and-repeat state: `(created_ids, cumulative_delta_xf)` for `Ctrl+D`.
+    pub last_duplicate_batch: Option<(Vec<ObjectId>, Affine2D)>,
     pub lock_aspect: bool,
     pub inline_renaming_page: Option<usize>,
     pub inline_page_name_buf: String,
@@ -112,6 +114,7 @@ impl DocumentTab {
             super_nudge_factor: 2.0,
             micro_nudge_divisor: 2.0,
             duplicate_offset_mm: Vec2D::new(5.0, 5.0),
+            last_duplicate_batch: None,
             lock_aspect: true,
             inline_renaming_page: None,
             inline_page_name_buf: String::new(),

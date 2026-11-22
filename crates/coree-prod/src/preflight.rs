@@ -661,7 +661,7 @@ fn check_object(
 
     // 4. Hairline outlines (< min_outline_width_mm) on non-cut layers
     if !layer.is_cut_layer && !is_marks && obj.outline.is_visible() {
-        let eff_w = obj.outline.effective_width_mm();
+        let eff_w = obj.outline.scaled_width_mm_for_transform(&world_xf);
         if obj.outline.is_hairline || eff_w + 1e-6 < rules.min_outline_width_mm {
             issues.push(PreflightIssue {
                 severity: PreflightSeverity::Warning,

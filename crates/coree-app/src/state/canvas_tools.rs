@@ -511,6 +511,34 @@ impl StudioApp {
     #[must_use]
     pub fn hit_test_canvas_point(&self, world_pt: Point2D, tol_mm: f64) -> Option<ObjectId> {
         let tab = self.active_tab()?;
+        if let Some(pc_id) = tab.powerclip_edit_id {
+            if let Some(cid) = hit_test_powerclip_contents(&tab.document, pc_id, world_pt, tol_mm) {
+                return Some(cid);
+            }
+            if self.treat_all_objects_as_filled {
+                if let Some(NodePayload::PowerClip { contents, .. }) =
+                    tab.document.objects.get(&pc_id).map(|o| &o.payload)
+                {
+                    for &cid in contents.iter().rev() {
+                        let Some(obj) = tab.document.objects.get(&cid) else {
+                            continue;
+                        };
+                        if !obj.visible || obj.locked {
+                            continue;
+                        }
+                        if let Some(wp) = tab.document.world_path_of(cid) {
+                            if wp.contains_point(world_pt) {
+                                return Some(cid);
+                            }
+                        } else if let Some(bb) = tab.document.world_object_bounds(cid) {
+                            if bb.contains_point(world_pt) {
+                                return Some(cid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let page_idx = tab.document.active_page_index;
         if let Some(hit) = hit_test_point(&tab.document, page_idx, world_pt, tol_mm) {
             return Some(hit);

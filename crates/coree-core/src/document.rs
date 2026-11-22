@@ -1715,6 +1715,115 @@ impl Document {
         Ok(())
     }
 
+    /// Converts an object's visible outline stroke into an independent closed filled path object
+    /// (`Ctrl+Shift+Q`: *Convert Outline to Object*).
+    ///
+    /// - If the object also has a visible fill, preserves the filled object (clearing its outline)
+    ///   and adds a new filled `"<Name> (Outline)"` object right above it, returning `Ok(Some(new_id))`.
+    /// - If the object has no visible fill (`Fill::None`), converts the object itself in-place into
+    ///   the stroked contour shape filled with the outline color, returning `Ok(None)`.
+    pub fn convert_outline_to_object(&mut self, id: ObjectId) -> CoreResult<Option<ObjectId>> {
+        let obj = self
+            .objects
+            .get(&id)
+            .cloned()
+            .ok_or(CoreError::ObjectNotFound(id))?;
+        if obj.locked {
+            return Err(CoreError::ObjectLocked(id));
+        }
+        if !obj.outline.is_visible() {
+            return Err(CoreError::InvalidGeometry(format!(
+                "object {id} has no visible outline to convert"
+            )));
+        }
+
+        let local_path = match &obj.payload {
+            NodePayload::Path(p) => p.clone(),
+            NodePayload::Shape(s) => s.to_bezier_path(),
+            NodePayload::Table(t) => t.to_grid_paths(),
+            NodePayload::Connector(conn) => {
+                let mut visiting = HashSet::new();
+                visiting.insert(id);
+                let (a, b) =
+                    self.resolve_connector_endpoints_inner(conn, &obj.transform, 0, &mut visiting);
+                let world_route = conn.route_path(a, b);
+                if let Some(inv) = obj.transform.inverse() {
+                    world_route.transformed(&inv)
+                } else {
+                    world_route
+                }
+            }
+            NodePayload::PowerClip { container, .. } => (**container).clone(),
+            _ => {
+                return Err(CoreError::InvalidGeometry(format!(
+                    "object {id} outline cannot be converted to an object directly"
+                )));
+            }
+        };
+
+        // Stroke in parent-local world-scaled space when `scale_with_object` or anisotropic transform
+        let stroke_xf = if matches!(obj.payload, NodePayload::Connector(_))
+            && obj.transform.inverse().is_none()
+        {
+            Affine2D::IDENTITY
+        } else {
+            obj.transform
+        };
+        let transformed_path = local_path.transformed(&stroke_xf);
+        let eff_width = obj.outline.scaled_width_mm_for_transform(&stroke_xf);
+        let outline_path = crate::boolean::stroke_to_closed_path(
+            &transformed_path,
+            &obj.outline,
+            Some(eff_width),
+        )?;
+
+        if obj.fill.is_visible() {
+            let layer_id = self.layer_of_object(id);
+            let mut new_obj = SceneObject::new(
+                ObjectId(0),
+                format!("{} (Outline)", obj.name),
+                NodePayload::Path(outline_path),
+            )
+            .with_fill(Fill::Solid(obj.outline.color.clone()))
+            .with_outline(OutlineStyle::none());
+            new_obj.blend_mode = obj.blend_mode;
+            new_obj.opacity = obj.opacity;
+
+            if let Some(orig) = self.objects.get_mut(&id) {
+                orig.outline = OutlineStyle::none();
+            }
+            let new_id = self.add_object(new_obj, layer_id)?;
+            // Place converted outline right above the original object inside the layer stack
+            if let Some(lid) = layer_id {
+                for page in &mut self.pages {
+                    if let Some(layer) = page.layers.iter_mut().find(|l| l.id == lid) {
+                        if let Some(new_pos) = layer.objects.iter().position(|&o| o == new_id) {
+                            layer.objects.remove(new_pos);
+                            if let Some(orig_pos) = layer.objects.iter().position(|&o| o == id) {
+                                layer.objects.insert(orig_pos + 1, new_id);
+                            } else {
+                                layer.objects.push(new_id);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            self.touch();
+            Ok(Some(new_id))
+        } else {
+            let stroke_color = obj.outline.color.clone();
+            if let Some(target) = self.objects.get_mut(&id) {
+                target.payload = NodePayload::Path(outline_path);
+                target.transform = Affine2D::IDENTITY;
+                target.fill = Fill::Solid(stroke_color);
+                target.outline = OutlineStyle::none();
+            }
+            self.touch();
+            Ok(None)
+        }
+    }
+
     /// Resolves world-space endpoints for a [`ConnectorObject`].
     #[must_use]
     pub fn resolve_connector_endpoints(&self, conn: &ConnectorObject) -> (Point2D, Point2D) {
@@ -1904,7 +2013,7 @@ impl Document {
     pub fn combined_bounds(&self, ids: &[ObjectId]) -> Option<Rect2D> {
         let mut acc: Option<Rect2D> = None;
         for &id in ids {
-            if let Some(bb) = self.object_bounds(id) {
+            if let Some(bb) = self.world_object_bounds(id) {
                 acc = Some(match acc {
                     Some(prev) => prev.union(bb),
                     None => bb,

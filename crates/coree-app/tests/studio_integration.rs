@@ -1950,3 +1950,271 @@ fn wave_d_v030_break_effect_powerclip_desktop_icc_and_workspace_bundle_suite() {
     );
     let _ = Point2D::ZERO;
 }
+
+#[test]
+fn community_workflows_outline_to_object_smart_dup_powerclip_page_frame_incremental_and_async_printers(
+) {
+    let dir = TempTestDir::new("community-workflows");
+    let mut app = StudioApp::new_headless();
+    app.show_welcome = false;
+    let (pw, ph, layer_id) = {
+        let tab = app.active_tab().unwrap();
+        let p = tab.document.active_page().unwrap();
+        (p.width_mm, p.height_mm, tab.active_layer_id)
+    };
+
+    // 1. Ctrl+Shift+Q Convert Outline to Object (preserving scale_with_object + z-order + undo/redo)
+    assert_eq!(
+        resolve_shortcut(
+            ShortcutProfile::ClassicStudio,
+            Key::Q,
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+            false,
+        ),
+        Some(ShortcutAction::ConvertOutlineToObject)
+    );
+    let stroked_rect = SceneObject::new(
+        ObjectId(0),
+        "StrokedBox",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 10.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(20, 120, 220, 255)))
+    .with_outline(OutlineStyle {
+        color: Color::rgba8(0, 0, 0, 255),
+        width_mm: 2.0,
+        scale_with_object: true,
+        ..OutlineStyle::default()
+    })
+    .with_transform(Affine2D::scale(2.0, 2.0));
+    app.execute_command(CommandOp::create_object(stroked_rect, layer_id))
+        .unwrap();
+    let orig_id = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .last()
+        .unwrap();
+    let doc_snap = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap, orig_id);
+
+    app.handle_shortcut(ShortcutAction::ConvertOutlineToObject);
+    assert_eq!(app.active_tab().unwrap().document.objects.len(), 2);
+    assert!(!app.active_tab().unwrap().document.objects[&orig_id]
+        .outline
+        .is_visible());
+    app.undo().unwrap();
+    assert_eq!(app.active_tab().unwrap().document.objects.len(), 1);
+    assert!(app.active_tab().unwrap().document.objects[&orig_id]
+        .outline
+        .is_visible());
+    app.redo().unwrap();
+    assert_eq!(app.active_tab().unwrap().document.objects.len(), 2);
+
+    // 2. Smart Step-and-Repeat Ctrl+D (tracks interactive transform delta after Duplicate)
+    let doc_snap = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap, orig_id);
+    let b0 = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(orig_id)
+        .unwrap();
+    let first_dups = app.duplicate_selection().unwrap();
+    assert_eq!(first_dups.len(), 1);
+    let dup1 = first_dups[0];
+    // Move dup1 by (+15, +5) relative to its initial (+5, +5) offset -> total delta (+20, +10)
+    app.execute_command(CommandOp::TransformObjects {
+        ids: vec![dup1],
+        affine: Affine2D::translate(15.0, 5.0),
+    })
+    .unwrap();
+    let second_dups = app.duplicate_selection().unwrap();
+    assert_eq!(second_dups.len(), 1);
+    let b2 = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(second_dups[0])
+        .unwrap();
+    assert!((b2.min_x - (b0.min_x + 40.0)).abs() < 1e-4);
+    assert!((b2.min_y - (b0.min_y + 20.0)).abs() < 1e-4);
+
+    // 3. PowerClip Edit Mode: enter, hit-test internal child, and exit via Esc
+    let child_circle = SceneObject::new(
+        ObjectId(0),
+        "ClipChild",
+        NodePayload::Shape(ParametricShape::Ellipse {
+            rx: 8.0,
+            ry: 8.0,
+            mode: coree_core::EllipseMode::Full,
+            start_deg: 0.0,
+            end_deg: 360.0,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 50, 50, 255)))
+    .with_transform(Affine2D::translate(120.0, 120.0));
+    let frame_rect = SceneObject::new(
+        ObjectId(0),
+        "ClipFrame",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 50.0,
+            height: 50.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(240, 240, 240, 255)))
+    .with_transform(Affine2D::translate(100.0, 100.0));
+    app.execute_command(CommandOp::create_object(child_circle, layer_id))
+        .unwrap();
+    let child_id = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .last()
+        .unwrap();
+    app.execute_command(CommandOp::create_object(frame_rect, layer_id))
+        .unwrap();
+    let frame_id = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects
+        .keys()
+        .last()
+        .unwrap();
+    let doc_snap = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_many(&doc_snap, &[child_id, frame_id]);
+    app.create_powerclip_from_selection();
+    assert!(matches!(
+        app.active_tab().unwrap().document.objects[&frame_id].payload,
+        NodePayload::PowerClip { .. }
+    ));
+    assert_eq!(
+        app.hit_test_canvas_point(Point2D::new(120.0, 120.0), 1.0),
+        Some(frame_id)
+    );
+    assert!(app.enter_powerclip_edit(frame_id));
+    assert_eq!(app.active_tab().unwrap().powerclip_edit_id, Some(frame_id));
+    assert_eq!(
+        app.hit_test_canvas_point(Point2D::new(120.0, 120.0), 1.0),
+        Some(child_id)
+    );
+    // 1st Esc clears selection inside PowerClip; 2nd Esc exits PowerClip Edit Mode
+    app.handle_shortcut(ShortcutAction::EscapeCancel);
+    assert_eq!(app.active_tab().unwrap().powerclip_edit_id, Some(frame_id));
+    app.handle_shortcut(ShortcutAction::EscapeCancel);
+    assert_eq!(app.active_tab().unwrap().powerclip_edit_id, None);
+
+    // 4. Page Frame & Shift+Selection Frame helper (Toolbox Double-Click Rectangle workflow)
+    let doc_snap = app.active_tab().unwrap().document.clone();
+    app.active_tab_mut()
+        .unwrap()
+        .selection
+        .select_single(&doc_snap, frame_id);
+    let sel_frame_id = app.create_page_frame_rectangle(true).unwrap();
+    let sel_bb = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(sel_frame_id)
+        .unwrap();
+    assert!((sel_bb.min_x - 100.0).abs() < 1e-4 && (sel_bb.width() - 50.0).abs() < 1e-4);
+
+    let page_frame_id = app.create_page_frame_rectangle(false).unwrap();
+    let pg_bb = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(page_frame_id)
+        .unwrap();
+    assert!((pg_bb.width() - pw).abs() < 1e-4 && (pg_bb.height() - ph).abs() < 1e-4);
+
+    // 5. Save Incremental Copy (_v1 -> _v2) & Native DXF CIRCLE export
+    let base_file = dir.path().join("poster.coree");
+    app.save_active_as(&base_file).unwrap();
+    let v1 = app.save_incremental_copy().unwrap();
+    let v2 = app.save_incremental_copy().unwrap();
+    assert_eq!(
+        v1.file_name().and_then(|s| s.to_str()),
+        Some("poster_v1.coree")
+    );
+    assert_eq!(
+        v2.file_name().and_then(|s| s.to_str()),
+        Some("poster_v2.coree")
+    );
+    assert!(v1.exists() && v2.exists());
+
+    let top_circle = SceneObject::new(
+        ObjectId(0),
+        "CadCircle",
+        NodePayload::Shape(ParametricShape::Ellipse {
+            rx: 12.0,
+            ry: 12.0,
+            mode: coree_core::EllipseMode::Full,
+            start_deg: 0.0,
+            end_deg: 360.0,
+        }),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::default())
+    .with_transform(Affine2D::translate(80.0, 80.0));
+    app.execute_command(CommandOp::create_object(top_circle, layer_id))
+        .unwrap();
+
+    let dxf_path = dir.path().join("circle_check.dxf");
+    app.export_active(&dxf_path, &UniversalExportOptions::default())
+        .unwrap();
+    let dxf_text = std::fs::read_to_string(&dxf_path).unwrap();
+    assert!(
+        dxf_text.contains("\nCIRCLE\n"),
+        "DXF export should emit native CIRCLE entity for circular objects"
+    );
+
+    // 6. Async printer discovery finishes cleanly without blocking thread
+    app.refresh_system_printers_async();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.scanning_printers && std::time::Instant::now() < deadline {
+        app.poll_system_printers_async();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    assert!(!app.scanning_printers);
+    assert!(app.printers_status.is_some());
+
+    // 7. Full UI render parity across DarkStudio, ClassicLight & HighContrast (including PowerClip pill + Status Bar)
+    assert!(app.enter_powerclip_edit(frame_id));
+    let ctx = egui::Context::default();
+    for theme in [
+        StudioTheme::DarkStudio,
+        StudioTheme::ClassicLight,
+        StudioTheme::HighContrast,
+    ] {
+        app.set_theme(theme);
+        let mut out = ctx.run_ui(RawInput::default(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+    }
+}

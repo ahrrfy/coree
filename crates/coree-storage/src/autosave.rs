@@ -604,6 +604,7 @@ const fn command_op_type_name(op: &CommandOp) -> &'static str {
         CommandOp::SetPowerClipLock { .. } => "SetPowerClipLock",
         CommandOp::MoveToDesktopLayer { .. } => "MoveToDesktopLayer",
         CommandOp::ConvertToCurves { .. } => "ConvertToCurves",
+        CommandOp::ConvertOutlineToObject { .. } => "ConvertOutlineToObject",
         CommandOp::UpdateRaster { .. } => "UpdateRaster",
         CommandOp::Batch(_) => "Batch",
     }

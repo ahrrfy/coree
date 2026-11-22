@@ -745,7 +745,7 @@ fn emit_eps_styled_path(
             out.push_str("true setoverprint\n");
         }
         emit_eps_color(out, &outline.color, use_cmyk);
-        let raw_w = outline.effective_width_mm();
+        let raw_w = outline.scaled_width_mm_for_transform(&fill_xf);
         let width_pt = if raw_w.is_finite() {
             (raw_w * MM_TO_PT).max(0.1)
         } else {

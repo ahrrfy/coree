@@ -36,8 +36,8 @@ pub use export_render::{
     render_svg_to_rgba, RenderedImage,
 };
 pub use hit_test::{
-    hit_test_node, hit_test_point, hit_test_rect, DynamicGuideKind, DynamicGuideLine, NodeHit,
-    SnapEngine, SnapOptions,
+    hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
+    DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use raster_engine::{
     apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,

@@ -102,6 +102,7 @@ pub enum ShortcutAction {
     Group,
     Ungroup,
     ConvertToCurves,
+    ConvertOutlineToObject,
     BreakApart,
     Combine,
     TogglePowerClipLock,
@@ -161,6 +162,7 @@ pub fn resolve_shortcut(
                 return Some(ShortcutAction::Ungroup);
             }
             (Key::Q, false) if !text_focus => return Some(ShortcutAction::ConvertToCurves),
+            (Key::Q, true) if !text_focus => return Some(ShortcutAction::ConvertOutlineToObject),
             (Key::K, false) => match profile {
                 ShortcutProfile::ClassicStudio if !text_focus => {
                     return Some(ShortcutAction::BreakApart);
@@ -505,6 +507,10 @@ impl ShortcutAction {
         (ShortcutAction::Group, "Object: Group"),
         (ShortcutAction::Ungroup, "Object: Ungroup"),
         (ShortcutAction::ConvertToCurves, "Object: Convert to Curves"),
+        (
+            ShortcutAction::ConvertOutlineToObject,
+            "Object: Convert Outline to Object",
+        ),
         (ShortcutAction::BreakApart, "Object: Break Apart"),
         (ShortcutAction::Combine, "Object: Combine"),
         (
@@ -577,6 +583,7 @@ impl ShortcutAction {
             Self::Group => "object.group",
             Self::Ungroup => "object.ungroup",
             Self::ConvertToCurves => "object.convert_to_curves",
+            Self::ConvertOutlineToObject => "object.convert_outline_to_object",
             Self::BreakApart => "object.break_apart",
             Self::Combine => "object.combine",
             Self::TogglePowerClipLock => "object.powerclip_lock",
@@ -882,6 +889,7 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::ClassicStudio, ShortcutAction::Ungroup) => "Ctrl+U",
         (ShortcutProfile::StandardVector, ShortcutAction::Ungroup) => "Ctrl+Shift+G",
         (_, ShortcutAction::ConvertToCurves) => "Ctrl+Q",
+        (_, ShortcutAction::ConvertOutlineToObject) => "Ctrl+Shift+Q",
         (ShortcutProfile::ClassicStudio, ShortcutAction::BreakApart) => "Ctrl+K",
         (ShortcutProfile::StandardVector, ShortcutAction::BreakApart) => "",
         (_, ShortcutAction::Combine) => "Ctrl+L",

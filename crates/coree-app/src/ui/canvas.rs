@@ -20,7 +20,8 @@ use coree_core::{
 };
 use coree_prod::{simulate_overprint_rgba, LaserOperationKind};
 use coree_render::{
-    create_smart_fill_object, hit_test_node, hit_test_point, hit_test_rect, SnapEngine,
+    create_smart_fill_object, hit_test_node, hit_test_point, hit_test_powerclip_contents,
+    hit_test_rect, SnapEngine,
 };
 use egui::{
     pos2, vec2, Align2, Color32, ColorImage, CornerRadius, FontId, Frame, Margin, Pos2, Rect,
@@ -39,6 +40,43 @@ pub fn show_canvas_and_status(ui: &mut Ui, app: &mut StudioApp) {
 // Bottom Status Bar + Live Path Length & Area Meter HUD
 // =============================================================================
 
+fn short_color_status_label(color: &Color) -> String {
+    match color {
+        Color::Spot { name, tint, .. } => format!("{name} {:.0}%", tint * 100.0),
+        Color::Cmyk { c, m, y, k, .. } => format!(
+            "C{:.0} M{:.0} Y{:.0} K{:.0}",
+            c * 100.0,
+            m * 100.0,
+            y * 100.0,
+            k * 100.0
+        ),
+        _ => color.to_hex(),
+    }
+}
+
+fn tool_status_hint(tool: ToolId) -> &'static str {
+    match tool {
+        ToolId::Pick | ToolId::FreehandPick | ToolId::FreeTransform => {
+            "Drag+Space/RightClick: Stamp copy · Ctrl+Click: PowerClip contents"
+        }
+        ToolId::Rectangle
+        | ToolId::ThreePointRectangle
+        | ToolId::Ellipse
+        | ToolId::ThreePointEllipse => "Ctrl: Square/Circle · Shift: From center",
+        ToolId::ShapeNode => "DblClick segment: Add/Del node · Drag handles",
+        ToolId::Zoom => "Click: Zoom in · Shift+Click: Zoom out · Drag: Marquee zoom",
+        ToolId::Pan => "Drag canvas or Middle-mouse drag anywhere",
+        ToolId::Freehand | ToolId::Bezier | ToolId::Pen | ToolId::BSpline | ToolId::Polyline => {
+            "Enter/DblClick: Finish open path · Click start: Close"
+        }
+        ToolId::Crop => "Drag box · Enter/DblClick: Crop to selection",
+        ToolId::ColorEyedropper | ToolId::AttributesEyedropper => {
+            "Click object: Sample · Alt/Toggle: Apply sampled style"
+        }
+        _ => "Drag on canvas to create · Right-click for context menu",
+    }
+}
+
 fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
 
@@ -52,9 +90,11 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
         )
         .show(ui, |ui| {
             let active_tool_label = app.active_tool.label();
+            let tool_hint = tool_status_hint(app.active_tool);
             let (
                 cursor_txt,
                 sel_txt,
+                hint_or_dim_txt,
                 metrics,
                 zoom_pct,
                 color_mode,
@@ -71,7 +111,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 let c_txt = format!("({cx:.1}, {cy:.1}) {}", u.suffix());
                 let s_txt = if tab.selection.is_empty() {
                     format!(
-                        "Tool: {} · {} obj(s)",
+                        "{} · {} obj(s)",
                         active_tool_label,
                         tab.document.objects.len()
                     )
@@ -87,9 +127,21 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         TransformMode::ScaleAndMove => "Move/Scale",
                         TransformMode::RotateAndSkew => "Rotate/Skew",
                     };
-                    format!("Selected: {name} [{mode_lbl}]")
+                    format!("Sel: {name} [{mode_lbl}]")
                 } else {
-                    format!("Selected: {} objects", tab.selection.len())
+                    format!("Sel: {} objects", tab.selection.len())
+                };
+                let dim_txt = if tab.powerclip_edit_id.is_some() {
+                    "PowerClip Edit · Ctrl+Click outside or Esc to finish".to_owned()
+                } else if let Some(bb) = (!tab.selection.is_empty())
+                    .then(|| tab.selection.bounding_box(&tab.document))
+                    .flatten()
+                {
+                    let bw = u.from_mm(bb.width(), dpi);
+                    let bh = u.from_mm(bb.height(), dpi);
+                    format!("{bw:.1} × {bh:.1} {} · {tool_hint}", u.suffix())
+                } else {
+                    tool_hint.to_owned()
                 };
                 let (fc, sc) = tab
                     .selection
@@ -109,6 +161,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 (
                     c_txt,
                     s_txt,
+                    dim_txt,
                     tab.last_metrics.clone(),
                     tab.viewport.zoom * 100.0,
                     format!("{:?}", tab.document.color_mode),
@@ -121,6 +174,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 (
                     "(0.0, 0.0) mm".to_owned(),
                     "No document".to_owned(),
+                    String::new(),
                     Default::default(),
                     100.0,
                     "Cmyk".to_owned(),
@@ -132,8 +186,8 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
             };
 
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                // Zone 1: Cursor coordinates & selection summary
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // Zone 1: Cursor coordinates, selection dimensions & contextual modifier hint
                 ui.label(
                     RichText::new(cursor_txt)
                         .monospace()
@@ -142,6 +196,14 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 );
                 ui.separator();
                 ui.label(RichText::new(sel_txt).size(11.0).color(tokens.text_muted));
+                if !hint_or_dim_txt.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(hint_or_dim_txt)
+                            .size(10.5)
+                            .color(tokens.text_muted),
+                    );
+                }
                 ui.separator();
 
                 // Zone 2: Live Path Length & Area Meter HUD
@@ -224,22 +286,16 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         app.focus_docker(DockerTab::Production);
                     }
 
-                    // Active Fill (F11) & Outline (F12) mini swatches
-                    let (fill_rect, fill_resp) =
-                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
-                    ui.painter().rect(
-                        fill_rect,
-                        CornerRadius::same(2),
-                        fill_c
-                            .as_ref()
-                            .map_or(Color32::TRANSPARENT, core_color_to_egui),
-                        Stroke::new(1.0, tokens.border_input),
-                        StrokeKind::Inside,
+                    // Active Fill (F11) & Outline (F12) mini swatches + right-click quick clear
+                    let stroke_label = stroke_c
+                        .as_ref()
+                        .map_or_else(|| "None".to_owned(), short_color_status_label);
+                    ui.label(
+                        RichText::new(stroke_label)
+                            .monospace()
+                            .size(10.0)
+                            .color(tokens.text_muted),
                     );
-                    if fill_resp.on_hover_text("Edit Fill Dialog (F11)").clicked() {
-                        app.open_edit_fill_dialog();
-                    }
-
                     let (stroke_rect, stroke_resp) =
                         ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
                     ui.painter().rect(
@@ -252,11 +308,40 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                         ),
                         StrokeKind::Inside,
                     );
-                    if stroke_resp
-                        .on_hover_text("Outline Pen Dialog (F12)")
-                        .clicked()
-                    {
+                    let stroke_resp = stroke_resp
+                        .on_hover_text("Outline Pen (F12) · Right-click: Remove Outline");
+                    if stroke_resp.clicked() {
                         app.open_outline_pen_dialog();
+                    } else if stroke_resp.secondary_clicked() {
+                        app.remove_outline();
+                    }
+
+                    let fill_label = fill_c
+                        .as_ref()
+                        .map_or_else(|| "None".to_owned(), short_color_status_label);
+                    ui.label(
+                        RichText::new(fill_label)
+                            .monospace()
+                            .size(10.0)
+                            .color(tokens.text_muted),
+                    );
+                    let (fill_rect, fill_resp) =
+                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
+                    ui.painter().rect(
+                        fill_rect,
+                        CornerRadius::same(2),
+                        fill_c
+                            .as_ref()
+                            .map_or(Color32::TRANSPARENT, core_color_to_egui),
+                        Stroke::new(1.0, tokens.border_input),
+                        StrokeKind::Inside,
+                    );
+                    let fill_resp =
+                        fill_resp.on_hover_text("Edit Fill (F11) · Right-click: Remove Fill");
+                    if fill_resp.clicked() {
+                        app.open_edit_fill_dialog();
+                    } else if fill_resp.secondary_clicked() {
+                        app.remove_fill();
                     }
 
                     ui.label(
@@ -637,11 +722,46 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                 return;
             }
 
+            // Floating PowerClip Content-Edit Mode pill at top-center of canvas
+            let mut pc_bar_interacted = false;
+            if app
+                .active_tab()
+                .is_some_and(|t| t.powerclip_edit_id.is_some())
+            {
+                let pill_anchor = pos2(canvas_rect.center().x - 145.0, canvas_rect.top() + 10.0);
+                egui::Area::new(ui.scope_id().with("coree_powerclip_edit_bar"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pill_anchor)
+                    .show(ui.ctx(), |ui| {
+                        Frame::NONE
+                            .fill(tokens.surface_elevated.gamma_multiply(0.95))
+                            .stroke(Stroke::new(1.2, tokens.accent))
+                            .corner_radius(CornerRadius::same(12))
+                            .inner_margin(Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Editing PowerClip")
+                                            .size(11.5)
+                                            .strong()
+                                            .color(tokens.accent),
+                                    );
+                                    if ui.small_button("Finish (Esc)").clicked() {
+                                        app.exit_powerclip_edit();
+                                        pc_bar_interacted = true;
+                                    }
+                                });
+                            });
+                    });
+            }
+
             // Handle Ruler drag -> Create live Horizontal / Vertical Guidelines!
             handle_ruler_guide_drag(app, canvas_rect, &top_ruler_resp, &left_ruler_resp);
 
             // Handle Canvas pointer interactions (pan, cursor-centered wheel zoom, all 62 tools!)
-            handle_canvas_interaction(ui, app, canvas_rect, &canvas_resp);
+            if !pc_bar_interacted {
+                handle_canvas_interaction(ui, app, canvas_rect, &canvas_resp);
+            }
 
             // Right-Click Canvas Context Menu (disabled during Zoom right-click & mid-drag stamp duplicate)
             let allow_context_menu = app.active_tool != ToolId::Zoom
@@ -1006,6 +1126,40 @@ fn handle_canvas_interaction(
                     });
                     if let Some((pt, tol)) = pt_tol {
                         let hit = app.hit_test_canvas_point(pt, tol);
+                        let active_pc = app.active_tab().and_then(|t| t.powerclip_edit_id);
+                        if ctrl {
+                            let hit_is_pc = hit.and_then(|hid| {
+                                app.active_tab().and_then(|t| {
+                                    matches!(
+                                        t.document.objects.get(&hid).map(|o| &o.payload),
+                                        Some(NodePayload::PowerClip { .. })
+                                    )
+                                    .then_some(hid)
+                                })
+                            });
+                            if let Some(pc_id) = hit_is_pc {
+                                app.enter_powerclip_edit(pc_id);
+                                return;
+                            } else if let Some(pc_id) = active_pc {
+                                let in_pc = hit.is_some_and(|hid| {
+                                    app.active_tab().is_some_and(|t| {
+                                        let mut cur = hid;
+                                        while let Some(parent) = t.document.parent_container_of(cur)
+                                        {
+                                            if parent == pc_id {
+                                                return true;
+                                            }
+                                            cur = parent;
+                                        }
+                                        false
+                                    })
+                                });
+                                if !in_pc {
+                                    app.exit_powerclip_edit();
+                                    return;
+                                }
+                            }
+                        }
                         if let Some(tab) = app.active_tab_mut() {
                             if let Some(hit_id) = hit {
                                 tab.selection.click_object(&tab.document, hit_id, shift);
@@ -1295,8 +1449,9 @@ fn handle_canvas_interaction(
         }
     } else if resp.dragged() {
         if let Some(pos) = resp.interact_pointer_pos() {
-            // Left-Drag + Right-Click stamp duplicate while moving/transforming selection!
-            if secondary_pressed {
+            // Left-Drag + Right-Click or Spacebar stamp duplicate while moving/transforming selection!
+            let space_stamp = !text_focus && ui.input(|i| i.key_pressed(egui::Key::Space));
+            if secondary_pressed || space_stamp {
                 let can_stamp = app.active_tab().is_some_and(|t| {
                     matches!(
                         &t.drag_state,
@@ -1479,8 +1634,13 @@ fn start_canvas_drag(
                 }
             }
 
-            // 2. Hit object -> Move selection
-            let hit = hit_test_point(&tab.document, tab.document.active_page_index, pt, tol_mm)
+            // 2. Hit PowerClip child (when editing contents) or page object -> Move selection
+            let hit = tab
+                .powerclip_edit_id
+                .and_then(|pc_id| hit_test_powerclip_contents(&tab.document, pc_id, pt, tol_mm))
+                .or_else(|| {
+                    hit_test_point(&tab.document, tab.document.active_page_index, pt, tol_mm)
+                })
                 .or_else(|| {
                     if treat_filled {
                         tab.document.active_page().and_then(|page| {
@@ -3628,6 +3788,16 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             ui.close();
         }
         if ui
+            .add_enabled(
+                has_sel,
+                egui::Button::new("Convert Outline to Object (Ctrl+Shift+Q)"),
+            )
+            .clicked()
+        {
+            app.convert_outline_to_object_selection();
+            ui.close();
+        }
+        if ui
             .add_enabled(has_sel, egui::Button::new("Break Apart (Ctrl+K)"))
             .clicked()
         {
@@ -3678,6 +3848,28 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             .clicked()
         {
             app.create_powerclip_from_selection();
+            ui.close();
+        }
+        let selected_pc = app.active_tab().and_then(|t| {
+            let oid = *t.selection.objects.first()?;
+            matches!(
+                t.document.objects.get(&oid).map(|o| &o.payload),
+                Some(NodePayload::PowerClip { .. })
+            )
+            .then_some(oid)
+        });
+        if let Some(pc_id) = selected_pc {
+            if ui.button("Edit PowerClip Contents (Ctrl+Click)").clicked() {
+                app.enter_powerclip_edit(pc_id);
+                ui.close();
+            }
+        }
+        if app
+            .active_tab()
+            .is_some_and(|t| t.powerclip_edit_id.is_some())
+            && ui.button("Finish Editing PowerClip (Esc)").clicked()
+        {
+            app.exit_powerclip_edit();
             ui.close();
         }
         if ui
@@ -3913,8 +4105,27 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
     let tokens = app.theme.tokens();
     let painter = ui.painter().with_clip_rect(canvas_rect);
 
-    // 0. Live Laser Toolpath Preview Overlay
+    // 0. Live Laser Toolpath Preview Overlay + Active PowerClip Edit Boundary
     paint_laser_toolpath_overlay(&painter, app, tab, canvas_rect);
+    if let Some(pc_id) = tab.powerclip_edit_id {
+        if let Some(pc_bb) = tab.document.world_object_bounds(pc_id) {
+            let a = world_to_screen(canvas_rect, tab, pc_bb.min());
+            let b = world_to_screen(canvas_rect, tab, pc_bb.max());
+            let pr = Rect::from_two_pos(a, b);
+            let dash = Stroke::new(1.6, tokens.accent_secondary);
+            paint_dashed_line(&painter, pr.left_top(), pr.right_top(), 6.0, 4.0, dash);
+            paint_dashed_line(&painter, pr.right_top(), pr.right_bottom(), 6.0, 4.0, dash);
+            paint_dashed_line(
+                &painter,
+                pr.right_bottom(),
+                pr.left_bottom(),
+                6.0,
+                4.0,
+                dash,
+            );
+            paint_dashed_line(&painter, pr.left_bottom(), pr.left_top(), 6.0, 4.0, dash);
+        }
+    }
 
     // 1. Live Dynamic Snap Guidelines
     for g in &tab.active_guides {

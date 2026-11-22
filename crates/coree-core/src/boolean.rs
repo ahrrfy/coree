@@ -9,13 +9,18 @@
 use crate::error::{CoreError, CoreResult};
 use crate::geometry::{BezierPath, Subpath};
 use crate::math::{sanitize_f64, Point2D};
+use crate::style::{LineCap, LineJoin, OutlineStyle};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::Overlay;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::i_float::int::point::IntPoint;
 use i_overlay::i_shape::int::shape::{IntContour, IntShapes};
 use i_overlay::mesh::float::outline::offset::OutlineOffset;
-use i_overlay::mesh::float::style::OutlineStyle as IoOutlineStyle;
+use i_overlay::mesh::float::stroke::offset::StrokeOffset;
+use i_overlay::mesh::float::style::{
+    LineCap as IoLineCap, LineJoin as IoLineJoin, OutlineStyle as IoOutlineStyle,
+    StrokeStyle as IoStrokeStyle,
+};
 use serde::{Deserialize, Serialize};
 
 /// Default integer grid scale (`10_000` units per millimeter = `0.1 µm`).
@@ -259,6 +264,97 @@ pub fn offset_polygon(path: &BezierPath, delta_mm: f64) -> CoreResult<BezierPath
         }
     }
     Ok(BezierPath { subpaths })
+}
+
+/// Converts a vector path's stroked outline into closed fillable contours (`Ctrl+Shift+Q`),
+/// honoring `cap`, `join`, `miter_limit`, and open vs. closed subpaths.
+pub fn stroke_to_closed_path(
+    path: &BezierPath,
+    outline: &OutlineStyle,
+    width_override_mm: Option<f64>,
+) -> CoreResult<BezierPath> {
+    if path.is_empty() {
+        return Err(CoreError::InvalidGeometry(
+            "cannot convert empty path outline to object".into(),
+        ));
+    }
+    let width = sanitize_f64(
+        width_override_mm.unwrap_or_else(|| outline.effective_width_mm()),
+        0.0,
+    );
+    if !width.is_finite() || width <= 1e-6 || width > 1e6 {
+        return Err(CoreError::InvalidParameter(
+            "outline width must be positive and within safe bounds".into(),
+        ));
+    }
+
+    let io_cap = match outline.cap {
+        LineCap::Butt => IoLineCap::Butt,
+        LineCap::Round => IoLineCap::Round(0.15),
+        LineCap::Square => IoLineCap::Square,
+    };
+    let io_join = match outline.join {
+        LineJoin::Miter => {
+            let lim = sanitize_f64(outline.miter_limit, 4.0).max(1.0);
+            let min_angle = (2.0 * (1.0 / lim).asin()).clamp(0.02, std::f64::consts::PI);
+            IoLineJoin::Miter(min_angle)
+        }
+        LineJoin::Round => IoLineJoin::Round(0.15),
+        LineJoin::Bevel => IoLineJoin::Bevel,
+    };
+    let style: IoStrokeStyle<[f64; 2]> = IoStrokeStyle {
+        width,
+        start_cap: io_cap.clone(),
+        end_cap: io_cap,
+        join: io_join,
+        ..IoStrokeStyle::default()
+    };
+
+    let mut piece_paths: Vec<BezierPath> = Vec::new();
+    for sp in &path.subpaths {
+        let single = BezierPath::from_subpath(sp.clone());
+        for poly in single.flatten(DEFAULT_FLATTEN_TOLERANCE_MM) {
+            let mut pts: Vec<[f64; 2]> = poly
+                .into_iter()
+                .filter(|p| p.is_finite() && p.x.abs() <= 1e9 && p.y.abs() <= 1e9)
+                .map(|p| [p.x, p.y])
+                .collect();
+            if sp.closed && pts.len() > 1 && pts.first() == pts.last() {
+                pts.pop();
+            }
+            if pts.len() < 2 {
+                continue;
+            }
+            let shapes = pts.stroke_as::<i64>(style.clone(), sp.closed);
+            let mut subpaths = Vec::new();
+            for shape in shapes {
+                for contour in shape {
+                    if contour.len() >= 3 {
+                        subpaths.push(Subpath::from_points(
+                            contour.into_iter().map(|[x, y]| Point2D::new(x, y)),
+                            true,
+                        ));
+                    }
+                }
+            }
+            if !subpaths.is_empty() {
+                piece_paths.push(BezierPath { subpaths });
+            }
+        }
+    }
+
+    if piece_paths.is_empty() {
+        return Err(CoreError::InvalidGeometry(
+            "outline stroke produced no closed contours".into(),
+        ));
+    }
+    if piece_paths.len() == 1 {
+        return Ok(piece_paths.into_iter().next().unwrap_or_default());
+    }
+    let unioned = apply_boolean_many(BooleanOp::Weld, &piece_paths)?;
+    Ok(BezierPath {
+        subpaths: unioned.into_iter().flat_map(|p| p.subpaths).collect(),
+    })
 }
 
 fn extract_float_rings(path: &BezierPath) -> Vec<Vec<[f64; 2]>> {

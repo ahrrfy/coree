@@ -55,6 +55,38 @@ pub fn hit_test_point(
     None
 }
 
+/// Hit-tests the internal `contents` of an active `PowerClip` container `pc_id` at `pt_mm`
+/// (in page/world mm), accounting for the container's world transform.
+#[must_use]
+pub fn hit_test_powerclip_contents(
+    doc: &Document,
+    pc_id: ObjectId,
+    pt_mm: Point2D,
+    tolerance_mm: f64,
+) -> Option<ObjectId> {
+    if !pt_mm.is_finite() {
+        return None;
+    }
+    let tol = sanitize_f64(tolerance_mm, 1.0).abs();
+    let pc_obj = doc.objects.get(&pc_id)?;
+    let coree_core::NodePayload::PowerClip { contents, .. } = &pc_obj.payload else {
+        return None;
+    };
+    let pc_xf = doc.world_transform_of(pc_id)?;
+    for &cid in contents.iter().rev() {
+        let Some(child) = doc.objects.get(&cid) else {
+            continue;
+        };
+        if !child.visible || child.locked {
+            continue;
+        }
+        if object_hits_point(doc, cid, &pc_xf, pt_mm, tol, 0) {
+            return Some(cid);
+        }
+    }
+    None
+}
+
 /// Returns all visible, unlocked objects on `page_index` intersecting (or fully enclosed by)
 /// `rect_mm`, ordered frontmost-first, using the R-Tree spatial index.
 ///
@@ -174,7 +206,7 @@ fn object_hits_point(
         return false;
     }
     let world_xf = parent_xf.compose(&obj.transform);
-    let stroke_tol = tol_mm + obj.outline.effective_width_mm() * 0.5;
+    let stroke_tol = tol_mm + obj.outline.scaled_width_mm_for_transform(&world_xf) * 0.5;
 
     match &obj.payload {
         NodePayload::Path(p) => {

@@ -528,7 +528,15 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                             }
                         }
                     });
-                if ui.button("Refresh").clicked() {
+                let refresh_lbl = if app.scanning_printers {
+                    "Scanning..."
+                } else {
+                    "Refresh"
+                };
+                if ui
+                    .add_enabled(!app.scanning_printers, egui::Button::new(refresh_lbl))
+                    .clicked()
+                {
                     refresh_printers = true;
                 }
             });
@@ -626,7 +634,7 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
             }
         });
     if refresh_printers {
-        app.refresh_system_printers();
+        app.refresh_system_printers_async();
     }
     if print_now {
         app.print_active_document_os();

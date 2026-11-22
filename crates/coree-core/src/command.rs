@@ -148,6 +148,9 @@ pub enum CommandOp {
     ConvertToCurves {
         id: ObjectId,
     },
+    ConvertOutlineToObject {
+        id: ObjectId,
+    },
     UpdateRaster {
         id: ObjectId,
         data: RasterLayerData,
@@ -200,6 +203,7 @@ impl CommandOp {
             Self::SetPowerClipLock { .. } => "Toggle PowerClip Lock Contents".to_owned(),
             Self::MoveToDesktopLayer { .. } => "Move to Desktop Layer".to_owned(),
             Self::ConvertToCurves { .. } => "Convert to Curves".to_owned(),
+            Self::ConvertOutlineToObject { .. } => "Convert Outline to Object".to_owned(),
             Self::UpdateRaster { .. } => "Update Raster".to_owned(),
             Self::Batch(ops) => format!("Batch ({} ops)", ops.len()),
         }
@@ -519,6 +523,13 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                 return Err(CoreError::ObjectLocked(*id));
             }
             doc.convert_to_curves(*id)?;
+        }
+        CommandOp::ConvertOutlineToObject { id } => {
+            let obj = doc.objects.get(id).ok_or(CoreError::ObjectNotFound(*id))?;
+            if obj.locked {
+                return Err(CoreError::ObjectLocked(*id));
+            }
+            doc.convert_outline_to_object(*id)?;
         }
         CommandOp::UpdateRaster { id, data } => {
             let obj = doc

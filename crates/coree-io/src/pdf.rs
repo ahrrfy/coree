@@ -1077,7 +1077,7 @@ fn emit_pdf_styled_path(
     if let Some(ref sh_name) = shading_name {
         if do_stroke && outline.behind_fill {
             emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
-            emit_pdf_stroke_state(out, outline);
+            emit_pdf_stroke_state(out, outline, fill_xf);
             emit_pdf_path_ops(ctx, path, out);
             out.push_str("S\n");
             emit_pdf_arrowheads(ctx, path, outline, emit, out);
@@ -1089,7 +1089,7 @@ fn emit_pdf_styled_path(
         out.push_str("Q\n");
         if do_stroke && !outline.behind_fill {
             emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
-            emit_pdf_stroke_state(out, outline);
+            emit_pdf_stroke_state(out, outline, fill_xf);
             emit_pdf_path_ops(ctx, path, out);
             out.push_str("S\n");
             emit_pdf_arrowheads(ctx, path, outline, emit, out);
@@ -1100,7 +1100,7 @@ fn emit_pdf_styled_path(
         }
         if do_stroke {
             emit_pdf_color(out, &outline.color, ctx.use_cmyk, true, emit);
-            emit_pdf_stroke_state(out, outline);
+            emit_pdf_stroke_state(out, outline, fill_xf);
         }
 
         if do_fill && do_stroke && outline.behind_fill {
@@ -1609,8 +1609,8 @@ fn emit_pdf_color(
     emit_pdf_process_color(out, color, use_cmyk, stroke);
 }
 
-fn emit_pdf_stroke_state(out: &mut String, outline: &OutlineStyle) {
-    let raw_w = outline.effective_width_mm();
+fn emit_pdf_stroke_state(out: &mut String, outline: &OutlineStyle, world_xf: Affine2D) {
+    let raw_w = outline.scaled_width_mm_for_transform(&world_xf);
     let width_pt = if raw_w.is_finite() {
         (raw_w * MM_TO_PT).max(0.1)
     } else {

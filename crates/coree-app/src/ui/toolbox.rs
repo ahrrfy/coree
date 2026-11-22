@@ -7,7 +7,7 @@
 
 use crate::shortcuts::shortcut_label;
 use crate::state::{StudioApp, ToolId, TOOL_GROUPS};
-use crate::theme::TOOLBOX_WIDTH;
+use crate::theme::{ThemeTokens, TOOLBOX_WIDTH};
 use egui::{
     pos2, vec2, Area, Color32, CornerRadius, Frame, Id, Margin, Order, Pos2, Rect, RichText, Sense,
     Shape, Stroke, StrokeKind, Ui,
@@ -102,6 +102,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     rect.shrink(5.5),
                                     primary_tool,
                                     icon_color,
+                                    &tokens,
                                 );
 
                                 // Bottom-right crisp corner flyout triangle
@@ -120,14 +121,21 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     ));
                                 }
 
-                                // Tooltip showing tool name + active profile shortcut
+                                // Tooltip showing tool name + active profile shortcut + double-click shortcut
                                 let sc = primary_tool
                                     .shortcut_action()
                                     .map(|a| shortcut_label(app.shortcut_profile, a))
                                     .unwrap_or("");
+                                let dbl_hint = match primary_tool {
+                                    ToolId::Pick => "\nDouble-click: Select All objects",
+                                    ToolId::Rectangle => {
+                                        "\nDouble-click: Page Frame · Shift+DblClick: Selection Frame"
+                                    }
+                                    _ => "",
+                                };
                                 let tip = if sc.is_empty() {
                                     format!(
-                                        "{}{}",
+                                        "{}{}{dbl_hint}",
                                         primary_tool.label(),
                                         if has_flyout {
                                             "\nRight-click or click corner triangle for flyout"
@@ -137,7 +145,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     )
                                 } else {
                                     format!(
-                                        "{} [{}]{}",
+                                        "{} [{}]{}{dbl_hint}",
                                         primary_tool.label(),
                                         sc,
                                         if has_flyout {
@@ -149,8 +157,22 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 };
                                 let resp = resp.on_hover_text(tip);
 
-                                // Click corner or right-click opens flyout; normal click selects tool (or toggles flyout if active)
-                                if resp.secondary_clicked() && has_flyout {
+                                // Double-click quick actions (Pick = Select All, Rectangle = Page/Selection Frame)
+                                // Single-click or corner/right-click selects tool or toggles flyout.
+                                if resp.double_clicked() {
+                                    app.open_flyout_group = None;
+                                    match primary_tool {
+                                        ToolId::Pick => {
+                                            app.select_tool(ToolId::Pick);
+                                            app.select_all();
+                                        }
+                                        ToolId::Rectangle => {
+                                            let shift = ui.input(|i| i.modifiers.shift);
+                                            app.create_page_frame_rectangle(shift);
+                                        }
+                                        _ => {}
+                                    }
+                                } else if resp.secondary_clicked() && has_flyout {
                                     app.open_flyout_group = if app.open_flyout_group == Some(g) {
                                         None
                                     } else {
@@ -210,6 +232,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     icon_rect.shrink(1.0),
                                     tool,
                                     if selected { tokens.accent } else { tokens.text },
+                                    &tokens,
                                 );
                                 let btn =
                                     ui.add(
@@ -231,9 +254,15 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
 }
 
 /// Draws crisp 2-tone clean-room geometric vector glyphs for every tool using `egui::Painter`.
-fn paint_tool_icon(painter: &egui::Painter, r: Rect, tool: ToolId, color: Color32) {
-    let accent = Color32::from_rgb(0x2D, 0xD4, 0xBF);
-    let amber = Color32::from_rgb(0xF5, 0x9E, 0x0B);
+fn paint_tool_icon(
+    painter: &egui::Painter,
+    r: Rect,
+    tool: ToolId,
+    color: Color32,
+    tokens: &ThemeTokens,
+) {
+    let accent = tokens.accent;
+    let amber = tokens.warning;
     let s = Stroke::new(1.45, color);
     let accent_s = Stroke::new(1.25, accent);
     let thin = Stroke::new(1.1, color);

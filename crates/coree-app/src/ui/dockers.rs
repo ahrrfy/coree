@@ -2279,14 +2279,40 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
     }
 
     let tokens = app.theme.tokens();
-    ui.label(
-        RichText::new(format!(
-            "{} local font face(s)",
-            app.font_manager_state.indexed_fonts.len()
-        ))
-        .size(11.0)
-        .color(tokens.text_muted),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "{} local font face(s)",
+                app.font_manager_state.indexed_fonts.len()
+            ))
+            .size(11.0)
+            .color(tokens.text_muted),
+        );
+        let q_len = app.font_manager_state.quarantined_files.len();
+        if q_len > 0 {
+            let preview: String = app
+                .font_manager_state
+                .quarantined_files
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let more = if q_len > 12 {
+                format!("\n... and {} more", q_len - 12)
+            } else {
+                String::new()
+            };
+            ui.label(
+                RichText::new(format!("⚠ {q_len} quarantined"))
+                    .size(10.5)
+                    .color(tokens.warning),
+            )
+            .on_hover_text(format!(
+                "Corrupted/unparseable system font files skipped safely:\n{preview}{more}"
+            ));
+        }
+    });
     ui.separator();
 
     let fonts = app.font_manager_state.indexed_fonts.clone();

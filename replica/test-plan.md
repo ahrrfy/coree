@@ -1,19 +1,19 @@
 # Verification & End-to-End Test Plan — `coree` (`v0.3.0`)
 
-All **18 core user flows (`F01`–`F18`)**, **v0.2 expansion flows (`V02-01`–`V02-08`)**, and **v0.2.1 / v0.3.0 deep parity & cross-OS suites (`V03-01`–`V03-07`)** from [recon.md](recon.md) and [bugs.md](bugs.md) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
+All **18 core user flows (`F01`–`F18`)**, **v0.2 expansion flows (`V02-01`–`V02-08`)**, and **v0.2.1 / v0.3.0 deep parity & cross-OS suites (`V03-01`–`V03-08`)** from [recon.md](recon.md) and [bugs.md](bugs.md) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
 
 ## Automated Suite Summary (`v0.3.0+` Verified Workspace)
 
 | Crate | Unit Tests | Integration / E2E Tests | Total Passed | Failed | Ignored |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `coree-core` | 38 | 19 (`comprehensive_engine_tests.rs`, ICC v2/v4 + synthetic sRGB/CMYK, PostScript fills, `Desktop` layer, `PowerClip` lock, delta undo) | **57** | 0 | 0 |
+| `coree-core` | 38 | 20 (`comprehensive_engine_tests.rs`, ICC v2/v4 + synthetic sRGB/CMYK, `ConvertOutlineToObject`, `Desktop` layer, `PowerClip` lock, delta undo) | **58** | 0 | 0 |
 | `coree-cdr` | 19 | 26 (`codec_integration.rs`, ZCF v16–26, `cdss` inheritance/RTL weights, RIFF `arrw`/`vpat`/`clrs`, v7–v15 fallbacks, audit regressions) | **45** | 0 | 0 |
-| `coree-io` | 46 | 10 (`io_integration.rs`, PDF `/OutputIntents` + Arabic curves + `/Separation` + `/SMask`, EPS inline hex + curves, SVG patterns, DXF, PLT, PSD) | **56** | 0 | 0 |
-| `coree-storage` | 12 | 7 (`storage_integration.rs`, WAL crash recovery + Unix `0700`/`0600` DB & autosave permission hardening) | **19** | 0 | 0 |
-| `coree-render` | 3 | 23 (`render_suite.rs`, Rayon parallel dirty-tile cache, `lower_effects_to_primitives`, shared font DB, soft-proofing, lenses, Arabic/Kashida) | **26** | 0 | 0 |
+| `coree-io` | 47 | 10 (`io_integration.rs`, PDF `/OutputIntents` + Arabic curves + `/Separation` + `/SMask`, `scale_with_object`, EPS inline hex + curves, SVG patterns, DXF `CIRCLE`/`ARC`, PLT, PSD) | **57** | 0 | 0 |
+| `coree-storage` | 12 | 7 (`storage_integration.rs`, WAL crash recovery + font quarantine + Unix `0700`/`0600` DB & autosave permission hardening) | **19** | 0 | 0 |
+| `coree-render` | 3 | 23 (`render_suite.rs`, Rayon parallel dirty-tile cache, `lower_effects_to_primitives`, `hit_test_powerclip_contents`, shared font DB, soft-proofing, lenses, Arabic/Kashida) | **26** | 0 | 0 |
 | `coree-prod` | 31 | 30 (`integration_production.rs`: 16 + `laser_and_plugins_suite.rs`: 14) | **61** | 0 | 0 |
-| `coree-app` | 18 | 41 (`studio_integration.rs`: 17 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **59** | 0 | 0 |
-| **Workspace Total (`v0.3.0+`)** | **167** | **156** | **323** | **0** | **0** |
+| `coree-app` | 18 | 42 (`studio_integration.rs`: 18 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **60** | 0 | 0 |
+| **Workspace Total (`v0.3.0+`)** | **168** | **158** | **326** | **0** | **0** |
 
 Additional verification gates passing with exit code `0`:
 - `cargo test --workspace --doc` — **0 failures**
@@ -109,3 +109,4 @@ Additional verification gates passing with exit code `0`:
 | `V03-05` | Single-Instance IPC, `.coreews` v2 & Custom Shortcuts | Studio UX | TCP loopback single-instance tab handoff + stale lock cleanup; `DockState` finite-rect sanitization; full `.coreews` v2 & SQLite persistence; live `CustomShortcutMap` editor | `coree-app::lib::ipc_single_instance_handoff_and_stale_cleanup_work` + `custom_shortcut_map_*` | **PASS** |
 | `V03-06` | Native OS Print Spooler (`Ctrl+P`), Dual Windows CLI & Unix Security | OS / Security | CUPS (`lpstat`/`lp`) & Windows Spooler arg/JSON parsing; paired Console `coree-cli`/`coree.com`; Unix `0700` dir & `0600` SQLite/autosave blob permissions | `coree-app::lib::printing::tests::*` + `coree-storage::db::tests::unix_storage_directories_and_db_have_owner_only_permissions` | **PASS** |
 | `V03-07` | Cross-Platform CI & Clean-Room Launch Hygiene | Release / Launch | GitHub Actions `ubuntu-latest` & `windows-latest` CI + WiX MSI + `.deb`/`.AppImage`/`.tar.gz`; `sweep.py` clean; `listing.py` (`0` errors / `0` warnings) | `.github/workflows/{ci,release}.yml` + `listing.py` + `sweep.py` | **PASS** |
+| `V03-08` | Community Workflow Accuracy & UX Polish (`v0.3.0`) | Engine / UI / Export | `Ctrl+Shift+Q` `ConvertOutlineToObject`, `scale_with_object` PDF/EPS/Preflight parity, native DXF `CIRCLE`/`ARC`, async print discovery, font quarantine badge, `PowerClip` `Ctrl+Click` edit mode, smart `Ctrl+D` step-and-repeat, `DblClick`/`Shift+DblClick` Page/Selection frame, `_vN` incremental save (`326/326` workspace tests) | `coree-app::studio_integration::community_workflows_*` + `coree-core::convert_outline_to_object_*` + `coree-io::dxf_exports_native_circle_*` | **PASS** |

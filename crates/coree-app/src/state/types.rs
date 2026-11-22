@@ -1404,6 +1404,7 @@ pub struct FontManagerState {
     pub kashida_only: bool,
     pub favorites_only: bool,
     pub indexed_fonts: Vec<FontRecord>,
+    pub quarantined_files: Vec<String>,
     pub scanned_once: bool,
 }
 

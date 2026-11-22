@@ -4,7 +4,7 @@
 
 use crate::color::Color;
 use crate::ids::{ImageAssetId, ObjectStyleId, SymbolId};
-use crate::math::{sanitize_f64, Point2D};
+use crate::math::{sanitize_f64, Affine2D, Point2D};
 use serde::{Deserialize, Serialize};
 
 /// Canonical hairline stroke width in millimeters (`0.003 in = 0.0762 mm`).
@@ -380,6 +380,20 @@ impl OutlineStyle {
         } else {
             sanitize_f64(self.width_mm, 0.0).max(0.0)
         }
+    }
+
+    /// Computes effective millimeter stroke width under `xf`, scaling isotropically when
+    /// `scale_with_object` is enabled (`1.0` scale otherwise).
+    #[must_use]
+    pub fn scaled_width_mm_for_transform(&self, xf: &Affine2D) -> f64 {
+        let base = self.effective_width_mm();
+        if !self.scale_with_object {
+            return base;
+        }
+        let sx = sanitize_f64(xf.m[0].hypot(xf.m[1]), 1.0);
+        let sy = sanitize_f64(xf.m[2].hypot(xf.m[3]), 1.0);
+        let scale = (0.5 * (sx + sy)).clamp(1e-4, 1e6);
+        sanitize_f64(base * scale, base).max(0.0)
     }
 
     /// Returns `true` if this outline has positive width and non-zero alpha.

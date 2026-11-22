@@ -626,7 +626,9 @@ impl StudioApp {
             return;
         };
         if rescan || !self.font_manager_state.scanned_once {
-            let _ = db.scan_system_fonts();
+            if let Ok(rep) = db.scan_system_fonts() {
+                self.font_manager_state.quarantined_files = rep.quarantined_files;
+            }
             self.font_manager_state.scanned_once = true;
         }
         let query = FontQuery {
@@ -904,9 +906,8 @@ impl StudioApp {
         Ok(())
     }
 
-    /// Refreshes available OS print queues into `self.available_printers`.
-    pub fn refresh_system_printers(&mut self) {
-        match list_system_printers() {
+    fn apply_printer_scan_result(&mut self, res: Result<Vec<PrinterInfo>, String>) {
+        match res {
             Ok(printers) => {
                 if self.print_job_config.printer_name.is_none() {
                     if let Some(def) = printers.iter().find(|p| p.is_default).or(printers.first()) {
@@ -925,6 +926,53 @@ impl StudioApp {
             Err(err) => {
                 self.available_printers.clear();
                 self.printers_status = Some(err);
+            }
+        }
+    }
+
+    /// Refreshes available OS print queues synchronously (headless tests / CLI callers).
+    pub fn refresh_system_printers(&mut self) {
+        self.apply_printer_scan_result(list_system_printers());
+    }
+
+    /// Triggers background OS print queue discovery so opening Print Preview never blocks the UI thread.
+    pub fn refresh_system_printers_async(&mut self) {
+        if self.scanning_printers {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.scanning_printers = true;
+        self.printer_scan_rx = Some(rx);
+        self.printers_status = Some("Scanning OS print queues...".to_owned());
+        if let Err(err) = std::thread::Builder::new()
+            .name("coree-printer-scan".into())
+            .spawn(move || {
+                let _ = tx.send(list_system_printers());
+            })
+        {
+            self.scanning_printers = false;
+            self.printer_scan_rx = None;
+            self.printers_status = Some(format!("Failed to start printer scan: {err}"));
+        }
+    }
+
+    /// Polls any in-flight background OS printer discovery without blocking.
+    pub fn poll_system_printers_async(&mut self) {
+        let Some(ref rx) = self.printer_scan_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.printer_scan_rx = None;
+                self.scanning_printers = false;
+                self.apply_printer_scan_result(res);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.printer_scan_rx = None;
+                self.scanning_printers = false;
+                self.printers_status =
+                    Some("Printer discovery thread stopped unexpectedly.".into());
             }
         }
     }
@@ -1458,7 +1506,7 @@ impl StudioApp {
             ShortcutAction::ExportFile => self.export_dialog.open = true,
             ShortcutAction::PrintDocument => {
                 self.show_print_preview_dialog = true;
-                self.refresh_system_printers();
+                self.refresh_system_printers_async();
             }
             ShortcutAction::ToggleCommandPalette => {
                 self.command_palette.open = !self.command_palette.open;
@@ -1576,14 +1624,20 @@ impl StudioApp {
                     tab.raster_mask_rect_mm = None;
                     tab.live_sketch_strokes.clear();
                     if !cleared_draft {
-                        tab.selection.clear();
-                        tab.metrics_dirty = true;
+                        if !tab.selection.is_empty() {
+                            tab.selection.clear();
+                            tab.metrics_dirty = true;
+                        } else if tab.powerclip_edit_id.is_some() {
+                            tab.powerclip_edit_id = None;
+                            tab.needs_rerender = true;
+                        }
                     }
                 }
             }
             ShortcutAction::Group => self.group_selection(),
             ShortcutAction::Ungroup => self.ungroup_selection(),
             ShortcutAction::ConvertToCurves => self.convert_selection_to_curves(),
+            ShortcutAction::ConvertOutlineToObject => self.convert_outline_to_object_selection(),
             ShortcutAction::BreakApart => self.break_apart_selection(),
             ShortcutAction::Combine => self.apply_boolean_op(BooleanOp::Combine),
             ShortcutAction::TogglePowerClipLock => self.set_powerclip_lock_selected(None),
@@ -1733,6 +1787,21 @@ impl StudioApp {
         }
     }
 
+    /// Saves a non-destructive numbered backup copy (`_v1`, `_v2`, ...) beside the active file.
+    pub fn save_incremental_copy(&mut self) -> Result<PathBuf, String> {
+        let src = {
+            let tab = self
+                .active_tab()
+                .ok_or_else(|| "no active document".to_owned())?;
+            tab.source_path
+                .clone()
+                .ok_or_else(|| "document has not been saved yet; use Save As first".to_owned())?
+        };
+        let target = next_incremental_path(&src);
+        self.save_active_as(&target)?;
+        Ok(target)
+    }
+
     // -------------------------------------------------------------------------
     // Command Palette Registry & Fuzzy Search
     // -------------------------------------------------------------------------
@@ -1765,6 +1834,12 @@ impl StudioApp {
                 title: "Save Document".into(),
                 category: "File".into(),
                 shortcut: shortcut_label(p, ShortcutAction::SaveDocument).into(),
+            },
+            PaletteCommand {
+                id: "file.save_incremental".into(),
+                title: "Save Incremental Copy (_vN)".into(),
+                category: "File".into(),
+                shortcut: String::new(),
             },
             PaletteCommand {
                 id: "file.export".into(),
@@ -1817,6 +1892,12 @@ impl StudioApp {
                 title: "Convert to Curves".into(),
                 category: "Object".into(),
                 shortcut: shortcut_label(p, ShortcutAction::ConvertToCurves).into(),
+            },
+            PaletteCommand {
+                id: "object.convert_outline_to_object".into(),
+                title: "Convert Outline to Object".into(),
+                category: "Object".into(),
+                shortcut: shortcut_label(p, ShortcutAction::ConvertOutlineToObject).into(),
             },
             PaletteCommand {
                 id: "object.powerclip.create".into(),
@@ -2055,6 +2136,11 @@ impl StudioApp {
             "file.sample" => self.new_sample_document(),
             "file.open" => self.open_file_dialog(),
             "file.save" => self.handle_shortcut(ShortcutAction::SaveDocument),
+            "file.save_incremental" => {
+                if let Err(e) = self.save_incremental_copy() {
+                    self.push_toast(e, true);
+                }
+            }
             "file.export" => self.export_dialog.open = true,
             "file.print" => self.handle_shortcut(ShortcutAction::PrintDocument),
             "edit.undo" => {
@@ -2069,6 +2155,7 @@ impl StudioApp {
             "object.group" => self.group_selection(),
             "object.ungroup" => self.ungroup_selection(),
             "object.curves" => self.convert_selection_to_curves(),
+            "object.convert_outline_to_object" => self.convert_outline_to_object_selection(),
             "object.powerclip.create" => self.create_powerclip_from_selection(),
             "object.powerclip.extract" => self.extract_selected_powerclip(),
             "object.powerclip.lock" => self.set_powerclip_lock_selected(None),
@@ -2167,4 +2254,48 @@ impl StudioApp {
         }
         true
     }
+}
+
+fn next_incremental_path(src: &Path) -> PathBuf {
+    let dir = src
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let raw_stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Untitled");
+    let raw_ext = src
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "coree".to_owned());
+    let ext = if matches!(raw_ext.as_str(), "coree" | "cdr" | "cdt" | "svg") {
+        raw_ext
+    } else {
+        "coree".to_owned()
+    };
+
+    let (base, start_num) = if let Some((prefix, num_str)) = raw_stem.rsplit_once("_v") {
+        if !prefix.is_empty() {
+            if let Ok(n) = num_str.parse::<u32>() {
+                (prefix.to_owned(), n.saturating_add(1).max(1))
+            } else {
+                (raw_stem.to_owned(), 1)
+            }
+        } else {
+            (raw_stem.to_owned(), 1)
+        }
+    } else {
+        (raw_stem.to_owned(), 1)
+    };
+
+    for v in start_num..start_num.saturating_add(10_000) {
+        let candidate = dir.join(format!("{base}_v{v}.{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{base}_v{start_num}.{ext}"))
 }

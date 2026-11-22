@@ -42,12 +42,12 @@ use coree_prod::{
 };
 use coree_render::{
     apply_dodge_burn_stroke, apply_healing_stroke, clone_stamp_stroke, compute_page_layouts,
-    convert_object_to_bitmap, erase_stroke, hit_test_point, lower_effects_to_primitives,
-    paint_brush_stroke, paint_brush_stroke_masked, paragraph_to_curves, raster_flood_fill,
-    resample, smudge_stroke, text_on_path_to_curves, text_to_curves, trace_raster_to_mm,
-    DirtyTileCache, DodgeBurnMode, DynamicGuideLine, GlyphBlockFilter, OutlinePreset, RasterMask,
-    RenderOptions, SceneRenderer, SnapOptions, ToneRange, TraceConfig, TraceMode, ViewMode,
-    Viewport,
+    convert_object_to_bitmap, erase_stroke, hit_test_point, hit_test_powerclip_contents,
+    lower_effects_to_primitives, paint_brush_stroke, paint_brush_stroke_masked,
+    paragraph_to_curves, raster_flood_fill, resample, smudge_stroke, text_on_path_to_curves,
+    text_to_curves, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
+    GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer, SnapOptions,
+    ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
 };
 use coree_storage::{
     FontQuery, FontRecord, JobHandle, JobOutcome, JobPool, RecentDocumentRecord, StorageDb,
@@ -98,6 +98,8 @@ pub struct StudioApp {
     pub print_job_config: PrintJobConfig,
     pub available_printers: Vec<PrinterInfo>,
     pub printers_status: Option<String>,
+    pub(crate) printer_scan_rx: Option<std::sync::mpsc::Receiver<Result<Vec<PrinterInfo>, String>>>,
+    pub scanning_printers: bool,
 
     // Toolbox & Dockers
     pub active_tool: ToolId,
@@ -289,6 +291,8 @@ impl StudioApp {
             print_job_config: PrintJobConfig::default(),
             available_printers: Vec::new(),
             printers_status: None,
+            printer_scan_rx: None,
+            scanning_printers: false,
             active_tool: ToolId::Pick,
             previous_non_pick_tool: ToolId::Rectangle,
             one_shot_zoom_return_tool: None,
@@ -848,6 +852,22 @@ impl StudioApp {
         let seq = tab.journal_seq;
         tab.mark_modified();
 
+        match &op {
+            CommandOp::TransformObjects { ids, affine } if !ids.is_empty() => {
+                if let Some((ref batch_ids, ref mut prev_delta)) = tab.last_duplicate_batch {
+                    if *batch_ids == *ids {
+                        *prev_delta = affine.compose(prev_delta);
+                    } else {
+                        tab.last_duplicate_batch = None;
+                    }
+                }
+            }
+            CommandOp::TransformObjects { ids, .. } if ids.is_empty() => {}
+            _ => {
+                tab.last_duplicate_batch = None;
+            }
+        }
+
         if let Some(ref db) = self.storage {
             let _ = db.append_command(&doc_id, seq, &op);
         }
@@ -866,6 +886,7 @@ impl StudioApp {
                 .history
                 .undo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
+            tab.last_duplicate_batch = None;
             tab.mark_modified();
             label
         };
@@ -884,6 +905,7 @@ impl StudioApp {
                 .history
                 .redo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
+            tab.last_duplicate_batch = None;
             tab.mark_modified();
             label
         };

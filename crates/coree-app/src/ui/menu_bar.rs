@@ -101,6 +101,17 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         app.save_as_file_dialog();
                         ui.close();
                     }
+                    if menu_item(ui, "Save Incremental Copy (_vN)", "") {
+                        let has_path = app.active_tab().is_some_and(|t| t.source_path.is_some());
+                        if has_path {
+                            if let Err(err) = app.save_incremental_copy() {
+                                app.push_toast(err, true);
+                            }
+                        } else {
+                            app.save_as_file_dialog();
+                        }
+                        ui.close();
+                    }
                     if menu_item(
                         ui,
                         "Export (PDF/CDR/SVG/EPS/DXF/PLT/G-Code/PNG)...",
@@ -124,7 +135,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                     }
                     if menu_item(ui, "Print Preview & Imposition...", "") {
                         app.show_print_preview_dialog = true;
-                        app.refresh_system_printers();
+                        app.refresh_system_printers_async();
                         ui.close();
                     }
                     if menu_item(ui, "Preflight Audit...", "") {
@@ -588,10 +599,55 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         app.convert_selection_to_curves();
                         ui.close();
                     }
+                    if menu_item(
+                        ui,
+                        "Convert Outline to Object",
+                        &shortcut_label_for(
+                            profile,
+                            &app.custom_shortcuts,
+                            ShortcutAction::ConvertOutlineToObject,
+                        ),
+                    ) {
+                        app.convert_outline_to_object_selection();
+                        ui.close();
+                    }
                     ui.separator();
                     ui.menu_button("PowerClip", |ui| {
                         if ui.button("Place Inside Frame").clicked() {
                             app.create_powerclip_from_selection();
+                            ui.close();
+                        }
+                        let selected_pc = app.active_tab().and_then(|t| {
+                            let oid = *t.selection.objects.first()?;
+                            matches!(
+                                t.document.objects.get(&oid).map(|o| &o.payload),
+                                Some(coree_core::NodePayload::PowerClip { .. })
+                            )
+                            .then_some(oid)
+                        });
+                        let in_pc_edit = app
+                            .active_tab()
+                            .is_some_and(|t| t.powerclip_edit_id.is_some());
+                        if ui
+                            .add_enabled(
+                                selected_pc.is_some(),
+                                egui::Button::new("Edit PowerClip Contents (Ctrl+Click)"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(pc_id) = selected_pc {
+                                app.enter_powerclip_edit(pc_id);
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                in_pc_edit,
+                                egui::Button::new("Finish Editing PowerClip (Esc)"),
+                            )
+                            .clicked()
+                        {
+                            app.exit_powerclip_edit();
                             ui.close();
                         }
                         if ui.button("Extract Contents").clicked() {

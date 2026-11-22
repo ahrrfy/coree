@@ -64,12 +64,14 @@ pub struct FontQuery {
 }
 
 /// Summary statistics returned by [`StorageDb::scan_font_directories`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FontScanReport {
     pub files_seen: usize,
     pub faces_indexed: usize,
     pub files_skipped_unchanged: usize,
     pub files_failed: usize,
+    /// Up to 256 malformed/unreadable font files quarantined during scan so startup never aborts.
+    pub quarantined_files: Vec<String>,
 }
 
 /// Returns standard OS font directories across Linux, Windows, and macOS.
@@ -154,7 +156,12 @@ impl StorageDb {
 
             match self.index_font_file(&path, collection_tag) {
                 Ok(n) => report.faces_indexed += n,
-                Err(_) => report.files_failed += 1,
+                Err(_) => {
+                    report.files_failed += 1;
+                    if report.quarantined_files.len() < 256 {
+                        report.quarantined_files.push(path_str);
+                    }
+                }
             }
         }
         Ok(report)
@@ -929,5 +936,15 @@ mod tests {
             .scan_font_directories(&[dir.path().to_path_buf()], "custom")
             .unwrap();
         assert_eq!(report2.files_skipped_unchanged, 2);
+
+        // Corrupt font file must be quarantined cleanly without failing the font index
+        let corrupt_path = dir.path().join("Corrupt-Font.ttf");
+        std::fs::write(&corrupt_path, b"NOT_AN_SFNT_FONT_FILE").unwrap();
+        let report3 = db
+            .scan_font_directories(&[dir.path().to_path_buf()], "custom")
+            .unwrap();
+        assert_eq!(report3.files_failed, 1);
+        assert_eq!(report3.quarantined_files.len(), 1);
+        assert!(report3.quarantined_files[0].ends_with("Corrupt-Font.ttf"));
     }
 }

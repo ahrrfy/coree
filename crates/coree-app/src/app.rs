@@ -2,8 +2,8 @@
 
 //! `eframe 0.37` desktop application shell wrapping [`StudioApp`].
 
-use crate::shortcuts::poll_egui_shortcuts_custom;
-use crate::state::StudioApp;
+use crate::shortcuts::{poll_egui_shortcuts_custom, ShortcutAction};
+use crate::state::{CanvasDragState, StudioApp};
 use crate::theme::{apply_theme, configure_arabic_capable_fonts_for_language};
 use crate::ui::{
     canvas::show_canvas_and_status, command_palette::show_command_palette, dialogs::show_dialogs,
@@ -256,8 +256,9 @@ impl StudioApp {
             self.theme_dirty = false;
         }
 
-        // Poll async background jobs, incoming single-instance IPC files, toasts, autosave
+        // Poll async background jobs, printer discovery, incoming single-instance IPC files, toasts, autosave
         self.tick_background_jobs();
+        self.poll_system_printers_async();
         self.prune_toasts();
         self.tick_autosave();
         let ipc_batches = self
@@ -276,8 +277,8 @@ impl StudioApp {
             }
         }
 
-        // Keep repainting smoothly while background jobs are running
-        if !self.active_jobs.is_empty() {
+        // Keep repainting smoothly while background jobs or printer discovery run
+        if !self.active_jobs.is_empty() || self.scanning_printers {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
 
@@ -298,9 +299,23 @@ impl StudioApp {
 
         // Process global keyboard shortcuts (unless Command Palette is open and consuming keys)
         if !self.command_palette.open {
+            let is_transform_drag = self.active_tab().is_some_and(|t| {
+                matches!(
+                    t.drag_state,
+                    CanvasDragState::MovingSelection { .. }
+                        | CanvasDragState::ScalingSelection { .. }
+                        | CanvasDragState::RotatingSelection { .. }
+                        | CanvasDragState::SkewingSelection { .. }
+                        | CanvasDragState::FreeTransforming { .. }
+                )
+            });
             let actions =
                 poll_egui_shortcuts_custom(&ctx, self.shortcut_profile, &self.custom_shortcuts);
             for act in actions {
+                // During Left-Drag object transforms, Spacebar stamps duplicates on canvas instead of switching Pick.
+                if is_transform_drag && act == ShortcutAction::TogglePickSpace {
+                    continue;
+                }
                 self.handle_shortcut(act);
             }
         }

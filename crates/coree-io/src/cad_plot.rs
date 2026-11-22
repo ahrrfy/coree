@@ -10,9 +10,9 @@
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Fill, Layer, LayerId,
-    MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Point2D, Rect2D, SceneObject,
-    TextDirection, TextStyle, Vec2D,
+    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, EllipseMode, Fill, Layer,
+    LayerId, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, ParametricShape, Point2D,
+    Rect2D, SceneObject, TextDirection, TextStyle, Vec2D,
 };
 use kurbo::{BezPath, PathSeg};
 use std::collections::{HashMap, HashSet};
@@ -144,15 +144,21 @@ pub fn export_dxf_to_string_with_options(
     out.push_str("0\nSECTION\n2\nENTITIES\n");
     for layer in &layers {
         let layer_name = sanitize_dxf_layer_name(&layer.name);
-        let mut paths = Vec::new();
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
             if let Some(obj) = doc.objects.get(&oid) {
-                collect_vector_paths(doc, obj, Affine2D::IDENTITY, &mut paths, 0, &mut visited);
+                emit_dxf_object_entities(
+                    doc,
+                    page,
+                    obj,
+                    Affine2D::IDENTITY,
+                    &layer_name,
+                    opts,
+                    &mut out,
+                    0,
+                    &mut visited,
+                );
             }
-        }
-        for path in &paths {
-            emit_dxf_path(page, path, &layer_name, opts, &mut out);
         }
     }
     out.push_str("0\nENDSEC\n");
@@ -176,6 +182,227 @@ pub fn export_dxf_with_options(
     atomic_write_bytes(path, dxf.as_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_dxf_object_entities(
+    doc: &Document,
+    page: &Page,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    layer_name: &str,
+    opts: &DxfExportOptions,
+    out: &mut String,
+    depth: usize,
+    visited: &mut HashSet<ObjectId>,
+) {
+    if depth > MAX_CAD_DEPTH || !obj.visible || !visited.insert(obj.id) {
+        return;
+    }
+    let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        visited.remove(&obj.id);
+        return;
+    }
+
+    // Native exact CAD CIRCLE & ARC export when shape is a uniformly-scaled circular arc/circle
+    // (avoids segmented/splined circles on CNC, plasma & laser cutters).
+    if obj.effects.is_empty() {
+        if let NodePayload::Shape(ParametricShape::Ellipse {
+            rx,
+            ry,
+            mode,
+            start_deg,
+            end_deg,
+        }) = &obj.payload
+        {
+            if try_emit_exact_dxf_circle_or_arc(
+                page, world_xf, *rx, *ry, *mode, *start_deg, *end_deg, layer_name, out,
+            ) {
+                visited.remove(&obj.id);
+                return;
+            }
+        }
+    }
+
+    match &obj.payload {
+        NodePayload::Path(p) => {
+            emit_dxf_path(page, &p.transformed(&world_xf), layer_name, opts, out);
+        }
+        NodePayload::Shape(s) => {
+            emit_dxf_path(
+                page,
+                &s.to_bezier_path().transformed(&world_xf),
+                layer_name,
+                opts,
+                out,
+            );
+        }
+        NodePayload::Table(t) => {
+            emit_dxf_path(
+                page,
+                &t.to_grid_paths().transformed(&world_xf),
+                layer_name,
+                opts,
+                out,
+            );
+        }
+        NodePayload::Connector(c) => {
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
+            emit_dxf_path(page, &c.route_path(a, b), layer_name, opts, out);
+        }
+        NodePayload::PowerClip { container, .. } => {
+            emit_dxf_path(
+                page,
+                &container.transformed(&world_xf),
+                layer_name,
+                opts,
+                out,
+            );
+        }
+        NodePayload::Group(children) => {
+            for &cid in children {
+                if let Some(child) = doc.objects.get(&cid) {
+                    emit_dxf_object_entities(
+                        doc,
+                        page,
+                        child,
+                        world_xf,
+                        layer_name,
+                        opts,
+                        out,
+                        depth + 1,
+                        visited,
+                    );
+                }
+            }
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if let Some(sym) = doc.symbols.get(sym_id) {
+                for sub in &sym.objects {
+                    let mut sym_visited = HashSet::new();
+                    emit_dxf_object_entities(
+                        doc,
+                        page,
+                        sub,
+                        world_xf,
+                        layer_name,
+                        opts,
+                        out,
+                        depth + 1,
+                        &mut sym_visited,
+                    );
+                }
+            }
+        }
+        NodePayload::ArtisticText(_)
+        | NodePayload::ParagraphText(_)
+        | NodePayload::TextOnPath(_)
+        | NodePayload::Raster(_)
+        | NodePayload::Dimension(_) => {}
+    }
+
+    visited.remove(&obj.id);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_emit_exact_dxf_circle_or_arc(
+    page: &Page,
+    world_xf: Affine2D,
+    rx: f64,
+    ry: f64,
+    mode: EllipseMode,
+    start_deg: f64,
+    end_deg: f64,
+    layer_name: &str,
+    out: &mut String,
+) -> bool {
+    if !rx.is_finite() || !ry.is_finite() || rx <= 1e-4 || (rx - ry).abs() > 1e-3 * rx.max(1.0) {
+        return false;
+    }
+    let sx = world_xf.m[0].hypot(world_xf.m[1]);
+    let sy = world_xf.m[2].hypot(world_xf.m[3]);
+    let skew = (world_xf.m[0] * world_xf.m[2] + world_xf.m[1] * world_xf.m[3]).abs();
+    if !sx.is_finite()
+        || !sy.is_finite()
+        || sx <= 1e-6
+        || (sx - sy).abs() > 1e-3 * sx.max(1.0)
+        || skew > 1e-3 * sx * sy
+    {
+        return false;
+    }
+
+    let radius = rx * 0.5 * (sx + sy);
+    let center_w = world_xf.transform_point(Point2D::ZERO);
+    if !center_w.is_finite() || !radius.is_finite() || radius <= 1e-5 {
+        return false;
+    }
+    let (cx, cy) = to_cad_mm(page, center_w);
+
+    if mode == EllipseMode::Full {
+        let _ = writeln!(
+            out,
+            "0\nCIRCLE\n8\n{layer_name}\n10\n{cx:.4}\n20\n{cy:.4}\n30\n0.0\n40\n{radius:.4}"
+        );
+        return true;
+    }
+
+    if mode == EllipseMode::Arc {
+        let mut sweep_deg = end_deg - start_deg;
+        if !start_deg.is_finite() || !end_deg.is_finite() || sweep_deg.abs() < 1e-3 {
+            return false;
+        }
+        sweep_deg = sweep_deg.clamp(-360.0, 360.0);
+        if sweep_deg.abs() >= 359.99 {
+            let _ = writeln!(
+                out,
+                "0\nCIRCLE\n8\n{layer_name}\n10\n{cx:.4}\n20\n{cy:.4}\n30\n0.0\n40\n{radius:.4}"
+            );
+            return true;
+        }
+        let s_rad = start_deg.to_radians();
+        let m_rad = (start_deg + 0.5 * sweep_deg).to_radians();
+        let e_rad = (start_deg + sweep_deg).to_radians();
+        let p_s = to_cad_mm(
+            page,
+            world_xf.transform_point(Point2D::new(rx * s_rad.cos(), ry * s_rad.sin())),
+        );
+        let p_m = to_cad_mm(
+            page,
+            world_xf.transform_point(Point2D::new(rx * m_rad.cos(), ry * m_rad.sin())),
+        );
+        let p_e = to_cad_mm(
+            page,
+            world_xf.transform_point(Point2D::new(rx * e_rad.cos(), ry * e_rad.sin())),
+        );
+
+        let ang_s = (p_s.1 - cy)
+            .atan2(p_s.0 - cx)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let ang_m = (p_m.1 - cy)
+            .atan2(p_m.0 - cx)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let ang_e = (p_e.1 - cy)
+            .atan2(p_e.0 - cx)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let mid_on_ccw = (ang_m - ang_s).rem_euclid(360.0) <= (ang_e - ang_s).rem_euclid(360.0);
+        let (dxf_start, dxf_end) = if mid_on_ccw {
+            (ang_s, ang_e)
+        } else {
+            (ang_e, ang_s)
+        };
+        let _ = writeln!(
+            out,
+            "0\nARC\n8\n{layer_name}\n10\n{cx:.4}\n20\n{cy:.4}\n30\n0.0\n40\n{radius:.4}\n50\n{dxf_start:.4}\n51\n{dxf_end:.4}"
+        );
+        return true;
+    }
+
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_dxf_path(
     page: &Page,
     path: &BezierPath,
@@ -2982,5 +3209,58 @@ mod tests {
         dag.push_str("0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n8\n0\n2\nB22\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n");
         let err = import_dxf_bytes(dag.as_bytes(), "DagBomb").unwrap_err();
         assert!(matches!(err, IoError::LimitExceeded { .. }));
+    }
+
+    #[test]
+    fn dxf_exports_native_circle_and_arc_entities_with_exact_roundtrip() {
+        let mut doc = Document::new("CAD Circle Arc Test", 100.0, 100.0, ColorMode::Cmyk, 300.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Bolt Hole",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 15.0,
+                    ry: 15.0,
+                    mode: EllipseMode::Full,
+                    start_deg: 0.0,
+                    end_deg: 360.0,
+                }),
+            )
+            .with_transform(Affine2D::translate(50.0, 40.0)),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Lead Arc",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 20.0,
+                    ry: 20.0,
+                    mode: EllipseMode::Arc,
+                    start_deg: 0.0,
+                    end_deg: 90.0,
+                }),
+            )
+            .with_transform(Affine2D::translate(30.0, 60.0)),
+            None,
+        )
+        .unwrap();
+
+        let dxf = export_dxf_to_string(&doc, 0).unwrap();
+        assert!(dxf.contains("0\nCIRCLE\n"));
+        assert!(dxf.contains("0\nARC\n"));
+
+        let imported = import_dxf_bytes(dxf.as_bytes(), "Roundtrip").unwrap();
+        assert_eq!(imported.objects.len(), 2);
+        let hole_bb = imported
+            .objects
+            .values()
+            .filter_map(|o| imported.object_bounds(o.id))
+            .find(|b| (b.width() - 30.0).abs() < 0.2 && (b.height() - 30.0).abs() < 0.2);
+        assert!(
+            hole_bb.is_some(),
+            "imported DXF circle must keep 30x30 mm diameter"
+        );
     }
 }

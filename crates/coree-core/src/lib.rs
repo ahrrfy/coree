@@ -27,7 +27,9 @@ pub mod text;
 pub const CRATE_NAME: &str = "coree-core";
 
 // Ergonomic top-level re-exports for downstream crates
-pub use boolean::{apply_boolean, apply_boolean_many, offset_polygon, BooleanOp};
+pub use boolean::{
+    apply_boolean, apply_boolean_many, offset_polygon, stroke_to_closed_path, BooleanOp,
+};
 pub use brand::{
     BrandInfo, APP_NAME, DISPLAY_NAME, LICENSE, NATIVE_EXT, REPO_URL, TRADEMARK_NOTICE,
 };

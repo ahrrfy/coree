@@ -7,14 +7,31 @@ impl StudioApp {
     // Core Scene Operations (Selection, Transform, Shaping, Fill, Outline, Lens, Effects)
     // -------------------------------------------------------------------------
 
-    /// Duplicates all currently selected objects by `tab.duplicate_offset_mm` via
-    /// undoable, WAL-journaled [`CommandOp::Batch`].
+    /// Duplicates all currently selected objects via undoable, WAL-journaled [`CommandOp::Batch`].
+    ///
+    /// Uses smart step-and-repeat: if the current selection matches the immediately preceding
+    /// duplicate batch, repeats the cumulative delta transform (including any interactive Move,
+    /// Scale, Rotate, or Skew applied right after duplicating); otherwise uses `tab.duplicate_offset_mm`.
     pub fn duplicate_selection(&mut self) -> Result<Vec<ObjectId>, String> {
-        let offset = self
+        enum DupPlan {
+            Affine(Affine2D),
+            Offset(Vec2D),
+        }
+        let plan = self
             .active_tab()
-            .map(|t| t.duplicate_offset_mm)
-            .unwrap_or(Vec2D::new(5.0, 5.0));
-        self.duplicate_selection_with_offset(offset)
+            .map(|t| {
+                if let Some((ref batch_ids, delta_xf)) = t.last_duplicate_batch {
+                    if !batch_ids.is_empty() && *batch_ids == t.selection.objects {
+                        return DupPlan::Affine(delta_xf);
+                    }
+                }
+                DupPlan::Offset(t.duplicate_offset_mm)
+            })
+            .unwrap_or(DupPlan::Offset(Vec2D::new(5.0, 5.0)));
+        match plan {
+            DupPlan::Affine(delta) => self.duplicate_selection_with_affine(delta),
+            DupPlan::Offset(offset) => self.duplicate_selection_with_offset(offset),
+        }
     }
 
     /// Duplicates all currently selected objects with an explicit `offset` (used by
@@ -26,56 +43,62 @@ impl StudioApp {
         self.duplicate_selection_with_affine(Affine2D::translate(offset.x, offset.y))
     }
 
+    fn build_duplicate_ops_for_selection(
+        &self,
+        delta_xf: Affine2D,
+    ) -> Result<(Vec<CommandOp>, Vec<ObjectId>), String> {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return Err("no active document".to_owned());
+        };
+        if tab.selection.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let ids = tab.selection.objects.clone();
+        let mut next_id = tab.document.next_id.max(
+            tab.document
+                .objects
+                .keys()
+                .next_back()
+                .map_or(1, |id| id.0.saturating_add(1)),
+        );
+        let mut id_map = HashMap::new();
+        let mut ops = Vec::new();
+        let mut created = Vec::new();
+        for src_id in ids {
+            let layer_id = tab.document.layer_of_object(src_id).or(tab.active_layer_id);
+            let mut visiting = HashSet::new();
+            if let Some(new_id) = build_duplicate_tree_ops(
+                &tab.document,
+                src_id,
+                layer_id,
+                delta_xf,
+                0,
+                &mut next_id,
+                &mut visiting,
+                &mut id_map,
+                &mut ops,
+            ) {
+                created.push(new_id);
+            }
+        }
+        remap_duplicate_ops(&mut ops, &id_map);
+        Ok((ops, created))
+    }
+
     /// Duplicates all currently selected objects with an arbitrary `delta_xf` affine
     /// transform (supporting Move, Scale, Rotate, Skew, and FreeTransform stamping).
     pub fn duplicate_selection_with_affine(
         &mut self,
         delta_xf: Affine2D,
     ) -> Result<Vec<ObjectId>, String> {
-        let (ops, created) = {
-            let Some(tab) = self.tabs.get(self.active_tab) else {
-                return Err("no active document".to_owned());
-            };
-            if tab.selection.is_empty() {
-                return Ok(Vec::new());
-            }
-            let ids = tab.selection.objects.clone();
-            let mut next_id = tab.document.next_id.max(
-                tab.document
-                    .objects
-                    .keys()
-                    .next_back()
-                    .map_or(1, |id| id.0.saturating_add(1)),
-            );
-            let mut id_map = HashMap::new();
-            let mut ops = Vec::new();
-            let mut created = Vec::new();
-            for src_id in ids {
-                let layer_id = tab.document.layer_of_object(src_id).or(tab.active_layer_id);
-                let mut visiting = HashSet::new();
-                if let Some(new_id) = build_duplicate_tree_ops(
-                    &tab.document,
-                    src_id,
-                    layer_id,
-                    delta_xf,
-                    0,
-                    &mut next_id,
-                    &mut visiting,
-                    &mut id_map,
-                    &mut ops,
-                ) {
-                    created.push(new_id);
-                }
-            }
-            remap_duplicate_ops(&mut ops, &id_map);
-            (ops, created)
-        };
+        let (ops, created) = self.build_duplicate_ops_for_selection(delta_xf)?;
         if ops.is_empty() {
             return Ok(Vec::new());
         }
         self.execute_command(CommandOp::Batch(ops))?;
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.selection.select_many(&tab.document, &created);
+            tab.last_duplicate_batch = Some((created.clone(), delta_xf));
             tab.metrics_dirty = true;
         }
         self.push_toast(format!("Duplicated {} object(s)", created.len()), false);
@@ -807,6 +830,49 @@ impl StudioApp {
         }
     }
 
+    /// Converts visible outlines on selected objects into closed fillable vector objects (`Ctrl+Shift+Q`).
+    pub fn convert_outline_to_object_selection(&mut self) {
+        let ops: Vec<CommandOp> = {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            if tab.selection.objects.is_empty() {
+                return;
+            }
+            tab.selection
+                .objects
+                .iter()
+                .copied()
+                .filter(|id| {
+                    tab.document
+                        .objects
+                        .get(id)
+                        .is_some_and(|obj| !obj.locked && obj.outline.is_visible())
+                })
+                .map(|id| CommandOp::ConvertOutlineToObject { id })
+                .collect()
+        };
+        if ops.is_empty() {
+            self.push_toast("No unlocked objects with a visible outline selected", false);
+            return;
+        }
+        let batch = if ops.len() == 1 {
+            ops.into_iter().next().unwrap()
+        } else {
+            CommandOp::Batch(ops)
+        };
+        match self.execute_command(batch) {
+            Ok(()) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.metrics_dirty = true;
+                    tab.needs_rerender = true;
+                }
+                self.push_toast("Converted outline to closed object", false);
+            }
+            Err(e) => self.push_toast(e, true),
+        }
+    }
+
     /// Creates a PowerClip using the last-selected object as container and earlier ones as contents.
     pub fn create_powerclip_from_selection(&mut self) {
         let ids = self
@@ -1148,5 +1214,116 @@ impl StudioApp {
         .with_transform(Affine2D::translate(center.x, center.y));
         let _ = self.execute_command(CommandOp::create_object(obj, tab.active_layer_id));
         self.push_toast(format!("Inserted {rows}x{cols} table"), false);
+    }
+
+    /// Double-click Rectangle tool -> Page Frame; Shift+Double-click -> tight frame around selection.
+    pub fn create_page_frame_rectangle(&mut self, around_selection: bool) -> Option<ObjectId> {
+        let (target_rect, layer_id, outline, is_sel_frame) = {
+            let tab = self.active_tab()?;
+            let page = tab.document.active_page()?;
+            let page_rect = Rect2D::from_xywh(0.0, 0.0, page.width_mm, page.height_mm);
+            let (rect, used_sel) = if around_selection && !tab.selection.is_empty() {
+                tab.selection
+                    .bounding_box(&tab.document)
+                    .map_or((page_rect, false), |bb| (bb, true))
+            } else {
+                (page_rect, false)
+            };
+            let outline = if self.default_outline.is_visible() {
+                self.default_outline.clone()
+            } else {
+                OutlineStyle {
+                    color: Color::rgba8(0, 0, 0, 255),
+                    width_mm: 0.25,
+                    ..self.default_outline.clone()
+                }
+            };
+            (rect, tab.active_layer_id, outline, used_sel)
+        };
+        let label = if is_sel_frame {
+            "Selection Frame"
+        } else {
+            "Page Frame"
+        };
+        let obj = SceneObject::new(
+            ObjectId(0),
+            label.to_owned(),
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: target_rect.width().max(0.5),
+                height: target_rect.height().max(0.5),
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::None)
+        .with_outline(outline)
+        .with_transform(Affine2D::translate(target_rect.min_x, target_rect.min_y));
+        self.execute_command(CommandOp::create_object(obj, layer_id))
+            .ok()?;
+        let created_id = if let Some(tab) = self.active_tab_mut() {
+            let id = tab.document.objects.keys().last().copied();
+            if let Some(oid) = id {
+                tab.selection.select_single(&tab.document, oid);
+            }
+            tab.metrics_dirty = true;
+            tab.needs_rerender = true;
+            id
+        } else {
+            None
+        };
+        self.push_toast(
+            if is_sel_frame {
+                "Created frame around selection"
+            } else {
+                "Created Page Frame rectangle"
+            },
+            false,
+        );
+        created_id
+    }
+
+    /// Enters PowerClip internal content-editing mode (`Ctrl+Click` container).
+    pub fn enter_powerclip_edit(&mut self, pc_id: ObjectId) -> bool {
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        let first_child = match tab.document.objects.get(&pc_id).map(|o| &o.payload) {
+            Some(NodePayload::PowerClip { contents, .. }) => contents
+                .iter()
+                .rev()
+                .copied()
+                .find(|cid| is_object_editable_in_doc(&tab.document, *cid)),
+            _ => return false,
+        };
+        tab.powerclip_edit_id = Some(pc_id);
+        if let Some(cid) = first_child {
+            tab.selection.select_single(&tab.document, cid);
+        } else {
+            tab.selection.clear();
+        }
+        tab.metrics_dirty = true;
+        tab.needs_rerender = true;
+        self.push_toast(
+            "Editing PowerClip contents — Ctrl+Click outside or Esc to finish",
+            false,
+        );
+        true
+    }
+
+    /// Exits PowerClip content-editing mode and restores selection to the parent container.
+    pub fn exit_powerclip_edit(&mut self) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if let Some(pc_id) = tab.powerclip_edit_id.take() {
+            if tab.document.objects.contains_key(&pc_id) {
+                tab.selection.select_single(&tab.document, pc_id);
+            } else {
+                tab.selection.clear();
+            }
+            tab.metrics_dirty = true;
+            tab.needs_rerender = true;
+        }
     }
 }

@@ -27,6 +27,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - Extended `InteractiveFill` canvas tool with Radial Focal point handle, intermediate stop handles across Linear/Radial/Conical/Square gradients, and double-click stop insertion.
   - Fixed multi-word Arabic UI run splitting (`configure_arabic_capable_fonts_for_language` prioritizing Arabic face in Arabic mode) and added `unicode-bidi` visual ordering helper (`shape_mixed_ui_bidi`).
   - Fixed Windows Release CLI (`#136994479287`): added Console-subsystem `coree-cli` shipped beside `coree.exe` as `coree.com` in WiX MSI & portable ZIP + synchronous `Start-Process` GUI smoke checks.
+- **Community-Driven Precision, Ergonomics & Productivity Polish (`coree-core`, `coree-storage`, `coree-io`, `coree-prod`, `coree-render`, `coree-app`):**
+  - Implemented `stroke_to_closed_path` (`coree-core::boolean`), `Document::convert_outline_to_object`, `CommandOp::ConvertOutlineToObject`, and `Ctrl+Shift+Q` shortcut/menu/context-menu workflow for converting outlines into fillable vector contours with z-order & Undo/Redo integrity.
+  - Added `OutlineStyle::scaled_width_mm_for_transform` across PDF, EPS, Preflight hairline checks, and canvas hit-testing so `scale_with_object` matches screen preview consistently.
+  - Upgraded DXF exporter (`coree-io/src/cad_plot.rs`) to emit native `0\nCIRCLE` and `0\nARC` entities for circular/arc shapes beside polyline curves.
+  - Made OS print queue discovery non-blocking via background thread + polling (`refresh_system_printers_async` / `poll_system_printers_async`) so Print Preview never stalls the UI thread.
+  - Added corrupted font file quarantine tracking (`FontScanReport::quarantined_files`) with a Font Manager warning badge, `PowerClip` internal content edit mode (`Ctrl+Click`, banner pill, `hit_test_powerclip_contents`, `Esc` exit), smart `Ctrl+D` step-and-repeat delta tracking, Left-Drag + `Spacebar` / Right-Click stamp duplicate guard, Toolbox Pick/Rect/`Shift+DblClick` quick frames, `Save Incremental Copy (_vN)`, Status Bar live dimensions/hints/right-click swatch clear, and theme-tokenized Toolbox icons (`326 / 326` workspace tests passing).
 
 ## [0.2.1] - 2026-11-22
 
