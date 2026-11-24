@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! Comprehensive integration and regression test suite for:
 //! - Laser Cutting, Engraving & Plotter Toolpath Engine (`laser_plugin`)
@@ -158,7 +159,7 @@ fn laser_hatch_fill_handles_3_level_island_nesting_and_adversarial_spacing() {
 #[test]
 fn laser_toolpath_three_level_nesting_travel_optimization_group_transforms_and_origins() {
     let mut doc = Document::new("Laser Panel", 200.0, 150.0, ColorMode::Rgb, 300.0);
-    let layer = doc.pages[0].layers[0].id;
+    let layer = doc.pages()[0].layers[0].id;
 
     // 3-level nested concentric red squares (added outer-first so planner MUST sort inner-first!)
     let outer_id = doc
@@ -232,7 +233,8 @@ fn laser_toolpath_three_level_nesting_travel_optimization_group_transforms_and_o
         )
         .unwrap();
     let grp_id = doc.group_objects(&[l1, l2], "Score Group").unwrap();
-    doc.objects.get_mut(&grp_id).unwrap().transform = Affine2D::translate(5.0, 125.0);
+    doc.set_object_transform(grp_id, Affine2D::translate(5.0, 125.0))
+        .unwrap();
 
     // Curved circle (radius 10mm) to verify adaptive flattening <= 0.05mm chord accuracy
     let circle_id = doc
@@ -618,7 +620,7 @@ auto_hatch = false
 fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
     // 1. Empty document (0 pages) handled safely across all engines
     let mut empty_doc = Document::new_a4("فارغ");
-    empty_doc.pages.clear();
+    empty_doc.clear_pages_for_load();
     assert!(plan_laser_toolpath(&empty_doc, 0, None, &LaserJobConfig::default()).is_err());
     assert!(compute_separations(&empty_doc, 0, &SeparationOptions::default()).is_err());
     assert!(impose_document(
@@ -637,7 +639,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
 
     // 2. Barcode & QR reject NaN/Inf origins and absurd dimensions without mutating doc
     let mut doc = Document::new_a4("درع الشكر والتقدير");
-    let before_count = doc.objects.len();
+    let before_count = doc.object_count();
     assert!(add_qr_code_to_document(
         &mut doc,
         "مرحبا",
@@ -655,7 +657,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
         None
     )
     .is_err());
-    assert_eq!(doc.objects.len(), before_count);
+    assert_eq!(doc.object_count(), before_count);
     assert!(generate_barcode(
         BarcodeSymbology::Code128,
         "ABC",
@@ -729,7 +731,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
     // 5. Find & Replace respects LOCKED LAYERS + NaN ColorMatch tolerance safely
     let locked_layer = doc
         .add_layer(
-            doc.pages[0].id,
+            doc.pages()[0].id,
             "Locked Brand",
             false,
             MasterLayerScope::None,
@@ -768,7 +770,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
         "objects on locked layers must not be mutated"
     );
     assert_eq!(
-        doc.objects[&locked_layer_obj].fill,
+        doc.objects()[&locked_layer_obj].fill,
         Fill::Solid(Color::MAGENTA)
     );
 
@@ -799,7 +801,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
     )
     .unwrap();
     let merged = apply_print_merge(&tpl, &ar_tbl, &PrintMergeOptions::default()).unwrap();
-    assert_eq!(merged.pages.len(), 2);
+    assert_eq!(merged.pages().len(), 2);
     assert!(PrintMergeTable::from_delimited("A\"B\n1\"2", '"').is_err());
 
     // 7. Sandboxed macros reject NaN/Inf transforms & page sizes atomically
@@ -1203,7 +1205,8 @@ fn regression_6_gcode_comment_injection_nan_sanitization_and_moved_connector() {
         )
         .unwrap();
     let grp = doc.group_objects(&[cid], "Moved Group").unwrap();
-    doc.objects.get_mut(&grp).unwrap().transform = Affine2D::translate(10.0, 5.0);
+    doc.set_object_transform(grp, Affine2D::translate(10.0, 5.0))
+        .unwrap();
 
     let plan = plan_laser_toolpath(&doc, 0, None, &LaserJobConfig::default()).unwrap();
     assert_eq!(plan.segments.len(), 1);

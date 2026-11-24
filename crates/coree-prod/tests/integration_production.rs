@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! End-to-end integration tests exercising all 8 `coree-prod` production modules together.
 
 use coree_core::{
-    Affine2D, ArtisticText, BlendMode, Color, ColorMode, CommandHistory, CommandOp, CornerStyle,
-    Document, Fill, LensConfig, LensKind, MasterLayerScope, NodePayload, ObjectId, OutlineStyle,
-    ParametricShape, Point2D, RasterAsset, RasterLayerData, SceneObject, TextDirection, TextStyle,
+    Affine2D, AnchorPoint, ArtisticText, BezierPath, BlendMode, Color, ColorMode, CommandHistory,
+    CommandOp, ConnectorObject, ConnectorStyle, CornerStyle, Document, Fill, LensConfig, LensKind,
+    MasterLayerScope, NodePayload, ObjectId, OutlineStyle, ParametricShape, Point2D, RasterAsset,
+    RasterLayerData, Rect2D, SceneObject, SymbolDef, TextDirection, TextOnPath, TextStyle,
 };
 use coree_prod::{
     add_barcode_to_document, add_qr_code_to_document, apply_print_merge, booklet_signature_order,
@@ -44,7 +46,7 @@ fn make_rect(x: f64, y: f64, w: f64, h: f64, fill: Fill, outline: OutlineStyle) 
 fn end_to_end_print_merge_imposition_marks_preflight_separations_and_collect() {
     // 1. Build an 85x55mm product label template with Arabic + English placeholders + EAN-13 + QR
     let mut template = Document::new("Product Label", 85.0, 55.0, ColorMode::Cmyk, 300.0);
-    template.pages[0].bleed_mm = 3.0;
+    template.set_page_bleed(0, 3.0).unwrap();
 
     // Full-bleed CMYK background (-3..-3 to 88..58)
     template
@@ -162,9 +164,9 @@ fn end_to_end_print_merge_imposition_marks_preflight_separations_and_collect() {
     };
 
     let mut merged = apply_print_merge(&template, &table, &merge_opts).unwrap();
-    assert_eq!(merged.pages.len(), 4);
-    assert_eq!(merged.pages[0].name, "Label SN-0100");
-    assert_eq!(merged.pages[3].name, "Label SN-0103");
+    assert_eq!(merged.pages().len(), 4);
+    assert_eq!(merged.pages()[0].name, "Label SN-0100");
+    assert_eq!(merged.pages()[3].name, "Label SN-0103");
 
     // 3. Preflight catches the RGB accent strip inside the CMYK document
     let pre_before = run_preflight(&merged, &PreflightRules::default());
@@ -197,7 +199,7 @@ fn end_to_end_print_merge_imposition_marks_preflight_separations_and_collect() {
         },
     )
     .unwrap();
-    assert_eq!(sheet.pages.len(), 1);
+    assert_eq!(sheet.pages().len(), 1);
 
     // 6. Add full vector Print Marks to the imposed press sheet
     let marks = generate_print_marks(&mut sheet, 0, &PrintMarksOptions::default()).unwrap();
@@ -362,9 +364,9 @@ fn booklet_4_6_8_page_signatures_and_tiling_overlap_marks() {
         },
     )
     .unwrap();
-    assert_eq!(imposed.pages.len(), 4);
-    assert!(imposed.pages[0].name.contains("P8 | P1"));
-    assert!(imposed.pages[3].name.contains("P4 | P5"));
+    assert_eq!(imposed.pages().len(), 4);
+    assert!(imposed.pages()[0].name.contains("P8 | P1"));
+    assert!(imposed.pages()[3].name.contains("P4 | P5"));
 
     // Invalid tiling overlap >= tile width must error cleanly
     assert!(impose_document(
@@ -494,16 +496,16 @@ fn barcodes_and_qr_all_symbologies() {
         None,
     )
     .unwrap();
-    assert!(doc.objects.contains_key(&b_id));
-    assert!(doc.objects.contains_key(&q_id));
+    assert!(doc.has_object(b_id));
+    assert!(doc.has_object(q_id));
 }
 
 #[test]
 fn find_replace_scope_locked_protection_and_preflight_scaled_dpi() {
     let mut doc = Document::new_a4("Inspect");
     doc.add_page("Page 2", 210.0, 297.0, 3.0);
-    let p1_layer = doc.pages[0].layers[0].id;
-    let p2_layer = doc.pages[1].layers[0].id;
+    let p1_layer = doc.pages()[0].layers[0].id;
+    let p2_layer = doc.pages()[1].layers[0].id;
 
     // 300x300 px asset placed at 25.4x25.4 mm, then scaled 2x -> effective 150 DPI (< 300 DPI!)
     let asset =
@@ -578,7 +580,7 @@ fn find_replace_scope_locked_protection_and_preflight_scaled_dpi() {
     );
     assert_eq!(rep.matched_ids, vec![locked_id]);
     assert!(rep.modified_ids.is_empty());
-    assert_eq!(doc.objects[&locked_id].fill, Fill::Solid(Color::CYAN));
+    assert_eq!(doc.objects()[&locked_id].fill, Fill::Solid(Color::CYAN));
 
     // Verify wildcard/regex text matching
     let t = doc
@@ -663,14 +665,14 @@ fn sandboxed_rhai_macro_library_and_recorded_replay() {
     .unwrap();
     assert_eq!(exec.commands_executed, 2);
     assert!(matches!(
-        target.objects[&obj_id].payload,
+        target.objects()[&obj_id].payload,
         NodePayload::Path(_)
     ));
 
     // Single undo reverts the entire macro transaction cleanly
     target_hist.undo(&mut target).unwrap();
     assert!(matches!(
-        target.objects[&obj_id].payload,
+        target.objects()[&obj_id].payload,
         NodePayload::Shape(_)
     ));
 
@@ -703,11 +705,11 @@ fn sandboxed_rhai_macro_library_and_recorded_replay() {
     assert!((after_bb.min_y - (before_bb.min_y + 7.5)).abs() < 1e-6);
 
     // Extra layer cleanup test
-    let p_id = target.pages[0].id;
+    let p_id = target.pages()[0].id;
     target
         .add_layer(p_id, "Temp Empty", false, MasterLayerScope::None)
         .unwrap();
-    assert_eq!(target.pages[0].layers.len(), 2);
+    assert_eq!(target.pages()[0].layers.len(), 2);
     run_macro(
         &mut target,
         find_builtin_macro("clean-empty-layers").unwrap().script,
@@ -715,7 +717,7 @@ fn sandboxed_rhai_macro_library_and_recorded_replay() {
         &MacroSandboxConfig::default(),
     )
     .unwrap();
-    assert_eq!(target.pages[0].layers.len(), 1);
+    assert_eq!(target.pages()[0].layers.len(), 1);
 }
 
 trait IntoFillExt {
@@ -753,7 +755,7 @@ fn regression_1_utf8_multibyte_object_names_never_panic_in_print_merge() {
     }
     let table = PrintMergeTable::from_csv("Name\nأحمد\nسارة\n").unwrap();
     let merged = apply_print_merge(&tpl, &table, &PrintMergeOptions::default()).unwrap();
-    assert_eq!(merged.pages.len(), 2);
+    assert_eq!(merged.pages().len(), 2);
 }
 
 #[test]
@@ -968,7 +970,7 @@ fn regression_4_gradient_separations_respect_object_world_transform() {
 #[test]
 fn regression_5_group_transform_and_powerclip_bleed_and_metrics() {
     let mut doc = Document::new_a4("Group & PowerClip");
-    doc.pages[0].bleed_mm = 3.0;
+    doc.set_page_bleed(0, 3.0).unwrap();
 
     // 5a. Child shape at local (0, 0) (would look like touching trim if parent transform were ignored!),
     // grouped and translated safely into the interior (50, 50) -> MUST NOT trigger bleed warning!
@@ -986,7 +988,8 @@ fn regression_5_group_transform_and_powerclip_bleed_and_metrics() {
         )
         .unwrap();
     let safe_grp = doc.group_objects(&[child_safe], "Safe Group").unwrap();
-    doc.objects.get_mut(&safe_grp).unwrap().transform = Affine2D::translate(50.0, 50.0);
+    doc.set_object_transform(safe_grp, Affine2D::translate(50.0, 50.0))
+        .unwrap();
 
     // 5b. Child shape at local (50, 50) translated by group to (-1, 50) -> touches trim without full 3mm bleed -> MUST flag!
     let child_bleed = doc
@@ -1003,7 +1006,8 @@ fn regression_5_group_transform_and_powerclip_bleed_and_metrics() {
         )
         .unwrap();
     let bleed_grp = doc.group_objects(&[child_bleed], "Bleed Group").unwrap();
-    doc.objects.get_mut(&bleed_grp).unwrap().transform = Affine2D::translate(-51.0, 0.0);
+    doc.set_object_transform(bleed_grp, Affine2D::translate(-51.0, 0.0))
+        .unwrap();
 
     // 5c. PowerClip container safely inside [90..150, 90..150] clipping an oversized child [-1..200, 90..150]
     // -> clipped child MUST NOT falsely trigger bleed warning!
@@ -1074,7 +1078,9 @@ fn regression_5_group_transform_and_powerclip_bleed_and_metrics() {
         )
         .unwrap();
     let tg = metrics_doc.group_objects(&[t], "TextGrp").unwrap();
-    metrics_doc.objects.get_mut(&tg).unwrap().transform = Affine2D::translate(80.0, 90.0);
+    metrics_doc
+        .set_object_transform(tg, Affine2D::translate(80.0, 90.0))
+        .unwrap();
 
     let m = compute_production_metrics(&metrics_doc, None);
     let bb = m.bounding_box.expect("metrics bbox");
@@ -1249,7 +1255,7 @@ fn regression_7_collect_for_output_font_collisions_tables_dimensions_and_spot_in
 #[test]
 fn regression_8_macro_nan_validation_and_locked_layer_preservation() {
     let mut doc = Document::new_a4("Macro Hardening");
-    let pid = doc.pages[0].id;
+    let pid = doc.pages()[0].id;
     let oid = doc
         .add_object(
             make_rect(
@@ -1314,7 +1320,7 @@ fn regression_8_macro_nan_validation_and_locked_layer_preservation() {
     )
     .is_err());
     assert_eq!(doc, snap);
-    assert!(doc.objects.contains_key(&oid));
+    assert!(doc.has_object(oid));
 
     // clean_empty_layers removes unlocked empty layer while preserving locked empty layer!
     run_macro(
@@ -1385,27 +1391,28 @@ fn regression_9_print_merge_grouped_barcodes_and_empty_resolved_guard() {
     let grp = tpl
         .group_objects(&[label, bc_ph, opt_bc_ph], "Product Card")
         .unwrap();
-    tpl.objects.get_mut(&grp).unwrap().transform = Affine2D::translate(30.0, 40.0);
+    tpl.set_object_transform(grp, Affine2D::translate(30.0, 40.0))
+        .unwrap();
 
     // Row 0 has empty OptCode -> must NOT fail! Row 1 has populated OptCode -> regenerates barcode!
     let csv = "Item,SKU,OptCode\nWidget A,SKU-001,\nWidget B,SKU-002,OPT-99\n";
     let table = PrintMergeTable::from_csv(csv).unwrap();
     let merged = apply_print_merge(&tpl, &table, &PrintMergeOptions::default()).unwrap();
-    assert_eq!(merged.pages.len(), 2);
+    assert_eq!(merged.pages().len(), 2);
 
     // Page 0: verify Product Card group still holds 3 children, child[1] is replaced with vector barcode group,
     // and its world bounds reflect the parent group's translate(30, 40) + child local (0, 15) = (30, 55)!
-    let p0_grp_id = merged.pages[0].layers[0].objects[0];
-    let NodePayload::Group(ref p0_children) = merged.objects[&p0_grp_id].payload else {
+    let p0_grp_id = merged.pages()[0].layers[0].objects[0];
+    let NodePayload::Group(ref p0_children) = merged.objects()[&p0_grp_id].payload else {
         panic!("expected Product Card group on page 0");
     };
     assert_eq!(p0_children.len(), 3);
     assert_eq!(
-        merged.objects[&p0_children[1]].name,
+        merged.objects()[&p0_children[1]].name,
         "Barcode:Code128:SKU-001"
     );
     assert!(matches!(
-        merged.objects[&p0_children[1]].payload,
+        merged.objects()[&p0_children[1]].payload,
         NodePayload::Group(_)
     ));
     // Verify parent group preserved its translation
@@ -1422,16 +1429,1242 @@ fn regression_9_print_merge_grouped_barcodes_and_empty_resolved_guard() {
     );
 
     // Page 1: OptCode WAS populated so child[2] also became a regenerated vector barcode group!
-    let p1_grp_id = merged.pages[1].layers[0].objects[0];
-    let NodePayload::Group(ref p1_children) = merged.objects[&p1_grp_id].payload else {
+    let p1_grp_id = merged.pages()[1].layers[0].objects[0];
+    let NodePayload::Group(ref p1_children) = merged.objects()[&p1_grp_id].payload else {
         panic!("expected Product Card group on page 1");
     };
     assert_eq!(
-        merged.objects[&p1_children[2]].name,
+        merged.objects()[&p1_children[2]].name,
         "Barcode:Code128:OPT-99"
     );
     assert!(matches!(
-        merged.objects[&p1_children[2]].payload,
+        merged.objects()[&p1_children[2]].payload,
         NodePayload::Group(_)
     ));
+}
+
+#[test]
+fn w1b_r11_cql_leading_dot_float_and_master_layer_owning_page_filtering() {
+    use coree_prod::evaluate_cql_query;
+
+    let mut doc = Document::new_a4("CQL & Master Scope");
+    let p1 = doc.pages()[0].id;
+    let _p2 = doc.add_page("Page 2", 210.0, 297.0, 3.0);
+
+    let mut half_alpha = make_rect(
+        10.0,
+        10.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::CYAN),
+        OutlineStyle::solid(Color::KEY_BLACK, 0.5),
+    );
+    half_alpha.opacity = 0.5;
+    let half_id = doc.add_object(half_alpha, None).unwrap();
+
+    let mut full_alpha = make_rect(
+        40.0,
+        10.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::MAGENTA),
+        OutlineStyle::solid(Color::KEY_BLACK, 0.1),
+    );
+    full_alpha.opacity = 1.0;
+    let full_id = doc.add_object(full_alpha, None).unwrap();
+
+    // Leading-dot float `.5` and `.25mm` in CQL
+    let matched_opacity =
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@opacity == .5").unwrap();
+    assert_eq!(matched_opacity, vec![half_id]);
+    let matched_width =
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.width >= .25mm").unwrap();
+    assert_eq!(matched_width, vec![half_id]);
+    let _ = full_id;
+
+    // EvenPages master layer created on Page 1 must NOT be included on Page 1 metrics/imposition!
+    let even_layer = doc
+        .add_layer(p1, "EvenOnlyOnP1", false, MasterLayerScope::EvenPages)
+        .unwrap();
+    let even_obj = make_rect(
+        180.0,
+        260.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::YELLOW),
+        OutlineStyle::none(),
+    );
+    doc.add_object(even_obj, Some(even_layer)).unwrap();
+
+    let imposed = impose_document(
+        &doc,
+        &ImpositionMode::NUp {
+            cols: 1,
+            rows: 1,
+            gap_x_mm: 0.0,
+            gap_y_mm: 0.0,
+            sheet_w_mm: 210.0,
+            sheet_h_mm: 297.0,
+        },
+    )
+    .unwrap();
+    // Page 1 sheet should only contain the 2 local Page 1 rects, NOT the EvenPages rect!
+    let sheet1_obj_count: usize = imposed.pages()[0]
+        .layers
+        .iter()
+        .map(|l| l.objects.len())
+        .sum();
+    assert_eq!(
+        sheet1_obj_count, 2,
+        "EvenPages master layer on Page 1 must not be copied onto Page 1 imposition sheet"
+    );
+    // Page 2 sheet SHOULD contain the EvenPages rect!
+    let sheet2_obj_count: usize = imposed.pages()[1]
+        .layers
+        .iter()
+        .map(|l| l.objects.len())
+        .sum();
+    assert_eq!(
+        sheet2_obj_count, 1,
+        "EvenPages master layer from Page 1 must appear on Page 2 imposition sheet"
+    );
+
+    // evaluate_cql_query with FindScope::CurrentPage must also respect EvenPages on Page 1 vs Page 2
+    let cql_p1 = evaluate_cql_query(&doc, FindScope::CurrentPage, "@visible == true").unwrap();
+    assert_eq!(
+        cql_p1.len(),
+        2,
+        "EvenPages layer on Page 1 must not match CurrentPage(Page 1) CQL query"
+    );
+    doc.set_active_page_index(1).unwrap();
+    let cql_p2 = evaluate_cql_query(&doc, FindScope::CurrentPage, "@visible == true").unwrap();
+    assert_eq!(
+        cql_p2.len(),
+        1,
+        "EvenPages layer from Page 1 must match CurrentPage(Page 2) CQL query"
+    );
+}
+
+#[test]
+fn w1b_r12_preflight_handles_branching_cyclic_symbol_and_symbol_local_text_on_path_connector() {
+    // 1. SymbolDef containing symbol-local Path, TextOnPath, Shape, and Connector safely centered on Page 1
+    let mut doc = Document::new_a4("Preflight Symbol Context");
+    let path_id = ObjectId(9001);
+    let shape_id = ObjectId(9002);
+    let sym_path = SceneObject::new(
+        path_id,
+        "SymCenterPath",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(80.0, 120.0),
+            Point2D::new(130.0, 120.0),
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::solid(Color::KEY_BLACK, 0.5));
+    let sym_top = SceneObject::new(
+        ObjectId(9003),
+        "SymTextOnPath",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain("CenteredLabel", TextStyle::default()),
+            path_id,
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::KEY_BLACK))
+    .with_outline(OutlineStyle::none());
+    let sym_shape = SceneObject::new(
+        shape_id,
+        "SymCenterBox",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            80.0, 150.0, 30.0, 20.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle::none());
+    let sym_conn = SceneObject::new(
+        ObjectId(9004),
+        "SymConnector",
+        NodePayload::Connector(ConnectorObject::between_objects(
+            path_id,
+            AnchorPoint::Center,
+            shape_id,
+            AnchorPoint::Center,
+            ConnectorStyle::Straight,
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::solid(Color::KEY_BLACK, 0.5));
+
+    let sym = SymbolDef::new(
+        "CenteredWidget",
+        vec![sym_path, sym_top, sym_shape, sym_conn],
+    );
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "SymInstCentered",
+            NodePayload::SymbolInstance(sym_id),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let report = run_preflight(&doc, &PreflightRules::default());
+    assert!(
+        !report
+            .issues
+            .iter()
+            .any(|i| i.kind == PreflightIssueKind::InsufficientBleedCoverage),
+        "symbol-local TextOnPath/Connector centered on page must not trigger bleed false positive: {:?}",
+        report.issues
+    );
+
+    // 2. Branching self-cyclic SymbolDef (2 SymbolInstance(self) children) must terminate immediately
+    let mut cyclic_doc = Document::new_a4("Branching Cyclic Symbol");
+    let cyclic_id = coree_core::SymbolId::new();
+    let cyclic_sym = SymbolDef {
+        id: cyclic_id,
+        name: "BranchingCycle".into(),
+        objects: vec![
+            SceneObject::new(ObjectId(1), "SelfA", NodePayload::SymbolInstance(cyclic_id)),
+            SceneObject::new(ObjectId(2), "SelfB", NodePayload::SymbolInstance(cyclic_id)),
+            SceneObject::new(
+                ObjectId(3),
+                "LeafRect",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    60.0, 60.0, 20.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::none()),
+        ],
+    };
+    cyclic_doc.insert_symbol(cyclic_sym);
+    cyclic_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CyclicInst",
+                NodePayload::SymbolInstance(cyclic_id),
+            ),
+            None,
+        )
+        .unwrap();
+
+    let cyclic_report = run_preflight(&cyclic_doc, &PreflightRules::default());
+    assert!(
+        !cyclic_report
+            .issues
+            .iter()
+            .any(|i| i.kind == PreflightIssueKind::InsufficientBleedCoverage),
+        "branching cyclic SymbolDef must terminate cleanly with centered leaf bounds"
+    );
+}
+
+#[test]
+fn w1b_r13_preflight_respects_master_layer_page_scope_and_dedups_layer_state() {
+    // Page 1 (A4) owns an EvenPages master layer (locked) whose object crosses Page 2's (A5) right trim edge.
+    let mut doc = Document::new_a4("R13 Master Preflight");
+    let p1_id = doc.pages()[0].id;
+    let p2_id = doc.add_page("Page 2 A5", 148.0, 210.0, 3.0);
+    let p3_id = doc.add_page("Page 3 A4", 210.0, 297.0, 3.0);
+    let p4_id = doc.add_page("Page 4 A5", 148.0, 210.0, 3.0);
+
+    let even_master = doc
+        .add_layer(p1_id, "EvenMaster", false, MasterLayerScope::EvenPages)
+        .unwrap();
+    let edge_rect = make_rect(
+        147.0,
+        20.0,
+        2.0,
+        20.0,
+        Fill::Solid(Color::CYAN),
+        OutlineStyle::none(),
+    );
+    doc.add_object(edge_rect, Some(even_master)).unwrap();
+    doc.set_layer_flags(even_master, None, Some(true), None, None)
+        .unwrap();
+
+    let report = run_preflight(&doc, &PreflightRules::default());
+    let bleed_pages: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.kind == PreflightIssueKind::InsufficientBleedCoverage)
+        .filter_map(|i| i.page_id)
+        .collect();
+    assert!(bleed_pages.contains(&p2_id));
+    assert!(bleed_pages.contains(&p4_id));
+    assert!(!bleed_pages.contains(&p1_id));
+    assert!(!bleed_pages.contains(&p3_id));
+
+    let locked_layer_hits = report
+        .issues
+        .iter()
+        .filter(|i| {
+            i.kind == PreflightIssueKind::LockedLayerWithObjects && i.layer_id == Some(even_master)
+        })
+        .count();
+    assert_eq!(
+        locked_layer_hits, 1,
+        "layer-level LockedLayerWithObjects must be deduplicated once per LayerId across even pages"
+    );
+
+    // 1-page document with an EvenPages master layer must NOT evaluate against Page 1
+    let mut single_doc = Document::new_a4("Single Page EvenMaster");
+    let sp1 = single_doc.pages()[0].id;
+    let sp1_even = single_doc
+        .add_layer(sp1, "EvenOnly", false, MasterLayerScope::EvenPages)
+        .unwrap();
+    single_doc
+        .add_object(
+            make_rect(
+                209.0,
+                20.0,
+                2.0,
+                20.0,
+                Fill::Solid(Color::CYAN),
+                OutlineStyle::none(),
+            ),
+            Some(sp1_even),
+        )
+        .unwrap();
+    single_doc
+        .set_layer_flags(sp1_even, None, Some(true), None, None)
+        .unwrap();
+    let single_report = run_preflight(&single_doc, &PreflightRules::default());
+    assert!(
+        single_report.issues.is_empty(),
+        "EvenPages layer on 1-page doc must not report false positives on Page 1: {:?}",
+        single_report.issues
+    );
+}
+
+#[test]
+fn w1b_r17_print_merge_container_barcode_preserves_connector_world_fallback() {
+    let mut tpl = Document::new_a4("R17 PrintMerge Container Barcode");
+    let lid = tpl.pages()[0].layers[0].id;
+
+    // 1. BARCODE placeholder inside a rotated+translated Group
+    let grp_bc = tpl
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BARCODE:QR:<<Code>>",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "<<Code>>",
+                    TextStyle::default(),
+                )),
+            )
+            .with_transform(Affine2D::translate(10.0, 5.0)),
+            Some(lid),
+        )
+        .unwrap();
+    let grp_id = tpl.group_objects(&[grp_bc], "BarcodeGroup").unwrap();
+    tpl.transform_object(
+        grp_id,
+        Affine2D::translate(80.0, 90.0).compose(&Affine2D::rotate_deg(45.0)),
+    )
+    .unwrap();
+
+    // 2. BARCODE placeholder inside a rotated+translated PowerClip
+    let pc_bc = tpl
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BARCODE:CODE128:<<Sku>>",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "<<Sku>>",
+                    TextStyle::default(),
+                )),
+            )
+            .with_transform(Affine2D::translate(6.0, 8.0)),
+            Some(lid),
+        )
+        .unwrap();
+    let pc_rect = tpl
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                60.0,
+                40.0,
+                Fill::Solid(Color::WHITE),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc_id = tpl.create_powerclip(pc_rect, &[pc_bc]).unwrap();
+    tpl.transform_object(
+        pc_id,
+        Affine2D::translate(120.0, 150.0).compose(&Affine2D::rotate_deg(30.0)),
+    )
+    .unwrap();
+
+    let expected_grp_anchor = AnchorPoint::Center.resolve(tpl.world_object_bounds(grp_bc).unwrap());
+    let expected_pc_anchor = AnchorPoint::Center.resolve(tpl.world_object_bounds(pc_bc).unwrap());
+
+    // 3. Connectors referencing both container-nested BARCODE placeholders
+    let conn_grp = tpl
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "ConnGrp",
+                NodePayload::Connector(ConnectorObject::between_objects(
+                    grp_bc,
+                    AnchorPoint::Center,
+                    pc_rect,
+                    AnchorPoint::Center,
+                    ConnectorStyle::Straight,
+                )),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let conn_pc = tpl
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "ConnPc",
+                NodePayload::Connector(ConnectorObject::between_objects(
+                    pc_bc,
+                    AnchorPoint::Center,
+                    grp_id,
+                    AnchorPoint::Center,
+                    ConnectorStyle::Straight,
+                )),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let _ = (conn_grp, conn_pc);
+
+    let table = PrintMergeTable {
+        headers: vec!["Code".into(), "Sku".into()],
+        rows: vec![vec!["ABC-123".into(), "SKU-999".into()]],
+    };
+    let merged = apply_print_merge(&tpl, &table, &PrintMergeOptions::default()).unwrap();
+    assert_eq!(merged.pages().len(), 1);
+
+    let mut found_conn_grp = None;
+    let mut found_conn_pc = None;
+    for obj in merged.objects().values() {
+        if obj.name == "ConnGrp" {
+            if let NodePayload::Connector(ref c) = obj.payload {
+                found_conn_grp = Some(c.clone());
+            }
+        } else if obj.name == "ConnPc" {
+            if let NodePayload::Connector(ref c) = obj.payload {
+                found_conn_pc = Some(c.clone());
+            }
+        }
+    }
+    let cg = found_conn_grp.expect("merged ConnGrp");
+    assert!(cg.from_obj.is_none());
+    assert!(
+        cg.from_fallback.distance_to(expected_grp_anchor) < 1e-3,
+        "Group BARCODE connector fallback {:?} must match world anchor {:?}",
+        cg.from_fallback,
+        expected_grp_anchor
+    );
+
+    let cp = found_conn_pc.expect("merged ConnPc");
+    assert!(cp.from_obj.is_none());
+    assert!(
+        cp.from_fallback.distance_to(expected_pc_anchor) < 1e-3,
+        "PowerClip BARCODE connector fallback {:?} must match world anchor {:?}",
+        cp.from_fallback,
+        expected_pc_anchor
+    );
+}
+
+#[test]
+fn w1b_r17_cut_contour_text_on_path_inside_rotated_group_and_powerclip() {
+    let mut doc = Document::new_a4("R17 CutContour TOP");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. TextOnPath inside translated + 45°-rotated Group
+    let host1 = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Host1",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(0.0, 0.0),
+                    Point2D::new(40.0, 0.0),
+                )),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let top1 = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Top1",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("GROUP_TOP", TextStyle::default()),
+                    path_id: host1,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let grp = doc.group_objects(&[host1, top1], "TopGroup").unwrap();
+    doc.transform_object(
+        grp,
+        Affine2D::translate(100.0, 120.0).compose(&Affine2D::rotate_deg(45.0)),
+    )
+    .unwrap();
+
+    let world_top1 = doc.world_object_bounds(top1).unwrap();
+    let cut1 = generate_cut_contour(&mut doc, &[top1], 2.0, "CutContour").unwrap();
+    let cut1_bb = doc.world_object_bounds(cut1.object_id).unwrap();
+    assert!(
+        (cut1_bb.min_x - (world_top1.min_x - 2.0)).abs() < 0.5
+            && (cut1_bb.min_y - (world_top1.min_y - 2.0)).abs() < 0.5
+            && (cut1_bb.max_x - (world_top1.max_x + 2.0)).abs() < 0.5
+            && (cut1_bb.max_y - (world_top1.max_y + 2.0)).abs() < 0.5,
+        "Group CutContour {cut1_bb:?} must match world TextOnPath bounds {world_top1:?} expanded by 2mm"
+    );
+
+    // 2. TextOnPath inside translated + 30°-rotated PowerClip
+    let host2 = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Host2",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(0.0, 0.0),
+                    Point2D::new(35.0, 0.0),
+                )),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let top2 = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Top2",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("PC_TOP", TextStyle::default()),
+                    path_id: host2,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc_container = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                60.0,
+                40.0,
+                Fill::Solid(Color::WHITE),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc = doc.create_powerclip(pc_container, &[host2, top2]).unwrap();
+    doc.transform_object(
+        pc,
+        Affine2D::translate(50.0, 180.0).compose(&Affine2D::rotate_deg(30.0)),
+    )
+    .unwrap();
+
+    let world_top2 = doc.world_object_bounds(top2).unwrap();
+    let cut2 = generate_cut_contour(&mut doc, &[top2], 2.0, "CutContour").unwrap();
+    let cut2_bb = doc.world_object_bounds(cut2.object_id).unwrap();
+    assert!(
+        (cut2_bb.min_x - (world_top2.min_x - 2.0)).abs() < 0.5
+            && (cut2_bb.min_y - (world_top2.min_y - 2.0)).abs() < 0.5
+            && (cut2_bb.max_x - (world_top2.max_x + 2.0)).abs() < 0.5
+            && (cut2_bb.max_y - (world_top2.max_y + 2.0)).abs() < 0.5,
+        "PowerClip CutContour {cut2_bb:?} must match world TextOnPath bounds {world_top2:?} expanded by 2mm"
+    );
+}
+
+#[test]
+fn w1b_r18_macros_resize_align_grid_and_cut_contour_symbol_hierarchy() {
+    use coree_core::{
+        apply_command, ArtisticText, BezierPath, CommandHistory, CommandOp, Point2D, SymbolDef,
+        TextOnPath, TextStyle,
+    };
+    use coree_prod::{plan_macro_ops, MacroSandboxConfig};
+    use std::collections::BTreeMap;
+
+    // 1. macros::resize_objects and align_grid on mixed top-level + nested scaled/rotated Group & PowerClip
+    let mut doc = Document::new_a4("R18 Macros Nested");
+    let lid = doc.pages()[0].layers[0].id;
+    let top_r = doc
+        .add_object(
+            make_rect(
+                10.0,
+                10.0,
+                20.0,
+                10.0,
+                Fill::Solid(Color::CYAN),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let grp_child = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                20.0,
+                10.0,
+                Fill::Solid(Color::MAGENTA),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let grp = doc.group_objects(&[grp_child], "ScaledGroup").unwrap();
+    doc.transform_object(
+        grp,
+        Affine2D::translate(100.0, 50.0).compose(&Affine2D::scale(2.0, 2.0)),
+    )
+    .unwrap();
+
+    let pc_child = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                20.0,
+                10.0,
+                Fill::Solid(Color::YELLOW),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc_host = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+                Fill::Solid(Color::WHITE),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc = doc.create_powerclip(pc_host, &[pc_child]).unwrap();
+    doc.transform_object(
+        pc,
+        Affine2D::translate(80.0, 120.0).compose(&Affine2D::rotate_deg(90.0)),
+    )
+    .unwrap();
+
+    let cfg = MacroSandboxConfig::default();
+    let resize_script = format!(
+        "resize_objects([{}, {}, {}], 30.0, 15.0);",
+        top_r.0, grp_child.0, pc_child.0
+    );
+    let init_doc = doc.clone();
+    let (_res, resize_ops) = plan_macro_ops(&doc, &resize_script, &BTreeMap::new(), &cfg).unwrap();
+    let mut hist = CommandHistory::default();
+    hist.execute(&mut doc, CommandOp::Batch(resize_ops))
+        .unwrap();
+
+    for (label, id) in [
+        ("top", top_r),
+        ("group_child", grp_child),
+        ("powerclip_child", pc_child),
+    ] {
+        let bb = doc.world_object_bounds(id).unwrap();
+        assert!(
+            (bb.width() - 30.0).abs() < 1e-4 && (bb.height() - 15.0).abs() < 1e-4,
+            "{label} world size after resize_objects must be 30x15, got {bb:?}"
+        );
+    }
+
+    let align_script = format!(
+        "align_grid([{}, {}, {}], 2, 10.0, 10.0, 5.0, 5.0);",
+        top_r.0, grp_child.0, pc_child.0
+    );
+    let (_res2, align_ops) = plan_macro_ops(&doc, &align_script, &BTreeMap::new(), &cfg).unwrap();
+    hist.execute(&mut doc, CommandOp::Batch(align_ops)).unwrap();
+
+    let bb0 = doc.world_object_bounds(top_r).unwrap();
+    let bb1 = doc.world_object_bounds(grp_child).unwrap();
+    let bb2 = doc.world_object_bounds(pc_child).unwrap();
+    assert!(
+        (bb0.min_x - 5.0).abs() < 1e-4 && (bb0.min_y - 5.0).abs() < 1e-4,
+        "top_r slot (0,0) expected (5,5), got {bb0:?}"
+    );
+    assert!(
+        (bb1.min_x - 45.0).abs() < 1e-4 && (bb1.min_y - 5.0).abs() < 1e-4,
+        "grp_child slot (0,1) expected (45,5), got {bb1:?}"
+    );
+    assert!(
+        (bb2.min_x - 5.0).abs() < 1e-4 && (bb2.min_y - 30.0).abs() < 1e-4,
+        "pc_child slot (1,0) expected (5,30), got {bb2:?}"
+    );
+
+    // Undo restores initial doc cleanly
+    hist.undo(&mut doc).unwrap();
+    hist.undo(&mut doc).unwrap();
+    assert_eq!(doc.objects(), init_doc.objects());
+    let _ = apply_command;
+
+    // 2. generate_cut_contour on SymbolInstance containing translated+rotated Group and TextOnPath
+    let mut sdoc = Document::new_a4("R18 CutContour Symbol");
+    let slid = sdoc.pages()[0].layers[0].id;
+    let s_rect_id = ObjectId(7001);
+    let s_grp_id = ObjectId(7002);
+    let s_path_id = ObjectId(7003);
+    let s_top_id = ObjectId(7004);
+
+    let s_rect = SceneObject::new(
+        s_rect_id,
+        "SymRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 20.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle::none());
+    let s_grp = SceneObject::new(s_grp_id, "SymGrp", NodePayload::Group(vec![s_rect_id]))
+        .with_transform(Affine2D::translate(100.0, 80.0).compose(&Affine2D::rotate_deg(45.0)));
+
+    let sym1 = SymbolDef::new("SymGroupedRect", vec![s_rect, s_grp]);
+    let sym1_id = sym1.id;
+    sdoc.insert_symbol(sym1);
+    let inst1 = sdoc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Inst1", NodePayload::SymbolInstance(sym1_id)),
+            Some(slid),
+        )
+        .unwrap();
+    let expected1 = sdoc.world_object_bounds(inst1).unwrap();
+    let cut1 = generate_cut_contour(&mut sdoc, &[inst1], 2.0, "CutContour").unwrap();
+    let cut1_bb = sdoc.world_object_bounds(cut1.object_id).unwrap();
+    assert!(
+        cut1_bb.min_x < expected1.min_x - 1.0
+            && cut1_bb.min_y < expected1.min_y - 1.0
+            && cut1_bb.max_x > expected1.max_x + 1.0
+            && cut1_bb.max_y > expected1.max_y + 1.0
+            && (cut1_bb.center().x - expected1.center().x).abs() < 0.25
+            && (cut1_bb.center().y - expected1.center().y).abs() < 0.25,
+        "SymbolInstance(Group) CutContour {cut1_bb:?} must cleanly surround world bounds {expected1:?}"
+    );
+
+    let s_path = SceneObject::new(
+        s_path_id,
+        "SymHost",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(0.0, 0.0),
+            Point2D::new(40.0, 0.0),
+        )),
+    );
+    let s_top = SceneObject::new(
+        s_top_id,
+        "SymTop",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain("SYM_CUT", TextStyle::default()),
+            path_id: s_path_id,
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    );
+    let sym2 = SymbolDef::new("SymWithTop", vec![s_path, s_top]);
+    let sym2_id = sym2.id;
+    sdoc.insert_symbol(sym2);
+    let inst2 = sdoc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Inst2", NodePayload::SymbolInstance(sym2_id))
+                .with_transform(
+                    Affine2D::translate(30.0, 50.0).compose(&Affine2D::rotate_deg(30.0)),
+                ),
+            Some(slid),
+        )
+        .unwrap();
+    let expected2 = sdoc.world_object_bounds(inst2).unwrap();
+    let cut2 = generate_cut_contour(&mut sdoc, &[inst2], 2.0, "CutContour").unwrap();
+    let cut2_bb = sdoc.world_object_bounds(cut2.object_id).unwrap();
+    assert!(
+        (cut2_bb.min_x - (expected2.min_x - 2.0)).abs() < 0.25
+            && (cut2_bb.min_y - (expected2.min_y - 2.0)).abs() < 0.25
+            && (cut2_bb.max_x - (expected2.max_x + 2.0)).abs() < 0.25
+            && (cut2_bb.max_y - (expected2.max_y + 2.0)).abs() < 0.25,
+        "SymbolInstance(TextOnPath) CutContour {cut2_bb:?} must wrap world bounds {expected2:?} + 2mm"
+    );
+}
+
+#[test]
+fn w1b_r20_generate_cut_contour_and_metrics_on_grouped_and_powerclipped_child() {
+    let mut doc = Document::new_a4("R20 CutContour Child");
+    let lid = doc.pages()[0].layers[0].id;
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+
+    // 1. Direct child inside a translated + rotated Group
+    let child = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                Fill::Solid(red.clone()),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let grp = doc.group_objects(&[child], "MovedGroup").unwrap();
+    doc.set_object_transform(
+        grp,
+        Affine2D::translate(100.0, 150.0).compose(&Affine2D::rotate_deg(30.0)),
+    )
+    .unwrap();
+
+    let expected_wb = doc.world_object_bounds(child).unwrap();
+    let cut = generate_cut_contour(&mut doc, &[child], 1.0, "CutContour").unwrap();
+    let cut_bb = doc.world_object_bounds(cut.object_id).unwrap();
+    assert!(
+        (cut_bb.center().x - expected_wb.center().x).abs() < 0.25
+            && (cut_bb.center().y - expected_wb.center().y).abs() < 0.25
+            && cut_bb.min_x < expected_wb.min_x - 0.5
+            && cut_bb.max_x > expected_wb.max_x + 0.5,
+        "CutContour {cut_bb:?} for grouped child must align with world bounds {expected_wb:?} (NOT page origin)"
+    );
+
+    let sel_metrics = compute_production_metrics(&doc, Some(&[child]));
+    let m_bb = sel_metrics.bounding_box.unwrap();
+    assert!(
+        (m_bb.min_x - expected_wb.min_x).abs() < 0.25
+            && (m_bb.min_y - expected_wb.min_y).abs() < 0.25
+            && (m_bb.max_x - expected_wb.max_x).abs() < 0.25
+            && (m_bb.max_y - expected_wb.max_y).abs() < 0.25,
+        "compute_production_metrics(Some(&[child])) bbox {m_bb:?} must match {expected_wb:?}"
+    );
+
+    // 2. Direct child inside a translated PowerClip
+    let pc_child = doc
+        .add_object(
+            make_rect(
+                5.0,
+                5.0,
+                20.0,
+                20.0,
+                Fill::Solid(blue),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let pc_container = doc
+        .add_object(
+            make_rect(0.0, 0.0, 40.0, 40.0, Fill::Solid(red), OutlineStyle::none())
+                .with_transform(Affine2D::translate(80.0, 40.0)),
+            Some(lid),
+        )
+        .unwrap();
+    let _pc_id = doc.create_powerclip(pc_container, &[pc_child]).unwrap();
+    let pc_child_wb = doc.world_object_bounds(pc_child).unwrap();
+    let pc_cut = generate_cut_contour(&mut doc, &[pc_child], 1.5, "CutContourPC").unwrap();
+    let pc_cut_bb = doc.world_object_bounds(pc_cut.object_id).unwrap();
+    assert!(
+        (pc_cut_bb.min_x - (pc_child_wb.min_x - 1.5)).abs() < 0.25
+            && (pc_cut_bb.min_y - (pc_child_wb.min_y - 1.5)).abs() < 0.25
+            && (pc_cut_bb.max_x - (pc_child_wb.max_x + 1.5)).abs() < 0.25
+            && (pc_cut_bb.max_y - (pc_child_wb.max_y + 1.5)).abs() < 0.25,
+        "PowerClip child CutContour {pc_cut_bb:?} must wrap world bounds {pc_child_wb:?} + 1.5mm"
+    );
+}
+
+#[test]
+fn w1b_r21_compute_production_metrics_expands_symbol_instance() {
+    let mut doc = Document::new_a4("R21 Symbol Metrics");
+    let page_id = doc.pages()[0].id;
+    let cut_lid = doc
+        .add_layer(page_id, "Cut", true, MasterLayerScope::None)
+        .unwrap();
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let mut leaf = make_rect(0.0, 0.0, 10.0, 20.0, Fill::Solid(red), OutlineStyle::none());
+    leaf.id = ObjectId(1);
+    let grp = SceneObject::new(ObjectId(2), "SymGrp", NodePayload::Group(vec![ObjectId(1)]));
+    let sym = SymbolDef::new("CutSym", vec![leaf, grp]);
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+
+    let inst = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CutSymInst",
+                NodePayload::SymbolInstance(sym_id),
+            )
+            .with_transform(Affine2D::scale(2.0, 2.0)),
+            Some(cut_lid),
+        )
+        .unwrap();
+
+    // Invisible instance must be ignored
+    let mut hidden_obj = SceneObject::new(
+        ObjectId(0),
+        "HiddenSymInst",
+        NodePayload::SymbolInstance(sym_id),
+    )
+    .with_transform(Affine2D::translate(50.0, 50.0));
+    hidden_obj.visible = false;
+    let hidden_inst = doc.add_object(hidden_obj, Some(cut_lid)).unwrap();
+
+    // 1. Selected SymbolInstance on Cut layer: world 20x40 => cut_length_mm=120, filled_area_mm2=800
+    let sel = compute_production_metrics(&doc, Some(&[inst]));
+    assert!(
+        (sel.cut_length_mm - 120.0).abs() < 0.5
+            && (sel.filled_area_mm2 - 800.0).abs() < 1.5
+            && sel.node_count == 4
+            && sel.subpath_count == 1,
+        "compute_production_metrics(Some(&[sym_inst])) must expand SymbolInstance->Group (exp len=120, area=800, nodes=4), got {sel:?}"
+    );
+
+    // 2. Whole document (selection=None) matches and ignores hidden_inst
+    let full = compute_production_metrics(&doc, None);
+    assert!(
+        (full.cut_length_mm - 120.0).abs() < 0.5 && (full.filled_area_mm2 - 800.0).abs() < 1.5,
+        "compute_production_metrics(&doc, None) must measure visible Cut SymbolInstance and skip hidden {hidden_inst:?}, got {full:?}"
+    );
+}
+
+#[test]
+fn w1b_r26_symbol_zero_id_metrics_and_cql_table_cell_predicates() {
+    use coree_core::VectorTable;
+    use coree_prod::evaluate_cql_query;
+
+    // 1. challenger1-r25-1: ObjectId(0) Group in SymbolDef propagates translate(50,30)
+    //    into compute_production_metrics for Connector & bbox.
+    let mut doc = Document::new_a4("R26 ZeroId Prod Metrics");
+    let lid = doc.pages()[0].layers[0].id;
+    let sym_rect = SceneObject::new(
+        ObjectId(10),
+        "SymRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 20.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle::none());
+    let sym_conn = SceneObject::new(
+        ObjectId(11),
+        "SymConn",
+        NodePayload::Connector(ConnectorObject {
+            from_obj: Some(ObjectId(10)),
+            from_anchor: AnchorPoint::TopLeft,
+            from_fallback: Point2D::ZERO,
+            to_obj: None,
+            to_anchor: AnchorPoint::Center,
+            to_fallback: Point2D::new(20.0, 10.0),
+            style: ConnectorStyle::Straight,
+            corner_radius_mm: 0.0,
+        }),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::solid(Color::KEY_BLACK, 0.2));
+    let zero_grp = SceneObject::new(
+        ObjectId(0),
+        "ZeroGrp",
+        NodePayload::Group(vec![ObjectId(10), ObjectId(11)]),
+    )
+    .with_transform(Affine2D::translate(50.0, 30.0));
+    let sym = SymbolDef::new("ZeroMetricsSym", vec![sym_rect, sym_conn, zero_grp]);
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+        Some(lid),
+    )
+    .unwrap();
+
+    let metrics = compute_production_metrics(&doc, None);
+    let expected_len = 60.0 + 20.0_f64.hypot(10.0);
+    assert!(
+        (metrics.artwork_length_mm - expected_len).abs() < 0.2,
+        "artwork_length_mm expected ~{expected_len:.4}, got {}",
+        metrics.artwork_length_mm
+    );
+    let m_bb = metrics.bounding_box.unwrap();
+    assert!(
+        (m_bb.min_x - 50.0).abs() < 0.1
+            && (m_bb.min_y - 30.0).abs() < 0.1
+            && (m_bb.max_x - 70.0).abs() < 0.1
+            && (m_bb.max_y - 40.0).abs() < 0.1,
+        "metrics bbox expected [50..70, 30..40], got {m_bb:?}"
+    );
+
+    // 2. challenger1-r25-3: CQL evaluates @color, @fill.model, and @font / @text.font across VectorTable cells
+    let mut tbl = VectorTable::new(1, 2, 20.0, 10.0);
+    tbl.cells[0].fill = Fill::Solid(Color::spot("Pantone185", 1.0, [0.0, 1.0, 1.0, 0.0]));
+    tbl.cells[1].text = "Label".into();
+    tbl.cells[1].fill = Fill::None;
+    tbl.cells[1].text_style.font_family = "CourierTest".into();
+    tbl.cells[1].text_style.fill = Color::cmyk(1.0, 0.0, 0.0, 0.0);
+    let tbl_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "SpotTable", NodePayload::Table(tbl))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@color == 'Pantone185'").unwrap(),
+        vec![tbl_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == 'spot'").unwrap(),
+        vec![tbl_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == 'cmyk'").unwrap(),
+        vec![tbl_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@font == 'CourierTest'").unwrap(),
+        vec![tbl_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(
+            &doc,
+            FindScope::WholeDocument,
+            "@text.font == 'CourierTest'"
+        )
+        .unwrap(),
+        vec![tbl_id]
+    );
+    assert!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@font == 'MissingFont'")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn w1b_r27_cql_fill_model_table_and_text_with_outer_fill() {
+    use coree_core::VectorTable;
+    use coree_prod::evaluate_cql_query;
+
+    let mut doc = Document::new_a4("R27 CQL Fill Model Outer Fill");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. VectorTable with non-None outer obj.fill (CMYK Cyan) + Spot cell fill + RGB cell text
+    let mut tbl = VectorTable::new(1, 2, 20.0, 10.0);
+    tbl.cells[0].fill = Fill::Solid(Color::spot("Pantone185", 1.0, [0.0, 1.0, 1.0, 0.0]));
+    tbl.cells[1].text = "CellText".into();
+    tbl.cells[1].fill = Fill::None;
+    tbl.cells[1].text_style.fill = Color::rgb(0.1, 0.2, 0.3);
+    let tbl_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "OuterCmykTable", NodePayload::Table(tbl))
+                .with_fill(Fill::Solid(Color::CYAN))
+                .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    // 2. ArtisticText with non-None outer obj.fill (CMYK Cyan) + Spot text run
+    let txt_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "OuterCmykText",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "SpotRun",
+                    TextStyle {
+                        font_family: "Cairo".into(),
+                        fill: Color::spot("Pantone300", 1.0, [1.0, 0.4, 0.0, 0.0]),
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    // 3. VectorTable with non-None outer obj.fill (CMYK Cyan) + Spot cell text fill (empty cell fill)
+    let mut tbl_text_spot = VectorTable::new(1, 1, 20.0, 10.0);
+    tbl_text_spot.cells[0].fill = Fill::None;
+    tbl_text_spot.cells[0].text = "SpotCellText".into();
+    tbl_text_spot.cells[0].text_style.fill = Color::spot("Pantone485", 1.0, [0.0, 0.9, 1.0, 0.0]);
+    let tbl_text_spot_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "OuterCmykCellTextSpotTable",
+                NodePayload::Table(tbl_text_spot),
+            )
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    // 4. Control CMYK-only rect (must match @fill.model != 'spot', NOT @fill.model == 'spot')
+    let cmyk_rect_id = doc
+        .add_object(
+            make_rect(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                Fill::Solid(Color::CYAN),
+                OutlineStyle::none(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == 'spot'").unwrap(),
+        vec![tbl_id, txt_id, tbl_text_spot_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model != 'spot'").unwrap(),
+        vec![cmyk_rect_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == 'cmyk'").unwrap(),
+        vec![tbl_id, txt_id, tbl_text_spot_id, cmyk_rect_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == 'rgb'").unwrap(),
+        vec![tbl_id]
+    );
+}
+
+#[test]
+fn w1b_r28_cql_table_border_style_fill_type_and_trimmed_font() {
+    use coree_core::{GradientStop, Point2D, VectorTable};
+    use coree_prod::evaluate_cql_query;
+
+    let mut doc = Document::new_a4("R28 CQL Table & Text Parity");
+    let lid = doc.pages()[0].layers[0].id;
+
+    let mut tbl = VectorTable::new(1, 2, 20.0, 10.0);
+    tbl.border_style = OutlineStyle::cut_contour();
+    tbl.cells[0].fill = Fill::LinearGradient {
+        start: Point2D::ZERO,
+        end: Point2D::new(20.0, 0.0),
+        stops: vec![
+            GradientStop::new(0.0, Color::spot("Pantone185", 1.0, [0.0, 1.0, 1.0, 0.0])),
+            GradientStop::new(1.0, Color::WHITE),
+        ],
+    };
+    let tid = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "CutGradTable", NodePayload::Table(tbl))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    let art_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "PaddedFontText",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "Hello",
+                    TextStyle {
+                        font_family: " Arial  ".into(),
+                        fill: Color::CYAN,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    let empty_id = doc
+        .add_object(
+            make_rect(0.0, 0.0, 10.0, 10.0, Fill::None, OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@color == 'CutContour'").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.model == 'spot'").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.hairline == true").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.overprint == true").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.width > 0mm").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@outline.model == 'none'").unwrap(),
+        vec![art_id, empty_id]
+    );
+
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.type == 'linear'").unwrap(),
+        vec![tid]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.type == 'solid'").unwrap(),
+        vec![art_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.type != 'none'").unwrap(),
+        vec![tid, art_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.type == 'none'").unwrap(),
+        vec![empty_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@font == 'Arial'").unwrap(),
+        vec![art_id]
+    );
+    assert_eq!(
+        evaluate_cql_query(&doc, FindScope::WholeDocument, "@text.font == 'Arial'").unwrap(),
+        vec![art_id]
+    );
 }

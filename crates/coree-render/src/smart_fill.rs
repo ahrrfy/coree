@@ -7,15 +7,15 @@
 //! pocket containing `click_pt_mm`, and traces the exact boundary back into a
 //! clean smooth vector [`BezierPath`].
 
-use crate::trace::{extract_marching_squares_contours, fit_smooth_subpath, rdp_simplify_closed};
+use crate::trace::{extract_marching_squares_contours, rdp_simplify_closed};
 use coree_core::{
-    Affine2D, BezierPath, Document, Fill, MasterLayerScope, NodePayload, ObjectId, OutlineStyle,
-    Point2D, Rect2D, SceneObject,
+    fit_cubic_bezier_subpath, Affine2D, BezierPath, Document, Fill, MasterLayerScope, NodePayload,
+    ObjectId, OutlineStyle, Point2D, Rect2D, SceneObject,
 };
 use std::collections::{HashSet, VecDeque};
 
 /// Target grid resolution along the longest axis of the active Smart Fill region.
-const SMART_FILL_GRID_MAX: usize = 640;
+const SMART_FILL_GRID_MAX: usize = 960;
 
 /// Computes the enclosed vector region containing `click_pt_mm` formed by all
 /// visible intersecting paths/shapes on `page_index`.
@@ -29,7 +29,7 @@ pub fn compute_smart_fill(
     _fill: Fill,
     _outline: OutlineStyle,
 ) -> Option<BezierPath> {
-    if !click_pt_mm.is_finite() || page_index >= doc.pages.len() {
+    if !click_pt_mm.is_finite() || page_index >= doc.pages().len() {
         return None;
     }
 
@@ -140,7 +140,7 @@ pub fn compute_smart_fill(
         return None;
     }
 
-    let rdp_eps_px = 0.85;
+    let rdp_eps_px = 0.55;
     let mut subpaths = Vec::new();
     for ring in loops {
         if ring.len() < 3 {
@@ -159,7 +159,7 @@ pub fn compute_smart_fill(
                 )
             })
             .collect();
-        let sp = fit_smooth_subpath(&world_pts, true, 0.35, 50.0);
+        let sp = fit_cubic_bezier_subpath(&world_pts, true, 0.025);
         if sp.nodes.len() >= 3 {
             subpaths.push(sp);
         }
@@ -248,7 +248,7 @@ fn collect_page_vector_paths(doc: &Document, page_index: usize) -> Vec<BezierPat
     let is_odd_page = page_index.is_multiple_of(2); // 1-based Page 1 is odd
 
     // Master layers applicable to this page
-    for page in &doc.pages {
+    for page in doc.pages() {
         for layer in &page.layers {
             if !layer.visible {
                 continue;
@@ -268,7 +268,7 @@ fn collect_page_vector_paths(doc: &Document, page_index: usize) -> Vec<BezierPat
     }
 
     // Active page local layers (non-master)
-    if let Some(page) = doc.pages.get(page_index) {
+    if let Some(page) = doc.page(page_index) {
         for layer in &page.layers {
             if layer.visible
                 && layer.master_scope == MasterLayerScope::None
@@ -293,7 +293,7 @@ fn collect_object_paths(
     if depth > 64 {
         return;
     }
-    let Some(obj) = doc.objects.get(&id) else {
+    let Some(obj) = doc.object(id) else {
         return;
     };
     if !obj.visible {
@@ -315,7 +315,7 @@ fn collect_object_paths(
             }
         }
         NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
+            if let Some(sym) = doc.symbol(*sym_id) {
                 for sub in &sym.objects {
                     if !sub.visible {
                         continue;

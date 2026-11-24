@@ -27,10 +27,10 @@ use coree_core::{
 };
 use coree_prod::{
     builtin_macros, default_laser_layer_rules, export_laser_dxf_r12, export_laser_gcode,
-    export_laser_plt, export_laser_svg, plan_laser_toolpath, run_rhai_plugin, BarcodeSymbology,
-    FindScope, GcodeDialect, LaserLayerRule, LaserOperationKind, LaserOrigin, LensKindFilter,
-    MacroSandboxConfig, ObjectKindFilter, PluginKind, PluginManifest, PreflightSeverity,
-    QrErrorCorrection, ReplaceAction,
+    export_laser_plt, export_laser_svg, plan_laser_toolpath, plan_rhai_plugin_ops,
+    BarcodeSymbology, FindScope, GcodeDialect, LaserLayerRule, LaserOperationKind, LaserOrigin,
+    LensKindFilter, MacroSandboxConfig, ObjectKindFilter, PluginKind, PluginManifest,
+    PreflightSeverity, QrErrorCorrection, ReplaceAction,
 };
 use coree_render::{list_glyphs_for_block, GlyphBlockFilter, OutlinePreset, ToneRange};
 use egui::{
@@ -85,7 +85,7 @@ impl TabViewer for StudioDockViewer<'_> {
     }
 
     fn title(&mut self, tab: &mut Self::Tab) -> WidgetText {
-        tab.title().into()
+        tab.title_for(self.app.ui_language).into()
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
@@ -160,11 +160,11 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
     };
 
     let mut flag_ops = Vec::new();
-    let page_count = tab.document.pages.len();
+    let page_count = tab.document.pages().len();
 
     for p_idx in 0..page_count {
-        let p_name = tab.document.pages[p_idx].name.clone();
-        let is_active_page = p_idx == tab.document.active_page_index;
+        let p_name = tab.document.pages()[p_idx].name.clone();
+        let is_active_page = p_idx == tab.document.active_page_index();
         let hdr = if is_active_page {
             RichText::new(format!("📄 {p_name}"))
                 .strong()
@@ -176,7 +176,7 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
             .id_salt(("obj_page", p_idx))
             .default_open(is_active_page)
             .show(ui, |ui| {
-                let layer_ids: Vec<_> = tab.document.pages[p_idx]
+                let layer_ids: Vec<_> = tab.document.pages()[p_idx]
                     .layers
                     .iter()
                     .rev()
@@ -203,7 +203,7 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
                             .clicked()
                         {
                             tab.active_layer_id = Some(lid);
-                            tab.document.active_page_index = p_idx;
+                            let _ = tab.document.set_active_page_index(p_idx);
                         }
                         if is_cut {
                             ui.label(RichText::new("CUT").size(9.5).color(tokens.cutcontour));
@@ -242,7 +242,7 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
 
                     ui.indent(("layer_objs", lid), |ui| {
                         for &oid in objs.iter().rev() {
-                            if let Some(obj) = tab.document.objects.get(&oid) {
+                            if let Some(obj) = tab.document.object(oid) {
                                 let selected = tab.selection.contains(oid);
                                 let badge = match &obj.payload {
                                     NodePayload::Group(c) => format!(" [Grp:{}]", c.len()),
@@ -261,7 +261,7 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
                                     .unwrap_or_default();
                                 let label = format!("{}{badge}{lens_tag}", obj.name);
                                 if ui.selectable_label(selected, label).clicked() {
-                                    tab.document.active_page_index = p_idx;
+                                    let _ = tab.document.set_active_page_index(p_idx);
                                     tab.active_layer_id = Some(lid);
                                     tab.sync_active_layer();
                                     tab.selection.select_single(&tab.document, oid);
@@ -326,8 +326,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                 .and_then(|id| {
                     app.active_tab()?
                         .document
-                        .objects
-                        .get(&id)
+                        .object(id)
                         .map(|o| o.fill.clone())
                 })
                 .unwrap_or_else(|| app.default_fill.clone());
@@ -678,8 +677,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                 .and_then(|id| {
                     app.active_tab()?
                         .document
-                        .objects
-                        .get(&id)
+                        .object(id)
                         .map(|o| o.outline.clone())
                 })
                 .unwrap_or_else(|| app.default_outline.clone());
@@ -790,48 +788,52 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
         }
         PropertiesSubTab::Transparency => {
             if let Some(id) = sel_id {
-                let mut mod_flag = false;
-                if let Some(tab) = app.active_tab_mut() {
-                    if let Some(obj) = tab.document.objects.get_mut(&id) {
-                        mod_flag |= ui
-                            .add(egui::Slider::new(&mut obj.opacity, 0.0..=1.0).text("Opacity"))
-                            .changed();
-                        ComboBox::from_id_salt("obj_blend_mode")
-                            .selected_text(format!("{:?}", obj.blend_mode))
-                            .show_ui(ui, |ui| {
-                                for bm in [
-                                    BlendMode::Normal,
-                                    BlendMode::Multiply,
-                                    BlendMode::Screen,
-                                    BlendMode::Overlay,
-                                    BlendMode::Darken,
-                                    BlendMode::Lighten,
-                                    BlendMode::Difference,
-                                    BlendMode::Exclusion,
-                                    BlendMode::SoftLight,
-                                    BlendMode::HardLight,
-                                    BlendMode::ColorDodge,
-                                    BlendMode::ColorBurn,
-                                ] {
-                                    if ui
-                                        .selectable_value(
-                                            &mut obj.blend_mode,
-                                            bm,
-                                            format!("{bm:?}"),
-                                        )
-                                        .changed()
-                                    {
-                                        mod_flag = true;
-                                    }
+                let current = app
+                    .active_tab()
+                    .and_then(|t| t.document.object(id))
+                    .map(|o| (o.opacity, o.blend_mode));
+                if let Some((mut opacity, mut blend_mode)) = current {
+                    let op_changed = ui
+                        .add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"))
+                        .changed();
+                    let mut bm_changed = false;
+                    ComboBox::from_id_salt("obj_blend_mode")
+                        .selected_text(format!("{blend_mode:?}"))
+                        .show_ui(ui, |ui| {
+                            for bm in [
+                                BlendMode::Normal,
+                                BlendMode::Multiply,
+                                BlendMode::Screen,
+                                BlendMode::Overlay,
+                                BlendMode::Darken,
+                                BlendMode::Lighten,
+                                BlendMode::Difference,
+                                BlendMode::Exclusion,
+                                BlendMode::SoftLight,
+                                BlendMode::HardLight,
+                                BlendMode::ColorDodge,
+                                BlendMode::ColorBurn,
+                            ] {
+                                if ui
+                                    .selectable_value(&mut blend_mode, bm, format!("{bm:?}"))
+                                    .changed()
+                                {
+                                    bm_changed = true;
                                 }
-                            });
-                        if mod_flag {
-                            tab.mark_modified();
-                        }
+                            }
+                        });
+                    if op_changed {
+                        let _ = app.execute_command(CommandOp::SetOpacity {
+                            ids: vec![id],
+                            opacity,
+                        });
                     }
-                }
-                if mod_flag {
-                    app.checkpoint_wal_snapshot_active();
+                    if bm_changed {
+                        let _ = app.execute_command(CommandOp::SetBlendMode {
+                            ids: vec![id],
+                            blend_mode,
+                        });
+                    }
                 }
             } else {
                 ui.label(
@@ -846,7 +848,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
             if let Some(id) = sel_id {
                 let text_edit_payload = app
                     .active_tab()
-                    .and_then(|t| t.document.objects.get(&id))
+                    .and_then(|t| t.document.object(id))
                     .map(|o| o.payload.clone());
                 match text_edit_payload {
                     Some(NodePayload::ArtisticText(mut art)) => {
@@ -1359,7 +1361,7 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
     // Active effects stack on selected object
     let active_stack = app.active_tab().and_then(|t| {
         let oid = *t.selection.objects.first()?;
-        let obj = t.document.objects.get(&oid)?;
+        let obj = t.document.object(oid)?;
         Some((oid, obj.effects.clone()))
     });
     if let Some((oid, stack)) = active_stack {
@@ -1398,7 +1400,7 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
     });
     let selected_pc_lock = app.active_tab().and_then(|t| {
         t.selection.objects.iter().find_map(|id| {
-            let obj = t.document.objects.get(id)?;
+            let obj = t.document.object(*id)?;
             if let NodePayload::PowerClip { lock_contents, .. } = &obj.payload {
                 Some(*lock_contents)
             } else {
@@ -1501,20 +1503,14 @@ fn ui_transform_align_shape_docker(ui: &mut Ui, app: &mut StudioApp) {
                 .map(|t| t.selection.objects.clone())
                 .unwrap_or_default();
             if !ids.is_empty() {
-                let _ = app.execute_command(CommandOp::TransformObjects {
-                    ids,
-                    affine: step_xf,
-                });
+                let _ = app.apply_world_transform_to_selection(&ids, step_xf);
             }
         } else {
             // Apply to Duplicate N copies sequentially with zero default offset so numeric step_xf is exact
             for _ in 0..ts_c.copies {
                 if let Ok(dups) = app.duplicate_selection_with_offset(Vec2D::ZERO) {
                     if !dups.is_empty() {
-                        let _ = app.execute_command(CommandOp::TransformObjects {
-                            ids: dups,
-                            affine: step_xf,
-                        });
+                        let _ = app.apply_world_transform_to_selection(&dups, step_xf);
                     }
                 }
             }
@@ -2039,19 +2035,35 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
 // =============================================================================
 
 fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
+    let lang = app.ui_language;
+    let tokens = app.theme.tokens();
     let fr = &mut app.find_replace_state;
     ui.horizontal(|ui| {
-        ui.label("Scope:");
-        ui.selectable_value(&mut fr.scope, FindScope::CurrentPage, "Page");
-        ui.selectable_value(&mut fr.scope, FindScope::WholeDocument, "Document");
+        ui.label(lang.tr_ui("Scope:", "النطاق:"));
+        ui.selectable_value(
+            &mut fr.scope,
+            FindScope::CurrentPage,
+            lang.tr_ui("Page", "الصفحة"),
+        );
+        ui.selectable_value(
+            &mut fr.scope,
+            FindScope::WholeDocument,
+            lang.tr_ui("Document", "المستند"),
+        );
     });
     ComboBox::from_id_salt("fr_kind")
         .selected_text(
             fr.object_kind
-                .map_or("Any Object".to_owned(), |k| format!("{k:?}")),
+                .map_or(lang.tr_ui("Any Object", "أي كائن"), |k| {
+                    format!("{k:?}")
+                }),
         )
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut fr.object_kind, None, "Any Object");
+            ui.selectable_value(
+                &mut fr.object_kind,
+                None,
+                lang.tr_ui("Any Object", "أي كائن"),
+            );
             for k in [
                 ObjectKindFilter::Path,
                 ObjectKindFilter::Shape,
@@ -2065,16 +2077,20 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         });
     ComboBox::from_id_salt("fr_lens")
-        .selected_text(
-            fr.lens_filter
-                .map_or("Any / No Lens".to_owned(), |l| format!("{l:?}")),
-        )
+        .selected_text(fr.lens_filter.map_or(
+            lang.tr_ui("Any / No Lens", "أي / بدون عدسة"),
+            |l| format!("{l:?}"),
+        ))
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut fr.lens_filter, None, "Any / No Lens");
+            ui.selectable_value(
+                &mut fr.lens_filter,
+                None,
+                lang.tr_ui("Any / No Lens", "أي / بدون عدسة"),
+            );
             ui.selectable_value(
                 &mut fr.lens_filter,
                 Some(LensKindFilter::AnyLens),
-                "Has Any Lens",
+                lang.tr_ui("Has Any Lens", "يحتوي عدسة"),
             );
             ui.selectable_value(
                 &mut fr.lens_filter,
@@ -2089,50 +2105,113 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
             ui.selectable_value(&mut fr.lens_filter, Some(LensKindFilter::Invert), "Invert");
         });
     ui.horizontal(|ui| {
-        ui.label("Find Text:");
+        ui.label(lang.tr_ui("Find Text:", "البحث عن نص:"));
         ui.text_edit_singleline(&mut fr.text_query);
     });
     ui.horizontal(|ui| {
-        ui.label("Replace:");
+        ui.label(lang.tr_ui("Replace:", "استبدال بـ:"));
         ui.text_edit_singleline(&mut fr.replace_text);
     });
-    ui.checkbox(&mut fr.case_sensitive, "Case Sensitive");
+    ui.checkbox(
+        &mut fr.case_sensitive,
+        lang.tr_ui("Case Sensitive", "مطابقة حالة الأحرف"),
+    );
 
     let mut action_to_run: Option<ReplaceAction> = None;
     let mut find_only = false;
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Find & Select").clicked() {
+        if ui
+            .button(lang.tr_ui("Find & Select", "بحث وتحديد"))
+            .clicked()
+        {
             find_only = true;
         }
-        if ui.button("Replace Text").clicked() {
+        if ui
+            .button(lang.tr_ui("Replace Text", "استبدال النص"))
+            .clicked()
+        {
             action_to_run = Some(ReplaceAction::ReplaceText {
                 find: fr.text_query.clone(),
                 replace_with: fr.replace_text.clone(),
                 case_sensitive: fr.case_sensitive,
             });
         }
-        if ui.button("Replace Fill").clicked() {
+        if ui
+            .button(lang.tr_ui("Replace Fill", "استبدال التعبئة"))
+            .clicked()
+        {
             action_to_run = Some(ReplaceAction::ReplaceFillColor {
                 color: fr.replace_fill_color.clone(),
             });
         }
-        if ui.button("Set Overprint").clicked() {
+        if ui
+            .button(lang.tr_ui("Set Overprint", "تفعيل الطباعة الفوقية"))
+            .clicked()
+        {
             action_to_run = Some(ReplaceAction::ConvertOverprint { overprint: true });
         }
     });
 
     let mut rc = core_color_to_egui(&fr.replace_fill_color);
     ui.horizontal(|ui| {
-        ui.label("Fill Color:");
+        ui.label(lang.tr_ui("Fill Color:", "لون التعبئة:"));
         if ui.color_edit_button_srgba(&mut rc).changed() {
             fr.replace_fill_color = egui_color_to_core(rc);
         }
     });
 
+    ui.separator();
+    ui.label(
+        RichText::new(lang.tr_ui(
+            "CQL Quick Filter (Clean-Room Query)",
+            "تصفية سريعة بلغة الاستعلام (CQL)",
+        ))
+        .strong(),
+    );
+    ui.add(
+        egui::TextEdit::singleline(&mut fr.cql_query)
+            .desired_width(f32::INFINITY)
+            .hint_text("@outline.hairline and @color == 'CutContour'"),
+    );
+    let mut run_cql = false;
+    ui.horizontal_wrapped(|ui| {
+        for (lbl, preset) in [
+            (lang.tr_ui("Hairlines", "خط شعري"), "@outline.hairline"),
+            (
+                lang.tr_ui("CutContour", "خط القص"),
+                "@color == 'CutContour'",
+            ),
+            (
+                lang.tr_ui("Spot Inks", "أحبار سبوت"),
+                "@fill.model == 'spot'",
+            ),
+            (lang.tr_ui("Overprint", "طباعة فوقية"), "@outline.overprint"),
+            (lang.tr_ui("RGB Fill", "تعبئة RGB"), "@fill.model == 'rgb'"),
+        ] {
+            if ui.small_button(lbl).clicked() {
+                fr.cql_query = preset.to_owned();
+                run_cql = true;
+            }
+        }
+    });
+    if ui
+        .button(lang.tr_ui("Select via CQL", "تحديد عبر CQL"))
+        .clicked()
+    {
+        run_cql = true;
+    }
+    if let Some(ref cql_err) = fr.last_cql_error {
+        ui.label(RichText::new(cql_err).size(11.0).color(tokens.danger));
+    }
+
     if find_only {
         app.run_find_select();
     } else if let Some(act) = action_to_run {
         app.run_find_and_replace_action(act);
+    } else if run_cql {
+        if let Err(err) = app.run_cql_select() {
+            app.find_replace_state.last_cql_error = Some(err);
+        }
     }
 
     if let Some(ref rep) = app.find_replace_state.last_report {
@@ -2153,19 +2232,22 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
 fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
     ui.label(RichText::new("Reusable Symbols").strong());
     if ui.button("+ Create Symbol from Selection").clicked() {
-        if let Some(tab) = app.active_tab_mut() {
+        let new_sym = app.active_tab().and_then(|tab| {
             let objs: Vec<SceneObject> = tab
                 .selection
                 .objects
                 .iter()
-                .filter_map(|id| tab.document.objects.get(id).cloned())
+                .filter_map(|id| tab.document.object(*id).cloned())
                 .collect();
-            if !objs.is_empty() {
-                let n = tab.document.symbols.len() + 1;
-                let def = SymbolDef::new(format!("Symbol {n}"), objs);
-                tab.document.symbols.insert(def.id, def);
-                tab.mark_modified();
+            if objs.is_empty() {
+                None
+            } else {
+                let n = tab.document.symbols().len() + 1;
+                Some(SymbolDef::new(format!("Symbol {n}"), objs))
             }
+        });
+        if let Some(symbol) = new_sym {
+            let _ = app.execute_command(CommandOp::UpsertSymbol { symbol });
         }
     }
 
@@ -2173,7 +2255,7 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
         .active_tab()
         .map(|t| {
             t.document
-                .symbols
+                .symbols()
                 .values()
                 .map(|s| (s.id, s.name.clone(), s.objects.len()))
                 .collect()
@@ -2183,14 +2265,16 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
         ui.horizontal(|ui| {
             ui.label(format!("{name} ({cnt} obj)"));
             if ui.small_button("Insert").clicked() {
-                let lid = app.active_tab().and_then(|t| t.active_layer_id);
-                let inst = SceneObject::new(
-                    ObjectId(0),
-                    format!("{name} Instance"),
-                    NodePayload::SymbolInstance(sid),
-                )
-                .with_transform(Affine2D::translate(30.0, 30.0));
-                let _ = app.execute_command(CommandOp::create_object(inst, lid));
+                if let Some(lid) = app.ensure_active_creation_layer() {
+                    if let Err(e) = app.execute_command(CommandOp::InstantiateSymbol {
+                        symbol_id: sid,
+                        layer_id: lid,
+                        transform: Affine2D::translate(30.0, 30.0),
+                        name: Some(format!("{name} Instance")),
+                    }) {
+                        app.push_toast(e, true);
+                    }
+                }
             }
         });
     }
@@ -2198,37 +2282,43 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
     ui.separator();
     ui.label(RichText::new("Object Styles").strong());
     if ui.button("+ Save Style from Selection").clicked() {
-        if let Some(tab) = app.active_tab_mut() {
-            if let Some(obj) = tab
+        let new_style = app.active_tab().and_then(|tab| {
+            let obj = tab
                 .selection
                 .objects
                 .first()
-                .and_then(|id| tab.document.objects.get(id))
-            {
-                let mut st =
-                    ObjectStyle::new(format!("Style {}", tab.document.object_styles.len() + 1));
-                st.fill = Some(obj.fill.clone());
-                st.outline = Some(obj.outline.clone());
-                st.blend_mode = Some(obj.blend_mode);
-                st.opacity = Some(obj.opacity);
-                tab.document.object_styles.push(st);
-                tab.mark_modified();
-            }
+                .and_then(|id| tab.document.object(*id))?;
+            let mut st =
+                ObjectStyle::new(format!("Style {}", tab.document.object_styles().len() + 1));
+            st.fill = Some(obj.fill.clone());
+            st.outline = Some(obj.outline.clone());
+            st.blend_mode = Some(obj.blend_mode);
+            st.opacity = Some(obj.opacity);
+            Some(st)
+        });
+        if let Some(style) = new_style {
+            let _ = app.execute_command(CommandOp::UpsertObjectStyle { style });
         }
     }
     let styles: Vec<_> = app
         .active_tab()
-        .map(|t| t.document.object_styles.clone())
+        .map(|t| t.document.object_styles().to_vec())
         .unwrap_or_default();
     for st in styles {
         ui.horizontal(|ui| {
             ui.label(&st.name);
             if ui.small_button("Apply").clicked() {
-                if let Some(fill) = st.fill.clone() {
-                    app.apply_fill(fill);
-                }
-                if let Some(out) = st.outline.clone() {
-                    app.apply_outline(out);
+                let ids = app
+                    .active_tab()
+                    .map(|t| t.selection.objects.clone())
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    app.push_toast("Select an object to apply Object Style", true);
+                } else if let Err(err) = app.execute_command(CommandOp::SetObjectStyleLink {
+                    ids,
+                    style_id: Some(st.id),
+                }) {
+                    app.push_toast(format!("Apply Object Style failed: {err}"), true);
                 }
             }
         });
@@ -2333,7 +2423,7 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
                             .iter()
                             .copied()
                             .filter_map(|oid| {
-                                let obj = tab.document.objects.get(&oid)?;
+                                let obj = tab.document.object(oid)?;
                                 let mut payload = obj.payload.clone();
                                 match &mut payload {
                                     NodePayload::ArtisticText(t) => {
@@ -3021,7 +3111,7 @@ fn direct_laser_export(app: &mut StudioApp, ext: &str) {
         app.push_toast("No active document to export", true);
         return;
     };
-    let page_idx = tab.document.active_page_index;
+    let page_idx = tab.document.active_page_index();
     let sel = if tab.selection.is_empty() {
         None
     } else {
@@ -3158,47 +3248,37 @@ fn ui_glyphs_browser(ui: &mut Ui, app: &mut StudioApp, id_salt: &str) {
     });
 }
 
-/// Runs a sandboxed `PluginKind::RhaiScript` plugin inside a `CommandHistory` transaction so
-/// `Ctrl+Z` / `Ctrl+Shift+Z` cleanly undo & redo all document mutations (and errors roll back).
+/// Runs a sandboxed `PluginKind::RhaiScript` plugin via real [`CommandOp`] execution so
+/// `Ctrl+Z` / `Ctrl+Shift+Z`, `CommandHistory::replay_log`, and SQLite WAL journaling work
+/// atomically (and 0-op or failing scripts push zero undo entries).
 pub(crate) fn run_rhai_plugin_undoable(app: &mut StudioApp, plugin: &PluginManifest) {
-    let outcome = app.active_tab_mut().map(|tab| {
-        let tx_started = tab
-            .history
-            .begin_transaction(&tab.document, format!("Plugin: {}", plugin.name))
-            .is_ok();
-        let res = run_rhai_plugin(
-            &mut tab.document,
+    let planned = app.active_tab().map(|tab| {
+        plan_rhai_plugin_ops(
+            &tab.document,
             plugin,
             &BTreeMap::new(),
             &MacroSandboxConfig::default(),
-        );
-        match res {
-            Ok(exec) => {
-                if tx_started {
-                    let _ = tab.history.execute(
-                        &mut tab.document,
-                        CommandOp::TransformObjects {
-                            ids: Vec::new(),
-                            affine: Affine2D::IDENTITY,
-                        },
-                    );
-                    let _ = tab.history.commit_transaction(&tab.document);
-                }
-                tab.mark_modified();
-                Ok(exec)
-            }
-            Err(err) => {
-                if tx_started {
-                    let _ = tab.history.cancel_transaction(&mut tab.document);
-                }
-                Err(err)
-            }
-        }
+        )
     });
 
-    match outcome {
-        Some(Ok(exec)) => {
-            app.checkpoint_wal_snapshot_active();
+    match planned {
+        Some(Ok((exec, ops))) => {
+            if !ops.is_empty() {
+                let cmd = if ops.len() == 1 {
+                    ops.into_iter().next().expect("len == 1")
+                } else {
+                    CommandOp::Batch(ops)
+                };
+                if let Err(err) = app.execute_command(cmd) {
+                    app.push_toast(format!("Plugin failed: {err}"), true);
+                    return;
+                }
+                if let Some(tab) = app.active_tab_mut() {
+                    tab.sync_active_layer();
+                    tab.needs_rerender = true;
+                }
+                app.checkpoint_wal_snapshot_active();
+            }
             let summary = exec
                 .logs
                 .last()
@@ -3271,29 +3351,78 @@ mod tests {
 
         let mut app = StudioApp::new_headless();
         app.new_sample_document();
-        let count_before = app.active_tab().unwrap().document.objects.len();
+        let doc_before_plugin = app.active_tab().unwrap().document.clone();
+        let count_before = doc_before_plugin.objects().len();
         assert!(count_before > 0);
 
-        // Run custom Rhai plugin -> adds a CutContour halo object inside a CommandHistory transaction
+        // Run custom Rhai plugin -> adds a CutContour halo object via real CommandOps
         run_rhai_plugin_undoable(&mut app, &sample_plugin);
-        let count_after = app.active_tab().unwrap().document.objects.len();
+        let count_after = app.active_tab().unwrap().document.objects().len();
         assert!(
             count_after > count_before,
             "sample Rhai plugin should add CutContour object"
         );
         assert!(app.active_tab().unwrap().history.can_undo());
 
+        let log = app.active_tab().unwrap().history.command_log();
+        fn has_empty_transform(op: &CommandOp) -> bool {
+            match op {
+                CommandOp::TransformObjects { ids, .. } => ids.is_empty(),
+                CommandOp::Batch(ops) => ops.iter().any(has_empty_transform),
+                _ => false,
+            }
+        }
+        assert!(
+            !log.iter().any(has_empty_transform),
+            "run_rhai_plugin_undoable must never emit dummy empty TransformObjects"
+        );
+        let mut replayed = doc_before_plugin;
+        coree_core::CommandHistory::replay_log(&mut replayed, &log)
+            .expect("replay_log must reproduce plugin execution");
+        assert_eq!(
+            replayed.objects(),
+            app.active_tab().unwrap().document.objects()
+        );
+        assert_eq!(replayed.pages(), app.active_tab().unwrap().document.pages());
+
+        // 0-command no-op Rhai plugin must NOT push a spurious undo entry
+        let noop_dir = tmp_dir.join("noop-plugin");
+        std::fs::create_dir_all(&noop_dir).expect("create noop dir");
+        std::fs::write(noop_dir.join("noop.rhai"), "log(\"noop plugin\");")
+            .expect("write noop rhai");
+        let noop_plugin = PluginManifest {
+            id: "noop-plugin".to_owned(),
+            name: "Noop Plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            author: "test".to_owned(),
+            description: "logs without mutating".to_owned(),
+            category: PluginCategory::Laser,
+            kind: PluginKind::RhaiScript {
+                script_file: "noop.rhai".to_owned(),
+                entry_label: "Noop".to_owned(),
+            },
+            source_dir: Some(noop_dir),
+            builtin: false,
+        };
+        let undo_len_before_noop = app.active_tab().unwrap().history.undo_labels().len();
+        run_rhai_plugin_undoable(&mut app, &noop_plugin);
+        assert_eq!(
+            app.active_tab().unwrap().history.undo_labels().len(),
+            undo_len_before_noop,
+            "0-op Rhai plugin must not push a spurious undo entry"
+        );
+
         // Undo cleanly restores exact pre-plugin object count
         app.undo().expect("undo plugin transaction");
         assert_eq!(
-            app.active_tab().unwrap().document.objects.len(),
+            app.active_tab().unwrap().document.objects().len(),
             count_before
         );
 
         // Redo cleanly restores exact post-plugin object count
         app.redo().expect("redo plugin transaction");
         assert_eq!(
-            app.active_tab().unwrap().document.objects.len(),
+            app.active_tab().unwrap().document.objects().len(),
             count_after
         );
 
@@ -3321,7 +3450,7 @@ mod tests {
         };
         run_rhai_plugin_undoable(&mut app, &bad_plugin);
         assert_eq!(
-            app.active_tab().unwrap().document.objects.len(),
+            app.active_tab().unwrap().document.objects().len(),
             count_after,
             "failed Rhai plugin must roll back partial mutations"
         );

@@ -514,5 +514,8 @@ mod tests {
         let mixed = shape_mixed_ui_bidi("العربية Arabic");
         assert!(mixed.starts_with("Arabic"));
         assert!(mixed.contains("العربية"));
+
+        assert_eq!(StudioLanguage::English.tr_ui("Page", "الصفحة"), "Page");
+        assert_eq!(StudioLanguage::Arabic.tr_ui("Page", "الصفحة"), "الصفحة");
     }
 }

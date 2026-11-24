@@ -11,8 +11,8 @@ use crate::cdr_bridge::{
 use coree_cdr::CdrWriteVersion;
 use coree_core::math::MM_PER_INCH;
 use coree_core::{
-    Affine2D, ColorMode, Document, Effect, Fill, NodePayload, ObjectId, OutlineStyle,
-    RasterLayerData, SceneObject,
+    Affine2D, ColorMode, CommandOp, Document, Effect, Fill, ImageAssetId, LayerId, NodePayload,
+    ObjectId, ObjectStyleId, OutlineStyle, RasterLayerData, SceneObject, SymbolId, TextOnPath,
 };
 use coree_io::{
     atomic_write_bytes, export_dxf_with_options, export_eps, export_pdf, export_plt_with_options,
@@ -307,8 +307,7 @@ fn open_raster_doc(path: &Path, stem: &str, storage_fmt: &str) -> Result<OpenedD
     let w_mm = (f64::from(asset.width) / dpi * MM_PER_INCH).max(10.0);
     let h_mm = (f64::from(asset.height) / dpi * MM_PER_INCH).max(10.0);
     let mut doc = Document::new(stem, w_mm, h_mm, ColorMode::Rgb, asset.source_dpi);
-    let asset_id = asset.id;
-    doc.assets.insert(asset_id, asset);
+    let asset_id = doc.register_asset(asset);
     let obj = SceneObject::new(
         ObjectId(0),
         stem.to_owned(),
@@ -332,85 +331,484 @@ fn open_raster_doc(path: &Path, stem: &str, storage_fmt: &str) -> Result<OpenedD
     })
 }
 
+/// Resolves the target layer on `doc.active_page()` for paste/import operations, preferring
+/// `active_layer_id` if it is visible and unlocked on the active page (or a visible unlocked
+/// Desktop layer), otherwise falling back to the topmost visible unlocked layer on the active page.
+#[must_use]
+pub fn resolve_import_target_layer(
+    doc: &Document,
+    active_layer_id: Option<LayerId>,
+) -> Option<LayerId> {
+    let active_page = doc.active_page()?;
+    if let Some(lid) = active_layer_id {
+        let on_active_page = active_page.layers.iter().find(|l| l.id == lid);
+        let desktop_layer = doc.find_layer(lid).filter(|l| l.is_desktop_layer);
+        if let Some(layer) = on_active_page.or(desktop_layer) {
+            if layer.visible && !layer.locked {
+                return Some(layer.id);
+            }
+        }
+    }
+    active_page
+        .layers
+        .iter()
+        .rev()
+        .find(|l| l.visible && !l.locked)
+        .map(|l| l.id)
+}
+
+fn is_valid_import_object_style(style: &coree_core::ObjectStyle) -> bool {
+    style
+        .opacity
+        .is_none_or(|op| op.is_finite() && (0.0..=1.0).contains(&op))
+        && coree_core::apply_command(
+            &mut Document::new_a4("style-check"),
+            &CommandOp::UpsertObjectStyle {
+                style: style.clone(),
+            },
+        )
+        .is_ok()
+}
+
+fn is_valid_import_asset(asset: &coree_core::RasterAsset) -> bool {
+    coree_core::apply_command(
+        &mut Document::new_a4("asset-check"),
+        &CommandOp::RegisterAsset {
+            asset: asset.clone(),
+        },
+    )
+    .is_ok()
+}
+
+fn is_valid_import_symbol(symbol: &coree_core::SymbolDef) -> bool {
+    coree_core::apply_command(
+        &mut Document::new_a4("symbol-check"),
+        &CommandOp::UpsertSymbol {
+            symbol: symbol.clone(),
+        },
+    )
+    .is_ok()
+}
+
+fn sanitize_import_fill(
+    fill: &mut Fill,
+    valid_symbols: &HashSet<SymbolId>,
+    valid_assets: &HashSet<ImageAssetId>,
+) {
+    match fill {
+        Fill::VectorPattern { symbol_id, .. } if !valid_symbols.contains(symbol_id) => {
+            *fill = Fill::None;
+        }
+        Fill::BitmapPattern { image_id, .. } if !valid_assets.contains(image_id) => {
+            *fill = Fill::None;
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_import_object_fills(
+    obj: &mut SceneObject,
+    valid_symbols: &HashSet<SymbolId>,
+    valid_assets: &HashSet<ImageAssetId>,
+) {
+    sanitize_import_fill(&mut obj.fill, valid_symbols, valid_assets);
+    if let NodePayload::Table(ref mut table) = obj.payload {
+        for cell in &mut table.cells {
+            sanitize_import_fill(&mut cell.fill, valid_symbols, valid_assets);
+        }
+    }
+}
+
+fn collect_import_symbol_refs(obj: &SceneObject, out: &mut HashSet<SymbolId>) {
+    if let NodePayload::SymbolInstance(sym_id) = obj.payload {
+        out.insert(sym_id);
+    }
+    if let Fill::VectorPattern { symbol_id, .. } = obj.fill {
+        out.insert(symbol_id);
+    }
+    if let NodePayload::Table(ref table) = obj.payload {
+        for cell in &table.cells {
+            if let Fill::VectorPattern { symbol_id, .. } = cell.fill {
+                out.insert(symbol_id);
+            }
+        }
+    }
+}
+
 /// Imports an external vector or raster file directly onto the active page of `target`.
 /// Returns the newly created top-level object IDs.
 pub fn import_into_document(target: &mut Document, path: &Path) -> Result<Vec<ObjectId>, String> {
     let opened = open_any_document(path)?;
+    if resolve_import_target_layer(target, None).is_none() {
+        return Err("Cannot import: active page has no visible unlocked layer".to_owned());
+    }
     Ok(import_document_into(target, &opened.document))
 }
 
-/// Imports the first page, raster assets, and symbol definitions of `src` into `target`'s
-/// active page with recursion/cycle protection and cross-object [`ObjectId`] remapping.
+/// Imports the first page, referenced raster assets, object styles, and symbol definitions of `src`
+/// into `target`'s active page with recursion/cycle protection, dangling `ObjectStyleId`
+/// sanitization, and cross-object [`ObjectId`] remapping/cleanup matching
+/// [`build_import_document_ops`].
 pub fn import_document_into(target: &mut Document, src: &Document) -> Vec<ObjectId> {
-    // Copy raster assets and reusable symbol definitions into target
-    for (aid, asset) in &src.assets {
-        target.assets.insert(*aid, asset.clone());
+    let (ops, created_ids) = build_import_document_ops(target, src);
+    if ops.is_empty() {
+        return Vec::new();
     }
-    for (sid, sym) in &src.symbols {
-        target.symbols.insert(*sid, sym.clone());
+    let rollback = target.clone();
+    for op in &ops {
+        if coree_core::apply_command(target, op).is_err() {
+            *target = rollback;
+            return Vec::new();
+        }
     }
+    created_ids
+}
 
-    let mut created_ids = Vec::new();
-    let Some(first_page) = src.pages.first() else {
-        return created_ids;
+/// Builds deterministic, replayable [`CommandOp`]s to import the first page, referenced
+/// raster assets, object styles, and symbol definitions of `src` into `target` without mutating `target`.
+#[must_use]
+pub fn build_import_document_ops(
+    target: &Document,
+    src: &Document,
+) -> (Vec<CommandOp>, Vec<ObjectId>) {
+    build_import_document_ops_on_layer(target, src, None)
+}
+
+/// Variant of [`build_import_document_ops`] that prefers `active_layer_id` when visible and unlocked.
+#[must_use]
+pub fn build_import_document_ops_on_layer(
+    target: &Document,
+    src: &Document,
+    active_layer_id: Option<LayerId>,
+) -> (Vec<CommandOp>, Vec<ObjectId>) {
+    let Some(target_layer_id) = resolve_import_target_layer(target, active_layer_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(first_page) = src.pages().first() else {
+        return (Vec::new(), Vec::new());
     };
     let page_offset = target
         .active_page()
         .map(|p| Affine2D::translate(p.width_mm * 0.05, p.height_mm * 0.05))
         .unwrap_or(Affine2D::IDENTITY);
 
+    // Pre-validate candidate assets and symbols so malformed RasterAssets / SymbolDefs
+    // never abort importing valid Page 1 objects.
+    let valid_src_asset_ids: HashSet<ImageAssetId> = src
+        .assets()
+        .values()
+        .filter(|asset| target.asset(asset.id).is_none() && is_valid_import_asset(asset))
+        .map(|asset| asset.id)
+        .collect();
+    let valid_assets: HashSet<ImageAssetId> = target
+        .assets()
+        .keys()
+        .copied()
+        .chain(valid_src_asset_ids.iter().copied())
+        .collect();
+
+    let valid_src_symbol_ids: HashSet<SymbolId> = src
+        .symbols()
+        .values()
+        .filter(|sym| target.symbol(sym.id).is_none() && is_valid_import_symbol(sym))
+        .map(|sym| sym.id)
+        .collect();
+    let valid_symbols: HashSet<SymbolId> = target
+        .symbols()
+        .keys()
+        .copied()
+        .chain(valid_src_symbol_ids.iter().copied())
+        .collect();
+
+    let mut next_id = target.next_id().max(
+        target
+            .objects()
+            .keys()
+            .next_back()
+            .map_or(1, |id| id.0.saturating_add(1)),
+    );
     let mut id_map: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut visiting: HashSet<ObjectId> = HashSet::new();
+    let mut detached: Vec<SceneObject> = Vec::new();
+    let mut top_level: Vec<SceneObject> = Vec::new();
+    let mut created_ids: Vec<ObjectId> = Vec::new();
+    let mut text_on_path_fallbacks: HashMap<ObjectId, Affine2D> = HashMap::new();
 
     for layer in &first_page.layers {
         for &src_oid in &layer.objects {
-            if let Some(id) = clone_object_tree_into(
+            if let Some(root_obj) = collect_import_tree(
                 src,
                 src_oid,
-                target,
                 true,
                 page_offset,
+                Affine2D::IDENTITY,
                 0,
+                &valid_symbols,
+                &mut next_id,
                 &mut visiting,
                 &mut id_map,
+                &mut detached,
+                &mut text_on_path_fallbacks,
             ) {
-                created_ids.push(id);
+                created_ids.push(root_obj.id);
+                top_level.push(root_obj);
             }
         }
     }
 
-    // Remap cross-object references on every newly cloned object
-    remap_object_references(target, &id_map);
-    created_ids
+    if created_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    for obj in detached.iter_mut().chain(top_level.iter_mut()) {
+        remap_imported_object_refs(obj, &id_map, &text_on_path_fallbacks);
+    }
+
+    let mut needed_assets: HashSet<ImageAssetId> = HashSet::new();
+    let mut needed_style_ids: HashSet<ObjectStyleId> = HashSet::new();
+    let mut needed_symbols: HashSet<SymbolId> = HashSet::new();
+    for obj in detached.iter().chain(top_level.iter()) {
+        obj.collect_asset_refs(&mut needed_assets);
+        if let Some(sid) = obj.style_id {
+            needed_style_ids.insert(sid);
+        }
+        collect_import_symbol_refs(obj, &mut needed_symbols);
+    }
+    needed_symbols.retain(|sid| valid_src_symbol_ids.contains(sid));
+    needed_assets.retain(|aid| valid_src_asset_ids.contains(aid));
+
+    // Pre-validate object styles from `src` that are not already defined on `target` so
+    // invalid discarded styles never pull malformed VectorPattern symbols or assets into ops.
+    let valid_src_style_ids: HashSet<ObjectStyleId> = src
+        .object_styles()
+        .iter()
+        .filter(|style| {
+            target.object_style(style.id).is_none() && is_valid_import_object_style(style)
+        })
+        .map(|style| style.id)
+        .collect();
+
+    // Transitively collect assets, styles, and nested symbols from valid referenced symbols not yet in target
+    let mut sym_queue: Vec<SymbolId> = needed_symbols.iter().copied().collect();
+    let mut expanded_styles: HashSet<ObjectStyleId> = HashSet::new();
+    loop {
+        while let Some(sid) = sym_queue.pop() {
+            if target.symbol(sid).is_some() || !valid_src_symbol_ids.contains(&sid) {
+                continue;
+            }
+            if let Some(sym) = src.symbol(sid) {
+                for sub in &sym.objects {
+                    let mut sub_assets = HashSet::new();
+                    sub.collect_asset_refs(&mut sub_assets);
+                    for aid in sub_assets {
+                        if valid_src_asset_ids.contains(&aid) {
+                            needed_assets.insert(aid);
+                        }
+                    }
+                    if let Some(style_id) = sub.style_id {
+                        needed_style_ids.insert(style_id);
+                    }
+                    let mut nested = HashSet::new();
+                    collect_import_symbol_refs(sub, &mut nested);
+                    for nsid in nested {
+                        if valid_src_symbol_ids.contains(&nsid) && needed_symbols.insert(nsid) {
+                            sym_queue.push(nsid);
+                        }
+                    }
+                }
+            }
+        }
+        let mut added_sym = false;
+        for style in src.object_styles() {
+            if needed_style_ids.contains(&style.id)
+                && valid_src_style_ids.contains(&style.id)
+                && expanded_styles.insert(style.id)
+            {
+                if let Some(Fill::VectorPattern { symbol_id, .. }) = style.fill {
+                    if valid_src_symbol_ids.contains(&symbol_id) && needed_symbols.insert(symbol_id)
+                    {
+                        sym_queue.push(symbol_id);
+                        added_sym = true;
+                    }
+                }
+                if let Some(Fill::BitmapPattern { image_id, .. }) = style.fill {
+                    if valid_src_asset_ids.contains(&image_id) {
+                        needed_assets.insert(image_id);
+                    }
+                }
+            }
+        }
+        if !added_sym && sym_queue.is_empty() {
+            break;
+        }
+    }
+
+    let mut imported_styles = Vec::new();
+    let mut imported_style_ids: HashSet<ObjectStyleId> = HashSet::new();
+    for style in src.object_styles() {
+        if needed_style_ids.contains(&style.id) && valid_src_style_ids.contains(&style.id) {
+            let mut sanitized_style = style.clone();
+            if let Some(ref mut fill) = sanitized_style.fill {
+                sanitize_import_fill(fill, &valid_symbols, &valid_assets);
+            }
+            if let Some(Fill::BitmapPattern { image_id, .. }) = sanitized_style.fill {
+                if valid_src_asset_ids.contains(&image_id) {
+                    needed_assets.insert(image_id);
+                }
+            }
+            imported_style_ids.insert(sanitized_style.id);
+            imported_styles.push(sanitized_style);
+        }
+    }
+
+    let style_exists = |sid: ObjectStyleId| -> bool {
+        target.object_style(sid).is_some() || imported_style_ids.contains(&sid)
+    };
+    for obj in detached.iter_mut().chain(top_level.iter_mut()) {
+        if obj.style_id.is_some_and(|sid| !style_exists(sid)) {
+            obj.style_id = None;
+        }
+        sanitize_import_object_fills(obj, &valid_symbols, &valid_assets);
+    }
+
+    let mut ops = Vec::new();
+    for asset in src.assets().values() {
+        if needed_assets.contains(&asset.id)
+            && target.asset(asset.id).is_none()
+            && valid_src_asset_ids.contains(&asset.id)
+        {
+            ops.push(CommandOp::RegisterAsset {
+                asset: asset.clone(),
+            });
+        }
+    }
+    for style in imported_styles {
+        ops.push(CommandOp::UpsertObjectStyle { style });
+    }
+    for sym in src.symbols().values() {
+        if needed_symbols.contains(&sym.id)
+            && target.symbol(sym.id).is_none()
+            && valid_src_symbol_ids.contains(&sym.id)
+        {
+            let mut sanitized_sym = sym.clone();
+            for sub in &mut sanitized_sym.objects {
+                if sub.style_id.is_some_and(|sid| !style_exists(sid)) {
+                    sub.style_id = None;
+                }
+                sanitize_import_object_fills(sub, &valid_symbols, &valid_assets);
+            }
+            ops.push(CommandOp::UpsertSymbol {
+                symbol: sanitized_sym,
+            });
+        }
+    }
+    for obj in detached {
+        ops.push(CommandOp::create_detached_object(obj));
+    }
+    for obj in top_level {
+        ops.push(CommandOp::create_object(obj, Some(target_layer_id)));
+    }
+
+    (ops, created_ids)
+}
+
+fn import_text_on_path_world_xf(
+    doc: &Document,
+    id: ObjectId,
+    top: &TextOnPath,
+) -> Option<Affine2D> {
+    doc.world_path_of(top.path_id)
+        .and_then(|wp| {
+            let dist = if top.offset_mm.is_finite() {
+                top.offset_mm.max(0.0)
+            } else {
+                0.0
+            };
+            wp.point_and_tangent_at(dist).map(|(pt, tan)| {
+                let lift = if top.distance_mm.is_finite() {
+                    top.distance_mm
+                } else {
+                    0.0
+                };
+                let pos = pt + tan.perp() * lift;
+                let angle = tan.y.atan2(tan.x);
+                Affine2D::translate(pos.x, pos.y).compose(&Affine2D::rotate(angle))
+            })
+        })
+        .or_else(|| doc.world_transform_of(top.path_id))
+        .or_else(|| doc.world_transform_of(id))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn clone_object_tree_into(
+fn collect_import_tree(
     src: &Document,
     src_oid: ObjectId,
-    dst: &mut Document,
-    attach_to_layer: bool,
+    is_root: bool,
     extra_xf: Affine2D,
+    copied_parent_xf: Affine2D,
     depth: usize,
+    valid_symbols: &HashSet<SymbolId>,
+    next_id: &mut u64,
     visiting: &mut HashSet<ObjectId>,
     id_map: &mut HashMap<ObjectId, ObjectId>,
-) -> Option<ObjectId> {
+    detached: &mut Vec<SceneObject>,
+    text_on_path_fallbacks: &mut HashMap<ObjectId, Affine2D>,
+) -> Option<SceneObject> {
     if depth > MAX_IMPORT_DEPTH || !visiting.insert(src_oid) {
         return None;
     }
 
-    let mut obj = match src.objects.get(&src_oid) {
-        Some(o) => o.clone(),
+    let orig = match src.object(src_oid) {
+        Some(o) => o,
         None => {
             visiting.remove(&src_oid);
             return None;
         }
     };
-    let new_id = dst.alloc_object_id();
+    if let NodePayload::SymbolInstance(sym_id) = orig.payload {
+        if !valid_symbols.contains(&sym_id) {
+            visiting.remove(&src_oid);
+            return None;
+        }
+    }
+    let mut obj = orig.clone();
+    let new_id = ObjectId(*next_id);
+    *next_id = next_id.saturating_add(1);
     obj.id = new_id;
     id_map.insert(src_oid, new_id);
 
-    if attach_to_layer {
+    let copied_world_xf = copied_parent_xf.compose(&orig.transform);
+    if let NodePayload::Connector(ref mut conn) = obj.payload {
+        let world_xf = src.world_transform_of(src_oid).unwrap_or(orig.transform);
+        let (w_from, w_to) = src.resolve_connector_endpoints_with_transform(conn, &world_xf);
+        let inv_copied = copied_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+        if conn.from_obj.is_some() {
+            let pt = inv_copied.transform_point(w_from);
+            if pt.is_finite() {
+                conn.from_fallback = pt;
+            }
+        }
+        if conn.to_obj.is_some() {
+            let pt = inv_copied.transform_point(w_to);
+            if pt.is_finite() {
+                conn.to_fallback = pt;
+            }
+        }
+    }
+    if let NodePayload::TextOnPath(ref top) = orig.payload {
+        if let Some(anchor_world) = import_text_on_path_world_xf(src, src_oid, top) {
+            let inv_parent = copied_parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+            let mut local_xf = inv_parent.compose(&anchor_world);
+            if is_root {
+                local_xf = extra_xf.compose(&local_xf);
+            }
+            if local_xf.is_finite() {
+                text_on_path_fallbacks.insert(new_id, local_xf);
+            }
+        }
+    }
+
+    if is_root {
         obj.transform = extra_xf.compose(&obj.transform);
     }
 
@@ -419,17 +817,22 @@ fn clone_object_tree_into(
             let old_children = children.clone();
             let mut new_children = Vec::with_capacity(old_children.len());
             for cid in old_children {
-                if let Some(nid) = clone_object_tree_into(
+                if let Some(child_obj) = collect_import_tree(
                     src,
                     cid,
-                    dst,
                     false,
                     Affine2D::IDENTITY,
+                    copied_world_xf,
                     depth + 1,
+                    valid_symbols,
+                    next_id,
                     visiting,
                     id_map,
+                    detached,
+                    text_on_path_fallbacks,
                 ) {
-                    new_children.push(nid);
+                    new_children.push(child_obj.id);
+                    detached.push(child_obj);
                 }
             }
             *children = new_children;
@@ -438,17 +841,22 @@ fn clone_object_tree_into(
             let old_contents = contents.clone();
             let mut new_contents = Vec::with_capacity(old_contents.len());
             for cid in old_contents {
-                if let Some(nid) = clone_object_tree_into(
+                if let Some(child_obj) = collect_import_tree(
                     src,
                     cid,
-                    dst,
                     false,
                     Affine2D::IDENTITY,
+                    copied_world_xf,
                     depth + 1,
+                    valid_symbols,
+                    next_id,
                     visiting,
                     id_map,
+                    detached,
+                    text_on_path_fallbacks,
                 ) {
-                    new_contents.push(nid);
+                    new_contents.push(child_obj.id);
+                    detached.push(child_obj);
                 }
             }
             *contents = new_contents;
@@ -457,69 +865,60 @@ fn clone_object_tree_into(
     }
 
     visiting.remove(&src_oid);
-
-    if attach_to_layer {
-        dst.add_object(obj, None).ok()
-    } else {
-        dst.objects.insert(new_id, obj);
-        Some(new_id)
-    }
+    Some(obj)
 }
 
-fn remap_object_references(target: &mut Document, id_map: &HashMap<ObjectId, ObjectId>) {
-    if id_map.is_empty() {
-        return;
-    }
-    let cloned_ids: Vec<ObjectId> = id_map.values().copied().collect();
-    for nid in cloned_ids {
-        let Some(obj) = target.objects.get_mut(&nid) else {
-            continue;
-        };
-        match &mut obj.payload {
-            NodePayload::TextOnPath(top) => {
-                if let Some(&mapped) = id_map.get(&top.path_id) {
-                    top.path_id = mapped;
-                }
-            }
-            NodePayload::Connector(conn) => {
-                if let Some(fid) = conn.from_obj {
-                    if let Some(&mapped) = id_map.get(&fid) {
-                        conn.from_obj = Some(mapped);
-                    }
-                }
-                if let Some(tid) = conn.to_obj {
-                    if let Some(&mapped) = id_map.get(&tid) {
-                        conn.to_obj = Some(mapped);
-                    }
-                }
-            }
-            NodePayload::ParagraphText(para) => {
-                if let Some(next_id) = para.linked_next_frame {
-                    if let Some(&mapped) = id_map.get(&next_id) {
-                        para.linked_next_frame = Some(mapped);
-                    }
-                }
-            }
-            _ => {}
-        }
-        for eff in &mut obj.effects {
-            if let Effect::Blend {
-                target_id,
-                along_path,
-                ..
-            } = eff
-            {
-                if let Some(&mapped) = id_map.get(target_id) {
-                    *target_id = mapped;
-                }
-                if let Some(ap) = *along_path {
-                    if let Some(&mapped) = id_map.get(&ap) {
-                        *along_path = Some(mapped);
-                    }
+fn remap_imported_object_refs(
+    obj: &mut SceneObject,
+    id_map: &HashMap<ObjectId, ObjectId>,
+    text_on_path_fallbacks: &HashMap<ObjectId, Affine2D>,
+) {
+    match &mut obj.payload {
+        NodePayload::TextOnPath(top) => {
+            if let Some(&mapped) = id_map.get(&top.path_id) {
+                top.path_id = mapped;
+            } else {
+                obj.payload = NodePayload::ArtisticText(top.text.clone());
+                if let Some(&xf) = text_on_path_fallbacks.get(&obj.id) {
+                    obj.transform = xf;
                 }
             }
         }
+        NodePayload::Connector(conn) => {
+            if let Some(old_from) = conn.from_obj {
+                conn.from_obj = id_map.get(&old_from).copied();
+            }
+            if let Some(old_to) = conn.to_obj {
+                conn.to_obj = id_map.get(&old_to).copied();
+            }
+        }
+        NodePayload::ParagraphText(para) => {
+            if let Some(old_next) = para.linked_next_frame {
+                para.linked_next_frame = id_map.get(&old_next).copied();
+            }
+        }
+        _ => {}
     }
+    let mut kept_effects = Vec::with_capacity(obj.effects.len());
+    for mut eff in std::mem::take(&mut obj.effects) {
+        if let Effect::Blend {
+            ref mut target_id,
+            ref mut along_path,
+            ..
+        } = eff
+        {
+            if let Some(&mapped) = id_map.get(target_id) {
+                *target_id = mapped;
+            } else {
+                continue;
+            }
+            if let Some(old_path) = *along_path {
+                *along_path = id_map.get(&old_path).copied();
+            }
+        }
+        kept_effects.push(eff);
+    }
+    obj.effects = kept_effects;
 }
 
 /// Saves or exports `doc` to `output_path` inferring the target format from extension.
@@ -534,7 +933,7 @@ pub fn export_any_document(
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "coree".to_owned());
 
-    let page_idx = opts.page_index.min(doc.pages.len().saturating_sub(1));
+    let page_idx = opts.page_index.min(doc.pages().len().saturating_sub(1));
 
     match ext.as_str() {
         "coree" => {
@@ -826,7 +1225,7 @@ mod tests {
                 path.display()
             );
             assert!(
-                !opened.document.pages.is_empty(),
+                !opened.document.pages().is_empty(),
                 "document must have >= 1 page for {}",
                 path.display()
             );

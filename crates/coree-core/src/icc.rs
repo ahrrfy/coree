@@ -687,6 +687,165 @@ impl IccLut {
     }
 }
 
+/// Parsed ICC v4 `mAB ` (`lutAToBType`) or `mBA ` (`lutBToAType`) multi-stage LUT pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IccV4Lut {
+    /// `false` for `mAB ` (Device -> PCS), `true` for `mBA ` (PCS -> Device).
+    pub is_b_to_a: bool,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub b_curves: Vec<IccToneCurve>,
+    pub m_curves: Vec<IccToneCurve>,
+    /// Optional `3 × 3` matrix (cols `0..3`) plus additive bias vector (col `3`).
+    pub matrix: Option<[[f64; 4]; 3]>,
+    pub a_curves: Vec<IccToneCurve>,
+    pub clut_grid: [usize; 4],
+    pub clut_is_16bit: bool,
+    pub clut: Vec<f64>,
+}
+
+impl IccV4Lut {
+    /// Evaluates the full ICC v4 `mAB`/`mBA` pipeline in normalized `0.0..=1.0` coordinates.
+    #[must_use]
+    pub fn evaluate(&self, input: &[f64]) -> Vec<f64> {
+        if self.in_channels == 0 || self.out_channels == 0 || input.len() < self.in_channels {
+            return vec![0.0; self.out_channels.max(1)];
+        }
+        let mut cur: Vec<f64> = input[..self.in_channels]
+            .iter()
+            .map(|&v| clamp_unit_finite(v))
+            .collect();
+
+        if !self.is_b_to_a {
+            // mAB: A-curves -> CLUT -> M-curves -> Matrix -> B-curves
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.a_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+            if !self.clut.is_empty() {
+                cur = self.interp_clut(&cur);
+            }
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.m_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+            if let Some(ref mat) = self.matrix {
+                if cur.len() >= 3 {
+                    let x = [cur[0], cur[1], cur[2]];
+                    cur[0] = clamp_unit_finite(
+                        mat[0][0] * x[0] + mat[0][1] * x[1] + mat[0][2] * x[2] + mat[0][3],
+                    );
+                    cur[1] = clamp_unit_finite(
+                        mat[1][0] * x[0] + mat[1][1] * x[1] + mat[1][2] * x[2] + mat[1][3],
+                    );
+                    cur[2] = clamp_unit_finite(
+                        mat[2][0] * x[0] + mat[2][1] * x[1] + mat[2][2] * x[2] + mat[2][3],
+                    );
+                }
+            }
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.b_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+        } else {
+            // mBA: B-curves -> Matrix -> M-curves -> CLUT -> A-curves
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.b_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+            if let Some(ref mat) = self.matrix {
+                if cur.len() >= 3 {
+                    let x = [cur[0], cur[1], cur[2]];
+                    cur[0] = clamp_unit_finite(
+                        mat[0][0] * x[0] + mat[0][1] * x[1] + mat[0][2] * x[2] + mat[0][3],
+                    );
+                    cur[1] = clamp_unit_finite(
+                        mat[1][0] * x[0] + mat[1][1] * x[1] + mat[1][2] * x[2] + mat[1][3],
+                    );
+                    cur[2] = clamp_unit_finite(
+                        mat[2][0] * x[0] + mat[2][1] * x[1] + mat[2][2] * x[2] + mat[2][3],
+                    );
+                }
+            }
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.m_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+            if !self.clut.is_empty() {
+                cur = self.interp_clut(&cur);
+            }
+            for (i, v) in cur.iter_mut().enumerate() {
+                if let Some(c) = self.a_curves.get(i) {
+                    *v = c.eval(*v);
+                }
+            }
+        }
+
+        cur.resize(self.out_channels, 0.0);
+        for v in &mut cur {
+            *v = clamp_unit_finite(*v);
+        }
+        cur
+    }
+
+    fn interp_clut(&self, x: &[f64]) -> Vec<f64> {
+        let dims = x.len().min(4);
+        if dims == 0 || self.clut.is_empty() {
+            return vec![0.0; self.out_channels];
+        }
+        let mut strides = [1usize; 4];
+        for axis in (0..dims).rev() {
+            if axis + 1 < dims {
+                strides[axis] = strides[axis + 1].saturating_mul(self.clut_grid[axis + 1].max(2));
+            }
+        }
+        let mut i0 = [0usize; 4];
+        let mut i1 = [0usize; 4];
+        let mut f = [0.0_f64; 4];
+        for axis in 0..dims {
+            let g = self.clut_grid[axis].max(2);
+            let s = clamp_unit_finite(x[axis]) * ((g - 1) as f64);
+            i0[axis] = (s.floor() as usize).min(g - 1);
+            i1[axis] = (i0[axis] + 1).min(g - 1);
+            f[axis] = s - (i0[axis] as f64);
+        }
+
+        let corners = 1usize << dims;
+        let mut out = vec![0.0_f64; self.out_channels];
+        for mask in 0..corners {
+            let mut w = 1.0_f64;
+            let mut flat = 0usize;
+            for axis in 0..dims {
+                if (mask & (1 << axis)) == 0 {
+                    w *= 1.0 - f[axis];
+                    flat = flat.saturating_add(i0[axis].saturating_mul(strides[axis]));
+                } else {
+                    w *= f[axis];
+                    flat = flat.saturating_add(i1[axis].saturating_mul(strides[axis]));
+                }
+            }
+            if w <= 1e-12 {
+                continue;
+            }
+            let off = flat.saturating_mul(self.out_channels);
+            if off + self.out_channels <= self.clut.len() {
+                for ch in 0..self.out_channels {
+                    out[ch] += w * self.clut[off + ch];
+                }
+            }
+        }
+        for v in &mut out {
+            *v = clamp_unit_finite(*v);
+        }
+        out
+    }
+}
+
 /// Complete parsed or built-in ICC v2/v4 color profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IccProfile {
@@ -704,6 +863,18 @@ pub struct IccProfile {
     pub a2b0: Option<IccLut>,
     /// PCS -> Device lookup table (`B2A0`, or fallback `B2A1`).
     pub b2a0: Option<IccLut>,
+    /// Intent-indexed `mft1`/`mft2` Device -> PCS tables (`[Perceptual A2B0, Colorimetric A2B1, Saturation A2B2]`).
+    #[serde(default)]
+    pub a2b_intents: [Option<IccLut>; 3],
+    /// Intent-indexed `mft1`/`mft2` PCS -> Device tables (`[Perceptual B2A0, Colorimetric B2A1, Saturation B2A2]`).
+    #[serde(default)]
+    pub b2a_intents: [Option<IccLut>; 3],
+    /// Intent-indexed ICC v4 `mAB ` tables (`[Perceptual A2B0, Colorimetric A2B1, Saturation A2B2]`).
+    #[serde(default)]
+    pub v4_a2b: [Option<IccV4Lut>; 3],
+    /// Intent-indexed ICC v4 `mBA ` tables (`[Perceptual B2A0, Colorimetric B2A1, Saturation B2A2]`).
+    #[serde(default)]
+    pub v4_b2a: [Option<IccV4Lut>; 3],
     /// Optional built-in analytical press tag when constructed via [`IccProfile::builtin`].
     pub builtin_kind: Option<BuiltinIccProfile>,
 }
@@ -855,8 +1026,21 @@ impl IccProfile {
             None => None,
         };
 
-        let a2b0 = parse_lut_pair(tag_slice(b"A2B0"), tag_slice(b"A2B1"))?;
-        let b2a0 = parse_lut_pair(tag_slice(b"B2A0"), tag_slice(b"B2A1"))?;
+        let parse_stage = |sig: &[u8; 4]| -> CoreResult<(Option<IccLut>, Option<IccV4Lut>)> {
+            match tag_slice(sig) {
+                Some(s) => parse_any_lut_tag(s),
+                None => Ok((None, None)),
+            }
+        };
+        let (a2b_p, v4_a2b_p) = parse_stage(b"A2B0")?;
+        let (a2b_c, v4_a2b_c) = parse_stage(b"A2B1")?;
+        let (a2b_s, v4_a2b_s) = parse_stage(b"A2B2")?;
+        let (b2a_p, v4_b2a_p) = parse_stage(b"B2A0")?;
+        let (b2a_c, v4_b2a_c) = parse_stage(b"B2A1")?;
+        let (b2a_s, v4_b2a_s) = parse_stage(b"B2A2")?;
+
+        let a2b0 = a2b_p.clone().or_else(|| a2b_c.clone());
+        let b2a0 = b2a_p.clone().or_else(|| b2a_c.clone());
 
         Ok(Self {
             header,
@@ -870,6 +1054,10 @@ impl IccProfile {
             k_trc,
             a2b0,
             b2a0,
+            a2b_intents: [a2b_p, a2b_c, a2b_s],
+            b2a_intents: [b2a_p, b2a_c, b2a_s],
+            v4_a2b: [v4_a2b_p, v4_a2b_c, v4_a2b_s],
+            v4_b2a: [v4_b2a_p, v4_b2a_c, v4_b2a_s],
             builtin_kind: None,
         })
     }
@@ -901,6 +1089,10 @@ impl IccProfile {
                 k_trc: None,
                 a2b0: None,
                 b2a0: None,
+                a2b_intents: [None, None, None],
+                b2a_intents: [None, None, None],
+                v4_a2b: [None, None, None],
+                v4_b2a: [None, None, None],
                 builtin_kind: Some(kind),
             },
             BuiltinIccProfile::DisplayP3 => Self {
@@ -926,6 +1118,10 @@ impl IccProfile {
                 k_trc: None,
                 a2b0: None,
                 b2a0: None,
+                a2b_intents: [None, None, None],
+                b2a_intents: [None, None, None],
+                v4_a2b: [None, None, None],
+                v4_b2a: [None, None, None],
                 builtin_kind: Some(kind),
             },
             BuiltinIccProfile::IsoCoatedV2Cmyk | BuiltinIccProfile::UsWebCoatedSwopCmyk => {
@@ -953,53 +1149,177 @@ impl IccProfile {
                     k_trc: None,
                     a2b0: None,
                     b2a0: None,
+                    a2b_intents: [None, None, None],
+                    b2a_intents: [None, None, None],
+                    v4_a2b: [None, None, None],
+                    v4_b2a: [None, None, None],
                     builtin_kind: Some(kind),
                 }
             }
         }
     }
 
-    /// Converts device RGB (`0.0..=1.0`) to D50 PCS CIE XYZ using this profile's `A2B0` LUT or TRC+Matrix.
+    fn intent_slot(intent: RenderingIntent) -> usize {
+        match intent {
+            RenderingIntent::Perceptual => 0,
+            RenderingIntent::RelativeColorimetric | RenderingIntent::AbsoluteColorimetric => 1,
+            RenderingIntent::Saturation => 2,
+        }
+    }
+
+    fn select_a2b(&self, intent: RenderingIntent) -> Option<&IccLut> {
+        let s = Self::intent_slot(intent);
+        self.a2b_intents[s]
+            .as_ref()
+            .or(self.a2b_intents[0].as_ref())
+            .or(self.a2b0.as_ref())
+    }
+
+    fn select_b2a(&self, intent: RenderingIntent) -> Option<&IccLut> {
+        let s = Self::intent_slot(intent);
+        self.b2a_intents[s]
+            .as_ref()
+            .or(self.b2a_intents[0].as_ref())
+            .or(self.b2a0.as_ref())
+    }
+
+    fn select_v4_a2b(&self, intent: RenderingIntent) -> Option<&IccV4Lut> {
+        let s = Self::intent_slot(intent);
+        self.v4_a2b[s]
+            .as_ref()
+            .or(self.v4_a2b[0].as_ref())
+            .or_else(|| self.v4_a2b.iter().flatten().next())
+    }
+
+    fn select_v4_b2a(&self, intent: RenderingIntent) -> Option<&IccV4Lut> {
+        let s = Self::intent_slot(intent);
+        self.v4_b2a[s]
+            .as_ref()
+            .or(self.v4_b2a[0].as_ref())
+            .or_else(|| self.v4_b2a.iter().flatten().next())
+    }
+
+    #[inline]
+    fn adapt_rel_xyz_for_intent(&self, xyz: [f64; 3], intent: RenderingIntent) -> [f64; 3] {
+        if intent != RenderingIntent::AbsoluteColorimetric {
+            return xyz;
+        }
+        let Some(wp) = self.white_point else {
+            return xyz;
+        };
+        if wp[0] <= 1e-4 || wp[1] <= 1e-4 || wp[2] <= 1e-4 {
+            return xyz;
+        }
+        [
+            xyz[0] * (wp[0] / D50_WHITE[0]),
+            xyz[1] * (wp[1] / D50_WHITE[1]),
+            xyz[2] * (wp[2] / D50_WHITE[2]),
+        ]
+    }
+
+    #[inline]
+    fn adapt_abs_xyz_to_rel(&self, xyz: [f64; 3], intent: RenderingIntent) -> [f64; 3] {
+        if intent != RenderingIntent::AbsoluteColorimetric {
+            return xyz;
+        }
+        let Some(wp) = self.white_point else {
+            return xyz;
+        };
+        if wp[0] <= 1e-4 || wp[1] <= 1e-4 || wp[2] <= 1e-4 {
+            return xyz;
+        }
+        [
+            xyz[0] * (D50_WHITE[0] / wp[0]),
+            xyz[1] * (D50_WHITE[1] / wp[1]),
+            xyz[2] * (D50_WHITE[2] / wp[2]),
+        ]
+    }
+
+    /// Converts device RGB (`0.0..=1.0`) to D50 PCS CIE XYZ using this profile's `A2B*` LUT or TRC+Matrix.
     #[must_use]
     pub fn rgb_to_pcs_xyz(&self, rgb: [f64; 3]) -> Option<[f64; 3]> {
+        self.rgb_to_pcs_xyz_with_intent(rgb, self.header.rendering_intent)
+    }
+
+    /// Converts device RGB (`0.0..=1.0`) to D50 PCS CIE XYZ honoring explicit [`RenderingIntent`].
+    #[must_use]
+    pub fn rgb_to_pcs_xyz_with_intent(
+        &self,
+        rgb: [f64; 3],
+        intent: RenderingIntent,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Rgb {
             return None;
         }
         let r = clamp_unit_finite(rgb[0]);
         let g = clamp_unit_finite(rgb[1]);
         let b = clamp_unit_finite(rgb[2]);
-        if let Some(lut) = &self.a2b0 {
+        if let Some(v4) = self.select_v4_a2b(intent) {
+            if v4.in_channels == 3 && v4.out_channels == 3 {
+                let raw = v4.evaluate(&[r, g, b]);
+                let rel = decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    v4.clut_is_16bit,
+                    4,
+                )
+                .map(sanitize_finite);
+                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
+            }
+        }
+        if let Some(lut) = self.select_a2b(intent) {
             if lut.in_channels == 3 && lut.out_channels == 3 {
                 let raw = lut.evaluate(&[r, g, b], false);
-                return Some(
-                    decode_lut_pcs_to_xyz(
-                        [raw[0], raw[1], raw[2]],
-                        self.header.pcs,
-                        lut.is_16bit,
-                        self.header.version_major,
-                    )
-                    .map(sanitize_finite),
-                );
+                let rel = decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    lut.is_16bit,
+                    self.header.version_major,
+                )
+                .map(sanitize_finite);
+                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
             }
         }
         let mat = self.rgb_to_xyz_matrix?;
         let rl = self.r_trc.as_ref().map_or(r, |t| t.eval(r));
         let gl = self.g_trc.as_ref().map_or(g, |t| t.eval(g));
         let bl = self.b_trc.as_ref().map_or(b, |t| t.eval(b));
-        Some(mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite))
+        let rel = mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite);
+        Some(self.adapt_rel_xyz_for_intent(rel, intent))
     }
 
-    /// Converts D50 PCS CIE XYZ to device RGB (`0.0..=1.0`) using this profile's `B2A0` LUT or inverse Matrix+TRC.
+    /// Converts D50 PCS CIE XYZ to device RGB (`0.0..=1.0`) using this profile's `B2A*` LUT or inverse Matrix+TRC.
     #[must_use]
     pub fn pcs_xyz_to_rgb(&self, xyz: [f64; 3]) -> Option<[f64; 3]> {
+        self.pcs_xyz_to_rgb_with_intent(xyz, self.header.rendering_intent)
+    }
+
+    /// Converts D50 PCS CIE XYZ to device RGB (`0.0..=1.0`) honoring explicit [`RenderingIntent`].
+    #[must_use]
+    pub fn pcs_xyz_to_rgb_with_intent(
+        &self,
+        xyz: [f64; 3],
+        intent: RenderingIntent,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Rgb {
             return None;
         }
-        let xyz = xyz.map(sanitize_finite);
-        if let Some(lut) = &self.b2a0 {
+        let rel_xyz = self.adapt_abs_xyz_to_rel(xyz.map(sanitize_finite), intent);
+        if let Some(v4) = self.select_v4_b2a(intent) {
+            if v4.in_channels == 3 && v4.out_channels == 3 {
+                let encoded = encode_xyz_to_lut_pcs(rel_xyz, self.header.pcs, v4.clut_is_16bit, 4);
+                let out = v4.evaluate(&encoded);
+                return Some([
+                    clamp_unit_finite(out[0]),
+                    clamp_unit_finite(out[1]),
+                    clamp_unit_finite(out[2]),
+                ]);
+            }
+        }
+        if let Some(lut) = self.select_b2a(intent) {
             if lut.in_channels == 3 && lut.out_channels == 3 {
                 let encoded = encode_xyz_to_lut_pcs(
-                    xyz,
+                    rel_xyz,
                     self.header.pcs,
                     lut.is_16bit,
                     self.header.version_major,
@@ -1014,7 +1334,7 @@ impl IccProfile {
         }
         let mat = self.rgb_to_xyz_matrix?;
         let inv = mat3_invert(&mat)?;
-        let lin = mat3_mul_vec(&inv, xyz);
+        let lin = mat3_mul_vec(&inv, rel_xyz);
         let r = self
             .r_trc
             .as_ref()
@@ -1034,51 +1354,92 @@ impl IccProfile {
         ])
     }
 
-    /// Converts device CMYK (`0.0..=1.0`) to D50 PCS CIE XYZ using `A2B0` LUT or built-in press model.
+    /// Converts device CMYK (`0.0..=1.0`) to D50 PCS CIE XYZ using `A2B*` LUT or built-in press model.
     #[must_use]
     pub fn cmyk_to_pcs_xyz(&self, cmyk: [f64; 4]) -> Option<[f64; 3]> {
+        self.cmyk_to_pcs_xyz_with_intent(cmyk, self.header.rendering_intent)
+    }
+
+    /// Converts device CMYK (`0.0..=1.0`) to D50 PCS CIE XYZ honoring explicit [`RenderingIntent`].
+    #[must_use]
+    pub fn cmyk_to_pcs_xyz_with_intent(
+        &self,
+        cmyk: [f64; 4],
+        intent: RenderingIntent,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Cmyk {
             return None;
         }
         let clamped = cmyk.map(clamp_unit_finite);
-        if let Some(lut) = &self.a2b0 {
+        if let Some(v4) = self.select_v4_a2b(intent) {
+            if v4.in_channels == 4 && v4.out_channels == 3 {
+                let raw = v4.evaluate(&clamped);
+                let rel = decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    v4.clut_is_16bit,
+                    4,
+                )
+                .map(sanitize_finite);
+                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
+            }
+        }
+        if let Some(lut) = self.select_a2b(intent) {
             if lut.in_channels == 4 && lut.out_channels == 3 {
                 let raw = lut.evaluate(&clamped, false);
-                return Some(
-                    decode_lut_pcs_to_xyz(
-                        [raw[0], raw[1], raw[2]],
-                        self.header.pcs,
-                        lut.is_16bit,
-                        self.header.version_major,
-                    )
-                    .map(sanitize_finite),
-                );
+                let rel = decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    lut.is_16bit,
+                    self.header.version_major,
+                )
+                .map(sanitize_finite);
+                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
             }
         }
         if let Some(builtin) = self.builtin_kind {
             if builtin.is_cmyk() {
                 let press = builtin.as_cmyk_press();
-                return Some(
-                    press
-                        .cmyk_to_xyz_d50(clamped, self.header.rendering_intent)
-                        .map(sanitize_finite),
-                );
+                return Some(press.cmyk_to_xyz_d50(clamped, intent).map(sanitize_finite));
             }
         }
         None
     }
 
-    /// Converts D50 PCS CIE XYZ to device CMYK (`0.0..=1.0`) using `B2A0` LUT or built-in press model.
+    /// Converts D50 PCS CIE XYZ to device CMYK (`0.0..=1.0`) using `B2A*` LUT or built-in press model.
     #[must_use]
     pub fn pcs_xyz_to_cmyk(&self, xyz: [f64; 3]) -> Option<[f64; 4]> {
+        self.pcs_xyz_to_cmyk_with_intent(xyz, self.header.rendering_intent)
+    }
+
+    /// Converts D50 PCS CIE XYZ to device CMYK (`0.0..=1.0`) honoring explicit [`RenderingIntent`].
+    #[must_use]
+    pub fn pcs_xyz_to_cmyk_with_intent(
+        &self,
+        xyz: [f64; 3],
+        intent: RenderingIntent,
+    ) -> Option<[f64; 4]> {
         if self.header.color_space != IccColorSpace::Cmyk {
             return None;
         }
-        let xyz = xyz.map(sanitize_finite);
-        if let Some(lut) = &self.b2a0 {
+        let xyz_clean = xyz.map(sanitize_finite);
+        let rel_xyz = self.adapt_abs_xyz_to_rel(xyz_clean, intent);
+        if let Some(v4) = self.select_v4_b2a(intent) {
+            if v4.in_channels == 3 && v4.out_channels == 4 {
+                let encoded = encode_xyz_to_lut_pcs(rel_xyz, self.header.pcs, v4.clut_is_16bit, 4);
+                let out = v4.evaluate(&encoded);
+                return Some([
+                    clamp_unit_finite(out[0]),
+                    clamp_unit_finite(out[1]),
+                    clamp_unit_finite(out[2]),
+                    clamp_unit_finite(out[3]),
+                ]);
+            }
+        }
+        if let Some(lut) = self.select_b2a(intent) {
             if lut.in_channels == 3 && lut.out_channels == 4 {
                 let encoded = encode_xyz_to_lut_pcs(
-                    xyz,
+                    rel_xyz,
                     self.header.pcs,
                     lut.is_16bit,
                     self.header.version_major,
@@ -1097,7 +1458,7 @@ impl IccProfile {
                 let press = builtin.as_cmyk_press();
                 return Some(
                     press
-                        .xyz_d50_to_cmyk(xyz, self.header.rendering_intent)
+                        .xyz_d50_to_cmyk(xyz_clean, intent)
                         .map(clamp_unit_finite),
                 );
             }
@@ -1247,49 +1608,70 @@ pub fn apply_soft_proof_rgba_with_profile(
     let lut = custom_lut
         .as_ref()
         .unwrap_or_else(|| cached_soft_proof_lut(fallback.as_cmyk_press(), intent));
-    for px in rgba.as_chunks_mut::<4>().0 {
-        if px[3] == 0 {
-            continue;
-        }
-        let rf = f32::from(px[0]) / 255.0;
-        let gf = f32::from(px[1]) / 255.0;
-        let bf = f32::from(px[2]) / 255.0;
-        let [pr, pg, pb, delta_e_norm] = lut.sample_tetrahedral(rf, gf, bf);
-
-        let (mut r, mut g, mut b) = if soft_proof {
-            (pr, pg, pb)
-        } else {
-            (rf, gf, bf)
-        };
-
-        // `delta_e_norm` stores `delta_e / 100.0` computed under RelativeColorimetric
-        if gamut_warning && (f64::from(delta_e_norm) * 100.0) > CMYK_GAMUT_DELTA_E_THRESHOLD {
-            // Vivid gamut warning overlay (cyan-green #00FF99 at 75% blend, never colliding with CMYK)
-            const WARN_R: f32 = 0.0;
-            const WARN_G: f32 = 1.0;
-            const WARN_B: f32 = 0.6;
-            r = r * 0.25 + WARN_R * 0.75;
-            g = g * 0.25 + WARN_G * 0.75;
-            b = b * 0.25 + WARN_B * 0.75;
-        }
-
-        px[0] = (r * 255.0).round().clamp(0.0, 255.0) as u8;
-        px[1] = (g * 255.0).round().clamp(0.0, 255.0) as u8;
-        px[2] = (b * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
+    lut.apply_rgba(rgba, soft_proof, gamut_warning);
 }
 
 // =============================================================================
 // Cached 17×17×17 3D Tetrahedral Soft-Proof LUT
 // =============================================================================
 
-struct SoftProofLut3D {
+/// Cached `17 × 17 × 17` 3D tetrahedral transform LUT for fast soft-proofing & gamut checks.
+#[derive(Debug, Clone)]
+pub struct SoftProofLut3D {
     grid: usize,
     /// `[proof_r, proof_g, proof_b, rel_delta_e / 100.0]` per `(r, g, b)` lattice point.
     data: Vec<[f32; 4]>,
 }
 
 impl SoftProofLut3D {
+    /// Builds a LUT for `custom_profile` if capable of full soft-proofing roundtrips, otherwise
+    /// returns the static cached LUT for `fallback` press and `intent`.
+    #[must_use]
+    pub fn build_for_profile_or_builtin(
+        custom_profile: Option<&IccProfile>,
+        fallback: BuiltinIccProfile,
+        intent: RenderingIntent,
+    ) -> Self {
+        custom_profile
+            .and_then(|p| Self::build_from_profile(p, intent))
+            .unwrap_or_else(|| cached_soft_proof_lut(fallback.as_cmyk_press(), intent).clone())
+    }
+
+    /// Applies precomputed soft-proofing / gamut-warning transformation to straight RGBA8 pixels.
+    pub fn apply_rgba(&self, rgba: &mut [u8], soft_proof: bool, gamut_warning: bool) {
+        if !soft_proof && !gamut_warning {
+            return;
+        }
+        for px in rgba.as_chunks_mut::<4>().0 {
+            if px[3] == 0 {
+                continue;
+            }
+            let rf = f32::from(px[0]) / 255.0;
+            let gf = f32::from(px[1]) / 255.0;
+            let bf = f32::from(px[2]) / 255.0;
+            let [pr, pg, pb, delta_e_norm] = self.sample_tetrahedral(rf, gf, bf);
+
+            let (mut r, mut g, mut b) = if soft_proof {
+                (pr, pg, pb)
+            } else {
+                (rf, gf, bf)
+            };
+
+            if gamut_warning && (f64::from(delta_e_norm) * 100.0) > CMYK_GAMUT_DELTA_E_THRESHOLD {
+                const WARN_R: f32 = 0.0;
+                const WARN_G: f32 = 1.0;
+                const WARN_B: f32 = 0.6;
+                r = r * 0.25 + WARN_R * 0.75;
+                g = g * 0.25 + WARN_G * 0.75;
+                b = b * 0.25 + WARN_B * 0.75;
+            }
+
+            px[0] = (r * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[1] = (g * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[2] = (b * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
     fn build(press: CmykPressKind, intent: RenderingIntent) -> Self {
         let g = SOFT_PROOF_LUT_GRID;
         let mut data = Vec::with_capacity(g * g * g);
@@ -1334,14 +1716,25 @@ impl SoftProofLut3D {
         Self { grid: g, data }
     }
 
-    fn build_from_profile(profile: &IccProfile, intent: RenderingIntent) -> Option<Self> {
-        let can_cmyk = profile.header.color_space == IccColorSpace::Cmyk
-            && (profile.a2b0.is_some() && profile.b2a0.is_some()
-                || profile.builtin_kind.is_some_and(BuiltinIccProfile::is_cmyk));
-        let can_rgb = profile.header.color_space == IccColorSpace::Rgb
-            && (profile.a2b0.is_some()
-                || (profile.rgb_to_xyz_matrix.is_some() && profile.b2a0.is_none())
-                || (profile.b2a0.is_some() && profile.a2b0.is_some()));
+    #[must_use]
+    pub fn build_from_profile(profile: &IccProfile, intent: RenderingIntent) -> Option<Self> {
+        let has_fwd_cmyk = profile.select_a2b(intent).is_some()
+            || profile.select_v4_a2b(intent).is_some()
+            || profile.builtin_kind.is_some_and(BuiltinIccProfile::is_cmyk);
+        let has_bwd_cmyk = profile.select_b2a(intent).is_some()
+            || profile.select_v4_b2a(intent).is_some()
+            || profile.builtin_kind.is_some_and(BuiltinIccProfile::is_cmyk);
+        let can_cmyk =
+            profile.header.color_space == IccColorSpace::Cmyk && has_fwd_cmyk && has_bwd_cmyk;
+
+        let has_fwd_rgb = profile.select_a2b(intent).is_some()
+            || profile.select_v4_a2b(intent).is_some()
+            || profile.rgb_to_xyz_matrix.is_some();
+        let has_bwd_rgb = profile.select_b2a(intent).is_some()
+            || profile.select_v4_b2a(intent).is_some()
+            || (profile.rgb_to_xyz_matrix.is_some() && profile.b2a0.is_none());
+        let can_rgb =
+            profile.header.color_space == IccColorSpace::Rgb && has_fwd_rgb && has_bwd_rgb;
         if !can_cmyk && !can_rgb {
             return None;
         }
@@ -1357,15 +1750,35 @@ impl SoftProofLut3D {
                     let xyz_in = srgb_to_xyz_d50([r, gv, b]);
                     let lab_in = xyz_d50_to_lab(xyz_in);
                     let xyz_proof = if can_cmyk {
-                        let cmyk = profile.pcs_xyz_to_cmyk(xyz_in)?;
-                        profile.cmyk_to_pcs_xyz(cmyk)?
+                        let cmyk = profile.pcs_xyz_to_cmyk_with_intent(xyz_in, intent)?;
+                        profile.cmyk_to_pcs_xyz_with_intent(cmyk, intent)?
                     } else {
-                        let rgb_dev = profile.pcs_xyz_to_rgb(xyz_in)?;
-                        profile.rgb_to_pcs_xyz(rgb_dev)?
+                        let rgb_dev = profile.pcs_xyz_to_rgb_with_intent(xyz_in, intent)?;
+                        profile.rgb_to_pcs_xyz_with_intent(rgb_dev, intent)?
                     };
-                    let _ = intent;
                     let proof_rgb = xyz_d50_to_srgb(xyz_proof);
-                    let lab_out = xyz_d50_to_lab(xyz_proof);
+                    let xyz_rel = if intent == RenderingIntent::RelativeColorimetric {
+                        xyz_proof
+                    } else if can_cmyk {
+                        let cmyk_r = profile.pcs_xyz_to_cmyk_with_intent(
+                            xyz_in,
+                            RenderingIntent::RelativeColorimetric,
+                        )?;
+                        profile.cmyk_to_pcs_xyz_with_intent(
+                            cmyk_r,
+                            RenderingIntent::RelativeColorimetric,
+                        )?
+                    } else {
+                        let rgb_r = profile.pcs_xyz_to_rgb_with_intent(
+                            xyz_in,
+                            RenderingIntent::RelativeColorimetric,
+                        )?;
+                        profile.rgb_to_pcs_xyz_with_intent(
+                            rgb_r,
+                            RenderingIntent::RelativeColorimetric,
+                        )?
+                    };
+                    let lab_out = xyz_d50_to_lab(xyz_rel);
                     let dl = lab_in[0] - lab_out[0];
                     let da = lab_in[1] - lab_out[1];
                     let db = lab_in[2] - lab_out[2];
@@ -2382,41 +2795,215 @@ fn parse_trc_tag(tag: &[u8]) -> CoreResult<IccToneCurve> {
     }
 }
 
-/// Parses a primary/fallback LUT tag pair (`A2B0`/`A2B1` or `B2A0`/`B2A1`), allowing valid
-/// ICC v4 `mAB `/`mBA ` (`lutAToBType`/`lutBToAType`) tags to gracefully fall back to
-/// matrix+TRC (or a `mft1`/`mft2` fallback tag) while strictly rejecting malformed `mft1`/`mft2`.
-fn parse_lut_pair(primary: Option<&[u8]>, fallback: Option<&[u8]>) -> CoreResult<Option<IccLut>> {
-    if let Some(s) = primary {
-        if let Some(lut) = parse_optional_lut_tag(s)? {
-            return Ok(Some(lut));
-        }
-    }
-    if let Some(s) = fallback {
-        return parse_optional_lut_tag(s);
-    }
-    Ok(None)
-}
-
-fn parse_optional_lut_tag(tag: &[u8]) -> CoreResult<Option<IccLut>> {
+/// Parses an arbitrary `mft1`, `mft2`, `mAB `, or `mBA ` LUT tag into either `IccLut` or `IccV4Lut`.
+fn parse_any_lut_tag(tag: &[u8]) -> CoreResult<(Option<IccLut>, Option<IccV4Lut>)> {
     if tag.len() < 4 {
         return Err(CoreError::InvalidColor("truncated ICC LUT tag".into()));
     }
     match &tag[0..4] {
-        b"mft1" | b"mft2" => parse_lut_tag(tag).map(Some),
-        b"mAB " | b"mBA " => {
-            // ICC.1:2010 §10.10/§10.11 lutAToBType / lutBToAType header is 32 bytes.
-            if tag.len() < 32 {
-                return Err(CoreError::InvalidColor(
-                    "truncated ICC v4 mAB/mBA LUT tag".into(),
-                ));
-            }
-            Ok(None)
-        }
+        b"mft1" | b"mft2" => parse_lut_tag(tag).map(|lut| (Some(lut), None)),
+        b"mAB " | b"mBA " => parse_mab_mba_tag(tag).map(|v4| (None, v4)),
         sig => Err(CoreError::InvalidColor(format!(
             "unsupported ICC LUT tag type '{}'",
             String::from_utf8_lossy(sig)
         ))),
     }
+}
+
+/// Parses an ICC v4 `mAB ` (`lutAToBType`) or `mBA ` (`lutBToAType`) multi-stage LUT tag with
+/// strict offset/clut bounds checks; returns `Ok(None)` if all stage offsets are zero (no-op stub).
+fn parse_mab_mba_tag(tag: &[u8]) -> CoreResult<Option<IccV4Lut>> {
+    if tag.len() < 32 {
+        return Err(CoreError::InvalidColor(
+            "truncated ICC v4 mAB/mBA LUT tag".into(),
+        ));
+    }
+    let is_b_to_a = &tag[0..4] == b"mBA ";
+    let in_channels = usize::from(tag[8]);
+    let out_channels = usize::from(tag[9]);
+    if !(1..=4).contains(&in_channels) || !(1..=4).contains(&out_channels) {
+        return Err(CoreError::InvalidColor(format!(
+            "ICC v4 LUT invalid channel counts ({in_channels} -> {out_channels})"
+        )));
+    }
+
+    let b_off = read_be_u32(tag, 12)? as usize;
+    let mat_off = read_be_u32(tag, 16)? as usize;
+    let m_off = read_be_u32(tag, 20)? as usize;
+    let clut_off = read_be_u32(tag, 24)? as usize;
+    let a_off = read_be_u32(tag, 28)? as usize;
+
+    // Empty stub mAB/mBA headers (all stage offsets zero) delegate cleanly to matrix+TRC.
+    if b_off == 0 && mat_off == 0 && m_off == 0 && clut_off == 0 && a_off == 0 {
+        return Ok(None);
+    }
+
+    let b_count = if is_b_to_a { in_channels } else { out_channels };
+    let a_count = if is_b_to_a { out_channels } else { in_channels };
+
+    let b_curves = if b_off != 0 {
+        parse_curve_sequence(tag, b_off, b_count)?
+    } else {
+        Vec::new()
+    };
+    let m_curves = if m_off != 0 {
+        parse_curve_sequence(tag, m_off, 3.min(b_count))?
+    } else {
+        Vec::new()
+    };
+    let matrix = if mat_off != 0 {
+        let end = mat_off
+            .checked_add(48)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 matrix offset overflow".into()))?;
+        if end > tag.len() {
+            return Err(CoreError::InvalidColor(
+                "ICC v4 matrix tag truncated".into(),
+            ));
+        }
+        let mut m = [[0.0_f64; 4]; 3];
+        for (r, row) in m.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().take(3).enumerate() {
+                *cell = read_s15_fixed16(tag, mat_off + (r * 3 + c) * 4)?;
+            }
+            row[3] = read_s15_fixed16(tag, mat_off + 36 + r * 4)?;
+        }
+        Some(m)
+    } else {
+        None
+    };
+
+    let (clut_grid, clut_is_16bit, clut) = if clut_off != 0 {
+        let hdr_end = clut_off
+            .checked_add(20)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 CLUT header overflow".into()))?;
+        if hdr_end > tag.len() {
+            return Err(CoreError::InvalidColor(
+                "ICC v4 CLUT header truncated".into(),
+            ));
+        }
+        let mut grid = [1usize; 4];
+        let mut total_nodes = 1usize;
+        for (axis, g_slot) in grid.iter_mut().enumerate().take(in_channels) {
+            let g = usize::from(tag[clut_off + axis]);
+            if !(2..=MAX_ICC_GRID_POINTS).contains(&g) {
+                return Err(CoreError::InvalidColor(format!(
+                    "ICC v4 CLUT grid axis {axis}={g} outside 2..={MAX_ICC_GRID_POINTS}"
+                )));
+            }
+            *g_slot = g;
+            total_nodes = total_nodes
+                .checked_mul(g)
+                .ok_or_else(|| CoreError::InvalidColor("ICC v4 CLUT node count overflow".into()))?;
+        }
+        let precision = tag[clut_off + 16];
+        let is_16 = match precision {
+            1 => false,
+            2 => true,
+            _ => {
+                return Err(CoreError::InvalidColor(format!(
+                    "ICC v4 CLUT invalid precision {precision}"
+                )));
+            }
+        };
+        let scalars = total_nodes
+            .checked_mul(out_channels)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 CLUT scalar count overflow".into()))?;
+        if scalars > MAX_ICC_CLUT_ENTRIES {
+            return Err(CoreError::InvalidColor(format!(
+                "ICC v4 CLUT scalars {scalars} exceeds limit {MAX_ICC_CLUT_ENTRIES}"
+            )));
+        }
+        let elem_bytes = if is_16 { 2usize } else { 1usize };
+        let data_bytes = scalars
+            .checked_mul(elem_bytes)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 CLUT byte size overflow".into()))?;
+        let data_end = hdr_end
+            .checked_add(data_bytes)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 CLUT data end overflow".into()))?;
+        if data_end > tag.len() {
+            return Err(CoreError::InvalidColor(
+                "ICC v4 CLUT payload truncated".into(),
+            ));
+        }
+        let mut vals = Vec::with_capacity(scalars);
+        let mut off = hdr_end;
+        if is_16 {
+            for _ in 0..scalars {
+                vals.push(f64::from(read_be_u16(tag, off)?) / 65_535.0);
+                off += 2;
+            }
+        } else {
+            for _ in 0..scalars {
+                vals.push(f64::from(tag[off]) / 255.0);
+                off += 1;
+            }
+        }
+        (grid, is_16, vals)
+    } else {
+        ([0usize; 4], true, Vec::new())
+    };
+
+    let a_curves = if a_off != 0 {
+        parse_curve_sequence(tag, a_off, a_count)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(IccV4Lut {
+        is_b_to_a,
+        in_channels,
+        out_channels,
+        b_curves,
+        m_curves,
+        matrix,
+        a_curves,
+        clut_grid,
+        clut_is_16bit,
+        clut,
+    }))
+}
+
+fn parse_curve_sequence(
+    tag: &[u8],
+    start_off: usize,
+    count: usize,
+) -> CoreResult<Vec<IccToneCurve>> {
+    let mut curves = Vec::with_capacity(count);
+    let mut pos = start_off;
+    for _ in 0..count {
+        if pos + 12 > tag.len() {
+            return Err(CoreError::InvalidColor(
+                "ICC v4 curve entry truncated".into(),
+            ));
+        }
+        let curve = parse_trc_tag(&tag[pos..])?;
+        let raw_len = match &tag[pos..pos + 4] {
+            b"curv" => {
+                let n = read_be_u32(tag, pos + 8)? as usize;
+                let entry_bytes = n.saturating_mul(2);
+                12usize.saturating_add(entry_bytes)
+            }
+            b"para" => {
+                let ft = read_be_u16(tag, pos + 8)?;
+                let params = match ft {
+                    0 => 1usize,
+                    1 => 3,
+                    2 => 4,
+                    3 => 5,
+                    4 => 7,
+                    _ => 0,
+                };
+                12usize + params * 4
+            }
+            _ => 12usize,
+        };
+        let aligned = (raw_len + 3) & !3;
+        pos = pos
+            .checked_add(aligned)
+            .ok_or_else(|| CoreError::InvalidColor("ICC v4 curve sequence overflow".into()))?;
+        curves.push(curve);
+    }
+    Ok(curves)
 }
 
 fn parse_lut_tag(tag: &[u8]) -> CoreResult<IccLut> {
@@ -3499,5 +4086,61 @@ mod tests {
             false,
         );
         assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn parses_real_v4_mab_mba_clut_and_honors_rendering_intents() {
+        // Build a synthetic ICC v4 A2B0 (`mAB `) with a 2x2x2 CLUT + curve sequence (no matrix)
+        let mut mab = vec![0u8; 32];
+        mab[0..4].copy_from_slice(b"mAB ");
+        mab[8] = 3;
+        mab[9] = 3;
+        // b_curves at 32 (3 identity `curv` tags, each 12 bytes -> 36 bytes)
+        mab[12..16].copy_from_slice(&32u32.to_be_bytes());
+        for _ in 0..3 {
+            mab.extend_from_slice(b"curv\0\0\0\0\0\0\0\0");
+        }
+        let clut_off = mab.len() as u32;
+        mab[24..28].copy_from_slice(&clut_off.to_be_bytes());
+        let mut hdr = [0u8; 20];
+        hdr[0] = 2;
+        hdr[1] = 2;
+        hdr[2] = 2;
+        hdr[16] = 1; // 8-bit CLUT
+        mab.extend_from_slice(&hdr);
+        // 8 grid corners * 3 output bytes = 24 bytes (identity XYZ-ish cube scaled to [0..255])
+        for ix in 0..=1u8 {
+            for iy in 0..=1u8 {
+                for iz in 0..=1u8 {
+                    mab.extend_from_slice(&[ix * 200, iy * 200, iz * 200]);
+                }
+            }
+        }
+
+        let bytes = build_synthetic_icc_bytes(
+            4,
+            b"mntr",
+            b"RGB ",
+            b"Lab ",
+            0,
+            &[
+                (b"desc", make_mluc_tag("v4 Full mAB CLUT")),
+                (b"wtpt", make_xyz_tag([0.90, 0.95, 0.80])),
+                (b"A2B0", mab),
+            ],
+        );
+        let prof = IccProfile::from_bytes(&bytes).expect("real v4 mAB CLUT parses cleanly");
+        assert!(prof.v4_a2b[0].is_some());
+        let xyz_rel = prof
+            .rgb_to_pcs_xyz_with_intent([0.5, 0.5, 0.5], RenderingIntent::Perceptual)
+            .expect("v4 mAB evaluation");
+        let xyz_abs = prof
+            .rgb_to_pcs_xyz_with_intent([0.5, 0.5, 0.5], RenderingIntent::AbsoluteColorimetric)
+            .expect("v4 absolute colorimetric evaluation");
+        assert!(xyz_rel.iter().all(|v| v.is_finite()));
+        assert!(
+            (xyz_abs[2] - xyz_rel[2]).abs() > 1e-4,
+            "AbsoluteColorimetric should apply media white-point scaling"
+        );
     }
 }

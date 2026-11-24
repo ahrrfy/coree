@@ -25,19 +25,21 @@ pub struct DocumentTab {
     pub last_autosave_at: Instant,
     pub journal_seq: u64,
     pub wal_session_open: bool,
+    pub wal_session_id: Option<String>,
+    pub wal_base_snapshot_id: Option<String>,
+    pub autosave_dirty_objects: HashSet<ObjectId>,
+    pub autosave_dirty_structure: bool,
+    pub autosave_dirty_all: bool,
     pub last_rendered_texture: Option<egui::TextureHandle>,
     pub needs_rerender: bool,
     pub viewport_initialized: bool,
-    pub drag_state: CanvasDragState,
-    pub poly_points_mm: Vec<Point2D>,
-    pub bezier_draft_nodes: Vec<PathNode>,
-    pub three_point_curve_chord: Option<(Point2D, Point2D)>,
-    pub three_point_shape_chord: Option<(ToolId, Point2D, Point2D)>,
+    pub tool_core: ToolCore,
+    pub transient_overlay: TransientOverlay,
+    pub last_canvas_rect: Option<[f32; 4]>,
     pub pending_crop_rect: Option<Rect2D>,
     pub inline_text_edit: Option<InlineTextEditState>,
     pub raster_mask_rect_mm: Option<Rect2D>,
     pub selected_mesh_node: Option<(ObjectId, usize)>,
-    pub live_sketch_strokes: Vec<Vec<Point2D>>,
     pub cursor_world_mm: Point2D,
     pub inspection_report: Option<FileInspectionReport>,
     pub overprint_preview: bool,
@@ -71,7 +73,7 @@ impl DocumentTab {
             .map(|l| l.id);
         let metrics = compute_production_metrics(&document, None);
         Self {
-            id: document.id,
+            id: document.id(),
             document,
             history: CommandHistory::default(),
             selection: SelectionState::new(),
@@ -88,19 +90,21 @@ impl DocumentTab {
             last_autosave_at: Instant::now(),
             journal_seq: 0,
             wal_session_open: false,
+            wal_session_id: None,
+            wal_base_snapshot_id: None,
+            autosave_dirty_objects: HashSet::new(),
+            autosave_dirty_structure: false,
+            autosave_dirty_all: false,
             last_rendered_texture: None,
             needs_rerender: true,
             viewport_initialized: false,
-            drag_state: CanvasDragState::Idle,
-            poly_points_mm: Vec::new(),
-            bezier_draft_nodes: Vec::new(),
-            three_point_curve_chord: None,
-            three_point_shape_chord: None,
+            tool_core: ToolCore::new(ToolId::Pick),
+            transient_overlay: TransientOverlay::default(),
+            last_canvas_rect: None,
             pending_crop_rect: None,
             inline_text_edit: None,
             raster_mask_rect_mm: None,
             selected_mesh_node: None,
-            live_sketch_strokes: Vec::new(),
             cursor_world_mm: Point2D::ZERO,
             inspection_report: None,
             overprint_preview: false,
@@ -125,12 +129,13 @@ impl DocumentTab {
     /// Ensures `active_page_index` and `active_layer_id` always reference an existing page
     /// and a valid layer belonging to that active page.
     pub fn sync_active_layer(&mut self) {
-        if self.document.pages.is_empty() {
+        if self.document.pages().is_empty() {
             self.active_layer_id = None;
             return;
         }
-        if self.document.active_page_index >= self.document.pages.len() {
-            self.document.active_page_index = self.document.pages.len() - 1;
+        if self.document.active_page_index() >= self.document.pages().len() {
+            let last = self.document.pages().len() - 1;
+            let _ = self.document.set_active_page_index(last);
         }
         let Some(page) = self.document.active_page() else {
             self.active_layer_id = None;
@@ -150,168 +155,61 @@ impl DocumentTab {
         }
     }
 
-    /// Cancels any active interactive drag gesture and cleanly rolls back live preview mutations
-    /// so `Esc` never leaves uncommitted transforms, paths, fills, or effects behind.
+    /// Cancels any active interactive drag gesture and clears transient overlay previews.
+    /// Since `ToolCore` never mutates `Document` mid-drag, zero rollback mutations or
+    /// `mark_all_dirty()` invalidations are needed.
     pub fn cancel_active_drag(&mut self) {
-        let state = std::mem::take(&mut self.drag_state);
-        match state {
-            CanvasDragState::MovingSelection {
-                accum_dx, accum_dy, ..
-            } => {
-                if accum_dx.abs() > 1e-6 || accum_dy.abs() > 1e-6 {
-                    let inv = Affine2D::translate(-accum_dx, -accum_dy);
-                    let editable: Vec<ObjectId> = self
-                        .selection
-                        .objects
-                        .iter()
-                        .copied()
-                        .filter(|&id| is_object_editable_in_doc(&self.document, id))
-                        .collect();
-                    for id in editable {
-                        if let Some(obj) = self.document.objects.get_mut(&id) {
-                            obj.transform = inv.compose(&obj.transform);
-                        }
-                    }
-                    self.tile_cache.mark_all_dirty();
-                    self.needs_rerender = true;
-                }
-            }
-            CanvasDragState::ScalingSelection {
-                orig_transforms, ..
-            }
-            | CanvasDragState::RotatingSelection {
-                orig_transforms, ..
-            }
-            | CanvasDragState::SkewingSelection {
-                orig_transforms, ..
-            }
-            | CanvasDragState::FreeTransforming {
-                orig_transforms, ..
-            } => {
-                for (id, orig_xf) in orig_transforms {
-                    if let Some(obj) = self.document.objects.get_mut(&id) {
-                        obj.transform = orig_xf;
-                    }
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingNode { orig_paths, .. } => {
-                for (id, orig_path) in orig_paths {
-                    if let Some(obj) = self.document.objects.get_mut(&id) {
-                        obj.payload = NodePayload::Path(orig_path);
-                    }
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingCurveSegment {
-                object_id,
-                orig_path,
-                ..
-            } => {
-                if let Some(obj) = self.document.objects.get_mut(&object_id) {
-                    obj.payload = NodePayload::Path(orig_path);
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingParametricHandle {
-                object_id,
-                orig_shape,
-                ..
-            } => {
-                if let Some(obj) = self.document.objects.get_mut(&object_id) {
-                    obj.payload = NodePayload::Shape(orig_shape);
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::Sculpting {
-                object_id,
-                orig_payload,
-                ..
-            } => {
-                if let Some(obj) = self.document.objects.get_mut(&object_id) {
-                    obj.payload = orig_payload;
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingGradientHandle {
-                object_id,
-                orig_fill,
-                ..
-            }
-            | CanvasDragState::DraggingGradientFocal {
-                object_id,
-                orig_fill,
-            }
-            | CanvasDragState::DraggingGradientStop {
-                object_id,
-                orig_fill,
-                ..
-            }
-            | CanvasDragState::DraggingMeshNode {
-                object_id,
-                orig_fill,
-                ..
-            } => {
-                if let Some(obj) = self.document.objects.get_mut(&object_id) {
-                    obj.fill = orig_fill;
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingTransparencyHandle {
-                object_id,
-                effect_index,
-                orig_effect,
-                ..
-            }
-            | CanvasDragState::DraggingEnvelopeHandle {
-                object_id,
-                effect_index,
-                orig_effect,
-                ..
-            }
-            | CanvasDragState::DraggingEffectHandle {
-                object_id,
-                effect_index,
-                orig_effect,
-            } => {
-                if let Some(obj) = self.document.objects.get_mut(&object_id) {
-                    if let Some(slot) = obj.effects.get_mut(effect_index) {
-                        *slot = orig_effect;
-                    }
-                }
-                self.tile_cache.mark_all_dirty();
-                self.needs_rerender = true;
-            }
-            CanvasDragState::DraggingCanvasGuide {
-                guide_id,
-                orig_orientation,
-            } => {
-                if let Some(g) = self.document.guides.iter_mut().find(|g| g.id == guide_id) {
-                    g.orientation = orig_orientation;
-                }
-                self.needs_rerender = true;
-            }
-            _ => {}
-        }
+        let _ = self.tool_core.cancel();
+        self.transient_overlay = TransientOverlay::default();
         self.viewport.lod_dragging = false;
         self.active_guides.clear();
     }
 
-    /// Marks the canvas cache and live production metrics dirty after any scene edit.
-    pub fn mark_modified(&mut self) {
+    /// Marks the canvas cache dirty according to a targeted [`DocumentInvalidation`] from
+    /// [`CommandHistory`], avoiding full-tile invalidation whenever only specific objects/bounds
+    /// changed.
+    pub fn mark_modified_with_invalidation(&mut self, inv: &DocumentInvalidation) {
         self.dirty = true;
         self.needs_rerender = true;
         self.metrics_dirty = true;
         self.separations_preview = None;
-        self.tile_cache.mark_all_dirty();
+        match inv {
+            DocumentInvalidation::All => {
+                self.autosave_dirty_structure = true;
+                self.autosave_dirty_all = true;
+                self.tile_cache.mark_all_dirty();
+            }
+            DocumentInvalidation::Targeted {
+                object_ids,
+                dirty_rects_mm,
+            } => {
+                for &id in object_ids {
+                    self.autosave_dirty_objects.insert(id);
+                }
+                for &rect in dirty_rects_mm {
+                    self.tile_cache.mark_dirty(rect);
+                }
+                for &id in object_ids {
+                    self.tile_cache.mark_object_dirty(&self.document, id);
+                }
+            }
+        }
         self.selection.prune_missing(&self.document);
         self.sync_active_layer();
+    }
+
+    /// Maps a world-space point (mm) into global egui screen coordinates using the last
+    /// painted canvas rect, if available.
+    #[must_use]
+    pub fn world_to_canvas_screen_pos(&self, world: Point2D) -> Option<[f32; 2]> {
+        let rect = self.last_canvas_rect?;
+        let sp = self.viewport.world_to_screen(world);
+        Some([rect[0] + sp.x as f32, rect[1] + sp.y as f32])
+    }
+
+    /// Marks the canvas cache and live production metrics dirty after any scene edit.
+    pub fn mark_modified(&mut self) {
+        self.mark_modified_with_invalidation(&DocumentInvalidation::All);
     }
 
     /// Refreshes live path length & area metrics if dirty.
@@ -331,9 +229,9 @@ impl DocumentTab {
     #[must_use]
     pub fn tab_title(&self) -> String {
         if self.dirty {
-            format!("{} *", self.document.title)
+            format!("{} *", self.document.title())
         } else {
-            self.document.title.clone()
+            self.document.title().to_owned()
         }
     }
 
@@ -341,10 +239,10 @@ impl DocumentTab {
     pub fn fit_active_page(&mut self) {
         let layouts = compute_page_layouts(
             &self.document,
-            self.document.multipage_view,
+            self.document.multipage_view(),
             self.render_options.multipage_gap_mm,
         );
-        let rect = if self.document.multipage_view {
+        let rect = if self.document.multipage_view() {
             let mut acc: Option<Rect2D> = None;
             for l in &layouts {
                 let r = l.rect_mm();

@@ -296,7 +296,7 @@ fn resolve_active_palette(app: &StudioApp) -> ColorPalette {
         1 => default_rgb_palette(),
         2 => app
             .active_tab()
-            .map(|t| t.document.document_palette.clone())
+            .map(|t| t.document.document_palette().clone())
             .unwrap_or_else(default_cmyk_palette),
         3 => laser_and_cut_palette(),
         idx => app

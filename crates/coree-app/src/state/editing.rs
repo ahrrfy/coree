@@ -2,6 +2,25 @@
 
 use super::*;
 
+fn resolve_paste_target_layer(doc: &Document, active_layer_id: Option<LayerId>) -> Option<LayerId> {
+    let active_page = doc.active_page()?;
+    if let Some(lid) = active_layer_id {
+        let on_active_page = active_page.layers.iter().find(|l| l.id == lid);
+        let desktop_layer = doc.find_layer(lid).filter(|l| l.is_desktop_layer);
+        if let Some(layer) = on_active_page.or(desktop_layer) {
+            if layer.visible && !layer.locked {
+                return Some(layer.id);
+            }
+        }
+    }
+    active_page
+        .layers
+        .iter()
+        .rev()
+        .find(|l| l.visible && !l.locked)
+        .map(|l| l.id)
+}
+
 impl StudioApp {
     // -------------------------------------------------------------------------
     // Core Scene Operations (Selection, Transform, Shaping, Fill, Outline, Lens, Effects)
@@ -53,10 +72,12 @@ impl StudioApp {
         if tab.selection.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let ids = tab.selection.objects.clone();
-        let mut next_id = tab.document.next_id.max(
+        let ids = tab
+            .document
+            .filter_topmost_selection(&tab.selection.objects);
+        let mut next_id = tab.document.next_id().max(
             tab.document
-                .objects
+                .objects()
                 .keys()
                 .next_back()
                 .map_or(1, |id| id.0.saturating_add(1)),
@@ -65,13 +86,19 @@ impl StudioApp {
         let mut ops = Vec::new();
         let mut created = Vec::new();
         for src_id in ids {
-            let layer_id = tab.document.layer_of_object(src_id).or(tab.active_layer_id);
+            let layer_id = enclosing_layer_of_object(&tab.document, src_id).or(tab.active_layer_id);
+            let parent_world = tab
+                .document
+                .parent_container_of(src_id)
+                .and_then(|pid| tab.document.world_transform_of(pid))
+                .unwrap_or(Affine2D::IDENTITY);
+            let root_delta = delta_xf.compose(&parent_world);
             let mut visiting = HashSet::new();
             if let Some(new_id) = build_duplicate_tree_ops(
                 &tab.document,
                 src_id,
                 layer_id,
-                delta_xf,
+                root_delta,
                 0,
                 &mut next_id,
                 &mut visiting,
@@ -82,6 +109,15 @@ impl StudioApp {
             }
         }
         remap_duplicate_ops(&mut ops, &id_map);
+        ops.retain(|op| {
+            !matches!(
+                op,
+                CommandOp::SetObjectStyleLink {
+                    style_id: Some(sid),
+                    ..
+                } if tab.document.object_style(*sid).is_none()
+            )
+        });
         Ok((ops, created))
     }
 
@@ -109,8 +145,8 @@ impl StudioApp {
     /// via a single undoable [`CommandOp::Batch`].
     pub fn duplicate_page(&mut self, src_idx: usize) {
         let plan = self.active_tab().and_then(|tab| {
-            let src_page = tab.document.pages.get(src_idx)?;
-            let mut next_id = tab.document.next_id.max(1);
+            let src_page = tab.document.page(src_idx)?;
+            let mut next_id = tab.document.next_id().max(1);
             let new_page_id = PageId(next_id);
             next_id = next_id.saturating_add(1);
             let first_layer_id = LayerId(next_id);
@@ -122,11 +158,25 @@ impl StudioApp {
                 height_mm: src_page.height_mm,
                 bleed_mm: src_page.bleed_mm,
             }];
+            if src_page.facing_pages {
+                ops.push(CommandOp::SetPageProperties {
+                    page_id: new_page_id,
+                    name: None,
+                    width_mm: None,
+                    height_mm: None,
+                    bleed_mm: None,
+                    facing_pages: Some(true),
+                });
+            }
 
             // Map each source layer onto a corresponding target layer on the new page
             let mut layer_targets: Vec<(LayerId, Vec<ObjectId>)> = Vec::new();
             for (l_idx, src_layer) in src_page.layers.iter().enumerate() {
                 let dst_lid = if l_idx == 0 {
+                    ops.push(CommandOp::RenameLayer {
+                        layer_id: first_layer_id,
+                        new_name: src_layer.name.clone(),
+                    });
                     ops.push(CommandOp::SetLayerFlags {
                         layer_id: first_layer_id,
                         visible: Some(src_layer.visible),
@@ -190,24 +240,27 @@ impl StudioApp {
                 }
             }
 
-            let first_layer_name = src_page.layers.first().map(|l| l.name.clone());
-            Some((ops, first_layer_id, first_layer_name))
+            ops.push(CommandOp::SetDocumentProperties {
+                title: None,
+                color_mode: None,
+                default_unit: None,
+                dpi: None,
+                multipage_view: None,
+                active_page_index: Some(tab.document.pages().len()),
+                metadata: None,
+                custom_icc_profile: None,
+                clear_custom_icc: false,
+            });
+
+            Some(ops)
         });
 
-        if let Some((ops, first_layer_id, first_layer_name)) = plan {
+        if let Some(ops) = plan {
             if let Err(err) = self.execute_command(CommandOp::Batch(ops)) {
                 self.push_toast(format!("Duplicate page failed: {err}"), true);
                 return;
             }
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                if let Some(name) = first_layer_name {
-                    if let Some(layer) = tab.document.find_layer_mut(first_layer_id) {
-                        layer.name = name;
-                    }
-                }
-                if !tab.document.pages.is_empty() {
-                    tab.document.active_page_index = tab.document.pages.len() - 1;
-                }
                 tab.selection.clear();
                 tab.sync_active_layer();
                 tab.needs_rerender = true;
@@ -258,8 +311,7 @@ impl StudioApp {
                     .flat_map(|l| l.objects.iter().copied())
                     .filter(|oid| {
                         tab.document
-                            .objects
-                            .get(oid)
+                            .object(*oid)
                             .is_some_and(|o| o.visible && !o.locked)
                     })
                     .collect()
@@ -271,148 +323,388 @@ impl StudioApp {
 
     /// Nudges selected objects by `(dx_steps, dy_steps) * nudge_mm * effective_mult`.
     pub fn nudge_selection(&mut self, dx_steps: i32, dy_steps: i32, mult: i32) {
-        let Some(tab) = self.active_tab() else {
-            return;
+        let cmd = {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            if tab.selection.is_empty() {
+                return;
+            }
+            let scale = if mult > 1 {
+                tab.super_nudge_factor.max(1.0)
+            } else {
+                f64::from(mult.max(1))
+            };
+            let step = tab.nudge_mm * scale;
+            let affine =
+                Affine2D::translate(f64::from(dx_steps) * step, f64::from(dy_steps) * step);
+            build_world_transform_command(&tab.document, &tab.selection.objects, affine)
         };
-        if tab.selection.is_empty() {
-            return;
+        if let Some(cmd) = cmd {
+            let _ = self.execute_command(cmd);
         }
-        let scale = if mult > 1 {
-            tab.super_nudge_factor.max(1.0)
-        } else {
-            f64::from(mult.max(1))
-        };
-        let step = tab.nudge_mm * scale;
-        let ids = tab.selection.objects.clone();
-        let affine = Affine2D::translate(f64::from(dx_steps) * step, f64::from(dy_steps) * step);
-        let _ = self.execute_command(CommandOp::TransformObjects { ids, affine });
     }
 
     /// Micro-nudges selected objects by `(dx_steps, dy_steps) * (nudge_mm / micro_nudge_divisor)` (`Ctrl+Arrow`).
     pub fn micro_nudge_selection(&mut self, dx_steps: i32, dy_steps: i32) {
-        let Some(tab) = self.active_tab() else {
-            return;
+        let cmd = {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            if tab.selection.is_empty() {
+                return;
+            }
+            let divisor = tab.micro_nudge_divisor.max(1.0);
+            let step = tab.nudge_mm / divisor;
+            let affine =
+                Affine2D::translate(f64::from(dx_steps) * step, f64::from(dy_steps) * step);
+            build_world_transform_command(&tab.document, &tab.selection.objects, affine)
         };
-        if tab.selection.is_empty() {
-            return;
+        if let Some(cmd) = cmd {
+            let _ = self.execute_command(cmd);
         }
-        let divisor = tab.micro_nudge_divisor.max(1.0);
-        let step = tab.nudge_mm / divisor;
-        let ids = tab.selection.objects.clone();
-        let affine = Affine2D::translate(f64::from(dx_steps) * step, f64::from(dy_steps) * step);
-        let _ = self.execute_command(CommandOp::TransformObjects { ids, affine });
     }
 
-    /// Copies the selected objects (including full `Group` / `PowerClip` descendant subtrees
-    /// and referenced raster assets) into the studio's internal clipboard.
+    /// Copies the selected objects (including full `Group` / `PowerClip` descendant subtrees,
+    /// referenced symbol definitions, raster assets, and fallback geometry) into the studio's internal
+    /// clipboard AND publishes live `SVG`, `PDF`, `[MS-EMF]`, and `PNG/RGBA8` representations to the OS clipboard.
     pub fn copy_selection(&mut self) -> usize {
         let captured = self.active_tab().map(|t| {
+            let source_doc_id = t.document.id();
             let mut roots = Vec::new();
             let mut copied = Vec::new();
             let mut snap_doc = Document::new_a4("Clipboard");
             let mut seen_roots = HashSet::new();
-            for &id in &t.selection.objects {
+            let mut visiting_syms = HashSet::new();
+            let mut text_on_path_fallbacks = HashMap::new();
+            let topmost = t.document.filter_topmost_selection(&t.selection.objects);
+            for id in topmost {
                 if !seen_roots.insert(id) {
                     continue;
                 }
-                if let Some(obj) = t.document.objects.get(&id) {
+                if let Some(obj) = t.document.object(id) {
+                    let parent_world = t
+                        .document
+                        .parent_container_of(id)
+                        .and_then(|pid| t.document.world_transform_of(pid))
+                        .unwrap_or(Affine2D::IDENTITY);
                     roots.push(id);
-                    copied.push(obj.clone());
+                    let mut root_copy = obj.clone();
+                    root_copy.transform = parent_world.compose(&root_copy.transform);
+                    copied.push(root_copy);
                     let mut visiting = HashSet::new();
-                    collect_subtree_into_snapshot(&t.document, &mut snap_doc, id, 0, &mut visiting);
+                    collect_subtree_into_snapshot(
+                        &t.document,
+                        &mut snap_doc,
+                        id,
+                        0,
+                        parent_world,
+                        &mut visiting,
+                        &mut visiting_syms,
+                        &mut text_on_path_fallbacks,
+                    );
                 }
             }
-            (copied, roots, snap_doc)
+            let clipboard_payload = if !roots.is_empty() {
+                coree_io::build_clipboard_document(&t.document, &roots, Some(&snap_doc))
+                    .and_then(|export_doc| coree_io::encode_clipboard_payload(&export_doc, 0))
+                    .ok()
+            } else {
+                None
+            };
+            (
+                copied,
+                source_doc_id,
+                roots,
+                snap_doc,
+                text_on_path_fallbacks,
+                clipboard_payload,
+            )
         });
-        let Some((copied, roots, snap_doc)) = captured else {
+        let Some((
+            copied,
+            source_doc_id,
+            roots,
+            snap_doc,
+            text_on_path_fallbacks,
+            clipboard_payload,
+        )) = captured
+        else {
             return 0;
         };
         let count = copied.len();
         if count > 0 {
             self.clipboard_objects = copied;
             self.clipboard_snapshot = Some(ClipboardSnapshot {
+                source_doc_id,
                 roots,
                 document: snap_doc,
+                text_on_path_fallbacks,
             });
+            if let Some(payload) = clipboard_payload {
+                self.last_clipboard_hash = Some(payload.content_hash);
+                let _ = self.clipboard_backend.write_payload(&payload);
+            }
             self.push_toast(format!("Copied {count} object(s)"), false);
         }
         count
     }
 
-    /// Cuts the selected objects into the internal clipboard and removes them undoably.
+    /// Cuts the selected objects into the studio & OS clipboard, cancels active drags, and removes them undoably.
     pub fn cut_selection(&mut self) -> usize {
         let count = self.copy_selection();
         if count > 0 {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.cancel_active_drag();
+            }
             self.delete_selection();
         }
         count
     }
 
-    /// Pastes objects (with deep-cloned `Group`/`PowerClip` subtrees and remapped child/link IDs)
-    /// from the internal clipboard onto the active unlocked layer via undoable `Batch`.
+    /// Pastes objects (with deep-cloned `Group`/`PowerClip` subtrees, referenced symbols/assets,
+    /// and sanitized cross-document references) from the studio or OS vector/raster clipboard
+    /// (`SVG > PDF > PNG > EMF > RGBA8`) onto the active unlocked layer via undoable `Batch`.
     pub fn paste_clipboard(&mut self) -> Vec<ObjectId> {
-        if self.clipboard_objects.is_empty() && self.clipboard_snapshot.is_none() {
+        let external_opt = self.clipboard_backend.read_payload().ok().flatten();
+        let has_external = external_opt.as_ref().is_some_and(|e| e.has_any());
+        let has_internal = !self.clipboard_objects.is_empty() || self.clipboard_snapshot.is_some();
+        if !has_internal && !has_external {
             return Vec::new();
         }
-        if let Some(snapshot) = self.clipboard_snapshot.clone() {
-            if !snapshot.roots.is_empty() {
-                // Ensure any referenced raster assets exist in the destination document
-                let plan = self.active_tab_mut().map(|tab| {
-                    for (&aid, asset) in &snapshot.document.assets {
-                        tab.document
-                            .assets
-                            .entry(aid)
-                            .or_insert_with(|| asset.clone());
-                    }
-                    let target_layer_id = tab
-                        .active_layer_id
-                        .filter(|lid| {
-                            tab.document
-                                .find_layer(*lid)
-                                .is_some_and(|l| l.visible && !l.locked)
-                        })
-                        .or_else(|| {
-                            tab.document.active_page().and_then(|p| {
-                                p.layers
-                                    .iter()
-                                    .rev()
-                                    .find(|l| l.visible && !l.locked)
-                                    .map(|l| l.id)
-                            })
-                        });
-                    let mut next_id = tab.document.next_id.max(
-                        tab.document
-                            .objects
-                            .keys()
-                            .next_back()
-                            .map_or(1, |id| id.0.saturating_add(1)),
-                    );
-                    let shift =
-                        Affine2D::translate(tab.duplicate_offset_mm.x, tab.duplicate_offset_mm.y);
-                    let mut id_map = HashMap::new();
-                    let mut ops = Vec::new();
-                    let mut created = Vec::new();
-                    for &src_id in &snapshot.roots {
-                        let mut visiting = HashSet::new();
-                        if let Some(new_id) = build_duplicate_tree_ops(
-                            &snapshot.document,
-                            src_id,
-                            target_layer_id,
-                            shift,
-                            0,
-                            &mut next_id,
-                            &mut visiting,
-                            &mut id_map,
-                            &mut ops,
-                        ) {
-                            created.push(new_id);
+
+        // Guard visible & unlocked target layer FIRST (never mutate or decode onto locked/hidden layers).
+        let target_layer_check = self
+            .active_tab()
+            .map(|tab| resolve_paste_target_layer(&tab.document, tab.active_layer_id).is_some());
+        match target_layer_check {
+            None => return Vec::new(),
+            Some(false) => {
+                self.push_toast(
+                    "Cannot paste: active page has no visible unlocked layer",
+                    true,
+                );
+                return Vec::new();
+            }
+            Some(true) => {}
+        }
+
+        // Prefer external OS clipboard when internal clipboard is empty OR external content hash changed.
+        let use_external = has_external
+            && (!has_internal
+                || external_opt.as_ref().is_some_and(|e| {
+                    e.content_hash != 0 && Some(e.content_hash) != self.last_clipboard_hash
+                }));
+        if use_external {
+            if let Some(ext) = external_opt {
+                let decoded_res = if ext.svg.is_some()
+                    || ext.pdf.is_some()
+                    || ext.emf.is_some()
+                    || ext.png.is_some()
+                {
+                    coree_io::decode_clipboard_auto(
+                        ext.svg.as_deref(),
+                        ext.pdf.as_deref(),
+                        ext.emf.as_deref(),
+                        ext.png.as_deref(),
+                    )
+                    .map(|(doc, fmt)| (doc, fmt.label().to_owned()))
+                } else if let Some((w, h, ref rgba)) = ext.rgba {
+                    coree_io::decode_clipboard_rgba(w, h, rgba, 96.0)
+                        .map(|doc| (doc, "RGBA".to_owned()))
+                } else {
+                    Err(coree_io::IoError::InvalidFormat {
+                        format: "clipboard".into(),
+                        message: "empty external clipboard".into(),
+                    })
+                };
+
+                if let Ok((decoded_doc, fmt_label)) = decoded_res {
+                    let (ops, created) = match self.active_tab() {
+                        Some(tab) => build_import_document_ops_on_layer(
+                            &tab.document,
+                            &decoded_doc,
+                            tab.active_layer_id,
+                        ),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    if !ops.is_empty() && !created.is_empty() {
+                        let cmd = if ops.len() == 1 {
+                            ops.into_iter().next().expect("len == 1")
+                        } else {
+                            CommandOp::Batch(ops)
+                        };
+                        if self.execute_command(cmd).is_ok() {
+                            let count = created.len();
+                            if let Some(tab) = self.active_tab_mut() {
+                                tab.selection.select_many(&tab.document, &created);
+                                tab.metrics_dirty = true;
+                                tab.needs_rerender = true;
+                            }
+                            self.push_toast(
+                                format!("Pasted {count} object(s) from OS clipboard ({fmt_label})"),
+                                false,
+                            );
+                            return created;
                         }
                     }
-                    remap_duplicate_ops(&mut ops, &id_map);
-                    (ops, created)
-                });
-                let Some((ops, created)) = plan else {
-                    return Vec::new();
+                }
+            }
+        }
+
+        if let Some(snapshot) = self.clipboard_snapshot.clone() {
+            if !snapshot.roots.is_empty() {
+                enum PasteSnapshotPlan {
+                    NoTab,
+                    NoUnlockedLayer,
+                    Ready(Vec<CommandOp>, Vec<ObjectId>),
+                }
+                let plan = match self.active_tab() {
+                    None => PasteSnapshotPlan::NoTab,
+                    Some(tab) => {
+                        if let Some(target_layer_id) =
+                            resolve_paste_target_layer(&tab.document, tab.active_layer_id)
+                        {
+                            let mut next_id = tab.document.next_id().max(
+                                tab.document
+                                    .objects()
+                                    .keys()
+                                    .next_back()
+                                    .map_or(1, |id| id.0.saturating_add(1)),
+                            );
+                            let shift = Affine2D::translate(
+                                tab.duplicate_offset_mm.x,
+                                tab.duplicate_offset_mm.y,
+                            );
+                            let mut id_map = HashMap::new();
+                            let mut obj_ops = Vec::new();
+                            let mut created = Vec::new();
+                            for &src_id in &snapshot.roots {
+                                let mut visiting = HashSet::new();
+                                if let Some(new_id) = build_duplicate_tree_ops(
+                                    &snapshot.document,
+                                    src_id,
+                                    Some(target_layer_id),
+                                    shift,
+                                    0,
+                                    &mut next_id,
+                                    &mut visiting,
+                                    &mut id_map,
+                                    &mut obj_ops,
+                                ) {
+                                    created.push(new_id);
+                                }
+                            }
+                            let same_doc = tab.document.id() == snapshot.source_doc_id;
+                            remap_and_sanitize_paste_ops(
+                                &mut obj_ops,
+                                &id_map,
+                                &snapshot.document,
+                                &snapshot.text_on_path_fallbacks,
+                                shift,
+                                &tab.document,
+                                same_doc,
+                            );
+                            let mut ops = Vec::new();
+                            if !obj_ops.is_empty() {
+                                let mut needed_assets = HashSet::new();
+                                let mut needed_symbols = HashSet::new();
+                                for op in &obj_ops {
+                                    match op {
+                                        CommandOp::CreateObject { object, .. }
+                                        | CommandOp::CreateDetachedObject { object } => {
+                                            object.collect_asset_refs(&mut needed_assets);
+                                            collect_symbol_refs_from_object(
+                                                object,
+                                                &mut needed_symbols,
+                                            );
+                                        }
+                                        CommandOp::SetFill { fill, .. } => {
+                                            if let Fill::BitmapPattern { image_id, .. } = fill {
+                                                needed_assets.insert(*image_id);
+                                            } else if let Fill::VectorPattern {
+                                                symbol_id, ..
+                                            } = fill
+                                            {
+                                                needed_symbols.insert(*symbol_id);
+                                            }
+                                        }
+                                        CommandOp::EditTable { table, .. } => {
+                                            for cell in &table.cells {
+                                                if let Fill::BitmapPattern { image_id, .. } =
+                                                    cell.fill
+                                                {
+                                                    needed_assets.insert(image_id);
+                                                } else if let Fill::VectorPattern {
+                                                    symbol_id,
+                                                    ..
+                                                } = cell.fill
+                                                {
+                                                    needed_symbols.insert(symbol_id);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let mut sym_queue: Vec<SymbolId> =
+                                    needed_symbols.iter().copied().collect();
+                                while let Some(sid) = sym_queue.pop() {
+                                    if let Some(sym) = snapshot.document.symbol(sid) {
+                                        for sub in &sym.objects {
+                                            sub.collect_asset_refs(&mut needed_assets);
+                                            let mut nested = HashSet::new();
+                                            collect_symbol_refs_from_object(sub, &mut nested);
+                                            for nsid in nested {
+                                                if needed_symbols.insert(nsid) {
+                                                    sym_queue.push(nsid);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for asset in snapshot.document.assets().values() {
+                                    if needed_assets.contains(&asset.id) {
+                                        ops.push(CommandOp::RegisterAsset {
+                                            asset: asset.clone(),
+                                        });
+                                    }
+                                }
+                                for sym in snapshot.document.symbols().values() {
+                                    if needed_symbols.contains(&sym.id)
+                                        && tab.document.symbol(sym.id).is_none()
+                                    {
+                                        let mut sanitized_sym = sym.clone();
+                                        for sub in &mut sanitized_sym.objects {
+                                            if sub.style_id.is_some_and(|sid| {
+                                                tab.document.object_style(sid).is_none()
+                                            }) {
+                                                sub.style_id = None;
+                                            }
+                                        }
+                                        ops.push(CommandOp::UpsertSymbol {
+                                            symbol: sanitized_sym,
+                                        });
+                                    }
+                                }
+                                ops.extend(obj_ops);
+                            }
+                            PasteSnapshotPlan::Ready(ops, created)
+                        } else {
+                            PasteSnapshotPlan::NoUnlockedLayer
+                        }
+                    }
+                };
+                let (ops, created) = match plan {
+                    PasteSnapshotPlan::NoTab => return Vec::new(),
+                    PasteSnapshotPlan::NoUnlockedLayer => {
+                        self.push_toast(
+                            "Cannot paste: active page has no visible unlocked layer",
+                            true,
+                        );
+                        return Vec::new();
+                    }
+                    PasteSnapshotPlan::Ready(ops, created) => (ops, created),
                 };
                 if ops.is_empty() {
                     return Vec::new();
@@ -431,33 +723,77 @@ impl StudioApp {
         }
 
         // Fallback if a caller populated `clipboard_objects` directly without `copy_selection`
-        let Some((layer_id, mut next_id, offset)) = self.active_tab().map(|t| {
-            (
-                t.active_layer_id,
-                t.document.next_id.max(
-                    t.document
-                        .objects
-                        .keys()
-                        .next_back()
-                        .map_or(1, |id| id.0.saturating_add(1)),
-                ),
-                t.duplicate_offset_mm,
-            )
-        }) else {
-            return Vec::new();
+        let (ops, created) = {
+            let Some(t) = self.active_tab() else {
+                return Vec::new();
+            };
+            let Some(target_layer_id) = resolve_paste_target_layer(&t.document, t.active_layer_id)
+            else {
+                self.push_toast(
+                    "Cannot paste: active page has no visible unlocked layer",
+                    true,
+                );
+                return Vec::new();
+            };
+            let mut next_id = t.document.next_id().max(
+                t.document
+                    .objects()
+                    .keys()
+                    .next_back()
+                    .map_or(1, |id| id.0.saturating_add(1)),
+            );
+            let mut ops = Vec::with_capacity(self.clipboard_objects.len());
+            let mut created = Vec::with_capacity(self.clipboard_objects.len());
+            let shift = Affine2D::translate(t.duplicate_offset_mm.x, t.duplicate_offset_mm.y);
+            for src in &self.clipboard_objects {
+                let mut obj = src.clone();
+                let nid = ObjectId(next_id);
+                next_id = next_id.saturating_add(1);
+                obj.id = nid;
+                obj.transform = shift.compose(&obj.transform);
+                if obj
+                    .style_id
+                    .is_some_and(|sid| t.document.object_style(sid).is_none())
+                {
+                    obj.style_id = None;
+                }
+                match &mut obj.payload {
+                    NodePayload::TextOnPath(top) if !t.document.has_object(top.path_id) => {
+                        obj.payload = NodePayload::ArtisticText(top.text.clone());
+                    }
+                    NodePayload::Connector(conn) => {
+                        if conn.from_obj.is_some_and(|fid| !t.document.has_object(fid)) {
+                            conn.from_obj = None;
+                        }
+                        if conn.to_obj.is_some_and(|tid| !t.document.has_object(tid)) {
+                            conn.to_obj = None;
+                        }
+                    }
+                    NodePayload::ParagraphText(para)
+                        if para
+                            .linked_next_frame
+                            .is_some_and(|nid| !t.document.has_object(nid)) =>
+                    {
+                        para.linked_next_frame = None;
+                    }
+                    _ => {}
+                }
+                obj.effects.retain(|eff| match eff {
+                    Effect::Blend { target_id, .. } => t.document.has_object(*target_id),
+                    _ => true,
+                });
+                for eff in &mut obj.effects {
+                    if let Effect::Blend { along_path, .. } = eff {
+                        if along_path.is_some_and(|ap| !t.document.has_object(ap)) {
+                            *along_path = None;
+                        }
+                    }
+                }
+                created.push(nid);
+                ops.push(CommandOp::create_object(obj, Some(target_layer_id)));
+            }
+            (ops, created)
         };
-        let mut ops = Vec::with_capacity(self.clipboard_objects.len());
-        let mut created = Vec::with_capacity(self.clipboard_objects.len());
-        let shift = Affine2D::translate(offset.x, offset.y);
-        for src in &self.clipboard_objects {
-            let mut obj = src.clone();
-            let nid = ObjectId(next_id);
-            next_id = next_id.saturating_add(1);
-            obj.id = nid;
-            obj.transform = shift.compose(&obj.transform);
-            created.push(nid);
-            ops.push(CommandOp::create_object(obj, layer_id));
-        }
         if self.execute_command(CommandOp::Batch(ops)).is_ok() {
             if let Some(tab) = self.active_tab_mut() {
                 tab.selection.select_many(&tab.document, &created);
@@ -472,25 +808,27 @@ impl StudioApp {
 
     /// Toggles `locked` state on currently selected objects (or unlocks locked objects on active page if none selected).
     pub fn toggle_lock_selection(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        if tab.selection.is_empty() {
-            return;
-        }
-        let any_unlocked = tab
-            .selection
-            .objects
-            .iter()
-            .any(|id| tab.document.objects.get(id).is_some_and(|o| !o.locked));
-        let target_lock = any_unlocked;
-        for &id in &tab.selection.objects {
-            if let Some(obj) = tab.document.objects.get_mut(&id) {
-                obj.locked = target_lock;
+        let (ids, target_lock) = {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return;
+            };
+            if tab.selection.is_empty() {
+                return;
             }
+            let any_unlocked = tab
+                .selection
+                .objects
+                .iter()
+                .any(|id| tab.document.object(*id).is_some_and(|o| !o.locked));
+            (tab.selection.objects.clone(), any_unlocked)
+        };
+        if let Err(err) = self.execute_command(CommandOp::SetObjectLocked {
+            ids,
+            locked: target_lock,
+        }) {
+            self.push_toast(format!("Lock failed: {err}"), true);
+            return;
         }
-        tab.mark_modified();
-        self.checkpoint_wal_snapshot_active();
         self.push_toast(
             if target_lock {
                 "Locked selected object(s)"
@@ -511,13 +849,26 @@ impl StudioApp {
             .active_tab()
             .map(|t| t.selection.objects.clone())
             .unwrap_or_default();
-        let adapted = match last {
-            CommandOp::TransformObjects { affine, .. } if !sel_ids.is_empty() => {
-                CommandOp::TransformObjects {
-                    ids: sel_ids,
-                    affine,
+        if let Some(world_affine) = self
+            .last_world_transform
+            .filter(|_| !sel_ids.is_empty())
+            .or(match &last {
+                CommandOp::TransformObjects { affine, .. } if !sel_ids.is_empty() => Some(*affine),
+                _ => None,
+            })
+        {
+            if let Some(cmd) = self
+                .active_tab()
+                .and_then(|t| build_world_transform_command(&t.document, &sel_ids, world_affine))
+            {
+                match self.execute_command(cmd) {
+                    Ok(()) => self.push_toast("Repeated last command", false),
+                    Err(e) => self.push_toast(format!("Repeat failed: {e}"), true),
                 }
             }
+            return;
+        }
+        let adapted = match last {
             CommandOp::SetFill { fill, .. } if !sel_ids.is_empty() => {
                 CommandOp::SetFill { ids: sel_ids, fill }
             }
@@ -574,15 +925,15 @@ impl StudioApp {
         let mut path_ids = Vec::new();
         let mut new_selection = Vec::new();
         if let Some(tab) = self.active_tab() {
-            let mut next_id = tab.document.next_id.max(
+            let mut next_id = tab.document.next_id().max(
                 tab.document
-                    .objects
+                    .objects()
                     .keys()
                     .next_back()
                     .map_or(1, |k| k.0.saturating_add(1)),
             );
             for &id in &ids {
-                if let Some(obj) = tab.document.objects.get(&id) {
+                if let Some(obj) = tab.document.object(id) {
                     match &obj.payload {
                         NodePayload::Group(_) => ops.push(CommandOp::Ungroup { group_id: id }),
                         NodePayload::PowerClip { .. } => {
@@ -591,7 +942,8 @@ impl StudioApp {
                         _ if !obj.effects.is_empty() => {
                             let world_xf =
                                 tab.document.world_transform_of(id).unwrap_or(obj.transform);
-                            let layer_id = tab.document.layer_of_object(id).or(tab.active_layer_id);
+                            let layer_id = enclosing_layer_of_object(&tab.document, id)
+                                .or(tab.active_layer_id);
                             let lowered = lower_effects_to_primitives(
                                 &tab.document,
                                 obj,
@@ -681,8 +1033,7 @@ impl StudioApp {
                     .copied()
                     .filter(|id| {
                         t.document
-                            .objects
-                            .get(id)
+                            .object(*id)
                             .is_some_and(|o| matches!(o.payload, NodePayload::Group(_)))
                     })
                     .collect()
@@ -734,7 +1085,7 @@ impl StudioApp {
                     .document
                     .active_page()
                     .map_or(Rect2D::from_xywh(0.0, 0.0, 210.0, 297.0), |p| p.trim_rect());
-                let bb = tab.document.object_bounds(ids[0])?;
+                let bb = tab.document.world_object_bounds(ids[0])?;
                 let (dx, dy) = match op {
                     AlignOp::Left => (page_rect.min_x - bb.min_x, 0.0),
                     AlignOp::CenterH => (page_rect.center().x - bb.center().x, 0.0),
@@ -747,7 +1098,21 @@ impl StudioApp {
                         page_rect.center().y - bb.center().y,
                     ),
                 };
-                Some(Affine2D::translate(dx, dy))
+                let world_delta = Affine2D::translate(dx, dy);
+                let local_delta = if let Some(pid) = tab.document.parent_container_of(ids[0]) {
+                    if let Some(pw) = tab.document.world_transform_of(pid) {
+                        if let Some(inv_pw) = pw.inverse() {
+                            inv_pw.compose(&world_delta).compose(&pw)
+                        } else {
+                            world_delta
+                        }
+                    } else {
+                        world_delta
+                    }
+                } else {
+                    world_delta
+                };
+                Some(local_delta)
             });
             if let Some(affine) = shift {
                 let _ = self.execute_command(CommandOp::TransformObjects { ids, affine });
@@ -797,26 +1162,21 @@ impl StudioApp {
             if tab.selection.objects.is_empty() {
                 return;
             }
+            let mut text_engine = TextEngine::new();
             tab.selection
                 .objects
                 .iter()
                 .copied()
                 .map(|id| {
-                    if let Some(obj) = tab.document.objects.get(&id) {
-                        let glyph_path = match &obj.payload {
-                            NodePayload::ArtisticText(art) => Some(text_to_curves(art)),
-                            NodePayload::ParagraphText(para) => Some(paragraph_to_curves(para)),
-                            NodePayload::TextOnPath(top) => {
-                                tab.document.world_path_of(top.path_id).map(|wp| {
-                                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
-                                    text_on_path_to_curves(top, &wp.transformed(&inv))
-                                })
-                            }
-                            _ => None,
-                        };
-                        if let Some(path) = glyph_path {
+                    if let Some(obj) = tab.document.object(id) {
+                        if let Some(path) =
+                            outline_text_object_with_engine(&mut text_engine, obj, &tab.document)
+                        {
                             if !path.is_empty() && path.is_finite() {
-                                return CommandOp::EditPath { id, path };
+                                return CommandOp::Batch(vec![
+                                    CommandOp::ConvertToCurves { id },
+                                    CommandOp::EditPath { id, path },
+                                ]);
                             }
                         }
                     }
@@ -844,10 +1204,11 @@ impl StudioApp {
                 .iter()
                 .copied()
                 .filter(|id| {
-                    tab.document
-                        .objects
-                        .get(id)
-                        .is_some_and(|obj| !obj.locked && obj.outline.is_visible())
+                    is_object_editable_in_doc(&tab.document, *id)
+                        && tab
+                            .document
+                            .object(*id)
+                            .is_some_and(|obj| obj.outline.is_visible())
                 })
                 .map(|id| CommandOp::ConvertOutlineToObject { id })
                 .collect()
@@ -902,8 +1263,7 @@ impl StudioApp {
         let pc_id = self.active_tab().and_then(|t| {
             t.selection.objects.iter().copied().find(|id| {
                 t.document
-                    .objects
-                    .get(id)
+                    .object(*id)
                     .is_some_and(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
             })
         });
@@ -932,7 +1292,7 @@ impl StudioApp {
             };
             let mut pc_states = Vec::new();
             for &id in &tab.selection.objects {
-                if let Some(obj) = tab.document.objects.get(&id) {
+                if let Some(obj) = tab.document.object(id) {
                     if let NodePayload::PowerClip {
                         lock_contents: cur, ..
                     } = &obj.payload
@@ -1022,24 +1382,9 @@ impl StudioApp {
             self.push_toast("Updated default Fill", false);
             return;
         }
-        // Record solid color into Document Palette automatically
-        if let Fill::Solid(ref col) = fill {
-            if let Some(tab) = self.active_tab_mut() {
-                if !tab
-                    .document
-                    .document_palette
-                    .swatches
-                    .iter()
-                    .any(|s| s.color == *col)
-                {
-                    tab.document
-                        .document_palette
-                        .swatches
-                        .push(ColorSwatch::new(col.to_hex(), col.clone()));
-                }
-            }
+        if let Err(e) = self.execute_command(CommandOp::SetFill { ids, fill }) {
+            self.push_toast(e, true);
         }
-        let _ = self.execute_command(CommandOp::SetFill { ids, fill });
     }
 
     /// Applies a solid color fill (`Left-click` on Palette Bar swatch).
@@ -1066,9 +1411,11 @@ impl StudioApp {
             for &id in &ids {
                 let mut outline = tab
                     .document
-                    .objects
-                    .get(&id)
-                    .map(|o| o.outline.clone())
+                    .object(id)
+                    .map(|o| match &o.payload {
+                        NodePayload::Table(tbl) => tbl.border_style.clone(),
+                        _ => o.outline.clone(),
+                    })
                     .unwrap_or_default();
                 outline.color = color.clone();
                 if !outline.is_visible() {
@@ -1080,7 +1427,9 @@ impl StudioApp {
                 });
             }
         }
-        let _ = self.execute_command(CommandOp::Batch(ops));
+        if let Err(e) = self.execute_command(CommandOp::Batch(ops)) {
+            self.push_toast(e, true);
+        }
     }
 
     /// Removes fill (`Fill::None`) from selected objects (Left-click top `X` swatch).
@@ -1103,7 +1452,9 @@ impl StudioApp {
             self.default_outline = outline;
             return;
         }
-        let _ = self.execute_command(CommandOp::SetOutline { ids, outline });
+        if let Err(e) = self.execute_command(CommandOp::SetOutline { ids, outline }) {
+            self.push_toast(e, true);
+        }
     }
 
     /// Applies a [`LensConfig`] (any of the 11 Lenses) to the selected object(s).
@@ -1157,7 +1508,7 @@ impl StudioApp {
             let mut text_obj: Option<(ObjectId, ArtisticText)> = None;
             let mut path_id: Option<ObjectId> = None;
             for &id in &tab.selection.objects {
-                if let Some(obj) = tab.document.objects.get(&id) {
+                if let Some(obj) = tab.document.object(id) {
                     match &obj.payload {
                         NodePayload::ArtisticText(t) if text_obj.is_none() => {
                             text_obj = Some((id, t.clone()));
@@ -1196,6 +1547,9 @@ impl StudioApp {
 
     /// Inserts a fresh [`VectorTable`] on the active page.
     pub fn insert_table(&mut self, rows: usize, cols: usize) {
+        let Some(layer_id) = self.ensure_active_creation_layer() else {
+            return;
+        };
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1212,13 +1566,16 @@ impl StudioApp {
             NodePayload::Table(table),
         )
         .with_transform(Affine2D::translate(center.x, center.y));
-        let _ = self.execute_command(CommandOp::create_object(obj, tab.active_layer_id));
-        self.push_toast(format!("Inserted {rows}x{cols} table"), false);
+        match self.execute_command(CommandOp::create_object(obj, layer_id)) {
+            Ok(()) => self.push_toast(format!("Inserted {rows}x{cols} table"), false),
+            Err(e) => self.push_toast(e, true),
+        }
     }
 
     /// Double-click Rectangle tool -> Page Frame; Shift+Double-click -> tight frame around selection.
     pub fn create_page_frame_rectangle(&mut self, around_selection: bool) -> Option<ObjectId> {
-        let (target_rect, layer_id, outline, is_sel_frame) = {
+        let layer_id = self.ensure_active_creation_layer()?;
+        let (target_rect, outline, is_sel_frame) = {
             let tab = self.active_tab()?;
             let page = tab.document.active_page()?;
             let page_rect = Rect2D::from_xywh(0.0, 0.0, page.width_mm, page.height_mm);
@@ -1238,7 +1595,7 @@ impl StudioApp {
                     ..self.default_outline.clone()
                 }
             };
-            (rect, tab.active_layer_id, outline, used_sel)
+            (rect, outline, used_sel)
         };
         let label = if is_sel_frame {
             "Selection Frame"
@@ -1259,10 +1616,12 @@ impl StudioApp {
         .with_fill(Fill::None)
         .with_outline(outline)
         .with_transform(Affine2D::translate(target_rect.min_x, target_rect.min_y));
-        self.execute_command(CommandOp::create_object(obj, layer_id))
-            .ok()?;
+        if let Err(e) = self.execute_command(CommandOp::create_object(obj, layer_id)) {
+            self.push_toast(e, true);
+            return None;
+        }
         let created_id = if let Some(tab) = self.active_tab_mut() {
-            let id = tab.document.objects.keys().last().copied();
+            let id = tab.document.objects().keys().last().copied();
             if let Some(oid) = id {
                 tab.selection.select_single(&tab.document, oid);
             }
@@ -1288,7 +1647,9 @@ impl StudioApp {
         let Some(tab) = self.active_tab_mut() else {
             return false;
         };
-        let first_child = match tab.document.objects.get(&pc_id).map(|o| &o.payload) {
+        tab.cancel_active_drag();
+        let _ = tab.tool_core.cancel_all();
+        let first_child = match tab.document.object(pc_id).map(|o| &o.payload) {
             Some(NodePayload::PowerClip { contents, .. }) => contents
                 .iter()
                 .rev()
@@ -1316,8 +1677,10 @@ impl StudioApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
+        tab.cancel_active_drag();
+        let _ = tab.tool_core.cancel_all();
         if let Some(pc_id) = tab.powerclip_edit_id.take() {
-            if tab.document.objects.contains_key(&pc_id) {
+            if tab.document.has_object(pc_id) {
                 tab.selection.select_single(&tab.document, pc_id);
             } else {
                 tab.selection.clear();

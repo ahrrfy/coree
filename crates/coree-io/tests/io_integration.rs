@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! End-to-end integration tests for `coree-io`.
 
@@ -25,9 +26,9 @@ use zip::{CompressionMethod, ZipWriter};
 
 fn build_all_features_document() -> Document {
     let mut doc = Document::new_a4("Coree Full Integration Spec");
-    doc.metadata.author = "coree QA".to_owned();
+    doc.metadata_mut().author = "coree QA".to_owned();
 
-    let page1_id = doc.pages[0].id;
+    let page1_id = doc.pages()[0].id;
     let master_layer = doc
         .add_layer(page1_id, "Master Header", false, MasterLayerScope::AllPages)
         .unwrap();
@@ -37,7 +38,7 @@ fn build_all_features_document() -> Document {
 
     // Add second page to verify multipage & master layers
     let page2_id = doc.add_page("Page 2", 210.0, 297.0, 3.0);
-    let page2_layer = doc.pages.iter().find(|p| p.id == page2_id).unwrap().layers[0].id;
+    let page2_layer = doc.page_by_id(page2_id).unwrap().layers[0].id;
 
     // Externalized raster asset
     let asset =
@@ -57,7 +58,7 @@ fn build_all_features_document() -> Document {
         .with_fill(Fill::Solid(Color::YELLOW))],
     );
     let sym_id = sym.id;
-    doc.symbols.insert(sym_id, sym);
+    doc.insert_symbol(sym);
 
     // Create 11 objects carrying ALL 11 Lenses!
     let all_lenses = [
@@ -296,7 +297,7 @@ fn build_all_features_document() -> Document {
         .unwrap();
 
     doc.add_guide(GuideOrientation::Vertical(105.0), true);
-    doc.unknown_doc_chunks.push(UnknownCdrChunk {
+    doc.push_unknown_doc_chunk(UnknownCdrChunk {
         fourcc: *b"vrsn",
         version_hint: 2400,
         raw_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -412,7 +413,7 @@ fn svg_pdf_eps_dxf_plt_all_export_valid_industry_files_from_complex_document() {
     assert!(svg_content.contains("direction=\"rtl\""));
     assert!(svg_content.contains("<clipPath"));
     let reimported = import_svg(&svg_path).unwrap();
-    assert!(!reimported.objects.is_empty());
+    assert!(!reimported.objects().is_empty());
 
     // Verify SVG depth bomb rejection
     let deep_svg = format!(
@@ -625,7 +626,7 @@ fn raster_and_palette_roundtrip_integration() {
     let spath = dir.path().join("stroke.svg");
     export_svg(&sdoc, 0, &spath).unwrap();
     let sback = import_svg(&spath).unwrap();
-    let obj = sback.objects.values().next().unwrap();
+    let obj = sback.objects().values().next().unwrap();
     assert_eq!(obj.outline.cap, LineCap::Square);
     assert_eq!(obj.outline.join, LineJoin::Round);
     assert_eq!(obj.outline.dash_pattern.len(), 2);
@@ -638,10 +639,10 @@ fn regression_1_coree_png_amplification_duplicate_asset_path_and_forged_compress
         format_version: coree_io::COREE_FORMAT_VERSION,
         app: "coree".into(),
         app_version: "0.1.0".into(),
-        document_id: doc.id,
-        title: doc.title.clone(),
-        created_at: doc.metadata.created_at,
-        modified_at: doc.metadata.modified_at,
+        document_id: doc.id(),
+        title: doc.title().to_owned(),
+        created_at: doc.metadata().created_at,
+        modified_at: doc.metadata().modified_at,
         page_count: 1,
         asset_count: 1,
         has_preview: false,
@@ -825,7 +826,7 @@ fn regression_2_svgz_ratio_bomb_text_no_double_scaling_cut_layer_and_grouped_wor
     let imported = coree_io::import_svg_str(px_svg).unwrap();
 
     // 2c. Cut-layer detection must NOT false-positive on "Woodcut" and MUST honor data-cut-layer="true"
-    let wood_layer = imported.pages[0]
+    let wood_layer = imported.pages()[0]
         .layers
         .iter()
         .find(|l| l.name == "Woodcut")
@@ -834,7 +835,7 @@ fn regression_2_svgz_ratio_bomb_text_no_double_scaling_cut_layer_and_grouped_wor
         !wood_layer.is_cut_layer,
         "Woodcut must not be falsely tagged as cut layer"
     );
-    let laser_layer = imported.pages[0]
+    let laser_layer = imported.pages()[0]
         .layers
         .iter()
         .find(|l| l.name == "LaserPath")
@@ -846,7 +847,7 @@ fn regression_2_svgz_ratio_bomb_text_no_double_scaling_cut_layer_and_grouped_wor
 
     // Verify imported <text> is 12pt (~4.233mm) with unit transform scale (not scale^2)
     let text_obj = imported
-        .objects
+        .objects()
         .values()
         .find(|o| matches!(o.payload, NodePayload::ArtisticText(_)))
         .expect("imported text object");
@@ -916,7 +917,8 @@ fn regression_2_svgz_ratio_bomb_text_no_double_scaling_cut_layer_and_grouped_wor
         )
         .unwrap();
     let grp_id = doc.group_objects(&[conn_id, top_id], "Shifted").unwrap();
-    doc.objects.get_mut(&grp_id).unwrap().transform = Affine2D::translate(50.0, 0.0);
+    doc.set_object_transform(grp_id, Affine2D::translate(50.0, 0.0))
+        .unwrap();
 
     let svg = coree_io::export_svg_to_string(&doc, 0).unwrap();
     // Inside `<g transform="matrix(1 0 0 1 50 0)">`, world x=50..90 must be emitted in local coords x=0..40!
@@ -1126,41 +1128,53 @@ fn all_four_new_importers_roundtrip_end_to_end_via_files() {
 
     let imported_pdf = coree_io::import_pdf(&pdf_path).unwrap();
     let imported_ai = coree_io::import_pdf(&ai_path).unwrap();
-    assert_eq!(imported_pdf.pages.len(), doc.pages.len());
-    assert_eq!(imported_ai.pages.len(), doc.pages.len());
-    assert!(!imported_pdf.objects.is_empty());
-    assert!(!imported_pdf.assets.is_empty());
-    assert_eq!(imported_pdf.metadata.source_format.as_deref(), Some("pdf"));
+    assert_eq!(imported_pdf.pages().len(), doc.pages().len());
+    assert_eq!(imported_ai.pages().len(), doc.pages().len());
+    assert!(!imported_pdf.objects().is_empty());
+    assert!(!imported_pdf.assets().is_empty());
+    assert_eq!(
+        imported_pdf.metadata().source_format.as_deref(),
+        Some("pdf")
+    );
 
     // 2. EPS file round-trip
     let eps_path = dir.path().join("page1.eps");
     export_eps(&doc, 0, &eps_path).unwrap();
     let imported_eps = coree_io::import_eps(&eps_path).unwrap();
-    assert_eq!(imported_eps.pages.len(), 1);
-    assert!((imported_eps.pages[0].width_mm - 210.0).abs() < 0.2);
-    assert!((imported_eps.pages[0].height_mm - 297.0).abs() < 0.2);
-    assert!(!imported_eps.objects.is_empty());
-    assert_eq!(imported_eps.metadata.source_format.as_deref(), Some("eps"));
+    assert_eq!(imported_eps.pages().len(), 1);
+    assert!((imported_eps.pages()[0].width_mm - 210.0).abs() < 0.2);
+    assert!((imported_eps.pages()[0].height_mm - 297.0).abs() < 0.2);
+    assert!(!imported_eps.objects().is_empty());
+    assert_eq!(
+        imported_eps.metadata().source_format.as_deref(),
+        Some("eps")
+    );
 
     // 3. DXF file round-trip
     let dxf_path = dir.path().join("cut.dxf");
     export_dxf(&doc, 0, &dxf_path).unwrap();
     let imported_dxf = coree_io::import_dxf(&dxf_path).unwrap();
-    assert_eq!(imported_dxf.pages.len(), 1);
-    assert!(imported_dxf.pages[0]
+    assert_eq!(imported_dxf.pages().len(), 1);
+    assert!(imported_dxf.pages()[0]
         .layers
         .iter()
         .any(|l| l.name.eq_ignore_ascii_case("CutContour") && l.is_cut_layer));
-    assert!(!imported_dxf.objects.is_empty());
-    assert_eq!(imported_dxf.metadata.source_format.as_deref(), Some("dxf"));
+    assert!(!imported_dxf.objects().is_empty());
+    assert_eq!(
+        imported_dxf.metadata().source_format.as_deref(),
+        Some("dxf")
+    );
 
     // 4. HPGL `.plt` file round-trip
     let plt_path = dir.path().join("cut.plt");
     export_plt(&doc, 0, &plt_path).unwrap();
     let imported_plt = coree_io::import_plt(&plt_path).unwrap();
-    assert_eq!(imported_plt.pages.len(), 1);
-    assert!(!imported_plt.objects.is_empty());
-    assert_eq!(imported_plt.metadata.source_format.as_deref(), Some("plt"));
+    assert_eq!(imported_plt.pages().len(), 1);
+    assert!(!imported_plt.objects().is_empty());
+    assert_eq!(
+        imported_plt.metadata().source_format.as_deref(),
+        Some("plt")
+    );
 
     // 5. Minimal valid PSD file import via disk path
     let psd_path = dir.path().join("flat.psd");
@@ -1183,9 +1197,12 @@ fn all_four_new_importers_roundtrip_end_to_end_via_files() {
     std::fs::write(&psd_path, &psd).unwrap();
 
     let imported_psd = coree_io::import_psd(&psd_path).unwrap();
-    assert_eq!(imported_psd.pages.len(), 1);
-    assert_eq!(imported_psd.assets.len(), 1);
-    assert_eq!(imported_psd.metadata.source_format.as_deref(), Some("psd"));
+    assert_eq!(imported_psd.pages().len(), 1);
+    assert_eq!(imported_psd.assets().len(), 1);
+    assert_eq!(
+        imported_psd.metadata().source_format.as_deref(),
+        Some("psd")
+    );
 }
 
 #[test]
@@ -1195,16 +1212,16 @@ fn optional_external_real_file_smoke_check() {
         let t0 = std::time::Instant::now();
         let doc = coree_io::import_pdf(p).expect("real PDF must import cleanly");
         let elapsed = t0.elapsed();
-        assert!(!doc.pages.is_empty());
-        assert!(!doc.objects.is_empty());
+        assert!(!doc.pages().is_empty());
+        assert!(!doc.objects().is_empty());
         eprintln!(
             "[VERIFY PDF] pages={} objects={} assets={} page0={:.2}x{:.2}mm mode={:?} elapsed={:.2?}",
-            doc.pages.len(),
-            doc.objects.len(),
-            doc.assets.len(),
-            doc.pages[0].width_mm,
-            doc.pages[0].height_mm,
-            doc.color_mode,
+            doc.pages().len(),
+            doc.object_count(),
+            doc.assets().len(),
+            doc.pages()[0].width_mm,
+            doc.pages()[0].height_mm,
+            doc.color_mode(),
             elapsed
         );
     }
@@ -1213,18 +1230,18 @@ fn optional_external_real_file_smoke_check() {
         let t0 = std::time::Instant::now();
         let doc = coree_io::import_psd(p).expect("real PSD must import cleanly");
         let elapsed = t0.elapsed();
-        assert_eq!(doc.pages.len(), 1);
-        assert!(!doc.objects.is_empty());
-        assert!(!doc.assets.is_empty());
-        let total_rgba: usize = doc.assets.values().map(|a| a.rgba_bytes.len()).sum();
+        assert_eq!(doc.pages().len(), 1);
+        assert!(!doc.objects().is_empty());
+        assert!(!doc.assets().is_empty());
+        let total_rgba: usize = doc.assets().values().map(|a| a.rgba_bytes.len()).sum();
         eprintln!(
             "[VERIFY PSD] layers={} objects={} assets={} page={:.2}x{:.2}mm dpi={:.1} total_rgba={:.1}MiB elapsed={:.2?}",
-            doc.pages[0].layers.len(),
-            doc.objects.len(),
-            doc.assets.len(),
-            doc.pages[0].width_mm,
-            doc.pages[0].height_mm,
-            doc.dpi,
+            doc.pages()[0].layers.len(),
+            doc.object_count(),
+            doc.assets().len(),
+            doc.pages()[0].width_mm,
+            doc.pages()[0].height_mm,
+            doc.dpi(),
             (total_rgba as f64) / (1024.0 * 1024.0),
             elapsed
         );

@@ -78,9 +78,9 @@ pub fn export_dxf_to_string_with_options(
     page_index: usize,
     opts: &DxfExportOptions,
 ) -> IoResult<String> {
-    let page = doc.pages.get(page_index).ok_or(IoError::PageOutOfRange {
+    let page = doc.page(page_index).ok_or(IoError::PageOutOfRange {
         page_index,
-        page_count: doc.pages.len(),
+        page_count: doc.pages().len(),
     })?;
 
     let layers = collect_page_layers(doc, page_index, opts.cut_layers_only);
@@ -146,7 +146,7 @@ pub fn export_dxf_to_string_with_options(
         let layer_name = sanitize_dxf_layer_name(&layer.name);
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
-            if let Some(obj) = doc.objects.get(&oid) {
+            if let Some(obj) = doc.object(oid) {
                 emit_dxf_object_entities(
                     doc,
                     page,
@@ -260,7 +260,7 @@ fn emit_dxf_object_entities(
         }
         NodePayload::Group(children) => {
             for &cid in children {
-                if let Some(child) = doc.objects.get(&cid) {
+                if let Some(child) = doc.object(cid) {
                     emit_dxf_object_entities(
                         doc,
                         page,
@@ -276,7 +276,7 @@ fn emit_dxf_object_entities(
             }
         }
         NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
+            if let Some(sym) = doc.symbol(*sym_id) {
                 for sub in &sym.objects {
                     let mut sym_visited = HashSet::new();
                     emit_dxf_object_entities(
@@ -576,9 +576,9 @@ pub fn export_plt_to_string_with_options(
     page_index: usize,
     opts: &PltExportOptions,
 ) -> IoResult<String> {
-    let page = doc.pages.get(page_index).ok_or(IoError::PageOutOfRange {
+    let page = doc.page(page_index).ok_or(IoError::PageOutOfRange {
         page_index,
-        page_count: doc.pages.len(),
+        page_count: doc.pages().len(),
     })?;
 
     let layers = collect_page_layers(doc, page_index, opts.cut_layers_only);
@@ -591,7 +591,7 @@ pub fn export_plt_to_string_with_options(
         let mut paths = Vec::new();
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
-            if let Some(obj) = doc.objects.get(&oid) {
+            if let Some(obj) = doc.object(oid) {
                 collect_vector_paths(doc, obj, Affine2D::IDENTITY, &mut paths, 0, &mut visited);
             }
         }
@@ -652,7 +652,7 @@ pub fn export_plt_with_options(
 fn collect_page_layers(doc: &Document, page_index: usize, cut_layers_only: bool) -> Vec<&Layer> {
     let mut layers = Vec::new();
     // Emit applicable master layers from OTHER pages first (bottom), then target page's own layers.
-    for (p_idx, p) in doc.pages.iter().enumerate() {
+    for (p_idx, p) in doc.pages().iter().enumerate() {
         if p_idx == page_index {
             continue;
         }
@@ -671,7 +671,7 @@ fn collect_page_layers(doc: &Document, page_index: usize, cut_layers_only: bool)
             }
         }
     }
-    if let Some(page) = doc.pages.get(page_index) {
+    if let Some(page) = doc.page(page_index) {
         for layer in &page.layers {
             if layer.visible && (!cut_layers_only || layer.is_cut_layer) {
                 layers.push(layer);
@@ -708,13 +708,13 @@ fn collect_vector_paths(
         NodePayload::PowerClip { container, .. } => out.push(container.transformed(&world_xf)),
         NodePayload::Group(children) => {
             for &cid in children {
-                if let Some(child) = doc.objects.get(&cid) {
+                if let Some(child) = doc.object(cid) {
                     collect_vector_paths(doc, child, world_xf, out, depth + 1, visited);
                 }
             }
         }
         NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = doc.symbols.get(sym_id) {
+            if let Some(sym) = doc.symbol(*sym_id) {
                 for sub in &sym.objects {
                     let mut sym_visited = HashSet::new();
                     collect_vector_paths(doc, sub, world_xf, out, depth + 1, &mut sym_visited);
@@ -957,9 +957,9 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         title
     };
     let mut doc = Document::new(clean_title, page_w, page_h, ColorMode::Rgb, 300.0);
-    doc.metadata.source_format = Some("dxf".to_owned());
-    let page_id = doc.pages[0].id;
-    let default_layer_id = doc.pages[0].layers[0].id;
+    doc.metadata_mut().source_format = Some("dxf".to_owned());
+    let page_id = doc.pages()[0].id;
+    let default_layer_id = doc.pages()[0].layers[0].id;
 
     // Create document layers in table order (plus any entity-referenced layers not in TABLES).
     let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
@@ -1047,13 +1047,13 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     }
 
     // Remove unused empty placeholder "Layer 1" when DXF layers were created.
-    if !layer_ids.is_empty() && doc.pages[0].layers.len() > 1 {
-        if let Some(pos) = doc.pages[0]
+    if !layer_ids.is_empty() && doc.pages()[0].layers.len() > 1 {
+        if let Some(pos) = doc.pages()[0]
             .layers
             .iter()
             .position(|l| l.id == default_layer_id && l.objects.is_empty())
         {
-            doc.pages[0].layers.remove(pos);
+            doc.remove_page_layer(0, pos);
         }
     }
 
@@ -2422,9 +2422,9 @@ pub fn import_plt_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         title
     };
     let mut doc = Document::new(clean_title, page_w, page_h, ColorMode::Rgb, 300.0);
-    doc.metadata.source_format = Some("plt".to_owned());
-    let page_id = doc.pages[0].id;
-    let default_layer_id = doc.pages[0].layers[0].id;
+    doc.metadata_mut().source_format = Some("plt".to_owned());
+    let page_id = doc.pages()[0].id;
+    let default_layer_id = doc.pages()[0].layers[0].id;
     let cut_layer_id = doc.add_layer(page_id, "CutContour", true, MasterLayerScope::None)?;
 
     for (idx, stroke) in state.strokes.into_iter().enumerate() {
@@ -2482,14 +2482,14 @@ pub fn import_plt_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
 
     // Prune unused empty layer so single-pen files cleanly show `CutContour`
     // and Pen 2+ files cleanly show `Layer 1` (while multi-pen files preserve both!).
-    if doc.pages[0].layers.len() > 1 {
-        let non_empty_count = doc.pages[0]
+    if doc.pages()[0].layers.len() > 1 {
+        let non_empty_count = doc.pages()[0]
             .layers
             .iter()
             .filter(|l| !l.objects.is_empty())
             .count();
         if non_empty_count > 0 {
-            doc.pages[0].layers.retain(|l| !l.objects.is_empty());
+            doc.retain_page_layers(0, |l| !l.objects.is_empty());
         }
     }
 
@@ -2921,7 +2921,7 @@ mod tests {
     #[test]
     fn dxf_export_contains_header_tables_cutcontour_lwpolyline_spline_line_and_eof() {
         let mut doc = Document::new("CNC Panel", 100.0, 50.0, coree_core::ColorMode::Cmyk, 300.0);
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let cut_layer = doc
             .add_layer(page_id, "CutContour", true, MasterLayerScope::None)
             .unwrap();
@@ -3014,7 +3014,7 @@ mod tests {
     #[test]
     fn dxf_roundtrip_export_then_import_preserves_layers_and_geometry() {
         let mut doc = Document::new("Laser Jig", 120.0, 60.0, ColorMode::Cmyk, 300.0);
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let cut_layer = doc
             .add_layer(page_id, "CutContour", true, MasterLayerScope::None)
             .unwrap();
@@ -3052,10 +3052,10 @@ mod tests {
         let dxf = export_dxf_to_string(&doc, 0).unwrap();
         let imported = import_dxf_bytes(dxf.as_bytes(), "Laser Jig").unwrap();
 
-        assert!((imported.pages[0].width_mm - 120.0).abs() < 0.05);
-        assert!((imported.pages[0].height_mm - 60.0).abs() < 0.05);
+        assert!((imported.pages()[0].width_mm - 120.0).abs() < 0.05);
+        assert!((imported.pages()[0].height_mm - 60.0).abs() < 0.05);
 
-        let cut = imported.pages[0]
+        let cut = imported.pages()[0]
             .layers
             .iter()
             .find(|l| l.name.eq_ignore_ascii_case("CutContour"))
@@ -3098,9 +3098,9 @@ mod tests {
 
         let doc = import_dxf_bytes(dxf.as_bytes(), "Inch Bracket").unwrap();
         // 6 entities (self-recursive INSERT inside BoltHole must terminate safely without duplicating!)
-        assert_eq!(doc.objects.len(), 6);
+        assert_eq!(doc.object_count(), 6);
 
-        let cut = doc.pages[0]
+        let cut = doc.pages()[0]
             .layers
             .iter()
             .find(|l| l.name == "CutContour")
@@ -3114,7 +3114,7 @@ mod tests {
         assert!((circle_bb.width() - 25.4).abs() < 0.2);
 
         let text = doc
-            .objects
+            .objects()
             .values()
             .find_map(|o| match &o.payload {
                 NodePayload::ArtisticText(t) => Some(t.plain_text()),
@@ -3141,8 +3141,8 @@ mod tests {
 
         let plt = export_plt_to_string(&doc, 0).unwrap();
         let imported = import_plt_bytes(plt.as_bytes(), "Sticker Sheet").unwrap();
-        assert_eq!(imported.objects.len(), 1);
-        let (&oid, _) = imported.objects.iter().next().unwrap();
+        assert_eq!(imported.object_count(), 1);
+        let (&oid, _) = imported.objects().iter().next().unwrap();
         let bb = imported.object_bounds(oid).unwrap();
         assert!((bb.width() - 40.0).abs() < 0.1);
         assert!((bb.height() - 20.0).abs() < 0.1);
@@ -3151,9 +3151,9 @@ mod tests {
         let rich_plt =
             "IN;SP1;PU400,400;CI400;EA1200,800;SP2;PW0.5,2;PU1600,400;PD;PR400,0;AA1600,400,90;PU;LBPLOT\x03;SP0;";
         let rich = import_plt_bytes(rich_plt.as_bytes(), "Rich HPGL").unwrap();
-        assert_eq!(rich.pages[0].layers.len(), 2); // CutContour (Pen 1) + Layer 1 (Pen 2)
-        assert!(rich.pages[0].layers.iter().any(|l| l.is_cut_layer));
-        assert!(rich.objects.values().any(|o| matches!(
+        assert_eq!(rich.pages()[0].layers.len(), 2); // CutContour (Pen 1) + Layer 1 (Pen 2)
+        assert!(rich.pages()[0].layers.iter().any(|l| l.is_cut_layer));
+        assert!(rich.objects().values().any(|o| matches!(
             &o.payload,
             NodePayload::ArtisticText(t) if t.plain_text() == "PLOT"
         )));
@@ -3164,14 +3164,14 @@ mod tests {
         // 1. HPGL DT/LB with multi-byte UTF-8 terminator & Arabic label must NEVER panic!
         let utf8_plt = "IN;SP1;PU400,400;DT\u{060C};LBمرحبا\u{060C};SP0;";
         let plt_doc = import_plt_bytes(utf8_plt.as_bytes(), "Utf8Plt").unwrap();
-        assert!(plt_doc.objects.values().any(|o| matches!(
+        assert!(plt_doc.objects().values().any(|o| matches!(
             &o.payload,
             NodePayload::ArtisticText(t) if t.plain_text() == "مرحبا"
         )));
         // Also test multi-byte char directly after DT without `;`
         let tricky_plt = "IN;SP1;PU0,0;DTéLBcafééSP0;";
         let tricky_doc = import_plt_bytes(tricky_plt.as_bytes(), "Utf8Dt").unwrap();
-        assert!(tricky_doc.objects.values().any(|o| matches!(
+        assert!(tricky_doc.objects().values().any(|o| matches!(
             &o.payload,
             NodePayload::ArtisticText(t) if t.plain_text() == "caf"
         )));
@@ -3188,8 +3188,8 @@ mod tests {
 0\nELLIPSE\n8\nMinAci\n10\n0\n20\n0\n11\n10\n21\n0\n40\n0.5\n41\ninf\n42\n0\n\
 0\nENDSEC\n0\nEOF\n";
         let ext_doc = import_dxf_bytes(extreme_dxf.as_bytes(), "ExtremeDxf").unwrap();
-        assert_eq!(ext_doc.pages.len(), 1);
-        assert_eq!(ext_doc.objects.len(), 4);
+        assert_eq!(ext_doc.pages().len(), 1);
+        assert_eq!(ext_doc.object_count(), 4);
 
         // 3. Exponential DXF Block DAG ("Billion Laughs": 22 levels * 2x = 4M entities) -> LimitExceeded!
         let mut dag = String::from("0\nSECTION\n2\nBLOCKS\n");
@@ -3252,9 +3252,9 @@ mod tests {
         assert!(dxf.contains("0\nARC\n"));
 
         let imported = import_dxf_bytes(dxf.as_bytes(), "Roundtrip").unwrap();
-        assert_eq!(imported.objects.len(), 2);
+        assert_eq!(imported.object_count(), 2);
         let hole_bb = imported
-            .objects
+            .objects()
             .values()
             .filter_map(|o| imported.object_bounds(o.id))
             .find(|b| (b.width() - 30.0).abs() < 0.2 && (b.height() - 30.0).abs() < 0.2);

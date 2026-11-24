@@ -263,9 +263,7 @@ pub fn add_qr_code_to_document(
     children.push(doc.add_object(modules_obj, layer_id)?);
 
     let group_id = doc.group_objects(&children, format!("Barcode:QR:{data}"))?;
-    if let Some(grp) = doc.objects.get_mut(&group_id) {
-        grp.transform = Affine2D::translate(origin.x, origin.y);
-    }
+    let _ = doc.set_object_transform(group_id, Affine2D::translate(origin.x, origin.y));
     Ok(group_id)
 }
 
@@ -555,9 +553,7 @@ pub fn add_barcode_to_document(
         &children,
         format!("Barcode:{symbology:?}:{}", out.encoded_text),
     )?;
-    if let Some(grp) = doc.objects.get_mut(&group_id) {
-        grp.transform = Affine2D::translate(origin.x, origin.y);
-    }
+    let _ = doc.set_object_transform(group_id, Affine2D::translate(origin.x, origin.y));
     Ok(group_id)
 }
 
@@ -1086,7 +1082,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(doc.objects[&id].name.contains("4006381333931"));
+        assert!(doc.objects()[&id].name.contains("4006381333931"));
         assert!(doc.object_bounds(id).unwrap().width() > 30.0);
     }
 }

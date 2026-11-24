@@ -9,7 +9,7 @@ use crate::backend::{validate_surface_dimensions, CanvasBackend, TinySkiaBackend
 use crate::error::{RenderError, RenderResult};
 use crate::renderer::{RenderOptions, SceneRenderer};
 use crate::viewport::{ViewMode, Viewport};
-use coree_core::math::{sanitize_f32, MM_PER_INCH};
+use coree_core::math::{sanitize_f32, sanitize_f64, MM_PER_INCH};
 use coree_core::{Color, Document, ObjectId, Point2D, RasterAsset, RasterFilter, Rect2D};
 use image::{imageops::FilterType, RgbaImage};
 use rayon::prelude::*;
@@ -1319,22 +1319,24 @@ pub fn resample(asset: &RasterAsset, new_w: u32, new_h: u32) -> RenderResult<Ras
     Ok(out)
 }
 
-/// Rasterizes a single scene object (with its full fills, outlines, effects, and text) into a [`RasterAsset`] at `dpi`.
-pub fn convert_object_to_bitmap(
+fn convert_object_to_bitmap_with_bounds_inner(
     doc: &Document,
     obj_id: ObjectId,
-    dpi: f32,
-) -> RenderResult<RasterAsset> {
-    if !doc.objects.contains_key(&obj_id) {
-        return Err(RenderError::InvalidParameter(format!(
-            "object {obj_id} not found"
-        )));
-    }
-    let safe_dpi = sanitize_f32(dpi, 300.0).clamp(1.0, 2400.0);
-    let bounds = doc.object_bounds(obj_id).ok_or_else(|| {
-        RenderError::InvalidParameter(format!("object {obj_id} has empty or non-finite bounds"))
-    })?;
-    // Pad slightly for strokes/shadows
+    dpi: f64,
+) -> RenderResult<(RasterAsset, Rect2D)> {
+    let _obj = doc
+        .object(obj_id)
+        .ok_or_else(|| RenderError::InvalidParameter(format!("object {obj_id} not found")))?;
+    let safe_dpi = sanitize_f64(dpi, 300.0).clamp(1.0, 2400.0) as f32;
+    let bounds = doc
+        .visual_world_bounds(obj_id)
+        .or_else(|| doc.world_object_bounds(obj_id))
+        .ok_or_else(|| {
+            RenderError::InvalidParameter(format!("object {obj_id} has empty or non-finite bounds"))
+        })?;
+    // `visual_world_bounds` already covers nested Group/SymbolInstance children, Symmetry,
+    // Blend, Extrude25D, Envelope/Perspective, effect overhangs, and spatial padding.
+    // Expand by 4.0 mm anti-aliasing / miter bleed margin.
     let padded = bounds.expand(4.0);
     let px_per_mm = f64::from(safe_dpi) / MM_PER_INCH;
     let width = (padded.width() * px_per_mm).ceil().max(1.0) as u32;
@@ -1347,6 +1349,7 @@ pub fn convert_object_to_bitmap(
 
     let mut renderer = SceneRenderer::new();
     let mut opts = RenderOptions::export();
+    opts.canvas_bg = Color::TRANSPARENT;
     opts.page_bg = Color::TRANSPARENT;
     renderer.render_single_object(
         doc,
@@ -1358,8 +1361,28 @@ pub fn convert_object_to_bitmap(
     );
 
     let rgba_buf = backend.into_rgba();
-    let asset = RasterAsset::new(width, height, rgba_buf.rgba, safe_dpi, doc.color_mode)?;
-    Ok(asset)
+    let asset = RasterAsset::new(width, height, rgba_buf.rgba, safe_dpi, doc.color_mode())?;
+    Ok((asset, padded))
+}
+
+/// Rasterizes a single scene object (with its full fills, outlines, effects, and text) into a
+/// [`RasterAsset`] at `dpi`, returning both the raster asset and the exact padded world-space
+/// [`Rect2D`] covered by its pixels.
+pub fn convert_object_to_bitmap_with_bounds(
+    doc: &Document,
+    obj_id: ObjectId,
+    dpi: f64,
+) -> Result<(RasterAsset, Rect2D), String> {
+    convert_object_to_bitmap_with_bounds_inner(doc, obj_id, dpi).map_err(|e| e.to_string())
+}
+
+/// Rasterizes a single scene object (with its full fills, outlines, effects, and text) into a [`RasterAsset`] at `dpi`.
+pub fn convert_object_to_bitmap(
+    doc: &Document,
+    obj_id: ObjectId,
+    dpi: f32,
+) -> RenderResult<RasterAsset> {
+    convert_object_to_bitmap_with_bounds_inner(doc, obj_id, f64::from(dpi)).map(|(asset, _)| asset)
 }
 
 /// Fast separable Gaussian blur on a straight RGBA8 buffer (also shared by DropShadow!).

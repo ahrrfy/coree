@@ -7,7 +7,7 @@
 //! with automatic coordinate-range clamping so degenerate or extreme inputs never panic.
 
 use crate::error::{CoreError, CoreResult};
-use crate::geometry::{BezierPath, Subpath};
+use crate::geometry::{fit_cubic_bezier_subpath, BezierPath};
 use crate::math::{sanitize_f64, Point2D};
 use crate::style::{LineCap, LineJoin, OutlineStyle};
 use i_overlay::core::fill_rule::FillRule;
@@ -256,10 +256,11 @@ pub fn offset_polygon(path: &BezierPath, delta_mm: f64) -> CoreResult<BezierPath
     for shape in shapes {
         for contour in shape {
             if contour.len() >= 3 {
-                subpaths.push(Subpath::from_points(
-                    contour.into_iter().map(|[x, y]| Point2D::new(x, y)),
-                    true,
-                ));
+                let pts: Vec<Point2D> = contour
+                    .into_iter()
+                    .map(|[x, y]| Point2D::new(x, y))
+                    .collect();
+                subpaths.push(fit_cubic_bezier_subpath(&pts, true, 0.025));
             }
         }
     }
@@ -330,10 +331,11 @@ pub fn stroke_to_closed_path(
             for shape in shapes {
                 for contour in shape {
                     if contour.len() >= 3 {
-                        subpaths.push(Subpath::from_points(
-                            contour.into_iter().map(|[x, y]| Point2D::new(x, y)),
-                            true,
-                        ));
+                        let pts: Vec<Point2D> = contour
+                            .into_iter()
+                            .map(|[x, y]| Point2D::new(x, y))
+                            .collect();
+                        subpaths.push(fit_cubic_bezier_subpath(&pts, true, 0.025));
                     }
                 }
             }
@@ -445,10 +447,11 @@ fn from_int_shapes(shapes: IntShapes<i64>, inv_scale: f64, outer_only: bool) -> 
             if contour.len() < 3 {
                 continue;
             }
-            let pts = contour
+            let pts: Vec<Point2D> = contour
                 .into_iter()
-                .map(|p| Point2D::new((p.x as f64) * inv_scale, (p.y as f64) * inv_scale));
-            subpaths.push(Subpath::from_points(pts, true));
+                .map(|p| Point2D::new((p.x as f64) * inv_scale, (p.y as f64) * inv_scale))
+                .collect();
+            subpaths.push(fit_cubic_bezier_subpath(&pts, true, 0.025));
         }
     }
     BezierPath { subpaths }
@@ -575,5 +578,59 @@ mod tests {
         let sq = rect_path(0.0, 0.0, 10.0, 10.0);
         let expanded = offset_polygon(&sq, 2.0).unwrap();
         assert!(expanded.area_mm2() > sq.area_mm2());
+    }
+
+    #[test]
+    fn boolean_refits_smooth_cubic_curves_while_keeping_rect_corners_sharp() {
+        use crate::geometry::{EllipseMode, ParametricShape};
+
+        let c1 = ParametricShape::Ellipse {
+            rx: 20.0,
+            ry: 20.0,
+            mode: EllipseMode::Full,
+            start_deg: 0.0,
+            end_deg: 360.0,
+        }
+        .to_bezier_path()
+        .transformed(&crate::math::Affine2D::translate(30.0, 30.0));
+        let c2 = ParametricShape::Ellipse {
+            rx: 20.0,
+            ry: 20.0,
+            mode: EllipseMode::Full,
+            start_deg: 0.0,
+            end_deg: 360.0,
+        }
+        .to_bezier_path()
+        .transformed(&crate::math::Affine2D::translate(50.0, 30.0));
+
+        let welded = apply_boolean(BooleanOp::Weld, &c1, &c2).unwrap();
+        assert_eq!(welded.len(), 1);
+        let nodes = &welded[0].subpaths[0].nodes;
+        assert!(
+            nodes.len() <= 24,
+            "curve re-fit should avoid 100+ polygon node explosion (got {})",
+            nodes.len()
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.handle_in.is_some() || n.handle_out.is_some()),
+            "welded circles should preserve cubic Bezier handles"
+        );
+        let exact_circle_area = std::f64::consts::PI * 400.0;
+        assert!(
+            welded[0].area_mm2() > exact_circle_area
+                && welded[0].area_mm2() < exact_circle_area * 2.0
+        );
+
+        // Rectangular booleans stay sharp linear corners with zero spurious handles
+        let r1 = rect_path(0.0, 0.0, 10.0, 10.0);
+        let r2 = rect_path(5.0, 0.0, 10.0, 10.0);
+        let r_weld = apply_boolean(BooleanOp::Weld, &r1, &r2).unwrap();
+        assert_eq!(r_weld[0].subpaths[0].nodes.len(), 4);
+        assert!(r_weld[0].subpaths[0]
+            .nodes
+            .iter()
+            .all(|n| n.handle_in.is_none() && n.handle_out.is_none()));
     }
 }

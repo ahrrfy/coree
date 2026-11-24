@@ -6,7 +6,7 @@
 use crate::error::{ProdError, ProdResult};
 use coree_core::{
     Affine2D, BezierPath, Document, Layer, LayerId, MasterLayerScope, NodePayload, ObjectId, Page,
-    PageId, Rect2D, SceneObject,
+    PageId, Rect2D, SceneObject, SymbolId,
 };
 use kurbo::PathEl;
 use std::collections::{HashMap, HashSet};
@@ -16,9 +16,9 @@ pub(crate) const MAX_SCENE_DEPTH: usize = 64;
 
 /// Ensures `page_index` exists in `doc` and returns a reference to the page.
 pub(crate) fn get_page(doc: &Document, page_index: usize) -> ProdResult<&Page> {
-    doc.pages.get(page_index).ok_or(ProdError::PageOutOfRange {
+    doc.page(page_index).ok_or(ProdError::PageOutOfRange {
         index: page_index,
-        total: doc.pages.len(),
+        total: doc.pages().len(),
     })
 }
 
@@ -45,20 +45,10 @@ pub(crate) fn find_or_create_layer(
 /// Creates a new blank document inheriting metadata/settings/assets/symbols from `src`,
 /// with zero pages initially (caller appends imposed/merged pages).
 pub(crate) fn clone_document_shell(src: &Document, title: impl Into<String>) -> Document {
-    let mut dst = Document::new(title, 210.0, 297.0, src.color_mode, src.dpi);
-    dst.default_unit = src.default_unit;
-    dst.pages.clear();
-    dst.active_page_index = 0;
-    dst.multipage_view = src.multipage_view;
-    dst.assets = src.assets.clone();
-    dst.palettes = src.palettes.clone();
-    dst.document_palette = src.document_palette.clone();
-    dst.color_styles = src.color_styles.clone();
-    dst.object_styles = src.object_styles.clone();
-    dst.symbols = src.symbols.clone();
-    dst.grid = src.grid;
-    dst.perspective_grid = src.perspective_grid.clone();
-    dst.metadata = src.metadata.clone();
+    let mut dst = Document::new(title, 210.0, 297.0, src.color_mode(), src.dpi());
+    dst.clone_shell_from(src);
+    dst.clear_pages_for_load();
+    let _ = dst.set_active_page_index(0);
     dst
 }
 
@@ -94,7 +84,7 @@ pub(crate) fn clone_page_contents_into(
 
         for &top_id in &src_layer.objects {
             if let Some(win) = clip_window_src {
-                if let Some(bb) = src_doc.object_bounds(top_id) {
+                if let Some(bb) = src_doc.world_object_bounds(top_id) {
                     if !bb.intersects(win) {
                         continue;
                     }
@@ -119,12 +109,7 @@ pub(crate) fn clone_page_contents_into(
     }
 
     // Pass 2: remap all cross-object references among newly cloned objects
-    let new_ids: Vec<ObjectId> = id_map.values().copied().collect();
-    for new_id in new_ids {
-        if let Some(obj) = dst_doc.objects.get_mut(&new_id) {
-            remap_object_references(obj, &id_map);
-        }
-    }
+    dst_doc.remap_object_references(&id_map);
 
     // Attach top-level clones to destination layers
     for (dst_layer_id, obj_ids) in layer_placements {
@@ -134,7 +119,7 @@ pub(crate) fn clone_page_contents_into(
     }
 
     // Remove empty default "Layer 1" if source page did not have one and other layers were created
-    if let Some(dst_page) = dst_doc.pages.get_mut(dst_page_index) {
+    if let Some(dst_page) = dst_doc.page(dst_page_index) {
         let src_has_layer1 = src_page.layers.iter().any(|l| l.name == "Layer 1");
         if !src_has_layer1 && dst_page.layers.len() > 1 {
             if let Some(pos) = dst_page
@@ -142,7 +127,7 @@ pub(crate) fn clone_page_contents_into(
                 .iter()
                 .position(|l| l.name == "Layer 1" && l.objects.is_empty())
             {
-                dst_page.layers.remove(pos);
+                dst_doc.remove_page_layer(dst_page_index, pos);
             }
         }
     }
@@ -155,7 +140,7 @@ fn ensure_layer_matching(
     dst_page_id: PageId,
     src_layer: &Layer,
 ) -> ProdResult<LayerId> {
-    if let Some(page) = dst_doc.pages.iter().find(|p| p.id == dst_page_id) {
+    if let Some(page) = dst_doc.page_by_id(dst_page_id) {
         if let Some(existing) = page.layers.iter().find(|l| {
             l.name == src_layer.name
                 && l.is_cut_layer == src_layer.is_cut_layer
@@ -195,7 +180,7 @@ fn clone_object_tree(
     if let Some(&existing) = id_map.get(&src_id) {
         return Some(existing);
     }
-    let src_obj = src_doc.objects.get(&src_id)?;
+    let src_obj = src_doc.object(src_id)?;
     let new_id = dst_doc.alloc_object_id();
     id_map.insert(src_id, new_id);
 
@@ -238,69 +223,45 @@ fn clone_object_tree(
         _ => {}
     }
 
-    dst_doc.objects.insert(new_id, cloned);
+    let _ = dst_doc.insert_loaded_object(cloned);
     Some(new_id)
 }
 
-fn remap_object_references(obj: &mut SceneObject, id_map: &HashMap<ObjectId, ObjectId>) {
-    match &mut obj.payload {
-        NodePayload::Group(children) => {
-            *children = children
-                .iter()
-                .filter_map(|old| id_map.get(old).copied())
-                .collect();
-        }
-        NodePayload::PowerClip { contents, .. } => {
-            *contents = contents
-                .iter()
-                .filter_map(|old| id_map.get(old).copied())
-                .collect();
-        }
-        NodePayload::TextOnPath(top) => {
-            if let Some(&mapped) = id_map.get(&top.path_id) {
-                top.path_id = mapped;
-            }
-        }
-        NodePayload::ParagraphText(p) => {
-            if let Some(old_next) = p.linked_next_frame {
-                p.linked_next_frame = id_map.get(&old_next).copied();
-            }
-        }
-        NodePayload::Connector(c) => {
-            if let Some(old_from) = c.from_obj {
-                c.from_obj = id_map.get(&old_from).copied();
-            }
-            if let Some(old_to) = c.to_obj {
-                c.to_obj = id_map.get(&old_to).copied();
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Returns effective layers rendered on `page_index`: applicable master layers from other
-/// pages (bottom) followed by the page's own layers.
+/// Returns effective layers rendered on `page_index`: applicable master/desktop layers from other
+/// pages (bottom) followed by the page's own applicable layers.
 pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec<&Layer> {
     let mut layers = Vec::new();
-    let page_num_1based = page_index + 1;
-    for (idx, page) in doc.pages.iter().enumerate() {
+    let is_odd = page_index.is_multiple_of(2); // 1-based Page 1 = index 0 = Odd
+    for (idx, page) in doc.pages().iter().enumerate() {
         if idx == page_index {
             continue;
         }
         for layer in &page.layers {
-            let applies = match layer.master_scope {
-                MasterLayerScope::None => false,
-                MasterLayerScope::AllPages => true,
-                MasterLayerScope::OddPages => page_num_1based % 2 == 1,
-                MasterLayerScope::EvenPages => page_num_1based.is_multiple_of(2),
-            };
+            let applies = layer.is_desktop_layer
+                || match layer.master_scope {
+                    MasterLayerScope::None => false,
+                    MasterLayerScope::AllPages => true,
+                    MasterLayerScope::OddPages => is_odd,
+                    MasterLayerScope::EvenPages => !is_odd,
+                };
             if applies {
                 layers.push(layer);
             }
         }
     }
-    if let Some(page) = doc.pages.get(page_index) {
-        layers.extend(page.layers.iter());
+    if let Some(page) = doc.page(page_index) {
+        for layer in &page.layers {
+            let applies = layer.is_desktop_layer
+                || match layer.master_scope {
+                    MasterLayerScope::None => true,
+                    MasterLayerScope::AllPages => true,
+                    MasterLayerScope::OddPages => is_odd,
+                    MasterLayerScope::EvenPages => !is_odd,
+                };
+            if applies {
+                layers.push(layer);
+            }
+        }
     }
     layers
 }
@@ -330,7 +291,7 @@ pub(crate) fn visit_object_recursive<F>(
     if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
         return;
     }
-    if let Some(obj) = doc.objects.get(&id) {
+    if let Some(obj) = doc.object(id) {
         let world_xf = parent_xf.compose(&obj.transform);
         visitor(id, obj, world_xf);
         match &obj.payload {
@@ -350,6 +311,50 @@ pub(crate) fn visit_object_recursive<F>(
     visiting.remove(&id);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SymParentRef {
+    Id(ObjectId),
+    RootIndex(usize),
+}
+
+pub(crate) struct SymBoundsCtx<'a> {
+    pub(crate) root_xf: &'a Affine2D,
+    pub(crate) sym_objects: &'a [SceneObject],
+    pub(crate) sym_map: &'a HashMap<ObjectId, &'a SceneObject>,
+    pub(crate) sym_parent_map: &'a HashMap<ObjectId, SymParentRef>,
+}
+
+pub(crate) fn sym_world_transform_of(
+    id: ObjectId,
+    sym_root_xf: &Affine2D,
+    sym_objects: &[SceneObject],
+    sym_map: &HashMap<ObjectId, &SceneObject>,
+    sym_parent_map: &HashMap<ObjectId, SymParentRef>,
+) -> Option<Affine2D> {
+    let mut chain = Vec::new();
+    let mut cur = SymParentRef::Id(id);
+    let mut seen = HashSet::new();
+    while seen.insert(cur) {
+        let obj = match cur {
+            SymParentRef::Id(oid) => sym_map.get(&oid).copied()?,
+            SymParentRef::RootIndex(idx) => sym_objects.get(idx)?,
+        };
+        chain.push(obj.transform);
+        match cur {
+            SymParentRef::Id(oid) => match sym_parent_map.get(&oid).copied() {
+                Some(pid) => cur = pid,
+                None => break,
+            },
+            SymParentRef::RootIndex(_) => break,
+        }
+    }
+    let mut xf = *sym_root_xf;
+    for local in chain.into_iter().rev() {
+        xf = xf.compose(&local);
+    }
+    Some(xf)
+}
+
 /// Computes the world-space axis-aligned bounding box of `obj` given its composed `world_xf`
 /// (unlike [`Document::object_bounds`], this properly incorporates ancestor `Group` / `PowerClip`
 /// transforms when inspecting descendant nodes).
@@ -359,7 +364,53 @@ pub(crate) fn world_bounds_with_xf(
     obj: &SceneObject,
     world_xf: &Affine2D,
 ) -> Option<Rect2D> {
-    if !world_xf.is_finite() {
+    let mut visiting = HashSet::new();
+    let mut visiting_syms = HashSet::new();
+    world_bounds_with_xf_inner(
+        doc,
+        id,
+        obj,
+        world_xf,
+        None,
+        0,
+        &mut visiting,
+        &mut visiting_syms,
+    )
+}
+
+pub(crate) fn world_bounds_with_sym_xf(
+    doc: &Document,
+    id: ObjectId,
+    obj: &SceneObject,
+    world_xf: &Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+) -> Option<Rect2D> {
+    let mut visiting = HashSet::new();
+    let mut visiting_syms = HashSet::new();
+    world_bounds_with_xf_inner(
+        doc,
+        id,
+        obj,
+        world_xf,
+        sym_ctx,
+        0,
+        &mut visiting,
+        &mut visiting_syms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn world_bounds_with_xf_inner(
+    doc: &Document,
+    id: ObjectId,
+    obj: &SceneObject,
+    world_xf: &Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+) -> Option<Rect2D> {
+    if depth > MAX_SCENE_DEPTH || !world_xf.is_finite() {
         return None;
     }
     let bounds = match &obj.payload {
@@ -367,9 +418,49 @@ pub(crate) fn world_bounds_with_xf(
         NodePayload::Shape(s) => s.to_bezier_path().transformed(world_xf).bounding_box(),
         NodePayload::ArtisticText(t) => world_xf.try_transform_rect(t.estimated_bounds()),
         NodePayload::ParagraphText(t) => world_xf.try_transform_rect(t.bounding_box()),
-        NodePayload::TextOnPath(top) => doc
-            .object_bounds(top.path_id)
-            .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds())),
+        NodePayload::TextOnPath(top) => {
+            if let Some(ctx) = sym_ctx {
+                if let Some(path_obj) = ctx.sym_map.get(&top.path_id).copied() {
+                    sym_world_transform_of(
+                        top.path_id,
+                        ctx.root_xf,
+                        ctx.sym_objects,
+                        ctx.sym_map,
+                        ctx.sym_parent_map,
+                    )
+                    .and_then(|p_xf| match &path_obj.payload {
+                        NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
+                        NodePayload::Shape(s) => {
+                            s.to_bezier_path().transformed(&p_xf).bounding_box()
+                        }
+                        _ => {
+                            if !visiting.insert(top.path_id) {
+                                return None;
+                            }
+                            let r = world_bounds_with_xf_inner(
+                                doc,
+                                top.path_id,
+                                path_obj,
+                                &p_xf,
+                                Some(ctx),
+                                depth + 1,
+                                visiting,
+                                visiting_syms,
+                            );
+                            visiting.remove(&top.path_id);
+                            r
+                        }
+                    })
+                    .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds()))
+                } else {
+                    doc.world_object_bounds(top.path_id)
+                        .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds()))
+                }
+            } else {
+                doc.world_object_bounds(top.path_id)
+                    .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds()))
+            }
+        }
         NodePayload::Raster(r) => {
             let rect = match r.crop_rect {
                 Some(cr) if cr.is_finite() => Some(cr),
@@ -384,24 +475,166 @@ pub(crate) fn world_bounds_with_xf(
         NodePayload::Table(t) => world_xf.try_transform_rect(t.to_bounding_box()),
         NodePayload::Dimension(d) => world_xf.try_transform_rect(d.bounding_box()),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, world_xf);
-            c.route_path(a, b).bounding_box()
+            if let Some(ctx) = sym_ctx {
+                let mut resolve_sym_endpoint =
+                    |oid_opt: Option<ObjectId>,
+                     fallback: coree_core::Point2D,
+                     anchor: coree_core::AnchorPoint| {
+                        oid_opt
+                            .and_then(|oid| {
+                                if let Some(sub) = ctx.sym_map.get(&oid).copied() {
+                                    if !visiting.insert(oid) {
+                                        return None;
+                                    }
+                                    let res = sym_world_transform_of(
+                                        oid,
+                                        ctx.root_xf,
+                                        ctx.sym_objects,
+                                        ctx.sym_map,
+                                        ctx.sym_parent_map,
+                                    )
+                                    .and_then(|p_xf| {
+                                        world_bounds_with_xf_inner(
+                                            doc,
+                                            oid,
+                                            sub,
+                                            &p_xf,
+                                            Some(ctx),
+                                            depth + 1,
+                                            visiting,
+                                            visiting_syms,
+                                        )
+                                    });
+                                    visiting.remove(&oid);
+                                    res
+                                } else {
+                                    doc.world_object_bounds(oid)
+                                }
+                            })
+                            .map_or_else(
+                                || world_xf.transform_point(fallback),
+                                |bb| anchor.resolve(bb),
+                            )
+                    };
+                let from_pt = resolve_sym_endpoint(c.from_obj, c.from_fallback, c.from_anchor);
+                let to_pt = resolve_sym_endpoint(c.to_obj, c.to_fallback, c.to_anchor);
+                c.route_path(from_pt, to_pt).bounding_box()
+            } else {
+                let (a, b) = doc.resolve_connector_endpoints_with_transform(c, world_xf);
+                c.route_path(a, b).bounding_box()
+            }
         }
         NodePayload::PowerClip { container, .. } => container.transformed(world_xf).bounding_box(),
-        NodePayload::SymbolInstance(sym_id) => doc.symbols.get(sym_id).and_then(|sym| {
-            let mut acc: Option<Rect2D> = None;
-            for sub in &sym.objects {
-                let sub_xf = world_xf.compose(&sub.transform);
-                if let Some(r) = world_bounds_with_xf(doc, id, sub, &sub_xf) {
-                    acc = Some(match acc {
-                        Some(prev) => prev.union(r),
-                        None => r,
-                    });
+        NodePayload::SymbolInstance(sym_id) => {
+            if !visiting_syms.insert(*sym_id) {
+                return None;
+            }
+            let res = doc.symbol(*sym_id).and_then(|sym| {
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced_children: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
+                    }
+                    let parent_ref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
+                    };
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
+                                }
+                            }
+                        }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                let mut sym_visiting = HashSet::new();
+                let ctx = SymBoundsCtx {
+                    root_xf: world_xf,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                let mut acc: Option<Rect2D> = None;
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced_children.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_visiting.insert(sub.id) {
+                        continue;
+                    }
+                    let sub_xf = world_xf.compose(&sub.transform);
+                    let r_opt = world_bounds_with_xf_inner(
+                        doc,
+                        sub.id,
+                        sub,
+                        &sub_xf,
+                        Some(&ctx),
+                        depth + 1,
+                        &mut sym_visiting,
+                        visiting_syms,
+                    );
+                    if sub.id.0 != 0 {
+                        sym_visiting.remove(&sub.id);
+                    }
+                    if let Some(r) = r_opt {
+                        acc = Some(match acc {
+                            Some(prev) => prev.union(r),
+                            None => r,
+                        });
+                    }
+                }
+                acc
+            });
+            visiting_syms.remove(sym_id);
+            res
+        }
+        NodePayload::Group(children) => {
+            let _ = id;
+            let mut acc: Option<Rect2D> = None;
+            for &cid in children {
+                if !visiting.insert(cid) {
+                    continue;
+                }
+                let child_opt = sym_ctx
+                    .and_then(|ctx| ctx.sym_map.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child) = child_opt {
+                    let child_xf = world_xf.compose(&child.transform);
+                    if let Some(r) = world_bounds_with_xf_inner(
+                        doc,
+                        cid,
+                        child,
+                        &child_xf,
+                        sym_ctx,
+                        depth + 1,
+                        visiting,
+                        visiting_syms,
+                    ) {
+                        acc = Some(match acc {
+                            Some(prev) => prev.union(r),
+                            None => r,
+                        });
+                    }
+                }
+                visiting.remove(&cid);
             }
             acc
-        }),
-        NodePayload::Group(_) => doc.object_bounds(id),
+        }
     };
     bounds.filter(|r| r.is_finite())
 }
@@ -452,7 +685,7 @@ pub(crate) fn bezier_to_skia_path(
 }
 
 /// Extracts world-space closed/open vector silhouette paths for `id` (expanding groups and
-/// falling back to bounding-box rects for text/raster/table objects).
+/// symbol definitions hierarchically, falling back to bounding-box rects for text/raster/table objects).
 pub(crate) fn collect_silhouette_paths(
     doc: &Document,
     id: ObjectId,
@@ -461,106 +694,259 @@ pub(crate) fn collect_silhouette_paths(
     visiting: &mut HashSet<ObjectId>,
     out: &mut Vec<BezierPath>,
 ) {
+    let mut visiting_syms = HashSet::new();
+    collect_silhouette_paths_by_id(
+        doc,
+        id,
+        parent_xf,
+        None,
+        depth,
+        visiting,
+        &mut visiting_syms,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_silhouette_paths_by_id(
+    doc: &Document,
+    id: ObjectId,
+    parent_xf: Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    out: &mut Vec<BezierPath>,
+) {
     if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
         return;
     }
-    if let Some(obj) = doc.objects.get(&id) {
-        let world_xf = parent_xf.compose(&obj.transform);
-        if !world_xf.is_finite() {
-            visiting.remove(&id);
-            return;
+    let obj_opt = sym_ctx
+        .and_then(|ctx| ctx.sym_map.get(&id).copied())
+        .or_else(|| doc.object(id));
+    if let Some(obj) = obj_opt {
+        collect_silhouette_paths_obj(
+            doc,
+            id,
+            obj,
+            parent_xf,
+            sym_ctx,
+            depth,
+            visiting,
+            visiting_syms,
+            out,
+        );
+    }
+    visiting.remove(&id);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_silhouette_paths_obj(
+    doc: &Document,
+    id: ObjectId,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    out: &mut Vec<BezierPath>,
+) {
+    if depth > MAX_SCENE_DEPTH {
+        return;
+    }
+    let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        return;
+    }
+    match &obj.payload {
+        NodePayload::Path(p) => {
+            if !p.is_empty() {
+                out.push(p.transformed(&world_xf));
+            }
         }
-        match &obj.payload {
-            NodePayload::Path(p) => {
-                if !p.is_empty() {
-                    out.push(p.transformed(&world_xf));
-                }
+        NodePayload::Shape(s) => {
+            let p = s.to_bezier_path().transformed(&world_xf);
+            if !p.is_empty() {
+                out.push(p);
             }
-            NodePayload::Shape(s) => {
-                let p = s.to_bezier_path().transformed(&world_xf);
-                if !p.is_empty() {
-                    out.push(p);
-                }
+        }
+        NodePayload::PowerClip { container, .. } => {
+            let p = container.transformed(&world_xf);
+            if !p.is_empty() {
+                out.push(p);
             }
-            NodePayload::PowerClip { container, .. } => {
-                let p = container.transformed(&world_xf);
-                if !p.is_empty() {
-                    out.push(p);
-                }
+        }
+        NodePayload::ArtisticText(t) => {
+            let p = BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf);
+            if !p.is_empty() {
+                out.push(p);
             }
-            NodePayload::ArtisticText(t) => {
-                let p = BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf);
-                if !p.is_empty() {
-                    out.push(p);
-                }
+        }
+        NodePayload::ParagraphText(t) => {
+            let p = BezierPath::from_rect(t.bounding_box()).transformed(&world_xf);
+            if !p.is_empty() {
+                out.push(p);
             }
-            NodePayload::ParagraphText(t) => {
-                let p = BezierPath::from_rect(t.bounding_box()).transformed(&world_xf);
-                if !p.is_empty() {
-                    out.push(p);
+        }
+        NodePayload::Raster(r) => {
+            let rect = match r.crop_rect {
+                Some(cr) if cr.is_finite() => Some(cr),
+                Some(_) => None,
+                None if r.width_mm.is_finite()
+                    && r.width_mm > 0.0
+                    && r.height_mm.is_finite()
+                    && r.height_mm > 0.0 =>
+                {
+                    Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
                 }
+                None => None,
+            };
+            if let Some(rc) = rect {
+                out.push(BezierPath::from_rect(rc).transformed(&world_xf));
             }
-            NodePayload::Raster(r) => {
-                let rect = match r.crop_rect {
-                    Some(cr) if cr.is_finite() => Some(cr),
-                    Some(_) => None,
-                    None if r.width_mm.is_finite()
-                        && r.width_mm > 0.0
-                        && r.height_mm.is_finite()
-                        && r.height_mm > 0.0 =>
-                    {
-                        Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+        }
+        NodePayload::Table(t) => {
+            let p = BezierPath::from_rect(t.to_bounding_box()).transformed(&world_xf);
+            if !p.is_empty() {
+                out.push(p);
+            }
+        }
+        NodePayload::Group(children) => {
+            for &cid in children {
+                collect_silhouette_paths_by_id(
+                    doc,
+                    cid,
+                    world_xf,
+                    sym_ctx,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    out,
+                );
+            }
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if !visiting_syms.insert(*sym_id) {
+                return;
+            }
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced_children: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
                     }
-                    None => None,
-                };
-                if let Some(rc) = rect {
-                    out.push(BezierPath::from_rect(rc).transformed(&world_xf));
-                }
-            }
-            NodePayload::Table(t) => {
-                let p = BezierPath::from_rect(t.to_bounding_box()).transformed(&world_xf);
-                if !p.is_empty() {
-                    out.push(p);
-                }
-            }
-            NodePayload::Group(children) => {
-                for &cid in children {
-                    collect_silhouette_paths(doc, cid, world_xf, depth + 1, visiting, out);
-                }
-            }
-            NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = doc.symbols.get(sym_id) {
-                    for sub in &sym.objects {
-                        let sub_xf = world_xf.compose(&sub.transform);
-                        if !sub_xf.is_finite() {
-                            continue;
-                        }
-                        match &sub.payload {
-                            NodePayload::Path(p) if !p.is_empty() => {
-                                out.push(p.transformed(&sub_xf))
-                            }
-                            NodePayload::Shape(s) => {
-                                let p = s.to_bezier_path().transformed(&sub_xf);
-                                if !p.is_empty() {
-                                    out.push(p);
+                    let parent_ref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
+                    };
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
                                 }
                             }
-                            _ => {}
                         }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut sym_visiting = HashSet::new();
+                let ctx = SymBoundsCtx {
+                    root_xf: &world_xf,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced_children.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_visiting.insert(sub.id) {
+                        continue;
+                    }
+                    collect_silhouette_paths_obj(
+                        doc,
+                        sub.id,
+                        sub,
+                        world_xf,
+                        Some(&ctx),
+                        depth + 1,
+                        &mut sym_visiting,
+                        visiting_syms,
+                        out,
+                    );
+                    if sub.id.0 != 0 {
+                        sym_visiting.remove(&sub.id);
                     }
                 }
             }
-            NodePayload::TextOnPath(top) => {
-                if let Some(bb) = doc.object_bounds(id) {
+            visiting_syms.remove(sym_id);
+        }
+        NodePayload::TextOnPath(top) => {
+            if let Some(ctx) = sym_ctx {
+                let sym_bb = ctx
+                    .sym_map
+                    .get(&top.path_id)
+                    .copied()
+                    .and_then(|path_obj| {
+                        let p_xf = sym_world_transform_of(
+                            top.path_id,
+                            ctx.root_xf,
+                            ctx.sym_objects,
+                            ctx.sym_map,
+                            ctx.sym_parent_map,
+                        )?;
+                        match &path_obj.payload {
+                            NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
+                            NodePayload::Shape(s) => {
+                                s.to_bezier_path().transformed(&p_xf).bounding_box()
+                            }
+                            _ => {
+                                if !visiting.insert(top.path_id) {
+                                    return None;
+                                }
+                                let r = world_bounds_with_xf_inner(
+                                    doc,
+                                    top.path_id,
+                                    path_obj,
+                                    &p_xf,
+                                    Some(ctx),
+                                    depth + 1,
+                                    visiting,
+                                    visiting_syms,
+                                );
+                                visiting.remove(&top.path_id);
+                                r
+                            }
+                        }
+                    })
+                    .or_else(|| doc.world_object_bounds(top.path_id));
+                if let Some(bb) = sym_bb {
                     out.push(BezierPath::from_rect(bb));
                 } else {
                     out.push(
                         BezierPath::from_rect(top.text.estimated_bounds()).transformed(&world_xf),
                     );
                 }
+            } else if let Some(bb) = doc.world_object_bounds(id) {
+                out.push(BezierPath::from_rect(bb));
+            } else {
+                out.push(BezierPath::from_rect(top.text.estimated_bounds()).transformed(&world_xf));
             }
-            NodePayload::Dimension(_) | NodePayload::Connector(_) => {}
         }
+        NodePayload::Dimension(_) | NodePayload::Connector(_) => {}
     }
-    visiting.remove(&id);
 }

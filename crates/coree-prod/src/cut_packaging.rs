@@ -8,16 +8,16 @@
 
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{
-    collect_silhouette_paths, find_or_create_layer, get_page, visit_layer_objects,
-    world_bounds_with_xf,
+    collect_silhouette_paths, find_or_create_layer, get_page, sym_world_transform_of,
+    visit_layer_objects, world_bounds_with_sym_xf, SymBoundsCtx, SymParentRef,
 };
 use coree_core::{
     apply_boolean_many, offset_polygon, Affine2D, BezierPath, BooleanOp, Color, CornerStyle,
     Document, EllipseMode, Fill, Layer, LayerId, NodePayload, ObjectId, OutlineStyle,
-    ParametricShape, Point2D, Rect2D, SceneObject,
+    ParametricShape, Point2D, Rect2D, SceneObject, SymbolId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Default spot color name for plotter/cutter contour paths.
 pub const DEFAULT_CUT_SPOT_NAME: &str = "CutContour";
@@ -59,23 +59,21 @@ pub fn generate_cut_contour(
     let page_index = target_ids
         .iter()
         .find_map(|&oid| find_page_index_of_object(doc, oid))
-        .unwrap_or(doc.active_page_index);
+        .unwrap_or_else(|| doc.active_page_index());
     let _ = get_page(doc, page_index)?;
 
     let mut silhouettes = Vec::new();
     let mut visiting = HashSet::new();
     for &oid in target_ids {
-        if !doc.objects.contains_key(&oid) {
+        if !doc.has_object(oid) {
             return Err(ProdError::Core(coree_core::CoreError::ObjectNotFound(oid)));
         }
-        collect_silhouette_paths(
-            doc,
-            oid,
-            Affine2D::IDENTITY,
-            0,
-            &mut visiting,
-            &mut silhouettes,
-        );
+        let parent_xf = doc
+            .parent_container_of(oid)
+            .and_then(|pid| doc.world_transform_of(pid))
+            .filter(|m| m.is_finite())
+            .unwrap_or(Affine2D::IDENTITY);
+        collect_silhouette_paths(doc, oid, parent_xf, 0, &mut visiting, &mut silhouettes);
     }
 
     if silhouettes.is_empty() {
@@ -138,7 +136,7 @@ pub fn generate_cut_contour(
 }
 
 fn find_page_index_of_object(doc: &Document, target_id: ObjectId) -> Option<usize> {
-    for (p_idx, page) in doc.pages.iter().enumerate() {
+    for (p_idx, page) in doc.pages().iter().enumerate() {
         for layer in &page.layers {
             if layer.objects.contains(&target_id) {
                 return Some(p_idx);
@@ -858,16 +856,24 @@ pub fn compute_production_metrics(
     match selection {
         Some(ids) => {
             let mut visited = HashSet::new();
+            let mut visiting_syms = HashSet::new();
             for &oid in ids {
                 let layer = find_layer_of_any_object(doc, oid);
+                let parent_xf = doc
+                    .parent_container_of(oid)
+                    .and_then(|pid| doc.world_transform_of(pid))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(Affine2D::IDENTITY);
                 accumulate_object_metrics(
                     doc,
                     oid,
                     layer,
-                    Affine2D::IDENTITY,
+                    parent_xf,
                     None,
                     0,
+                    None,
                     &mut visited,
+                    &mut visiting_syms,
                     &mut metrics,
                     &mut cut_subpaths,
                 );
@@ -875,7 +881,8 @@ pub fn compute_production_metrics(
         }
         None => {
             let mut visited = HashSet::new();
-            for page in &doc.pages {
+            let mut visiting_syms = HashSet::new();
+            for page in doc.pages() {
                 for layer in &page.layers {
                     if !layer.visible {
                         continue;
@@ -888,7 +895,9 @@ pub fn compute_production_metrics(
                             Affine2D::IDENTITY,
                             None,
                             0,
+                            None,
                             &mut visited,
+                            &mut visiting_syms,
                             &mut metrics,
                             &mut cut_subpaths,
                         );
@@ -946,7 +955,7 @@ pub fn compute_production_metrics(
 }
 
 fn find_layer_of_any_object(doc: &Document, target_id: ObjectId) -> Option<&Layer> {
-    for page in &doc.pages {
+    for page in doc.pages() {
         for layer in &page.layers {
             if layer.objects.contains(&target_id) {
                 return Some(layer);
@@ -1008,17 +1017,55 @@ fn accumulate_object_metrics(
     parent_xf: Affine2D,
     clip_bounds: Option<Rect2D>,
     depth: usize,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
     visited: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
     metrics: &mut ProductionMetrics,
     cut_subpaths: &mut usize,
 ) {
     if depth > crate::scene_helpers::MAX_SCENE_DEPTH || !visited.insert(id) {
         return;
     }
-    let Some(obj) = doc.objects.get(&id) else {
+    let obj = if let Some(ctx) = sym_ctx {
+        ctx.sym_map.get(&id).copied()
+    } else {
+        doc.object(id)
+    };
+    let Some(obj) = obj else {
         return;
     };
-    if !obj.visible {
+    accumulate_scene_object_metrics(
+        doc,
+        id,
+        obj,
+        layer,
+        parent_xf,
+        clip_bounds,
+        depth,
+        sym_ctx,
+        visited,
+        visiting_syms,
+        metrics,
+        cut_subpaths,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_scene_object_metrics(
+    doc: &Document,
+    id: ObjectId,
+    obj: &SceneObject,
+    layer: Option<&Layer>,
+    parent_xf: Affine2D,
+    clip_bounds: Option<Rect2D>,
+    depth: usize,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    visited: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    metrics: &mut ProductionMetrics,
+    cut_subpaths: &mut usize,
+) {
+    if depth > crate::scene_helpers::MAX_SCENE_DEPTH || !obj.visible {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
@@ -1036,7 +1083,9 @@ fn accumulate_object_metrics(
                     world_xf,
                     clip_bounds,
                     depth + 1,
+                    sym_ctx,
                     visited,
+                    visiting_syms,
                     metrics,
                     cut_subpaths,
                 );
@@ -1065,11 +1114,82 @@ fn accumulate_object_metrics(
                     world_xf,
                     child_clip,
                     depth + 1,
+                    sym_ctx,
                     visited,
+                    visiting_syms,
                     metrics,
                     cut_subpaths,
                 );
             }
+            return;
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if !visiting_syms.insert(*sym_id) {
+                return;
+            }
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced_children: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
+                    }
+                    let parent_ref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
+                    };
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
+                                }
+                            }
+                        }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced_children.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(parent_ref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut sym_visited = HashSet::new();
+                let ctx = SymBoundsCtx {
+                    root_xf: &world_xf,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                for sub in &sym.objects {
+                    if sub.id.0 != 0
+                        && (referenced_children.contains(&sub.id) || !sym_visited.insert(sub.id))
+                    {
+                        continue;
+                    }
+                    accumulate_scene_object_metrics(
+                        doc,
+                        sub.id,
+                        sub,
+                        layer,
+                        world_xf,
+                        clip_bounds,
+                        depth + 1,
+                        Some(&ctx),
+                        &mut sym_visited,
+                        visiting_syms,
+                        metrics,
+                        cut_subpaths,
+                    );
+                }
+            }
+            visiting_syms.remove(sym_id);
             return;
         }
         _ => {}
@@ -1080,15 +1200,44 @@ fn accumulate_object_metrics(
         NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
         NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
-            Some(c.route_path(a, b))
+            if let Some(ctx) = sym_ctx {
+                let resolve_ep = |oid_opt: Option<ObjectId>,
+                                  anchor: &coree_core::AnchorPoint,
+                                  fallback: Point2D| {
+                    oid_opt
+                        .and_then(|oid| {
+                            if let Some(sub) = ctx.sym_map.get(&oid).copied() {
+                                let p_xf = sym_world_transform_of(
+                                    oid,
+                                    ctx.root_xf,
+                                    ctx.sym_objects,
+                                    ctx.sym_map,
+                                    ctx.sym_parent_map,
+                                )?;
+                                world_bounds_with_sym_xf(doc, oid, sub, &p_xf, Some(ctx))
+                            } else {
+                                doc.world_object_bounds(oid)
+                            }
+                        })
+                        .map_or_else(
+                            || world_xf.transform_point(fallback),
+                            |bb| anchor.resolve(bb),
+                        )
+                };
+                let a = resolve_ep(c.from_obj, &c.from_anchor, c.from_fallback);
+                let b = resolve_ep(c.to_obj, &c.to_anchor, c.to_fallback);
+                Some(c.route_path(a, b))
+            } else {
+                let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
+                Some(c.route_path(a, b))
+            }
         }
         _ => None,
     };
 
     if let Some(path) = world_path {
         record_path_metrics(obj, layer, &path, clip_bounds, metrics, cut_subpaths);
-    } else if let Some(bb) = world_bounds_with_xf(doc, id, obj, &world_xf) {
+    } else if let Some(bb) = world_bounds_with_sym_xf(doc, id, obj, &world_xf, sym_ctx) {
         let effective_bb = match clip_bounds {
             Some(clip) => bb.intersection(clip),
             None => Some(bb),
@@ -1209,7 +1358,7 @@ mod tests {
         assert!(cut_layer.is_cut_layer);
         assert_eq!(cut_layer.name, "CutContour");
 
-        let obj = &doc.objects[&res.object_id];
+        let obj = &doc.objects()[&res.object_id];
         assert!(obj.outline.is_hairline);
         assert!(obj.outline.overprint);
         assert!(matches!(
@@ -1256,9 +1405,9 @@ mod tests {
         assert!(!box_res.cut_object_ids.is_empty());
         assert_eq!(box_res.crease_object_ids.len(), 12);
         // Verify Cut is solid hairline & Crease is dashed hairline
-        let cut_obj = &doc1.objects[&box_res.cut_object_ids[0]];
+        let cut_obj = &doc1.objects()[&box_res.cut_object_ids[0]];
         assert!(cut_obj.outline.is_hairline && cut_obj.outline.dash_pattern.is_empty());
-        let crease_obj = &doc1.objects[&box_res.crease_object_ids[0]];
+        let crease_obj = &doc1.objects()[&box_res.crease_object_ids[0]];
         assert!(crease_obj.outline.is_hairline && !crease_obj.outline.dash_pattern.is_empty());
 
         // 2. Envelope: W=220, H=110, F=35 -> side_flap = 220*0.12 = 25 (clamped)
@@ -1340,7 +1489,7 @@ mod tests {
         // Add a Cut line (100 mm) and a Crease line (40 mm) inside the same 100x40 box
         let cut_layer = doc
             .add_layer(
-                doc.pages[0].id,
+                doc.pages()[0].id,
                 "Cut",
                 true,
                 coree_core::MasterLayerScope::None,
@@ -1361,7 +1510,7 @@ mod tests {
         .unwrap();
         let crease_layer = doc
             .add_layer(
-                doc.pages[0].id,
+                doc.pages()[0].id,
                 "Crease",
                 true,
                 coree_core::MasterLayerScope::None,

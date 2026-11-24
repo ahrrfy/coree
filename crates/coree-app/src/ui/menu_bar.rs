@@ -281,18 +281,22 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         app.refresh_laser_plan_preview();
                     }
                     ui.separator();
+                    let mut pending_multipage: Option<bool> = None;
+                    let mut pending_grid: Option<coree_core::GridConfig> = None;
+                    let mut pending_pgrid: Option<coree_core::PerspectiveGridConfig> = None;
                     if let Some(tab) = app.active_tab_mut() {
-                        if ui
-                            .checkbox(&mut tab.document.multipage_view, "Multipage View")
-                            .changed()
-                        {
-                            tab.viewport.multipage_view = tab.document.multipage_view;
+                        let mut multipage = tab.document.multipage_view();
+                        if ui.checkbox(&mut multipage, "Multipage View").changed() {
+                            pending_multipage = Some(multipage);
+                            tab.viewport.multipage_view = multipage;
                             tab.needs_rerender = true;
                         }
+                        let mut grid = tab.document.grid();
                         if ui
-                            .checkbox(&mut tab.document.grid.visible, "Show Document Grid")
+                            .checkbox(&mut grid.visible, "Show Document Grid")
                             .changed()
                         {
+                            pending_grid = Some(grid);
                             tab.needs_rerender = true;
                         }
                         if ui
@@ -307,13 +311,12 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         {
                             tab.needs_rerender = true;
                         }
+                        let mut pgrid = tab.document.perspective_grid().clone();
                         if ui
-                            .checkbox(
-                                &mut tab.document.perspective_grid.enabled,
-                                "Perspective Drawing Grid",
-                            )
+                            .checkbox(&mut pgrid.enabled, "Perspective Drawing Grid")
                             .changed()
                         {
+                            pending_pgrid = Some(pgrid);
                             tab.needs_rerender = true;
                         }
                         if ui
@@ -329,9 +332,30 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                                 .checkbox(&mut tab.snap_options.grid, "Snap to Document Grid")
                                 .changed()
                             {
-                                tab.document.grid.snap = tab.snap_options.grid;
+                                let mut g = pending_grid.unwrap_or_else(|| tab.document.grid());
+                                g.snap = tab.snap_options.grid;
+                                pending_grid = Some(g);
                             }
                         });
+                    }
+                    if let Some(next) = pending_multipage {
+                        let _ = app.execute_command(CommandOp::SetDocumentProperties {
+                            title: None,
+                            color_mode: None,
+                            default_unit: None,
+                            dpi: None,
+                            multipage_view: Some(next),
+                            active_page_index: None,
+                            metadata: None,
+                            custom_icc_profile: None,
+                            clear_custom_icc: false,
+                        });
+                    }
+                    if let Some(config) = pending_grid {
+                        let _ = app.execute_command(CommandOp::SetGridConfig { config });
+                    }
+                    if let Some(config) = pending_pgrid {
+                        let _ = app.execute_command(CommandOp::SetPerspectiveGrid { config });
                     }
                     if menu_item(ui, "Compute CMYK/Spot Separations Preview", "") {
                         app.compute_separations_active();
@@ -385,7 +409,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                                         p.width_mm,
                                         p.height_mm,
                                         p.bleed_mm,
-                                        t.document.pages.len() + 1,
+                                        t.document.pages().len() + 1,
                                     )
                                 })
                             })
@@ -399,15 +423,16 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         ui.close();
                     }
                     if menu_item(ui, "Duplicate Active Page", "") {
-                        if let Some(idx) = app.active_tab().map(|t| t.document.active_page_index) {
+                        if let Some(idx) = app.active_tab().map(|t| t.document.active_page_index())
+                        {
                             app.duplicate_page(idx);
                         }
                         ui.close();
                     }
                     if menu_item(ui, "Rename Active Page", "") {
                         if let Some(tab) = app.active_tab_mut() {
-                            let idx = tab.document.active_page_index;
-                            if let Some(p) = tab.document.pages.get(idx) {
+                            let idx = tab.document.active_page_index();
+                            if let Some(p) = tab.document.page(idx) {
                                 tab.inline_page_name_buf = p.name.clone();
                                 tab.inline_renaming_page = Some(idx);
                             }
@@ -417,7 +442,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                     if menu_item(ui, "Delete Active Page", "") {
                         if let Some(pid) = app
                             .active_tab()
-                            .filter(|t| t.document.pages.len() > 1)
+                            .filter(|t| t.document.pages().len() > 1)
                             .and_then(|t| t.document.active_page())
                             .map(|p| p.id)
                         {
@@ -429,10 +454,21 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                     }
                     ui.separator();
                     if menu_item(ui, "Switch Page Orientation (Portrait / Landscape)", "") {
-                        if let Some(tab) = app.active_tab_mut() {
-                            if let Some(page) = tab.document.active_page_mut() {
-                                std::mem::swap(&mut page.width_mm, &mut page.height_mm);
-                                tab.mark_modified();
+                        let dims = app
+                            .active_tab()
+                            .and_then(|t| t.document.active_page())
+                            .map(|p| (p.id, p.width_mm, p.height_mm));
+                        if let Some((page_id, w, h)) = dims {
+                            let _ = app.execute_command(CommandOp::SetPageProperties {
+                                page_id,
+                                name: None,
+                                width_mm: Some(h),
+                                height_mm: Some(w),
+                                bleed_mm: None,
+                                facing_pages: None,
+                            });
+                            if let Some(tab) = app.active_tab_mut() {
+                                tab.needs_rerender = true;
                             }
                         }
                         ui.close();
@@ -620,7 +656,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         let selected_pc = app.active_tab().and_then(|t| {
                             let oid = *t.selection.objects.first()?;
                             matches!(
-                                t.document.objects.get(&oid).map(|o| &o.payload),
+                                t.document.object(oid).map(|o| &o.payload),
                                 Some(coree_core::NodePayload::PowerClip { .. })
                             )
                             .then_some(oid)
@@ -1237,7 +1273,7 @@ fn export_laser_dxf_dialog(app: &mut StudioApp) {
         app.push_toast("No active document to export", true);
         return;
     };
-    let page_idx = tab.document.active_page_index;
+    let page_idx = tab.document.active_page_index();
     let sel = if tab.selection.is_empty() {
         None
     } else {

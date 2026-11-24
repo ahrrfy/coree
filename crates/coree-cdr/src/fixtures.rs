@@ -37,13 +37,16 @@ use zip::{CompressionMethod, ZipWriter};
 #[must_use]
 pub fn generate_sample_document() -> Document {
     let mut doc = Document::new_a4("coree Clean-Room Showcase");
-    doc.metadata.author = "coree contributors".to_owned();
-    doc.metadata.subject = "Vector & Print Showcase".to_owned();
-    doc.metadata.keywords = vec!["vector".to_owned(), "arabic".to_owned(), "cmyk".to_owned()];
-    doc.metadata.notes = "Generated programmatically with zero proprietary assets.".to_owned();
+    {
+        let meta = doc.metadata_mut();
+        meta.author = "coree contributors".to_owned();
+        meta.subject = "Vector & Print Showcase".to_owned();
+        meta.keywords = vec!["vector".to_owned(), "arabic".to_owned(), "cmyk".to_owned()];
+        meta.notes = "Generated programmatically with zero proprietary assets.".to_owned();
+    }
 
-    let page1_id = doc.pages[0].id;
-    let artwork_layer = doc.pages[0].layers[0].id;
+    let page1_id = doc.pages()[0].id;
+    let artwork_layer = doc.pages()[0].layers[0].id;
     let cut_layer = doc
         .add_layer(page1_id, "CutContour", true, MasterLayerScope::None)
         .expect("page1 exists");
@@ -364,7 +367,7 @@ pub fn generate_sample_document() -> Document {
     // 11. Page 2 (US Letter) for multi-page verification
     let page2_id = doc.add_page("Back Cover", 215.9, 279.4, 3.0);
     let page2_layer = doc
-        .pages
+        .pages()
         .iter()
         .find(|p| p.id == page2_id)
         .expect("page2")
@@ -387,7 +390,7 @@ pub fn generate_sample_document() -> Document {
     );
 
     // 12. Document-level Unknown-Chunk Passthrough
-    doc.unknown_doc_chunks.push(UnknownCdrChunk {
+    doc.push_unknown_doc_chunk(UnknownCdrChunk {
         fourcc: *b"XDOC",
         version_hint: 1200,
         raw_bytes: b"coree-passthrough-doc-payload!".to_vec(),
@@ -415,7 +418,7 @@ pub fn sample_cdr_zip_x6_bytes() -> Vec<u8> {
     write_cdr_zip(&generate_sample_document(), CdrZipEra::X6, false).expect("write_cdr_zip X6")
 }
 
-/// Generates a valid clean-room CorelDRAW Template (`.cdt` ZIP) container.
+/// Generates a valid clean-room CDR Template (`.cdt` ZIP) container.
 #[must_use]
 pub fn sample_cdt_bytes() -> Vec<u8> {
     export_cdt_bytes(&generate_sample_document(), CdrWriteVersion::ZipX4).expect("export_cdt")
@@ -433,7 +436,7 @@ pub fn sample_cmx_32bit_bytes() -> Vec<u8> {
     export_cmx_bytes(&generate_sample_document(), CmxPrecision::Bit32).expect("export_cmx 32")
 }
 
-/// Generates a multi-layer Corel PHOTO-PAINT `.cpt` (`CPT9FILE`) binary featuring:
+/// Generates a multi-layer `.cpt` (`CPT9FILE`) binary featuring:
 /// - Layer 1: RGB24 (Raw)
 /// - Layer 2: CMYK32 (PackBits RLE strips) + Zlib Alpha Mask channel
 /// - Layer 3: Gray8 (Deflate) + RLE Alpha Mask channel
@@ -621,7 +624,7 @@ pub fn sample_cp1256_arabic_cdr_bytes() -> Vec<u8> {
 #[must_use]
 pub fn sample_unknown_chunk_cdr_bytes() -> Vec<u8> {
     let mut doc = Document::new_a4("Unknown Chunk Passthrough Test");
-    doc.unknown_doc_chunks.push(UnknownCdrChunk {
+    doc.push_unknown_doc_chunk(UnknownCdrChunk {
         fourcc: *b"XDOC",
         version_hint: 1200,
         raw_bytes: vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD],
@@ -668,7 +671,7 @@ pub fn malformed_truncated_header() -> Vec<u8> {
     b"RIFF\x20\x00".to_vec()
 }
 
-/// Arbitrary non-Corel garbage bytes.
+/// Arbitrary non-CDR garbage bytes.
 #[must_use]
 pub fn malformed_garbage_bytes() -> Vec<u8> {
     vec![

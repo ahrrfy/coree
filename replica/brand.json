@@ -30,5 +30,30 @@
     "#1b8e3e",
     "#4eb848",
     "#009944"
-  ]
+  ],
+  "mime_allowlist": {
+    "literals": [
+      "application/x-vnd.corel.zcf.draw.document+zip",
+      "application/x-vnd.corel.zcf.draw.template+zip",
+      "application/x-vnd.corel.draw.document+zip",
+      "application/x-vnd.corel.draw.template+zip",
+      "application/x-vnd.corel.zcf.draw.template",
+      "application/x-vnd.corel.draw.template",
+      "application/x-vnd.corel",
+      "application/vnd.corel-draw",
+      "application-vnd.corel-draw"
+    ],
+    "allowed_files": [
+      "crates/coree-cdr/src/cdr_zip.rs",
+      "crates/coree-cdr/tests/codec_integration.rs",
+      "packaging/linux/coree-mime.xml",
+      "packaging/linux/coree.desktop",
+      "packaging/linux/coree.thumbnailer",
+      "packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml",
+      "packaging/linux/build-appimage.sh",
+      "packaging/linux/build-deb.sh",
+      "packaging/linux/install-linux.sh",
+      "packaging/windows/wix/main.wxs"
+    ]
+  }
 }

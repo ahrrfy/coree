@@ -9,9 +9,9 @@
 | `replica-backend` area | `coree` local equivalent | implementation |
 | --- | --- | --- |
 | Auth & Accounts | **Explicitly absent (by design)** | Zero login screens, zero license activation checks, zero network sockets. App opens offline immediately on first launch. |
-| Database & Migrations | Local SQLite 3 (`rusqlite` `bundled`, WAL mode) | Stored at `$XDG_DATA_HOME/coree/coree.db` (Linux) or `%APPDATA%\coree\coree.db` (Windows) with `0600` file permissions. Schema defined in [schema.sql](file:///run/media/ahmed/DATA/coreldraw%20me/replica/schema.sql), applied via idempotent versioned SQL migrations in `coree-storage::migrations`. |
-| Payments & Billing | **Explicitly absent (MPL-2.0 Free & Open Source)** | Zero paywalls, zero trial expirations, zero billing logic. |
-| Background Jobs | Local worker pools & timers | `autosave-flusher` (30 s idle / 25 cmds), `font-indexer` (incremental OS font scan), `tile-render-pool` (Rayon 256×256 tile rasterizer), `trace-worker` (PowerTRACE async job). |
+| Database & Migrations | Local SQLite 3 (`rusqlite` `bundled`, WAL mode) | Stored at `$XDG_DATA_HOME/coree/coree.db` (Linux) or `%APPDATA%\coree\coree.db` (Windows) with `0600` file permissions. Schema defined in [schema.sql](schema.sql), applied via idempotent versioned SQL migrations in `coree-storage::migrations`. |
+| Payments & Billing | **Explicitly absent (`MIT OR Apache-2.0` Free & Open Source)** | Zero paywalls, zero trial expirations, zero billing logic. |
+| Background Jobs | Local worker pools & timers | `autosave-flusher` (30 s idle / 25 cmds), `font-indexer` (incremental OS font scan), `tile-render-pool` (Rayon 256×256 tile rasterizer), `trace-worker` (Vector Trace async job). |
 | File Storage & Saves | Local filesystem via `rfd` (`xdg-portal`) + atomic saves | Every save writes to a `NamedTempFile` in the destination directory, calls `file.sync_all()`, and atomically renames (`persist`) over the target file — eliminating mid-crash `.cdr` corruption. |
 | Third-Party APIs / Secrets | **None** | No `.env` secrets, no API keys, no outbound HTTP crates (`reqwest`/`ureq`/`hyper` are forbidden in `Cargo.toml`). |
 

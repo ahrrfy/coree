@@ -22,7 +22,20 @@ use coree_core::{
 /// to a copy of `path` in local object coordinates.
 #[must_use]
 pub fn apply_geometry_effects(path: &BezierPath, effects: &[Effect]) -> BezierPath {
+    apply_geometry_effects_in_bounds(path, None, effects)
+}
+
+/// Applies all path-deforming live effects (`Distort`, `Envelope`, `Perspective`)
+/// to `path` using an optional shared reference bounding box `ref_bounds` (used for
+/// `Group`-level `Envelope`/`Perspective` so sibling children share the group's cage).
+#[must_use]
+pub fn apply_geometry_effects_in_bounds(
+    path: &BezierPath,
+    ref_bounds: Option<coree_core::Rect2D>,
+    effects: &[Effect],
+) -> BezierPath {
     let mut current = path.clone();
+    let mut cur_ref = ref_bounds.filter(|r| r.is_finite());
     for eff in effects {
         match eff {
             Effect::Distort {
@@ -39,12 +52,36 @@ pub fn apply_geometry_effects(path: &BezierPath, effects: &[Effect]) -> BezierPa
                     *frequency,
                     *center,
                 );
+                if let Some(rbb) = cur_ref {
+                    let ref_sub = subdivide_for_deformation(&BezierPath::from_rect(rbb), 3.0);
+                    cur_ref = Effect::apply_distort_to_path(
+                        &ref_sub, *kind, *amplitude, *frequency, *center,
+                    )
+                    .bounding_box();
+                }
             }
             Effect::Envelope { mode, cage } => {
-                current = apply_envelope_to_path(&current, *mode, cage);
+                current = apply_envelope_to_path_in_bounds(&current, cur_ref, *mode, cage);
+                if let Some(rbb) = cur_ref {
+                    cur_ref = apply_envelope_to_path_in_bounds(
+                        &BezierPath::from_rect(rbb),
+                        Some(rbb),
+                        *mode,
+                        cage,
+                    )
+                    .bounding_box();
+                }
             }
             Effect::Perspective { quad } => {
-                current = apply_perspective_to_path(&current, quad);
+                current = apply_perspective_to_path_in_bounds(&current, cur_ref, quad);
+                if let Some(rbb) = cur_ref {
+                    cur_ref = apply_perspective_to_path_in_bounds(
+                        &BezierPath::from_rect(rbb),
+                        Some(rbb),
+                        quad,
+                    )
+                    .bounding_box();
+                }
             }
             _ => {}
         }
@@ -266,17 +303,7 @@ pub fn find_transparency_effect(effects: &[Effect]) -> Option<(&TransparencyMode
 /// Extracts symmetry transforms if `effects` contains an [`Effect::Symmetry`], or `[IDENTITY]`.
 #[must_use]
 pub fn symmetry_effect_transforms(effects: &[Effect]) -> Vec<Affine2D> {
-    for eff in effects {
-        if let Effect::Symmetry {
-            axes,
-            mirror,
-            origin,
-        } = eff
-        {
-            return Effect::symmetry_transforms(*axes, *mirror, *origin);
-        }
-    }
-    vec![Affine2D::IDENTITY]
+    Effect::symmetry_transforms_for(effects)
 }
 
 /// Modulates an offscreen-rendered `buffer` (located at `rect_px` on screen) with a
@@ -355,39 +382,7 @@ pub fn apply_transparency_mask(
 /// Computes extra world-mm padding needed around an object for frustum culling (DirtyTileCache).
 #[must_use]
 pub fn effect_bounds_padding_mm(effects: &[Effect]) -> f64 {
-    let mut pad = 0.0_f64;
-    for eff in effects {
-        match eff {
-            Effect::DropShadow {
-                dx_mm,
-                dy_mm,
-                blur_mm,
-                ..
-            } => {
-                pad = pad.max(dx_mm.abs() + blur_mm.abs() * 3.0);
-                pad = pad.max(dy_mm.abs() + blur_mm.abs() * 3.0);
-            }
-            Effect::BlockShadow { dx_mm, dy_mm, .. } => {
-                pad = pad.max(dx_mm.abs().max(dy_mm.abs()) + 2.0);
-            }
-            Effect::Contour {
-                mode: ContourMode::Outside,
-                steps,
-                offset_mm,
-                ..
-            } => {
-                pad = pad.max(f64::from(*steps) * offset_mm.abs() + 2.0);
-            }
-            Effect::Extrude25D { depth, .. } => {
-                pad = pad.max(depth.abs() * 2.0 + 10.0);
-            }
-            Effect::Distort { amplitude, .. } => {
-                pad = pad.max(amplitude.abs() * 2.0 + 2.0);
-            }
-            _ => {}
-        }
-    }
-    pad
+    Effect::effects_bounds_padding_mm(effects)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -424,29 +419,58 @@ fn render_drop_shadow(
         return;
     };
 
-    // Expand offscreen silhouette buffer by full Gaussian kernel radius beyond `clamped`
-    // (NOT clipped to `backend` edges) so tiled rendering produces identical blur values
-    // across 256×256 tile boundaries with zero seams!
-    let desired_margin = if blur_px > 0.2 {
-        (blur_px.ceil() as u32 + 2).min(130)
-    } else {
-        0
-    };
-    let candidate_w = clamped
-        .width
-        .saturating_add(desired_margin.saturating_mul(2));
-    let candidate_h = clamped
-        .height
-        .saturating_add(desired_margin.saturating_mul(2));
-    let (margin, work_w, work_h) = if validate_surface_dimensions(candidate_w, candidate_h).is_ok()
-    {
-        (desired_margin, candidate_w, candidate_h)
-    } else {
-        (0, clamped.width, clamped.height)
-    };
+    // Anchor offscreen shadow rasterization + blur to the UNCLIPPED shadow bounds whenever
+    // within safe surface dimensions so `tiny_skia` edge clipping and `f32` `local_xf`
+    // rounding match bit-for-bit across `256×256` tile boundaries (even for rotated shadows!).
+    let full_x0 = (sb.min_x.floor() - f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_y0 = (sb.min_y.floor() - f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_x1 = (sb.max_x.ceil() + f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_y1 = (sb.max_y.ceil() + f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_w_i64 = full_x1.saturating_sub(full_x0);
+    let full_h_i64 = full_y1.saturating_sub(full_y0);
 
-    let work_x = i64::from(clamped.x) - i64::from(margin);
-    let work_y = i64::from(clamped.y) - i64::from(margin);
+    let (work_x, work_y, work_w, work_h, crop_x, crop_y) = if full_w_i64 > 0
+        && full_h_i64 > 0
+        && full_w_i64 <= 4096
+        && full_h_i64 <= 4096
+        && validate_surface_dimensions(full_w_i64 as u32, full_h_i64 as u32).is_ok()
+    {
+        let cx = (i64::from(clamped.x) - full_x0).max(0) as usize;
+        let cy = (i64::from(clamped.y) - full_y0).max(0) as usize;
+        (
+            full_x0,
+            full_y0,
+            full_w_i64 as u32,
+            full_h_i64 as u32,
+            cx,
+            cy,
+        )
+    } else {
+        let desired_margin = if blur_px > 0.2 {
+            (blur_px.ceil() as u32 + 2).min(130)
+        } else {
+            0
+        };
+        let candidate_w = clamped
+            .width
+            .saturating_add(desired_margin.saturating_mul(2));
+        let candidate_h = clamped
+            .height
+            .saturating_add(desired_margin.saturating_mul(2));
+        let (margin, ww, wh) = if validate_surface_dimensions(candidate_w, candidate_h).is_ok() {
+            (desired_margin, candidate_w, candidate_h)
+        } else {
+            (0, clamped.width, clamped.height)
+        };
+        (
+            i64::from(clamped.x) - i64::from(margin),
+            i64::from(clamped.y) - i64::from(margin),
+            ww,
+            wh,
+            margin as usize,
+            margin as usize,
+        )
+    };
 
     let Ok(mut sub) = TinySkiaBackend::new(work_w, work_h) else {
         return;
@@ -464,28 +488,33 @@ fn render_drop_shadow(
         orig_buf.rgba.clone()
     };
 
-    // Crop the interior `[margin .. margin + clamped.width, margin .. margin + clamped.height]`
+    // Crop the interior `[crop_x .. crop_x + clamped.width, crop_y .. crop_y + clamped.height]`
     let eff_alpha_scale = (f32::from(ca) / 255.0) * op;
     let cw = clamped.width as usize;
     let ch = clamped.height as usize;
     let ww = work_w as usize;
-    let m = margin as usize;
+    let wh = work_h as usize;
     let mut final_rgba = Vec::with_capacity(cw * ch * 4);
     for ly in 0..ch {
-        let src_row_off = (ly + m) * ww + m;
+        let sy = ly + crop_y;
         for lx in 0..cw {
-            let pidx = (src_row_off + lx) * 4;
-            let oa = orig_buf.rgba[pidx + 3];
-            let ba = blurred[pidx + 3];
-            let shaped_a = match feather {
-                FeatherDirection::Middle | FeatherDirection::Average => ba,
-                FeatherDirection::Inside => ba.min(oa),
-                FeatherDirection::Outside => oa.max(ba),
-            };
-            let out_a = (f32::from(shaped_a) * eff_alpha_scale)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            final_rgba.extend_from_slice(&[cr, cg, cb, out_a]);
+            let sx = lx + crop_x;
+            if sx < ww && sy < wh {
+                let pidx = (sy * ww + sx) * 4;
+                let oa = orig_buf.rgba[pidx + 3];
+                let ba = blurred[pidx + 3];
+                let shaped_a = match feather {
+                    FeatherDirection::Middle | FeatherDirection::Average => ba,
+                    FeatherDirection::Inside => ba.min(oa),
+                    FeatherDirection::Outside => oa.max(ba),
+                };
+                let out_a = (f32::from(shaped_a) * eff_alpha_scale)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                final_rgba.extend_from_slice(&[cr, cg, cb, out_a]);
+            } else {
+                final_rgba.extend_from_slice(&[cr, cg, cb, 0]);
+            }
         }
     }
     let shadow_buf = RgbaBuffer {
@@ -782,23 +811,46 @@ fn compute_blend_steps(
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
 ) -> Vec<ComputedBlendStep> {
-    let n_steps = steps.clamp(1, 64);
-    let Some(target_obj) = doc.objects.get(&target_id) else {
+    let n_steps = steps.clamp(1, 999);
+    let Some(target_obj) = doc.object(target_id) else {
         return Vec::new();
     };
     let Some(target_world_path) = doc.world_path_of(target_id) else {
         return Vec::new();
     };
 
-    const SAMPLES: usize = 64;
-    let Some(src_ring) = resample_primary_contour(src_world_path, SAMPLES) else {
-        return Vec::new();
-    };
-    let Some(dst_ring) = resample_primary_contour(&target_world_path, SAMPLES) else {
-        return Vec::new();
-    };
-    let src_center = centroid(&src_ring);
-    let dst_center = centroid(&dst_ring);
+    const SAMPLES: usize = 72;
+    let mut contour_pairs: Vec<(Vec<Point2D>, Vec<Point2D>, Point2D, Point2D)> = Vec::new();
+    let pair_count = src_world_path
+        .subpaths
+        .len()
+        .min(target_world_path.subpaths.len());
+    for s_idx in 0..pair_count {
+        let s_bp = BezierPath::from_subpath(src_world_path.subpaths[s_idx].clone());
+        let t_bp = BezierPath::from_subpath(target_world_path.subpaths[s_idx].clone());
+        if let (Some(sr), Some(dr)) = (
+            resample_primary_contour(&s_bp, SAMPLES),
+            resample_primary_contour(&t_bp, SAMPLES),
+        ) {
+            let sc = centroid(&sr);
+            let dc = centroid(&dr);
+            contour_pairs.push((sr, dr, sc, dc));
+        }
+    }
+    if contour_pairs.is_empty() {
+        let Some(sr) = resample_primary_contour(src_world_path, SAMPLES) else {
+            return Vec::new();
+        };
+        let Some(dr) = resample_primary_contour(&target_world_path, SAMPLES) else {
+            return Vec::new();
+        };
+        let sc = centroid(&sr);
+        let dc = centroid(&dr);
+        contour_pairs.push((sr, dr, sc, dc));
+    }
+
+    let src_root = centroid(&contour_pairs.iter().map(|p| p.2).collect::<Vec<_>>());
+    let dst_root = centroid(&contour_pairs.iter().map(|p| p.3).collect::<Vec<_>>());
     let host_path = along_path.and_then(|pid| doc.world_path_of(pid));
 
     let src_fill = primary_fill_color(&src_obj.fill);
@@ -810,27 +862,31 @@ fn compute_blend_steps(
     for i in 1..=n_steps {
         let t = f64::from(i) / f64::from(n_steps + 1);
         let tf = t as f32;
-        let center_lerp = src_center.lerp(dst_center, t);
+        let center_lerp = src_root.lerp(dst_root, t);
         let target_center = host_path
             .as_ref()
             .and_then(|hp| hp.point_and_tangent_at_t(t))
             .map_or(center_lerp, |(pt, _)| pt);
         let angle = rot_total_rad * t;
 
-        let mut pts = Vec::with_capacity(SAMPLES);
-        for k in 0..SAMPLES {
-            let local_src = src_ring[k] - src_center;
-            let local_dst = dst_ring[k] - dst_center;
-            let local_interp = Vec2D::new(
-                local_src.x + (local_dst.x - local_src.x) * t,
-                local_src.y + (local_dst.y - local_src.y) * t,
-            );
-            let rotated = if angle.abs() > 1e-6 {
-                local_interp.rotate(angle)
-            } else {
-                local_interp
-            };
-            pts.push(target_center + rotated);
+        let mut step_subpaths = Vec::with_capacity(contour_pairs.len());
+        for (src_ring, dst_ring, _, _) in &contour_pairs {
+            let mut pts = Vec::with_capacity(SAMPLES);
+            for k in 0..SAMPLES {
+                let local_src = src_ring[k] - src_root;
+                let local_dst = dst_ring[k] - dst_root;
+                let local_interp = Vec2D::new(
+                    local_src.x + (local_dst.x - local_src.x) * t,
+                    local_src.y + (local_dst.y - local_src.y) * t,
+                );
+                let rotated = if angle.abs() > 1e-6 {
+                    local_interp.rotate(angle)
+                } else {
+                    local_interp
+                };
+                pts.push(target_center + rotated);
+            }
+            step_subpaths.push(coree_core::fit_cubic_bezier_subpath(&pts, true, 0.03));
         }
 
         let w_mm = if has_outline {
@@ -841,7 +897,9 @@ fn compute_blend_steps(
             None
         };
         out.push(ComputedBlendStep {
-            path: BezierPath::from_polygon(pts, true),
+            path: BezierPath {
+                subpaths: step_subpaths,
+            },
             fill: src_fill.lerp(&dst_fill, tf),
             opacity: src_obj.opacity + (target_obj.opacity - src_obj.opacity) * tf,
             outline_width_mm: w_mm,
@@ -897,11 +955,19 @@ fn render_blend_effect(
 }
 
 /// Applies Envelope bilinear/Coons cage deformation to `path`.
-fn apply_envelope_to_path(path: &BezierPath, mode: EnvelopeMode, cage: &[Point2D]) -> BezierPath {
+fn apply_envelope_to_path_in_bounds(
+    path: &BezierPath,
+    ref_bounds: Option<coree_core::Rect2D>,
+    mode: EnvelopeMode,
+    cage: &[Point2D],
+) -> BezierPath {
     if cage.len() < 4 || path.is_empty() || !cage.iter().all(|p| p.is_finite()) {
         return path.clone();
     }
-    let Some(bb) = path.bounding_box() else {
+    let Some(bb) = ref_bounds
+        .filter(|r| r.is_finite())
+        .or_else(|| path.bounding_box())
+    else {
         return path.clone();
     };
     let w = bb.width().max(1e-6);
@@ -964,11 +1030,18 @@ fn apply_envelope_to_path(path: &BezierPath, mode: EnvelopeMode, cage: &[Point2D
 }
 
 /// Applies true 3x3 projective homography warp onto `quad` `[TL, TR, BR, BL]`.
-fn apply_perspective_to_path(path: &BezierPath, quad: &[Point2D; 4]) -> BezierPath {
+fn apply_perspective_to_path_in_bounds(
+    path: &BezierPath,
+    ref_bounds: Option<coree_core::Rect2D>,
+    quad: &[Point2D; 4],
+) -> BezierPath {
     if path.is_empty() || !quad.iter().all(|p| p.is_finite()) {
         return path.clone();
     }
-    let Some(bb) = path.bounding_box() else {
+    let Some(bb) = ref_bounds
+        .filter(|r| r.is_finite())
+        .or_else(|| path.bounding_box())
+    else {
         return path.clone();
     };
     let w = bb.width().max(1e-6);
@@ -1159,7 +1232,7 @@ pub fn sanitize_bezier_path(path: BezierPath) -> BezierPath {
 
 /// Breaks all non-destructive [`Effect`]s on `obj` apart into standalone editable vector
 /// [`SceneObject`] primitives (underlay shadows/extrusions/contours/blends, deformed base shape,
-/// overlay inside-contours/bevels, and Symmetry copies), matching CorelDRAW `Ctrl+K` (*Break
+/// overlay inside-contours/bevels, and Symmetry copies), matching `Ctrl+K` (*Break
 /// Effect Group Apart*).
 ///
 /// If `obj` has no effects, returns an empty vector.
@@ -1541,7 +1614,7 @@ mod tests {
 
         let pieces = lower_effects_to_primitives(
             &doc,
-            &doc.objects[&obj.id],
+            doc.object(obj.id).unwrap(),
             Affine2D::IDENTITY,
             &mut || {
                 let id = ObjectId(next_id);

@@ -1,7 +1,7 @@
 # Brand Specification — `coree`
 
-Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](file:///run/media/ahmed/DATA/coreldraw%20me/replica/fixes.md):
-> For print shops, sign makers, and laser/vinyl cutting workshops who are sick of expensive subscriptions, server lockouts, and Windows-only lock-in just to open `.cdr` files and drive production machinery, **`coree`** is a fast, native Linux & Windows pure-Rust vector production studio with lossless `.cdr` round-tripping, native CMYK prepress, and built-in `CutContour` dielines — free forever under MPL-2.0, completely offline.
+Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](fixes.md):
+> For print shops, sign makers, and laser/vinyl cutting workshops who are sick of expensive subscriptions, server lockouts, and Windows-only lock-in just to open `.cdr` files and drive production machinery, **`coree`** is a fast, native Linux & Windows pure-Rust vector production studio with lossless `.cdr` round-tripping, native CMYK prepress, and built-in `CutContour` dielines — free forever under `MIT OR Apache-2.0`, completely offline.
 
 ---
 
@@ -28,7 +28,7 @@ Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](
 
 ## 2. Trademark, Domain, Store & Handle Checks
 
-> **Honest Status Rule:** No live legal/registrar/registry searches were executed during offline design specification. Every check below is marked **`to run`**. Screening checks are **not** legal clearance; consult a trademark attorney before investing in a public brand launch.
+> **Honest Status & `MND-01` Legal Governance Decision (`v0.3.1+`):** `coree` is retained as the active project brand for `v0.3.1+`, with Class 9 trademark clearance explicitly logged as **pending external legal counsel review** prior to any commercial trademark filing or paid promotion. No live legal/registrar/registry searches were executed during offline development; every check below remains **`to run`**. Screening checks are **not** legal clearance — consult a trademark attorney before investing in a public commercial launch. Fallback zero-overlap names (`Platen`, `Burin`, `NodePress`, `Caliper`) remain prepared if counsel advises greater distance.
 
 | candidate | US trademark (`tmsearch.uspto.gov`, class 9 & 42) | EU trademark (`euipo.europa.eu` / TMview) | Canada (`ised-isde.canada.ca`) | Global (WIPO Global Brand DB) | Domain (`whois` / registrar) | Linux / App Stores (Flathub, Snap, MS Store, Mac) | Handles (GitHub, X, Mastodon, YouTube) | Web (`"<name>" vector graphics`) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -42,7 +42,7 @@ Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](
 
 ## 3. Clean-Room Brand Palette (WCAG 2.2 Verified)
 
-`coree` deliberately avoids Corel's signature emerald green (`#009c4a`, hue ~148°) and bright balloon trade dress. Instead, `coree` adopts a **Neutral Graphite + Electric Cobalt + Studio Amber** industrial precision palette defined in [tokens.json](file:///run/media/ahmed/DATA/coreldraw%20me/replica/design/tokens.json):
+`coree` deliberately avoids Corel's signature emerald green (`#009c4a`, hue ~148°) and bright balloon trade dress. Instead, `coree` adopts a **Neutral Graphite + Electric Cobalt + Studio Amber** industrial precision palette defined in [tokens.json](design/tokens.json):
 
 | role | token | hex | purpose | contrast check (`contrast.py`) |
 | --- | --- | --- | --- | --- |
@@ -108,12 +108,30 @@ Grounds `coree`'s identity in the recommended positioning angle from [fixes.md](
 
 ---
 
-## 6. Rebrand Sweep Gate (`brand.json`)
+## 6. Rebrand Sweep Gate (`brand.json` & `scripts/brand_sweep.py`)
 
-[brand.json](file:///run/media/ahmed/DATA/coreldraw%20me/replica/brand.json) configures `replica-brand/sweep.py` with Corel's trademarks, company names, domains, and signature green palette so CI and release checks ensure zero leftover third-party brand strings or colors ship inside `crates/` UI/source code:
+[brand.json](brand.json) configures `replica-brand/sweep.py` and the CI wrapper `scripts/brand_sweep.py` with third-party trademarks, company names, domains, signature green hex colors, and an explicit **`mime_allowlist`** so CI and release checks ensure zero leftover third-party brand strings or colors ship inside `crates/` or `packaging/` source code, UI strings, comments, or identifiers.
 
 ```bash
-python3 /home/ahmed/.gemini/config/plugins/replica-skill/skills/replica-brand/sweep.py . --config replica/brand.json
+python3 scripts/brand_sweep.py
+# Local strict mode (verifies against external replica-brand/sweep.py):
+python3 scripts/brand_sweep.py --require-external-sweep
 ```
 
-*(Note: `sweep.py` intentionally skips `replica/` planning docs; legal trademark notices in root `NOTICE` / `README.md` are reviewed explicitly by eye while all `crates/` code, icons, and UI strings must remain 100% clean.)*
+### Documented Technical MIME Allowlist (`MND-01`)
+
+Only canonical technical MIME / ZCF `mimetype` / freedesktop icon identifiers required for `.cdr`/`.cdt` interoperability are allowlisted inside `replica/brand.json` (`mime_allowlist.literals` across `mime_allowlist.allowed_files`). Legacy non-canonical aliases (`application/coreldraw`, `application/x-coreldraw`) were removed from `packaging/linux/coree.desktop`, and `scripts/brand_sweep.py` reads full lines from disk, strips exact delimited allowlisted MIME literals longest-first, verifies each hit matches inside the matched literal, and re-scans the remainder so co-located non-MIME leaks are always rejected:
+
+| Allowlisted Literal | Scope & Purpose | Allowed Files |
+|---|---|---|
+| `application/x-vnd.corel.zcf.draw.document+zip` | ZCF X6–2025 `.cdr` ZIP `mimetype` entry | `crates/coree-cdr/src/cdr_zip.rs`, `crates/coree-cdr/tests/codec_integration.rs` |
+| `application/x-vnd.corel.zcf.draw.template+zip` | ZCF X6–2025 `.cdt` ZIP `mimetype` entry | `crates/coree-cdr/src/cdr_zip.rs` |
+| `application/x-vnd.corel.draw.document+zip` | X4–X5 `.cdr` ZIP `mimetype` entry | `crates/coree-cdr/src/cdr_zip.rs` |
+| `application/x-vnd.corel.draw.template+zip` | X4–X5 `.cdt` ZIP `mimetype` entry | `crates/coree-cdr/src/cdr_zip.rs` |
+| `application/x-vnd.corel.zcf.draw.template` | Shared-MIME-Info `.cdt` ZCF magic match | `packaging/linux/coree-mime.xml` |
+| `application/x-vnd.corel.draw.template` | Shared-MIME-Info `.cdt` ZIP magic match | `packaging/linux/coree-mime.xml` |
+| `application/x-vnd.corel` | Shared-MIME-Info ZCF/ZIP prefix magic match | `packaging/linux/coree-mime.xml` |
+| `application/vnd.corel-draw` | Canonical freedesktop/AppStream/WiX `.cdr` MIME type | `coree-mime.xml`, `coree.desktop`, `coree.thumbnailer`, `io.github.ahrrfy.coree.metainfo.xml`, `install-linux.sh`, `packaging/windows/wix/main.wxs` |
+| `application-vnd.corel-draw` | Canonical freedesktop MIME icon name | `build-appimage.sh`, `build-deb.sh`, `install-linux.sh` |
+
+*(Note: `sweep.py` intentionally skips `replica/` planning docs; legal trademark notices in root `NOTICE` / `README.md` are reviewed explicitly by eye while all `crates/` and `packaging/` files must pass `python3 scripts/brand_sweep.py` with exit code `0`.)*

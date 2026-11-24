@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! End-to-end integration tests for `coree-storage`.
 
 use coree_core::{
     apply_command, Affine2D, BezierPath, Color, ColorMode, ColorPalette, ColorSwatch, CommandOp,
-    Document, Fill, NodePayload, ObjectId, OutlineStyle, Rect2D, SceneObject,
+    Document, Fill, FindQuery, NodePayload, ObjectId, OutlineStyle, Rect2D, ReplaceAction,
+    SceneObject,
 };
 use coree_storage::{
     standard_font_directories, BrushPresetRecord, FontQuery, JobOutcome, JobPool, JobState,
@@ -244,13 +246,13 @@ fn multi_snapshot_crash_recovery_replays_only_post_snapshot_commands_and_purges_
     let db = StorageDb::open(&db_path).unwrap();
 
     let mut doc = Document::new_a4("Packaging Box");
-    let doc_id = doc.id.to_string();
+    let doc_id = doc.id().to_string();
 
     // Snapshot 1 (empty document, seq 0)
     let snap1 = db
         .save_snapshot(
             &doc_id,
-            &doc.title,
+            doc.title(),
             Some(Path::new("/work/box.coree")),
             &doc,
         )
@@ -269,7 +271,7 @@ fn multi_snapshot_crash_recovery_replays_only_post_snapshot_commands_and_purges_
         .with_fill(Fill::Solid(Color::CYAN)),
         None,
     );
-    let obj1_id = ObjectId(doc.next_id);
+    let obj1_id = ObjectId(doc.next_id());
     apply_command(&mut doc, &op1).unwrap();
     db.append_command(&doc_id, 1, &op1).unwrap();
 
@@ -284,7 +286,7 @@ fn multi_snapshot_crash_recovery_replays_only_post_snapshot_commands_and_purges_
     let snap2 = db
         .save_snapshot(
             &doc_id,
-            &doc.title,
+            doc.title(),
             Some(Path::new("/work/box.coree")),
             &doc,
         )
@@ -317,10 +319,10 @@ fn multi_snapshot_crash_recovery_replays_only_post_snapshot_commands_and_purges_
     assert_eq!(unclean[0].pending_journal_ops, 2);
 
     let recovered = db2.recover_document(&doc_id).unwrap();
-    assert_eq!(recovered.pages.len(), 2);
-    assert_eq!(recovered.pages[1].name, "Back");
-    assert_eq!(recovered.objects.len(), 1);
-    assert!(recovered.objects[&obj1_id].outline.is_hairline);
+    assert_eq!(recovered.pages().len(), 2);
+    assert_eq!(recovered.pages()[1].name, "Back");
+    assert_eq!(recovered.objects().len(), 1);
+    assert!(recovered.object(obj1_id).unwrap().outline.is_hairline);
     let bounds = recovered.object_bounds(obj1_id).unwrap();
     assert!((bounds.min_x - 25.0).abs() < 1e-6);
     assert!((bounds.min_y - 30.0).abs() < 1e-6);
@@ -503,10 +505,10 @@ fn job_pool_runs_concurrent_jobs_non_blocking_and_cancels_cleanly() {
 fn regression_5_reopen_after_clean_close_session_apis_and_bounds() {
     let db = StorageDb::open_in_memory().unwrap();
     let mut doc = Document::new_a4("Reopen Test");
-    let doc_id = doc.id.to_string();
+    let doc_id = doc.id().to_string();
 
     // Session 1: snapshot + op seq 1 + clean close
-    let snap1 = db.save_snapshot(&doc_id, &doc.title, None, &doc).unwrap();
+    let snap1 = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
     let op1 = CommandOp::AddPage {
         name: "Session 1 Page".into(),
         width_mm: 210.0,
@@ -519,7 +521,7 @@ fn regression_5_reopen_after_clean_close_session_apis_and_bounds() {
     assert!(db.list_unclean_sessions().unwrap().is_empty());
 
     // Session 2: reopen the SAME doc_id and start seq=1 again (must NOT hit UNIQUE collision!)
-    let snap2 = db.save_snapshot(&doc_id, &doc.title, None, &doc).unwrap();
+    let snap2 = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
     assert_ne!(snap1.session_id, snap2.session_id);
     assert_eq!(snap2.last_command_seq, 0);
 
@@ -532,12 +534,12 @@ fn regression_5_reopen_after_clean_close_session_apis_and_bounds() {
     db.append_command(&doc_id, 1, &op2).unwrap();
 
     let recovered = db.recover_document(&doc_id).unwrap();
-    assert_eq!(recovered.pages.len(), 3);
-    assert_eq!(recovered.pages[2].name, "Session 2 Page");
+    assert_eq!(recovered.pages().len(), 3);
+    assert_eq!(recovered.pages()[2].name, "Session 2 Page");
 
     // Session-scoped APIs: mark_session_clean_close & recover_session
     let recovered_s1 = db.recover_session(&doc_id, &snap1.session_id).unwrap();
-    assert_eq!(recovered_s1.pages.len(), 2);
+    assert_eq!(recovered_s1.pages().len(), 2);
     assert_eq!(
         db.mark_session_clean_close(&doc_id, &snap2.session_id)
             .unwrap(),
@@ -553,7 +555,7 @@ fn regression_5_reopen_after_clean_close_session_apis_and_bounds() {
         bleed_mm: 0.0,
     };
     db.append_command(&doc_id, 1, &op3).unwrap();
-    let snap3 = db.save_snapshot(&doc_id, &doc.title, None, &doc).unwrap();
+    let snap3 = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
     assert_ne!(snap3.session_id, snap2.session_id);
     assert_eq!(snap3.last_command_seq, 1);
 
@@ -803,4 +805,753 @@ fn regression_7_symlinked_fonts_cycle_guard_and_large_limit() {
         !parsed_faces[0].supports_arabic_rtl,
         "cmap fmt4 raw_gid + idDelta == 0 (mod 65536) must be treated as missing glyph 0"
     );
+}
+
+#[test]
+fn w1b_wal_snapshot_and_command_journal_replay_new_ops() {
+    use coree_core::find_replace::{
+        ColorMatch, FindQuery, FindScope, ReplaceAction, TextMatchMode,
+    };
+    use coree_core::{
+        ArtisticText, CommandHistory, ObjectStyle, PageId, ParametricShape, PowerClipFitMode,
+        SymbolDef, TextStyle, Unit,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("wal_new_ops.db");
+    let db = StorageDb::open(&db_path).unwrap();
+
+    let mut base_doc = Document::new_a4("WAL New Ops");
+    let p1_id: PageId = base_doc.pages()[0].id;
+    let l1_id = base_doc.pages()[0].layers[0].id;
+    let rect_obj = SceneObject::new(
+        ObjectId(0),
+        "Rect1",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: coree_core::CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::CYAN));
+    let rect_id = base_doc.add_object(rect_obj, Some(l1_id)).unwrap();
+    let txt_obj = SceneObject::new(
+        ObjectId(0),
+        "Txt1",
+        NodePayload::ArtisticText(ArtisticText::from_plain("Alpha", TextStyle::default())),
+    );
+    let _txt_id = base_doc.add_object(txt_obj, Some(l1_id)).unwrap();
+    let child_obj = SceneObject::new(
+        ObjectId(0),
+        "ClipChild",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 5.0, 5.0))),
+    );
+    let child_id = base_doc.add_object(child_obj, Some(l1_id)).unwrap();
+
+    let doc_id = base_doc.id().to_string();
+    let session_info = db
+        .save_snapshot(&doc_id, base_doc.title(), None, &base_doc)
+        .unwrap();
+
+    let sym = SymbolDef::new(
+        "WalSym",
+        vec![SceneObject::new(
+            ObjectId(0),
+            "S",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 8.0, 8.0))),
+        )],
+    );
+    let sym_id = sym.id;
+    let style = ObjectStyle::new("WalStyle");
+    let style_id = style.id;
+
+    let ops = vec![
+        CommandOp::SetDocumentProperties {
+            title: Some("WAL Updated".to_owned()),
+            color_mode: None,
+            default_unit: Some(Unit::Inch),
+            dpi: Some(150.0),
+            multipage_view: Some(true),
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+        },
+        CommandOp::SetPageProperties {
+            page_id: p1_id,
+            name: Some("WAL Page 1".to_owned()),
+            width_mm: Some(150.0),
+            height_mm: Some(200.0),
+            bleed_mm: Some(3.0),
+            facing_pages: Some(true),
+        },
+        CommandOp::UpsertSymbol { symbol: sym },
+        CommandOp::InstantiateSymbol {
+            symbol_id: sym_id,
+            layer_id: Some(l1_id),
+            transform: Affine2D::translate(15.0, 15.0),
+            name: Some("WalSymInst".to_owned()),
+        },
+        CommandOp::UpsertObjectStyle { style },
+        CommandOp::SetObjectStyleLink {
+            ids: vec![rect_id],
+            style_id: Some(style_id),
+        },
+        CommandOp::CreatePowerClip {
+            container_id: rect_id,
+            content_ids: vec![child_id],
+        },
+        CommandOp::FitPowerClip {
+            id: rect_id,
+            mode: PowerClipFitMode::FitContents,
+        },
+        CommandOp::FindAndReplace {
+            query: FindQuery {
+                scope: FindScope::WholeDocument,
+                text_pattern: Some((
+                    "Alpha".to_owned(),
+                    TextMatchMode::Contains {
+                        case_sensitive: true,
+                    },
+                )),
+                fill_color: None,
+                ..FindQuery::default()
+            },
+            action: ReplaceAction::ReplaceText {
+                find: "Alpha".to_owned(),
+                replace_with: "Omega".to_owned(),
+                case_sensitive: true,
+            },
+        },
+        CommandOp::FindAndReplace {
+            query: FindQuery {
+                fill_color: Some(ColorMatch::exact(Color::CYAN)),
+                ..FindQuery::default()
+            },
+            action: ReplaceAction::ReplaceFillColor {
+                color: Color::MAGENTA,
+            },
+        },
+    ];
+
+    let mut live_doc = base_doc.clone();
+    let mut hist = CommandHistory::default();
+    for (idx, op) in ops.into_iter().enumerate() {
+        let seq = (idx + 1) as u64;
+        db.append_command(&doc_id, seq, &op).unwrap();
+        hist.execute(&mut live_doc, op).unwrap();
+    }
+
+    let recovered = db
+        .recover_session(&doc_id, &session_info.session_id)
+        .unwrap();
+    let mut rec_json = serde_json::to_value(&recovered).unwrap();
+    let mut live_json = serde_json::to_value(&live_doc).unwrap();
+    rec_json["metadata"]["modified_at"] = serde_json::json!("normalized");
+    live_json["metadata"]["modified_at"] = serde_json::json!("normalized");
+    assert_eq!(
+        rec_json, live_json,
+        "WAL replay of all new CommandOp variants must match live execution across every field"
+    );
+    // Avoid unused import warning if apply_command isn't used below
+    let _ = apply_command;
+}
+
+#[test]
+fn wal_command_journal_replays_w1b_r4_command_ops_exactly() {
+    use coree_core::{
+        CommandHistory, CornerStyle, MasterLayerScope, ParametricShape, RasterAsset,
+        RasterLayerData,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("wal_r4.db")).unwrap();
+
+    let mut base_doc = Document::new_a4("WAL-R4");
+    let p1_id = base_doc.pages()[0].id;
+    let l1_id = base_doc.pages()[0].layers[0].id;
+    let extra_layer = base_doc
+        .add_layer(p1_id, "TempEmpty", false, MasterLayerScope::None)
+        .unwrap();
+    let shape_id = base_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Shape1",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 10.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            ),
+            Some(l1_id),
+        )
+        .unwrap();
+
+    let doc_id = base_doc.id().to_string();
+    let snap = db
+        .save_snapshot(&doc_id, base_doc.title(), None, &base_doc)
+        .unwrap();
+
+    let asset = RasterAsset::new(2, 2, vec![99u8; 16], 150.0, ColorMode::Rgb).unwrap();
+    let aid = asset.id;
+    let detached_id = ObjectId(base_doc.next_id().max(1));
+    let detached_obj = SceneObject::new(
+        detached_id,
+        "DetachedRaster",
+        NodePayload::Raster(RasterLayerData {
+            asset_id: aid,
+            width_mm: 10.0,
+            height_mm: 10.0,
+            filters: Vec::new(),
+            crop_rect: None,
+        }),
+    );
+    let group_id = ObjectId(detached_id.0 + 1);
+    let group_obj = SceneObject::new(
+        group_id,
+        "ImportedGroup",
+        NodePayload::Group(vec![detached_id]),
+    );
+
+    let ops = vec![
+        CommandOp::EditShape {
+            id: shape_id,
+            shape: ParametricShape::Rectangle {
+                width: 30.0,
+                height: 15.0,
+                corner_radii: [4.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            },
+        },
+        CommandOp::DeleteLayer {
+            layer_id: extra_layer,
+        },
+        CommandOp::Batch(vec![
+            CommandOp::RegisterAsset { asset },
+            CommandOp::create_detached_object(detached_obj),
+            CommandOp::create_object(group_obj, Some(l1_id)),
+        ]),
+    ];
+
+    let mut live_doc = base_doc.clone();
+    let mut hist = CommandHistory::default();
+    for (idx, op) in ops.into_iter().enumerate() {
+        db.append_command(&doc_id, (idx + 1) as u64, &op).unwrap();
+        hist.execute(&mut live_doc, op).unwrap();
+    }
+
+    let recovered = db.recover_session(&doc_id, &snap.session_id).unwrap();
+    let mut rec_json = serde_json::to_value(&recovered).unwrap();
+    let mut live_json = serde_json::to_value(&live_doc).unwrap();
+    rec_json["metadata"]["modified_at"] = serde_json::json!("normalized");
+    live_json["metadata"]["modified_at"] = serde_json::json!("normalized");
+    assert_eq!(rec_json, live_json);
+}
+
+#[test]
+fn wal_standalone_register_asset_recovery_parity() {
+    use coree_core::{CommandHistory, RasterAsset};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("wal_standalone_asset.db")).unwrap();
+
+    let base_doc = Document::new_a4("Standalone-Asset-WAL");
+    let doc_id = base_doc.id().to_string();
+    db.save_snapshot(&doc_id, base_doc.title(), None, &base_doc)
+        .unwrap();
+
+    let asset = RasterAsset::new(2, 2, vec![123u8; 16], 300.0, ColorMode::Rgb).unwrap();
+    let op = CommandOp::RegisterAsset {
+        asset: asset.clone(),
+    };
+
+    let mut live_doc = base_doc;
+    let mut hist = CommandHistory::default();
+    db.append_command(&doc_id, 1, &op).unwrap();
+    hist.execute(&mut live_doc, op).unwrap();
+
+    let recovered = db.recover_document(&doc_id).unwrap();
+    assert_eq!(
+        recovered.assets(),
+        live_doc.assets(),
+        "StorageDb::recover_document must match live_doc.assets() for standalone RegisterAsset"
+    );
+    assert_eq!(recovered.asset(asset.id), Some(&asset));
+}
+
+#[test]
+fn wal_max_history_eviction_parity_standalone_and_two_step() {
+    use coree_core::{CommandHistory, CornerStyle, ParametricShape, RasterAsset};
+
+    // Case 1: Standalone RegisterAsset -> RenameObject -> RenameObject (max_history = 2)
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("wal_max_history_eviction.db")).unwrap();
+
+    let mut base1 = Document::new_a4("Evict-Standalone");
+    let l1 = base1.pages()[0].layers[0].id;
+    let obj1 = base1
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Box",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 10.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            ),
+            Some(l1),
+        )
+        .unwrap();
+    let doc1_id = base1.id().to_string();
+    let snap1 = db
+        .save_snapshot(&doc1_id, base1.title(), None, &base1)
+        .unwrap();
+
+    let standalone_asset = RasterAsset::new(2, 2, vec![77u8; 16], 150.0, ColorMode::Rgb).unwrap();
+    let mut live1 = base1.clone();
+    let mut hist1 = CommandHistory::new(2);
+    let mut seq1 = 0u64;
+    for op in [
+        CommandOp::RegisterAsset {
+            asset: standalone_asset,
+        },
+        CommandOp::RenameObject {
+            id: obj1,
+            new_name: "Box1".into(),
+        },
+        CommandOp::RenameObject {
+            id: obj1,
+            new_name: "Box2".into(),
+        },
+    ] {
+        db.execute_and_journal(&doc1_id, &mut seq1, &mut hist1, &mut live1, op)
+            .unwrap();
+    }
+    assert!(
+        live1.assets().is_empty(),
+        "evicted standalone RegisterAsset must be pruned from live_doc"
+    );
+
+    let mut replayed1 = base1;
+    CommandHistory::replay_log(&mut replayed1, &hist1.command_log()).unwrap();
+    let rec_doc1 = db.recover_document(&doc1_id).unwrap();
+    let rec_sess1 = db.recover_session(&doc1_id, &snap1.session_id).unwrap();
+    assert_eq!(live1.assets(), replayed1.assets());
+    assert_eq!(live1.assets(), rec_doc1.assets());
+    assert_eq!(live1.assets(), rec_sess1.assets());
+
+    // Case 2: Two-step RegisterAsset -> SetFill(BitmapPattern) -> SetFill(Solid) -> Rename -> Rename
+    let mut base2 = Document::new_a4("Evict-TwoStep");
+    let l2 = base2.pages()[0].layers[0].id;
+    let obj2 = base2
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Target",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 25.0,
+                    height: 15.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            ),
+            Some(l2),
+        )
+        .unwrap();
+    let doc2_id = base2.id().to_string();
+    let snap2 = db
+        .save_snapshot(&doc2_id, base2.title(), None, &base2)
+        .unwrap();
+
+    let pat_asset = RasterAsset::new(2, 2, vec![88u8; 16], 300.0, ColorMode::Rgb).unwrap();
+    let pat_aid = pat_asset.id;
+    let mut live2 = base2.clone();
+    let mut hist2 = CommandHistory::new(2);
+    let mut seq2 = 0u64;
+    for op in [
+        CommandOp::RegisterAsset { asset: pat_asset },
+        CommandOp::SetFill {
+            ids: vec![obj2],
+            fill: Fill::BitmapPattern {
+                image_id: pat_aid,
+                tile_w: 10.0,
+                tile_h: 10.0,
+            },
+        },
+        CommandOp::SetFill {
+            ids: vec![obj2],
+            fill: Fill::Solid(Color::CYAN),
+        },
+        CommandOp::RenameObject {
+            id: obj2,
+            new_name: "T1".into(),
+        },
+        CommandOp::RenameObject {
+            id: obj2,
+            new_name: "T2".into(),
+        },
+    ] {
+        db.execute_and_journal(&doc2_id, &mut seq2, &mut hist2, &mut live2, op)
+            .unwrap();
+    }
+    assert!(
+        live2.assets().is_empty(),
+        "evicted two-step BitmapPattern asset must be pruned from live_doc"
+    );
+
+    let mut replayed2 = base2;
+    CommandHistory::replay_log(&mut replayed2, &hist2.command_log()).unwrap();
+    let rec_doc2 = db.recover_document(&doc2_id).unwrap();
+    let rec_sess2 = db.recover_session(&doc2_id, &snap2.session_id).unwrap();
+    assert_eq!(live2.assets(), replayed2.assets());
+    assert_eq!(live2.assets(), rec_doc2.assets());
+    assert_eq!(live2.assets(), rec_sess2.assets());
+
+    // Case 3: Active reference retained even after RegisterAsset is evicted beyond max_history
+    let mut base3 = Document::new_a4("Keep-Live-Ref");
+    let l3 = base3.pages()[0].layers[0].id;
+    let obj3 = base3
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "LivePat",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 20.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            ),
+            Some(l3),
+        )
+        .unwrap();
+    let doc3_id = base3.id().to_string();
+    let snap3 = db
+        .save_snapshot(&doc3_id, base3.title(), None, &base3)
+        .unwrap();
+    let live_asset = RasterAsset::new(2, 2, vec![44u8; 16], 300.0, ColorMode::Rgb).unwrap();
+    let live_aid = live_asset.id;
+    let mut live3 = base3;
+    let mut hist3 = CommandHistory::new(2);
+    let mut seq3 = 0u64;
+    for op in [
+        CommandOp::RegisterAsset {
+            asset: live_asset.clone(),
+        },
+        CommandOp::SetFill {
+            ids: vec![obj3],
+            fill: Fill::BitmapPattern {
+                image_id: live_aid,
+                tile_w: 8.0,
+                tile_h: 8.0,
+            },
+        },
+        CommandOp::RenameObject {
+            id: obj3,
+            new_name: "Keep1".into(),
+        },
+        CommandOp::RenameObject {
+            id: obj3,
+            new_name: "Keep2".into(),
+        },
+    ] {
+        db.execute_and_journal(&doc3_id, &mut seq3, &mut hist3, &mut live3, op)
+            .unwrap();
+    }
+    assert_eq!(live3.asset(live_aid), Some(&live_asset));
+    assert_eq!(
+        db.recover_document(&doc3_id).unwrap().assets(),
+        live3.assets()
+    );
+    assert_eq!(
+        db.recover_session(&doc3_id, &snap3.session_id)
+            .unwrap()
+            .assets(),
+        live3.assets()
+    );
+}
+
+#[test]
+fn wal_delete_page_cross_page_relational_cleanup_parity() {
+    use coree_core::{
+        AnchorPoint, ArtisticText, CommandHistory, ConnectorObject, ConnectorStyle, CornerStyle,
+        Effect, ParagraphText, ParametricShape, Point2D, TextOnPath, TextStyle, Vec2D,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("wal_delete_page.db")).unwrap();
+
+    let mut base = Document::new_a4("WAL-DeletePage");
+    let p1_layer = base.pages()[0].layers[0].id;
+    let p2_id = base.add_page("Page 2", 210.0, 297.0, 0.0);
+    let p2_layer = base.page_by_id(p2_id).unwrap().layers[0].id;
+
+    let rect = || {
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        })
+    };
+
+    let p2_target = base
+        .add_object(
+            SceneObject::new(ObjectId(0), "P2Target", rect()),
+            Some(p2_layer),
+        )
+        .unwrap();
+    let p2_path = base
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "P2Path",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::ZERO,
+                    Point2D::new(40.0, 0.0),
+                )),
+            ),
+            Some(p2_layer),
+        )
+        .unwrap();
+
+    let p1_box = base
+        .add_object(
+            SceneObject::new(ObjectId(0), "P1Box", rect()),
+            Some(p1_layer),
+        )
+        .unwrap();
+    let conn_id = base
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Conn",
+                NodePayload::Connector(ConnectorObject::between_objects(
+                    p1_box,
+                    AnchorPoint::Right,
+                    p2_target,
+                    AnchorPoint::Left,
+                    ConnectorStyle::Straight,
+                )),
+            ),
+            Some(p1_layer),
+        )
+        .unwrap();
+    let mut blend_obj = SceneObject::new(ObjectId(0), "BlendObj", rect());
+    blend_obj.effects.push(Effect::Blend {
+        target_id: p2_target,
+        steps: 5,
+        rotation_deg: 0.0,
+        along_path: Some(p2_path),
+    });
+    let blend_id = base.add_object(blend_obj, Some(p1_layer)).unwrap();
+    let top_id = base
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Top",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("PathText", TextStyle::default()),
+                    path_id: p2_path,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(p1_layer),
+        )
+        .unwrap();
+    let frame_c = base
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "FC",
+                NodePayload::ParagraphText(ParagraphText::new(
+                    "C",
+                    Vec2D::new(20.0, 20.0),
+                    TextStyle::default(),
+                )),
+            ),
+            Some(p1_layer),
+        )
+        .unwrap();
+    let mut pb = ParagraphText::new("B", Vec2D::new(20.0, 20.0), TextStyle::default());
+    pb.linked_next_frame = Some(frame_c);
+    let frame_b = base
+        .add_object(
+            SceneObject::new(ObjectId(0), "FB", NodePayload::ParagraphText(pb)),
+            Some(p2_layer),
+        )
+        .unwrap();
+    let mut pa = ParagraphText::new("A", Vec2D::new(20.0, 20.0), TextStyle::default());
+    pa.linked_next_frame = Some(frame_b);
+    let frame_a = base
+        .add_object(
+            SceneObject::new(ObjectId(0), "FA", NodePayload::ParagraphText(pa)),
+            Some(p1_layer),
+        )
+        .unwrap();
+
+    let doc_id = base.id().to_string();
+    let snap = db
+        .save_snapshot(&doc_id, base.title(), None, &base)
+        .unwrap();
+
+    let mut live = base;
+    let mut hist = CommandHistory::default();
+    let mut seq = 0u64;
+    db.execute_and_journal(
+        &doc_id,
+        &mut seq,
+        &mut hist,
+        &mut live,
+        CommandOp::DeletePage { page_id: p2_id },
+    )
+    .unwrap();
+
+    let rec_doc = db.recover_document(&doc_id).unwrap();
+    let rec_sess = db.recover_session(&doc_id, &snap.session_id).unwrap();
+    assert_eq!(rec_doc.objects(), live.objects());
+    assert_eq!(rec_doc.pages(), live.pages());
+    assert_eq!(rec_sess.objects(), live.objects());
+    assert_eq!(rec_sess.pages(), live.pages());
+    assert!(rec_doc.object(blend_id).unwrap().effects.is_empty());
+    assert!(matches!(
+        rec_doc.object(top_id).unwrap().payload,
+        NodePayload::ArtisticText(_)
+    ));
+    if let NodePayload::Connector(ref c) = rec_doc.object(conn_id).unwrap().payload {
+        assert_eq!(c.to_obj, None);
+    } else {
+        panic!("expected Connector");
+    }
+    if let NodePayload::ParagraphText(ref p) = rec_doc.object(frame_a).unwrap().payload {
+        assert_eq!(p.linked_next_frame, Some(frame_c));
+    } else {
+        panic!("expected ParagraphText");
+    }
+}
+
+#[test]
+fn w1b_r11_rejected_nan_commands_never_corrupt_wal_recovery() {
+    use coree_core::{
+        ColorStyle, CommandHistory, CornerStyle, GuideOrientation, OutlineStyle, ParametricShape,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("wal_nan_guard.db")).unwrap();
+
+    let mut doc = Document::new_a4("WAL-NaN-Guard");
+    let l1 = doc.pages()[0].layers[0].id;
+    let rect = SceneObject::new(
+        ObjectId(0),
+        "R",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 15.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    let doc_id = doc.id().to_string();
+    db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+
+    let mut hist = CommandHistory::default();
+    let mut seq = 0u64;
+    db.execute_and_journal(
+        &doc_id,
+        &mut seq,
+        &mut hist,
+        &mut doc,
+        CommandOp::create_object(rect, Some(l1)),
+    )
+    .unwrap();
+    let rect_id = doc.pages()[0].layers[0].objects[0];
+
+    let bad_ops = vec![
+        CommandOp::SetOutline {
+            ids: vec![rect_id],
+            outline: OutlineStyle {
+                width_mm: f64::NAN,
+                ..OutlineStyle::solid(Color::BLACK, 1.0)
+            },
+        },
+        CommandOp::AddPage {
+            name: "Bad".into(),
+            width_mm: -5.0,
+            height_mm: 100.0,
+            bleed_mm: 1.0,
+        },
+        CommandOp::AddGuide {
+            orientation: GuideOrientation::Vertical(f64::INFINITY),
+            locked: false,
+        },
+        CommandOp::UpsertColorStyle {
+            style: ColorStyle::new(
+                "Bad",
+                Color::Rgba {
+                    r: f32::NAN,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                None,
+            ),
+        },
+        CommandOp::FindAndReplace {
+            query: FindQuery::default(),
+            action: ReplaceAction::ReplaceOutlineWidth {
+                width_mm: f64::NAN,
+                is_hairline: true,
+            },
+        },
+        CommandOp::FindAndReplace {
+            query: FindQuery::default(),
+            action: ReplaceAction::ReplaceOutlineWidth {
+                width_mm: f64::INFINITY,
+                is_hairline: true,
+            },
+        },
+    ];
+    for bad in bad_ops {
+        assert!(db
+            .execute_and_journal(&doc_id, &mut seq, &mut hist, &mut doc, bad)
+            .is_err());
+    }
+
+    let recovered = db.recover_document(&doc_id).unwrap();
+    assert_eq!(recovered.objects(), doc.objects());
+    assert_eq!(recovered.pages(), doc.pages());
+    let log_json = hist.export_log_json().unwrap();
+    assert_eq!(CommandHistory::import_log_json(&log_json).unwrap().len(), 1);
+
+    // Also verify CommandOp::SetFill updates document_palette deterministically across WAL recovery
+    db.execute_and_journal(
+        &doc_id,
+        &mut seq,
+        &mut hist,
+        &mut doc,
+        CommandOp::SetFill {
+            ids: vec![rect_id],
+            fill: Fill::Solid(Color::CYAN),
+        },
+    )
+    .unwrap();
+    let recovered_fill = db.recover_document(&doc_id).unwrap();
+    assert_eq!(recovered_fill.document_palette(), doc.document_palette());
+    assert_eq!(doc.document_palette().swatches.len(), 1);
 }

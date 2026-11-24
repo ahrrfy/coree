@@ -214,13 +214,103 @@ impl TextEngine {
         })
     }
 
+    /// Measures the shaped horizontal advance width (in mm) of a single `TextRun` using `FontSystem`.
+    #[must_use]
+    pub fn measure_run_advance_mm(&mut self, run: &TextRun) -> f64 {
+        if run.text.is_empty() {
+            return 0.0;
+        }
+        let font_px = (run.style.font_size_mm() as f32 * LAYOUT_UNITS_PER_MM).max(4.0);
+        let metrics = Metrics::new(font_px, font_px * 1.2);
+        let has_arabic = contains_arabic(&run.text);
+        let dir = if has_arabic {
+            TextDirection::Rtl
+        } else {
+            TextDirection::Ltr
+        };
+        let fam_owned: Option<String> = {
+            let fam = self.resolve_family(run.style.family_for_direction(dir), has_arabic);
+            match fam {
+                Family::Name(n) => Some(n.to_owned()),
+                _ => None,
+            }
+        };
+        let fam = fam_owned.as_deref().map_or(Family::SansSerif, Family::Name);
+        let attrs = build_attrs(&run.style, fam, 0);
+        let mut buf = Buffer::new(&mut self.font_system, metrics);
+        {
+            let mut b = buf.borrow_with(&mut self.font_system);
+            b.set_wrap(Wrap::None);
+            b.set_size(None, None);
+            b.set_text(&run.text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(false);
+        }
+        let w_px = buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+        f64::from(w_px) / f64::from(LAYOUT_UNITS_PER_MM)
+    }
+
+    fn preprocess_runs_for_kashida_shaped(
+        &mut self,
+        runs: &[TextRun],
+        block_align: TextAlign,
+        col_width_mm: Option<f64>,
+    ) -> Vec<TextRun> {
+        let mut measured_widths = Vec::with_capacity(runs.len());
+        for run in runs {
+            let stretch = sanitize_f32(run.style.kashida_stretch, 0.0).clamp(0.0, 2.0);
+            let want_kashida = block_align == TextAlign::ForceJustifyKashida
+                || run.style.align == TextAlign::ForceJustifyKashida
+                || stretch > 0.01;
+            if want_kashida
+                && contains_arabic(&run.text)
+                && col_width_mm.is_some()
+                && stretch <= 0.01
+            {
+                let text_w = self.measure_run_advance_mm(run);
+                let sample_tat =
+                    self.measure_run_advance_mm(&TextRun::new("\u{0640}", run.style.clone()));
+                measured_widths.push(Some((text_w, sample_tat.max(0.25))));
+            } else {
+                measured_widths.push(None);
+            }
+        }
+        runs.iter()
+            .zip(measured_widths)
+            .map(|(run, shaped)| {
+                let stretch = sanitize_f32(run.style.kashida_stretch, 0.0).clamp(0.0, 2.0);
+                let want_kashida = block_align == TextAlign::ForceJustifyKashida
+                    || run.style.align == TextAlign::ForceJustifyKashida
+                    || stretch > 0.01;
+                if !want_kashida || !contains_arabic(&run.text) {
+                    return run.clone();
+                }
+                let tatweels = if stretch > 0.01 {
+                    (stretch * 2.5).round().clamp(1.0, 5.0) as usize
+                } else if let (Some(cw), Some((raw_w, tat_w))) = (col_width_mm, shaped) {
+                    let words = run.text.split_whitespace().count().max(1);
+                    if cw > raw_w {
+                        let gap_per_word = (cw - raw_w) / (words as f64);
+                        (gap_per_word / tat_w).round().clamp(1.0, 6.0) as usize
+                    } else {
+                        1
+                    }
+                } else {
+                    2
+                };
+                let mut cloned = run.clone();
+                cloned.text = apply_kashida_elongation(&run.text, tatweels);
+                cloned
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn layout_artistic_pieces(&mut self, text: &ArtisticText) -> Vec<ShapedGlyphDraw> {
         if text.runs.is_empty() {
             return Vec::new();
         }
         let direction = text.effective_direction();
-        let processed_runs = preprocess_runs_for_kashida(&text.runs, text.align, None);
+        let processed_runs = self.preprocess_runs_for_kashida_shaped(&text.runs, text.align, None);
         let default_style = processed_runs
             .first()
             .map_or_else(TextStyle::default, |r| r.style.clone());
@@ -299,7 +389,8 @@ impl TextEngine {
         let col_w_px = (col_w_mm as f32) * LAYOUT_UNITS_PER_MM;
         let frame_h_px = (frame_h_mm as f32) * LAYOUT_UNITS_PER_MM;
 
-        let processed_runs = preprocess_runs_for_kashida(&para.runs, para.align, Some(col_w_mm));
+        let processed_runs =
+            self.preprocess_runs_for_kashida_shaped(&para.runs, para.align, Some(col_w_mm));
         let default_style = processed_runs
             .first()
             .map_or_else(TextStyle::default, |r| r.style.clone());
@@ -438,7 +529,8 @@ impl TextEngine {
             return Vec::new();
         }
         let direction = top.text.effective_direction();
-        let processed_runs = preprocess_runs_for_kashida(&top.text.runs, top.text.align, None);
+        let processed_runs =
+            self.preprocess_runs_for_kashida_shaped(&top.text.runs, top.text.align, None);
         let default_style = processed_runs
             .first()
             .map_or_else(TextStyle::default, |r| r.style.clone());
@@ -876,7 +968,7 @@ struct GlyphSnapshot {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_text_pieces(
+pub(crate) fn draw_text_pieces(
     backend: &mut dyn CanvasBackend,
     pieces: &[ShapedGlyphDraw],
     transform: Affine2D,
@@ -978,19 +1070,12 @@ fn build_attrs<'a>(style: &TextStyle, family: Family<'a>, run_idx: usize) -> Att
     attrs
 }
 
-fn map_align(align: TextAlign, direction: TextDirection) -> Align {
+fn map_align(align: TextAlign, _direction: TextDirection) -> Align {
     match align {
         TextAlign::Left => Align::Left,
         TextAlign::Center => Align::Center,
         TextAlign::Right => Align::Right,
-        TextAlign::Justify => Align::Justified,
-        TextAlign::ForceJustifyKashida => {
-            if direction == TextDirection::Rtl {
-                Align::Right
-            } else {
-                Align::Justified
-            }
-        }
+        TextAlign::Justify | TextAlign::ForceJustifyKashida => Align::Justified,
     }
 }
 
@@ -1146,42 +1231,6 @@ fn find_best_kashida_index(chars: &[char]) -> Option<usize> {
         }
     }
     best.map(|(_, idx)| idx)
-}
-
-fn preprocess_runs_for_kashida(
-    runs: &[TextRun],
-    block_align: TextAlign,
-    col_width_mm: Option<f64>,
-) -> Vec<TextRun> {
-    runs.iter()
-        .map(|run| {
-            let stretch = sanitize_f32(run.style.kashida_stretch, 0.0).clamp(0.0, 2.0);
-            let want_kashida = block_align == TextAlign::ForceJustifyKashida
-                || run.style.align == TextAlign::ForceJustifyKashida
-                || stretch > 0.01;
-            if !want_kashida || !contains_arabic(&run.text) {
-                return run.clone();
-            }
-            let tatweels = if stretch > 0.01 {
-                (stretch * 2.5).round().clamp(1.0, 5.0) as usize
-            } else if let Some(cw) = col_width_mm {
-                let char_w = (run.style.font_size_mm() * 0.45).max(1.0);
-                let words = run.text.split_whitespace().count().max(1);
-                let raw_w = (run.text.chars().count() as f64) * char_w;
-                if cw > raw_w {
-                    let gap_per_word = (cw - raw_w) / (words as f64);
-                    (gap_per_word / (char_w * 0.8)).round().clamp(1.0, 4.0) as usize
-                } else {
-                    1
-                }
-            } else {
-                2
-            };
-            let mut cloned = run.clone();
-            cloned.text = apply_kashida_elongation(&run.text, tatweels);
-            cloned
-        })
-        .collect()
 }
 
 fn merge_paths(iter: impl IntoIterator<Item = BezierPath>) -> BezierPath {

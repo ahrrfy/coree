@@ -9,29 +9,102 @@
 
 use crate::backend::{
     BackendPaint, CanvasBackend, FillRule, PaintShader, PixelRect, RgbaBuffer, StrokeParams,
-    TinySkiaBackend,
+    TinySkiaBackend, MAX_SURFACE_DIM_PX, MAX_SURFACE_PIXELS,
 };
 use crate::effects_render::{
-    apply_geometry_effects, apply_transparency_mask, effect_bounds_padding_mm,
-    find_transparency_effect, render_overlay_effects, render_underlay_effects,
-    symmetry_effect_transforms,
+    apply_geometry_effects, apply_geometry_effects_in_bounds, apply_transparency_mask,
+    effect_bounds_padding_mm, find_transparency_effect, render_overlay_effects,
+    render_underlay_effects, symmetry_effect_transforms,
 };
-use crate::lens_render::{render_lens_object, FrozenLensSnapshot};
+use crate::hit_test::resolve_connector_endpoints_with_sym;
+use crate::lens_render::{render_lens_object_with_backdrop, BackdropItem, FrozenLensSnapshot};
 use crate::raster_engine::apply_raster_filters;
-use crate::text_layout::TextEngine;
+use crate::text_layout::{draw_text_pieces, ShapedGlyphDraw, TextEngine};
 use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
-    apply_soft_proof_rgba_with_profile, Affine2D, ArrowheadStyle, ArtisticText, BezierPath,
-    BlendMode, BuiltinIccProfile, Color, DimensionKind, DimensionObject, Document, Fill,
-    GuideOrientation, IccProfile, Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId,
-    OutlineStyle, Page, PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D,
-    RenderingIntent, SceneObject, SpatialIndex, Subpath, SymbolDef, Vec2D, VectorTable,
+    Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, BuiltinIccProfile, Color,
+    DimensionKind, DimensionObject, Document, Effect, Fill, GuideOrientation, IccProfile, Layer,
+    MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page, PerspectiveGridMode,
+    Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject, SoftProofLut3D,
+    SpatialIndex, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
 /// Maximum scene recursion depth matching `coree-core`.
 const MAX_RENDER_DEPTH: usize = 64;
+
+pub(crate) type SymRenderCtx<'a> = (&'a HashMap<ObjectId, &'a SceneObject>, Affine2D);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeformFrame<'a> {
+    pub(crate) group_local_bb: Option<Rect2D>,
+    pub(crate) group_effects: &'a [Effect],
+    pub(crate) rel_to_outer: Affine2D,
+}
+
+#[inline]
+pub(crate) fn apply_deform_chain_in_bounds(
+    path: &BezierPath,
+    c_xf: Affine2D,
+    frames: &[DeformFrame<'_>],
+) -> BezierPath {
+    let mut cur = path.transformed(&c_xf);
+    for frame in frames.iter().rev() {
+        cur = apply_geometry_effects_in_bounds(&cur, frame.group_local_bb, frame.group_effects);
+        if frame.rel_to_outer != Affine2D::IDENTITY {
+            cur = cur.transformed(&frame.rel_to_outer);
+        }
+    }
+    cur
+}
+
+fn sym_object_world_xf(
+    id: ObjectId,
+    sym_root_xf: &Affine2D,
+    sym_map: &HashMap<ObjectId, &SceneObject>,
+) -> Option<Affine2D> {
+    let mut chain = Vec::new();
+    let mut cur = id;
+    let mut seen = HashSet::new();
+    while seen.insert(cur) {
+        let obj = sym_map.get(&cur).copied()?;
+        chain.push(obj.transform);
+        let parent = sym_map.iter().find_map(|(&pid, po)| match &po.payload {
+            NodePayload::Group(c) if c.contains(&cur) => Some(pid),
+            NodePayload::PowerClip { contents, .. } if contents.contains(&cur) => Some(pid),
+            _ => None,
+        });
+        match parent {
+            Some(pid) => cur = pid,
+            None => break,
+        }
+    }
+    let mut xf = *sym_root_xf;
+    for local in chain.into_iter().rev() {
+        xf = xf.compose(&local);
+    }
+    Some(xf)
+}
+
+fn resolve_sym_world_path(
+    doc: &Document,
+    path_id: ObjectId,
+    sym_ctx: Option<SymRenderCtx<'_>>,
+) -> Option<BezierPath> {
+    if let Some((sym_map, sym_root_xf)) = sym_ctx {
+        if let Some(sub) = sym_map.get(&path_id).copied() {
+            let p_xf = sym_object_world_xf(path_id, &sym_root_xf, sym_map)?;
+            return match &sub.payload {
+                NodePayload::Path(p) => Some(p.transformed(&p_xf)),
+                NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&p_xf)),
+                NodePayload::PowerClip { container, .. } => Some(container.transformed(&p_xf)),
+                _ => None,
+            };
+        }
+    }
+    doc.world_path_of(path_id)
+}
 
 /// Configurable chrome, guides, color proofing, and surface styling for [`SceneRenderer`].
 #[derive(Debug, Clone)]
@@ -134,12 +207,13 @@ impl PageLayout {
 /// Computes world-space page placements for single-page or side-by-side Multipage View.
 #[must_use]
 pub fn compute_page_layouts(doc: &Document, multipage_view: bool, gap_mm: f64) -> Vec<PageLayout> {
-    if doc.pages.is_empty() {
+    let pages = doc.pages();
+    if pages.is_empty() {
         return Vec::new();
     }
     if !multipage_view {
-        let idx = doc.active_page_index.min(doc.pages.len() - 1);
-        let p = &doc.pages[idx];
+        let idx = doc.active_page_index().min(pages.len() - 1);
+        let p = &pages[idx];
         return vec![PageLayout {
             page_index: idx,
             origin_mm: Point2D::ZERO,
@@ -149,14 +223,10 @@ pub fn compute_page_layouts(doc: &Document, multipage_view: bool, gap_mm: f64) -
     }
 
     let gap = sanitize_f64(gap_mm, 20.0).max(0.0);
-    let max_h = doc
-        .pages
-        .iter()
-        .map(|p| p.height_mm)
-        .fold(0.0_f64, f64::max);
+    let max_h = pages.iter().map(|p| p.height_mm).fold(0.0_f64, f64::max);
     let mut cursor_x = 0.0_f64;
-    let mut layouts = Vec::with_capacity(doc.pages.len());
-    for (idx, p) in doc.pages.iter().enumerate() {
+    let mut layouts = Vec::with_capacity(pages.len());
+    for (idx, p) in pages.iter().enumerate() {
         let y = (max_h - p.height_mm) * 0.5;
         layouts.push(PageLayout {
             page_index: idx,
@@ -169,10 +239,57 @@ pub fn compute_page_layouts(doc: &Document, multipage_view: bool, gap_mm: f64) -
     layouts
 }
 
-/// Stateful Pure-Rust 2D scene renderer caching typography and frozen lens snapshots.
+pub(crate) const FROZEN_TAG_SYM_INST: u64 = 0x5359_4d49;
+pub(crate) const FROZEN_TAG_SYM_BRANCH: u64 = 0x5359_4d42;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FrozenLensKey {
+    pub object_id: ObjectId,
+    pub scope_hash: u64,
+}
+
+#[inline]
+pub(crate) fn compute_frozen_scope_hash(stack: &[u64], sym_root_idx: Option<usize>) -> u64 {
+    if stack.is_empty() && sym_root_idx.is_none() {
+        return 0;
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for &v in stack {
+        for b in v.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    if let Some(idx) = sym_root_idx {
+        h ^= 0xa5;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+        for b in (idx as u64).to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Stateful Pure-Rust 2D scene renderer caching typography, soft-proof LUTs, and frozen lens snapshots.
 pub struct SceneRenderer {
     text_engine: TextEngine,
-    frozen_lenses: HashMap<ObjectId, FrozenLensSnapshot>,
+    frozen_lenses: HashMap<FrozenLensKey, FrozenLensSnapshot>,
+    soft_proof_cache: Option<(
+        Option<u64>,
+        BuiltinIccProfile,
+        RenderingIntent,
+        SoftProofLut3D,
+    )>,
+    pub(crate) force_offscreen_lens_backdrop: bool,
+    pub(crate) parent_xf_override: Option<(ObjectId, Affine2D)>,
+    pub(crate) frozen_scope_stack: Vec<u64>,
+    pub(crate) current_sym_root_idx: Option<usize>,
+    active_symbols: HashSet<SymbolId>,
 }
 
 impl Default for SceneRenderer {
@@ -188,7 +305,39 @@ impl SceneRenderer {
         Self {
             text_engine: TextEngine::new(),
             frozen_lenses: HashMap::new(),
+            soft_proof_cache: None,
+            force_offscreen_lens_backdrop: false,
+            parent_xf_override: None,
+            frozen_scope_stack: Vec::new(),
+            current_sym_root_idx: None,
+            active_symbols: HashSet::new(),
         }
+    }
+
+    pub(crate) fn copy_frozen_lenses_from(&mut self, other: &Self) {
+        self.frozen_lenses = other.frozen_lenses.clone();
+        self.force_offscreen_lens_backdrop = other.force_offscreen_lens_backdrop;
+        self.parent_xf_override = other.parent_xf_override;
+    }
+
+    pub(crate) fn get_or_build_soft_proof_lut(
+        &mut self,
+        custom_profile_bytes: Option<&[u8]>,
+        fallback: BuiltinIccProfile,
+        intent: RenderingIntent,
+    ) -> &SoftProofLut3D {
+        let profile_hash = custom_profile_bytes.map(fnv1a_64);
+        let cache_hit = self
+            .soft_proof_cache
+            .as_ref()
+            .is_some_and(|(h, f, i, _)| *h == profile_hash && *f == fallback && *i == intent);
+        if !cache_hit {
+            let parsed = custom_profile_bytes.and_then(|bytes| IccProfile::from_bytes(bytes).ok());
+            let lut =
+                SoftProofLut3D::build_for_profile_or_builtin(parsed.as_ref(), fallback, intent);
+            self.soft_proof_cache = Some((profile_hash, fallback, intent, lut));
+        }
+        &self.soft_proof_cache.as_ref().expect("populated").3
     }
 
     /// Mutable access to the internal [`TextEngine`].
@@ -196,25 +345,307 @@ impl SceneRenderer {
         &mut self.text_engine
     }
 
-    /// Returns a cached frozen lens snapshot if one exists for `id`.
+    /// Returns a cached frozen lens snapshot if one exists for top-level `id`.
     #[must_use]
     pub fn get_frozen_lens(&self, id: ObjectId) -> Option<&FrozenLensSnapshot> {
-        self.frozen_lenses.get(&id)
+        self.frozen_lenses.get(&FrozenLensKey {
+            object_id: id,
+            scope_hash: 0,
+        })
     }
 
-    /// Stores a frozen lens snapshot for `id`.
+    /// Stores a frozen lens snapshot for top-level `id`.
     pub fn store_frozen_lens(&mut self, id: ObjectId, snap: FrozenLensSnapshot) {
-        self.frozen_lenses.insert(id, snap);
+        self.frozen_lenses.insert(
+            FrozenLensKey {
+                object_id: id,
+                scope_hash: 0,
+            },
+            snap,
+        );
     }
 
-    /// Removes any cached frozen lens snapshot for `id`.
+    /// Removes any cached frozen lens snapshots associated with `id`.
     pub fn remove_frozen_lens(&mut self, id: ObjectId) {
-        self.frozen_lenses.remove(&id);
+        self.frozen_lenses.retain(|k, _| k.object_id != id);
     }
 
     /// Clears all cached frozen lens snapshots.
     pub fn clear_frozen_lenses(&mut self) {
         self.frozen_lenses.clear();
+    }
+
+    #[inline]
+    pub(crate) fn current_frozen_lens_key(&self, id: ObjectId) -> FrozenLensKey {
+        FrozenLensKey {
+            object_id: id,
+            scope_hash: compute_frozen_scope_hash(
+                &self.frozen_scope_stack,
+                if id.0 == 0 {
+                    self.current_sym_root_idx
+                } else {
+                    None
+                },
+            ),
+        }
+    }
+
+    pub(crate) fn get_frozen_lens_key(&self, key: FrozenLensKey) -> Option<&FrozenLensSnapshot> {
+        self.frozen_lenses.get(&key)
+    }
+
+    pub(crate) fn store_frozen_lens_key(&mut self, key: FrozenLensKey, snap: FrozenLensSnapshot) {
+        self.frozen_lenses.insert(key, snap);
+    }
+
+    pub(crate) fn remove_frozen_lens_key(&mut self, key: FrozenLensKey) {
+        self.frozen_lenses.remove(&key);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_frozen_warm_check(
+        &self,
+        doc: &Document,
+        obj: &SceneObject,
+        sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+        sym_root_idx: Option<usize>,
+        scope_stack: &mut Vec<u64>,
+        visiting_objs: &mut HashSet<ObjectId>,
+        visiting_syms: &mut HashSet<SymbolId>,
+        expand_own_sym: bool,
+        already_entered_sym_inst: bool,
+        depth: usize,
+    ) -> bool {
+        let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
+        if depth > MAX_RENDER_DEPTH || !obj.visible || obj_opacity <= 1e-6 {
+            return false;
+        }
+        let sym_count = if expand_own_sym {
+            symmetry_effect_transforms(&obj.effects).len()
+        } else {
+            1
+        };
+        for branch_idx in 0..sym_count {
+            let prev_len = scope_stack.len();
+            if expand_own_sym && branch_idx > 0 {
+                scope_stack.extend_from_slice(&[
+                    FROZEN_TAG_SYM_BRANCH,
+                    obj.id.0,
+                    branch_idx as u64,
+                ]);
+            }
+            if obj.lens.as_ref().is_some_and(|l| l.frozen)
+                && matches!(
+                    obj.payload,
+                    NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::PowerClip { .. }
+                )
+            {
+                let key = FrozenLensKey {
+                    object_id: obj.id,
+                    scope_hash: compute_frozen_scope_hash(
+                        scope_stack,
+                        if obj.id.0 == 0 { sym_root_idx } else { None },
+                    ),
+                };
+                if !self.frozen_lenses.contains_key(&key) {
+                    scope_stack.truncate(prev_len);
+                    return true;
+                }
+            }
+            let hit = match &obj.payload {
+                NodePayload::Group(children) => children.iter().any(|&cid| {
+                    if !visiting_objs.insert(cid) {
+                        return false;
+                    }
+                    let cobj = sym_map
+                        .and_then(|m| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid));
+                    let found = cobj.is_some_and(|c| {
+                        self.visit_frozen_warm_check(
+                            doc,
+                            c,
+                            sym_map,
+                            None,
+                            scope_stack,
+                            visiting_objs,
+                            visiting_syms,
+                            true,
+                            false,
+                            depth + 1,
+                        )
+                    });
+                    visiting_objs.remove(&cid);
+                    found
+                }),
+                NodePayload::PowerClip { contents, .. } => {
+                    if obj.lens.is_some() {
+                        false
+                    } else {
+                        contents.iter().any(|&cid| {
+                            if !visiting_objs.insert(cid) {
+                                return false;
+                            }
+                            let cobj = sym_map
+                                .and_then(|m| m.get(&cid).copied())
+                                .or_else(|| doc.object(cid));
+                            let found = cobj.is_some_and(|c| {
+                                self.visit_frozen_warm_check(
+                                    doc,
+                                    c,
+                                    sym_map,
+                                    None,
+                                    scope_stack,
+                                    visiting_objs,
+                                    visiting_syms,
+                                    true,
+                                    false,
+                                    depth + 1,
+                                )
+                            });
+                            visiting_objs.remove(&cid);
+                            found
+                        })
+                    }
+                }
+                NodePayload::SymbolInstance(sym_id) => {
+                    if !visiting_syms.insert(*sym_id) {
+                        false
+                    } else {
+                        let found = doc.symbol(*sym_id).is_some_and(|sym| {
+                            let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                            let mut referenced: HashSet<ObjectId> = HashSet::new();
+                            for sub in &sym.objects {
+                                if sub.id.0 != 0 {
+                                    child_map.insert(sub.id, sub);
+                                }
+                                match &sub.payload {
+                                    NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                    NodePayload::PowerClip { contents, .. } => {
+                                        referenced.extend(contents.iter().copied());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let sym_prev_len = scope_stack.len();
+                            if !already_entered_sym_inst {
+                                let sym_u128 = sym_id.0.as_u128();
+                                scope_stack.extend_from_slice(&[
+                                    FROZEN_TAG_SYM_INST,
+                                    sym_u128 as u64,
+                                    (sym_u128 >> 64) as u64,
+                                    obj.id.0,
+                                    sym_root_idx.map_or(u64::MAX, |i| i as u64),
+                                ]);
+                            }
+                            let saved_objs = std::mem::take(visiting_objs);
+                            let inner_hit = sym.objects.iter().enumerate().any(|(idx, sub)| {
+                                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                    return false;
+                                }
+                                if sub.id.0 != 0 && !visiting_objs.insert(sub.id) {
+                                    return false;
+                                }
+                                let r_idx = if sub.id.0 == 0 { Some(idx) } else { None };
+                                let res = self.visit_frozen_warm_check(
+                                    doc,
+                                    sub,
+                                    Some(&child_map),
+                                    r_idx,
+                                    scope_stack,
+                                    visiting_objs,
+                                    visiting_syms,
+                                    true,
+                                    false,
+                                    depth + 1,
+                                );
+                                if sub.id.0 != 0 {
+                                    visiting_objs.remove(&sub.id);
+                                }
+                                res
+                            });
+                            *visiting_objs = saved_objs;
+                            scope_stack.truncate(sym_prev_len);
+                            inner_hit
+                        });
+                        visiting_syms.remove(sym_id);
+                        found
+                    }
+                }
+                _ => false,
+            };
+            scope_stack.truncate(prev_len);
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn subtree_has_unwarmed_frozen_lens_in_branch(
+        &self,
+        doc: &Document,
+        obj: &SceneObject,
+        sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+        already_entered_sym_inst: bool,
+    ) -> bool {
+        let mut scope_stack = self.frozen_scope_stack.clone();
+        let mut visiting_objs = if obj.id.0 != 0 {
+            HashSet::from([obj.id])
+        } else {
+            HashSet::new()
+        };
+        let mut visiting_syms = HashSet::new();
+        self.visit_frozen_warm_check(
+            doc,
+            obj,
+            sym_map,
+            self.current_sym_root_idx,
+            &mut scope_stack,
+            &mut visiting_objs,
+            &mut visiting_syms,
+            false,
+            already_entered_sym_inst,
+            0,
+        )
+    }
+
+    /// Returns `true` if any visible frozen lens in `doc` lacks a cached snapshot.
+    #[must_use]
+    pub fn has_unwarmed_frozen_lens(&self, doc: &Document, multipage: bool) -> bool {
+        let layouts = compute_page_layouts(doc, multipage, 20.0);
+        let mut scope_stack = Vec::new();
+        let mut visiting_objs = HashSet::new();
+        let mut visiting_syms = HashSet::new();
+        for layout in layouts {
+            for layer in collect_effective_layers(doc, layout.page_index) {
+                if !layer.visible {
+                    continue;
+                }
+                for &oid in &layer.objects {
+                    let Some(obj) = doc.object(oid) else {
+                        continue;
+                    };
+                    visiting_objs.clear();
+                    visiting_objs.insert(oid);
+                    visiting_syms.clear();
+                    if self.visit_frozen_warm_check(
+                        doc,
+                        obj,
+                        None,
+                        None,
+                        &mut scope_stack,
+                        &mut visiting_objs,
+                        &mut visiting_syms,
+                        true,
+                        false,
+                        0,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Renders `doc` into `backend` according to `viewport`, `view_mode`, and `options`.
@@ -255,12 +686,12 @@ impl SceneRenderer {
         backend.set_flatten_tolerance(viewport.lod_flatten_tolerance_mm());
         backend.clear(options.canvas_bg.clone());
 
-        let multipage = viewport.multipage_view || doc.multipage_view;
+        let multipage = viewport.multipage_view || doc.multipage_view();
         let layouts = compute_page_layouts(doc, multipage, options.multipage_gap_mm);
         let px_per_mm = viewport.px_per_mm();
 
         for layout in &layouts {
-            let Some(page) = doc.pages.get(layout.page_index) else {
+            let Some(page) = doc.page(layout.page_index) else {
                 continue;
             };
             let page_to_surface = world_to_surface
@@ -287,18 +718,16 @@ impl SceneRenderer {
                     for &oid in &layer.objects {
                         if is_master {
                             set.insert(oid);
-                        } else if let Some(obj) = doc.objects.get(&oid) {
-                            if obj.lens.is_some()
-                                || obj.effects.iter().any(|e| {
-                                    matches!(
-                                        e,
-                                        coree_core::Effect::Blend { .. }
-                                            | coree_core::Effect::Symmetry { .. }
-                                            | coree_core::Effect::Perspective { .. }
-                                            | coree_core::Effect::Envelope { .. }
-                                    )
-                                })
-                            {
+                        } else if let Some(obj) = doc.object(oid) {
+                            let mut visiting_objs = HashSet::from([oid]);
+                            let mut visiting_syms = HashSet::new();
+                            if object_has_nonlocal_effect_or_lens(
+                                doc,
+                                obj,
+                                &mut visiting_objs,
+                                &mut visiting_syms,
+                                0,
+                            ) {
                                 set.insert(oid);
                             }
                         }
@@ -308,7 +737,7 @@ impl SceneRenderer {
             });
 
             // 3. Render objects in strict back-to-front z-order, tracking underlying objects for Lenses
-            let mut rendered_so_far: Vec<ObjectId> = Vec::new();
+            let mut rendered_so_far: Vec<BackdropItem> = Vec::new();
             for layer in &layers {
                 if !layer.visible {
                     continue;
@@ -318,7 +747,7 @@ impl SceneRenderer {
                         .as_ref()
                         .is_none_or(|allowed| allowed.contains(&oid));
                     if should_draw {
-                        self.render_object_by_id(
+                        self.render_object_by_id_with_backdrop(
                             doc,
                             Some(page),
                             oid,
@@ -331,7 +760,7 @@ impl SceneRenderer {
                             0,
                         );
                     }
-                    rendered_so_far.push(oid);
+                    rendered_so_far.push(BackdropItem::Object(oid));
                 }
             }
         }
@@ -341,15 +770,13 @@ impl SceneRenderer {
         if (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe {
             let mut buf = backend.snapshot_rgba();
             if !buf.is_empty() {
-                let custom_icc = doc
-                    .custom_icc_profile
-                    .as_deref()
-                    .and_then(|bytes| IccProfile::from_bytes(bytes).ok());
-                apply_soft_proof_rgba_with_profile(
-                    &mut buf.rgba,
-                    custom_icc.as_ref(),
+                let lut = self.get_or_build_soft_proof_lut(
+                    doc.custom_icc_profile(),
                     options.proof_profile,
                     options.proof_intent,
+                );
+                lut.apply_rgba(
+                    &mut buf.rgba,
                     options.soft_proof_cmyk,
                     options.gamut_warning,
                 );
@@ -365,7 +792,7 @@ impl SceneRenderer {
 
         // 5. Page overlays: Grid, Bleed/Margin guides, Perspective Grid, Guidelines
         for layout in &layouts {
-            let Some(page) = doc.pages.get(layout.page_index) else {
+            let Some(page) = doc.page(layout.page_index) else {
                 continue;
             };
             let page_to_surface = world_to_surface
@@ -387,23 +814,72 @@ impl SceneRenderer {
         backend: &mut dyn CanvasBackend,
     ) {
         let xf = viewport.world_to_screen_transform();
-        self.render_object_by_id(
-            doc,
-            None,
-            obj_id,
-            xf,
-            xf,
-            view_mode,
-            options,
-            backend,
-            &[],
-            0,
-        );
+        let parent_world = doc
+            .parent_container_of(obj_id)
+            .and_then(|pid| doc.world_transform_of(pid))
+            .unwrap_or(Affine2D::IDENTITY);
+        let parent_to_screen = xf.compose(&parent_world);
+        let has_lens = doc.object(obj_id).is_some_and(|obj| {
+            let mut visit = HashSet::from([obj_id]);
+            crate::export_render::object_or_subtree_has_lens(doc, obj, 0, &mut visit)
+        });
+        if has_lens {
+            let page_idx = crate::export_render::find_object_page_index(doc, obj_id);
+            let page = doc.pages().get(page_idx);
+            let mut underlying_items = Vec::new();
+            let layers = collect_effective_layers(doc, page_idx);
+            'layer_loop: for layer in layers {
+                if !layer.visible {
+                    continue;
+                }
+                for &oid in &layer.objects {
+                    let mut sub_visit = HashSet::new();
+                    if crate::export_render::collect_underlying_until(
+                        doc,
+                        oid,
+                        obj_id,
+                        &mut underlying_items,
+                        0,
+                        &mut sub_visit,
+                    ) {
+                        break 'layer_loop;
+                    }
+                }
+            }
+            let prev_force = self.force_offscreen_lens_backdrop;
+            self.force_offscreen_lens_backdrop = true;
+            self.render_object_by_id_with_backdrop(
+                doc,
+                page,
+                obj_id,
+                xf,
+                parent_to_screen,
+                view_mode,
+                options,
+                backend,
+                &underlying_items,
+                0,
+            );
+            self.force_offscreen_lens_backdrop = prev_force;
+        } else {
+            self.render_object_by_id_with_backdrop(
+                doc,
+                None,
+                obj_id,
+                xf,
+                parent_to_screen,
+                view_mode,
+                options,
+                backend,
+                &[],
+                0,
+            );
+        }
     }
 
     /// Recursive scene-graph object renderer.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render_object_by_id(
+    pub(crate) fn render_object_by_id_with_backdrop(
         &mut self,
         doc: &Document,
         page: Option<&Page>,
@@ -413,25 +889,62 @@ impl SceneRenderer {
         view_mode: ViewMode,
         options: &RenderOptions,
         backend: &mut dyn CanvasBackend,
-        underlying_ids: &[ObjectId],
+        underlying: &[BackdropItem],
+        depth: usize,
+    ) {
+        self.render_object_by_id_with_sym(
+            doc,
+            page,
+            id,
+            page_to_surface,
+            parent_to_screen,
+            None,
+            Affine2D::IDENTITY,
+            view_mode,
+            options,
+            backend,
+            underlying,
+            depth,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_object_by_id_with_sym(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        id: ObjectId,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        ancestor_world_sym_xf: Affine2D,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
         depth: usize,
     ) {
         if depth > MAX_RENDER_DEPTH {
             return;
         }
-        let Some(obj) = doc.objects.get(&id) else {
+        let Some(obj) = sym_ctx
+            .and_then(|(m, _)| m.get(&id).copied())
+            .or_else(|| doc.object(id))
+        else {
             return;
         };
-        self.render_scene_object(
+        self.render_scene_object_with_sym(
             doc,
             page,
             obj,
             page_to_surface,
             parent_to_screen,
+            sym_ctx,
+            ancestor_world_sym_xf,
             view_mode,
             options,
             backend,
-            underlying_ids,
+            underlying,
             depth,
         );
     }
@@ -450,6 +963,73 @@ impl SceneRenderer {
         underlying_ids: &[ObjectId],
         depth: usize,
     ) {
+        let items: Vec<BackdropItem> = underlying_ids
+            .iter()
+            .copied()
+            .map(BackdropItem::Object)
+            .collect();
+        self.render_scene_object_with_sym(
+            doc,
+            page,
+            obj,
+            page_to_surface,
+            parent_to_screen,
+            None,
+            Affine2D::IDENTITY,
+            view_mode,
+            options,
+            backend,
+            &items,
+            depth,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_scene_object_with_backdrop(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
+        depth: usize,
+    ) {
+        self.render_scene_object_with_sym(
+            doc,
+            page,
+            obj,
+            page_to_surface,
+            parent_to_screen,
+            None,
+            Affine2D::IDENTITY,
+            view_mode,
+            options,
+            backend,
+            underlying,
+            depth,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_scene_object_with_sym(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        ancestor_world_sym_xf: Affine2D,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
+        depth: usize,
+    ) {
         let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
         if !obj.visible || obj_opacity <= 1e-6 || depth > MAX_RENDER_DEPTH {
             return;
@@ -459,45 +1039,458 @@ impl SceneRenderer {
         }
         let px_per_mm = estimate_scale(&parent_to_screen);
         let sym_transforms = symmetry_effect_transforms(&obj.effects);
+        let parent_world = page_to_surface
+            .inverse()
+            .map(|inv| inv.compose(&parent_to_screen))
+            .filter(|m| m.is_finite())
+            .unwrap_or(Affine2D::IDENTITY);
+        let inv_parent_world = parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
 
-        for sym_xf in sym_transforms {
+        let is_container = matches!(
+            obj.payload,
+            NodePayload::Group(_) | NodePayload::PowerClip { .. } | NodePayload::SymbolInstance(_)
+        );
+        for (sym_branch_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
+            let scope_prev_len = self.frozen_scope_stack.len();
+            let own_world_sym_xf = if sym_xf == Affine2D::IDENTITY {
+                Affine2D::IDENTITY
+            } else {
+                let w = parent_world.compose(&sym_xf).compose(&inv_parent_world);
+                if w.is_finite() {
+                    w
+                } else {
+                    sym_xf
+                }
+            };
+            let mut branch_underlying = if sym_branch_idx > 0 {
+                self.frozen_scope_stack.extend_from_slice(&[
+                    FROZEN_TAG_SYM_BRANCH,
+                    obj.id.0,
+                    sym_branch_idx as u64,
+                ]);
+                is_container.then(|| {
+                    let branch_world_xf = if matches!(obj.payload, NodePayload::SymbolInstance(_)) {
+                        None
+                    } else {
+                        Some(own_world_sym_xf)
+                    };
+                    let mut v = underlying.to_vec();
+                    v.push(BackdropItem::EnterSymmetryBranch {
+                        obj_id: obj.id,
+                        branch_idx: sym_branch_idx,
+                        branch_world_xf,
+                    });
+                    v
+                })
+            } else {
+                None
+            };
+            let effective_underlying = branch_underlying.as_deref().unwrap_or(underlying);
+            let world_sym_xf = own_world_sym_xf.compose(&ancestor_world_sym_xf);
             let effective_parent = parent_to_screen.compose(&sym_xf);
 
             // Check if this object uses an Effect::Transparency alpha mask
-            if view_mode != ViewMode::Wireframe {
-                if let Some((trans_mode, trans_blend)) = find_transparency_effect(&obj.effects) {
-                    self.render_with_transparency_effect(
-                        doc,
-                        page,
-                        obj,
-                        page_to_surface,
-                        effective_parent,
-                        view_mode,
-                        options,
-                        backend,
-                        underlying_ids,
-                        depth,
-                        trans_mode,
-                        trans_blend,
-                    );
-                    continue;
+            let trans_info = if view_mode != ViewMode::Wireframe {
+                find_transparency_effect(&obj.effects)
+            } else {
+                None
+            };
+            if let Some((trans_mode, trans_blend)) = trans_info {
+                self.render_with_transparency_effect(
+                    doc,
+                    page,
+                    obj,
+                    page_to_surface,
+                    effective_parent,
+                    sym_ctx,
+                    world_sym_xf,
+                    view_mode,
+                    options,
+                    backend,
+                    effective_underlying,
+                    depth,
+                    trans_mode,
+                    trans_blend,
+                );
+            } else {
+                self.render_scene_object_core(
+                    doc,
+                    page,
+                    obj,
+                    page_to_surface,
+                    effective_parent,
+                    sym_ctx,
+                    world_sym_xf,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    effective_underlying,
+                    depth,
+                );
+            }
+            if let Some(ref mut v) = branch_underlying {
+                v.push(BackdropItem::ExitSymmetryBranch);
+            }
+            self.frozen_scope_stack.truncate(scope_prev_len);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_object_screen_bounds(
+        doc: &Document,
+        obj: &SceneObject,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        ancestor_world_sym: Affine2D,
+        expand_own_sym: bool,
+        visited_doc: &mut HashSet<ObjectId>,
+        visited_syms: &mut HashSet<SymbolId>,
+        depth: usize,
+    ) -> Option<Rect2D> {
+        if depth > MAX_RENDER_DEPTH
+            || !obj.visible
+            || !page_to_surface.is_finite()
+            || !parent_to_screen.is_finite()
+            || !obj.transform.is_finite()
+        {
+            return None;
+        }
+        if expand_own_sym
+            && obj
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::Symmetry { .. }))
+        {
+            let parent_world = page_to_surface
+                .inverse()
+                .map(|inv| inv.compose(&parent_to_screen))
+                .filter(|m| m.is_finite())
+                .unwrap_or(Affine2D::IDENTITY);
+            let inv_parent_world = parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
+            let mut acc: Option<Rect2D> = None;
+            for sxf in symmetry_effect_transforms(&obj.effects) {
+                let own_wsxf = if sxf == Affine2D::IDENTITY {
+                    Affine2D::IDENTITY
+                } else {
+                    let w = parent_world.compose(&sxf).compose(&inv_parent_world);
+                    if w.is_finite() {
+                        w
+                    } else {
+                        sxf
+                    }
+                };
+                let combined_wsxf = own_wsxf.compose(&ancestor_world_sym);
+                if let Some(sb) = Self::compute_object_screen_bounds(
+                    doc,
+                    obj,
+                    page_to_surface,
+                    parent_to_screen.compose(&sxf),
+                    sym_ctx,
+                    combined_wsxf,
+                    false,
+                    visited_doc,
+                    visited_syms,
+                    depth,
+                ) {
+                    acc = Some(match acc {
+                        Some(prev) => prev.union(sb),
+                        None => sb,
+                    });
                 }
             }
-
-            self.render_scene_object_core(
-                doc,
-                page,
-                obj,
-                page_to_surface,
-                effective_parent,
-                px_per_mm,
-                view_mode,
-                options,
-                backend,
-                underlying_ids,
-                depth,
-            );
+            return acc;
         }
+        let obj_to_screen = parent_to_screen.compose(&obj.transform);
+        if !obj_to_screen.is_finite() {
+            return None;
+        }
+        let active_world_sym = ancestor_world_sym;
+        let obj_to_world = page_to_surface
+            .inverse()
+            .map(|inv| inv.compose(&obj_to_screen))
+            .filter(|m| m.is_finite())
+            .unwrap_or(obj.transform);
+
+        let mut base_sb: Option<Rect2D> = match &obj.payload {
+            NodePayload::Path(p) => apply_geometry_effects(p, &obj.effects)
+                .transformed(&obj_to_screen)
+                .bounding_box(),
+            NodePayload::Shape(s) => apply_geometry_effects(&s.to_bezier_path(), &obj.effects)
+                .transformed(&obj_to_screen)
+                .bounding_box(),
+            NodePayload::PowerClip { container, .. } => {
+                apply_geometry_effects(container, &obj.effects)
+                    .transformed(&obj_to_screen)
+                    .bounding_box()
+            }
+            NodePayload::ArtisticText(t) => {
+                let mut sb = obj_to_screen.try_transform_rect(t.estimated_bounds())?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(t.estimated_bounds().height()),
+                    &mut sb,
+                );
+                Some(sb)
+            }
+            NodePayload::ParagraphText(t) => {
+                let mut sb = obj_to_screen.try_transform_rect(t.bounding_box())?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(t.bounding_box().height()),
+                    &mut sb,
+                );
+                Some(sb)
+            }
+            NodePayload::Raster(r) => {
+                let full = Rect2D::from_xywh(
+                    0.0,
+                    0.0,
+                    sanitize_f64(r.width_mm, 50.0).max(0.1),
+                    sanitize_f64(r.height_mm, 50.0).max(0.1),
+                );
+                let rc = r
+                    .crop_rect
+                    .filter(|c| c.is_finite())
+                    .and_then(|c| c.intersection(full))
+                    .unwrap_or(full);
+                obj_to_screen.try_transform_rect(rc)
+            }
+            NodePayload::Table(t) => {
+                let r = t.to_bounding_box();
+                let mut sb = obj_to_screen.try_transform_rect(r)?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(r.height()),
+                    &mut sb,
+                );
+                Some(sb)
+            }
+            NodePayload::Dimension(d) => {
+                let r = d.bounding_box();
+                let mut sb = obj_to_screen.try_transform_rect(r)?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(r.height()),
+                    &mut sb,
+                );
+                Some(sb)
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                    let parent_world = page_to_surface
+                        .inverse()
+                        .map(|inv| inv.compose(&parent_to_screen))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    let doc_parent_world = doc
+                        .parent_container_of(obj.id)
+                        .and_then(|pid| doc.world_transform_of(pid))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    let delta_xf = if sym_ctx.is_some() {
+                        active_world_sym
+                    } else {
+                        parent_world
+                            .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY))
+                    };
+                    let text_surface_xf = page_to_surface.compose(&delta_xf);
+                    let dist = sanitize_f64(top.distance_mm, 0.0).abs();
+                    let max_font = top
+                        .text
+                        .runs
+                        .iter()
+                        .map(|r| r.style.font_size_mm())
+                        .filter(|v| v.is_finite())
+                        .fold(4.0_f64, f64::max);
+                    let text_margin_mm = dist + max_font * 1.5;
+                    let mut sb = host_path
+                        .transformed(&text_surface_xf)
+                        .bounding_box()
+                        .map(|r| r.expand(text_margin_mm * estimate_scale(&text_surface_xf)))?;
+                    let deform_xf = text_surface_xf.compose(&obj.transform);
+                    Self::expand_screen_bounds_for_deforms(
+                        &obj.effects,
+                        &deform_xf,
+                        host_path.bounding_box().map(|r| r.height()),
+                        &mut sb,
+                    );
+                    Some(sb)
+                } else {
+                    let mut sb = obj_to_screen.try_transform_rect(top.text.estimated_bounds())?;
+                    Self::expand_screen_bounds_for_deforms(
+                        &obj.effects,
+                        &obj_to_screen,
+                        Some(top.text.estimated_bounds().height()),
+                        &mut sb,
+                    );
+                    Some(sb)
+                }
+            }
+            NodePayload::Connector(conn) => {
+                let base_world_xf = active_world_sym
+                    .inverse()
+                    .map(|inv| inv.compose(&obj_to_world))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(obj_to_world);
+                let mut sym_visiting = HashMap::new();
+                let mut sym_cache = HashMap::new();
+                let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                    doc,
+                    conn,
+                    &base_world_xf,
+                    sym_ctx,
+                    &mut sym_visiting,
+                    visited_syms,
+                    &mut sym_cache,
+                    depth + 1,
+                );
+                let route = conn.route_path(a, b);
+                if let Some(inv) = base_world_xf.inverse() {
+                    apply_geometry_effects(&route.transformed(&inv), &obj.effects)
+                        .transformed(&obj_to_screen)
+                        .bounding_box()
+                } else {
+                    let conn_surface_xf = page_to_surface.compose(&active_world_sym);
+                    route.transformed(&conn_surface_xf).bounding_box()
+                }
+            }
+            NodePayload::Group(children) => {
+                let mut acc: Option<Rect2D> = None;
+                for &cid in children {
+                    let from_sym = sym_ctx.and_then(|(m, _)| m.get(&cid).copied());
+                    let child_obj = if from_sym.is_some() {
+                        from_sym
+                    } else {
+                        if !visited_doc.insert(cid) {
+                            continue;
+                        }
+                        doc.object(cid)
+                    };
+                    if let Some(cobj) = child_obj {
+                        if let Some(cb) = Self::compute_object_screen_bounds(
+                            doc,
+                            cobj,
+                            page_to_surface,
+                            obj_to_screen,
+                            sym_ctx,
+                            active_world_sym,
+                            true,
+                            visited_doc,
+                            visited_syms,
+                            depth + 1,
+                        ) {
+                            acc = Some(match acc {
+                                Some(prev) => prev.union(cb),
+                                None => cb,
+                            });
+                        }
+                    }
+                    if from_sym.is_none() {
+                        visited_doc.remove(&cid);
+                    }
+                }
+                if let Some(mut sb) = acc {
+                    let local_h = if sym_ctx.is_none() && obj.id.0 != 0 {
+                        doc.local_object_bounds(obj.id).map(|b| b.height())
+                    } else {
+                        let mut visit = HashSet::new();
+                        Self::compute_children_local_bounds(
+                            doc,
+                            children,
+                            sym_ctx,
+                            Affine2D::IDENTITY,
+                            obj_to_world,
+                            depth + 1,
+                            &mut visit,
+                        )
+                        .map(|b| b.height())
+                    };
+                    Self::expand_screen_bounds_for_deforms(
+                        &obj.effects,
+                        &obj_to_screen,
+                        local_h,
+                        &mut sb,
+                    );
+                    acc = Some(sb);
+                }
+                acc
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if !visited_syms.insert(*sym_id) {
+                    None
+                } else {
+                    let res = doc.symbol(*sym_id).and_then(|sym| {
+                        let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                        let mut referenced: HashSet<ObjectId> = HashSet::new();
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 {
+                                child_map.insert(sub.id, sub);
+                            }
+                            match &sub.payload {
+                                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                NodePayload::PowerClip { contents, .. } => {
+                                    referenced.extend(contents.iter().copied());
+                                }
+                                _ => {}
+                            }
+                        }
+                        let mut acc: Option<Rect2D> = None;
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                continue;
+                            }
+                            if let Some(sb) = Self::compute_object_screen_bounds(
+                                doc,
+                                sub,
+                                page_to_surface,
+                                obj_to_screen,
+                                Some((&child_map, obj_to_world)),
+                                Affine2D::IDENTITY,
+                                true,
+                                visited_doc,
+                                visited_syms,
+                                depth + 1,
+                            ) {
+                                acc = Some(match acc {
+                                    Some(prev) => prev.union(sb),
+                                    None => sb,
+                                });
+                            }
+                        }
+                        acc
+                    });
+                    visited_syms.remove(sym_id);
+                    res
+                }
+            }
+        };
+
+        let scale = estimate_scale(&obj_to_screen).max(estimate_scale(&page_to_surface));
+        for eff in &obj.effects {
+            if let Effect::Blend { target_id, .. } = eff {
+                if let Some(tbb) = doc.world_object_bounds(*target_id) {
+                    if let Some(tsb) = page_to_surface.try_transform_rect(tbb) {
+                        base_sb = Some(match base_sb {
+                            Some(prev) => prev.union(tsb),
+                            None => tsb,
+                        });
+                    }
+                }
+            }
+        }
+        let stroke_pad_mm = if obj.outline.is_visible() {
+            obj.outline.scaled_width_mm_for_transform(&obj_to_world)
+        } else {
+            0.0
+        };
+        let pad_px = (effect_bounds_padding_mm(&obj.effects) + stroke_pad_mm + 2.0) * scale;
+        base_sb.map(|r| r.expand(pad_px.max(4.0)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -508,72 +1501,167 @@ impl SceneRenderer {
         obj: &SceneObject,
         page_to_surface: Affine2D,
         parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        world_sym_xf: Affine2D,
         view_mode: ViewMode,
         options: &RenderOptions,
         backend: &mut dyn CanvasBackend,
-        underlying_ids: &[ObjectId],
+        underlying: &[BackdropItem],
         depth: usize,
         trans_mode: &coree_core::TransparencyMode,
         trans_blend: BlendMode,
     ) {
-        let Some(screen_to_world) = parent_to_screen.inverse() else {
+        let obj_to_screen = parent_to_screen.compose(&obj.transform);
+        let Some(screen_to_local) = obj_to_screen.inverse() else {
             return;
         };
-        // Include geometry-effect deformations (`Distort`/`Envelope`/`Perspective`) in offscreen bounds
-        // so Transparency never clips deformed artwork!
-        let mut world_bounds = doc.object_bounds(obj.id);
-        let deformed_bb = match &obj.payload {
-            NodePayload::Path(p) => Some(apply_geometry_effects(p, &obj.effects)),
-            NodePayload::Shape(s) => {
-                Some(apply_geometry_effects(&s.to_bezier_path(), &obj.effects))
-            }
-            NodePayload::PowerClip { container, .. } => {
-                Some(apply_geometry_effects(container, &obj.effects))
-            }
-            _ => None,
-        }
-        .and_then(|p| p.transformed(&obj.transform).bounding_box());
-        if let Some(dbb) = deformed_bb {
-            world_bounds = Some(match world_bounds {
-                Some(prev) => prev.union(dbb),
-                None => dbb,
-            });
-        }
-        let Some(world_bounds) = world_bounds else {
+        let mut visited_doc = HashSet::new();
+        let mut visited_syms = HashSet::new();
+        let Some(sb) = Self::compute_object_screen_bounds(
+            doc,
+            obj,
+            page_to_surface,
+            parent_to_screen,
+            sym_ctx,
+            world_sym_xf,
+            false,
+            &mut visited_doc,
+            &mut visited_syms,
+            depth,
+        ) else {
             return;
         };
-        let pad = effect_bounds_padding_mm(&obj.effects) + 2.0;
-        let sb = parent_to_screen.transform_rect(world_bounds.expand(pad));
         let Some(clamped) =
             PixelRect::from_f64_rect_clamped(sb, 0, backend.width(), backend.height())
         else {
+            if view_mode != ViewMode::Wireframe
+                && self.subtree_has_unwarmed_frozen_lens_in_branch(
+                    doc,
+                    obj,
+                    sym_ctx.map(|(m, _)| m),
+                    false,
+                )
+            {
+                if let Ok(mut dummy) = TinySkiaBackend::new(1, 1) {
+                    let px_per_mm = estimate_scale(&parent_to_screen);
+                    let prev_force = self.force_offscreen_lens_backdrop;
+                    self.force_offscreen_lens_backdrop = true;
+                    self.render_scene_object_core(
+                        doc,
+                        page,
+                        obj,
+                        page_to_surface,
+                        parent_to_screen,
+                        sym_ctx,
+                        world_sym_xf,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        &mut dummy,
+                        underlying,
+                        depth,
+                    );
+                    self.force_offscreen_lens_backdrop = prev_force;
+                }
+            }
             return;
         };
-        let Ok(mut sub) = TinySkiaBackend::new(clamped.width, clamped.height) else {
-            return;
+        let has_lens = {
+            let mut v = HashSet::from([obj.id]);
+            let mut vs = HashSet::new();
+            crate::export_render::object_or_subtree_has_lens_with_sym(
+                doc,
+                obj,
+                sym_ctx.map(|(m, _)| m),
+                0,
+                &mut v,
+                &mut vs,
+            )
         };
-        sub.clear(Color::TRANSPARENT);
-        let shift = Affine2D::translate(-f64::from(clamped.x), -f64::from(clamped.y));
-        let local_page = shift.compose(&page_to_surface);
-        let local_parent = shift.compose(&parent_to_screen);
-        let px_per_mm = estimate_scale(&parent_to_screen);
-        self.render_scene_object_core(
-            doc,
-            page,
-            obj,
-            local_page,
-            local_parent,
-            px_per_mm,
-            view_mode,
-            options,
-            &mut sub,
-            underlying_ids,
-            depth,
-        );
+        if let Ok(mut sub) = TinySkiaBackend::new(clamped.width, clamped.height) {
+            sub.clear(Color::TRANSPARENT);
+            let shift = Affine2D::translate(-f64::from(clamped.x), -f64::from(clamped.y));
+            let local_page = shift.compose(&page_to_surface);
+            let local_parent = shift.compose(&parent_to_screen);
+            let px_per_mm = estimate_scale(&parent_to_screen);
+            let prev_force = self.force_offscreen_lens_backdrop;
+            if has_lens {
+                self.force_offscreen_lens_backdrop = true;
+            }
+            self.render_scene_object_core(
+                doc,
+                page,
+                obj,
+                local_page,
+                local_parent,
+                sym_ctx,
+                world_sym_xf,
+                px_per_mm,
+                view_mode,
+                options,
+                &mut sub,
+                underlying,
+                depth,
+            );
+            self.force_offscreen_lens_backdrop = prev_force;
 
-        let mut buf = sub.into_rgba();
-        apply_transparency_mask(&mut buf, clamped, screen_to_world, trans_mode);
-        backend.composite_region(clamped, &buf, 1.0, trans_blend);
+            let mut buf = sub.into_rgba();
+            apply_transparency_mask(&mut buf, clamped, screen_to_local, trans_mode);
+            backend.composite_region(clamped, &buf, 1.0, trans_blend);
+            return;
+        }
+        // Downscale isolation buffer if `clamped` exceeds `MAX_SURFACE_DIM_PX` /
+        // `MAX_SURFACE_PIXELS` so `Effect::Transparency` objects are never silently dropped.
+        let dim_scale = (f64::from(MAX_SURFACE_DIM_PX)
+            / f64::from(clamped.width.max(clamped.height).max(1)))
+        .min(1.0);
+        let px_total = (f64::from(clamped.width) * f64::from(clamped.height)).max(1.0);
+        let px_scale = ((MAX_SURFACE_PIXELS as f64) / px_total).sqrt().min(1.0);
+        let ds = (dim_scale.min(px_scale) * 0.999).clamp(1e-4, 1.0);
+        let buf_w = ((f64::from(clamped.width) * ds).floor() as u32).clamp(1, MAX_SURFACE_DIM_PX);
+        let buf_h = ((f64::from(clamped.height) * ds).floor() as u32).clamp(1, MAX_SURFACE_DIM_PX);
+        if let Ok(mut sub) = TinySkiaBackend::new(buf_w, buf_h) {
+            sub.clear(Color::TRANSPARENT);
+            let sx = f64::from(buf_w) / f64::from(clamped.width);
+            let sy = f64::from(buf_h) / f64::from(clamped.height);
+            let shift = Affine2D::scale(sx, sy).compose(&Affine2D::translate(
+                -f64::from(clamped.x),
+                -f64::from(clamped.y),
+            ));
+            let local_page = shift.compose(&page_to_surface);
+            let local_parent = shift.compose(&parent_to_screen);
+            let px_per_mm = estimate_scale(&local_parent);
+            let prev_force = self.force_offscreen_lens_backdrop;
+            if has_lens {
+                self.force_offscreen_lens_backdrop = true;
+            }
+            self.render_scene_object_core(
+                doc,
+                page,
+                obj,
+                local_page,
+                local_parent,
+                sym_ctx,
+                world_sym_xf,
+                px_per_mm,
+                view_mode,
+                options,
+                &mut sub,
+                underlying,
+                depth,
+            );
+            self.force_offscreen_lens_backdrop = prev_force;
+            let mut buf = sub.into_rgba();
+            let buf_to_local = shift
+                .compose(&obj_to_screen)
+                .inverse()
+                .unwrap_or(screen_to_local);
+            let buf_rect = PixelRect::new(0, 0, buf_w, buf_h);
+            apply_transparency_mask(&mut buf, buf_rect, buf_to_local, trans_mode);
+            let draw_xf = Affine2D::translate(f64::from(clamped.x), f64::from(clamped.y))
+                .compose(&Affine2D::scale(1.0 / sx, 1.0 / sy));
+            backend.draw_pixmap(&buf, draw_xf, 1.0, trans_blend, true);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -584,11 +1672,13 @@ impl SceneRenderer {
         obj: &SceneObject,
         page_to_surface: Affine2D,
         parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        world_sym_xf: Affine2D,
         px_per_mm: f64,
         view_mode: ViewMode,
         options: &RenderOptions,
         backend: &mut dyn CanvasBackend,
-        underlying_ids: &[ObjectId],
+        underlying: &[BackdropItem],
         depth: usize,
     ) {
         let anti_alias = view_mode != ViewMode::Pixels;
@@ -604,7 +1694,7 @@ impl SceneRenderer {
                     _ => None,
                 } {
                     let deformed = apply_geometry_effects(&local_path, &obj.effects);
-                    render_lens_object(
+                    render_lens_object_with_backdrop(
                         self,
                         doc,
                         page,
@@ -616,7 +1706,7 @@ impl SceneRenderer {
                         view_mode,
                         options,
                         backend,
-                        underlying_ids,
+                        underlying,
                         depth,
                     );
                     if obj.outline.is_visible() {
@@ -668,36 +1758,11 @@ impl SceneRenderer {
                 );
             }
             NodePayload::ArtisticText(text) => {
-                self.text_engine.render_artistic_text(
-                    backend,
-                    text,
-                    obj_to_screen,
-                    &obj.outline,
-                    obj.opacity,
-                    obj.blend_mode,
-                    view_mode,
-                    px_per_mm,
-                );
-            }
-            NodePayload::ParagraphText(para) => {
-                self.text_engine.render_paragraph_text(
-                    backend,
-                    para,
-                    obj_to_screen,
-                    &obj.outline,
-                    obj.opacity,
-                    obj.blend_mode,
-                    view_mode,
-                    px_per_mm,
-                );
-            }
-            NodePayload::TextOnPath(top) => {
-                if let Some(host_path) = doc.world_path_of(top.path_id) {
-                    self.text_engine.render_text_on_path(
+                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                    self.text_engine.render_artistic_text(
                         backend,
-                        top,
-                        &host_path,
-                        parent_to_screen,
+                        text,
+                        obj_to_screen,
                         &obj.outline,
                         obj.opacity,
                         obj.blend_mode,
@@ -705,15 +1770,132 @@ impl SceneRenderer {
                         px_per_mm,
                     );
                 } else {
-                    self.text_engine.render_artistic_text(
+                    let pieces = self.text_engine.layout_artistic_pieces(text);
+                    if pieces.is_empty() && !text.plain_text().trim().is_empty() {
+                        self.text_engine.render_artistic_text(
+                            backend,
+                            text,
+                            obj_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            view_mode,
+                            px_per_mm,
+                        );
+                    } else {
+                        self.render_text_pieces_with_effects(
+                            doc,
+                            obj,
+                            &pieces,
+                            None,
+                            obj.transform,
+                            page_to_surface,
+                            parent_to_screen,
+                            px_per_mm,
+                            view_mode,
+                            backend,
+                        );
+                    }
+                }
+            }
+            NodePayload::ParagraphText(para) => {
+                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                    self.text_engine.render_paragraph_text(
                         backend,
-                        &top.text,
+                        para,
                         obj_to_screen,
                         &obj.outline,
                         obj.opacity,
                         obj.blend_mode,
                         view_mode,
                         px_per_mm,
+                    );
+                } else {
+                    let pieces = self.text_engine.layout_paragraph_pieces(para);
+                    self.render_text_pieces_with_effects(
+                        doc,
+                        obj,
+                        &pieces,
+                        Some(para.bounding_box()),
+                        obj.transform,
+                        page_to_surface,
+                        parent_to_screen,
+                        px_per_mm,
+                        view_mode,
+                        backend,
+                    );
+                }
+            }
+            NodePayload::TextOnPath(top) => {
+                let delta_xf = if sym_ctx.is_some() {
+                    world_sym_xf
+                } else {
+                    let actual_parent_world = page_to_surface
+                        .inverse()
+                        .map(|inv| inv.compose(&parent_to_screen))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    let doc_parent_world = doc
+                        .parent_container_of(obj.id)
+                        .and_then(|pid| doc.world_transform_of(pid))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    actual_parent_world
+                        .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY))
+                };
+                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                    if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                        let text_surface_xf = page_to_surface.compose(&delta_xf);
+                        self.text_engine.render_text_on_path(
+                            backend,
+                            top,
+                            &host_path,
+                            text_surface_xf,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            view_mode,
+                            px_per_mm,
+                        );
+                    } else {
+                        self.text_engine.render_artistic_text(
+                            backend,
+                            &top.text,
+                            obj_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            view_mode,
+                            px_per_mm,
+                        );
+                    }
+                } else if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                    let pieces = self.text_engine.layout_text_on_path_pieces(top, &host_path);
+                    self.render_text_pieces_with_effects(
+                        doc,
+                        obj,
+                        &pieces,
+                        None,
+                        delta_xf,
+                        page_to_surface,
+                        page_to_surface,
+                        px_per_mm,
+                        view_mode,
+                        backend,
+                    );
+                } else {
+                    let pieces = self.text_engine.layout_artistic_pieces(&top.text);
+                    self.render_text_pieces_with_effects(
+                        doc,
+                        obj,
+                        &pieces,
+                        None,
+                        obj.transform,
+                        page_to_surface,
+                        parent_to_screen,
+                        px_per_mm,
+                        view_mode,
+                        backend,
                     );
                 }
             }
@@ -755,85 +1937,275 @@ impl SceneRenderer {
                 );
             }
             NodePayload::Connector(conn) => {
-                let (a, b) = doc.resolve_connector_endpoints_with_transform(conn, &obj.transform);
+                let page_world_xf = page_to_surface
+                    .inverse()
+                    .map(|inv| inv.compose(&parent_to_screen).compose(&obj.transform))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(obj.transform);
+                let base_world_xf = world_sym_xf
+                    .inverse()
+                    .map(|inv| inv.compose(&page_world_xf))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(page_world_xf);
+                let mut sym_visiting = HashMap::new();
+                let mut sym_visited_syms = HashSet::new();
+                let mut sym_cache = HashMap::new();
+                let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                    doc,
+                    conn,
+                    &base_world_xf,
+                    sym_ctx,
+                    &mut sym_visiting,
+                    &mut sym_visited_syms,
+                    &mut sym_cache,
+                    depth + 1,
+                );
                 let route = conn.route_path(a, b);
+                let (draw_path, draw_local_xf, draw_parent_to_screen) =
+                    if let Some(inv) = base_world_xf.inverse() {
+                        (
+                            apply_geometry_effects(&route.transformed(&inv), &obj.effects),
+                            obj.transform,
+                            parent_to_screen,
+                        )
+                    } else {
+                        (
+                            route,
+                            Affine2D::IDENTITY,
+                            page_to_surface.compose(&world_sym_xf),
+                        )
+                    };
                 if view_mode == ViewMode::Wireframe {
-                    stroke_wireframe(&route, parent_to_screen, px_per_mm, options, backend);
-                } else if obj.outline.is_visible() {
-                    draw_outline_styled(
-                        &route,
-                        Affine2D::IDENTITY,
-                        parent_to_screen,
-                        &obj.outline,
-                        obj.opacity,
-                        obj.blend_mode,
+                    stroke_wireframe(
+                        &draw_path,
+                        draw_parent_to_screen.compose(&draw_local_xf),
                         px_per_mm,
-                        anti_alias,
+                        options,
                         backend,
                     );
+                } else {
+                    if !obj.effects.is_empty() {
+                        render_underlay_effects(
+                            doc,
+                            obj,
+                            &draw_path,
+                            draw_local_xf,
+                            draw_parent_to_screen,
+                            page_to_surface,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if obj.outline.is_visible() {
+                        draw_outline_styled(
+                            &draw_path,
+                            draw_local_xf,
+                            draw_parent_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if !obj.effects.is_empty() {
+                        render_overlay_effects(
+                            obj,
+                            &draw_path,
+                            draw_local_xf,
+                            draw_parent_to_screen,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
                 }
             }
             NodePayload::Group(children) => {
+                let sym_map = sym_ctx.map(|(m, _)| m);
+                let track_child_lens = children.iter().any(|&cid| {
+                    sym_map
+                        .and_then(|m| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid))
+                        .is_some_and(|c| {
+                            let mut v = HashSet::from([cid]);
+                            let mut vs = HashSet::new();
+                            crate::export_render::object_or_subtree_has_lens_with_sym(
+                                doc, c, sym_map, 0, &mut v, &mut vs,
+                            )
+                        })
+                });
                 let needs_isolation = view_mode != ViewMode::Wireframe
                     && (obj.opacity < 0.999 || obj.blend_mode != BlendMode::Normal);
                 if needs_isolation {
-                    if let Some(wb) = doc.object_bounds(obj.id) {
-                        let sb = parent_to_screen.transform_rect(wb.expand(4.0));
-                        if let Some(clamped) = PixelRect::from_f64_rect_clamped(
+                    let mut visited_doc = HashSet::new();
+                    let mut visited_syms = HashSet::new();
+                    if let Some(sb) = Self::compute_object_screen_bounds(
+                        doc,
+                        obj,
+                        page_to_surface,
+                        parent_to_screen,
+                        sym_ctx,
+                        world_sym_xf,
+                        false,
+                        &mut visited_doc,
+                        &mut visited_syms,
+                        depth,
+                    ) {
+                        let Some(clamped) = PixelRect::from_f64_rect_clamped(
                             sb,
                             0,
                             backend.width(),
                             backend.height(),
-                        ) {
-                            if let Ok(mut sub) = TinySkiaBackend::new(clamped.width, clamped.height)
+                        ) else {
+                            if track_child_lens
+                                && self.subtree_has_unwarmed_frozen_lens_in_branch(
+                                    doc,
+                                    obj,
+                                    sym_ctx.map(|(m, _)| m),
+                                    false,
+                                )
                             {
-                                sub.clear(Color::TRANSPARENT);
-                                let shift = Affine2D::translate(
-                                    -f64::from(clamped.x),
-                                    -f64::from(clamped.y),
-                                );
-                                let sub_page = shift.compose(&page_to_surface);
-                                let sub_xf = shift.compose(&obj_to_screen);
-                                for &cid in children {
-                                    self.render_object_by_id(
+                                if let Ok(mut dummy) = TinySkiaBackend::new(1, 1) {
+                                    let prev_force = self.force_offscreen_lens_backdrop;
+                                    self.force_offscreen_lens_backdrop = true;
+                                    self.render_group_children(
                                         doc,
                                         page,
-                                        cid,
-                                        sub_page,
-                                        sub_xf,
+                                        obj,
+                                        children,
+                                        page_to_surface,
+                                        parent_to_screen,
+                                        obj_to_screen,
+                                        sym_ctx,
+                                        world_sym_xf,
+                                        px_per_mm,
                                         view_mode,
                                         options,
-                                        &mut sub,
-                                        underlying_ids,
-                                        depth + 1,
+                                        &mut dummy,
+                                        underlying,
+                                        track_child_lens,
+                                        depth,
                                     );
+                                    self.force_offscreen_lens_backdrop = prev_force;
                                 }
-                                let buf = sub.into_rgba();
-                                backend.composite_region(
-                                    clamped,
-                                    &buf,
-                                    obj.opacity,
-                                    obj.blend_mode,
-                                );
-                                return;
                             }
+                            // Group is completely outside the current surface/tile; do NOT fall through and drop opacity/blend_mode.
+                            return;
+                        };
+                        if let Ok(mut sub) = TinySkiaBackend::new(clamped.width, clamped.height) {
+                            sub.clear(Color::TRANSPARENT);
+                            let shift =
+                                Affine2D::translate(-f64::from(clamped.x), -f64::from(clamped.y));
+                            let sub_page = shift.compose(&page_to_surface);
+                            let sub_parent = shift.compose(&parent_to_screen);
+                            let sub_xf = shift.compose(&obj_to_screen);
+                            let prev_force = self.force_offscreen_lens_backdrop;
+                            if track_child_lens {
+                                self.force_offscreen_lens_backdrop = true;
+                            }
+                            self.render_group_children(
+                                doc,
+                                page,
+                                obj,
+                                children,
+                                sub_page,
+                                sub_parent,
+                                sub_xf,
+                                sym_ctx,
+                                world_sym_xf,
+                                px_per_mm,
+                                view_mode,
+                                options,
+                                &mut sub,
+                                underlying,
+                                track_child_lens,
+                                depth,
+                            );
+                            self.force_offscreen_lens_backdrop = prev_force;
+                            let buf = sub.into_rgba();
+                            backend.composite_region(clamped, &buf, obj.opacity, obj.blend_mode);
+                            return;
                         }
+                        // Downscale isolation buffer if `clamped` exceeds `MAX_SURFACE_DIM_PX` /
+                        // `MAX_SURFACE_PIXELS` so opacity and blend_mode are never dropped.
+                        let dim_scale = (f64::from(MAX_SURFACE_DIM_PX)
+                            / f64::from(clamped.width.max(clamped.height).max(1)))
+                        .min(1.0);
+                        let px_total =
+                            (f64::from(clamped.width) * f64::from(clamped.height)).max(1.0);
+                        let px_scale = ((MAX_SURFACE_PIXELS as f64) / px_total).sqrt().min(1.0);
+                        let ds = (dim_scale.min(px_scale) * 0.999).clamp(1e-4, 1.0);
+                        let buf_w = ((f64::from(clamped.width) * ds).floor() as u32)
+                            .clamp(1, MAX_SURFACE_DIM_PX);
+                        let buf_h = ((f64::from(clamped.height) * ds).floor() as u32)
+                            .clamp(1, MAX_SURFACE_DIM_PX);
+                        if let Ok(mut sub) = TinySkiaBackend::new(buf_w, buf_h) {
+                            sub.clear(Color::TRANSPARENT);
+                            let sx = f64::from(buf_w) / f64::from(clamped.width);
+                            let sy = f64::from(buf_h) / f64::from(clamped.height);
+                            let shift = Affine2D::scale(sx, sy).compose(&Affine2D::translate(
+                                -f64::from(clamped.x),
+                                -f64::from(clamped.y),
+                            ));
+                            let sub_page = shift.compose(&page_to_surface);
+                            let sub_parent = shift.compose(&parent_to_screen);
+                            let sub_xf = shift.compose(&obj_to_screen);
+                            let sub_px_per_mm = estimate_scale(&sub_parent);
+                            let prev_force = self.force_offscreen_lens_backdrop;
+                            if track_child_lens {
+                                self.force_offscreen_lens_backdrop = true;
+                            }
+                            self.render_group_children(
+                                doc,
+                                page,
+                                obj,
+                                children,
+                                sub_page,
+                                sub_parent,
+                                sub_xf,
+                                sym_ctx,
+                                world_sym_xf,
+                                sub_px_per_mm,
+                                view_mode,
+                                options,
+                                &mut sub,
+                                underlying,
+                                track_child_lens,
+                                depth,
+                            );
+                            self.force_offscreen_lens_backdrop = prev_force;
+                            let buf = sub.into_rgba();
+                            let draw_xf =
+                                Affine2D::translate(f64::from(clamped.x), f64::from(clamped.y))
+                                    .compose(&Affine2D::scale(1.0 / sx, 1.0 / sy));
+                            backend.draw_pixmap(&buf, draw_xf, obj.opacity, obj.blend_mode, true);
+                        }
+                        return;
+                    } else {
+                        return;
                     }
                 }
-                for &cid in children {
-                    self.render_object_by_id(
-                        doc,
-                        page,
-                        cid,
-                        page_to_surface,
-                        obj_to_screen,
-                        view_mode,
-                        options,
-                        backend,
-                        underlying_ids,
-                        depth + 1,
-                    );
-                }
+                self.render_group_children(
+                    doc,
+                    page,
+                    obj,
+                    children,
+                    page_to_surface,
+                    parent_to_screen,
+                    obj_to_screen,
+                    sym_ctx,
+                    world_sym_xf,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    underlying,
+                    track_child_lens,
+                    depth,
+                );
             }
             NodePayload::PowerClip {
                 container,
@@ -850,16 +2222,18 @@ impl SceneRenderer {
                         backend,
                     );
                     for &cid in contents {
-                        self.render_object_by_id(
+                        self.render_object_by_id_with_sym(
                             doc,
                             page,
                             cid,
                             page_to_surface,
                             obj_to_screen,
+                            sym_ctx,
+                            world_sym_xf,
                             view_mode,
                             options,
                             backend,
-                            underlying_ids,
+                            underlying,
                             depth + 1,
                         );
                     }
@@ -913,20 +2287,54 @@ impl SceneRenderer {
 
                 // Clip contents strictly to container contour!
                 backend.push_clip(&deformed_container, FillRule::Winding, obj_to_screen);
+                let sym_map = sym_ctx.map(|(m, _)| m);
+                let track_pc_lens = contents.iter().any(|&cid| {
+                    sym_map
+                        .and_then(|m| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid))
+                        .is_some_and(|c| {
+                            let mut v = HashSet::from([cid]);
+                            let mut vs = HashSet::new();
+                            crate::export_render::object_or_subtree_has_lens_with_sym(
+                                doc, c, sym_map, 0, &mut v, &mut vs,
+                            )
+                        })
+                });
+                let pc_sym_root_idx = if obj.id.0 == 0 {
+                    self.current_sym_root_idx
+                } else {
+                    None
+                };
+                let saved_sym_root_idx = self.current_sym_root_idx.take();
+                let mut pc_underlying = track_pc_lens.then(|| {
+                    let mut v = underlying.to_vec();
+                    v.push(BackdropItem::EnterPowerClip {
+                        pc_id: obj.id,
+                        sym_root_idx: pc_sym_root_idx,
+                    });
+                    v
+                });
                 for &cid in contents {
-                    self.render_object_by_id(
+                    let child_u = pc_underlying.as_deref().unwrap_or(underlying);
+                    self.render_object_by_id_with_sym(
                         doc,
                         page,
                         cid,
                         page_to_surface,
                         obj_to_screen,
+                        sym_ctx,
+                        world_sym_xf,
                         view_mode,
                         options,
                         backend,
-                        underlying_ids,
+                        child_u,
                         depth + 1,
                     );
+                    if let Some(ref mut u) = pc_underlying {
+                        u.push(BackdropItem::Object(cid));
+                    }
                 }
+                self.current_sym_root_idx = saved_sym_root_idx;
                 backend.pop_clip();
 
                 // Overlay effects on PowerClip container (e.g. Contour::Inside, Extrude bevel)
@@ -958,23 +2366,2901 @@ impl SceneRenderer {
                 }
             }
             NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = doc.symbols.get(sym_id) {
+                if !self.active_symbols.insert(*sym_id) {
+                    return;
+                }
+                if let Some(sym) = doc.symbol(*sym_id) {
+                    let sym_root_world_xf = page_to_surface
+                        .inverse()
+                        .map(|inv| inv.compose(&obj_to_screen))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(obj.transform);
+                    let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                    let mut referenced: HashSet<ObjectId> = HashSet::new();
                     for sub in &sym.objects {
-                        self.render_scene_object(
+                        if sub.id.0 != 0 {
+                            child_map.insert(sub.id, sub);
+                        }
+                        match &sub.payload {
+                            NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                            NodePayload::PowerClip { contents, .. } => {
+                                referenced.extend(contents.iter().copied());
+                            }
+                            _ => {}
+                        }
+                    }
+                    let sym_has_lens = sym.objects.iter().any(|sub| {
+                        if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                            return false;
+                        }
+                        let mut v = if sub.id.0 != 0 {
+                            HashSet::from([sub.id])
+                        } else {
+                            HashSet::new()
+                        };
+                        let mut vs = HashSet::new();
+                        crate::export_render::object_or_subtree_has_lens_with_sym(
                             doc,
-                            page,
                             sub,
+                            Some(&child_map),
+                            0,
+                            &mut v,
+                            &mut vs,
+                        )
+                    });
+                    let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
+                    let needs_isolation = view_mode != ViewMode::Wireframe
+                        && (obj_opacity < 0.999 || obj.blend_mode != BlendMode::Normal);
+                    let parent_sym_root_idx = self.current_sym_root_idx.take();
+                    let scope_prev_len = self.frozen_scope_stack.len();
+                    let sym_u128 = sym_id.0.as_u128();
+                    self.frozen_scope_stack.extend_from_slice(&[
+                        FROZEN_TAG_SYM_INST,
+                        sym_u128 as u64,
+                        (sym_u128 >> 64) as u64,
+                        obj.id.0,
+                        parent_sym_root_idx.map_or(u64::MAX, |i| i as u64),
+                    ]);
+
+                    let render_roots =
+                        |renderer: &mut Self,
+                         target_page_to_surface: Affine2D,
+                         target_obj_to_screen: Affine2D,
+                         target_backend: &mut dyn CanvasBackend| {
+                            let mut sym_underlying = sym_has_lens.then(|| {
+                                let mut v = underlying.to_vec();
+                                v.push(BackdropItem::EnterSymbolInstance {
+                                    sym_id: *sym_id,
+                                    sym_world_xf: sym_root_world_xf,
+                                    inst_id: obj.id,
+                                    inst_sym_root_idx: parent_sym_root_idx,
+                                });
+                                v
+                            });
+                            for (idx, sub) in sym.objects.iter().enumerate() {
+                                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                    continue;
+                                }
+                                renderer.current_sym_root_idx =
+                                    if sub.id.0 == 0 { Some(idx) } else { None };
+                                let sub_u = sym_underlying.as_deref().unwrap_or(underlying);
+                                renderer.render_scene_object_with_sym(
+                                    doc,
+                                    page,
+                                    sub,
+                                    target_page_to_surface,
+                                    target_obj_to_screen,
+                                    Some((&child_map, sym_root_world_xf)),
+                                    Affine2D::IDENTITY,
+                                    view_mode,
+                                    options,
+                                    target_backend,
+                                    sub_u,
+                                    depth + 1,
+                                );
+                                if let Some(ref mut u) = sym_underlying {
+                                    if sub.id.0 != 0 {
+                                        u.push(BackdropItem::Object(sub.id));
+                                    } else {
+                                        u.push(BackdropItem::SymObjectIndex(idx));
+                                    }
+                                }
+                            }
+                            if let Some(ref mut u) = sym_underlying {
+                                u.push(BackdropItem::ExitSymbolInstance);
+                            }
+                        };
+
+                    if needs_isolation {
+                        let mut visited_doc = HashSet::new();
+                        let mut visited_syms = HashSet::new();
+                        if let Some(sb) = Self::compute_object_screen_bounds(
+                            doc,
+                            obj,
                             page_to_surface,
-                            obj_to_screen,
-                            view_mode,
-                            options,
-                            backend,
-                            underlying_ids,
+                            parent_to_screen,
+                            sym_ctx,
+                            world_sym_xf,
+                            false,
+                            &mut visited_doc,
+                            &mut visited_syms,
+                            depth,
+                        ) {
+                            if let Some(clamped) = PixelRect::from_f64_rect_clamped(
+                                sb,
+                                0,
+                                backend.width(),
+                                backend.height(),
+                            ) {
+                                if let Ok(mut sub) =
+                                    TinySkiaBackend::new(clamped.width, clamped.height)
+                                {
+                                    sub.clear(Color::TRANSPARENT);
+                                    let shift = Affine2D::translate(
+                                        -f64::from(clamped.x),
+                                        -f64::from(clamped.y),
+                                    );
+                                    let sub_page = shift.compose(&page_to_surface);
+                                    let sub_obj = shift.compose(&obj_to_screen);
+                                    let prev_force = self.force_offscreen_lens_backdrop;
+                                    if sym_has_lens {
+                                        self.force_offscreen_lens_backdrop = true;
+                                    }
+                                    render_roots(self, sub_page, sub_obj, &mut sub);
+                                    self.force_offscreen_lens_backdrop = prev_force;
+                                    let buf = sub.into_rgba();
+                                    backend.composite_region(
+                                        clamped,
+                                        &buf,
+                                        obj_opacity,
+                                        obj.blend_mode,
+                                    );
+                                } else {
+                                    let dim_scale = (f64::from(MAX_SURFACE_DIM_PX)
+                                        / f64::from(clamped.width.max(clamped.height).max(1)))
+                                    .min(1.0);
+                                    let px_total = (f64::from(clamped.width)
+                                        * f64::from(clamped.height))
+                                    .max(1.0);
+                                    let px_scale =
+                                        ((MAX_SURFACE_PIXELS as f64) / px_total).sqrt().min(1.0);
+                                    let ds = (dim_scale.min(px_scale) * 0.999).clamp(1e-4, 1.0);
+                                    let buf_w = ((f64::from(clamped.width) * ds).floor() as u32)
+                                        .clamp(1, MAX_SURFACE_DIM_PX);
+                                    let buf_h = ((f64::from(clamped.height) * ds).floor() as u32)
+                                        .clamp(1, MAX_SURFACE_DIM_PX);
+                                    if let Ok(mut sub) = TinySkiaBackend::new(buf_w, buf_h) {
+                                        sub.clear(Color::TRANSPARENT);
+                                        let sx = f64::from(buf_w) / f64::from(clamped.width);
+                                        let sy = f64::from(buf_h) / f64::from(clamped.height);
+                                        let shift =
+                                            Affine2D::scale(sx, sy).compose(&Affine2D::translate(
+                                                -f64::from(clamped.x),
+                                                -f64::from(clamped.y),
+                                            ));
+                                        let sub_page = shift.compose(&page_to_surface);
+                                        let sub_obj = shift.compose(&obj_to_screen);
+                                        let prev_force = self.force_offscreen_lens_backdrop;
+                                        if sym_has_lens {
+                                            self.force_offscreen_lens_backdrop = true;
+                                        }
+                                        render_roots(self, sub_page, sub_obj, &mut sub);
+                                        self.force_offscreen_lens_backdrop = prev_force;
+                                        let buf = sub.into_rgba();
+                                        let draw_xf = Affine2D::translate(
+                                            f64::from(clamped.x),
+                                            f64::from(clamped.y),
+                                        )
+                                        .compose(&Affine2D::scale(1.0 / sx, 1.0 / sy));
+                                        backend.draw_pixmap(
+                                            &buf,
+                                            draw_xf,
+                                            obj_opacity,
+                                            obj.blend_mode,
+                                            true,
+                                        );
+                                    }
+                                }
+                            } else if sym_has_lens
+                                && self.subtree_has_unwarmed_frozen_lens_in_branch(
+                                    doc,
+                                    obj,
+                                    sym_ctx.map(|(m, _)| m),
+                                    true,
+                                )
+                            {
+                                if let Ok(mut dummy) = TinySkiaBackend::new(1, 1) {
+                                    let prev_force = self.force_offscreen_lens_backdrop;
+                                    self.force_offscreen_lens_backdrop = true;
+                                    render_roots(self, page_to_surface, obj_to_screen, &mut dummy);
+                                    self.force_offscreen_lens_backdrop = prev_force;
+                                }
+                            }
+                        }
+                    } else {
+                        render_roots(self, page_to_surface, obj_to_screen, backend);
+                    }
+
+                    self.frozen_scope_stack.truncate(scope_prev_len);
+                    self.current_sym_root_idx = parent_sym_root_idx;
+                }
+                self.active_symbols.remove(sym_id);
+            }
+        }
+    }
+
+    fn expand_screen_bounds_for_deforms(
+        effects: &[Effect],
+        obj_to_screen: &Affine2D,
+        local_h: Option<f64>,
+        acc: &mut Rect2D,
+    ) {
+        if !obj_to_screen.is_finite() {
+            return;
+        }
+        let union_pt = |local_pt: Point2D, out: &mut Rect2D| {
+            if !local_pt.is_finite() {
+                return;
+            }
+            let sp = obj_to_screen.transform_point(local_pt);
+            if sp.is_finite() {
+                *out = out.union(Rect2D::new(sp.x, sp.y, sp.x, sp.y));
+            }
+        };
+        let eval_quad = |p0: Point2D, p1: Point2D, p2: Point2D, t: f64| -> Point2D {
+            let it = 1.0 - t;
+            Point2D::new(
+                it * it * p0.x + 2.0 * it * t * p1.x + t * t * p2.x,
+                it * it * p0.y + 2.0 * it * t * p1.y + t * t * p2.y,
+            )
+        };
+        let mut cur_local_h = local_h.filter(|v| v.is_finite() && *v > 0.0);
+        for eff in effects {
+            match eff {
+                Effect::Perspective { quad } => {
+                    let (mut q_min_y, mut q_max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                    for &p in quad {
+                        union_pt(p, acc);
+                        if p.is_finite() {
+                            q_min_y = q_min_y.min(p.y);
+                            q_max_y = q_max_y.max(p.y);
+                        }
+                    }
+                    if q_min_y.is_finite() && q_max_y.is_finite() {
+                        let q_h = (q_max_y - q_min_y).max(1e-6);
+                        cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(q_h));
+                    }
+                }
+                Effect::Distort {
+                    kind,
+                    amplitude,
+                    center,
+                    ..
+                } => {
+                    if amplitude.is_finite() && amplitude.abs() > 1e-9 {
+                        if matches!(kind, coree_core::DistortKind::Twister) && center.is_finite() {
+                            if let Some(inv_xf) = obj_to_screen.inverse() {
+                                if let Some(local_acc) = inv_xf.try_transform_rect(*acc) {
+                                    let corners = [
+                                        Point2D::new(local_acc.min_x, local_acc.min_y),
+                                        Point2D::new(local_acc.max_x, local_acc.min_y),
+                                        Point2D::new(local_acc.max_x, local_acc.max_y),
+                                        Point2D::new(local_acc.min_x, local_acc.max_y),
+                                    ];
+                                    let r_max = corners
+                                        .iter()
+                                        .map(|c| (*c - *center).length())
+                                        .fold(0.0_f64, f64::max);
+                                    if r_max.is_finite() && r_max > 0.0 {
+                                        let sq = Rect2D::new(
+                                            center.x - r_max,
+                                            center.y - r_max,
+                                            center.x + r_max,
+                                            center.y + r_max,
+                                        );
+                                        if let Some(sb) = obj_to_screen.try_transform_rect(sq) {
+                                            *acc = acc.union(sb);
+                                        }
+                                        cur_local_h =
+                                            Some(cur_local_h.unwrap_or(0.0).max(2.0 * r_max));
+                                    }
+                                }
+                            }
+                        } else {
+                            let pad = 2.0 * amplitude.abs();
+                            let screen_pad_x =
+                                (obj_to_screen.m[0].abs() + obj_to_screen.m[2].abs()) * pad;
+                            let screen_pad_y =
+                                (obj_to_screen.m[1].abs() + obj_to_screen.m[3].abs()) * pad;
+                            if screen_pad_x.is_finite() && screen_pad_y.is_finite() {
+                                *acc = Rect2D::new(
+                                    acc.min_x - screen_pad_x,
+                                    acc.min_y - screen_pad_y,
+                                    acc.max_x + screen_pad_x,
+                                    acc.max_y + screen_pad_y,
+                                );
+                            }
+                            cur_local_h = Some(cur_local_h.unwrap_or(0.0) + pad);
+                        }
+                    }
+                }
+                Effect::Envelope { mode, cage } if cage.len() >= 4 => {
+                    let (mut c_min_y, mut c_max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                    for &p in cage {
+                        union_pt(p, acc);
+                        if p.is_finite() {
+                            c_min_y = c_min_y.min(p.y);
+                            c_max_y = c_max_y.max(p.y);
+                        }
+                    }
+                    if cage.len() >= 8 {
+                        let (tl, tm, tr, rm, br, bm, bl, lm) = (
+                            cage[0], cage[1], cage[2], cage[3], cage[4], cage[5], cage[6], cage[7],
+                        );
+                        if [tl, tm, tr, rm, br, bm, bl, lm]
+                            .iter()
+                            .all(|p| p.is_finite())
+                        {
+                            let eval_coons = |u: f64, v: f64| -> Point2D {
+                                let top = eval_quad(tl, tm, tr, u);
+                                let bottom = eval_quad(bl, bm, br, u);
+                                let left = eval_quad(tl, lm, bl, v);
+                                let right = eval_quad(tr, rm, br, v);
+                                let ruled_u = top.lerp(bottom, v);
+                                let ruled_v = left.lerp(right, u);
+                                let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+                                Point2D::new(
+                                    ruled_u.x + ruled_v.x - bilin.x,
+                                    ruled_u.y + ruled_v.y - bilin.y,
+                                )
+                            };
+                            let quad_vertex_t = |f0: f64, f_half: f64, f1: f64| -> Option<f64> {
+                                let a = 2.0 * f0 - 4.0 * f_half + 2.0 * f1;
+                                let b = -3.0 * f0 + 4.0 * f_half - f1;
+                                if a.abs() > 1e-12 {
+                                    let t = -b / (2.0 * a);
+                                    if t > 0.0 && t < 1.0 && t.is_finite() {
+                                        return Some(t);
+                                    }
+                                }
+                                None
+                            };
+                            let (mut s_min_y, mut s_max_y) = (c_min_y, c_max_y);
+                            let mut record_pt = |pt: Point2D| {
+                                s_min_y = s_min_y.min(pt.y);
+                                s_max_y = s_max_y.max(pt.y);
+                                union_pt(pt, acc);
+                            };
+                            for iu in 0..=16 {
+                                let u = f64::from(iu) * 0.0625;
+                                for iv in 0..=16 {
+                                    let v = f64::from(iv) * 0.0625;
+                                    record_pt(eval_coons(u, v));
+                                }
+                                let p0 = eval_coons(u, 0.0);
+                                let pm = eval_coons(u, 0.5);
+                                let p1 = eval_coons(u, 1.0);
+                                for vt in [
+                                    quad_vertex_t(p0.x, pm.x, p1.x),
+                                    quad_vertex_t(p0.y, pm.y, p1.y),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    record_pt(eval_coons(u, vt));
+                                    let q0 = eval_coons(0.0, vt);
+                                    let qm = eval_coons(0.5, vt);
+                                    let q1 = eval_coons(1.0, vt);
+                                    for ut in [
+                                        quad_vertex_t(q0.x, qm.x, q1.x),
+                                        quad_vertex_t(q0.y, qm.y, q1.y),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    {
+                                        record_pt(eval_coons(ut, vt));
+                                    }
+                                }
+                            }
+                            if s_min_y.is_finite() && s_max_y.is_finite() {
+                                let env_h = (s_max_y - s_min_y).max(1e-6);
+                                cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                            }
+                        } else if c_min_y.is_finite() && c_max_y.is_finite() {
+                            let env_h = (c_max_y - c_min_y).max(1e-6);
+                            cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                        }
+                    } else {
+                        let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                        for &p in &cage[..4] {
+                            if p.is_finite() {
+                                min_y = min_y.min(p.y);
+                                max_y = max_y.max(p.y);
+                            }
+                        }
+                        if min_y.is_finite() && max_y.is_finite() {
+                            let cage_h = (max_y - min_y).max(1e-6);
+                            if matches!(
+                                mode,
+                                coree_core::EnvelopeMode::SingleArc
+                                    | coree_core::EnvelopeMode::DoubleArc
+                            ) {
+                                let h_ref = cur_local_h
+                                    .filter(|v| v.is_finite() && *v > 0.0)
+                                    .unwrap_or(cage_h)
+                                    .max(cage_h);
+                                let arc_pad = h_ref * 0.08;
+                                for &p in &cage[..4] {
+                                    union_pt(Point2D::new(p.x, p.y - arc_pad), acc);
+                                    union_pt(Point2D::new(p.x, p.y + arc_pad), acc);
+                                }
+                                cur_local_h = Some(h_ref.max(cage_h + 2.0 * arc_pad));
+                            } else {
+                                cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(cage_h));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_group_children(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        children: &[ObjectId],
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        obj_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        world_sym_xf: Affine2D,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
+        track_child_lens: bool,
+        depth: usize,
+    ) {
+        let anti_alias = view_mode != ViewMode::Pixels;
+        let group_has_deform = obj.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+            )
+        });
+        let group_has_underlay = view_mode != ViewMode::Wireframe
+            && obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::DropShadow { .. }
+                        | Effect::BlockShadow { .. }
+                        | Effect::Contour {
+                            mode: coree_core::ContourMode::Outside,
+                            ..
+                        }
+                        | Effect::Extrude25D { .. }
+                        | Effect::Blend { .. }
+                )
+            });
+        let group_has_overlay = view_mode != ViewMode::Wireframe
+            && obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Contour {
+                        mode: coree_core::ContourMode::Inside | coree_core::ContourMode::ToCenter,
+                        ..
+                    } | Effect::Extrude25D { .. }
+                )
+            });
+
+        if !group_has_deform && !group_has_underlay && !group_has_overlay {
+            let saved_sym_root_idx = self.current_sym_root_idx.take();
+            let mut child_underlying = track_child_lens.then(|| underlying.to_vec());
+            for &cid in children {
+                let child_u = child_underlying.as_deref().unwrap_or(underlying);
+                self.render_object_by_id_with_sym(
+                    doc,
+                    page,
+                    cid,
+                    page_to_surface,
+                    obj_to_screen,
+                    sym_ctx,
+                    world_sym_xf,
+                    view_mode,
+                    options,
+                    backend,
+                    child_u,
+                    depth + 1,
+                );
+                if let Some(ref mut u) = child_underlying {
+                    u.push(BackdropItem::Object(cid));
+                }
+            }
+            self.current_sym_root_idx = saved_sym_root_idx;
+            return;
+        }
+
+        let group_world_xf = page_to_surface
+            .inverse()
+            .map(|inv| inv.compose(&obj_to_screen))
+            .filter(|m| m.is_finite())
+            .unwrap_or(obj.transform);
+        let group_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
+            doc.local_object_bounds(obj.id)
+        } else {
+            let mut visit = HashSet::new();
+            Self::compute_children_local_bounds(
+                doc,
+                children,
+                sym_ctx,
+                Affine2D::IDENTITY,
+                group_world_xf,
+                depth + 1,
+                &mut visit,
+            )
+        };
+
+        let mut proxy_holder: Option<SceneObject> = None;
+        let mut deformed_sil_holder: Option<BezierPath> = None;
+        if group_has_underlay || group_has_overlay {
+            let mut visit = HashSet::new();
+            let sil = self.collect_group_local_silhouette(
+                doc,
+                children,
+                sym_ctx,
+                Affine2D::IDENTITY,
+                depth + 1,
+                &mut visit,
+            );
+            let deformed_sil = apply_geometry_effects_in_bounds(&sil, group_local_bb, &obj.effects);
+            let mut proxy = obj.clone();
+            if !proxy.fill.is_visible() {
+                proxy.fill = Self::first_visible_child_fill(doc, children, sym_ctx)
+                    .unwrap_or(Fill::Solid(Color::BLACK));
+            }
+            deformed_sil_holder = Some(deformed_sil);
+            proxy_holder = Some(proxy);
+        }
+
+        if group_has_underlay {
+            if let (Some(proxy), Some(deformed_sil)) = (&proxy_holder, &deformed_sil_holder) {
+                render_underlay_effects(
+                    doc,
+                    proxy,
+                    deformed_sil,
+                    obj.transform,
+                    parent_to_screen,
+                    page_to_surface,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        }
+
+        let group_sym_root_idx = if obj.id.0 == 0 {
+            self.current_sym_root_idx
+        } else {
+            None
+        };
+        let saved_sym_root_idx = self.current_sym_root_idx.take();
+        if group_has_deform {
+            let mut group_underlying = track_child_lens.then(|| {
+                let mut v = underlying.to_vec();
+                v.push(BackdropItem::EnterDeformedGroup {
+                    group_id: obj.id,
+                    group_sym_root_idx,
+                    group_local_bb,
+                    group_world_xf: Some(group_world_xf),
+                });
+                v
+            });
+            let u_ref = group_underlying.as_deref().unwrap_or(underlying);
+            let frames = [DeformFrame {
+                group_local_bb,
+                group_effects: &obj.effects,
+                rel_to_outer: Affine2D::IDENTITY,
+            }];
+            let mut visit = HashSet::new();
+            self.render_group_deformed_subtree(
+                doc,
+                page,
+                children,
+                obj.id,
+                &frames,
+                page_to_surface,
+                obj_to_screen,
+                Affine2D::IDENTITY,
+                sym_ctx,
+                px_per_mm,
+                view_mode,
+                options,
+                backend,
+                u_ref,
+                track_child_lens,
+                depth + 1,
+                &mut visit,
+            );
+            if let Some(ref mut v) = group_underlying {
+                v.push(BackdropItem::ExitDeformedGroup);
+            }
+        } else {
+            let mut child_underlying = track_child_lens.then(|| underlying.to_vec());
+            for &cid in children {
+                let child_u = child_underlying.as_deref().unwrap_or(underlying);
+                self.render_object_by_id_with_sym(
+                    doc,
+                    page,
+                    cid,
+                    page_to_surface,
+                    obj_to_screen,
+                    sym_ctx,
+                    world_sym_xf,
+                    view_mode,
+                    options,
+                    backend,
+                    child_u,
+                    depth + 1,
+                );
+                if let Some(ref mut u) = child_underlying {
+                    u.push(BackdropItem::Object(cid));
+                }
+            }
+        }
+        self.current_sym_root_idx = saved_sym_root_idx;
+
+        if group_has_overlay {
+            if let (Some(proxy), Some(deformed_sil)) = (&proxy_holder, &deformed_sil_holder) {
+                render_overlay_effects(
+                    proxy,
+                    deformed_sil,
+                    obj.transform,
+                    parent_to_screen,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        }
+    }
+
+    fn first_visible_child_fill(
+        doc: &Document,
+        children: &[ObjectId],
+        sym_ctx: Option<SymRenderCtx<'_>>,
+    ) -> Option<Fill> {
+        for &cid in children {
+            let cobj = sym_ctx
+                .and_then(|(m, _)| m.get(&cid).copied())
+                .or_else(|| doc.object(cid))?;
+            if !cobj.visible {
+                continue;
+            }
+            if cobj.fill.is_visible() {
+                return Some(cobj.fill.clone());
+            }
+            if let NodePayload::Group(sub) = &cobj.payload {
+                if let Some(f) = Self::first_visible_child_fill(doc, sub, sym_ctx) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn compute_children_local_bounds(
+        doc: &Document,
+        children: &[ObjectId],
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        rel_xf: Affine2D,
+        target_world_xf: Affine2D,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> Option<Rect2D> {
+        if depth > MAX_RENDER_DEPTH || !rel_xf.is_finite() || !target_world_xf.is_finite() {
+            return None;
+        }
+        let inv_target_world = target_world_xf.inverse();
+        let mut acc: Option<Rect2D> = None;
+        for &cid in children {
+            if !visiting.insert(cid) {
+                continue;
+            }
+            let cobj = sym_ctx
+                .and_then(|(m, _)| m.get(&cid).copied())
+                .or_else(|| doc.object(cid));
+            if let Some(obj) = cobj {
+                let c_xf = rel_xf.compose(&obj.transform);
+                let cb = match &obj.payload {
+                    NodePayload::Path(p) => p.transformed(&c_xf).bounding_box(),
+                    NodePayload::Shape(s) => s.to_bezier_path().transformed(&c_xf).bounding_box(),
+                    NodePayload::PowerClip { container, .. } => {
+                        container.transformed(&c_xf).bounding_box()
+                    }
+                    NodePayload::ArtisticText(t) => c_xf.try_transform_rect(t.estimated_bounds()),
+                    NodePayload::ParagraphText(t) => c_xf.try_transform_rect(t.bounding_box()),
+                    NodePayload::Table(t) => c_xf.try_transform_rect(t.to_bounding_box()),
+                    NodePayload::Dimension(d) => c_xf.try_transform_rect(d.bounding_box()),
+                    NodePayload::Raster(r) => {
+                        let rc = match r.crop_rect {
+                            Some(cr) if cr.is_finite() => Some(cr),
+                            Some(_) => None,
+                            None if r.width_mm.is_finite() && r.height_mm.is_finite() => {
+                                Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+                            }
+                            None => None,
+                        };
+                        rc.and_then(|rect| c_xf.try_transform_rect(rect))
+                    }
+                    NodePayload::TextOnPath(top) => {
+                        resolve_sym_world_path(doc, top.path_id, sym_ctx)
+                            .and_then(|wp| {
+                                let inv = inv_target_world?;
+                                wp.transformed(&inv).bounding_box()
+                            })
+                            .or_else(|| c_xf.try_transform_rect(top.text.estimated_bounds()))
+                    }
+                    NodePayload::Connector(conn) => {
+                        let obj_world_xf = target_world_xf.compose(&c_xf);
+                        let mut sym_visiting = HashMap::new();
+                        let mut sym_visited_syms = HashSet::new();
+                        let mut sym_cache = HashMap::new();
+                        let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                            doc,
+                            conn,
+                            &obj_world_xf,
+                            sym_ctx,
+                            &mut sym_visiting,
+                            &mut sym_visited_syms,
+                            &mut sym_cache,
                             depth + 1,
+                        );
+                        inv_target_world
+                            .and_then(|inv| conn.route_path(a, b).transformed(&inv).bounding_box())
+                    }
+                    NodePayload::SymbolInstance(sym_id) => {
+                        doc.symbol_bounds_with_xf_and_space(*sym_id, &c_xf, Some(&target_world_xf))
+                    }
+                    NodePayload::Group(sub) => Self::compute_children_local_bounds(
+                        doc,
+                        sub,
+                        sym_ctx,
+                        c_xf,
+                        target_world_xf,
+                        depth + 1,
+                        visiting,
+                    ),
+                };
+                if let Some(r) = cb {
+                    acc = Some(match acc {
+                        Some(prev) => prev.union(r),
+                        None => r,
+                    });
+                }
+            }
+            visiting.remove(&cid);
+        }
+        acc
+    }
+
+    fn collect_group_local_silhouette(
+        &mut self,
+        doc: &Document,
+        children: &[ObjectId],
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        rel_xf: Affine2D,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> BezierPath {
+        let mut out = BezierPath::default();
+        if depth > MAX_RENDER_DEPTH || !rel_xf.is_finite() {
+            return out;
+        }
+        for &cid in children {
+            if !visiting.insert(cid) {
+                continue;
+            }
+            let cobj = sym_ctx
+                .and_then(|(m, _)| m.get(&cid).copied())
+                .or_else(|| doc.object(cid));
+            if let Some(obj) = cobj {
+                if obj.visible {
+                    for sym_xf in symmetry_effect_transforms(&obj.effects) {
+                        let c_xf = rel_xf.compose(&sym_xf).compose(&obj.transform);
+                        match &obj.payload {
+                            NodePayload::Path(p) => {
+                                let def =
+                                    apply_geometry_effects(p, &obj.effects).transformed(&c_xf);
+                                out.subpaths.extend(def.subpaths);
+                            }
+                            NodePayload::Shape(s) => {
+                                let def = apply_geometry_effects(&s.to_bezier_path(), &obj.effects)
+                                    .transformed(&c_xf);
+                                out.subpaths.extend(def.subpaths);
+                            }
+                            NodePayload::PowerClip { container, .. } => {
+                                let def = apply_geometry_effects(container, &obj.effects)
+                                    .transformed(&c_xf);
+                                out.subpaths.extend(def.subpaths);
+                            }
+                            NodePayload::ArtisticText(t) => {
+                                let p = self.text_engine.artistic_text_to_curves(t);
+                                let def =
+                                    apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
+                                out.subpaths.extend(def.subpaths);
+                            }
+                            NodePayload::ParagraphText(t) => {
+                                let p = self.text_engine.paragraph_text_to_curves(t);
+                                let def =
+                                    apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
+                                out.subpaths.extend(def.subpaths);
+                            }
+                            NodePayload::Table(t) => {
+                                let p =
+                                    BezierPath::from_rect(t.to_bounding_box()).transformed(&c_xf);
+                                out.subpaths.extend(p.subpaths);
+                            }
+                            NodePayload::Group(sub) => {
+                                let sub_sil = self.collect_group_local_silhouette(
+                                    doc,
+                                    sub,
+                                    sym_ctx,
+                                    c_xf,
+                                    depth + 1,
+                                    visiting,
+                                );
+                                out.subpaths.extend(sub_sil.subpaths);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            visiting.remove(&cid);
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_deformed_scene_object(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        deform_frames: &[DeformFrame<'_>],
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        rel_xf: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        child_u: &[BackdropItem],
+        track_child_lens: bool,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) {
+        if depth > MAX_RENDER_DEPTH || !rel_xf.is_finite() || deform_frames.is_empty() {
+            return;
+        }
+        let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
+        if !obj.visible || obj_opacity <= 1e-6 || !obj.transform.is_finite() {
+            return;
+        }
+        let is_container = matches!(
+            obj.payload,
+            NodePayload::Group(_) | NodePayload::PowerClip { .. } | NodePayload::SymbolInstance(_)
+        );
+        let outer_world_xf = page_to_surface
+            .inverse()
+            .map(|inv| inv.compose(&group_to_screen))
+            .filter(|m| m.is_finite())
+            .unwrap_or(Affine2D::IDENTITY);
+        let inner_to_outer_rel = deform_frames
+            .iter()
+            .skip(1)
+            .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
+        let c_parent_world = outer_world_xf.compose(&inner_to_outer_rel).compose(&rel_xf);
+        let inv_c_parent_world = c_parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
+        for (sym_branch_idx, sym_xf) in symmetry_effect_transforms(&obj.effects)
+            .into_iter()
+            .enumerate()
+        {
+            let scope_prev_len = self.frozen_scope_stack.len();
+            let own_world_sym_xf = if sym_xf == Affine2D::IDENTITY {
+                Affine2D::IDENTITY
+            } else {
+                let w = c_parent_world.compose(&sym_xf).compose(&inv_c_parent_world);
+                if w.is_finite() {
+                    w
+                } else {
+                    sym_xf
+                }
+            };
+            let mut branch_underlying = if sym_branch_idx > 0 {
+                self.frozen_scope_stack.extend_from_slice(&[
+                    FROZEN_TAG_SYM_BRANCH,
+                    obj.id.0,
+                    sym_branch_idx as u64,
+                ]);
+                (track_child_lens && is_container).then(|| {
+                    let branch_world_xf = if matches!(obj.payload, NodePayload::SymbolInstance(_)) {
+                        None
+                    } else {
+                        Some(own_world_sym_xf)
+                    };
+                    let mut v = child_u.to_vec();
+                    v.push(BackdropItem::EnterSymmetryBranch {
+                        obj_id: obj.id,
+                        branch_idx: sym_branch_idx,
+                        branch_world_xf,
+                    });
+                    v
+                })
+            } else {
+                None
+            };
+            let effective_child_u = branch_underlying.as_deref().unwrap_or(child_u);
+            let c_xf = rel_xf.compose(&sym_xf).compose(&obj.transform);
+            if c_xf.is_finite() {
+                let trans_info = if view_mode != ViewMode::Wireframe {
+                    find_transparency_effect(&obj.effects)
+                } else {
+                    None
+                };
+                let isolate_child_group = view_mode != ViewMode::Wireframe
+                    && trans_info.is_none()
+                    && matches!(
+                        obj.payload,
+                        NodePayload::Group(_) | NodePayload::SymbolInstance(_)
+                    )
+                    && (obj_opacity < 0.999 || obj.blend_mode != BlendMode::Normal);
+
+                if trans_info.is_some() || isolate_child_group {
+                    if let Some(clamped) = self
+                        .compute_deformed_child_screen_bounds(
+                            doc,
+                            obj,
+                            deform_frames,
+                            page_to_surface,
+                            group_to_screen,
+                            c_xf,
+                            sym_ctx,
+                            depth,
+                        )
+                        .and_then(|sb| {
+                            PixelRect::from_f64_rect_clamped(
+                                sb,
+                                0,
+                                backend.width(),
+                                backend.height(),
+                            )
+                        })
+                    {
+                        let child_to_screen =
+                            group_to_screen.compose(&inner_to_outer_rel).compose(&c_xf);
+                        let screen_to_local =
+                            child_to_screen.inverse().unwrap_or(Affine2D::IDENTITY);
+                        let has_lens = {
+                            let mut v = if obj.id.0 != 0 {
+                                HashSet::from([obj.id])
+                            } else {
+                                HashSet::new()
+                            };
+                            let mut vs = HashSet::new();
+                            crate::export_render::object_or_subtree_has_lens_with_sym(
+                                doc,
+                                obj,
+                                sym_ctx.map(|(m, _)| m),
+                                0,
+                                &mut v,
+                                &mut vs,
+                            )
+                        };
+                        let (comp_op, comp_blend) = match trans_info {
+                            Some((_, tb)) => (1.0_f32, tb),
+                            None => (obj_opacity, obj.blend_mode),
+                        };
+                        if let Ok(mut sub) = TinySkiaBackend::new(clamped.width, clamped.height) {
+                            sub.clear(Color::TRANSPARENT);
+                            let shift =
+                                Affine2D::translate(-f64::from(clamped.x), -f64::from(clamped.y));
+                            let sub_page = shift.compose(&page_to_surface);
+                            let sub_group = shift.compose(&group_to_screen);
+                            let prev_force = self.force_offscreen_lens_backdrop;
+                            if has_lens {
+                                self.force_offscreen_lens_backdrop = true;
+                            }
+                            self.render_deformed_child_core(
+                                doc,
+                                page,
+                                obj,
+                                deform_frames,
+                                sub_page,
+                                sub_group,
+                                rel_xf,
+                                sym_xf,
+                                c_xf,
+                                sym_ctx,
+                                px_per_mm,
+                                view_mode,
+                                options,
+                                &mut sub,
+                                effective_child_u,
+                                track_child_lens,
+                                depth,
+                                visiting,
+                            );
+                            self.force_offscreen_lens_backdrop = prev_force;
+                            let mut buf = sub.into_rgba();
+                            if let Some((trans_mode, _)) = trans_info {
+                                apply_transparency_mask(
+                                    &mut buf,
+                                    clamped,
+                                    screen_to_local,
+                                    trans_mode,
+                                );
+                            }
+                            backend.composite_region(clamped, &buf, comp_op, comp_blend);
+                        } else {
+                            let dim_scale = (f64::from(MAX_SURFACE_DIM_PX)
+                                / f64::from(clamped.width.max(clamped.height).max(1)))
+                            .min(1.0);
+                            let px_total =
+                                (f64::from(clamped.width) * f64::from(clamped.height)).max(1.0);
+                            let px_scale = ((MAX_SURFACE_PIXELS as f64) / px_total).sqrt().min(1.0);
+                            let ds = (dim_scale.min(px_scale) * 0.999).clamp(1e-4, 1.0);
+                            let buf_w = ((f64::from(clamped.width) * ds).floor() as u32)
+                                .clamp(1, MAX_SURFACE_DIM_PX);
+                            let buf_h = ((f64::from(clamped.height) * ds).floor() as u32)
+                                .clamp(1, MAX_SURFACE_DIM_PX);
+                            if let Ok(mut sub) = TinySkiaBackend::new(buf_w, buf_h) {
+                                sub.clear(Color::TRANSPARENT);
+                                let sx = f64::from(buf_w) / f64::from(clamped.width);
+                                let sy = f64::from(buf_h) / f64::from(clamped.height);
+                                let shift = Affine2D::scale(sx, sy).compose(&Affine2D::translate(
+                                    -f64::from(clamped.x),
+                                    -f64::from(clamped.y),
+                                ));
+                                let sub_page = shift.compose(&page_to_surface);
+                                let sub_group = shift.compose(&group_to_screen);
+                                let sub_px_per_mm = estimate_scale(&sub_group);
+                                let prev_force = self.force_offscreen_lens_backdrop;
+                                if has_lens {
+                                    self.force_offscreen_lens_backdrop = true;
+                                }
+                                self.render_deformed_child_core(
+                                    doc,
+                                    page,
+                                    obj,
+                                    deform_frames,
+                                    sub_page,
+                                    sub_group,
+                                    rel_xf,
+                                    sym_xf,
+                                    c_xf,
+                                    sym_ctx,
+                                    sub_px_per_mm,
+                                    view_mode,
+                                    options,
+                                    &mut sub,
+                                    effective_child_u,
+                                    track_child_lens,
+                                    depth,
+                                    visiting,
+                                );
+                                self.force_offscreen_lens_backdrop = prev_force;
+                                let mut buf = sub.into_rgba();
+                                if let Some((trans_mode, _)) = trans_info {
+                                    let buf_to_local = shift
+                                        .compose(&child_to_screen)
+                                        .inverse()
+                                        .unwrap_or(screen_to_local);
+                                    let buf_rect = PixelRect::new(0, 0, buf_w, buf_h);
+                                    apply_transparency_mask(
+                                        &mut buf,
+                                        buf_rect,
+                                        buf_to_local,
+                                        trans_mode,
+                                    );
+                                }
+                                let draw_xf =
+                                    Affine2D::translate(f64::from(clamped.x), f64::from(clamped.y))
+                                        .compose(&Affine2D::scale(1.0 / sx, 1.0 / sy));
+                                backend.draw_pixmap(&buf, draw_xf, comp_op, comp_blend, true);
+                            }
+                        }
+                    } else if view_mode != ViewMode::Wireframe
+                        && self.subtree_has_unwarmed_frozen_lens_in_branch(
+                            doc,
+                            obj,
+                            sym_ctx.map(|(m, _)| m),
+                            false,
+                        )
+                    {
+                        if let Ok(mut dummy) = TinySkiaBackend::new(1, 1) {
+                            let prev_force = self.force_offscreen_lens_backdrop;
+                            self.force_offscreen_lens_backdrop = true;
+                            self.render_deformed_child_core(
+                                doc,
+                                page,
+                                obj,
+                                deform_frames,
+                                page_to_surface,
+                                group_to_screen,
+                                rel_xf,
+                                sym_xf,
+                                c_xf,
+                                sym_ctx,
+                                px_per_mm,
+                                view_mode,
+                                options,
+                                &mut dummy,
+                                effective_child_u,
+                                track_child_lens,
+                                depth,
+                                visiting,
+                            );
+                            self.force_offscreen_lens_backdrop = prev_force;
+                        }
+                    }
+                } else {
+                    self.render_deformed_child_core(
+                        doc,
+                        page,
+                        obj,
+                        deform_frames,
+                        page_to_surface,
+                        group_to_screen,
+                        rel_xf,
+                        sym_xf,
+                        c_xf,
+                        sym_ctx,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        backend,
+                        effective_child_u,
+                        track_child_lens,
+                        depth,
+                        visiting,
+                    );
+                }
+            }
+            if let Some(ref mut v) = branch_underlying {
+                v.push(BackdropItem::ExitSymmetryBranch);
+            }
+            self.frozen_scope_stack.truncate(scope_prev_len);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_group_deformed_subtree(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        children: &[ObjectId],
+        _group_id: ObjectId,
+        deform_frames: &[DeformFrame<'_>],
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        rel_xf: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
+        track_child_lens: bool,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) {
+        if depth > MAX_RENDER_DEPTH || !rel_xf.is_finite() || deform_frames.is_empty() {
+            return;
+        }
+        let mut child_underlying = track_child_lens.then(|| underlying.to_vec());
+        for &cid in children {
+            if !visiting.insert(cid) {
+                if let Some(ref mut u) = child_underlying {
+                    u.push(BackdropItem::Object(cid));
+                }
+                continue;
+            }
+            let cobj = sym_ctx
+                .and_then(|(m, _)| m.get(&cid).copied())
+                .or_else(|| doc.object(cid));
+            if let Some(obj) = cobj {
+                let child_u = child_underlying.as_deref().unwrap_or(underlying);
+                self.render_deformed_scene_object(
+                    doc,
+                    page,
+                    obj,
+                    deform_frames,
+                    page_to_surface,
+                    group_to_screen,
+                    rel_xf,
+                    sym_ctx,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    child_u,
+                    track_child_lens,
+                    depth,
+                    visiting,
+                );
+            }
+            visiting.remove(&cid);
+            if let Some(ref mut u) = child_underlying {
+                u.push(BackdropItem::Object(cid));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_deformed_child_screen_bounds(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        deform_frames: &[DeformFrame<'_>],
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        c_xf: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        depth: usize,
+    ) -> Option<Rect2D> {
+        let mut visiting_bounds = HashSet::new();
+        let mut visiting_syms = HashSet::new();
+        self.compute_deformed_child_screen_bounds_inner(
+            doc,
+            obj,
+            deform_frames,
+            page_to_surface,
+            group_to_screen,
+            c_xf,
+            sym_ctx,
+            depth,
+            &mut visiting_bounds,
+            &mut visiting_syms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_deformed_child_screen_bounds_inner(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        deform_frames: &[DeformFrame<'_>],
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        c_xf: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        depth: usize,
+        visiting_bounds: &mut HashSet<ObjectId>,
+        visiting_syms: &mut HashSet<SymbolId>,
+    ) -> Option<Rect2D> {
+        if depth > MAX_RENDER_DEPTH || !c_xf.is_finite() || !group_to_screen.is_finite() {
+            return None;
+        }
+        let scale = estimate_scale(&group_to_screen).max(estimate_scale(&page_to_surface));
+        let inner_to_outer_rel = deform_frames
+            .iter()
+            .skip(1)
+            .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
+        let inner_to_screen = group_to_screen.compose(&inner_to_outer_rel);
+        let obj_to_screen = inner_to_screen.compose(&c_xf);
+        let group_world_xf = page_to_surface
+            .inverse()
+            .map(|inv| inv.compose(&group_to_screen))
+            .filter(|m| m.is_finite())
+            .unwrap_or(Affine2D::IDENTITY);
+        let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
+        let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+        let world_sym_xf = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
+        let mut extra_top_pad = 0.0_f64;
+
+        let mut base_sb: Option<Rect2D> = match &obj.payload {
+            NodePayload::Path(p) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(p, &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::Shape(s) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&s.to_bezier_path(), &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::PowerClip { container, .. } => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(container, &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::ArtisticText(t) => {
+                let mut bb = apply_deform_chain_in_bounds(
+                    &BezierPath::from_rect(t.estimated_bounds()),
+                    c_xf,
+                    deform_frames,
+                )
+                .transformed(&group_to_screen)
+                .bounding_box()
+                .or_else(|| obj_to_screen.try_transform_rect(t.estimated_bounds()))?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(t.estimated_bounds().height()),
+                    &mut bb,
+                );
+                Some(bb)
+            }
+            NodePayload::ParagraphText(t) => {
+                let mut bb = apply_deform_chain_in_bounds(
+                    &BezierPath::from_rect(t.bounding_box()),
+                    c_xf,
+                    deform_frames,
+                )
+                .transformed(&group_to_screen)
+                .bounding_box()
+                .or_else(|| obj_to_screen.try_transform_rect(t.bounding_box()))?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(t.bounding_box().height()),
+                    &mut bb,
+                );
+                Some(bb)
+            }
+            NodePayload::Table(t) => {
+                let r = t.to_bounding_box();
+                let mut bb =
+                    apply_deform_chain_in_bounds(&BezierPath::from_rect(r), c_xf, deform_frames)
+                        .transformed(&group_to_screen)
+                        .bounding_box()
+                        .or_else(|| obj_to_screen.try_transform_rect(r))?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(r.height()),
+                    &mut bb,
+                );
+                Some(bb)
+            }
+            NodePayload::Dimension(d) => {
+                let r = d.bounding_box();
+                let mut bb =
+                    apply_deform_chain_in_bounds(&BezierPath::from_rect(r), c_xf, deform_frames)
+                        .transformed(&group_to_screen)
+                        .bounding_box()
+                        .or_else(|| obj_to_screen.try_transform_rect(r))?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(r.height()),
+                    &mut bb,
+                );
+                Some(bb)
+            }
+            NodePayload::Raster(r) => {
+                let rc = match r.crop_rect {
+                    Some(cr) if cr.is_finite() => Some(cr),
+                    Some(_) => None,
+                    None if r.width_mm.is_finite() && r.height_mm.is_finite() => {
+                        Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+                    }
+                    None => None,
+                }?;
+                apply_deform_chain_in_bounds(&BezierPath::from_rect(rc), c_xf, deform_frames)
+                    .transformed(&group_to_screen)
+                    .bounding_box()
+                    .or_else(|| obj_to_screen.try_transform_rect(rc))
+            }
+            NodePayload::TextOnPath(top) => {
+                let dist = sanitize_f64(top.distance_mm, 0.0).abs();
+                let max_font = top
+                    .text
+                    .runs
+                    .iter()
+                    .map(|r| r.style.font_size_mm())
+                    .filter(|v| v.is_finite())
+                    .fold(4.0_f64, f64::max);
+                extra_top_pad = dist + max_font * 1.5;
+                if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                    let to_inner = inv_inner_world.compose(&world_sym_xf);
+                    let path_in_inner = host_path.transformed(&to_inner);
+                    let deformed = apply_deform_chain_in_bounds(
+                        &apply_geometry_effects(&path_in_inner, &obj.effects),
+                        Affine2D::IDENTITY,
+                        deform_frames,
+                    );
+                    deformed.transformed(&group_to_screen).bounding_box()
+                } else {
+                    let est = top.text.estimated_bounds();
+                    let mut bb = apply_deform_chain_in_bounds(
+                        &BezierPath::from_rect(est),
+                        c_xf,
+                        deform_frames,
+                    )
+                    .transformed(&group_to_screen)
+                    .bounding_box()
+                    .or_else(|| obj_to_screen.try_transform_rect(est))?;
+                    Self::expand_screen_bounds_for_deforms(
+                        &obj.effects,
+                        &obj_to_screen,
+                        Some(est.height()),
+                        &mut bb,
+                    );
+                    Some(bb)
+                }
+            }
+            NodePayload::Connector(conn) => {
+                let obj_world_xf = inner_world_xf.compose(&c_xf);
+                let base_world_xf = world_sym_xf
+                    .inverse()
+                    .map(|inv| inv.compose(&obj_world_xf))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(obj_world_xf);
+                let mut sym_visiting = HashMap::new();
+                let mut sym_visited_syms = HashSet::new();
+                let mut sym_cache = HashMap::new();
+                let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                    doc,
+                    conn,
+                    &base_world_xf,
+                    sym_ctx,
+                    &mut sym_visiting,
+                    &mut sym_visited_syms,
+                    &mut sym_cache,
+                    depth + 1,
+                );
+                let route_in_inner = conn
+                    .route_path(a, b)
+                    .transformed(&world_sym_xf)
+                    .transformed(&inv_inner_world);
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&route_in_inner, &obj.effects),
+                    Affine2D::IDENTITY,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::Group(sub) => {
+                let sub_has_deform = obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                });
+                let sub_local_bb = if sub_has_deform {
+                    if sym_ctx.is_none() && obj.id.0 != 0 {
+                        doc.local_object_bounds(obj.id)
+                    } else {
+                        let mut v = HashSet::new();
+                        Self::compute_children_local_bounds(
+                            doc,
+                            sub,
+                            sym_ctx,
+                            Affine2D::IDENTITY,
+                            inner_world_xf.compose(&c_xf),
+                            depth + 1,
+                            &mut v,
+                        )
+                    }
+                } else {
+                    None
+                };
+                let mut extended_frames: Vec<DeformFrame<'_>> = Vec::new();
+                let (active_frames, child_rel_xf) = if sub_has_deform {
+                    extended_frames.extend_from_slice(deform_frames);
+                    extended_frames.push(DeformFrame {
+                        group_local_bb: sub_local_bb,
+                        group_effects: &obj.effects,
+                        rel_to_outer: c_xf,
+                    });
+                    (extended_frames.as_slice(), Affine2D::IDENTITY)
+                } else {
+                    (deform_frames, c_xf)
+                };
+                let mut acc: Option<Rect2D> = None;
+                for &cid in sub {
+                    if !visiting_bounds.insert(cid) {
+                        continue;
+                    }
+                    let cobj = sym_ctx
+                        .and_then(|(m, _)| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid));
+                    if let Some(child) = cobj {
+                        if child.visible && child.transform.is_finite() {
+                            for sxf in symmetry_effect_transforms(&child.effects) {
+                                let child_c_xf =
+                                    child_rel_xf.compose(&sxf).compose(&child.transform);
+                                if let Some(cb) = self.compute_deformed_child_screen_bounds_inner(
+                                    doc,
+                                    child,
+                                    active_frames,
+                                    page_to_surface,
+                                    group_to_screen,
+                                    child_c_xf,
+                                    sym_ctx,
+                                    depth + 1,
+                                    visiting_bounds,
+                                    visiting_syms,
+                                ) {
+                                    acc = Some(match acc {
+                                        Some(prev) => prev.union(cb),
+                                        None => cb,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    visiting_bounds.remove(&cid);
+                }
+                acc
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if !visiting_syms.insert(*sym_id) {
+                    None
+                } else {
+                    let res = doc.symbol(*sym_id).and_then(|sym| {
+                        let sym_root_world_xf = inner_world_xf.compose(&c_xf);
+                        let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                        let mut referenced: HashSet<ObjectId> = HashSet::new();
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 {
+                                child_map.insert(sub.id, sub);
+                            }
+                            match &sub.payload {
+                                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                NodePayload::PowerClip { contents, .. } => {
+                                    referenced.extend(contents.iter().copied());
+                                }
+                                _ => {}
+                            }
+                        }
+                        let mut acc: Option<Rect2D> = None;
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                continue;
+                            }
+                            if !sub.visible || !sub.transform.is_finite() {
+                                continue;
+                            }
+                            for sxf in symmetry_effect_transforms(&sub.effects) {
+                                let sub_c_xf = c_xf.compose(&sxf).compose(&sub.transform);
+                                if let Some(sb) = self.compute_deformed_child_screen_bounds_inner(
+                                    doc,
+                                    sub,
+                                    deform_frames,
+                                    page_to_surface,
+                                    group_to_screen,
+                                    sub_c_xf,
+                                    Some((&child_map, sym_root_world_xf)),
+                                    depth + 1,
+                                    visiting_bounds,
+                                    visiting_syms,
+                                ) {
+                                    acc = Some(match acc {
+                                        Some(prev) => prev.union(sb),
+                                        None => sb,
+                                    });
+                                }
+                            }
+                        }
+                        acc
+                    });
+                    visiting_syms.remove(sym_id);
+                    res
+                }
+            }
+        };
+
+        for eff in &obj.effects {
+            match eff {
+                Effect::Blend {
+                    target_id,
+                    along_path,
+                    ..
+                } => {
+                    for ref_id in std::iter::once(*target_id).chain(along_path.iter().copied()) {
+                        if let Some(tbb) = doc.world_object_bounds(ref_id) {
+                            if let Some(tsb) = page_to_surface.try_transform_rect(tbb) {
+                                base_sb = Some(match base_sb {
+                                    Some(prev) => prev.union(tsb),
+                                    None => tsb,
+                                });
+                            }
+                        }
+                    }
+                }
+                Effect::Extrude25D {
+                    vanishing_point, ..
+                } if vanishing_point.is_finite() => {
+                    let vp = page_to_surface.transform_point(*vanishing_point);
+                    if vp.is_finite() {
+                        let vpr = Rect2D::new(vp.x, vp.y, vp.x, vp.y);
+                        base_sb = Some(match base_sb {
+                            Some(prev) => prev.union(vpr),
+                            None => vpr,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        let obj_world_xf = inner_world_xf.compose(&c_xf);
+        let stroke_pad_mm = if obj.outline.is_visible() {
+            obj.outline
+                .scaled_width_mm_for_transform(&obj_world_xf)
+                .max(obj.outline.effective_width_mm())
+        } else {
+            0.0
+        };
+        let pad_px =
+            (effect_bounds_padding_mm(&obj.effects) + stroke_pad_mm + extra_top_pad + 4.0) * scale;
+        base_sb.map(|r| r.expand(pad_px.max(4.0)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_deformed_child_core(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        deform_frames: &[DeformFrame<'_>],
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        rel_xf: Affine2D,
+        sym_xf: Affine2D,
+        c_xf: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        child_u: &[BackdropItem],
+        track_child_lens: bool,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) {
+        let anti_alias = view_mode != ViewMode::Pixels;
+        let inner_to_outer_rel = deform_frames
+            .iter()
+            .skip(1)
+            .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
+
+        if view_mode != ViewMode::Wireframe {
+            if let Some(lens_cfg) = &obj.lens {
+                if let Some(local_path) = match &obj.payload {
+                    NodePayload::Path(p) => Some(p.clone()),
+                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                    NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+                    _ => None,
+                } {
+                    let deformed = apply_deform_chain_in_bounds(
+                        &apply_geometry_effects(&local_path, &obj.effects),
+                        c_xf,
+                        deform_frames,
+                    );
+                    if !obj.effects.is_empty() {
+                        render_underlay_effects(
+                            doc,
+                            obj,
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            page_to_surface,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    render_lens_object_with_backdrop(
+                        self,
+                        doc,
+                        page,
+                        obj,
+                        lens_cfg,
+                        &deformed,
+                        group_to_screen,
+                        page_to_surface,
+                        view_mode,
+                        options,
+                        backend,
+                        child_u,
+                        depth,
+                    );
+                    if !obj.effects.is_empty() {
+                        render_overlay_effects(
+                            obj,
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if obj.outline.is_visible() {
+                        draw_outline_styled(
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        match &obj.payload {
+            NodePayload::Path(p) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(p, &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                self.render_deformed_leaf(
+                    doc,
+                    obj,
+                    &deformed,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::Shape(s) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&s.to_bezier_path(), &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                self.render_deformed_leaf(
+                    doc,
+                    obj,
+                    &deformed,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::ArtisticText(text) => {
+                let pieces = self.text_engine.layout_artistic_pieces(text);
+                self.render_deformed_text_pieces(
+                    doc,
+                    obj,
+                    &pieces,
+                    deform_frames,
+                    c_xf,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::ParagraphText(para) => {
+                let pieces = self.text_engine.layout_paragraph_pieces(para);
+                self.render_deformed_text_pieces(
+                    doc,
+                    obj,
+                    &pieces,
+                    deform_frames,
+                    c_xf,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                    let group_world_xf = page_to_surface
+                        .inverse()
+                        .map(|inv| inv.compose(&group_to_screen))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
+                    let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let world_sym = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
+                    let to_grp = inv_inner_world.compose(&world_sym);
+                    let mut pieces = self.text_engine.layout_text_on_path_pieces(top, &host_path);
+                    for piece in &mut pieces {
+                        piece.path = piece.path.transformed(&to_grp);
+                    }
+                    self.render_deformed_text_pieces(
+                        doc,
+                        obj,
+                        &pieces,
+                        deform_frames,
+                        Affine2D::IDENTITY,
+                        page_to_surface,
+                        group_to_screen,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        anti_alias,
+                        backend,
+                        depth,
+                    );
+                } else {
+                    let pieces = self.text_engine.layout_artistic_pieces(&top.text);
+                    self.render_deformed_text_pieces(
+                        doc,
+                        obj,
+                        &pieces,
+                        deform_frames,
+                        c_xf,
+                        page_to_surface,
+                        group_to_screen,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        anti_alias,
+                        backend,
+                        depth,
+                    );
+                }
+            }
+            NodePayload::Table(table) => {
+                let deform_path = |p: &BezierPath, local_xf: Affine2D| -> BezierPath {
+                    apply_deform_chain_in_bounds(
+                        &apply_geometry_effects(p, &obj.effects),
+                        local_xf,
+                        deform_frames,
+                    )
+                };
+                let deformed_grid = deform_path(&table.to_grid_paths(), c_xf);
+                if view_mode == ViewMode::Wireframe {
+                    stroke_wireframe(&deformed_grid, group_to_screen, px_per_mm, options, backend);
+                    return;
+                }
+                if !obj.effects.is_empty() {
+                    render_underlay_effects(
+                        doc,
+                        obj,
+                        &deformed_grid,
+                        Affine2D::IDENTITY,
+                        group_to_screen,
+                        page_to_surface,
+                        px_per_mm,
+                        anti_alias,
+                        backend,
+                    );
+                }
+                for r in 0..table.rows {
+                    for c in 0..table.cols {
+                        let Some(cell) = table.cell(r, c) else {
+                            continue;
+                        };
+                        let Some(rect) = table.cell_rect(r, c) else {
+                            continue;
+                        };
+                        let cell_path = BezierPath::from_rect(rect);
+                        let deformed_cell = deform_path(&cell_path, c_xf);
+                        if cell.fill.is_visible() {
+                            self.draw_fill_styled(
+                                doc,
+                                &deformed_cell,
+                                &cell.fill,
+                                group_to_screen,
+                                obj.opacity,
+                                obj.blend_mode,
+                                anti_alias,
+                                backend,
+                                depth,
+                            );
+                        } else if obj.fill.is_visible() {
+                            self.draw_fill_styled(
+                                doc,
+                                &deformed_cell,
+                                &obj.fill,
+                                group_to_screen,
+                                obj.opacity,
+                                obj.blend_mode,
+                                anti_alias,
+                                backend,
+                                depth,
+                            );
+                        }
+                        if table.border_style.is_visible() {
+                            let w = if table.border_style.is_hairline {
+                                table
+                                    .border_style
+                                    .effective_width_mm()
+                                    .max(1.0 / px_per_mm.max(1e-3))
+                                    as f32
+                            } else {
+                                table.border_style.effective_width_mm() as f32
+                            };
+                            let st = StrokeParams::from_outline(
+                                &table.border_style,
+                                w,
+                                obj.opacity,
+                                obj.blend_mode,
+                                anti_alias,
+                            );
+                            backend.stroke_path(&deformed_cell, &st, group_to_screen);
+                        }
+                        if !cell.text.trim().is_empty() {
+                            let pad = sanitize_f64(cell.padding_mm, 1.5).max(0.0);
+                            let at = ArtisticText::from_plain(
+                                cell.text.clone(),
+                                cell.text_style.clone(),
+                            );
+                            let text_pieces = self.text_engine.layout_artistic_pieces(&at);
+                            let cell_text_xf = c_xf
+                                .compose(&Affine2D::translate(rect.min_x + pad, rect.min_y + pad));
+                            backend.push_clip(&deformed_cell, FillRule::Winding, group_to_screen);
+                            for piece in &text_pieces {
+                                let deformed_glyph = deform_path(&piece.path, cell_text_xf);
+                                let fill = Fill::Solid(piece.fill.clone());
+                                self.draw_fill_styled(
+                                    doc,
+                                    &deformed_glyph,
+                                    &fill,
+                                    group_to_screen,
+                                    obj.opacity,
+                                    obj.blend_mode,
+                                    anti_alias,
+                                    backend,
+                                    depth,
+                                );
+                            }
+                            backend.pop_clip();
+                        }
+                    }
+                }
+                if !obj.effects.is_empty() {
+                    render_overlay_effects(
+                        obj,
+                        &deformed_grid,
+                        Affine2D::IDENTITY,
+                        group_to_screen,
+                        px_per_mm,
+                        anti_alias,
+                        backend,
+                    );
+                }
+            }
+            NodePayload::Dimension(dim) => {
+                let deform_path = |p: &BezierPath, local_xf: Affine2D| -> BezierPath {
+                    apply_deform_chain_in_bounds(
+                        &apply_geometry_effects(p, &obj.effects),
+                        local_xf,
+                        deform_frames,
+                    )
+                };
+                let dim_outline = if obj.outline.is_visible() {
+                    obj.outline.clone()
+                } else {
+                    OutlineStyle::solid(Color::BLACK, 0.25)
+                };
+                let stroke_w = (dim_outline.effective_width_mm().max(0.2)) as f32;
+                let stroke = StrokeParams::from_outline(
+                    &dim_outline,
+                    stroke_w,
+                    obj.opacity,
+                    obj.blend_mode,
+                    anti_alias,
+                );
+                let label_text =
+                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+                let mut stroke_paths = Vec::new();
+                let mut arrow_paths = Vec::new();
+                let label_anchor = match dim.kind {
+                    DimensionKind::Parallel
+                    | DimensionKind::Horizontal
+                    | DimensionKind::Vertical
+                    | DimensionKind::Segment => {
+                        let (d1, d2, ext_dir) = match dim.kind {
+                            DimensionKind::Horizontal => {
+                                let y_line = dim.p1.y.min(dim.p2.y) - dim.offset_mm;
+                                (
+                                    Point2D::new(dim.p1.x, y_line),
+                                    Point2D::new(dim.p2.x, y_line),
+                                    Vec2D::new(0.0, -1.0),
+                                )
+                            }
+                            DimensionKind::Vertical => {
+                                let x_line = dim.p1.x.min(dim.p2.x) - dim.offset_mm;
+                                (
+                                    Point2D::new(x_line, dim.p1.y),
+                                    Point2D::new(x_line, dim.p2.y),
+                                    Vec2D::new(-1.0, 0.0),
+                                )
+                            }
+                            _ => {
+                                let dir = (dim.p2 - dim.p1)
+                                    .normalized()
+                                    .unwrap_or(Vec2D::new(1.0, 0.0));
+                                let perp = Vec2D::new(dir.y, -dir.x);
+                                let off = perp * dim.offset_mm;
+                                (dim.p1 + off, dim.p2 + off, perp)
+                            }
+                        };
+                        let overshoot = ext_dir * 1.5;
+                        stroke_paths.push(BezierPath::from_line(dim.p1, d1 + overshoot));
+                        stroke_paths.push(BezierPath::from_line(dim.p2, d2 + overshoot));
+                        stroke_paths.push(BezierPath::from_line(d1, d2));
+                        if let Some(dir) = (d2 - d1).normalized() {
+                            if let Some((g, filled)) = arrowhead_geometry(
+                                d1,
+                                -dir,
+                                &ArrowheadStyle::Triangle,
+                                stroke_w.max(0.35),
+                            ) {
+                                arrow_paths.push((g, filled));
+                            }
+                            if let Some((g, filled)) = arrowhead_geometry(
+                                d2,
+                                dir,
+                                &ArrowheadStyle::Triangle,
+                                stroke_w.max(0.35),
+                            ) {
+                                arrow_paths.push((g, filled));
+                            }
+                        }
+                        d1.midpoint(d2) + ext_dir * 1.2
+                    }
+                    DimensionKind::Angular => {
+                        let v = dim.p1;
+                        let r1 = (dim.p2 - v).normalized().unwrap_or(Vec2D::new(1.0, 0.0));
+                        let r2 = dim
+                            .p3
+                            .map_or(Vec2D::new(1.0, 0.0), |p| (p - v).normalize_or_zero());
+                        let rad = dim.offset_mm.abs().max(5.0);
+                        stroke_paths.push(BezierPath::from_line(v, v + r1 * (rad + 2.0)));
+                        stroke_paths.push(BezierPath::from_line(v, v + r2 * (rad + 2.0)));
+                        let a1 = r1.angle_rad();
+                        let mut a2 = r2.angle_rad();
+                        let mut sweep = a2 - a1;
+                        while sweep > std::f64::consts::PI {
+                            sweep -= std::f64::consts::TAU;
+                        }
+                        while sweep < -std::f64::consts::PI {
+                            sweep += std::f64::consts::TAU;
+                        }
+                        a2 = a1 + sweep;
+                        let steps = 24;
+                        let arc_pts: Vec<Point2D> = (0..=steps)
+                            .map(|i| {
+                                let a = a1 + (a2 - a1) * (i as f64 / steps as f64);
+                                v + Vec2D::from_angle(a) * rad
+                            })
+                            .collect();
+                        stroke_paths.push(BezierPath::from_polygon(arc_pts, false));
+                        let mid_a = 0.5 * (a1 + a2);
+                        v + Vec2D::from_angle(mid_a) * (rad + 3.0)
+                    }
+                    DimensionKind::Callout3Pt => {
+                        let mut pts = vec![dim.p1, dim.p2];
+                        let anchor = if let Some(p3) = dim.p3 {
+                            pts.push(p3);
+                            p3
+                        } else {
+                            dim.p2
+                        };
+                        stroke_paths.push(BezierPath::from_polygon(pts, false));
+                        anchor
+                    }
+                };
+                for sp in &stroke_paths {
+                    let def = deform_path(sp, c_xf);
+                    if view_mode == ViewMode::Wireframe {
+                        stroke_wireframe(&def, group_to_screen, px_per_mm, options, backend);
+                    } else {
+                        backend.stroke_path(&def, &stroke, group_to_screen);
+                    }
+                }
+                if view_mode != ViewMode::Wireframe {
+                    let arrow_paint = BackendPaint {
+                        shader: PaintShader::Solid(dim_outline.color.clone()),
+                        opacity: obj.opacity,
+                        blend_mode: obj.blend_mode,
+                        anti_alias,
+                    };
+                    for (ap, filled) in &arrow_paths {
+                        let def = deform_path(ap, c_xf);
+                        if *filled {
+                            backend.fill_path(
+                                &def,
+                                &arrow_paint,
+                                FillRule::Winding,
+                                group_to_screen,
+                            );
+                        } else {
+                            backend.stroke_path(&def, &stroke, group_to_screen);
+                        }
+                    }
+                }
+                if !label_text.trim().is_empty() {
+                    let at = ArtisticText::from_plain(label_text, dim.text_style.clone());
+                    let pieces = self.text_engine.layout_artistic_pieces(&at);
+                    let label_xf = c_xf.compose(&Affine2D::translate(
+                        label_anchor.x,
+                        label_anchor.y - dim.text_style.font_size_mm(),
+                    ));
+                    for piece in &pieces {
+                        let def = deform_path(&piece.path, label_xf);
+                        if view_mode == ViewMode::Wireframe {
+                            stroke_wireframe(&def, group_to_screen, px_per_mm, options, backend);
+                        } else {
+                            let fill = Fill::Solid(piece.fill.clone());
+                            self.draw_fill_styled(
+                                doc,
+                                &def,
+                                &fill,
+                                group_to_screen,
+                                obj.opacity,
+                                obj.blend_mode,
+                                anti_alias,
+                                backend,
+                                depth,
+                            );
+                        }
+                    }
+                }
+            }
+            NodePayload::Connector(conn) => {
+                let group_world_xf = page_to_surface
+                    .inverse()
+                    .map(|inv| inv.compose(&group_to_screen))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(Affine2D::IDENTITY);
+                let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
+                let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                let obj_world_xf = inner_world_xf.compose(&c_xf);
+                let world_sym_xf = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
+                let base_world_xf = world_sym_xf
+                    .inverse()
+                    .map(|inv| inv.compose(&obj_world_xf))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(obj_world_xf);
+                let mut sym_visiting = HashMap::new();
+                let mut sym_visited_syms = HashSet::new();
+                let mut sym_cache = HashMap::new();
+                let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                    doc,
+                    conn,
+                    &base_world_xf,
+                    sym_ctx,
+                    &mut sym_visiting,
+                    &mut sym_visited_syms,
+                    &mut sym_cache,
+                    depth + 1,
+                );
+                let route = conn.route_path(a, b);
+                let route_in_inner = route
+                    .transformed(&world_sym_xf)
+                    .transformed(&inv_inner_world);
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&route_in_inner, &obj.effects),
+                    Affine2D::IDENTITY,
+                    deform_frames,
+                );
+                if view_mode == ViewMode::Wireframe {
+                    stroke_wireframe(&deformed, group_to_screen, px_per_mm, options, backend);
+                } else {
+                    if !obj.effects.is_empty() {
+                        render_underlay_effects(
+                            doc,
+                            obj,
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            page_to_surface,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if obj.outline.is_visible() {
+                        draw_outline_styled(
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if !obj.effects.is_empty() {
+                        render_overlay_effects(
+                            obj,
+                            &deformed,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
                         );
                     }
                 }
             }
+            NodePayload::Group(sub) => {
+                let sub_has_deform = obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                });
+                let outer_world_xf = page_to_surface
+                    .inverse()
+                    .map(|inv| inv.compose(&group_to_screen))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(Affine2D::IDENTITY);
+                let sub_world_xf = outer_world_xf.compose(&inner_to_outer_rel).compose(&c_xf);
+                let sub_local_bb = if sub_has_deform {
+                    if sym_ctx.is_none() && obj.id.0 != 0 {
+                        doc.local_object_bounds(obj.id)
+                    } else {
+                        let mut v = HashSet::new();
+                        Self::compute_children_local_bounds(
+                            doc,
+                            sub,
+                            sym_ctx,
+                            Affine2D::IDENTITY,
+                            sub_world_xf,
+                            depth + 1,
+                            &mut v,
+                        )
+                    }
+                } else {
+                    None
+                };
+                let mut extended_frames: Vec<DeformFrame<'_>> = Vec::new();
+                let (next_frames, next_rel_xf) = if sub_has_deform {
+                    extended_frames.extend_from_slice(deform_frames);
+                    extended_frames.push(DeformFrame {
+                        group_local_bb: sub_local_bb,
+                        group_effects: &obj.effects,
+                        rel_to_outer: c_xf,
+                    });
+                    (extended_frames.as_slice(), Affine2D::IDENTITY)
+                } else {
+                    (deform_frames, c_xf)
+                };
+                let child_has_underlay = view_mode != ViewMode::Wireframe
+                    && obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::DropShadow { .. }
+                                | Effect::BlockShadow { .. }
+                                | Effect::Contour {
+                                    mode: coree_core::ContourMode::Outside,
+                                    ..
+                                }
+                                | Effect::Extrude25D { .. }
+                                | Effect::Blend { .. }
+                        )
+                    });
+                let child_has_overlay = view_mode != ViewMode::Wireframe
+                    && obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Contour {
+                                mode: coree_core::ContourMode::Inside
+                                    | coree_core::ContourMode::ToCenter,
+                                ..
+                            } | Effect::Extrude25D { .. }
+                        )
+                    });
+                let mut child_proxy: Option<SceneObject> = None;
+                let mut child_sil: Option<BezierPath> = None;
+                if child_has_underlay || child_has_overlay {
+                    let mut v = HashSet::new();
+                    let sil = self.collect_group_local_silhouette(
+                        doc,
+                        sub,
+                        sym_ctx,
+                        Affine2D::IDENTITY,
+                        depth + 1,
+                        &mut v,
+                    );
+                    let def_sil = apply_deform_chain_in_bounds(&sil, next_rel_xf, next_frames);
+                    let mut proxy = obj.clone();
+                    if !proxy.fill.is_visible() {
+                        proxy.fill = Self::first_visible_child_fill(doc, sub, sym_ctx)
+                            .unwrap_or(Fill::Solid(Color::BLACK));
+                    }
+                    child_sil = Some(def_sil);
+                    child_proxy = Some(proxy);
+                }
+                if child_has_underlay {
+                    if let (Some(proxy), Some(def_sil)) = (&child_proxy, &child_sil) {
+                        render_underlay_effects(
+                            doc,
+                            proxy,
+                            def_sil,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            page_to_surface,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                }
+                let group_sym_root_idx = if obj.id.0 == 0 {
+                    self.current_sym_root_idx
+                } else {
+                    None
+                };
+                let saved_sym_root_idx = self.current_sym_root_idx.take();
+                let mut sub_underlying = (sub_has_deform && track_child_lens).then(|| {
+                    let mut v = child_u.to_vec();
+                    v.push(BackdropItem::EnterDeformedGroup {
+                        group_id: obj.id,
+                        group_sym_root_idx,
+                        group_local_bb: sub_local_bb,
+                        group_world_xf: Some(sub_world_xf),
+                    });
+                    v
+                });
+                let sub_u = sub_underlying.as_deref().unwrap_or(child_u);
+                self.render_group_deformed_subtree(
+                    doc,
+                    page,
+                    sub,
+                    obj.id,
+                    next_frames,
+                    page_to_surface,
+                    group_to_screen,
+                    next_rel_xf,
+                    sym_ctx,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    sub_u,
+                    track_child_lens,
+                    depth + 1,
+                    visiting,
+                );
+                self.current_sym_root_idx = saved_sym_root_idx;
+                if let Some(ref mut v) = sub_underlying {
+                    v.push(BackdropItem::ExitDeformedGroup);
+                }
+                if child_has_overlay {
+                    if let (Some(proxy), Some(def_sil)) = (&child_proxy, &child_sil) {
+                        render_overlay_effects(
+                            proxy,
+                            def_sil,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                }
+            }
+            NodePayload::PowerClip {
+                container,
+                contents,
+                ..
+            } => {
+                let deformed_container = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(container, &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                let sym_map = sym_ctx.map(|(m, _)| m);
+                let track_pc_lens = track_child_lens
+                    && contents.iter().any(|&cid| {
+                        sym_map
+                            .and_then(|m| m.get(&cid).copied())
+                            .or_else(|| doc.object(cid))
+                            .is_some_and(|c| {
+                                let mut v = HashSet::from([cid]);
+                                let mut vs = HashSet::new();
+                                crate::export_render::object_or_subtree_has_lens_with_sym(
+                                    doc, c, sym_map, 0, &mut v, &mut vs,
+                                )
+                            })
+                    });
+                let pc_sym_root_idx = if obj.id.0 == 0 {
+                    self.current_sym_root_idx
+                } else {
+                    None
+                };
+                let saved_sym_root_idx = self.current_sym_root_idx.take();
+                let pc_underlying = track_pc_lens.then(|| {
+                    let mut v = child_u.to_vec();
+                    v.push(BackdropItem::EnterPowerClip {
+                        pc_id: obj.id,
+                        sym_root_idx: pc_sym_root_idx,
+                    });
+                    v
+                });
+                let pc_u = pc_underlying.as_deref().unwrap_or(child_u);
+                if view_mode == ViewMode::Wireframe {
+                    stroke_wireframe(
+                        &deformed_container,
+                        group_to_screen,
+                        px_per_mm,
+                        options,
+                        backend,
+                    );
+                    self.render_group_deformed_subtree(
+                        doc,
+                        page,
+                        contents,
+                        obj.id,
+                        deform_frames,
+                        page_to_surface,
+                        group_to_screen,
+                        c_xf,
+                        sym_ctx,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        backend,
+                        pc_u,
+                        track_pc_lens,
+                        depth + 1,
+                        visiting,
+                    );
+                    self.current_sym_root_idx = saved_sym_root_idx;
+                } else {
+                    if !obj.effects.is_empty() {
+                        render_underlay_effects(
+                            doc,
+                            obj,
+                            &deformed_container,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            page_to_surface,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if obj.outline.behind_fill && obj.outline.is_visible() {
+                        draw_outline_styled(
+                            &deformed_container,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if obj.fill.is_visible() {
+                        self.draw_fill_styled(
+                            doc,
+                            &deformed_container,
+                            &obj.fill,
+                            group_to_screen,
+                            obj.opacity,
+                            obj.blend_mode,
+                            anti_alias,
+                            backend,
+                            depth,
+                        );
+                    }
+                    backend.push_clip(&deformed_container, FillRule::Winding, group_to_screen);
+                    self.render_group_deformed_subtree(
+                        doc,
+                        page,
+                        contents,
+                        obj.id,
+                        deform_frames,
+                        page_to_surface,
+                        group_to_screen,
+                        c_xf,
+                        sym_ctx,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        backend,
+                        pc_u,
+                        track_pc_lens,
+                        depth + 1,
+                        visiting,
+                    );
+                    self.current_sym_root_idx = saved_sym_root_idx;
+                    backend.pop_clip();
+                    if !obj.effects.is_empty() {
+                        render_overlay_effects(
+                            obj,
+                            &deformed_container,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                    if !obj.outline.behind_fill && obj.outline.is_visible() {
+                        draw_outline_styled(
+                            &deformed_container,
+                            Affine2D::IDENTITY,
+                            group_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            px_per_mm,
+                            anti_alias,
+                            backend,
+                        );
+                    }
+                }
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                if self.active_symbols.insert(*sym_id) {
+                    if let Some(sym) = doc.symbol(*sym_id) {
+                        let sym_root_world_xf = page_to_surface
+                            .inverse()
+                            .map(|inv| {
+                                inv.compose(&group_to_screen)
+                                    .compose(&inner_to_outer_rel)
+                                    .compose(&c_xf)
+                            })
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(c_xf);
+                        let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                        let mut referenced: HashSet<ObjectId> = HashSet::new();
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 {
+                                child_map.insert(sub.id, sub);
+                            }
+                            match &sub.payload {
+                                NodePayload::Group(c) => {
+                                    referenced.extend(c.iter().copied());
+                                }
+                                NodePayload::PowerClip { contents, .. } => {
+                                    referenced.extend(contents.iter().copied());
+                                }
+                                _ => {}
+                            }
+                        }
+                        let sym_has_lens = track_child_lens
+                            && sym.objects.iter().any(|sub| {
+                                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                    return false;
+                                }
+                                let mut v = if sub.id.0 != 0 {
+                                    HashSet::from([sub.id])
+                                } else {
+                                    HashSet::new()
+                                };
+                                let mut vs = HashSet::new();
+                                crate::export_render::object_or_subtree_has_lens_with_sym(
+                                    doc,
+                                    sub,
+                                    Some(&child_map),
+                                    0,
+                                    &mut v,
+                                    &mut vs,
+                                )
+                            });
+                        let parent_sym_root_idx = self.current_sym_root_idx.take();
+                        let scope_prev_len = self.frozen_scope_stack.len();
+                        let sym_u128 = sym_id.0.as_u128();
+                        self.frozen_scope_stack.extend_from_slice(&[
+                            FROZEN_TAG_SYM_INST,
+                            sym_u128 as u64,
+                            (sym_u128 >> 64) as u64,
+                            obj.id.0,
+                            parent_sym_root_idx.map_or(u64::MAX, |i| i as u64),
+                        ]);
+                        let mut sym_underlying = sym_has_lens.then(|| {
+                            let mut v = child_u.to_vec();
+                            v.push(BackdropItem::EnterSymbolInstance {
+                                sym_id: *sym_id,
+                                sym_world_xf: sym_root_world_xf,
+                                inst_id: obj.id,
+                                inst_sym_root_idx: parent_sym_root_idx,
+                            });
+                            v
+                        });
+                        let mut sym_visit = HashSet::new();
+                        for (idx, sub) in sym.objects.iter().enumerate() {
+                            if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                continue;
+                            }
+                            if sub.id.0 != 0 && !sym_visit.insert(sub.id) {
+                                if let Some(ref mut u) = sym_underlying {
+                                    u.push(BackdropItem::Object(sub.id));
+                                }
+                                continue;
+                            }
+                            self.current_sym_root_idx =
+                                if sub.id.0 == 0 { Some(idx) } else { None };
+                            let sub_u = sym_underlying.as_deref().unwrap_or(child_u);
+                            self.render_deformed_scene_object(
+                                doc,
+                                page,
+                                sub,
+                                deform_frames,
+                                page_to_surface,
+                                group_to_screen,
+                                c_xf,
+                                Some((&child_map, sym_root_world_xf)),
+                                px_per_mm,
+                                view_mode,
+                                options,
+                                backend,
+                                sub_u,
+                                sym_has_lens,
+                                depth + 1,
+                                &mut sym_visit,
+                            );
+                            if sub.id.0 != 0 {
+                                sym_visit.remove(&sub.id);
+                            }
+                            if let Some(ref mut u) = sym_underlying {
+                                if sub.id.0 != 0 {
+                                    u.push(BackdropItem::Object(sub.id));
+                                } else {
+                                    u.push(BackdropItem::SymObjectIndex(idx));
+                                }
+                            }
+                        }
+                        if let Some(ref mut u) = sym_underlying {
+                            u.push(BackdropItem::ExitSymbolInstance);
+                        }
+                        self.frozen_scope_stack.truncate(scope_prev_len);
+                        self.current_sym_root_idx = parent_sym_root_idx;
+                    }
+                    self.active_symbols.remove(sym_id);
+                }
+            }
+            NodePayload::Raster(_) => {
+                self.render_scene_object_core(
+                    doc,
+                    page,
+                    obj,
+                    page_to_surface,
+                    group_to_screen
+                        .compose(&inner_to_outer_rel)
+                        .compose(&rel_xf)
+                        .compose(&sym_xf),
+                    sym_ctx,
+                    Affine2D::IDENTITY,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    child_u,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_deformed_leaf(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        deformed_in_group: &BezierPath,
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        anti_alias: bool,
+        backend: &mut dyn CanvasBackend,
+        depth: usize,
+    ) {
+        if view_mode == ViewMode::Wireframe {
+            stroke_wireframe(
+                deformed_in_group,
+                group_to_screen,
+                px_per_mm,
+                options,
+                backend,
+            );
+            return;
+        }
+        if !obj.effects.is_empty() {
+            render_underlay_effects(
+                doc,
+                obj,
+                deformed_in_group,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                page_to_surface,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
+        }
+        if obj.outline.behind_fill && obj.outline.is_visible() {
+            draw_outline_styled(
+                deformed_in_group,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                &obj.outline,
+                obj.opacity,
+                obj.blend_mode,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
+        }
+        if obj.fill.is_visible() {
+            self.draw_fill_styled(
+                doc,
+                deformed_in_group,
+                &obj.fill,
+                group_to_screen,
+                obj.opacity,
+                obj.blend_mode,
+                anti_alias,
+                backend,
+                depth,
+            );
+        }
+        if !obj.effects.is_empty() {
+            render_overlay_effects(
+                obj,
+                deformed_in_group,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
+        }
+        if !obj.outline.behind_fill && obj.outline.is_visible() {
+            draw_outline_styled(
+                deformed_in_group,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                &obj.outline,
+                obj.opacity,
+                obj.blend_mode,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_deformed_text_pieces(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        pieces: &[ShapedGlyphDraw],
+        deform_frames: &[DeformFrame<'_>],
+        c_xf: Affine2D,
+        page_to_surface: Affine2D,
+        group_to_screen: Affine2D,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        anti_alias: bool,
+        backend: &mut dyn CanvasBackend,
+        depth: usize,
+    ) {
+        let deformed_pieces: Vec<(&ShapedGlyphDraw, BezierPath)> = pieces
+            .iter()
+            .map(|piece| {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&piece.path, &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                (piece, deformed)
+            })
+            .collect();
+        if view_mode == ViewMode::Wireframe {
+            for (_, deformed) in &deformed_pieces {
+                stroke_wireframe(deformed, group_to_screen, px_per_mm, options, backend);
+            }
+            return;
+        }
+        let combined_deformed = if !obj.effects.is_empty() {
+            Some(BezierPath {
+                subpaths: deformed_pieces
+                    .iter()
+                    .flat_map(|(_, d)| d.subpaths.iter().cloned())
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        if let Some(ref combined) = combined_deformed {
+            render_underlay_effects(
+                doc,
+                obj,
+                combined,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                page_to_surface,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
+        }
+        for (piece, deformed) in &deformed_pieces {
+            let fill = Fill::Solid(piece.fill.clone());
+            self.draw_fill_styled(
+                doc,
+                deformed,
+                &fill,
+                group_to_screen,
+                obj.opacity,
+                obj.blend_mode,
+                anti_alias,
+                backend,
+                depth,
+            );
+            if obj.outline.is_visible() {
+                draw_outline_styled(
+                    deformed,
+                    Affine2D::IDENTITY,
+                    group_to_screen,
+                    &obj.outline,
+                    obj.opacity,
+                    obj.blend_mode,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        }
+        if let Some(ref combined) = combined_deformed {
+            render_overlay_effects(
+                obj,
+                combined,
+                Affine2D::IDENTITY,
+                group_to_screen,
+                px_per_mm,
+                anti_alias,
+                backend,
+            );
         }
     }
 
@@ -1204,7 +5490,7 @@ impl SceneRenderer {
             anti_alias,
         );
 
-        let label_text = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
+        let label_text = dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
         let label_anchor = match dim.kind {
             DimensionKind::Parallel
             | DimensionKind::Horizontal
@@ -1361,10 +5647,120 @@ impl SceneRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_text_pieces_with_effects(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        pieces: &[ShapedGlyphDraw],
+        clip_rect_mm: Option<Rect2D>,
+        base_xf: Affine2D,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        backend: &mut dyn CanvasBackend,
+    ) {
+        if pieces.is_empty() {
+            return;
+        }
+        let anti_alias = view_mode != ViewMode::Pixels;
+        let combined_local = BezierPath {
+            subpaths: pieces
+                .iter()
+                .flat_map(|p| p.path.subpaths.iter().cloned())
+                .collect(),
+        };
+        let deformed_local = apply_geometry_effects(&combined_local, &obj.effects);
+        let draw_xf = parent_to_screen.compose(&base_xf);
+
+        render_underlay_effects(
+            doc,
+            obj,
+            &deformed_local,
+            base_xf,
+            parent_to_screen,
+            page_to_surface,
+            px_per_mm,
+            anti_alias,
+            backend,
+        );
+
+        let has_deform = obj.effects.iter().any(|e| {
+            matches!(
+                e,
+                coree_core::Effect::Distort { .. }
+                    | coree_core::Effect::Envelope { .. }
+                    | coree_core::Effect::Perspective { .. }
+            )
+        });
+
+        let clipped = clip_rect_mm.is_some();
+        if let Some(cr) = clip_rect_mm {
+            let clip_path = apply_geometry_effects(&BezierPath::from_rect(cr), &obj.effects);
+            backend.push_clip(&clip_path, FillRule::Winding, draw_xf);
+        }
+
+        if has_deform {
+            let fill = pieces
+                .first()
+                .map_or(Fill::Solid(Color::BLACK), |p| Fill::Solid(p.fill.clone()));
+            self.draw_fill_styled(
+                doc,
+                &deformed_local,
+                &fill,
+                draw_xf,
+                obj.opacity,
+                obj.blend_mode,
+                anti_alias,
+                backend,
+                0,
+            );
+            if obj.outline.is_visible() {
+                draw_outline_styled(
+                    &deformed_local,
+                    base_xf,
+                    parent_to_screen,
+                    &obj.outline,
+                    obj.opacity,
+                    obj.blend_mode,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        } else {
+            draw_text_pieces(
+                backend,
+                pieces,
+                draw_xf,
+                &obj.outline,
+                obj.opacity,
+                obj.blend_mode,
+                view_mode,
+                px_per_mm,
+            );
+        }
+
+        if clipped {
+            backend.pop_clip();
+        }
+
+        render_overlay_effects(
+            obj,
+            &deformed_local,
+            base_xf,
+            parent_to_screen,
+            px_per_mm,
+            anti_alias,
+            backend,
+        );
+    }
+
     /// Renders all 11 [`Fill`] variants onto `backend`, reusing `self` for `VectorPattern`
     /// symbol tile rasterization with recursion depth tracking.
     #[allow(clippy::too_many_arguments)]
-    fn draw_fill_styled(
+    pub(crate) fn draw_fill_styled(
         &mut self,
         doc: &Document,
         local_path: &BezierPath,
@@ -1500,7 +5896,7 @@ impl SceneRenderer {
                 let tw = sanitize_f64(*tile_w, 15.0).max(0.5);
                 let th = sanitize_f64(*tile_h, 15.0).max(0.5);
                 let tile_px = 64u32;
-                if let Some(sym) = doc.symbols.get(symbol_id) {
+                if let Some(sym) = doc.symbol(*symbol_id) {
                     let tile = self.rasterize_symbol_tile(doc, sym, tw, th, tile_px, depth + 1);
                     let tile_xf = Affine2D::scale(tw / f64::from(tile_px), th / f64::from(tile_px));
                     let paint = BackendPaint {
@@ -1520,7 +5916,7 @@ impl SceneRenderer {
                 tile_w,
                 tile_h,
             } => {
-                if let Some(asset) = doc.assets.get(image_id) {
+                if let Some(asset) = doc.asset(*image_id) {
                     if let Ok(tile) =
                         RgbaBuffer::from_vec(asset.width, asset.height, asset.rgba_bytes.clone())
                     {
@@ -1786,7 +6182,7 @@ fn render_mesh_fill(
     }
 
     let mut buf = RgbaBuffer::new_transparent(clamped.width, clamped.height);
-    let sub_divs = 8usize; // 8x8 bicubic/Coons subdivisions per mesh cell
+    let sub_divs = 10usize; // Smooth 10x10 bicubic Catmull-Rom / Coons subdivisions per mesh cell
 
     // Project all mesh control points into local buffer pixel space
     let to_buf_px = |p: Point2D| -> Point2D {
@@ -1794,12 +6190,43 @@ fn render_mesh_fill(
         Point2D::new(s.x - f64::from(clamped.x), s.y - f64::from(clamped.y))
     };
 
+    let sample_grid_pt = |rr: isize, cc: isize| -> Point2D {
+        let rc = rr.clamp(0, (r_cnt - 1) as isize) as usize;
+        let cc = cc.clamp(0, (c_cnt - 1) as isize) as usize;
+        to_buf_px(grid_pos[rc][cc])
+    };
+
     for r in 0..(r_cnt - 1) {
+        let ri = r as isize;
         for c in 0..(c_cnt - 1) {
-            let p00 = to_buf_px(grid_pos[r][c]);
-            let p10 = to_buf_px(grid_pos[r][c + 1]);
-            let p01 = to_buf_px(grid_pos[r + 1][c]);
-            let p11 = to_buf_px(grid_pos[r + 1][c + 1]);
+            let ci = c as isize;
+            // 4x4 neighborhood stencil for C1 Catmull-Rom curved mesh patch interpolation
+            let patch_pts: [[Point2D; 4]; 4] = [
+                [
+                    sample_grid_pt(ri - 1, ci - 1),
+                    sample_grid_pt(ri - 1, ci),
+                    sample_grid_pt(ri - 1, ci + 1),
+                    sample_grid_pt(ri - 1, ci + 2),
+                ],
+                [
+                    sample_grid_pt(ri, ci - 1),
+                    sample_grid_pt(ri, ci),
+                    sample_grid_pt(ri, ci + 1),
+                    sample_grid_pt(ri, ci + 2),
+                ],
+                [
+                    sample_grid_pt(ri + 1, ci - 1),
+                    sample_grid_pt(ri + 1, ci),
+                    sample_grid_pt(ri + 1, ci + 1),
+                    sample_grid_pt(ri + 1, ci + 2),
+                ],
+                [
+                    sample_grid_pt(ri + 2, ci - 1),
+                    sample_grid_pt(ri + 2, ci),
+                    sample_grid_pt(ri + 2, ci + 1),
+                    sample_grid_pt(ri + 2, ci + 2),
+                ],
+            ];
 
             let c00 = grid_col[r][c];
             let c10 = grid_col[r][c + 1];
@@ -1807,9 +6234,17 @@ fn render_mesh_fill(
             let c11 = grid_col[r + 1][c + 1];
 
             let eval_pos = |u: f64, v: f64| -> Point2D {
-                let top = p00.lerp(p10, u);
-                let bot = p01.lerp(p11, u);
-                top.lerp(bot, v)
+                let mut rows_u = [Point2D::ZERO; 4];
+                for k in 0..4 {
+                    rows_u[k] = catmull_rom_pt(
+                        patch_pts[k][0],
+                        patch_pts[k][1],
+                        patch_pts[k][2],
+                        patch_pts[k][3],
+                        u,
+                    );
+                }
+                catmull_rom_pt(rows_u[0], rows_u[1], rows_u[2], rows_u[3], v)
             };
             // Smooth cubic Hermite (bicubic smoothstep) color interpolation for silky mesh blends
             let eval_col = |u: f64, v: f64| -> [f32; 4] {
@@ -1910,7 +6345,7 @@ fn rasterize_gouraud_triangle(
 /// Renders an [`OutlineStyle`] honoring `is_hairline`, `scale_with_object`, `dash_pattern`,
 /// `calligraphy_stretch`/`calligraphy_angle_deg`, and `start_arrow`/`end_arrow` arrowheads!
 #[allow(clippy::too_many_arguments)]
-fn draw_outline_styled(
+pub(crate) fn draw_outline_styled(
     local_path: &BezierPath,
     obj_xf: Affine2D,
     parent_to_screen: Affine2D,
@@ -2256,7 +6691,7 @@ fn render_raster_object(
         return;
     }
 
-    let Some(asset) = doc.assets.get(&raster.asset_id) else {
+    let Some(asset) = doc.asset(raster.asset_id) else {
         return;
     };
     let filtered = if raster.filters.is_empty() {
@@ -2344,10 +6779,11 @@ fn render_page_overlays(
     let hairline_mm = (1.0 / px_per_mm.max(1e-3)) as f32;
 
     // 1. Document Grid
-    if options.show_grid && doc.grid.visible {
-        let sx = sanitize_f64(doc.grid.spacing_x_mm, 10.0).max(0.5);
-        let sy = sanitize_f64(doc.grid.spacing_y_mm, 10.0).max(0.5);
-        let subs = doc.grid.subdivisions.clamp(1, 10);
+    let grid = doc.grid();
+    if options.show_grid && grid.visible {
+        let sx = sanitize_f64(grid.spacing_x_mm, 10.0).max(0.5);
+        let sy = sanitize_f64(grid.spacing_y_mm, 10.0).max(0.5);
+        let subs = grid.subdivisions.clamp(1, 10);
         let step_x = sx / f64::from(subs);
         let step_y = sy / f64::from(subs);
 
@@ -2363,7 +6799,7 @@ fn render_page_overlays(
             blend_mode: BlendMode::Normal,
             anti_alias: false,
         };
-        if doc.grid.show_dots {
+        if grid.show_dots {
             let dot_paint = BackendPaint::solid(Color::rgba8(130, 150, 185, 180));
             let r = f64::from(hairline_mm) * 0.8;
             let mut y = 0.0;
@@ -2454,9 +6890,9 @@ fn render_page_overlays(
     }
 
     // 3. Perspective Grid
-    if options.show_perspective_grid && doc.perspective_grid.enabled {
+    if options.show_perspective_grid && doc.perspective_grid().enabled {
         render_perspective_grid(
-            &doc.perspective_grid,
+            doc.perspective_grid(),
             page,
             page_to_surface,
             hairline_mm,
@@ -2465,7 +6901,8 @@ fn render_page_overlays(
     }
 
     // 4. Guidelines
-    if options.show_guidelines && !doc.guides.is_empty() {
+    let guides = doc.guides();
+    if options.show_guidelines && !guides.is_empty() {
         let guide_stroke = StrokeParams {
             color: Color::rgba8(0, 165, 225, 200),
             width: hairline_mm,
@@ -2479,8 +6916,8 @@ fn render_page_overlays(
             anti_alias: false,
         };
         let extent = page.width_mm.max(page.height_mm) * 4.0;
-        let mut subpaths = Vec::with_capacity(doc.guides.len());
-        for guide in &doc.guides {
+        let mut subpaths = Vec::with_capacity(guides.len());
+        for guide in guides {
             match guide.orientation {
                 GuideOrientation::Horizontal(y) => {
                     subpaths.push(Subpath::from_points(
@@ -2576,7 +7013,7 @@ fn render_perspective_grid(
     backend.pop_clip();
 }
 
-fn stroke_wireframe(
+pub(crate) fn stroke_wireframe(
     path: &BezierPath,
     transform: Affine2D,
     px_per_mm: f64,
@@ -2604,7 +7041,7 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
     let mut seen = HashSet::new();
     let is_odd = page_index.is_multiple_of(2); // 1-based Page 1 = index 0 = Odd
 
-    for page in &doc.pages {
+    for page in doc.pages() {
         for layer in &page.layers {
             let applies = layer.is_desktop_layer
                 || match layer.master_scope {
@@ -2618,7 +7055,7 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
             }
         }
     }
-    if let Some(page) = doc.pages.get(page_index) {
+    if let Some(page) = doc.page(page_index) {
         for layer in &page.layers {
             if !layer.is_desktop_layer
                 && layer.master_scope == MasterLayerScope::None
@@ -2631,6 +7068,256 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
     out
 }
 
+fn object_has_nonlocal_effect_or_lens(
+    doc: &Document,
+    obj: &SceneObject,
+    visiting_objs: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_RENDER_DEPTH {
+        return false;
+    }
+    if obj.lens.is_some()
+        || obj.effects.iter().any(|e| {
+            matches!(
+                e,
+                coree_core::Effect::Blend { .. }
+                    | coree_core::Effect::Symmetry { .. }
+                    | coree_core::Effect::Perspective { .. }
+                    | coree_core::Effect::Envelope { .. }
+                    | coree_core::Effect::Distort { .. }
+            )
+        })
+    {
+        return true;
+    }
+    match &obj.payload {
+        NodePayload::Group(children) => children.iter().any(|&cid| {
+            if !visiting_objs.insert(cid) {
+                return false;
+            }
+            let hit = doc.object(cid).is_some_and(|c| {
+                object_has_nonlocal_effect_or_lens(doc, c, visiting_objs, visiting_syms, depth + 1)
+            });
+            visiting_objs.remove(&cid);
+            hit
+        }),
+        NodePayload::PowerClip { contents, .. } => contents.iter().any(|&cid| {
+            if !visiting_objs.insert(cid) {
+                return false;
+            }
+            let hit = doc.object(cid).is_some_and(|c| {
+                object_has_nonlocal_effect_or_lens(doc, c, visiting_objs, visiting_syms, depth + 1)
+            });
+            visiting_objs.remove(&cid);
+            hit
+        }),
+        NodePayload::SymbolInstance(sym_id) => {
+            if !visiting_syms.insert(*sym_id) {
+                return false;
+            }
+            let hit = doc.symbol(*sym_id).is_some_and(|sym| {
+                sym.objects.iter().any(|sub| {
+                    object_has_nonlocal_effect_or_lens(
+                        doc,
+                        sub,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    )
+                })
+            });
+            visiting_syms.remove(sym_id);
+            hit
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn max_object_effect_padding_mm(
+    doc: &Document,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+) -> f64 {
+    let mut visiting_objs = HashSet::new();
+    let mut visiting_syms = HashSet::new();
+    if obj.id.0 != 0 {
+        visiting_objs.insert(obj.id);
+    }
+    max_object_effect_padding_inner(
+        doc,
+        obj,
+        parent_xf,
+        None,
+        &mut visiting_objs,
+        &mut visiting_syms,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn max_object_effect_padding_inner(
+    doc: &Document,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+    visiting_objs: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    depth: usize,
+) -> f64 {
+    if depth > MAX_RENDER_DEPTH || !parent_xf.is_finite() || !obj.transform.is_finite() {
+        return 0.0;
+    }
+    let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        return 0.0;
+    }
+    let mut max_pad = effect_bounds_padding_mm(&obj.effects);
+    let lin_norm =
+        (world_xf.m[0].abs() + world_xf.m[2].abs()).max(world_xf.m[1].abs() + world_xf.m[3].abs());
+    if lin_norm.is_finite() && lin_norm > 1.0 {
+        for eff in &obj.effects {
+            match eff {
+                Effect::Distort { amplitude, .. } if amplitude.is_finite() => {
+                    max_pad = max_pad.max(lin_norm * (2.0 * amplitude.abs() + 2.0));
+                }
+                Effect::DropShadow {
+                    dx_mm,
+                    dy_mm,
+                    blur_mm,
+                    ..
+                } => {
+                    let base =
+                        (dx_mm.abs() + blur_mm.abs() * 3.0).max(dy_mm.abs() + blur_mm.abs() * 3.0);
+                    if base.is_finite() {
+                        max_pad = max_pad.max(lin_norm * base);
+                    }
+                }
+                Effect::BlockShadow { dx_mm, dy_mm, .. } => {
+                    let base = dx_mm.abs().max(dy_mm.abs()) + 2.0;
+                    if base.is_finite() {
+                        max_pad = max_pad.max(lin_norm * base);
+                    }
+                }
+                Effect::Contour {
+                    mode: coree_core::ContourMode::Outside,
+                    steps,
+                    offset_mm,
+                    ..
+                } => {
+                    let base = f64::from(*steps) * offset_mm.abs() + 2.0;
+                    if base.is_finite() {
+                        max_pad = max_pad.max(lin_norm * base);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if obj.outline.is_visible() {
+        let stroke_w = obj
+            .outline
+            .scaled_width_mm_for_transform(&world_xf)
+            .max(obj.outline.effective_width_mm());
+        if stroke_w.is_finite() {
+            max_pad = max_pad.max(stroke_w * 4.0);
+        }
+    }
+    match &obj.payload {
+        NodePayload::Group(children) => {
+            for &cid in children {
+                if !visiting_objs.insert(cid) {
+                    continue;
+                }
+                if let Some(child) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    max_pad = max_pad.max(max_object_effect_padding_inner(
+                        doc,
+                        child,
+                        world_xf,
+                        sym_map,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    ));
+                }
+                visiting_objs.remove(&cid);
+            }
+        }
+        NodePayload::PowerClip { contents, .. } => {
+            for &cid in contents {
+                if !visiting_objs.insert(cid) {
+                    continue;
+                }
+                if let Some(child) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    max_pad = max_pad.max(max_object_effect_padding_inner(
+                        doc,
+                        child,
+                        world_xf,
+                        sym_map,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    ));
+                }
+                visiting_objs.remove(&cid);
+            }
+        }
+        NodePayload::SymbolInstance(sym_id) if visiting_syms.insert(*sym_id) => {
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut referenced: HashSet<ObjectId> = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 {
+                        child_map.insert(sub.id, sub);
+                    }
+                    match &sub.payload {
+                        NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                        NodePayload::PowerClip { contents, .. } => {
+                            referenced.extend(contents.iter().copied());
+                        }
+                        _ => {}
+                    }
+                }
+                let mut sym_visiting = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_visiting.insert(sub.id) {
+                        continue;
+                    }
+                    max_pad = max_pad.max(max_object_effect_padding_inner(
+                        doc,
+                        sub,
+                        world_xf,
+                        Some(&child_map),
+                        &mut sym_visiting,
+                        visiting_syms,
+                        depth + 1,
+                    ));
+                    if sub.id.0 != 0 {
+                        sym_visiting.remove(&sub.id);
+                    }
+                }
+            }
+            visiting_syms.remove(sym_id);
+        }
+        _ => {}
+    }
+    if max_pad.is_finite() {
+        max_pad
+    } else {
+        0.0
+    }
+}
+
 fn compute_page_max_effect_padding(doc: &Document, layers: &[&Layer]) -> f64 {
     let mut max_pad = 0.0_f64;
     for layer in layers {
@@ -2638,11 +7325,8 @@ fn compute_page_max_effect_padding(doc: &Document, layers: &[&Layer]) -> f64 {
             continue;
         }
         for &oid in &layer.objects {
-            if let Some(obj) = doc.objects.get(&oid) {
-                max_pad = max_pad.max(effect_bounds_padding_mm(&obj.effects));
-                if obj.outline.is_visible() {
-                    max_pad = max_pad.max(obj.outline.effective_width_mm() * 4.0);
-                }
+            if let Some(obj) = doc.object(oid) {
+                max_pad = max_pad.max(max_object_effect_padding_mm(doc, obj, Affine2D::IDENTITY));
             }
         }
     }
@@ -2919,4 +7603,178 @@ fn hash_grid(ix: i64, iy: i64, seed: u64) -> f64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^= z >> 31;
     (z as f64) / (u64::MAX as f64)
+}
+
+#[inline]
+fn catmull_rom_pt(p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64) -> Point2D {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let x = 0.5
+        * ((2.0 * p1.x)
+            + (-p0.x + p2.x) * t
+            + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
+            + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
+    let y = 0.5
+        * ((2.0 * p1.y)
+            + (-p0.y + p2.y) * t
+            + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
+            + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
+    Point2D::new(x, y)
+}
+
+#[inline]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coree_core::{
+        ColorMode, CornerStyle, Effect, FeatherDirection, ParametricShape, TextStyle,
+    };
+
+    #[test]
+    fn text_drop_shadow_renders_non_glyph_shadow_pixels() {
+        let mut plain_doc = Document::new("TextEffects", 80.0, 50.0, ColorMode::Rgb, 96.0);
+        let txt = ArtisticText::from_plain(
+            "HI",
+            TextStyle {
+                font_size_pt: 36.0,
+                fill: Color::BLACK,
+                ..TextStyle::default()
+            },
+        );
+        let obj = SceneObject::new(ObjectId(0), "ShadowText", NodePayload::ArtisticText(txt))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(15.0, 25.0));
+        let id = plain_doc.add_object(obj, None).unwrap();
+
+        let mut fx_doc = plain_doc.clone();
+        coree_core::apply_command(
+            &mut fx_doc,
+            &coree_core::CommandOp::AddEffect {
+                id,
+                effect: Effect::DropShadow {
+                    dx_mm: 4.0,
+                    dy_mm: 4.0,
+                    blur_mm: 1.5,
+                    opacity: 0.75,
+                    color: Color::rgb(1.0, 0.0, 0.0),
+                    feather_direction: FeatherDirection::Middle,
+                },
+            },
+        )
+        .unwrap();
+
+        let mut vp = Viewport::new(320, 200);
+        vp.fit_rect(Rect2D::from_xywh(0.0, 0.0, 80.0, 50.0), 4.0);
+        let mut r = SceneRenderer::new();
+        let mut b_plain = TinySkiaBackend::new(320, 200).unwrap();
+        r.render_document(
+            &plain_doc,
+            &vp,
+            ViewMode::Enhanced,
+            &RenderOptions::default(),
+            &mut b_plain,
+        );
+        let mut b_fx = TinySkiaBackend::new(320, 200).unwrap();
+        r.render_document(
+            &fx_doc,
+            &vp,
+            ViewMode::Enhanced,
+            &RenderOptions::default(),
+            &mut b_fx,
+        );
+
+        let rgba_fx = b_fx.into_rgba();
+        let rgba_plain = b_plain.into_rgba();
+        let red_shadow_px = rgba_fx
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgba_plain.rgba.as_chunks::<4>().0.iter())
+            .filter(|(f, p)| f[0] > f[1].saturating_add(20) && p[1] > f[1].saturating_add(20))
+            .count();
+        assert!(
+            red_shadow_px > 20,
+            "red DropShadow on live ArtisticText should render red-tinted shadow pixels on white paper (diff={red_shadow_px})"
+        );
+    }
+
+    #[test]
+    fn high_step_blend_supports_up_to_999_steps() {
+        let mut doc = Document::new("Blend999", 100.0, 60.0, ColorMode::Rgb, 96.0);
+        let s1 = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "R1",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 10.0,
+                        height: 10.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::CYAN))
+                .with_transform(Affine2D::translate(10.0, 20.0)),
+                None,
+            )
+            .unwrap();
+        let s2 = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "R2",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 10.0,
+                        height: 10.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::MAGENTA))
+                .with_transform(Affine2D::translate(70.0, 20.0)),
+                None,
+            )
+            .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: s1,
+                effect: Effect::Blend {
+                    target_id: s2,
+                    steps: 120,
+                    rotation_deg: 0.0,
+                    along_path: None,
+                },
+            },
+        )
+        .unwrap();
+        let mut next = 1000u64;
+        let obj = doc.object(s1).unwrap();
+        let lowered = crate::effects_render::lower_effects_to_primitives(
+            &doc,
+            obj,
+            obj.transform,
+            &mut || {
+                next += 1;
+                ObjectId(next)
+            },
+        );
+        assert!(
+            lowered.len() >= 120,
+            "Blend should honor >64 steps up to 999 (got {})",
+            lowered.len()
+        );
+    }
 }

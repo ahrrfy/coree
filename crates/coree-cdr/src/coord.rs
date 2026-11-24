@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room coordinate conversions (0.1 µm CDR units & 16/32-bit CMX units),
-//! Corel color model codecs (`CMYK255`, `CMYK100`, `RGB`, `BGR`, `Gray`, `Lab`,
+//! CDR color model codecs (`CMYK255`, `CMYK100`, `RGB`, `BGR`, `Gray`, `Lab`,
 //! `Spot`), and legacy Arabic Windows-1256 (CP1256) / UTF-16LE / UTF-8 text codecs.
 
 use crate::error::CdrResult;
@@ -14,6 +14,8 @@ use coree_core::{
 
 /// Windows Arabic codepage identifier (`Windows-1256`).
 pub const CODEPAGE_ARABIC_CP1256: u16 = 1256;
+/// Windows Cyrillic codepage identifier (`Windows-1251`).
+pub const CODEPAGE_CYRILLIC_CP1251: u16 = 1251;
 /// Windows Western Latin codepage identifier (`Windows-1252`).
 pub const CODEPAGE_LATIN1_CP1252: u16 = 1252;
 /// UTF-16 Little-Endian codepage identifier.
@@ -22,6 +24,8 @@ pub const CODEPAGE_UTF16LE: u16 = 1200;
 pub const CODEPAGE_UTF8: u16 = 65001;
 /// Windows GDI `ARABIC_CHARSET` constant (`178 = 0xB2`) stored in legacy `stlt`/`font` chunks.
 pub const CHARSET_ARABIC: u8 = 178;
+/// Windows GDI `RUSSIAN_CHARSET` constant (`204 = 0xCC`) stored in legacy `stlt`/`font` chunks.
+pub const CHARSET_RUSSIAN: u8 = 204;
 
 /// Physical coordinate unit used inside `.cmx` containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,10 +142,10 @@ pub fn page_mm_to_cdr_point(pt: coree_core::Point2D, page_w_mm: f64, page_h_mm: 
 }
 
 // =============================================================================
-// Corel Color Model Codecs
+// CDR Color Model Codecs
 // =============================================================================
 
-/// Clean-room Corel color model identifiers used across CDR and CMX chunks.
+/// Clean-room CDR color model identifiers used across CDR and CMX chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum CdrColorModel {
@@ -168,7 +172,7 @@ pub enum CdrColorModel {
 }
 
 impl CdrColorModel {
-    /// Maps a numeric Corel color-model ID into [`CdrColorModel`].
+    /// Maps a numeric CDR color-model ID into [`CdrColorModel`].
     #[must_use]
     pub const fn from_u16(raw: u16) -> Option<Self> {
         match raw {
@@ -179,7 +183,7 @@ impl CdrColorModel {
             6 => Some(Self::Hsl),
             9 => Some(Self::Gray),
             12 => Some(Self::Lab),
-            14 | 1 => Some(Self::Spot),
+            1 | 14 | 15 | 16 | 18 | 25 => Some(Self::Spot),
             20 => Some(Self::Rgba),
             21 => Some(Self::Cmyka255),
             _ => None,
@@ -215,7 +219,7 @@ pub const fn color_model_name(color: &Color) -> &'static str {
     }
 }
 
-/// Decodes a Corel binary color record (`model_id` + payload bytes) into a [`Color`].
+/// Decodes a CDR binary color record (`model_id` + payload bytes) into a [`Color`].
 pub fn decode_cdr_color(
     model_id: u16,
     raw: &[u8],
@@ -314,7 +318,7 @@ pub fn decode_cdr_color(
             } else {
                 1.0
             };
-            // Standard Corel Lab stores L* in 0..=100; clamp safely if > 100
+            // Standard CDR Lab stores L* in 0..=100; clamp safely if > 100
             let l = if l_raw <= 100 {
                 f32::from(l_raw)
             } else {
@@ -328,6 +332,24 @@ pub fn decode_cdr_color(
             })
         }
         CdrColorModel::Spot => {
+            if raw.len() == 4 {
+                let c = f32::from(raw[0]) / 255.0;
+                let m = f32::from(raw[1]) / 255.0;
+                let y = f32::from(raw[2]) / 255.0;
+                let k = f32::from(raw[3]) / 255.0;
+                let name = spot_name_override.unwrap_or("Spot").to_owned();
+                let fallback_cmyk = if c == 0.0 && m == 0.0 && y == 0.0 && k == 0.0 {
+                    derive_spot_fallback_cmyk(&name)
+                } else {
+                    [c, m, y, k]
+                };
+                return Ok(Color::Spot {
+                    name,
+                    tint: 1.0,
+                    fallback_cmyk,
+                    alpha: 1.0,
+                });
+            }
             let tint = f32::from(r.read_u8("Spot tint")?.min(100)) / 100.0;
             let c = f32::from(r.read_u8("Spot fallback C")?) / 255.0;
             let m = f32::from(r.read_u8("Spot fallback M")?) / 255.0;
@@ -359,6 +381,57 @@ pub fn decode_cdr_color(
             })
         }
     }
+}
+
+/// Derives a deterministic non-black CMYK fallback for named Spot/PANTONE/Fixed colors
+/// when a container omits explicit fallback channels.
+#[must_use]
+pub(crate) fn derive_spot_fallback_cmyk(name: &str) -> [f32; 4] {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.contains("magenta") || lower.contains("rubine") || lower.contains("rhodamine") {
+        return [0.0, 1.0, 0.0, 0.0];
+    }
+    if lower.contains("cyan") || lower.contains("process blue") {
+        return [1.0, 0.0, 0.0, 0.0];
+    }
+    if lower.contains("yellow") {
+        return [0.0, 0.0, 1.0, 0.0];
+    }
+    if lower.contains("cut")
+        || lower.contains("die")
+        || lower.contains("red")
+        || lower.contains("185")
+    {
+        return [0.0, 0.95, 0.85, 0.0];
+    }
+    if lower.contains("green") || lower.contains("354") {
+        return [0.85, 0.0, 0.90, 0.0];
+    }
+    if lower.contains("blue") || lower.contains("reflex") || lower.contains("286") {
+        return [0.95, 0.70, 0.0, 0.0];
+    }
+    if lower.contains("orange") {
+        return [0.0, 0.65, 1.0, 0.0];
+    }
+    if lower.contains("violet") || lower.contains("purple") {
+        return [0.65, 0.90, 0.0, 0.0];
+    }
+    if lower.contains("gold") {
+        return [0.10, 0.25, 0.80, 0.10];
+    }
+    if lower.contains("silver") {
+        return [0.10, 0.08, 0.08, 0.25];
+    }
+    // Deterministic chromatic hash so Spot colors never collapse to [0,0,0,1] black.
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in lower.as_bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    let c = ((h & 0xFF) as f32 / 255.0) * 0.85 + 0.05;
+    let m = (((h >> 8) & 0xFF) as f32 / 255.0) * 0.85 + 0.05;
+    let y = (((h >> 16) & 0xFF) as f32 / 255.0) * 0.85;
+    [c.min(1.0), m.min(1.0), y.min(1.0), 0.0]
 }
 
 /// Encodes a [`Color`] into a `(CdrColorModel u16, payload bytes)` tuple.
@@ -498,6 +571,14 @@ pub fn encode_cp1256(text: &str) -> (Vec<u8>, bool) {
     (cow.into_owned(), had_errors)
 }
 
+/// Encodes `text` into Windows-1251 (Cyrillic CP1251) bytes via `encoding_rs`.
+/// Returns `(bytes, had_unmappable_chars)`.
+#[must_use]
+pub fn encode_cp1251(text: &str) -> (Vec<u8>, bool) {
+    let (cow, _, had_errors) = encoding_rs::WINDOWS_1251.encode(text);
+    (cow.into_owned(), had_errors)
+}
+
 /// Encodes `text` into UTF-16LE bytes (without BOM).
 #[must_use]
 pub fn encode_utf16le(text: &str) -> Vec<u8> {
@@ -508,7 +589,7 @@ pub fn encode_utf16le(text: &str) -> Vec<u8> {
     out
 }
 
-/// Decodes Corel text bytes with full support for Arabic Windows-1256 (`CP1256`),
+/// Decodes CDR text bytes with full support for Arabic Windows-1256 (`CP1256`),
 /// Windows `ARABIC_CHARSET` (`178`), UTF-16LE, UTF-8, and heuristic CP1256 auto-detection.
 #[must_use]
 pub fn decode_cdr_text(raw: &[u8], codepage_hint: Option<u16>, charset_hint: Option<u8>) -> String {
@@ -545,6 +626,13 @@ pub fn decode_cdr_text(raw: &[u8], codepage_hint: Option<u16>, charset_hint: Opt
     if codepage_hint == Some(CODEPAGE_ARABIC_CP1256) || charset_hint == Some(CHARSET_ARABIC) {
         let trimmed = trim_trailing_nul_bytes(raw);
         let (cow, _, _) = encoding_rs::WINDOWS_1256.decode(trimmed);
+        return cow.into_owned();
+    }
+
+    // 3b. Explicit Windows-1251 Cyrillic codepage or Windows RUSSIAN_CHARSET (204)
+    if codepage_hint == Some(CODEPAGE_CYRILLIC_CP1251) || charset_hint == Some(CHARSET_RUSSIAN) {
+        let trimmed = trim_trailing_nul_bytes(raw);
+        let (cow, _, _) = encoding_rs::WINDOWS_1251.decode(trimmed);
         return cow.into_owned();
     }
 

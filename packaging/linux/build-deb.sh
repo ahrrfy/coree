@@ -14,7 +14,7 @@ fi
 
 # Extract default version from workspace Cargo.toml unless overridden via --version or COREE_VERSION
 DEFAULT_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_ROOT}/Cargo.toml" | head -n 1)"
-VERSION="${COREE_VERSION:-${DEFAULT_VERSION:-0.2.0}}"
+VERSION="${COREE_VERSION:-${DEFAULT_VERSION:-0.3.1}}"
 ARCH="${COREE_DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 OUT_DIR="${REPO_ROOT}/dist"
 BINARY_PATH="${REPO_ROOT}/target/release/coree"

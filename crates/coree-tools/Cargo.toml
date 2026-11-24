@@ -1,0 +1,12 @@
+[package]
+name = "coree-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Headless pure-Rust interactive tool state machines (ToolCore) and transient overlays for coree."
+
+[dependencies]
+coree-core.workspace = true
+serde.workspace = true

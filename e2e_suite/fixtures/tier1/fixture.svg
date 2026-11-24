@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 793.7008 1122.5197">
+  <g id="layer-artwork" data-layer="Artwork">
+    <rect x="40" y="40" width="220" height="140" fill="#00A8E8" stroke="#111111" stroke-width="2"/>
+    <circle cx="380" cy="180" r="70" fill="#E63946" stroke="#000000" stroke-width="1.5"/>
+    <text x="40" y="240" font-family="Noto Sans" font-size="24" fill="#111111">coree SVG</text>
+  </g>
+  <g id="layer-cut" data-layer="CutContour">
+    <path d="M 30 30 L 470 30 L 470 280 L 30 280 Z" fill="none" stroke="#FF00FF" stroke-width="0.288"/>
+  </g>
+</svg>

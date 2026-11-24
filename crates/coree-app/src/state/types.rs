@@ -3,287 +3,29 @@
 use super::*;
 
 // =============================================================================
-// 15 Toolbox Flyout Groups & Complete Tool Registry
+// 15 Toolbox Flyout Groups & Complete Tool Registry (re-exported from coree-tools)
 // =============================================================================
 
-/// Every interactive studio tool across all 15 Toolbox Flyout groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub enum ToolId {
-    // Group 0: Pick
-    #[default]
-    Pick,
-    FreehandPick,
-    FreeTransform,
-
-    // Group 1: Shape / Node & Sculpting
-    ShapeNode,
-    Smooth,
-    Smear,
-    Twirl,
-    AttractRepel,
-    Roughen,
-
-    // Group 2: Crop & Cutting
-    Crop,
-    Knife,
-    VirtualSegmentDelete,
-    Eraser,
-
-    // Group 3: Zoom & Pan
-    Zoom,
-    Pan,
-
-    // Group 4: Curves & Drawing
-    Freehand,
-    TwoPointLine,
-    Bezier,
-    Pen,
-    BSpline,
-    Polyline,
-    ThreePointCurve,
-    SmartDrawing,
-    LiveSketch,
-    ArtisticMedia,
-
-    // Group 5: Rectangle
-    Rectangle,
-    ThreePointRectangle,
-
-    // Group 6: Ellipse
-    Ellipse,
-    ThreePointEllipse,
-
-    // Group 7: Object / Parametric Shapes
-    Polygon,
-    Star,
-    ComplexStar,
-    Spiral,
-    GraphPaper,
-    Impact,
-    BasicShapes,
-
-    // Group 8: Text & Table
-    ArtisticText,
-    ParagraphText,
-    Table,
-
-    // Group 9: Dimensions & Connectors
-    ParallelDimension,
-    HvDimension,
-    AngularDimension,
-    SegmentDimension,
-    ThreePointCallout,
-    StraightConnector,
-    RightAngleConnector,
-
-    // Group 10: Interactive Vector Effects
-    DropShadow,
-    BlockShadow,
-    Contour,
-    Blend,
-    Distort,
-    Envelope,
-    Extrude25D,
-    Transparency,
-
-    // Group 11: Eyedroppers
-    ColorEyedropper,
-    AttributesEyedropper,
-
-    // Group 12: Interactive & Smart Fills
-    InteractiveFill,
-    MeshFill,
-    SmartFill,
-
-    // Group 13: Lens Tool
-    LensTool,
-
-    // Group 14: Integrated Bitmap Studio
-    BitmapBrush,
-    BitmapEraser,
-    CloneStamp,
-    Smudge,
-    MaskSelect,
-}
-
-/// Static definition of all 15 Toolbox Flyout groups.
-pub const TOOL_GROUPS: [&[ToolId]; 15] = [
-    &[ToolId::Pick, ToolId::FreehandPick, ToolId::FreeTransform],
-    &[
-        ToolId::ShapeNode,
-        ToolId::Smooth,
-        ToolId::Smear,
-        ToolId::Twirl,
-        ToolId::AttractRepel,
-        ToolId::Roughen,
-    ],
-    &[
-        ToolId::Crop,
-        ToolId::Knife,
-        ToolId::VirtualSegmentDelete,
-        ToolId::Eraser,
-    ],
-    &[ToolId::Zoom, ToolId::Pan],
-    &[
-        ToolId::Freehand,
-        ToolId::TwoPointLine,
-        ToolId::Bezier,
-        ToolId::Pen,
-        ToolId::BSpline,
-        ToolId::Polyline,
-        ToolId::ThreePointCurve,
-        ToolId::SmartDrawing,
-        ToolId::LiveSketch,
-        ToolId::ArtisticMedia,
-    ],
-    &[ToolId::Rectangle, ToolId::ThreePointRectangle],
-    &[ToolId::Ellipse, ToolId::ThreePointEllipse],
-    &[
-        ToolId::Polygon,
-        ToolId::Star,
-        ToolId::ComplexStar,
-        ToolId::Spiral,
-        ToolId::GraphPaper,
-        ToolId::Impact,
-        ToolId::BasicShapes,
-    ],
-    &[ToolId::ArtisticText, ToolId::ParagraphText, ToolId::Table],
-    &[
-        ToolId::ParallelDimension,
-        ToolId::HvDimension,
-        ToolId::AngularDimension,
-        ToolId::SegmentDimension,
-        ToolId::ThreePointCallout,
-        ToolId::StraightConnector,
-        ToolId::RightAngleConnector,
-    ],
-    &[
-        ToolId::DropShadow,
-        ToolId::BlockShadow,
-        ToolId::Contour,
-        ToolId::Blend,
-        ToolId::Distort,
-        ToolId::Envelope,
-        ToolId::Extrude25D,
-        ToolId::Transparency,
-    ],
-    &[ToolId::ColorEyedropper, ToolId::AttributesEyedropper],
-    &[ToolId::InteractiveFill, ToolId::MeshFill, ToolId::SmartFill],
-    &[ToolId::LensTool],
-    &[
-        ToolId::BitmapBrush,
-        ToolId::BitmapEraser,
-        ToolId::CloneStamp,
-        ToolId::Smudge,
-        ToolId::MaskSelect,
-    ],
-];
-
-impl ToolId {
-    /// Human-readable clean-room label for tooltips, flyouts, and Command Palette.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Pick => "Pick Tool",
-            Self::FreehandPick => "Freehand Pick",
-            Self::FreeTransform => "Free Transform",
-            Self::ShapeNode => "Shape (Node Editor)",
-            Self::Smooth => "Smooth Sculpt",
-            Self::Smear => "Smear Sculpt",
-            Self::Twirl => "Twirl Sculpt",
-            Self::AttractRepel => "Attract & Repel",
-            Self::Roughen => "Roughen Edge",
-            Self::Crop => "Crop",
-            Self::Knife => "Knife Cut",
-            Self::VirtualSegmentDelete => "Virtual Segment Delete",
-            Self::Eraser => "Vector Eraser",
-            Self::Zoom => "Zoom",
-            Self::Pan => "Pan",
-            Self::Freehand => "Freehand Curve",
-            Self::TwoPointLine => "2-Point Line",
-            Self::Bezier => "Bézier Curve",
-            Self::Pen => "Pen Tool",
-            Self::BSpline => "B-Spline",
-            Self::Polyline => "Polyline",
-            Self::ThreePointCurve => "3-Point Curve",
-            Self::SmartDrawing => "Smart Drawing",
-            Self::LiveSketch => "LiveSketch",
-            Self::ArtisticMedia => "Artistic Media",
-            Self::Rectangle => "Rectangle",
-            Self::ThreePointRectangle => "3-Point Rectangle",
-            Self::Ellipse => "Ellipse",
-            Self::ThreePointEllipse => "3-Point Ellipse",
-            Self::Polygon => "Polygon",
-            Self::Star => "Star",
-            Self::ComplexStar => "Complex Star",
-            Self::Spiral => "Spiral",
-            Self::GraphPaper => "Graph Paper",
-            Self::Impact => "Impact Rays",
-            Self::BasicShapes => "Basic Shapes",
-            Self::ArtisticText => "Artistic Text",
-            Self::ParagraphText => "Paragraph Text",
-            Self::Table => "Vector Table",
-            Self::ParallelDimension => "Parallel Dimension",
-            Self::HvDimension => "Horizontal/Vertical Dimension",
-            Self::AngularDimension => "Angular Dimension",
-            Self::SegmentDimension => "Segment Dimension",
-            Self::ThreePointCallout => "3-Point Callout",
-            Self::StraightConnector => "Straight Connector",
-            Self::RightAngleConnector => "Right-Angle Connector",
-            Self::DropShadow => "Drop Shadow",
-            Self::BlockShadow => "Block Shadow",
-            Self::Contour => "Contour",
-            Self::Blend => "Blend",
-            Self::Distort => "Distort",
-            Self::Envelope => "Envelope",
-            Self::Extrude25D => "Extrude 2.5D",
-            Self::Transparency => "Transparency",
-            Self::ColorEyedropper => "Color Eyedropper",
-            Self::AttributesEyedropper => "Attributes Eyedropper",
-            Self::InteractiveFill => "Interactive Fill",
-            Self::MeshFill => "Mesh Fill",
-            Self::SmartFill => "Smart Fill",
-            Self::LensTool => "Interactive Lens",
-            Self::BitmapBrush => "Bitmap Brush",
-            Self::BitmapEraser => "Bitmap Eraser",
-            Self::CloneStamp => "Clone Stamp",
-            Self::Smudge => "Smudge Brush",
-            Self::MaskSelect => "Mask Select",
-        }
-    }
-
-    /// Returns which of the 15 Toolbox Flyout groups (`0..15`) owns this tool.
-    #[must_use]
-    pub fn group_index(self) -> usize {
-        for (idx, group) in TOOL_GROUPS.iter().enumerate() {
-            if group.contains(&self) {
-                return idx;
-            }
-        }
-        0
-    }
-
-    /// Associated shortcut action if one exists.
-    #[must_use]
-    pub const fn shortcut_action(self) -> Option<ShortcutAction> {
-        match self {
-            Self::Pick => Some(ShortcutAction::SelectPick),
-            Self::ShapeNode => Some(ShortcutAction::SelectShapeNode),
-            Self::Zoom => Some(ShortcutAction::SelectZoom),
-            Self::Pan => Some(ShortcutAction::SelectPan),
-            Self::Freehand => Some(ShortcutAction::SelectFreehand),
-            Self::Pen => Some(ShortcutAction::SelectPen),
-            Self::Rectangle => Some(ShortcutAction::SelectRectangle),
-            Self::Ellipse => Some(ShortcutAction::SelectEllipse),
-            Self::Polygon => Some(ShortcutAction::SelectPolygon),
-            Self::Spiral => Some(ShortcutAction::SelectSpiral),
-            Self::GraphPaper => Some(ShortcutAction::SelectGraphPaper),
-            Self::ArtisticText => Some(ShortcutAction::SelectArtisticText),
-            Self::ColorEyedropper => Some(ShortcutAction::SelectEyedropper),
-            Self::InteractiveFill => Some(ShortcutAction::SelectInteractiveFill),
-            Self::MeshFill => Some(ShortcutAction::SelectMeshFill),
-            _ => None,
-        }
+/// Associated shortcut action for a [`ToolId`] if one exists.
+#[must_use]
+pub const fn tool_shortcut_action(tool: ToolId) -> Option<ShortcutAction> {
+    match tool {
+        ToolId::Pick => Some(ShortcutAction::SelectPick),
+        ToolId::ShapeNode => Some(ShortcutAction::SelectShapeNode),
+        ToolId::Zoom => Some(ShortcutAction::SelectZoom),
+        ToolId::Pan => Some(ShortcutAction::SelectPan),
+        ToolId::Freehand => Some(ShortcutAction::SelectFreehand),
+        ToolId::Pen => Some(ShortcutAction::SelectPen),
+        ToolId::Rectangle => Some(ShortcutAction::SelectRectangle),
+        ToolId::Ellipse => Some(ShortcutAction::SelectEllipse),
+        ToolId::Polygon => Some(ShortcutAction::SelectPolygon),
+        ToolId::Spiral => Some(ShortcutAction::SelectSpiral),
+        ToolId::GraphPaper => Some(ShortcutAction::SelectGraphPaper),
+        ToolId::ArtisticText => Some(ShortcutAction::SelectArtisticText),
+        ToolId::ColorEyedropper => Some(ShortcutAction::SelectEyedropper),
+        ToolId::InteractiveFill => Some(ShortcutAction::SelectInteractiveFill),
+        ToolId::MeshFill => Some(ShortcutAction::SelectMeshFill),
+        _ => None,
     }
 }
 
@@ -349,6 +91,27 @@ impl DockerTab {
             Self::CdrInspector => "CDR Inspector",
         }
     }
+
+    /// Localized short tab title displayed in `egui_dock` (respecting English / Arabic UAX #9 BiDi).
+    #[must_use]
+    pub fn title_for(self, lang: crate::theme::StudioLanguage) -> String {
+        match self {
+            Self::Objects => lang.tr_ui("Objects", "الكائنات والطبقات"),
+            Self::Properties => lang.tr_ui("Properties", "الخصائص"),
+            Self::Lens => lang.tr_ui("Lens", "العدسات"),
+            Self::Effects => lang.tr_ui("Effects", "التأثيرات"),
+            Self::TransformAlignShape => lang.tr_ui("Transform", "التحويل والمحاذاة"),
+            Self::VectorTrace => lang.tr_ui("Vector Trace", "التتبع المتجهي"),
+            Self::BitmapStudio => lang.tr_ui("Bitmap Studio", "استوديو الصور"),
+            Self::Production => lang.tr_ui("Production", "الإنتاج والطباعة"),
+            Self::FindReplace => lang.tr_ui("Find & Replace", "البحث والاستبدال"),
+            Self::SymbolsStyles => lang.tr_ui("Symbols", "الرموز والأنماط"),
+            Self::FontManager => lang.tr_ui("Fonts", "الخطوط"),
+            Self::History => lang.tr_ui("History", "السجل والتراجع"),
+            Self::Macros => lang.tr_ui("Macros", "الماكرو والأتمتة"),
+            Self::CdrInspector => lang.tr_ui("CDR Inspector", "فاحص CDR"),
+        }
+    }
 }
 
 /// Builds the default right-side docker layout (`Objects` + `Properties` + `Lens` + `Effects`
@@ -378,55 +141,8 @@ pub fn default_dock_state() -> DockState<DockerTab> {
 }
 
 // =============================================================================
-// Workspace Presets, Raster Brush Sub-Modes & Shape Smoothness Alias
+// Workspace Presets (RasterBrushOp & NodeSmoothness re-exported from coree-tools)
 // =============================================================================
-
-/// Smoothness continuity rule for `F10` Shape/Node Property Bar controls.
-pub type NodeSmoothness = NodeKind;
-
-/// Raster studio brush sub-mode (keeps `ToolId` 100% backwards-compatible while
-/// enabling Paint, Eraser, Clone Stamp, Smudge, Healing, Dodge, Burn, and Flood Fill).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub enum RasterBrushOp {
-    #[default]
-    Paint,
-    Eraser,
-    CloneStamp,
-    Smudge,
-    Healing,
-    Dodge,
-    Burn,
-    FloodFill,
-}
-
-impl RasterBrushOp {
-    /// All 8 interactive raster brush / fill operations.
-    pub const ALL: [Self; 8] = [
-        Self::Paint,
-        Self::Eraser,
-        Self::CloneStamp,
-        Self::Smudge,
-        Self::Healing,
-        Self::Dodge,
-        Self::Burn,
-        Self::FloodFill,
-    ];
-
-    /// Display label for toolbars and Bitmap Studio controls.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Paint => "Paint Brush",
-            Self::Eraser => "Bitmap Eraser",
-            Self::CloneStamp => "Clone Stamp",
-            Self::Smudge => "Smudge",
-            Self::Healing => "Healing Brush",
-            Self::Dodge => "Dodge (Lighten)",
-            Self::Burn => "Burn (Darken)",
-            Self::FloodFill => "Flood Fill",
-        }
-    }
-}
 
 /// Switchable clean-room studio workspace presets (exportable/importable as `.coreews` JSON).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -539,193 +255,8 @@ pub struct InlineTextEditState {
     pub just_opened: bool,
 }
 
-/// Identifies an interactive parametric shape handle dragged in `F10` Shape mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParametricHandleKind {
-    RectCorner(usize),
-    EllipseAngle { is_end: bool },
-    PolygonVertex,
-    StarOuter,
-    StarInner,
-}
-
-// =============================================================================
-// Interactive Canvas Drag Gesture State
-// =============================================================================
-
-/// Which resize handle is being dragged on the selection bounding box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScaleHandle {
-    TopLeft,
-    Top,
-    TopRight,
-    Right,
-    BottomRight,
-    Bottom,
-    BottomLeft,
-    Left,
-}
-
-/// Active interactive gesture on the central canvas.
-#[derive(Debug, Clone, Default)]
-pub enum CanvasDragState {
-    #[default]
-    Idle,
-    Panning {
-        start_screen: [f32; 2],
-        orig_pan_mm: Point2D,
-    },
-    MarqueeSelect {
-        start_mm: Point2D,
-        current_mm: Point2D,
-    },
-    LassoSelect {
-        points_mm: Vec<Point2D>,
-    },
-    MovingSelection {
-        start_mm: Point2D,
-        last_mm: Point2D,
-        accum_dx: f64,
-        accum_dy: f64,
-    },
-    ScalingSelection {
-        handle: ScaleHandle,
-        orig_bounds: Rect2D,
-        current_mm: Point2D,
-        orig_transforms: Vec<(ObjectId, Affine2D)>,
-        last_affine: Affine2D,
-    },
-    RotatingSelection {
-        pivot_mm: Point2D,
-        start_angle_rad: f64,
-        current_angle_rad: f64,
-        orig_transforms: Vec<(ObjectId, Affine2D)>,
-        last_affine: Affine2D,
-    },
-    SkewingSelection {
-        horizontal: bool,
-        pivot_mm: Point2D,
-        start_mm: Point2D,
-        current_mm: Point2D,
-        orig_transforms: Vec<(ObjectId, Affine2D)>,
-        last_affine: Affine2D,
-    },
-    FreeTransforming {
-        anchor_mm: Point2D,
-        start_mm: Point2D,
-        current_mm: Point2D,
-        orig_transforms: Vec<(ObjectId, Affine2D)>,
-        last_affine: Affine2D,
-    },
-    DraggingPivot,
-    DraggingNode {
-        node: NodeRef,
-        handle_part: NodeDragPart,
-        orig_paths: Vec<(ObjectId, BezierPath)>,
-        last_world_mm: Point2D,
-    },
-    NodeMarqueeSelect {
-        start_mm: Point2D,
-        current_mm: Point2D,
-    },
-    DraggingCurveSegment {
-        object_id: ObjectId,
-        subpath_index: usize,
-        seg_index: usize,
-        t: f64,
-        last_local_mm: Point2D,
-        orig_path: BezierPath,
-    },
-    DraggingParametricHandle {
-        object_id: ObjectId,
-        handle: ParametricHandleKind,
-        orig_shape: ParametricShape,
-    },
-    Sculpting {
-        object_id: ObjectId,
-        orig_payload: NodePayload,
-        last_mm: Point2D,
-        points_mm: Vec<Point2D>,
-        step_counter: u64,
-    },
-    ZoomMarquee {
-        start_mm: Point2D,
-        current_mm: Point2D,
-    },
-    CropBoxHandle {
-        handle: ScaleHandle,
-        orig_rect: Rect2D,
-    },
-    PullingBezierHandle {
-        anchor_mm: Point2D,
-        handle_out_mm: Point2D,
-        closing: bool,
-    },
-    DraggingGradientHandle {
-        object_id: ObjectId,
-        is_end: bool,
-        orig_fill: Fill,
-    },
-    DraggingGradientFocal {
-        object_id: ObjectId,
-        orig_fill: Fill,
-    },
-    DraggingGradientStop {
-        object_id: ObjectId,
-        stop_index: usize,
-        orig_fill: Fill,
-    },
-    DraggingEffectHandle {
-        object_id: ObjectId,
-        effect_index: usize,
-        orig_effect: Effect,
-    },
-    DraggingCanvasGuide {
-        guide_id: u64,
-        orig_orientation: GuideOrientation,
-    },
-    DraggingTransparencyHandle {
-        object_id: ObjectId,
-        effect_index: usize,
-        is_end: bool,
-        orig_effect: Effect,
-    },
-    DraggingInteractiveEffect {
-        object_id: ObjectId,
-        start_mm: Point2D,
-        current_mm: Point2D,
-    },
-    DraggingEnvelopeHandle {
-        object_id: ObjectId,
-        effect_index: usize,
-        handle_index: usize,
-        orig_effect: Effect,
-    },
-    DraggingMeshNode {
-        object_id: ObjectId,
-        node_index: usize,
-        orig_fill: Fill,
-    },
-    DrawingBox {
-        start_mm: Point2D,
-        current_mm: Point2D,
-    },
-    DrawingStroke {
-        points_mm: Vec<Point2D>,
-    },
-    DraggingRulerGuide {
-        horizontal: bool,
-        position_mm: f64,
-    },
-}
-
-/// Which component of a Bézier node is being dragged in `F10` Shape/Node mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeDragPart {
-    Anchor,
-    HandleIn,
-    HandleOut,
-}
+// Note: `ParametricHandleKind`, `ScaleHandle`, `NodeDragPart`, and `ActiveDragState`
+// live in `coree_tools` (`crate::state` re-exports `CanvasDragState = ActiveDragState` if needed).
 
 // =============================================================================
 // Tool, Docker & Dialog Form States
@@ -807,6 +338,61 @@ impl Default for ToolSettings {
             shape_reduce_tolerance_mm: 0.5,
             text_insert_draft: "coree Studio".to_owned(),
             dimension_offset_mm: 8.0,
+        }
+    }
+}
+
+impl ToolSettings {
+    /// Captures an immutable [`coree_tools::ToolSettingsSnapshot`] for `ToolCore`.
+    #[must_use]
+    pub fn to_snapshot(
+        &self,
+        props: &PropertiesDockerState,
+        fx: &EffectsDockerState,
+    ) -> coree_tools::ToolSettingsSnapshot {
+        coree_tools::ToolSettingsSnapshot {
+            rect_corner_radius_mm: self.rect_corner_radius_mm,
+            rect_corner_style: self.rect_corner_style,
+            ellipse_mode: self.ellipse_mode,
+            polygon_sides: self.polygon_sides,
+            star_points: self.star_points,
+            star_inner_ratio: self.star_inner_ratio,
+            spiral_revolutions: self.spiral_revolutions,
+            spiral_logarithmic: self.spiral_logarithmic,
+            graph_cols: self.graph_cols,
+            graph_rows: self.graph_rows,
+            impact_rays: self.impact_rays,
+            impact_style: self.impact_style,
+            basic_shape_kind: self.basic_shape_kind,
+            table_rows: self.table_rows,
+            table_cols: self.table_cols,
+            artistic_media_width_mm: self.artistic_media_width_mm,
+            artistic_media_profile: self.artistic_media_profile.clone(),
+            sculpt_radius_mm: self.sculpt_radius_mm,
+            sculpt_strength: self.sculpt_strength,
+            eraser_radius_mm: self.eraser_radius_mm,
+            brush_radius_px: self.brush_radius_px,
+            raster_op: self.raster_op,
+            clone_source_mm: self.clone_source_mm,
+            eyedropper_apply_mode: self.eyedropper_apply_mode,
+            sampled_effects: self.sampled_effects.clone(),
+            text_insert_draft: self.text_insert_draft.clone(),
+            dimension_offset_mm: self.dimension_offset_mm,
+            grad_start_color: props.grad_start_color.clone(),
+            grad_end_color: props.grad_end_color.clone(),
+            mesh_rows: props.mesh_rows,
+            mesh_cols: props.mesh_cols,
+            effect_dx_mm: fx.dx_mm,
+            effect_dy_mm: fx.dy_mm,
+            effect_blur_mm: fx.blur_mm,
+            effect_opacity: fx.opacity,
+            effect_color: fx.color.clone(),
+            effect_contour_mode: fx.contour_mode,
+            effect_steps: fx.steps,
+            effect_distort_kind: fx.distort_kind,
+            effect_frequency: fx.frequency,
+            effect_envelope_mode: fx.envelope_mode,
+            effect_blend_mode: fx.blend_mode,
         }
     }
 }
@@ -1375,6 +961,8 @@ pub struct FindReplaceState {
     pub font_query: String,
     pub replace_font: String,
     pub replace_fill_color: Color,
+    pub cql_query: String,
+    pub last_cql_error: Option<String>,
     pub last_report: Option<FindReplaceReport>,
 }
 
@@ -1391,6 +979,8 @@ impl Default for FindReplaceState {
             font_query: String::new(),
             replace_font: "Noto Sans".to_owned(),
             replace_fill_color: Color::CYAN,
+            cql_query: String::new(),
+            last_cql_error: None,
             last_report: None,
         }
     }

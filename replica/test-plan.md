@@ -1,19 +1,19 @@
-# Verification & End-to-End Test Plan — `coree` (`v0.3.0`)
+# Verification & End-to-End Test Plan — `coree` (`v0.3.1`)
 
-All **18 core user flows (`F01`–`F18`)**, **v0.2 expansion flows (`V02-01`–`V02-08`)**, and **v0.2.1 / v0.3.0 deep parity & cross-OS suites (`V03-01`–`V03-08`)** from [recon.md](recon.md) and [bugs.md](bugs.md) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
+All **18 core user flows (`F01`–`F18`)**, **v0.2 expansion flows (`V02-01`–`V02-08`)**, and **v0.2.1 / v0.3.0 / v0.3.1 deep parity & cross-OS suites (`V03-01`–`V03-09`)** from [recon.md](recon.md) and [bugs.md](bugs.md) are verified by automated unit, integration, adversarial security, headless UI, real-file read-only benchmarks, and packaging validation checks across all 7 workspace crates.
 
-## Automated Suite Summary (`v0.3.0+` Verified Workspace)
+## Automated Suite Summary (`v0.3.1` Verified Workspace)
 
 | Crate | Unit Tests | Integration / E2E Tests | Total Passed | Failed | Ignored |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `coree-core` | 38 | 20 (`comprehensive_engine_tests.rs`, ICC v2/v4 + synthetic sRGB/CMYK, `ConvertOutlineToObject`, `Desktop` layer, `PowerClip` lock, delta undo) | **58** | 0 | 0 |
+| `coree-core` | 41 | 20 (`comprehensive_engine_tests.rs`, ICC v2/v4 `mAB`/`mBA` CLUT & intents, Philip Schneider cubic refit, Master Odd/Even spatial index, `ConvertOutlineToObject`, `Desktop` layer, `PowerClip` lock, delta undo) | **61** | 0 | 0 |
 | `coree-cdr` | 19 | 26 (`codec_integration.rs`, ZCF v16–26, `cdss` inheritance/RTL weights, RIFF `arrw`/`vpat`/`clrs`, v7–v15 fallbacks, audit regressions) | **45** | 0 | 0 |
 | `coree-io` | 47 | 10 (`io_integration.rs`, PDF `/OutputIntents` + Arabic curves + `/Separation` + `/SMask`, `scale_with_object`, EPS inline hex + curves, SVG patterns, DXF `CIRCLE`/`ARC`, PLT, PSD) | **57** | 0 | 0 |
-| `coree-storage` | 12 | 7 (`storage_integration.rs`, WAL crash recovery + font quarantine + Unix `0700`/`0600` DB & autosave permission hardening) | **19** | 0 | 0 |
-| `coree-render` | 3 | 23 (`render_suite.rs`, Rayon parallel dirty-tile cache, `lower_effects_to_primitives`, `hit_test_powerclip_contents`, shared font DB, soft-proofing, lenses, Arabic/Kashida) | **26** | 0 | 0 |
-| `coree-prod` | 31 | 30 (`integration_production.rs`: 16 + `laser_and_plugins_suite.rs`: 14) | **61** | 0 | 0 |
-| `coree-app` | 18 | 42 (`studio_integration.rs`: 18 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **60** | 0 | 0 |
-| **Workspace Total (`v0.3.0+`)** | **168** | **158** | **326** | **0** | **0** |
+| `coree-storage` | 12 | 7 (`storage_integration.rs`, WAL crash recovery + gzipped snapshots + font quarantine + Unix `0700`/`0600` DB & autosave permission hardening) | **19** | 0 | 0 |
+| `coree-render` | 5 | 23 (`render_suite.rs`, Rayon parallel dirty-tile cache, `lower_effects_to_primitives`, `hit_test_powerclip_contents`, shared font DB, cached `SoftProofLut3D`, 999-step Blend, C¹ Mesh Fill, 960px SmartFill, shaped Kashida, live text effects, lenses) | **28** | 0 | 0 |
+| `coree-prod` | 34 | 30 (`integration_production.rs`: 16 + `laser_and_plugins_suite.rs`: 14) | **64** | 0 | 0 |
+| `coree-app` | 19 | 43 (`studio_integration.rs`: 19 + `e2e_workflows.rs`: 8 + `tools_62_audit.rs`: 16) | **62** | 0 | 0 |
+| **Workspace Total (`v0.3.1`)** | **177** | **159** | **336** | **0** | **0** |
 
 Additional verification gates passing with exit code `0`:
 - `cargo test --workspace --doc` — **0 failures**
@@ -92,13 +92,13 @@ Additional verification gates passing with exit code `0`:
 | `V02-03` | ICC v2/v4 & Soft-Proofing | Happy / Real-File / Adversarial | 52/52 real system ICC profiles under `/usr/share/color/icc/` parse cleanly with 0 `NaN`; live CMYK soft-proof LUT & gamut warning overlay; `mluc`/`profile_size` DoS regressions | `coree-core::icc` + `coree-render::render_suite` (79/79 tests) | **PASS** |
 | `V02-04` | Raster Brushes, PostScript Fills, Autofit, Glyphs | Happy | BT.709 Healing Brush, Dodge/Burn, scanline Flood Fill, all 10 analytic SDF PostScript fills, `autofit_page_to_content`, and live cmap Glyphs catalog | `coree-core` + `coree-render` (79/79 tests) | **PASS** |
 | `V02-05` | Laser Cutting, Engraving & Plugins | Happy / Adversarial | Dedupe, join, kerf offset, rotated/cross hatch, inner-loops-first, travel opt, weeding box, GRBL/Marlin/Ruida G-Code, DXF R12, PLT, 7 built-in plugins (`LightBurn`..`HPGL`) + 7 security/geometry regressions | `coree-prod::laser_and_plugins_suite` (61/61 tests) | **PASS** |
-| `V02-06` | 62 Live Tools & Workspaces | Happy | All 62 tools across 15 Toolbox flyout groups, muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2-F4`, `F9`, `Space`, `Ctrl+K/L/Q/D/R/J`), 6 Workspace presets + `.coreews` JSON round-trip | `coree-app::tools_62_audit` (Stage B1) | **PASS** |
+| `V02-06` | 65 Live Tools & Workspaces *(originally 62 in v0.2)* | Happy | All 65 registered `ToolId` tools across 15 Toolbox flyout groups (verified by `assert_eq!(all_tools.len(), 65)` in `tools_62_audit.rs`), muscle-memory shortcuts (`P`, `L/R/T/B/C/E`, `F2-F4`, `F9`, `Space`, `Ctrl+K/L/Q/D/R/J`), 6 Workspace presets + `.coreews` JSON round-trip | `coree-app::tools_62_audit` (Stage B1, expanded to 65 tools) | **PASS** |
 | `V02-07` | Linux OS Integration & Packages | Packaging Gate | `coree-mime.xml` + isolated `gio info` confirms zero ZIP-icon misclassification on X6/X4/RIFF `.cdr` & `.cdr.zip`; `coree.desktop`, `io.github.ahrrfy.coree.metainfo.xml`, `io.github.ahrrfy.coree.yml`, `build-deb.sh` (`dpkg-deb`) validated | `desktop-file-validate`, `appstreamcli validate --no-net`, `update-mime-database`, `dpkg-deb` | **PASS** |
 | `V02-08` | Windows Packaging & Release CI | Packaging Gate | `coree.ico` (4 PNG frames `16/32/48/256`, CRC OK), `coree.exe.manifest` (`PerMonitorV2` + `UTF-8`), `coree.rc`, `wix/main.wxs` XML valid, `register-file-associations.cmd`, `.github/workflows/{ci,release}.yml` YAML valid & 0 brand hits | Python binary/XML/YAML validators + `sweep.py` | **PASS** |
 
 ---
 
-## v0.2.1 & v0.3.0+ Deep Audit & Hardening Matrix (`V03-01`–`V03-07`)
+## v0.2.1, v0.3.0 & v0.3.1 Deep Audit & Hardening Matrix (`V03-01`–`V03-09`)
 
 | Case ID | Capability | Type | Scenario Verified | Automated / CI Reference | Result |
 | --- | --- | --- | --- | --- | --- |
@@ -110,3 +110,4 @@ Additional verification gates passing with exit code `0`:
 | `V03-06` | Native OS Print Spooler (`Ctrl+P`), Dual Windows CLI & Unix Security | OS / Security | CUPS (`lpstat`/`lp`) & Windows Spooler arg/JSON parsing; paired Console `coree-cli`/`coree.com`; Unix `0700` dir & `0600` SQLite/autosave blob permissions | `coree-app::lib::printing::tests::*` + `coree-storage::db::tests::unix_storage_directories_and_db_have_owner_only_permissions` | **PASS** |
 | `V03-07` | Cross-Platform CI & Clean-Room Launch Hygiene | Release / Launch | GitHub Actions `ubuntu-latest` & `windows-latest` CI + WiX MSI + `.deb`/`.AppImage`/`.tar.gz`; `sweep.py` clean; `listing.py` (`0` errors / `0` warnings) | `.github/workflows/{ci,release}.yml` + `listing.py` + `sweep.py` | **PASS** |
 | `V03-08` | Community Workflow Accuracy & UX Polish (`v0.3.0`) | Engine / UI / Export | `Ctrl+Shift+Q` `ConvertOutlineToObject`, `scale_with_object` PDF/EPS/Preflight parity, native DXF `CIRCLE`/`ARC`, async print discovery, font quarantine badge, `PowerClip` `Ctrl+Click` edit mode, smart `Ctrl+D` step-and-repeat, `DblClick`/`Shift+DblClick` Page/Selection frame, `_vN` incremental save (`326/326` workspace tests) | `coree-app::studio_integration::community_workflows_*` + `coree-core::convert_outline_to_object_*` + `coree-io::dxf_exports_native_circle_*` | **PASS** |
+| `V03-09` | Deep Atomic Architecture, Precision, Security & UI Audit (`v0.3.1`, `BUG-106`–`BUG-116`) | Kernel / Color / Security / UI | ICC v4 `mAB`/`mBA` CLUT + cached `SoftProofLut3D`, Philip Schneider cubic refit, Master Odd/Even spatial index & asset GC, gzip autosave, `999`-step Blend, C¹ Mesh Fill, `960px` SmartFill, shaped Kashida `ForceJustifyKashida`, `compute_separations_with_text_outliner`, `coree-cql` parser & UI bar, SFNT `name` collector, `0700`/`0600` IPC lockfile, nested `Group`/`PowerClip` world-xf/lock fixes, live Print Preview thumbnail, distinct tool icons & Arabic dockers (`336/336` workspace tests) | `coree-app::studio_integration::v031_nested_group_transforms_*` + `coree-core::*` + `coree-render::*` + `coree-prod::*` | **PASS** |

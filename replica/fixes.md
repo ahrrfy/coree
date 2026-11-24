@@ -2,7 +2,7 @@
 
 ## Sample & Collection Transparency
 
-- **Sample size:** **378 genuine, verbatim, linked items** collected via official public APIs/feeds across **5 sources**, with **0 rows dropped** and **0 duplicates** when verified by `reviews.py` (see [reviews.csv](file:///run/media/ahmed/DATA/coreldraw%20me/replica/reviews.csv) and [feedback.md](file:///run/media/ahmed/DATA/coreldraw%20me/replica/feedback.md)):
+- **Sample size:** **378 genuine, verbatim, linked items** collected via official public APIs/feeds across **5 sources**, with **0 rows dropped** and **0 duplicates** when verified by `reviews.py` (see [reviews.csv](reviews.csv) and [feedback.md](feedback.md)):
   - `app-store`: **216** customer reviews for CorelDRAW (`id=1447605203`) via Apple's official iTunes Customer Reviews RSS feed (`us`, `gb`, `ca`, `au`, `in`, `ae`, `sa` storefronts; all 216 star-rated: 1★ = 113, 2★ = 20, 3★ = 10, 4★ = 20, 5★ = 53).
   - `hacker-news`: **92** substantive comments mentioning CorelDRAW / `.cdr` via the official HN Algolia API.
   - `libreoffice-bugzilla`: **31** bug reports on CorelDRAW / `libcdr` file compatibility, codepages, lenses, and crashes via The Document Foundation's official Bugzilla REST API.
@@ -92,12 +92,12 @@
 
 ## 4. Fix Plan (Mapped to `replica/features.csv` with `original=no`)
 
-Each fix directly eliminates a top user pain point and is tracked in [features.csv](file:///run/media/ahmed/DATA/coreldraw%20me/replica/features.csv) with `original=no`:
+Each fix directly eliminates a top user pain point and is tracked in [features.csv](features.csv) with `original=no`:
 
 | # | Fix (What `coree` builds instead) | Size | Skill / Crate | Evidence |
 | --- | --- | --- | --- | --- |
 | 1 | **Native Linux-First Desktop Binary (Wayland + X11, zero Wine, Windows cross-compile)** — Pure-Rust `eframe`/`egui` binary compiled cleanly on Linux with no `-dev` C header lock-in and native `xdg-desktop-portal` file dialogs. | M | `replica-architect` / `coree-app` | 21 Linux/platform mentions (`github`, `hacker-news`); 51 `Platforms, offline and mobile` items across 4 sources. |
-| 2 | **100% Offline-First, Zero-Subscription, Zero-Account MPL-2.0 Release** — Zero network sockets, zero license servers, zero telemetry, zero credit-card trials, zero paywalls. Always opens instantaneously offline. | S | `replica-backend` + `replica-brand` / `coree-app`, `coree-storage` | 87 pricing/paywall complaints (rank #1, `1.8★` avg, 3 sources) + 21 server/offline lockouts (3 sources) + 19 billing/cancel complaints (thin, `app-store`). |
+| 2 | **100% Offline-First, Zero-Subscription, Zero-Account `MIT OR Apache-2.0` Release** — Zero network sockets, zero license servers, zero telemetry, zero credit-card trials, zero paywalls. Always opens instantaneously offline. | S | `replica-backend` + `replica-brand` / `coree-app`, `coree-storage` | 87 pricing/paywall complaints (rank #1, `1.8★` avg, 3 sources) + 21 server/offline lockouts (3 sources) + 19 billing/cancel complaints (thin, `app-store`). |
 | 3 | **Unknown-Chunk Passthrough & Live CDR Binary Inspector** — When reading RIFF/ZIP `.cdr`/`.cdt`/`.cmx` archives (v3–v25+), any unrecognized chunk is preserved byte-for-byte on re-export alongside a live hex/tree CDR Inspector panel so legacy shop files never silently lose data. | L | `replica-architect` / `coree-cdr`, `coree-app` | 54 `.cdr` compatibility items across all 5 sources (`libcdr` Bugzilla `160492`, `65220`, HN `48975103`, GitHub `vectorcraft/3090`, `rayforge/575`). |
 | 4 | **Crash-Safe Serializable Command Journal + Atomic Saves + Rhai Macro Recorder** — Every mutation emits a typed `DocumentCommand` logged to local SQLite WAL before disk flush, enabling crash replay, infinite deterministic undo, atomic rename saves, and one-click `.rhai` macro recording (replacing fragile Windows COM/VBA). | M | `replica-backend` / `coree-core`, `coree-storage`, `coree-prod` | 79 bug/crash/corrupted-save items across all 5 sources (rank #2, `1.6★` avg; `corel-mcp/issues/1`, App Store save/crash reports). |
 | 5 | **R-Tree Spatial Index + Dirty-Tile Multithreaded Renderer** — `rstar` R-Tree hit-testing/culling paired with Rayon-parallel 256×256 dirty-tile `tiny-skia` rasterization keeps 10,000+ node documents smooth at 60 FPS without lag spikes. | L | `replica-architect` / `coree-render`, `coree-core` | 17 slow/laggy/heavy items across 4 sources (`2.1★` avg; App Store large-file lag, HN heavy-tool complaints). |
@@ -109,7 +109,7 @@ Each fix directly eliminates a top user pain point and is tracked in [features.c
 ## 5. Positioning Angles
 
 ### Option A — Commercial Print, Sign & Laser Workshops (RECOMMENDED)
-> For print shops, sign makers, and laser/vinyl cutting workshops who are sick of expensive subscriptions, server lockouts, and Windows-only lock-in just to open `.cdr` files and drive production machinery, **`coree`** is a fast, native Linux & Windows pure-Rust vector production studio with lossless `.cdr` round-tripping, native CMYK prepress, and built-in `CutContour` dielines — free forever under MPL-2.0, completely offline.
+> For print shops, sign makers, and laser/vinyl cutting workshops who are sick of expensive subscriptions, server lockouts, and Windows-only lock-in just to open `.cdr` files and drive production machinery, **`coree`** is a fast, native Linux & Windows pure-Rust vector production studio with lossless `.cdr` round-tripping, native CMYK prepress, and built-in `CutContour` dielines — free forever under `MIT OR Apache-2.0`, completely offline.
 - **Evidence:** `Price and paywalls` (87 items, 3 sources, `1.8★`), `Integrations, import and export` / prepress & machinery (41 items, 5 sources), `.cdr` compatibility (54 items, 5 sources), `Bugs and crashes` (79 items, 5 sources).
 
 ### Option B — Perpetual-License Refugees & Offline Freelance Designers

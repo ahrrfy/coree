@@ -11,7 +11,7 @@ pub mod backend;
 pub mod effects_render;
 pub mod error;
 pub mod export_render;
-pub mod hit_test;
+pub use coree_core::hit_test;
 pub mod lens_render;
 pub mod raster_engine;
 pub mod renderer;
@@ -19,7 +19,7 @@ pub mod smart_fill;
 pub mod text_layout;
 pub mod tile_cache;
 pub mod trace;
-pub mod viewport;
+pub use coree_core::viewport;
 
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-render";
@@ -42,8 +42,9 @@ pub use hit_test::{
 pub use raster_engine::{
     apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,
     apply_raster_filter, apply_raster_filters, clone_stamp_stroke, convert_object_to_bitmap,
-    erase_stroke, paint_brush_stroke, paint_brush_stroke_masked, raster_flood_fill, resample,
-    smudge_stroke, DodgeBurnMode, RasterMask, ToneRange,
+    convert_object_to_bitmap_with_bounds, erase_stroke, paint_brush_stroke,
+    paint_brush_stroke_masked, raster_flood_fill, resample, smudge_stroke, DodgeBurnMode,
+    RasterMask, ToneRange,
 };
 pub use renderer::{
     arrowhead_geometry, compute_page_layouts, outline_arrowhead_geometries, PageLayout,
@@ -55,7 +56,7 @@ pub use text_layout::{
     text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, ShapedGlyphDraw,
     TextEngine,
 };
-pub use tile_cache::{CachedTile, DirtyTileCache, TILE_SIZE_PX};
+pub use tile_cache::{object_visual_world_bounds, CachedTile, DirtyTileCache, TILE_SIZE_PX};
 pub use trace::{trace_raster, trace_raster_to_mm, OutlinePreset, TraceConfig, TraceMode};
 pub use viewport::{ViewMode, Viewport};
 

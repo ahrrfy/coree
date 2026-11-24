@@ -11,6 +11,7 @@ description = "Local SQLite persistence, autosave snapshots, command journal, pa
 chrono.workspace = true
 coree-core.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 rayon.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

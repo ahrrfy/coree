@@ -135,7 +135,7 @@ impl SelectionState {
     /// centering the pivot on its bounding box.
     pub fn select_single(&mut self, doc: &Document, id: ObjectId) {
         self.objects.clear();
-        if doc.objects.contains_key(&id) {
+        if doc.has_object(id) {
             self.objects.push(id);
         }
         self.transform_mode = TransformMode::ScaleAndMove;
@@ -149,7 +149,7 @@ impl SelectionState {
     ///   `ScaleAndMove <-> RotateAndSkew`; clicking any other object selects it in `ScaleAndMove`.
     /// - With `shift`: toggles `id` in/out of the multi-selection.
     pub fn click_object(&mut self, doc: &Document, id: ObjectId, shift: bool) {
-        if !doc.objects.contains_key(&id) {
+        if !doc.has_object(id) {
             return;
         }
         if shift {
@@ -170,7 +170,7 @@ impl SelectionState {
     pub fn select_many(&mut self, doc: &Document, ids: &[ObjectId]) {
         self.objects.clear();
         for &id in ids {
-            if doc.objects.contains_key(&id) && !self.objects.contains(&id) {
+            if doc.has_object(id) && !self.objects.contains(&id) {
                 self.objects.push(id);
             }
         }
@@ -184,7 +184,7 @@ impl SelectionState {
     pub fn toggle_object(&mut self, doc: &Document, id: ObjectId) {
         if let Some(pos) = self.objects.iter().position(|&oid| oid == id) {
             self.objects.remove(pos);
-        } else if doc.objects.contains_key(&id) {
+        } else if doc.has_object(id) {
             self.objects.push(id);
         }
         self.transform_mode = TransformMode::ScaleAndMove;
@@ -194,10 +194,10 @@ impl SelectionState {
 
     /// Removes any IDs that no longer exist in `doc` (e.g. after Delete or Undo).
     pub fn prune_missing(&mut self, doc: &Document) {
-        self.objects.retain(|id| doc.objects.contains_key(id));
+        self.objects.retain(|id| doc.has_object(*id));
         self.node_selection
             .nodes
-            .retain(|n| doc.objects.contains_key(&n.object_id));
+            .retain(|n| doc.has_object(n.object_id));
         if self.objects.is_empty() {
             self.transform_mode = TransformMode::ScaleAndMove;
             self.custom_pivot = false;

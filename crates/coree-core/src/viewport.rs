@@ -3,8 +3,8 @@
 //! Canvas viewport camera model (`pan`, `zoom`, `rotation`, `DPI`, `LOD`, `Multipage View`)
 //! and display [`ViewMode`] settings.
 
-use coree_core::math::{sanitize_f64, DEFAULT_DPI, MM_PER_INCH};
-use coree_core::{Affine2D, Point2D, Rect2D};
+use crate::math::{sanitize_f64, DEFAULT_DPI, MM_PER_INCH};
+use crate::{Affine2D, Point2D, Rect2D};
 
 /// Canvas rendering fidelity mode matching professional illustration workflows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

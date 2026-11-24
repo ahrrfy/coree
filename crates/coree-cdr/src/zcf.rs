@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Clean-room ZCF (CorelDRAW X6–2025, v16–26) indirect pointer resolution,
+//! Clean-room ZCF (CDR X6–2025, v16–26) indirect pointer resolution,
 //! JSON style sheet (`styles/document.cdss` & `loda` `0x00C9`) decoding,
 //! XML document palette / color context / XMP metadata / textinfo parsing,
 //! and bounded preview PNG extraction (`extract_cdr_preview_png`).
 
 use crate::cdr_riff::{decode_dib_to_rgba_with_budget, is_cdr_form_type, is_cdt_form_type};
 use crate::cdr_zip::is_zip_bytes;
-use crate::coord::cdr32_to_mm;
+use crate::cmx::is_cmx_form_type;
+use crate::coord::{cdr32_to_mm, derive_spot_fallback_cmyk};
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{read_bounded, sanitize_zip_path, ByteReader, CodecLimits};
 use crate::riff::{parse_riff_with_budget, RiffDocument, RiffNode};
@@ -17,6 +18,8 @@ use coree_core::{
     Point2D, TextAlign, TextDirection, TextStyle,
 };
 use flate2::{write::ZlibEncoder, Compression};
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
@@ -29,7 +32,7 @@ const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 #[derive(Debug, Clone, Default)]
 pub struct ZcfContext {
     /// `true` when `content/root.dat` used ZCF 16-byte indirect chunk pointers
-    /// (authentic CorelDRAW X6–2025 structure).
+    /// (native CDR X6–2025 structure).
     pub is_zcf: bool,
     /// Optional numeric version hint parsed from `styles/document.cdss` or `META-INF/metadata.xml`.
     pub version_hint: Option<u16>,
@@ -300,7 +303,7 @@ pub struct TextInfoXml {
 // ZCF 16-Byte Indirect Pointer Detection & Bounded Dereferencing
 // =============================================================================
 
-/// Detects whether a parsed `content/root.dat` RIFF tree uses CorelDRAW X6–2025 (ZCF)
+/// Detects whether a parsed `content/root.dat` RIFF tree uses CDR X6–2025 (ZCF)
 /// 16-byte indirect chunk pointers (`file_index`, `data_len`, `data_offset`, `reserved`).
 #[must_use]
 pub fn is_zcf_indirect_tree(tree: &RiffDocument, data_file_count: usize) -> bool {
@@ -492,15 +495,24 @@ fn resolve_zcf_chunk_payload(
         usize::try_from(file_index).map_err(|_| CdrError::ArithmeticOverflow("ZCF file_index"))?;
 
     let Some(Some(pool_idx)) = file_index_map.get(fidx).copied() else {
-        warnings.push(format!(
-            "ZCF chunk '{}' references missing data file index {}",
+        let msg = format!(
+            "ZCF chunk '{}' references missing/out-of-bounds data file index {}",
             crate::riff::fourcc_to_string(fourcc),
             file_index
-        ));
-        return Ok(Vec::new());
+        );
+        warnings.push(msg.clone());
+        return Err(CdrError::InvalidChunk {
+            fourcc: crate::riff::fourcc_to_string(fourcc),
+            reason: msg,
+        });
     };
     let Some(blob) = data_pool.get(pool_idx) else {
-        return Ok(Vec::new());
+        return Err(CdrError::InvalidChunk {
+            fourcc: crate::riff::fourcc_to_string(fourcc),
+            reason: format!(
+                "ZCF chunk references invalid data pool index {pool_idx} (file_index={file_index})"
+            ),
+        });
     };
 
     let end = data_offset
@@ -520,10 +532,10 @@ fn resolve_zcf_chunk_payload(
 }
 
 // =============================================================================
-// CorelDRAW Color String & Style Sheet (`styles/document.cdss` + `0x00C9`) Parsers
+// CDR Color String & Style Sheet (`styles/document.cdss` + `0x00C9`) Parsers
 // =============================================================================
 
-/// Parses a CorelDRAW X6–2025 style color string such as:
+/// Parses a CDR X6–2025 style color string such as:
 /// - `"CMYK,USER,0,0,0,100,100,00000000-0000-0000-0000-000000000000"`
 /// - `"CMYK255,USER,0,255,255,0,100,cccd19cb-..."`
 /// - `"RGB255,USER,255,128,0,100,..."`
@@ -532,12 +544,15 @@ fn resolve_zcf_chunk_payload(
 /// - `"LAB,USER,55,20,-30,100,..."`
 /// - `"HSB,USER,210,80,90,100,..."` / `"HLS,USER,210,50,80,100,..."`
 #[must_use]
-pub fn parse_corel_color_string(spec: &str) -> Option<Color> {
+pub fn parse_cdr_color_string(spec: &str) -> Option<Color> {
     let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
-    if parts.len() < 4 {
+    if parts.len() < 2 {
         return None;
     }
     let model = parts[0].to_ascii_uppercase();
+    if !matches!(model.as_str(), "SPOT" | "FIXED" | "PANTONE") && parts.len() < 4 {
+        return None;
+    }
     // Numeric channels begin at index 2 (after `MODEL,PALETTE_KIND,...`).
     // If index 1 itself is numeric (short form), start at index 1.
     let start = if parts[1].parse::<f64>().is_ok() {
@@ -673,7 +688,7 @@ pub fn parse_corel_color_string(spec: &str) -> Option<Color> {
                 };
                 (sl as f32, lv as f32)
             } else {
-                // Corel HLS order is H, L, S (0..100)
+                // ZCF HLS order is H, L, S (0..100)
                 let lv = (nums[1] / 100.0).clamp(0.0, 1.0) as f32;
                 let sv = (nums[2] / 100.0).clamp(0.0, 1.0) as f32;
                 (sv, lv)
@@ -684,15 +699,59 @@ pub fn parse_corel_color_string(spec: &str) -> Option<Color> {
             Some(Color::Hsl { h, s, l, a: alpha })
         }
         "SPOT" | "FIXED" | "PANTONE" => {
-            let tint = nums
-                .first()
-                .map_or(1.0_f32, |&t| (t / 100.0).clamp(0.0, 1.0) as f32);
-            let name = parts.get(1).copied().unwrap_or("Spot").to_owned();
+            let name = parts
+                .get(1)
+                .copied()
+                .filter(|s| !s.is_empty() && s.parse::<f64>().is_err())
+                .unwrap_or("Spot")
+                .to_owned();
+            let (tint, fallback_cmyk, alpha) = if nums.len() >= 5 {
+                let t = (nums[0] / 100.0).clamp(0.0, 1.0) as f32;
+                let max_c = nums[1..5].iter().copied().fold(0.0_f64, f64::max);
+                let scale = if max_c > 100.0 {
+                    255.0
+                } else if max_c > 1.0 {
+                    100.0
+                } else {
+                    1.0
+                };
+                let cmyk = [
+                    (nums[1] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[2] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[3] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[4] / scale).clamp(0.0, 1.0) as f32,
+                ];
+                let a = nums
+                    .get(5)
+                    .map_or(1.0_f32, |&v| (v / 100.0).clamp(0.0, 1.0) as f32);
+                (t, cmyk, a)
+            } else if nums.len() == 4 {
+                let max_c = nums[0..4].iter().copied().fold(0.0_f64, f64::max);
+                let scale = if max_c > 100.0 {
+                    255.0
+                } else if max_c > 1.0 {
+                    100.0
+                } else {
+                    1.0
+                };
+                let cmyk = [
+                    (nums[0] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[1] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[2] / scale).clamp(0.0, 1.0) as f32,
+                    (nums[3] / scale).clamp(0.0, 1.0) as f32,
+                ];
+                (1.0_f32, cmyk, 1.0_f32)
+            } else {
+                let t = nums
+                    .first()
+                    .map_or(1.0_f32, |&v| (v / 100.0).clamp(0.0, 1.0) as f32);
+                (t, derive_spot_fallback_cmyk(&name), 1.0_f32)
+            };
             Some(Color::Spot {
                 name,
                 tint,
-                fallback_cmyk: [0.0, 0.0, 0.0, 1.0],
-                alpha: 1.0,
+                fallback_cmyk,
+                alpha,
             })
         }
         _ => None,
@@ -818,11 +877,11 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
         style.fill_primary = fill
             .get("primaryColor")
             .and_then(Value::as_str)
-            .and_then(parse_corel_color_string);
+            .and_then(parse_cdr_color_string);
         style.fill_secondary = fill
             .get("secondaryColor")
             .and_then(Value::as_str)
-            .and_then(parse_corel_color_string);
+            .and_then(parse_cdr_color_string);
         style.fill_overprint = json_bool(fill, "overprint");
         if let Some(ang) = json_f64(fill, "angle") {
             style.fill_angle_deg = Some(if ang.abs() > 360.0 {
@@ -846,7 +905,7 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
                     if let Some(color) = so
                         .get("color")
                         .and_then(Value::as_str)
-                        .and_then(parse_corel_color_string)
+                        .and_then(parse_cdr_color_string)
                     {
                         style
                             .fill_stops
@@ -867,7 +926,7 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
         style.outline_color = outl
             .get("color")
             .and_then(Value::as_str)
-            .and_then(parse_corel_color_string);
+            .and_then(parse_cdr_color_string);
         style.outline_cap = json_u32(outl, "endCaps").map(|c| match c {
             1 => LineCap::Round,
             2 => LineCap::Square,
@@ -903,7 +962,7 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
             if let Some(c) = cfill
                 .get("primaryColor")
                 .and_then(Value::as_str)
-                .and_then(parse_corel_color_string)
+                .and_then(parse_cdr_color_string)
             {
                 ts.fill = c;
             }
@@ -919,14 +978,14 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
                 }
             }
             if let Some(sz_cdr) = json_f64(fb, "size") {
-                // Corel stores character height in 0.1 µm (`84667` = 8.4667 mm = 24 pt).
+                // CDR stores character height in 0.1 µm (`84667` = 8.4667 mm = 24 pt).
                 let pt = (sz_cdr / coree_core::math::CDR_UNITS_PER_MM) * (72.0 / 25.4);
                 if pt.is_finite() && pt >= 1.0 {
                     ts.font_size_pt = pt;
                 }
             }
             if let Some(w) = json_u32(fb, "weight") {
-                // Corel weight can be Windows LOGFONT (100..=900) or OS/2 class (e.g. 400=normal, 700=bold)
+                // CDR weight can be Windows LOGFONT (100..=900) or OS/2 class (e.g. 400=normal, 700=bold)
                 let norm_w = if w <= 12 {
                     match w {
                         0..=2 => 300,
@@ -993,31 +1052,189 @@ fn parse_cdss_style_value(val: &Value) -> Option<CdssStyle> {
 // XML Auxiliary Parsers (`docPalette.xml`, `color.xml`, `textinfo.xml`, XMP)
 // =============================================================================
 
-/// Parses CorelDRAW `color/docPalette.xml` (and clean-room `color/documentPalette.xml`)
-/// into [`ColorSwatch`] entries.
+#[derive(Debug, Clone)]
+struct XmlElem {
+    tag: String,
+    attrs: Vec<(String, String)>,
+    text: String,
+    children: Vec<XmlElem>,
+}
+
+impl XmlElem {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn parse_xml_strict(xml: &str) -> Option<Vec<XmlElem>> {
+    const MAX_XML_NODES: usize = 65_536;
+    const MAX_XML_DEPTH: usize = 128;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut roots: Vec<XmlElem> = Vec::new();
+    let mut stack: Vec<XmlElem> = Vec::new();
+    let mut total_nodes = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::DocType(_)) | Err(_) => return None,
+            Ok(Event::Comment(_)) | Ok(Event::Decl(_)) | Ok(Event::PI(_)) => {}
+            Ok(Event::Start(e)) => {
+                total_nodes += 1;
+                if total_nodes > MAX_XML_NODES || stack.len() >= MAX_XML_DEPTH {
+                    return None;
+                }
+                let tag = std::str::from_utf8(e.name().as_ref()).ok()?.to_owned();
+                let mut attrs = Vec::new();
+                for a in e.attributes() {
+                    let attr = a.ok()?;
+                    let k = std::str::from_utf8(attr.key.as_ref()).ok()?.to_owned();
+                    let v = attr
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::default(),
+                            reader.decoder(),
+                        )
+                        .ok()?
+                        .into_owned();
+                    attrs.push((k, v));
+                }
+                stack.push(XmlElem {
+                    tag,
+                    attrs,
+                    text: String::new(),
+                    children: Vec::new(),
+                });
+            }
+            Ok(Event::Empty(e)) => {
+                total_nodes += 1;
+                if total_nodes > MAX_XML_NODES || stack.len() >= MAX_XML_DEPTH {
+                    return None;
+                }
+                let tag = std::str::from_utf8(e.name().as_ref()).ok()?.to_owned();
+                let mut attrs = Vec::new();
+                for a in e.attributes() {
+                    let attr = a.ok()?;
+                    let k = std::str::from_utf8(attr.key.as_ref()).ok()?.to_owned();
+                    let v = attr
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::default(),
+                            reader.decoder(),
+                        )
+                        .ok()?
+                        .into_owned();
+                    attrs.push((k, v));
+                }
+                let elem = XmlElem {
+                    tag,
+                    attrs,
+                    text: String::new(),
+                    children: Vec::new(),
+                };
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(elem);
+                } else {
+                    roots.push(elem);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let eq = e.name();
+                let end_tag = std::str::from_utf8(eq.as_ref()).ok()?;
+                let elem = stack.pop()?;
+                if elem.tag != end_tag {
+                    return None;
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(elem);
+                } else {
+                    roots.push(elem);
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(top) = stack.last_mut() {
+                    let txt = t.xml10_content().ok()?;
+                    top.text.push_str(&txt);
+                }
+            }
+            Ok(Event::CData(c)) => {
+                if let Some(top) = stack.last_mut() {
+                    let txt = c.decode().ok()?;
+                    top.text.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                let resolved = if let Ok(Some(ch)) = r.resolve_char_ref() {
+                    ch.to_string()
+                } else {
+                    let rb: &[u8] = &r;
+                    match rb {
+                        b"amp" => "&".to_owned(),
+                        b"lt" => "<".to_owned(),
+                        b"gt" => ">".to_owned(),
+                        b"quot" => "\"".to_owned(),
+                        b"apos" => "'".to_owned(),
+                        _ => return None,
+                    }
+                };
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&resolved);
+                }
+            }
+        }
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+    Some(roots)
+}
+
+fn find_first_elem<'a>(nodes: &'a [XmlElem], tag: &str) -> Option<&'a XmlElem> {
+    for n in nodes {
+        if n.tag == tag {
+            return Some(n);
+        }
+        if let Some(found) = find_first_elem(&n.children, tag) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn collect_elems<'a>(nodes: &'a [XmlElem], tag: &str, out: &mut Vec<&'a XmlElem>) {
+    for n in nodes {
+        if n.tag == tag {
+            out.push(n);
+        }
+        collect_elems(&n.children, tag, out);
+    }
+}
+
+/// Parses CDR `color/docPalette.xml` (and clean-room `color/documentPalette.xml`)
+/// into [`ColorSwatch`] entries using structural XML parsing (no DTD/entity expansion).
 #[must_use]
 pub fn parse_doc_palette_xml(xml: &str) -> Vec<ColorSwatch> {
+    let Some(roots) = parse_xml_strict(xml) else {
+        return Vec::new();
+    };
     let mut swatches = Vec::new();
-    let mut rest = xml;
 
-    // Real CorelDRAW format: `<color cs="CMYK" name="Red" tints="0,1,1,0"/>`
-    while let Some(pos) = rest.find("<color ") {
-        let after = &rest[pos + 7..];
-        let Some(end) = after.find('>') else {
-            break;
-        };
-        let attrs = &after[..end];
-        rest = &after[end + 1..];
-
-        let cs = extract_xml_attr(attrs, "cs").unwrap_or_default();
-        let name = extract_xml_attr(attrs, "name").unwrap_or_default();
-        let tints = extract_xml_attr(attrs, "tints").unwrap_or_default();
-
-        if let Some(color) = parse_palette_color(&cs, &name, &tints) {
+    // Native CDR XML format: `<color cs="CMYK" name="Red" tints="0,1,1,0"/>`
+    let mut color_elems = Vec::new();
+    collect_elems(&roots, "color", &mut color_elems);
+    for el in color_elems {
+        let cs = el.attr("cs").unwrap_or_default();
+        let name = el.attr("name").unwrap_or_default();
+        let tints = el.attr("tints").unwrap_or_default();
+        if let Some(color) = parse_palette_color(cs, name, tints) {
             let label = if name.is_empty() {
                 format!("Color {}", swatches.len() + 1)
             } else {
-                name
+                name.to_owned()
             };
             swatches.push(ColorSwatch::new(label, color));
         }
@@ -1025,19 +1242,17 @@ pub fn parse_doc_palette_xml(xml: &str) -> Vec<ColorSwatch> {
 
     // Clean-room synthetic fallback: `<swatch name="..." hex="#RRGGBBAA"/>`
     if swatches.is_empty() {
-        let mut srest = xml;
-        while let Some(pos) = srest.find("<swatch ") {
-            let after = &srest[pos + 8..];
-            let Some(end) = after.find('>') else {
-                break;
-            };
-            let attrs = &after[..end];
-            srest = &after[end + 1..];
-
-            let name = extract_xml_attr(attrs, "name").unwrap_or_default();
-            if let Some(hex) = extract_xml_attr(attrs, "hex") {
-                if let Ok(color) = Color::from_hex(&hex) {
-                    let label = if name.is_empty() { hex } else { name };
+        let mut swatch_elems = Vec::new();
+        collect_elems(&roots, "swatch", &mut swatch_elems);
+        for el in swatch_elems {
+            let name = el.attr("name").unwrap_or_default();
+            if let Some(hex) = el.attr("hex") {
+                if let Ok(color) = Color::from_hex(hex) {
+                    let label = if name.is_empty() {
+                        hex.to_owned()
+                    } else {
+                        name.to_owned()
+                    };
                     swatches.push(ColorSwatch::new(label, color));
                 }
             }
@@ -1107,11 +1322,11 @@ fn parse_palette_color(cs: &str, name: &str, tints: &str) -> Option<Color> {
                 a: 1.0,
             })
         }
-        "SPOT" | "PANTONE" => {
+        "SPOT" | "FIXED" | "PANTONE" => {
             let fallback = if vals.len() >= 4 {
                 [norm(vals[0]), norm(vals[1]), norm(vals[2]), norm(vals[3])]
             } else {
-                [0.0, 0.0, 0.0, 1.0]
+                derive_spot_fallback_cmyk(name)
             };
             Some(Color::spot(
                 if name.is_empty() { "Spot" } else { name },
@@ -1126,7 +1341,8 @@ fn parse_palette_color(cs: &str, name: &str, tints: &str) -> Option<Color> {
 /// Parses `color/color.xml` and returns the document's primary [`ColorMode`].
 #[must_use]
 pub fn parse_color_context_xml(xml: &str) -> Option<ColorMode> {
-    let model = extract_xml_tag_simple(xml, "ColorModel")?;
+    let roots = parse_xml_strict(xml)?;
+    let model = extract_xml_tag_simple(&roots, "ColorModel")?;
     if model.eq_ignore_ascii_case("rgb") {
         Some(ColorMode::Rgb)
     } else if model.eq_ignore_ascii_case("cmyk") {
@@ -1139,10 +1355,13 @@ pub fn parse_color_context_xml(xml: &str) -> Option<ColorMode> {
 /// Parses `META-INF/textinfo.xml` to recover `<PageNames>`, `<LayerNames>`, and `<ObjectNames>`.
 #[must_use]
 pub fn parse_textinfo_xml(xml: &str) -> TextInfoXml {
+    let Some(roots) = parse_xml_strict(xml) else {
+        return TextInfoXml::default();
+    };
     TextInfoXml {
-        page_names: extract_rdf_li_list(xml, "PageNames"),
-        layer_names: extract_rdf_li_list(xml, "LayerNames"),
-        object_names: extract_rdf_li_list(xml, "ObjectNames"),
+        page_names: extract_rdf_li_list(&roots, "PageNames"),
+        layer_names: extract_rdf_li_list(&roots, "LayerNames"),
+        object_names: extract_rdf_li_list(&roots, "ObjectNames"),
     }
 }
 
@@ -1153,50 +1372,53 @@ pub fn apply_xmp_metadata_xml(
     is_template: &mut bool,
     zcf_ctx: &mut ZcfContext,
 ) {
-    if let Some(fmt) = extract_xml_tag_simple(xml, "dc:format") {
+    let Some(roots) = parse_xml_strict(xml) else {
+        return;
+    };
+    if let Some(fmt) = extract_xml_tag_simple(&roots, "dc:format") {
         if fmt.to_ascii_lowercase().contains("template") {
             *is_template = true;
         }
     }
-    if let Some(ver_str) = extract_xml_tag_simple(xml, "cdr:CoreVersion") {
+    if let Some(ver_str) = extract_xml_tag_simple(&roots, "cdr:CoreVersion") {
         if let Ok(v) = ver_str.trim().parse::<u16>() {
             if v > 0 {
                 zcf_ctx.version_hint = Some(v);
             }
         }
     }
-    if let Some(author) = extract_rdf_li_list(xml, "dc:creator")
+    if let Some(author) = extract_rdf_li_list(&roots, "dc:creator")
         .into_iter()
         .find(|s| !s.is_empty())
-        .or_else(|| extract_xml_tag_simple(xml, "crl:LastAuthor").filter(|s| !s.is_empty()))
+        .or_else(|| extract_xml_tag_simple(&roots, "crl:LastAuthor").filter(|s| !s.is_empty()))
     {
-        doc.metadata.author = author;
+        doc.metadata_mut().author = author;
     }
-    if let Some(title) = extract_rdf_li_list(xml, "dc:title")
-        .into_iter()
-        .find(|s| !s.is_empty())
-    {
-        doc.title = title;
-    }
-    if let Some(subj) = extract_rdf_li_list(xml, "crl:Subject")
+    if let Some(title) = extract_rdf_li_list(&roots, "dc:title")
         .into_iter()
         .find(|s| !s.is_empty())
     {
-        doc.metadata.subject = subj;
+        doc.set_title(title);
     }
-    if let Some(notes) = extract_rdf_li_list(xml, "crl:Notes")
+    if let Some(subj) = extract_rdf_li_list(&roots, "crl:Subject")
         .into_iter()
         .find(|s| !s.is_empty())
     {
-        doc.metadata.notes = notes;
+        doc.metadata_mut().subject = subj;
     }
-    let kws = extract_rdf_li_list(xml, "crl:Keywords");
+    if let Some(notes) = extract_rdf_li_list(&roots, "crl:Notes")
+        .into_iter()
+        .find(|s| !s.is_empty())
+    {
+        doc.metadata_mut().notes = notes;
+    }
+    let kws = extract_rdf_li_list(&roots, "crl:Keywords");
     if !kws.is_empty() {
-        doc.metadata.keywords = kws;
+        doc.metadata_mut().keywords = kws;
     }
     if let (Some(w_str), Some(h_str)) = (
-        extract_xml_tag_simple(xml, "cdrinfo:PageWidth"),
-        extract_xml_tag_simple(xml, "cdrinfo:PageHeight"),
+        extract_xml_tag_simple(&roots, "cdrinfo:PageWidth"),
+        extract_xml_tag_simple(&roots, "cdrinfo:PageHeight"),
     ) {
         if let (Ok(w), Ok(h)) = (w_str.trim().parse::<i32>(), h_str.trim().parse::<i32>()) {
             let wm = sanitize_f64(cdr32_to_mm(w), 0.0);
@@ -1208,68 +1430,22 @@ pub fn apply_xmp_metadata_xml(
     }
 }
 
-fn extract_xml_attr(attrs: &str, name: &str) -> Option<String> {
-    let needle_dq = format!("{name}=\"");
-    if let Some(pos) = attrs.find(&needle_dq) {
-        let rest = &attrs[pos + needle_dq.len()..];
-        let end = rest.find('"')?;
-        return Some(xml_unescape(&rest[..end]));
-    }
-    let needle_sq = format!("{name}='");
-    if let Some(pos) = attrs.find(&needle_sq) {
-        let rest = &attrs[pos + needle_sq.len()..];
-        let end = rest.find('\'')?;
-        return Some(xml_unescape(&rest[..end]));
-    }
-    None
+fn extract_xml_tag_simple(roots: &[XmlElem], tag: &str) -> Option<String> {
+    let elem = find_first_elem(roots, tag)?;
+    Some(elem.text.trim().to_owned())
 }
 
-fn extract_xml_tag_raw<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(&xml[start..end])
-}
-
-fn extract_xml_tag_simple(xml: &str, tag: &str) -> Option<String> {
-    extract_xml_tag_raw(xml, tag).map(|raw| xml_unescape(raw.trim()))
-}
-
-fn extract_rdf_li_list(xml: &str, container_tag: &str) -> Vec<String> {
-    let Some(section) = extract_xml_tag_raw(xml, container_tag) else {
+fn extract_rdf_li_list(roots: &[XmlElem], container_tag: &str) -> Vec<String> {
+    let Some(container) = find_first_elem(roots, container_tag) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    let mut rest = section;
-    while let Some(pos) = rest.find("<rdf:li") {
-        let after = &rest[pos + 7..];
-        let Some(gt) = after.find('>') else {
-            break;
-        };
-        if after[..gt].ends_with('/') {
-            rest = &after[gt + 1..];
-            continue;
-        }
-        let body = &after[gt + 1..];
-        let Some(close) = body.find("</rdf:li>") else {
-            break;
-        };
-        let item = xml_unescape(body[..close].trim());
-        if !item.is_empty() {
-            out.push(item);
-        }
-        rest = &body[close + 9..];
-    }
-    out
-}
-
-fn xml_unescape(s: &str) -> String {
-    s.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    let mut li_elems = Vec::new();
+    collect_elems(&container.children, "rdf:li", &mut li_elems);
+    li_elems
+        .into_iter()
+        .map(|el| el.text.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // =============================================================================
@@ -1295,10 +1471,13 @@ pub fn extract_cdr_preview_png(bytes: &[u8], limits: &CodecLimits) -> CdrResult<
 
     if bytes.len() >= 12 && (&bytes[0..4] == b"RIFF" || &bytes[0..4] == b"RIFX") {
         let form = [bytes[8], bytes[9], bytes[10], bytes[11]];
-        if is_cdr_form_type(&form) || is_cdt_form_type(&form) {
+        if is_cdr_form_type(&form) || is_cdt_form_type(&form) || is_cmx_form_type(&form) {
             let mut budget = limits.max_uncompressed_bytes;
             let tree = parse_riff_with_budget(bytes, limits, &mut budget, true)?;
-            if let Some(disp) = tree.find_chunk(b"DISP") {
+            if let Some(disp) = tree
+                .find_chunk(b"DISP")
+                .or_else(|| tree.find_chunk(b"disp"))
+            {
                 return decode_disp_to_png(disp, limits, &mut budget).map(Some);
             }
             return Ok(None);
@@ -1434,7 +1613,7 @@ fn extract_zip_preview_png(bytes: &[u8], limits: &CodecLimits) -> CdrResult<Opti
 }
 
 fn decode_disp_to_png(disp: &[u8], limits: &CodecLimits, budget: &mut u64) -> CdrResult<Vec<u8>> {
-    // Classic CorelDRAW `DISP` chunks prepend a 4-byte Windows clipboard format (`8` = `CF_DIB`).
+    // Classic CDR `DISP` chunks prepend a 4-byte Windows clipboard format (`8` = `CF_DIB`).
     let dib_slice = if disp.len() >= 44 {
         let cf_tag = u32::from_le_bytes([disp[0], disp[1], disp[2], disp[3]]);
         let next_hdr = u32::from_le_bytes([disp[4], disp[5], disp[6], disp[7]]);
@@ -1565,20 +1744,19 @@ mod tests {
     use crate::limits::decompress_zlib_bounded;
 
     #[test]
-    fn parse_corel_color_string_all_models() {
-        let black = parse_corel_color_string(
-            "CMYK,USER,0,0,0,100,100,00000000-0000-0000-0000-000000000000",
-        )
-        .unwrap();
+    fn parse_cdr_color_string_all_models() {
+        let black =
+            parse_cdr_color_string("CMYK,USER,0,0,0,100,100,00000000-0000-0000-0000-000000000000")
+                .unwrap();
         assert_eq!(black, Color::cmyk(0.0, 0.0, 0.0, 1.0));
 
-        let red = parse_corel_color_string(
+        let red = parse_cdr_color_string(
             "CMYK255,USER,0,255,255,0,100,cccd19cb-4675-4a5e-8bda-d0bbbaab8af0",
         )
         .unwrap();
         assert_eq!(red, Color::cmyk(0.0, 1.0, 1.0, 0.0));
 
-        let rgb = parse_corel_color_string("RGB255,USER,255,128,0,50,0000").unwrap();
+        let rgb = parse_cdr_color_string("RGB255,USER,255,128,0,50,0000").unwrap();
         match rgb {
             Color::Rgba { r, g, b, a } => {
                 assert!((r - 1.0).abs() < 1e-3);
@@ -1589,10 +1767,10 @@ mod tests {
             other => panic!("expected Rgba, got {other:?}"),
         }
 
-        let gray = parse_corel_color_string("GRAY,USER,50,100,0000").unwrap();
+        let gray = parse_cdr_color_string("GRAY,USER,50,100,0000").unwrap();
         assert!(matches!(gray, Color::Gray { v, .. } if (v - 0.5).abs() < 1e-3));
 
-        let lab = parse_corel_color_string("LAB,USER,60,25,-30,100,0000").unwrap();
+        let lab = parse_cdr_color_string("LAB,USER,60,25,-30,100,0000").unwrap();
         assert!(matches!(lab, Color::Lab { l, a_ch, b_ch, .. }
             if (l - 60.0).abs() < 1e-3 && (a_ch - 25.0).abs() < 1e-3 && (b_ch + 30.0).abs() < 1e-3));
     }
@@ -1826,5 +2004,95 @@ mod tests {
         assert!(ts.bold);
         assert_eq!(ts.bidi_font_family.as_deref(), Some("Noto Sans Arabic"));
         assert!((ts.font_size_pt - 24.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn oob_file_index_errors_strictly() {
+        let mut ptr = Vec::with_capacity(16);
+        ptr.extend_from_slice(&99u32.to_le_bytes()); // out-of-bounds file_index
+        ptr.extend_from_slice(&24u32.to_le_bytes());
+        ptr.extend_from_slice(&0u32.to_le_bytes());
+        ptr.extend_from_slice(&0u32.to_le_bytes());
+
+        let tree = RiffDocument::new(*b"CDRO", vec![RiffNode::chunk(*b"loda", ptr)]);
+        let mut budget = CodecLimits::default().max_uncompressed_bytes;
+        let mut warnings = Vec::new();
+        let err = resolve_zcf_riff_tree(
+            tree,
+            &[],
+            &[],
+            &CodecLimits::default(),
+            &mut budget,
+            &mut warnings,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CdrError::InvalidChunk { .. }));
+    }
+
+    #[test]
+    fn xml_parsers_reject_doctype_and_handle_comments_entities_and_attr_gt() {
+        let dtd_xml = r#"<?xml version="1.0"?>
+<!DOCTYPE palette [ <!ENTITY bomb "AAAA"> ]>
+<palette><color cs="RGB" name="Red" tints="255,0,0"/></palette>"#;
+        assert!(parse_doc_palette_xml(dtd_xml).is_empty());
+
+        let pal_xml = r#"<?xml version="1.0"?>
+<!-- <color cs="RGB" name="Ignored" tints="0,0,0"/> -->
+<palette><color cs="SPOT" name="A &amp; B &gt; C" tints="0,100,0,0"/></palette>"#;
+        let swatches = parse_doc_palette_xml(pal_xml);
+        assert_eq!(swatches.len(), 1);
+        assert_eq!(swatches[0].name, "A & B > C");
+        assert_eq!(
+            swatches[0].color,
+            Color::spot("A & B > C", 1.0, [0.0, 1.0, 0.0, 0.0])
+        );
+
+        let tricky_ti = r#"<x:xmpmeta><rdf:RDF><rdf:Description>
+<!-- <PageNames><rdf:Bag><rdf:li>CommentedOut</rdf:li></rdf:Bag></PageNames> -->
+<PageNames><rdf:Bag><rdf:li>P1 &amp; &lt;/rdf:li&gt;</rdf:li></rdf:Bag></PageNames>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let ti = parse_textinfo_xml(tricky_ti);
+        assert_eq!(ti.page_names, vec!["P1 & </rdf:li>"]);
+    }
+
+    #[test]
+    fn spot_and_fixed_colors_decode_non_black_fallbacks() {
+        let spot = parse_cdr_color_string("SPOT,PantoneMagenta,100,0,100,0,0").unwrap();
+        assert_eq!(
+            spot,
+            Color::Spot {
+                name: "PantoneMagenta".to_owned(),
+                tint: 1.0,
+                fallback_cmyk: [0.0, 1.0, 0.0, 0.0],
+                alpha: 1.0,
+            }
+        );
+        let fixed = parse_cdr_color_string("FIXED,WarmGold,50,0,25,100,0").unwrap();
+        assert_eq!(
+            fixed,
+            Color::Spot {
+                name: "WarmGold".to_owned(),
+                tint: 0.5,
+                fallback_cmyk: [0.0, 0.25, 1.0, 0.0],
+                alpha: 1.0,
+            }
+        );
+        let fallback_only = parse_cdr_color_string("SPOT,BrandCyan").unwrap();
+        if let Color::Spot { fallback_cmyk, .. } = fallback_only {
+            assert_ne!(fallback_cmyk, [0.0, 0.0, 0.0, 1.0]);
+        } else {
+            panic!("expected Spot");
+        }
+    }
+
+    #[test]
+    fn extract_cdr_preview_png_supports_cmx_disp() {
+        let dib = crate::cdr_riff::encode_dib_rgba(2, 2, &[200u8; 16]).unwrap();
+        let tree = RiffDocument::new(*b"CMX2", vec![RiffNode::chunk(*b"disp", dib)]);
+        let cmx_bytes = crate::riff::write_riff(&tree).unwrap();
+        let png = extract_cdr_preview_png(&cmx_bytes, &CodecLimits::default())
+            .unwrap()
+            .expect("cmx disp preview");
+        assert!(png.starts_with(PNG_SIGNATURE));
     }
 }

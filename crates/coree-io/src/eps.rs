@@ -31,9 +31,9 @@ const MAX_EPS_INPUT_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
 
 /// Exports `page_index` of `doc` as an Encapsulated PostScript Level 3 string.
 pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<String> {
-    let page = doc.pages.get(page_index).ok_or(IoError::PageOutOfRange {
+    let page = doc.page(page_index).ok_or(IoError::PageOutOfRange {
         page_index,
-        page_count: doc.pages.len(),
+        page_count: doc.pages().len(),
     })?;
 
     if !page.width_mm.is_finite()
@@ -52,7 +52,7 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
 
     let w_pt = page.width_mm * MM_TO_PT;
     let h_pt = page.height_mm * MM_TO_PT;
-    let use_cmyk = doc.color_mode == ColorMode::Cmyk;
+    let use_cmyk = doc.color_mode() == ColorMode::Cmyk;
 
     let mut out = String::with_capacity(4096);
     out.push_str("%!PS-Adobe-3.0 EPSF-3.0\n");
@@ -64,7 +64,7 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
     );
     let _ = writeln!(out, "%%HiResBoundingBox: 0.0000 0.0000 {w_pt:.4} {h_pt:.4}");
     out.push_str("%%Creator: coree (coree-io EPS Level 3 Writer)\n");
-    let _ = writeln!(out, "%%Title: {}", sanitize_dsc_comment(&doc.title));
+    let _ = writeln!(out, "%%Title: {}", sanitize_dsc_comment(doc.title()));
     out.push_str("%%LanguageLevel: 3\n");
     out.push_str("%%Pages: 1\n");
     out.push_str("%%EndComments\n");
@@ -74,7 +74,7 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
 
     // Emit applicable master layers from OTHER pages first (bottom), then target page's own layers.
     let mut ordered_layers = Vec::new();
-    for (p_idx, p) in doc.pages.iter().enumerate() {
+    for (p_idx, p) in doc.pages().iter().enumerate() {
         if p_idx == page_index {
             continue;
         }
@@ -105,7 +105,7 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
         let _ = writeln!(out, "% Layer: {}", sanitize_dsc_comment(&layer.name));
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
-            if let Some(obj) = doc.objects.get(&oid) {
+            if let Some(obj) = doc.object(oid) {
                 emit_eps_object(
                     doc,
                     page,
@@ -440,7 +440,8 @@ fn emit_eps_object(
                     use_cmyk,
                     out,
                 );
-                let label = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
+                let label =
+                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
                 let mid = dim.p1.midpoint(dim.p2);
                 let at = ArtisticText::from_plain(label, dim.text_style.clone());
                 emit_eps_artistic_text(
@@ -469,7 +470,7 @@ fn emit_eps_object(
             }
             NodePayload::Group(children) => {
                 for &cid in children {
-                    if let Some(child) = doc.objects.get(&cid) {
+                    if let Some(child) = doc.object(cid) {
                         emit_eps_object(
                             doc,
                             page,
@@ -507,7 +508,7 @@ fn emit_eps_object(
                 emit_eps_path_ops(page, &clip_path, out);
                 out.push_str("clip newpath\n");
                 for &cid in contents {
-                    if let Some(child) = doc.objects.get(&cid) {
+                    if let Some(child) = doc.object(cid) {
                         emit_eps_object(
                             doc,
                             page,
@@ -536,7 +537,7 @@ fn emit_eps_object(
                 }
             }
             NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = doc.symbols.get(sym_id) {
+                if let Some(sym) = doc.symbol(*sym_id) {
                     for sub in &sym.objects {
                         let mut sym_visited = HashSet::new();
                         emit_eps_object(
@@ -555,7 +556,7 @@ fn emit_eps_object(
                 }
             }
             NodePayload::Raster(raster) => {
-                if let Some(asset) = doc.assets.get(&raster.asset_id) {
+                if let Some(asset) = doc.asset(raster.asset_id) {
                     let bl = world_xf.transform_point(Point2D::new(0.0, raster.height_mm));
                     let br =
                         world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
@@ -1168,7 +1169,7 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         });
 
     let mut doc = Document::new(doc_title, page_w_mm, page_h_mm, color_mode, 300.0);
-    doc.metadata.source_format = Some("eps".to_owned());
+    doc.metadata_mut().source_format = Some("eps".to_owned());
 
     for (idx, item) in interp.emitted.into_iter().enumerate() {
         match item {
@@ -1243,7 +1244,7 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 ctm,
             } => {
                 if let Ok(asset) =
-                    coree_core::RasterAsset::new(width, height, rgba_bytes, 300.0, doc.color_mode)
+                    coree_core::RasterAsset::new(width, height, rgba_bytes, 300.0, doc.color_mode())
                 {
                     let asset_id = doc.register_asset(asset);
                     // PostScript image maps [0,1]x[0,1] bottom-to-top in CTM -> convert corners via `eps_to_mm * ctm`
@@ -2913,17 +2914,17 @@ mod tests {
         let eps_str = export_eps_to_string(&doc, 0).unwrap();
         let imported = import_eps_bytes(eps_str.as_bytes(), "fallback").unwrap();
 
-        assert_eq!(imported.title, "Brand Card");
-        assert!((imported.pages[0].width_mm - 120.0).abs() < 0.05);
-        assert!((imported.pages[0].height_mm - 80.0).abs() < 0.05);
+        assert_eq!(imported.title(), "Brand Card");
+        assert!((imported.pages()[0].width_mm - 120.0).abs() < 0.05);
+        assert!((imported.pages()[0].height_mm - 80.0).abs() < 0.05);
 
         // Expect filled rect path + stroked rect path + ArtisticText
-        assert_eq!(imported.objects.len(), 3);
+        assert_eq!(imported.object_count(), 3);
 
         let mut saw_fill = false;
         let mut saw_stroke = false;
         let mut saw_text = false;
-        for (&id, obj) in &imported.objects {
+        for (&id, obj) in imported.objects() {
             match &obj.payload {
                 NodePayload::Path(_) => {
                     let bb = imported.object_bounds(id).unwrap();
@@ -2984,10 +2985,10 @@ grestore\n\
         dos_eps.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0xDE, 0xAD]);
 
         let doc = import_eps_bytes(&dos_eps, "DOS Binary").unwrap();
-        assert_eq!(doc.color_mode, ColorMode::Cmyk);
-        assert_eq!(doc.objects.len(), 4); // rectfill, arc B, line S, text show
+        assert_eq!(doc.color_mode(), ColorMode::Cmyk);
+        assert_eq!(doc.object_count(), 4); // rectfill, arc B, line S, text show
         let text_obj = doc
-            .objects
+            .objects()
             .values()
             .find_map(|o| match &o.payload {
                 NodePayload::ArtisticText(t) => Some(t.plain_text()),
@@ -3001,13 +3002,13 @@ grestore\n\
     fn eps_adversarial_unmatched_paren_extreme_arc_empty_repeat_and_array_bomb() {
         // 1. Unmatched `)` must terminate immediately without infinite loop or OOM
         let doc = import_eps_bytes(b"%!PS\n)\n", "UnmatchedParen").unwrap();
-        assert_eq!(doc.pages.len(), 1);
+        assert_eq!(doc.pages().len(), 1);
 
         // 2. Extreme finite arc angles (1e20) must finish in O(1) without hanging
         let extreme_arc =
             b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n50 50 20 1e20 0 arc stroke\n50 50 20 0 1e20 arcn stroke\n%%EOF\n";
         let arc_doc = import_eps_bytes(extreme_arc, "ExtremeArc").unwrap();
-        assert_eq!(arc_doc.objects.len(), 2);
+        assert_eq!(arc_doc.object_count(), 2);
 
         // 3. Nested empty repeat loop bomb must trip MAX_PS_STEPS immediately
         let empty_loop_bomb = b"%!PS\n10000 { 10000 { } repeat } repeat\n";
@@ -3076,9 +3077,9 @@ grestore\n\
         assert!(eps.contains("FF0000"));
 
         let imported = import_eps_bytes(eps.as_bytes(), "EPS Full").unwrap();
-        assert!(!imported.assets.is_empty());
+        assert!(!imported.assets().is_empty());
         assert!(imported
-            .objects
+            .objects()
             .values()
             .any(|o| matches!(o.payload, NodePayload::Raster(_))));
     }

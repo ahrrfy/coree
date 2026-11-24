@@ -1,0 +1,53 @@
+[package]
+name = "coree-fuzz"
+version = "0.3.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[workspace]
+
+[dependencies]
+coree-cdr = { path = "../crates/coree-cdr" }
+coree-core = { path = "../crates/coree-core" }
+coree-io = { path = "../crates/coree-io" }
+coree-render = { path = "../crates/coree-render" }
+
+[[bin]]
+name = "fuzz_cdr"
+path = "fuzz_targets/fuzz_cdr.rs"
+doc = false
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_pdf"
+path = "fuzz_targets/fuzz_pdf.rs"
+doc = false
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_svg"
+path = "fuzz_targets/fuzz_svg.rs"
+doc = false
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_eps"
+path = "fuzz_targets/fuzz_eps.rs"
+doc = false
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_psd"
+path = "fuzz_targets/fuzz_psd.rs"
+doc = false
+test = false
+bench = false

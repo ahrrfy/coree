@@ -329,27 +329,7 @@ impl BezierPath {
     pub fn to_kurbo(&self) -> BezPath {
         let mut out = BezPath::new();
         for sp in &self.subpaths {
-            if sp.nodes.is_empty() {
-                continue;
-            }
-            let first = sp.nodes[0];
-            if !first.pos.is_finite() {
-                continue;
-            }
-            out.move_to(first.pos.to_kurbo());
-            let seg_count = sp.segment_count();
-            for s in 0..seg_count {
-                if let Some(seg) = sp.segment_to_kurbo(s) {
-                    match seg {
-                        PathSeg::Line(l) => out.line_to(l.p1),
-                        PathSeg::Quad(q) => out.quad_to(q.p1, q.p2),
-                        PathSeg::Cubic(c) => out.curve_to(c.p1, c.p2, c.p3),
-                    }
-                }
-            }
-            if sp.closed {
-                out.close_path();
-            }
+            push_subpath_to_kurbo(sp, &mut out);
         }
         out
     }
@@ -612,10 +592,17 @@ impl BezierPath {
     /// Non-zero winding hit-test for closed contours.
     #[must_use]
     pub fn contains_point(&self, pt: Point2D) -> bool {
-        if !pt.is_finite() || self.is_empty() {
+        if !pt.is_finite() || self.is_empty() || !self.subpaths.iter().any(|sp| sp.closed) {
             return false;
         }
-        self.to_kurbo().winding(pt.to_kurbo()) != 0
+        let mut kb = BezPath::new();
+        for sp in self.subpaths.iter().filter(|sp| sp.closed) {
+            push_subpath_to_kurbo(sp, &mut kb);
+        }
+        if kb.is_empty() {
+            return false;
+        }
+        kb.winding(pt.to_kurbo()) != 0
     }
 
     // -------------------------------------------------------------------------
@@ -1168,6 +1155,30 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+fn push_subpath_to_kurbo(sp: &Subpath, out: &mut BezPath) {
+    if sp.nodes.is_empty() {
+        return;
+    }
+    let first = sp.nodes[0];
+    if !first.pos.is_finite() {
+        return;
+    }
+    out.move_to(first.pos.to_kurbo());
+    let seg_count = sp.segment_count();
+    for s in 0..seg_count {
+        if let Some(seg) = sp.segment_to_kurbo(s) {
+            match seg {
+                PathSeg::Line(l) => out.line_to(l.p1),
+                PathSeg::Quad(q) => out.quad_to(q.p1, q.p2),
+                PathSeg::Cubic(c) => out.curve_to(c.p1, c.p2, c.p3),
+            }
+        }
+    }
+    if sp.closed {
+        out.close_path();
+    }
+}
+
 fn eval_seg_point_tangent(seg: PathSeg, t: f64) -> (Point2D, Vec2D) {
     let pt = Point2D::from_kurbo(seg.eval(t));
     let deriv = match seg {
@@ -1633,8 +1644,8 @@ pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<Bezi
         };
     }
 
-    // Build a 32-gon circle polygon
-    const SEGMENTS: usize = 32;
+    // Build a smooth 96-gon circular cutter and re-fit output arcs back to cubic Béziers
+    const SEGMENTS: usize = 96;
     let circle_ring: Vec<[f64; 2]> = (0..SEGMENTS)
         .map(|i| {
             let theta = TAU * (i as f64) / (SEGMENTS as f64);
@@ -1686,26 +1697,28 @@ pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<Bezi
                             let p1 = a.lerp(b, t1);
                             if piece.last().is_none_or(|last| last.distance_to(p0) > 1e-5) {
                                 if piece.len() >= 2 {
-                                    results.push(BezierPath::from_polygon(
-                                        std::mem::take(&mut piece),
-                                        false,
+                                    results.push(BezierPath::from_subpath(
+                                        fit_cubic_bezier_subpath(&piece, false, 0.025),
                                     ));
-                                } else {
-                                    piece.clear();
                                 }
+                                piece.clear();
                                 piece.push(p0);
                             }
                             piece.push(p1);
-                        } else if piece.len() >= 2 {
-                            results
-                                .push(BezierPath::from_polygon(std::mem::take(&mut piece), false));
                         } else {
+                            if piece.len() >= 2 {
+                                results.push(BezierPath::from_subpath(fit_cubic_bezier_subpath(
+                                    &piece, false, 0.025,
+                                )));
+                            }
                             piece.clear();
                         }
                     }
                 }
                 if piece.len() >= 2 {
-                    results.push(BezierPath::from_polygon(piece, false));
+                    results.push(BezierPath::from_subpath(fit_cubic_bezier_subpath(
+                        &piece, false, 0.025,
+                    )));
                 }
             }
         }
@@ -1721,7 +1734,11 @@ pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<Bezi
             let subpaths: Vec<Subpath> = shape
                 .into_iter()
                 .filter(|c| c.len() >= 3)
-                .map(|c| Subpath::from_points(c.into_iter().map(|[x, y]| Point2D::new(x, y)), true))
+                .map(|c| {
+                    let pts: Vec<Point2D> =
+                        c.into_iter().map(|[x, y]| Point2D::new(x, y)).collect();
+                    fit_cubic_bezier_subpath(&pts, true, 0.025)
+                })
                 .collect();
             if !subpaths.is_empty() {
                 results.push(BezierPath { subpaths });
@@ -1730,6 +1747,429 @@ pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<Bezi
     }
 
     results
+}
+
+/// Re-fits a dense polyline contour back into compact cubic Bézier segments using Philip
+/// Schneider's chord-length least-squares + Newton-Raphson curve fitter with sharp-corner
+/// preservation (preventing 100-node polygon bloat after boolean, offset, or eraser ops).
+#[must_use]
+pub fn fit_cubic_bezier_subpath(points: &[Point2D], closed: bool, max_error_mm: f64) -> Subpath {
+    let mut pts: Vec<Point2D> = Vec::with_capacity(points.len());
+    for &p in points {
+        if !p.is_finite() {
+            continue;
+        }
+        if pts.last().is_none_or(|prev| prev.distance_to(p) > 1e-6) {
+            pts.push(p);
+        }
+    }
+    if closed && pts.len() > 1 && pts[0].distance_to(pts[pts.len() - 1]) <= 1e-6 {
+        pts.pop();
+    }
+    if pts.len() < 2 || (closed && pts.len() < 3) {
+        return Subpath::from_points(pts, closed);
+    }
+
+    // Drop strictly collinear micro-vertices on flat edges (within 1e-4 mm) so rectangles and
+    // chamfered shapes keep minimal sharp corners without unnecessary nodes.
+    let pts = simplify_collinear_vertices(&pts, closed, 1e-4);
+    let n = pts.len();
+    if n < 2 || (closed && n < 3) {
+        return Subpath::from_points(pts, closed);
+    }
+
+    let err_tol = sanitize_f64(max_error_mm, 0.02).clamp(0.002, 2.0);
+    let mut is_corner = vec![false; n];
+    for i in 0..n {
+        if !closed && (i == 0 || i == n - 1) {
+            is_corner[i] = true;
+            continue;
+        }
+        let prev = pts[(i + n - 1) % n];
+        let curr = pts[i];
+        let next = pts[(i + 1) % n];
+        let d0 = curr - prev;
+        let d1 = next - curr;
+        let l0 = d0.length();
+        let l1 = d1.length();
+        if l0 <= 1e-9 || l1 <= 1e-9 {
+            is_corner[i] = true;
+            continue;
+        }
+        let cos_a = (d0.dot(d1) / (l0 * l1)).clamp(-1.0, 1.0);
+        // Treat crisp geometric turns (> ~26 deg) or flat-sided polygon corners (longer chords) as sharp cusps.
+        if cos_a < 0.90 || (cos_a < 0.996 && l0.min(l1) > 1.5) {
+            is_corner[i] = true;
+        }
+    }
+
+    // Closed smooth loop with zero corners (e.g., circle/ellipse): seed 4 cardinal anchors
+    let mut corner_indices: Vec<usize> = (0..n).filter(|&i| is_corner[i]).collect();
+    let all_smooth_loop = closed && corner_indices.is_empty();
+    if all_smooth_loop && n >= 8 {
+        corner_indices = vec![0, n / 4, n / 2, (3 * n) / 4];
+        corner_indices.sort_unstable();
+        corner_indices.dedup();
+    } else if !closed && corner_indices.is_empty() {
+        corner_indices.push(0);
+        corner_indices.push(n - 1);
+    }
+
+    if corner_indices.len() < 2 {
+        return Subpath::from_points(pts, closed);
+    }
+
+    // Build contiguous spans between consecutive corners and collect cubic segments.
+    #[derive(Clone, Copy)]
+    struct FittedSeg {
+        p0: Point2D,
+        c1: Option<Point2D>,
+        c2: Option<Point2D>,
+        p1: Point2D,
+        c1_smooth_anchor: bool,
+        c2_smooth_anchor: bool,
+    }
+
+    let mut segs: Vec<FittedSeg> = Vec::new();
+    let span_count = if closed {
+        corner_indices.len()
+    } else {
+        corner_indices.len() - 1
+    };
+
+    for s_idx in 0..span_count {
+        let i_start = corner_indices[s_idx];
+        let i_end = corner_indices[(s_idx + 1) % corner_indices.len()];
+        let mut span: Vec<Point2D> = Vec::new();
+        let mut k = i_start;
+        loop {
+            span.push(pts[k]);
+            if k == i_end {
+                break;
+            }
+            k = (k + 1) % n;
+            if span.len() > n + 1 {
+                break;
+            }
+        }
+        if span.len() < 2 {
+            continue;
+        }
+        if span.len() == 2 || span_max_deviation(&span) <= err_tol * 0.3 {
+            segs.push(FittedSeg {
+                p0: span[0],
+                c1: None,
+                c2: None,
+                p1: *span.last().expect("span >= 2"),
+                c1_smooth_anchor: !is_corner[i_start],
+                c2_smooth_anchor: !is_corner[i_end],
+            });
+            continue;
+        }
+
+        let t_hat1 = if is_corner[i_start] {
+            (span[1] - span[0])
+                .normalized()
+                .unwrap_or(Vec2D::new(1.0, 0.0))
+        } else {
+            let prev = pts[(i_start + n - 1) % n];
+            (span[1] - prev)
+                .normalized()
+                .unwrap_or(Vec2D::new(1.0, 0.0))
+        };
+        let t_hat2 = if is_corner[i_end] {
+            (span[span.len() - 2] - span[span.len() - 1])
+                .normalized()
+                .unwrap_or(Vec2D::new(-1.0, 0.0))
+        } else {
+            let next = pts[(i_end + 1) % n];
+            (span[span.len() - 2] - next)
+                .normalized()
+                .unwrap_or(Vec2D::new(-1.0, 0.0))
+        };
+
+        let cubics = fit_schneider_cubic(&span, t_hat1, t_hat2, err_tol * err_tol, 0);
+        let m = cubics.len();
+        for (idx, (p0, c1, c2, p1)) in cubics.into_iter().enumerate() {
+            segs.push(FittedSeg {
+                p0,
+                c1: Some(c1),
+                c2: Some(c2),
+                p1,
+                c1_smooth_anchor: idx > 0 || !is_corner[i_start],
+                c2_smooth_anchor: idx + 1 < m || !is_corner[i_end],
+            });
+        }
+    }
+
+    if segs.is_empty() {
+        return Subpath::from_points(pts, closed);
+    }
+
+    let mut nodes: Vec<PathNode> = Vec::with_capacity(segs.len() + usize::from(!closed));
+    if closed {
+        let m = segs.len();
+        for i in 0..m {
+            let prev = &segs[(i + m - 1) % m];
+            let curr = &segs[i];
+            let kind = if curr.c1_smooth_anchor
+                && prev.c2_smooth_anchor
+                && prev.c2.is_some()
+                && curr.c1.is_some()
+            {
+                NodeKind::Smooth
+            } else {
+                NodeKind::Cusp
+            };
+            nodes.push(PathNode::new(curr.p0, prev.c2, curr.c1, kind));
+        }
+    } else {
+        let m = segs.len();
+        nodes.push(PathNode::new(segs[0].p0, None, segs[0].c1, NodeKind::Cusp));
+        for i in 1..m {
+            let prev = &segs[i - 1];
+            let curr = &segs[i];
+            let kind = if curr.c1_smooth_anchor
+                && prev.c2_smooth_anchor
+                && prev.c2.is_some()
+                && curr.c1.is_some()
+            {
+                NodeKind::Smooth
+            } else {
+                NodeKind::Cusp
+            };
+            nodes.push(PathNode::new(curr.p0, prev.c2, curr.c1, kind));
+        }
+        let last = &segs[m - 1];
+        nodes.push(PathNode::new(last.p1, last.c2, None, NodeKind::Cusp));
+    }
+    Subpath { nodes, closed }
+}
+
+fn simplify_collinear_vertices(pts: &[Point2D], closed: bool, eps: f64) -> Vec<Point2D> {
+    if pts.len() <= 3 {
+        return pts.to_vec();
+    }
+    let n = pts.len();
+    let mut keep = Vec::with_capacity(n);
+    for i in 0..n {
+        if !closed && (i == 0 || i == n - 1) {
+            keep.push(pts[i]);
+            continue;
+        }
+        let prev = keep.last().copied().unwrap_or(pts[(i + n - 1) % n]);
+        let next = pts[(i + 1) % n];
+        if point_to_segment_dist(pts[i], prev, next) > eps {
+            keep.push(pts[i]);
+        }
+    }
+    if keep.len() < if closed { 3 } else { 2 } {
+        pts.to_vec()
+    } else {
+        keep
+    }
+}
+
+fn point_to_segment_dist(p: Point2D, a: Point2D, b: Point2D) -> f64 {
+    let ab = b - a;
+    let len_sq = ab.dot(ab);
+    if len_sq <= 1e-12 {
+        return p.distance_to(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance_to(a + ab * t)
+}
+
+fn span_max_deviation(pts: &[Point2D]) -> f64 {
+    if pts.len() <= 2 {
+        return 0.0;
+    }
+    let a = pts[0];
+    let b = pts[pts.len() - 1];
+    pts[1..pts.len() - 1]
+        .iter()
+        .map(|&p| point_to_segment_dist(p, a, b))
+        .fold(0.0_f64, f64::max)
+}
+
+#[inline]
+fn eval_cubic_pts(p0: Point2D, c1: Point2D, c2: Point2D, p1: Point2D, t: f64) -> Point2D {
+    let mt = 1.0 - t;
+    let mt2 = mt * mt;
+    let t2 = t * t;
+    let sum = p0.to_vec() * (mt2 * mt)
+        + c1.to_vec() * (3.0 * mt2 * t)
+        + c2.to_vec() * (3.0 * mt * t2)
+        + p1.to_vec() * (t2 * t);
+    Point2D::new(sum.x, sum.y)
+}
+
+fn fit_schneider_cubic(
+    pts: &[Point2D],
+    t_hat1: Vec2D,
+    t_hat2: Vec2D,
+    err_sq_tol: f64,
+    depth: usize,
+) -> Vec<(Point2D, Point2D, Point2D, Point2D)> {
+    let n = pts.len();
+    if n <= 2 {
+        let p0 = pts[0];
+        let p1 = pts[n - 1];
+        let d = p0.distance_to(p1) / 3.0;
+        return vec![(p0, p0 + t_hat1 * d, p1 + t_hat2 * d, p1)];
+    }
+
+    // Chord-length parameterization
+    let mut u = Vec::with_capacity(n);
+    u.push(0.0);
+    for i in 1..n {
+        u.push(u[i - 1] + pts[i].distance_to(pts[i - 1]));
+    }
+    let total_len = *u.last().unwrap_or(&1.0);
+    if total_len <= 1e-9 {
+        let p0 = pts[0];
+        return vec![(p0, p0, p0, pts[n - 1])];
+    }
+    for val in &mut u {
+        *val /= total_len;
+    }
+
+    let mut bez = generate_bezier(pts, &u, t_hat1, t_hat2);
+    let (mut max_err_sq, mut split_idx) = compute_max_fit_error(pts, &u, bez);
+    if max_err_sq <= err_sq_tol {
+        return vec![bez];
+    }
+
+    if max_err_sq < err_sq_tol * 16.0 {
+        for _ in 0..4 {
+            reparameterize(pts, &mut u, bez);
+            bez = generate_bezier(pts, &u, t_hat1, t_hat2);
+            let (err_sq, s) = compute_max_fit_error(pts, &u, bez);
+            max_err_sq = err_sq;
+            split_idx = s;
+            if max_err_sq <= err_sq_tol {
+                return vec![bez];
+            }
+        }
+    }
+
+    if depth >= 10 || n <= 3 {
+        return vec![bez];
+    }
+
+    let split = split_idx.clamp(1, n - 2);
+    let t_center = (pts[split - 1] - pts[split + 1])
+        .normalized()
+        .unwrap_or_else(|| (pts[split] - pts[split + 1]).normalized().unwrap_or(t_hat2));
+    let mut left = fit_schneider_cubic(&pts[..=split], t_hat1, t_center, err_sq_tol, depth + 1);
+    let right = fit_schneider_cubic(&pts[split..], -t_center, t_hat2, err_sq_tol, depth + 1);
+    left.extend(right);
+    left
+}
+
+fn generate_bezier(
+    pts: &[Point2D],
+    u: &[f64],
+    t_hat1: Vec2D,
+    t_hat2: Vec2D,
+) -> (Point2D, Point2D, Point2D, Point2D) {
+    let n = pts.len();
+    let p0 = pts[0];
+    let p3 = pts[n - 1];
+    let mut c = [[0.0_f64; 2]; 2];
+    let mut x = [0.0_f64; 2];
+
+    for i in 0..n {
+        let t = u[i];
+        let mt = 1.0 - t;
+        let b0 = mt * mt * mt;
+        let b1 = 3.0 * mt * mt * t;
+        let b2 = 3.0 * mt * t * t;
+        let b3 = t * t * t;
+        let a1 = t_hat1 * b1;
+        let a2 = t_hat2 * b2;
+
+        c[0][0] += a1.dot(a1);
+        c[0][1] += a1.dot(a2);
+        c[1][0] = c[0][1];
+        c[1][1] += a2.dot(a2);
+
+        let base_vec = p0.to_vec() * (b0 + b1) + p3.to_vec() * (b2 + b3);
+        let tmp = pts[i] - Point2D::new(base_vec.x, base_vec.y);
+        x[0] += a1.dot(tmp);
+        x[1] += a2.dot(tmp);
+    }
+
+    let det = c[0][0] * c[1][1] - c[0][1] * c[1][0];
+    let seg_len = p0.distance_to(p3);
+    let default_alpha = (seg_len / 3.0).max(1e-6);
+    let (mut alpha_l, mut alpha_r) = if det.abs() > 1e-12 {
+        (
+            (x[0] * c[1][1] - x[1] * c[0][1]) / det,
+            (c[0][0] * x[1] - c[1][0] * x[0]) / det,
+        )
+    } else {
+        (default_alpha, default_alpha)
+    };
+
+    let eps = 1e-6 * seg_len;
+    if !alpha_l.is_finite()
+        || !alpha_r.is_finite()
+        || alpha_l < eps
+        || alpha_r < eps
+        || alpha_l > seg_len * 3.0 + 1.0
+        || alpha_r > seg_len * 3.0 + 1.0
+    {
+        alpha_l = default_alpha;
+        alpha_r = default_alpha;
+    }
+
+    (p0, p0 + t_hat1 * alpha_l, p3 + t_hat2 * alpha_r, p3)
+}
+
+fn compute_max_fit_error(
+    pts: &[Point2D],
+    u: &[f64],
+    (p0, c1, c2, p3): (Point2D, Point2D, Point2D, Point2D),
+) -> (f64, usize) {
+    let mut max_dist_sq = 0.0_f64;
+    let mut split_idx = pts.len() / 2;
+    for i in 1..pts.len().saturating_sub(1) {
+        let p = eval_cubic_pts(p0, c1, c2, p3, u[i]);
+        let d = p - pts[i];
+        let d_sq = d.dot(d);
+        if d_sq >= max_dist_sq {
+            max_dist_sq = d_sq;
+            split_idx = i;
+        }
+    }
+    (max_dist_sq, split_idx)
+}
+
+fn reparameterize(
+    pts: &[Point2D],
+    u: &mut [f64],
+    (p0, c1, c2, p3): (Point2D, Point2D, Point2D, Point2D),
+) {
+    let q1 = (c1 - p0) * 3.0;
+    let q2 = (c2 - c1) * 3.0;
+    let q3 = (p3 - c2) * 3.0;
+    let r1 = (q2 - q1) * 2.0;
+    let r2 = (q3 - q2) * 2.0;
+
+    for i in 1..pts.len().saturating_sub(1) {
+        let t = u[i];
+        let mt = 1.0 - t;
+        let qt = eval_cubic_pts(p0, c1, c2, p3, t);
+        let q1_t = q1 * (mt * mt) + q2 * (2.0 * mt * t) + q3 * (t * t);
+        let q2_t = r1 * mt + r2 * t;
+        let diff = qt - pts[i];
+        let num = diff.dot(q1_t);
+        let den = q1_t.dot(q1_t) + diff.dot(q2_t);
+        if den.abs() > 1e-12 {
+            u[i] = (t - num / den).clamp(0.0, 1.0);
+        }
+    }
 }
 
 fn segment_segment_intersection(
@@ -2482,6 +2922,51 @@ impl ParametricShape {
     #[must_use]
     pub fn bounding_box(&self) -> Option<Rect2D> {
         self.to_bezier_path().bounding_box()
+    }
+
+    /// Returns `true` if every floating-point field on this shape is finite.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        match *self {
+            Self::Rectangle {
+                width,
+                height,
+                corner_radii,
+                ..
+            } => {
+                width.is_finite()
+                    && height.is_finite()
+                    && corner_radii.iter().all(|r| r.is_finite())
+            }
+            Self::Ellipse {
+                rx,
+                ry,
+                start_deg,
+                end_deg,
+                ..
+            } => rx.is_finite() && ry.is_finite() && start_deg.is_finite() && end_deg.is_finite(),
+            Self::Polygon {
+                radius_x, radius_y, ..
+            } => radius_x.is_finite() && radius_y.is_finite(),
+            Self::Star {
+                outer_radius,
+                inner_ratio,
+                ..
+            } => outer_radius.is_finite() && inner_ratio.is_finite(),
+            Self::Spiral {
+                revolutions,
+                radius,
+                expansion,
+                ..
+            } => revolutions.is_finite() && radius.is_finite() && expansion.is_finite(),
+            Self::GraphPaper { width, height, .. } => width.is_finite() && height.is_finite(),
+            Self::Impact {
+                inner_radius,
+                outer_radius,
+                ..
+            } => inner_radius.is_finite() && outer_radius.is_finite(),
+            Self::BasicShape { width, height, .. } => width.is_finite() && height.is_finite(),
+        }
     }
 }
 

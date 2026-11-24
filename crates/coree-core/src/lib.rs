@@ -13,7 +13,9 @@ pub mod dimension;
 pub mod document;
 pub mod effects;
 pub mod error;
+pub mod find_replace;
 pub mod geometry;
+pub mod hit_test;
 pub mod icc;
 pub mod ids;
 pub mod lens;
@@ -22,6 +24,7 @@ pub mod selection;
 pub mod style;
 pub mod table;
 pub mod text;
+pub mod viewport;
 
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-core";
@@ -37,30 +40,44 @@ pub use color::{
     default_cmyk_palette, default_rgb_palette, Color, ColorHarmony, ColorMode, ColorPalette,
     ColorStyle, ColorStyleId, ColorSwatch,
 };
-pub use command::{apply_command, rhai_array_to_ids, run_rhai_macro, CommandHistory, CommandOp};
+pub use command::{
+    apply_command, rhai_array_to_ids, run_rhai_macro, CommandHistory, CommandOp,
+    DocumentInvalidation,
+};
 pub use dimension::{AnchorPoint, ConnectorObject, ConnectorStyle, DimensionKind, DimensionObject};
 pub use document::{
     decode_base64, encode_base64, AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig,
     Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload, Page, PathMetrics,
-    PerspectiveGridConfig, PerspectiveGridMode, RasterAsset, RasterLayerData, SceneObject,
-    SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
+    PerspectiveGridConfig, PerspectiveGridMode, PowerClipFitMode, RasterAsset, RasterLayerData,
+    SceneObject, SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
 };
 pub use effects::{
     ContourMode, DistortKind, Effect, EnvelopeMode, FeatherDirection, RasterFilter,
     TransparencyMode,
 };
 pub use error::{CoreError, CoreResult};
+pub use find_replace::{
+    extract_searchable_text, find_and_replace, find_objects, preview_find_and_replace,
+    scoped_page_indices, text_runs_ref, ColorMatch, FindQuery, FindReplaceReport, FindScope,
+    LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
+};
 pub use geometry::{
-    erase_circle, knife_cut, virtual_segment_delete, ArtisticMedia, ArtisticMediaStyle,
-    ArtisticWidthProfile, BasicShapeKind, BezierPath, CornerStyle, EllipseMode, ImpactStyle,
-    LiveSketch, NodeKind, ParametricShape, PathNode, RecognizedShape, SmartDrawing, Subpath,
+    erase_circle, fit_cubic_bezier_subpath, knife_cut, virtual_segment_delete, ArtisticMedia,
+    ArtisticMediaStyle, ArtisticWidthProfile, BasicShapeKind, BezierPath, CornerStyle, EllipseMode,
+    ImpactStyle, LiveSketch, NodeKind, ParametricShape, PathNode, RecognizedShape, SmartDrawing,
+    Subpath,
+};
+pub use hit_test::{
+    hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
+    DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use icc::{
     apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile, convert_cmyk_to_rgb_icc,
     convert_rgb_between_builtin_profiles, convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2,
     generate_minimal_srgb_icc_v2, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk,
     BuiltinIccProfile, IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass,
-    IccProfileHeader, IccTagEntry, IccToneCurve, RenderingIntent, MAX_ICC_PROFILE_BYTES,
+    IccProfileHeader, IccTagEntry, IccToneCurve, IccV4Lut, RenderingIntent, SoftProofLut3D,
+    MAX_ICC_PROFILE_BYTES,
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
@@ -75,6 +92,7 @@ pub use text::{
     ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphText, TextAlign, TextDirection,
     TextOnPath, TextRun, TextStyle, TextWrapMode,
 };
+pub use viewport::{ViewMode, Viewport};
 
 #[cfg(test)]
 mod tests {
@@ -89,7 +107,7 @@ mod tests {
     #[test]
     fn end_to_end_document_serialization_with_all_node_types() {
         let mut doc = Document::new_a4("Full Feature Stress Test");
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let cut_layer = doc
             .add_layer(page_id, "CutContour", true, MasterLayerScope::None)
             .unwrap();
@@ -184,9 +202,9 @@ mod tests {
 
         let json = serde_json::to_string(&doc).unwrap();
         let restored: Document = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.objects.len(), 5);
-        assert!(restored.objects.contains_key(&text_id));
-        assert!(restored.objects.contains_key(&dim_id));
-        assert!(restored.objects.contains_key(&conn_id));
+        assert_eq!(restored.objects().len(), 5);
+        assert!(restored.has_object(text_id));
+        assert!(restored.has_object(dim_id));
+        assert!(restored.has_object(conn_id));
     }
 }

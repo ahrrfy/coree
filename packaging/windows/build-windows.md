@@ -11,7 +11,7 @@ When compiling for Windows (`x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnu`)
   - `PerMonitorV2` HiDPI awareness for sharp canvas and UI rendering on 4K/mixed-DPI displays.
   - `<activeCodePage>UTF-8</activeCodePage>` so Windows CLI & file dialogs handle Arabic and Unicode filenames (such as `درع الشكر والتقدير.cdr`) flawlessly without legacy ANSI codepage corruption.
   - `longPathAware` enabled.
-- **Version Metadata (`VS_VERSION_INFO`):** Product name `coree`, version `0.3.0.0`, and `MIT OR Apache-2.0` copyright metadata.
+- **Version Metadata (`VS_VERSION_INFO`):** Product name `coree`, version `0.3.1.0`, and `MIT OR Apache-2.0` copyright metadata.
 
 ---
 
@@ -97,21 +97,21 @@ wix build packaging\windows\wix\main.wxs `
     -d ComPath="target\release\coree.com" `
     -d IconPath="packaging\windows\coree.ico" `
     -d RepoRoot="." `
-    -d Version="0.3.0" `
-    -o dist\coree-v0.3.0-x86_64-windows-setup.msi
+    -d Version="0.3.1" `
+    -o dist\coree-v0.3.1-x86_64-windows-setup.msi
 ```
 
 ### Portable `.zip` Package (Zero Admin)
-Users who prefer a portable install without Administrator privileges can unpack `coree-v0.3.0-x86_64-windows-portable.zip` (containing `coree.exe`, `coree.com`, `coree.ico`, [`register-file-associations.cmd`](register-file-associations.cmd), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, and `README.md`) and double-click `register-file-associations.cmd` to register per-user (`HKCU`) file associations and icons.
+Users who prefer a portable install without Administrator privileges can unpack `coree-v0.3.1-x86_64-windows-portable.zip` (containing `coree.exe`, `coree.com`, `coree.ico`, [`register-file-associations.cmd`](register-file-associations.cmd), `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, and `README.md`) and double-click `register-file-associations.cmd` to register per-user (`HKCU`) file associations and icons.
 
 ### Silent Enterprise Install / Uninstall Verification
 ```powershell
 # Silent install
-msiexec /i dist\coree-v0.3.0-x86_64-windows-setup.msi /qn /l*v install.log
+msiexec /i dist\coree-v0.3.1-x86_64-windows-setup.msi /qn /l*v install.log
 
 # Verify CLI diagnostics via coree.com (synchronous stdout + exit code)
 & "$env:ProgramFiles\coree\coree.com" --diagnostics
 
 # Silent uninstall
-msiexec /x dist\coree-v0.3.0-x86_64-windows-setup.msi /qn
+msiexec /x dist\coree-v0.3.1-x86_64-windows-setup.msi /qn
 ```

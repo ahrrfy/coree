@@ -1,4 +1,4 @@
-# Launch Plan — `coree` (`v0.3.0`)
+# Launch Plan — `coree` (`v0.3.1`)
 
 Grounds every rollout step in public user communities verified in [reviews.csv](../reviews.csv) and [feedback.md](../feedback.md), strictly avoiding fabricated metrics, borrowed testimonials, or paid ad trademark infringement.
 
@@ -7,12 +7,12 @@ Grounds every rollout step in public user communities verified in [reviews.csv](
 ## 1. Pre-Launch Readiness Checklist (Desktop Open-Source Verification)
 
 - **Zero-Telemetry Diagnostic Readiness:** `coree` collects zero analytics or crash-upload beacons by default. Instead, users attach plain local output from `coree --diagnostics` and `coree inspect <file.cdr> --json` cleanly inside GitHub Issue templates (`.github/ISSUE_TEMPLATE/`).
-- **Binary & Package Distribution Live (`v0.3.0` on GitHub Releases):**
+- **Binary & Package Distribution Live (`v0.3.1` on GitHub Releases):**
   - Windows (`x86_64`): `.msi` installer (`coree.exe` + `coree.com` CLI + icons/file associations) and Portable `.zip` (`register-file-associations.cmd`).
   - Linux (`x86_64`): Ubuntu/Debian `.deb` (`application/vnd.corel-draw` MIME + thumbnailer), universal `.AppImage`, `.tar.gz`, and zero-network Flatpak manifest.
 - **Legal & Clean-Room Gates:**
   - `python3 listing.py replica/launch/listing.json` — `0 errors, 0 warnings`.
-  - `python3 sweep.py crates/ packaging/ replica/launch/listing.json --config replica/brand.json` — clean.
+  - `python3 scripts/brand_sweep.py --require-external-sweep` — clean (`0` disallowed non-MIME hits across `crates/` and `packaging/`).
   - `cargo test --workspace --all-targets` + `cargo clippy --workspace --all-targets -- -D warnings` + GitHub Actions (`ubuntu-latest` + `windows-latest`) green.
 
 ---

@@ -546,8 +546,9 @@ dependencies = [
 
 [[package]]
 name = "coree-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "arboard",
  "chrono",
  "clap",
  "coree-cdr",
@@ -556,6 +557,7 @@ dependencies = [
  "coree-prod",
  "coree-render",
  "coree-storage",
+ "coree-tools",
  "dirs",
  "eframe",
  "egui",
@@ -567,25 +569,40 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-bidi",
  "uuid",
+ "wl-clipboard-rs",
+ "x11rb",
+]
+
+[[package]]
+name = "coree-bench"
+version = "0.3.1"
+dependencies = [
+ "coree-core",
+ "coree-render",
+ "coree-storage",
+ "coree-tools",
+ "tempfile",
 ]
 
 [[package]]
 name = "coree-cdr"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "byteorder",
  "coree-core",
  "encoding_rs",
  "flate2",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "uuid",
  "zip",
 ]
 
 [[package]]
 name = "coree-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "i_overlay",
@@ -601,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "coree-io"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "coree-core",
@@ -620,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "coree-prod"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "coree-core",
  "i_overlay",
@@ -638,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "coree-render"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "coree-core",
  "cosmic-text",
@@ -654,11 +671,12 @@ dependencies = [
 
 [[package]]
 name = "coree-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "coree-core",
  "dirs",
+ "flate2",
  "rayon",
  "rusqlite",
  "serde",
@@ -666,6 +684,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "coree-tools"
+version = "0.3.1"
+dependencies = [
+ "coree-core",
+ "serde",
 ]
 
 [[package]]

@@ -9,792 +9,782 @@
 
 use crate::scene_helpers::visit_layer_objects;
 use coree_core::{
-    Color, Document, Fill, LayerId, LensKind, NodePayload, ObjectId, SceneObject, TextRun,
-    HAIRLINE_WIDTH_MM,
+    extract_searchable_text, scoped_page_indices, text_runs_ref, Color, Document, Fill,
+    NodePayload, ObjectId, SceneObject,
+};
+pub use coree_core::{
+    find_and_replace, find_objects, ColorMatch, FindQuery, FindReplaceReport, FindScope,
+    LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Document search scope for [`FindQuery`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum FindScope {
-    /// Search only `doc.active_page_index`.
-    CurrentPage,
-    /// Search a specific 0-based page index.
-    Page(usize),
-    /// Search every page in the document.
-    #[default]
-    WholeDocument,
-}
+// =============================================================================
+// Clean-Room Query Language (`coree-cql`)
+// =============================================================================
 
-/// Filter matching [`NodePayload`] variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ObjectKindFilter {
-    Path,
-    Shape,
-    ArtisticText,
-    ParagraphText,
-    TextOnPath,
-    /// Matches any of `ArtisticText`, `ParagraphText`, or `TextOnPath`.
-    AnyText,
-    Raster,
-    Table,
-    Dimension,
-    Connector,
-    Group,
-    PowerClip,
-    SymbolInstance,
-}
+const MAX_CQL_DEPTH: usize = 64;
 
-/// Filter matching [`LensKind`] discriminants on `SceneObject::lens`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum LensKindFilter {
-    AnyLens,
-    Brighten,
-    ColorAdd,
-    ColorLimit,
-    CustomColorMap,
-    FishEye,
-    HeatMap,
-    Invert,
-    Magnify,
-    TintedGrayscale,
-    Transparency,
-    Wireframe,
-}
-
-/// Color matching criterion with perceptual CIE76 Delta-E tolerance (`0.0` = exact).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ColorMatch {
-    pub color: Color,
-    /// Maximum allowed CIE76 Delta-E distance (`0.0` matches near-exact `< 0.01`, e.g. `2.5` for close shades).
-    pub delta_e_tolerance: f32,
-}
-
-impl ColorMatch {
-    /// Creates an exact color match (`delta_e_tolerance = 0.0`).
-    #[must_use]
-    pub fn exact(color: Color) -> Self {
-        Self {
-            color,
-            delta_e_tolerance: 0.0,
-        }
-    }
-
-    /// Creates a perceptual color match with the given CIE76 Delta-E threshold.
-    #[must_use]
-    pub fn within_delta_e(color: Color, delta_e_tolerance: f32) -> Self {
-        let safe = if delta_e_tolerance.is_finite() {
-            delta_e_tolerance.max(0.0)
-        } else {
-            0.0
-        };
-        Self {
-            color,
-            delta_e_tolerance: safe,
-        }
-    }
-
-    /// Returns `true` if `candidate` matches `self`.
-    ///
-    /// Under exact matching (`delta_e_tolerance <= 1e-4`), named `Color::Spot` inks only match
-    /// another `Color::Spot` with the same name and never cross-match process CMYK/RGB colors
-    /// that happen to share their visual fallback.
-    #[must_use]
-    pub fn matches(&self, candidate: &Color) -> bool {
-        let tol = if self.delta_e_tolerance.is_finite() {
-            self.delta_e_tolerance.max(0.0)
-        } else {
-            0.0
-        };
-        if tol <= 1e-4 {
-            return match (&self.color, candidate) {
-                (Color::Spot { name: a, .. }, Color::Spot { name: b, .. }) => {
-                    a.eq_ignore_ascii_case(b)
-                }
-                (Color::Spot { .. }, _) | (_, Color::Spot { .. }) => false,
-                _ => self.color.delta_e76(candidate) <= 0.01,
-            };
-        }
-        self.color.delta_e76(candidate) <= tol
-    }
-}
-
-/// Text matching semantics for [`FindQuery::text_pattern`].
+/// Binary comparison operator supported by the clean-room CQL query engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TextMatchMode {
-    Contains {
-        case_sensitive: bool,
-    },
-    Exact {
-        case_sensitive: bool,
-    },
-    /// Lightweight regex-like pattern supporting `^`, `$`, `.`, `*`, `+`, `?`, `[abc]`.
-    RegexLike {
-        case_sensitive: bool,
-    },
+pub enum CqlCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Contains,
 }
 
-/// Declarative multi-criteria query (all `Some(...)` fields combine with logical AND).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct FindQuery {
-    pub scope: FindScope,
-    pub object_kind: Option<ObjectKindFilter>,
-    pub fill_color: Option<ColorMatch>,
-    pub outline_color: Option<ColorMatch>,
-    pub outline_width_min_mm: Option<f64>,
-    pub outline_width_max_mm: Option<f64>,
-    pub is_hairline: Option<bool>,
-    pub font_family: Option<String>,
-    pub text_pattern: Option<(String, TextMatchMode)>,
-    pub lens_kind: Option<LensKindFilter>,
-    pub layer_id: Option<LayerId>,
-    pub layer_name: Option<String>,
-}
-
-/// Action to execute on every object matching a [`FindQuery`].
+/// Literal operand in a CQL predicate expression.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ReplaceAction {
-    /// Non-destructive query: returns matching IDs without mutating the document.
-    SelectMatches,
-    /// Replaces solid/gradient/text fill color on matching objects.
-    ReplaceFillColor { color: Color },
-    /// Replaces outline stroke color on matching objects.
-    ReplaceOutlineColor { color: Color },
-    /// Updates outline width and hairline flag on matching objects.
-    ReplaceOutlineWidth { width_mm: f64, is_hairline: bool },
-    /// Swaps the font family on matching text runs.
-    ReplaceFontFamily { font_family: String },
-    /// Replaces text occurrences inside matching text/table objects.
-    ReplaceText {
-        find: String,
-        replace_with: String,
-        case_sensitive: bool,
+pub enum CqlLiteral {
+    Str(String),
+    Number { raw: f64, mm: Option<f64> },
+    Bool(bool),
+}
+
+/// Parsed abstract syntax tree for clean-room CQL expressions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CqlExpr {
+    Predicate {
+        field: String,
+        op: CqlCompareOp,
+        value: CqlLiteral,
     },
-    /// Sets `outline.overprint` on matching objects.
-    ConvertOverprint { overprint: bool },
+    And(Box<CqlExpr>, Box<CqlExpr>),
+    Or(Box<CqlExpr>, Box<CqlExpr>),
+    Not(Box<CqlExpr>),
 }
 
-/// Summary returned by [`find_and_replace`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct FindReplaceReport {
-    pub matched_ids: Vec<ObjectId>,
-    pub modified_ids: Vec<ObjectId>,
-    pub replacements_applied: usize,
-}
-
-/// Evaluates `query` against `doc` and returns all matching [`ObjectId`]s in deterministic
-/// page / layer / scene order.
-#[must_use]
-pub fn find_objects(doc: &Document, query: &FindQuery) -> Vec<ObjectId> {
-    let page_indices: Vec<usize> = match query.scope {
-        FindScope::CurrentPage => {
-            if doc.active_page_index < doc.pages.len() {
-                vec![doc.active_page_index]
-            } else {
-                Vec::new()
-            }
-        }
-        FindScope::Page(idx) => {
-            if idx < doc.pages.len() {
-                vec![idx]
-            } else {
-                Vec::new()
-            }
-        }
-        FindScope::WholeDocument => (0..doc.pages.len()).collect(),
+/// Parses a CQL query expression such as
+/// `@type == 'curve' and (@outline.hairline == true or @outline.width <= 0.5pt)`.
+pub fn parse_cql_query(input: &str) -> crate::error::ProdResult<CqlExpr> {
+    let tokens = tokenize_cql(input)?;
+    if tokens.is_empty() {
+        return Err(crate::error::ProdError::InvalidParameter(
+            "empty CQL query".into(),
+        ));
+    }
+    let mut parser = CqlParser {
+        tokens: &tokens,
+        pos: 0,
     };
+    let expr = parser.parse_or(0)?;
+    if parser.pos < parser.tokens.len() {
+        return Err(crate::error::ProdError::InvalidParameter(format!(
+            "unexpected trailing CQL token {:?}",
+            parser.tokens[parser.pos]
+        )));
+    }
+    Ok(expr)
+}
 
+/// Evaluates a parsed [`CqlExpr`] against a single [`SceneObject`].
+#[must_use]
+pub fn cql_matches_object(obj: &SceneObject, expr: &CqlExpr) -> bool {
+    match expr {
+        CqlExpr::And(a, b) => cql_matches_object(obj, a) && cql_matches_object(obj, b),
+        CqlExpr::Or(a, b) => cql_matches_object(obj, a) || cql_matches_object(obj, b),
+        CqlExpr::Not(inner) => !cql_matches_object(obj, inner),
+        CqlExpr::Predicate { field, op, value } => evaluate_cql_predicate(obj, field, *op, value),
+    }
+}
+
+/// Returns all [`ObjectId`]s within `scope` satisfying the compiled [`CqlExpr`].
+#[must_use]
+pub fn find_objects_cql(doc: &Document, scope: FindScope, expr: &CqlExpr) -> Vec<ObjectId> {
+    let page_indices = scoped_page_indices(doc, scope);
+    let pages = doc.pages();
     let mut matched = Vec::new();
     let mut seen = HashSet::new();
 
     for p_idx in page_indices {
-        let page = &doc.pages[p_idx];
-        for layer in &page.layers {
-            if let Some(target_lid) = query.layer_id {
-                if layer.id != target_lid {
-                    continue;
-                }
-            }
-            if let Some(ref target_name) = query.layer_name {
-                if !layer.name.eq_ignore_ascii_case(target_name.trim()) {
-                    continue;
-                }
-            }
-
-            visit_layer_objects(doc, layer, &mut |oid, obj, _| {
-                if seen.insert(oid) && object_matches(obj, query) {
-                    matched.push(oid);
-                }
-            });
-        }
-    }
-
-    matched
-}
-
-/// Finds all objects matching `query` and applies `action` to them (skipping locked objects
-/// for mutating actions).
-pub fn find_and_replace(
-    doc: &mut Document,
-    query: &FindQuery,
-    action: &ReplaceAction,
-) -> FindReplaceReport {
-    let matched_ids = find_objects(doc, query);
-    if matches!(action, ReplaceAction::SelectMatches) || matched_ids.is_empty() {
-        return FindReplaceReport {
-            matched_ids,
-            modified_ids: Vec::new(),
-            replacements_applied: 0,
-        };
-    }
-
-    // Collect objects residing on locked layers so batch replacement also respects layer locks
-    let mut locked_layer_ids: HashSet<ObjectId> = HashSet::new();
-    for page in &doc.pages {
-        for layer in &page.layers {
-            if layer.locked {
-                visit_layer_objects(doc, layer, &mut |oid, _, _| {
-                    locked_layer_ids.insert(oid);
+        for layer in &pages[p_idx].layers {
+            if Document::layer_applies_to_page(layer, p_idx, p_idx) {
+                visit_layer_objects(doc, layer, &mut |oid, obj, _| {
+                    if seen.insert(oid) && cql_matches_object(obj, expr) {
+                        matched.push(oid);
+                    }
                 });
             }
         }
-    }
-
-    let mut modified_ids = Vec::new();
-    let mut replacements_applied = 0usize;
-
-    for &oid in &matched_ids {
-        if locked_layer_ids.contains(&oid) {
-            continue;
-        }
-        let Some(obj) = doc.objects.get_mut(&oid) else {
-            continue;
-        };
-        if obj.locked {
-            continue;
-        }
-        let changed = apply_replace_action(obj, query, action);
-        if changed > 0 {
-            modified_ids.push(oid);
-            replacements_applied += changed;
-        }
-    }
-
-    if !modified_ids.is_empty() {
-        doc.touch();
-    }
-
-    FindReplaceReport {
-        matched_ids,
-        modified_ids,
-        replacements_applied,
-    }
-}
-
-fn object_matches(obj: &SceneObject, query: &FindQuery) -> bool {
-    if let Some(kind_filter) = query.object_kind {
-        if !matches_object_kind(&obj.payload, kind_filter) {
-            return false;
-        }
-    }
-
-    if let Some(ref fill_match) = query.fill_color {
-        let mut fill_colors = obj.fill.referenced_colors();
-        // Also check text run fills when fill is on text runs
-        for run in text_runs_ref(&obj.payload) {
-            fill_colors.push(run.style.fill.clone());
-        }
-        if !fill_colors.iter().any(|c| fill_match.matches(c)) {
-            return false;
-        }
-    }
-
-    if let Some(ref outline_match) = query.outline_color {
-        if !obj.outline.is_visible() || !outline_match.matches(&obj.outline.color) {
-            return false;
-        }
-    }
-
-    if let Some(min_w) = query.outline_width_min_mm.filter(|v| v.is_finite()) {
-        if !obj.outline.is_visible() || obj.outline.effective_width_mm() + 1e-9 < min_w {
-            return false;
-        }
-    }
-    if let Some(max_w) = query.outline_width_max_mm.filter(|v| v.is_finite()) {
-        if !obj.outline.is_visible() || obj.outline.effective_width_mm() - 1e-9 > max_w {
-            return false;
-        }
-    }
-
-    if let Some(want_hairline) = query.is_hairline {
-        let is_hl = obj.outline.is_visible() && obj.outline.is_hairline;
-        if is_hl != want_hairline {
-            return false;
-        }
-    }
-
-    if let Some(ref family) = query.font_family {
-        let runs = text_runs_ref(&obj.payload);
-        let target = family.trim();
-        if runs.is_empty()
-            || !runs
-                .iter()
-                .any(|r| r.style.font_family.trim().eq_ignore_ascii_case(target))
-        {
-            return false;
-        }
-    }
-
-    if let Some((ref pattern, mode)) = query.text_pattern {
-        let Some(text) = extract_searchable_text(&obj.payload) else {
-            return false;
-        };
-        if !matches_text_pattern(&text, pattern, mode) {
-            return false;
-        }
-    }
-
-    if let Some(lens_filter) = query.lens_kind {
-        let Some(ref cfg) = obj.lens else {
-            return false;
-        };
-        if !matches_lens_kind(&cfg.kind, lens_filter) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn matches_object_kind(payload: &NodePayload, filter: ObjectKindFilter) -> bool {
-    match filter {
-        ObjectKindFilter::Path => matches!(payload, NodePayload::Path(_)),
-        ObjectKindFilter::Shape => matches!(payload, NodePayload::Shape(_)),
-        ObjectKindFilter::ArtisticText => matches!(payload, NodePayload::ArtisticText(_)),
-        ObjectKindFilter::ParagraphText => matches!(payload, NodePayload::ParagraphText(_)),
-        ObjectKindFilter::TextOnPath => matches!(payload, NodePayload::TextOnPath(_)),
-        ObjectKindFilter::AnyText => matches!(
-            payload,
-            NodePayload::ArtisticText(_)
-                | NodePayload::ParagraphText(_)
-                | NodePayload::TextOnPath(_)
-        ),
-        ObjectKindFilter::Raster => matches!(payload, NodePayload::Raster(_)),
-        ObjectKindFilter::Table => matches!(payload, NodePayload::Table(_)),
-        ObjectKindFilter::Dimension => matches!(payload, NodePayload::Dimension(_)),
-        ObjectKindFilter::Connector => matches!(payload, NodePayload::Connector(_)),
-        ObjectKindFilter::Group => matches!(payload, NodePayload::Group(_)),
-        ObjectKindFilter::PowerClip => matches!(payload, NodePayload::PowerClip { .. }),
-        ObjectKindFilter::SymbolInstance => matches!(payload, NodePayload::SymbolInstance(_)),
-    }
-}
-
-fn matches_lens_kind(kind: &LensKind, filter: LensKindFilter) -> bool {
-    match filter {
-        LensKindFilter::AnyLens => true,
-        LensKindFilter::Brighten => matches!(kind, LensKind::Brighten { .. }),
-        LensKindFilter::ColorAdd => matches!(kind, LensKind::ColorAdd { .. }),
-        LensKindFilter::ColorLimit => matches!(kind, LensKind::ColorLimit { .. }),
-        LensKindFilter::CustomColorMap => matches!(kind, LensKind::CustomColorMap { .. }),
-        LensKindFilter::FishEye => matches!(kind, LensKind::FishEye { .. }),
-        LensKindFilter::HeatMap => matches!(kind, LensKind::HeatMap { .. }),
-        LensKindFilter::Invert => matches!(kind, LensKind::Invert),
-        LensKindFilter::Magnify => matches!(kind, LensKind::Magnify { .. }),
-        LensKindFilter::TintedGrayscale => matches!(kind, LensKind::TintedGrayscale { .. }),
-        LensKindFilter::Transparency => matches!(kind, LensKind::Transparency { .. }),
-        LensKindFilter::Wireframe => matches!(kind, LensKind::Wireframe { .. }),
-    }
-}
-
-fn text_runs_ref(payload: &NodePayload) -> &[TextRun] {
-    match payload {
-        NodePayload::ArtisticText(t) => &t.runs,
-        NodePayload::ParagraphText(t) => &t.runs,
-        NodePayload::TextOnPath(top) => &top.text.runs,
-        _ => &[],
-    }
-}
-
-fn text_runs_mut(payload: &mut NodePayload) -> Option<&mut [TextRun]> {
-    match payload {
-        NodePayload::ArtisticText(t) => Some(&mut t.runs),
-        NodePayload::ParagraphText(t) => Some(&mut t.runs),
-        NodePayload::TextOnPath(top) => Some(&mut top.text.runs),
-        _ => None,
-    }
-}
-
-fn extract_searchable_text(payload: &NodePayload) -> Option<String> {
-    match payload {
-        NodePayload::ArtisticText(t) => Some(t.plain_text()),
-        NodePayload::ParagraphText(t) => Some(t.plain_text()),
-        NodePayload::TextOnPath(top) => Some(top.text.plain_text()),
-        NodePayload::Table(table) => Some(
-            table
-                .cells
-                .iter()
-                .map(|c| c.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => None,
-    }
-}
-
-fn apply_replace_action(obj: &mut SceneObject, query: &FindQuery, action: &ReplaceAction) -> usize {
-    match action {
-        ReplaceAction::SelectMatches => 0,
-        ReplaceAction::ReplaceFillColor { color } => {
-            let mut changes = 0usize;
-            let matcher = query.fill_color.as_ref();
-            let should_replace = |c: &Color| matcher.is_none_or(|m| m.matches(c));
-
-            match &mut obj.fill {
-                Fill::Solid(c) if should_replace(c) => {
-                    *c = color.clone();
-                    changes += 1;
-                }
-                Fill::LinearGradient { stops, .. }
-                | Fill::RadialGradient { stops, .. }
-                | Fill::ConicalGradient { stops, .. }
-                | Fill::SquareGradient { stops, .. } => {
-                    for stop in stops {
-                        if should_replace(&stop.color) {
-                            stop.color = color.clone();
-                            changes += 1;
-                        }
-                    }
-                }
-                Fill::TwoColorPattern { fg, bg, .. } | Fill::TextureFill { fg, bg, .. } => {
-                    if should_replace(fg) {
-                        *fg = color.clone();
-                        changes += 1;
-                    }
-                    if should_replace(bg) {
-                        *bg = color.clone();
-                        changes += 1;
-                    }
-                }
-                Fill::MeshFill { nodes, .. } => {
-                    for n in nodes {
-                        if should_replace(&n.color) {
-                            n.color = color.clone();
-                            changes += 1;
-                        }
-                    }
-                }
-                _ => {}
+        for (owner_idx, owner_page) in pages.iter().enumerate() {
+            if owner_idx == p_idx {
+                continue;
             }
+            for layer in &owner_page.layers {
+                if Document::layer_applies_to_page(layer, owner_idx, p_idx) {
+                    visit_layer_objects(doc, layer, &mut |oid, obj, _| {
+                        if seen.insert(oid) && cql_matches_object(obj, expr) {
+                            matched.push(oid);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    matched
+}
 
-            if let Some(runs) = text_runs_mut(&mut obj.payload) {
-                for run in runs {
-                    if should_replace(&run.style.fill) {
-                        run.style.fill = color.clone();
-                        changes += 1;
+/// Parses and evaluates a CQL string query over `doc` inside `scope`.
+pub fn evaluate_cql_query(
+    doc: &Document,
+    scope: FindScope,
+    query: &str,
+) -> crate::error::ProdResult<Vec<ObjectId>> {
+    let expr = parse_cql_query(query)?;
+    Ok(find_objects_cql(doc, scope, &expr))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CqlToken {
+    LParen,
+    RParen,
+    And,
+    Or,
+    Not,
+    Op(CqlCompareOp),
+    String(String),
+    Number { raw: f64, mm: Option<f64> },
+    Ident(String),
+}
+
+fn tokenize_cql(input: &str) -> crate::error::ProdResult<Vec<CqlToken>> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match ch {
+            '(' => {
+                out.push(CqlToken::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(CqlToken::RParen);
+                i += 1;
+            }
+            '=' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                out.push(CqlToken::Op(CqlCompareOp::Eq));
+            }
+            '!' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    out.push(CqlToken::Op(CqlCompareOp::Ne));
+                    i += 2;
+                } else {
+                    out.push(CqlToken::Not);
+                    i += 1;
+                }
+            }
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    out.push(CqlToken::Op(CqlCompareOp::Le));
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    out.push(CqlToken::Op(CqlCompareOp::Ne));
+                    i += 2;
+                } else {
+                    out.push(CqlToken::Op(CqlCompareOp::Lt));
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    out.push(CqlToken::Op(CqlCompareOp::Ge));
+                    i += 2;
+                } else {
+                    out.push(CqlToken::Op(CqlCompareOp::Gt));
+                    i += 1;
+                }
+            }
+            '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
+                out.push(CqlToken::And);
+                i += 2;
+            }
+            '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
+                out.push(CqlToken::Or);
+                i += 2;
+            }
+            '\'' | '"' => {
+                let quote = ch;
+                i += 1;
+                let mut buf = String::new();
+                let mut closed = false;
+                while i < chars.len() {
+                    let c = chars[i];
+                    if c == '\\' && i + 1 < chars.len() {
+                        buf.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if c == quote {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    buf.push(c);
+                    i += 1;
+                }
+                if !closed {
+                    return Err(crate::error::ProdError::InvalidParameter(
+                        "unterminated string literal in CQL query".into(),
+                    ));
+                }
+                out.push(CqlToken::String(buf));
+            }
+            '-' | '+' | '0'..='9' => {
+                let start = i;
+                if ch == '-' || ch == '+' {
+                    i += 1;
+                }
+                let mut saw_digit = false;
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                    if chars[i].is_ascii_digit() {
+                        saw_digit = true;
+                    }
+                    i += 1;
+                }
+                if !saw_digit {
+                    return Err(crate::error::ProdError::InvalidParameter(
+                        "invalid numeric token in CQL query".into(),
+                    ));
+                }
+                let num_str: String = chars[start..i].iter().collect();
+                let raw: f64 = num_str.parse().map_err(|_| {
+                    crate::error::ProdError::InvalidParameter(format!(
+                        "invalid number '{num_str}' in CQL query"
+                    ))
+                })?;
+                // Optional unit suffix: mm, cm, in, inch, pt, px
+                let u_start = i;
+                while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let unit: String = chars[u_start..i]
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
+                let mm = if unit.is_empty() {
+                    None
+                } else {
+                    let scale = match unit.as_str() {
+                        "mm" => 1.0,
+                        "cm" => 10.0,
+                        "in" | "inch" => 25.4,
+                        "pt" => 25.4 / 72.0,
+                        "px" => 25.4 / 96.0,
+                        other => {
+                            return Err(crate::error::ProdError::InvalidParameter(format!(
+                                "unknown unit suffix '{other}' in CQL query"
+                            )))
+                        }
+                    };
+                    Some(raw * scale)
+                };
+                out.push(CqlToken::Number { raw, mm });
+            }
+            '.' if chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()) => {
+                let start = i;
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                    i += 1;
+                }
+                let num_str: String = chars[start..i].iter().collect();
+                let raw: f64 = num_str.parse().map_err(|_| {
+                    crate::error::ProdError::InvalidParameter(format!(
+                        "invalid number '{num_str}' in CQL query"
+                    ))
+                })?;
+                let u_start = i;
+                while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let unit: String = chars[u_start..i]
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
+                let mm = if unit.is_empty() {
+                    None
+                } else {
+                    let scale = match unit.as_str() {
+                        "mm" => 1.0,
+                        "cm" => 10.0,
+                        "in" | "inch" => 25.4,
+                        "pt" => 25.4 / 72.0,
+                        "px" => 25.4 / 96.0,
+                        other => {
+                            return Err(crate::error::ProdError::InvalidParameter(format!(
+                                "unknown unit suffix '{other}' in CQL query"
+                            )))
+                        }
+                    };
+                    Some(raw * scale)
+                };
+                out.push(CqlToken::Number { raw, mm });
+            }
+            c if c == '@' || c == '_' || c == '.' || c.is_alphanumeric() => {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i] == '@'
+                        || chars[i] == '_'
+                        || chars[i] == '.'
+                        || chars[i] == '-'
+                        || chars[i].is_alphanumeric())
+                {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                match word.to_ascii_lowercase().as_str() {
+                    "and" => out.push(CqlToken::And),
+                    "or" => out.push(CqlToken::Or),
+                    "not" => out.push(CqlToken::Not),
+                    "contains" => out.push(CqlToken::Op(CqlCompareOp::Contains)),
+                    _ => out.push(CqlToken::Ident(word)),
+                }
+            }
+            other => {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "unexpected character '{other}' in CQL query"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+struct CqlParser<'a> {
+    tokens: &'a [CqlToken],
+    pos: usize,
+}
+
+impl<'a> CqlParser<'a> {
+    fn peek(&self) -> Option<&CqlToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn parse_or(&mut self, depth: usize) -> crate::error::ProdResult<CqlExpr> {
+        if depth > MAX_CQL_DEPTH {
+            return Err(crate::error::ProdError::InvalidParameter(
+                "CQL nesting exceeds maximum depth".into(),
+            ));
+        }
+        let mut lhs = self.parse_and(depth + 1)?;
+        while matches!(self.peek(), Some(CqlToken::Or)) {
+            self.pos += 1;
+            let rhs = self.parse_and(depth + 1)?;
+            lhs = CqlExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self, depth: usize) -> crate::error::ProdResult<CqlExpr> {
+        let mut lhs = self.parse_not(depth + 1)?;
+        while matches!(self.peek(), Some(CqlToken::And)) {
+            self.pos += 1;
+            let rhs = self.parse_not(depth + 1)?;
+            lhs = CqlExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_not(&mut self, depth: usize) -> crate::error::ProdResult<CqlExpr> {
+        if depth > MAX_CQL_DEPTH {
+            return Err(crate::error::ProdError::InvalidParameter(
+                "CQL nesting exceeds maximum depth".into(),
+            ));
+        }
+        if matches!(self.peek(), Some(CqlToken::Not)) {
+            self.pos += 1;
+            let inner = self.parse_not(depth + 1)?;
+            return Ok(CqlExpr::Not(Box::new(inner)));
+        }
+        self.parse_primary(depth + 1)
+    }
+
+    fn parse_primary(&mut self, depth: usize) -> crate::error::ProdResult<CqlExpr> {
+        match self.peek().cloned() {
+            Some(CqlToken::LParen) => {
+                self.pos += 1;
+                let expr = self.parse_or(depth + 1)?;
+                if !matches!(self.peek(), Some(CqlToken::RParen)) {
+                    return Err(crate::error::ProdError::InvalidParameter(
+                        "missing closing ')' in CQL query".into(),
+                    ));
+                }
+                self.pos += 1;
+                Ok(expr)
+            }
+            Some(CqlToken::Ident(raw_field)) => {
+                self.pos += 1;
+                let field = raw_field.trim_start_matches('@').to_ascii_lowercase();
+                if let Some(CqlToken::Op(op)) = self.peek().cloned() {
+                    self.pos += 1;
+                    let value = match self.peek().cloned() {
+                        Some(CqlToken::String(s)) => {
+                            self.pos += 1;
+                            CqlLiteral::Str(s)
+                        }
+                        Some(CqlToken::Number { raw, mm }) => {
+                            self.pos += 1;
+                            CqlLiteral::Number { raw, mm }
+                        }
+                        Some(CqlToken::Ident(word)) => {
+                            self.pos += 1;
+                            if word.eq_ignore_ascii_case("true") {
+                                CqlLiteral::Bool(true)
+                            } else if word.eq_ignore_ascii_case("false") {
+                                CqlLiteral::Bool(false)
+                            } else {
+                                CqlLiteral::Str(word)
+                            }
+                        }
+                        other => {
+                            return Err(crate::error::ProdError::InvalidParameter(format!(
+                                "expected CQL literal value, got {other:?}"
+                            )))
+                        }
+                    };
+                    Ok(CqlExpr::Predicate { field, op, value })
+                } else {
+                    // Unary property flag shorthand e.g. `@outline.hairline` or `@locked`
+                    Ok(CqlExpr::Predicate {
+                        field,
+                        op: CqlCompareOp::Eq,
+                        value: CqlLiteral::Bool(true),
+                    })
+                }
+            }
+            other => Err(crate::error::ProdError::InvalidParameter(format!(
+                "unexpected CQL token {other:?}"
+            ))),
+        }
+    }
+}
+
+fn cql_color_model(c: &Color) -> &'static str {
+    match c {
+        Color::Rgba { .. } => "rgb",
+        Color::Cmyk { .. } => "cmyk",
+        Color::Hsl { .. } => "hsl",
+        Color::Lab { .. } => "lab",
+        Color::Gray { .. } => "gray",
+        Color::Spot { .. } => "spot",
+    }
+}
+
+fn cql_color_matches_text(c: &Color, needle: &str, op: CqlCompareOp) -> bool {
+    let model = cql_color_model(c);
+    let [r, g, b, _] = c.to_rgba8();
+    let hex = format!("#{r:02x}{g:02x}{b:02x}");
+    let spot_name = match c {
+        Color::Spot { name, .. } => name.as_str(),
+        _ => "",
+    };
+    let n_low = needle.trim().to_ascii_lowercase();
+    match op {
+        CqlCompareOp::Eq => {
+            model == n_low
+                || (!spot_name.is_empty() && spot_name.eq_ignore_ascii_case(needle.trim()))
+                || hex == n_low
+        }
+        CqlCompareOp::Contains => {
+            model.contains(&n_low)
+                || spot_name.to_lowercase().contains(&needle.to_lowercase())
+                || hex.contains(&n_low)
+        }
+        _ => false,
+    }
+}
+
+fn cql_type_aliases(payload: &NodePayload) -> &'static [&'static str] {
+    match payload {
+        NodePayload::Path(_) => &["curve", "path", "bezier"],
+        NodePayload::Shape(shape) => match shape {
+            coree_core::ParametricShape::Rectangle { .. } => &["rectangle", "shape"],
+            coree_core::ParametricShape::Ellipse { .. } => &["ellipse", "shape"],
+            coree_core::ParametricShape::Polygon { .. } => &["polygon", "shape"],
+            coree_core::ParametricShape::Star { .. } => &["star", "shape"],
+            coree_core::ParametricShape::Spiral { .. } => &["spiral", "shape"],
+            _ => &["shape"],
+        },
+        NodePayload::ArtisticText(_) => &["artistictext", "text", "artistic"],
+        NodePayload::ParagraphText(_) => &["paragraphtext", "text", "paragraph"],
+        NodePayload::TextOnPath(_) => &["textonpath", "text"],
+        NodePayload::Raster(_) => &["bitmap", "raster", "image"],
+        NodePayload::Table(_) => &["table"],
+        NodePayload::Dimension(_) => &["dimension"],
+        NodePayload::Connector(_) => &["connector"],
+        NodePayload::Group(_) => &["group"],
+        NodePayload::PowerClip { .. } => &["powerclip"],
+        NodePayload::SymbolInstance(_) => &["symbol", "symbolinstance"],
+    }
+}
+
+fn cql_fill_type_aliases(fill: &Fill) -> &'static [&'static str] {
+    match fill {
+        Fill::None => &["none"],
+        Fill::Solid(_) => &["solid", "uniform"],
+        Fill::LinearGradient { .. } => &["linear", "fountain", "gradient"],
+        Fill::RadialGradient { .. } => &["radial", "fountain", "gradient"],
+        Fill::ConicalGradient { .. } => &["conical", "fountain", "gradient"],
+        Fill::SquareGradient { .. } => &["square", "fountain", "gradient"],
+        Fill::TwoColorPattern { .. } => &["twocolorpattern", "pattern"],
+        Fill::VectorPattern { .. } => &["vectorpattern", "pattern"],
+        Fill::BitmapPattern { .. } => &["bitmappattern", "pattern"],
+        Fill::TextureFill { .. } => &["texture", "texturefill"],
+        Fill::MeshFill { .. } => &["mesh", "meshfill"],
+    }
+}
+
+fn cql_cmp_str(actual: &str, op: CqlCompareOp, lit: &CqlLiteral) -> bool {
+    let CqlLiteral::Str(ref s) = lit else {
+        return false;
+    };
+    match op {
+        CqlCompareOp::Eq => actual.eq_ignore_ascii_case(s),
+        CqlCompareOp::Ne => !actual.eq_ignore_ascii_case(s),
+        CqlCompareOp::Contains => actual.to_lowercase().contains(&s.to_lowercase()),
+        CqlCompareOp::Lt => actual.to_lowercase() < s.to_lowercase(),
+        CqlCompareOp::Le => actual.to_lowercase() <= s.to_lowercase(),
+        CqlCompareOp::Gt => actual.to_lowercase() > s.to_lowercase(),
+        CqlCompareOp::Ge => actual.to_lowercase() >= s.to_lowercase(),
+    }
+}
+
+fn cql_cmp_bool(actual: bool, op: CqlCompareOp, lit: &CqlLiteral) -> bool {
+    let CqlLiteral::Bool(b) = lit else {
+        return false;
+    };
+    match op {
+        CqlCompareOp::Eq => actual == *b,
+        CqlCompareOp::Ne => actual != *b,
+        _ => false,
+    }
+}
+
+fn cql_cmp_num(actual: f64, op: CqlCompareOp, lit: &CqlLiteral, is_length_mm: bool) -> bool {
+    let CqlLiteral::Number { raw, mm } = lit else {
+        return false;
+    };
+    let target = if is_length_mm {
+        mm.unwrap_or(*raw)
+    } else {
+        *raw
+    };
+    if !actual.is_finite() || !target.is_finite() {
+        return false;
+    }
+    const EPS: f64 = 1e-6;
+    match op {
+        CqlCompareOp::Eq => (actual - target).abs() <= EPS,
+        CqlCompareOp::Ne => (actual - target).abs() > EPS,
+        CqlCompareOp::Lt => actual + EPS < target,
+        CqlCompareOp::Le => actual - EPS <= target,
+        CqlCompareOp::Gt => actual - EPS > target,
+        CqlCompareOp::Ge => actual + EPS >= target,
+        CqlCompareOp::Contains => false,
+    }
+}
+
+#[inline]
+fn effective_outline(obj: &SceneObject) -> &coree_core::OutlineStyle {
+    match &obj.payload {
+        NodePayload::Table(tbl) => &tbl.border_style,
+        _ => &obj.outline,
+    }
+}
+
+fn evaluate_cql_predicate(
+    obj: &SceneObject,
+    field: &str,
+    op: CqlCompareOp,
+    value: &CqlLiteral,
+) -> bool {
+    match field {
+        "type" | "kind" => {
+            let CqlLiteral::Str(ref s) = value else {
+                return false;
+            };
+            let aliases = cql_type_aliases(&obj.payload);
+            match op {
+                CqlCompareOp::Eq => aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
+                CqlCompareOp::Ne => !aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
+                CqlCompareOp::Contains => {
+                    aliases.iter().any(|a| a.contains(&s.to_ascii_lowercase()))
+                }
+                _ => false,
+            }
+        }
+        "name" => cql_cmp_str(&obj.name, op, value),
+        "visible" => cql_cmp_bool(obj.visible, op, value),
+        "locked" => cql_cmp_bool(obj.locked, op, value),
+        "printable" => cql_cmp_bool(obj.printable, op, value),
+        "has_lens" | "lens" => cql_cmp_bool(obj.lens.is_some(), op, value),
+        "opacity" => cql_cmp_num(f64::from(obj.opacity), op, value, false),
+        "fill.type" => {
+            let CqlLiteral::Str(ref s) = value else {
+                return false;
+            };
+            let mut aliases: Vec<&'static str> = Vec::new();
+            if obj.fill.is_visible() {
+                aliases.extend_from_slice(cql_fill_type_aliases(&obj.fill));
+            }
+            for run in text_runs_ref(&obj.payload) {
+                if run.style.fill.alpha() > 1e-6 {
+                    aliases.extend_from_slice(&["solid", "uniform"]);
+                }
+            }
+            if let NodePayload::Table(ref table) = obj.payload {
+                for cell in &table.cells {
+                    if cell.fill.is_visible() {
+                        aliases.extend_from_slice(cql_fill_type_aliases(&cell.fill));
+                    }
+                    if !cell.text.is_empty() && cell.text_style.fill.alpha() > 1e-6 {
+                        aliases.extend_from_slice(&["solid", "uniform"]);
                     }
                 }
-            } else if changes == 0 && matches!(obj.fill, Fill::None) && matcher.is_none() {
-                obj.fill = Fill::Solid(color.clone());
-                changes += 1;
             }
-            changes
+            if aliases.is_empty() {
+                aliases.push("none");
+            }
+            match op {
+                CqlCompareOp::Eq => aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
+                CqlCompareOp::Ne => !aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
+                CqlCompareOp::Contains => {
+                    let needle = s.to_ascii_lowercase();
+                    aliases.iter().any(|a| a.contains(&needle))
+                }
+                _ => false,
+            }
         }
-        ReplaceAction::ReplaceOutlineColor { color } => {
-            obj.outline.color = color.clone();
-            1
+        "fill.model" => {
+            let mut models: Vec<&'static str> = obj
+                .fill
+                .referenced_colors()
+                .iter()
+                .map(cql_color_model)
+                .collect();
+            for run in text_runs_ref(&obj.payload) {
+                models.push(cql_color_model(&run.style.fill));
+            }
+            if let NodePayload::Table(ref table) = obj.payload {
+                for cell in &table.cells {
+                    models.extend(cell.fill.referenced_colors().iter().map(cql_color_model));
+                    if !cell.text.is_empty() {
+                        models.push(cql_color_model(&cell.text_style.fill));
+                    }
+                }
+            }
+            if models.is_empty() {
+                cql_cmp_str("none", op, value)
+            } else if op == CqlCompareOp::Ne {
+                !models
+                    .iter()
+                    .any(|m| cql_cmp_str(m, CqlCompareOp::Eq, value))
+            } else {
+                models.iter().any(|m| cql_cmp_str(m, op, value))
+            }
         }
-        ReplaceAction::ReplaceOutlineWidth {
-            width_mm,
-            is_hairline,
-        } => {
-            obj.outline.is_hairline = *is_hairline;
-            obj.outline.width_mm = if *is_hairline {
-                HAIRLINE_WIDTH_MM
-            } else if width_mm.is_finite() {
-                width_mm.max(0.0)
+        "fill.overprint" => {
+            cql_cmp_bool(obj.blend_mode == coree_core::BlendMode::Multiply, op, value)
+        }
+        "outline.width" => {
+            let outline = effective_outline(obj);
+            let w = if outline.is_visible() {
+                outline.effective_width_mm()
             } else {
                 0.0
             };
-            1
+            cql_cmp_num(w, op, value, true)
         }
-        ReplaceAction::ReplaceFontFamily { font_family } => {
-            let mut changes = 0usize;
-            if let Some(runs) = text_runs_mut(&mut obj.payload) {
-                for run in runs {
-                    let matches_filter = query.font_family.as_ref().is_none_or(|f| {
-                        run.style.font_family.trim().eq_ignore_ascii_case(f.trim())
-                    });
-                    if matches_filter {
-                        run.style.font_family = font_family.clone();
-                        changes += 1;
-                    }
-                }
-            }
-            changes
+        "outline.hairline" | "hairline" => {
+            let outline = effective_outline(obj);
+            cql_cmp_bool(outline.is_visible() && outline.is_hairline, op, value)
         }
-        ReplaceAction::ReplaceText {
-            find,
-            replace_with,
-            case_sensitive,
-        } => {
-            if find.is_empty() {
-                return 0;
-            }
-            let mut changes = 0usize;
-            if let Some(runs) = text_runs_mut(&mut obj.payload) {
-                for run in runs {
-                    let (updated, count) =
-                        replace_substring(&run.text, find, replace_with, *case_sensitive);
-                    if count > 0 {
-                        run.text = updated;
-                        changes += count;
-                    }
-                }
-            } else if let NodePayload::Table(table) = &mut obj.payload {
-                for cell in &mut table.cells {
-                    let (updated, count) =
-                        replace_substring(&cell.text, find, replace_with, *case_sensitive);
-                    if count > 0 {
-                        cell.text = updated;
-                        changes += count;
-                    }
-                }
-            }
-            changes
+        "outline.overprint" | "overprint" => {
+            cql_cmp_bool(effective_outline(obj).overprint, op, value)
         }
-        ReplaceAction::ConvertOverprint { overprint } => {
-            obj.outline.overprint = *overprint;
-            1
-        }
-    }
-}
-
-fn replace_substring(
-    haystack: &str,
-    needle: &str,
-    replacement: &str,
-    case_sensitive: bool,
-) -> (String, usize) {
-    if case_sensitive {
-        let count = haystack.matches(needle).count();
-        if count == 0 {
-            (haystack.to_owned(), 0)
-        } else {
-            (haystack.replace(needle, replacement), count)
-        }
-    } else {
-        let lower_hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
-        let lower_ndl: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-        if lower_ndl.is_empty() {
-            return (haystack.to_owned(), 0);
-        }
-        // Simple character-aligned case-insensitive replacement (safe for ASCII & Unicode)
-        let hay_chars: Vec<char> = haystack.chars().collect();
-        if hay_chars.len() != lower_hay.len() {
-            // Fallback when case folding expands characters (e.g. 'ß' -> "ss")
-            let hay_l = haystack.to_lowercase();
-            let ndl_l = needle.to_lowercase();
-            let count = hay_l.matches(&ndl_l).count();
-            return if count == 0 {
-                (haystack.to_owned(), 0)
+        "outline.model" => {
+            let outline = effective_outline(obj);
+            let model = if outline.is_visible() {
+                cql_color_model(&outline.color)
             } else {
-                (hay_l.replace(&ndl_l, replacement), count)
+                "none"
             };
+            cql_cmp_str(model, op, value)
         }
-        let mut out = String::with_capacity(haystack.len());
-        let mut i = 0usize;
-        let mut count = 0usize;
-        let nlen = lower_ndl.len();
-        while i < hay_chars.len() {
-            if i + nlen <= hay_chars.len() && lower_hay[i..i + nlen] == lower_ndl[..] {
-                out.push_str(replacement);
-                i += nlen;
-                count += 1;
-            } else {
-                out.push(hay_chars[i]);
-                i += 1;
-            }
-        }
-        (out, count)
-    }
-}
-
-// --- Pure-Rust bounded regex-like pattern matcher (no ReDoS, zero external crates) ---
-
-#[derive(Debug, Clone)]
-enum Token {
-    Literal(char),
-    Any,
-    /// Inclusive `(lo, hi)` Unicode scalar ranges plus negation flag (O(1) memory even for `[\u{0}-\u{10FFFF}]`).
-    Class(Vec<(char, char)>, bool),
-}
-
-#[derive(Debug, Clone)]
-struct Atom {
-    token: Token,
-    min: usize,
-    max: Option<usize>,
-}
-
-fn matches_text_pattern(text: &str, pattern: &str, mode: TextMatchMode) -> bool {
-    match mode {
-        TextMatchMode::Contains { case_sensitive } => {
-            if case_sensitive {
-                text.contains(pattern)
-            } else {
-                text.to_lowercase().contains(&pattern.to_lowercase())
-            }
-        }
-        TextMatchMode::Exact { case_sensitive } => {
-            if case_sensitive {
-                text == pattern
-            } else {
-                text.to_lowercase() == pattern.to_lowercase()
-            }
-        }
-        TextMatchMode::RegexLike { case_sensitive } => {
-            let t_str = if case_sensitive {
-                text.to_owned()
-            } else {
-                text.to_lowercase()
+        "color" => {
+            let CqlLiteral::Str(ref s) = value else {
+                return false;
             };
-            let p_str = if case_sensitive {
-                pattern.to_owned()
-            } else {
-                pattern.to_lowercase()
-            };
-            regex_like_is_match(&t_str, &p_str)
-        }
-    }
-}
-
-fn regex_like_is_match(text: &str, pattern: &str) -> bool {
-    let anchored_start = pattern.starts_with('^');
-    let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
-    let mut pat_slice = pattern;
-    if anchored_start {
-        pat_slice = &pat_slice[1..];
-    }
-    if anchored_end && !pat_slice.is_empty() {
-        pat_slice = &pat_slice[..pat_slice.len() - 1];
-    }
-    let atoms = compile_atoms(pat_slice);
-    let chars: Vec<char> = text.chars().collect();
-    let max_start = if anchored_start { 0 } else { chars.len() };
-    for start in 0..=max_start {
-        let mut memo = HashSet::new();
-        if match_atoms(&chars, start, &atoms, 0, anchored_end, &mut memo) {
-            return true;
-        }
-    }
-    false
-}
-
-fn compile_atoms(pattern: &str) -> Vec<Atom> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0usize;
-    let mut atoms = Vec::new();
-    while i < chars.len() {
-        let token = match chars[i] {
-            '\\' if i + 1 < chars.len() => {
-                i += 1;
-                match chars[i] {
-                    'd' => Token::Class(vec![('0', '9')], false),
-                    c => Token::Literal(c),
-                }
+            let mut colors = obj.fill.referenced_colors();
+            for run in text_runs_ref(&obj.payload) {
+                colors.push(run.style.fill.clone());
             }
-            '.' => Token::Any,
-            '[' => {
-                i += 1;
-                let negated = i < chars.len() && chars[i] == '^';
-                if negated {
-                    i += 1;
-                }
-                let mut ranges = Vec::new();
-                while i < chars.len() && chars[i] != ']' {
-                    if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
-                        let a = chars[i];
-                        let b = chars[i + 2];
-                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                        ranges.push((lo, hi));
-                        i += 3;
-                    } else {
-                        ranges.push((chars[i], chars[i]));
-                        i += 1;
+            if let NodePayload::Table(ref table) = obj.payload {
+                for cell in &table.cells {
+                    colors.extend(cell.fill.referenced_colors());
+                    if !cell.text.is_empty() {
+                        colors.push(cell.text_style.fill.clone());
                     }
                 }
-                Token::Class(ranges, negated)
             }
-            c => Token::Literal(c),
-        };
-        i += 1;
-        let (min, max) = if i < chars.len() {
-            match chars[i] {
-                '*' => {
-                    i += 1;
-                    (0, None)
-                }
-                '+' => {
-                    i += 1;
-                    (1, None)
-                }
-                '?' => {
-                    i += 1;
-                    (0, Some(1))
-                }
-                _ => (1, Some(1)),
+            let outline = effective_outline(obj);
+            if outline.is_visible() {
+                colors.push(outline.color.clone());
             }
-        } else {
-            (1, Some(1))
-        };
-        atoms.push(Atom { token, min, max });
-    }
-    atoms
-}
-
-fn token_matches(token: &Token, ch: char) -> bool {
-    match token {
-        Token::Literal(c) => *c == ch,
-        Token::Any => ch != '\n',
-        Token::Class(ranges, negated) => {
-            ranges.iter().any(|&(lo, hi)| ch >= lo && ch <= hi) != *negated
+            if op == CqlCompareOp::Ne {
+                !colors
+                    .iter()
+                    .any(|c| cql_color_matches_text(c, s, CqlCompareOp::Eq))
+            } else {
+                colors.iter().any(|c| cql_color_matches_text(c, s, op))
+            }
         }
-    }
-}
-
-fn match_atoms(
-    chars: &[char],
-    pos: usize,
-    atoms: &[Atom],
-    ai: usize,
-    anchored_end: bool,
-    memo: &mut HashSet<(usize, usize)>,
-) -> bool {
-    if !memo.insert((pos, ai)) {
-        return false;
-    }
-    if ai == atoms.len() {
-        return !anchored_end || pos == chars.len();
-    }
-    let atom = &atoms[ai];
-    let mut max_rep = 0usize;
-    let limit = atom.max.unwrap_or(chars.len().saturating_sub(pos));
-    while max_rep < limit
-        && pos + max_rep < chars.len()
-        && token_matches(&atom.token, chars[pos + max_rep])
-    {
-        max_rep += 1;
-    }
-    if max_rep < atom.min {
-        return false;
-    }
-    for rep in (atom.min..=max_rep).rev() {
-        if match_atoms(chars, pos + rep, atoms, ai + 1, anchored_end, memo) {
-            return true;
+        "text" => {
+            let txt = extract_searchable_text(&obj.payload).unwrap_or_default();
+            cql_cmp_str(&txt, op, value)
         }
+        "text.len" | "text.count" => {
+            let len = extract_searchable_text(&obj.payload).map_or(0, |s| s.chars().count());
+            cql_cmp_num(len as f64, op, value, false)
+        }
+        "font" | "text.font" => {
+            let mut fonts: Vec<&str> = text_runs_ref(&obj.payload)
+                .iter()
+                .map(|r| r.style.font_family.trim())
+                .collect();
+            if let NodePayload::Table(ref table) = obj.payload {
+                for cell in &table.cells {
+                    if !cell.text.is_empty() {
+                        fonts.push(cell.text_style.font_family.trim());
+                    }
+                }
+            }
+            if fonts.is_empty() {
+                return false;
+            }
+            if op == CqlCompareOp::Ne {
+                !fonts
+                    .iter()
+                    .any(|f| cql_cmp_str(f, CqlCompareOp::Eq, value))
+            } else {
+                fonts.iter().any(|f| cql_cmp_str(f, op, value))
+            }
+        }
+        _ => false,
     }
-    false
 }
 
 #[cfg(test)]
@@ -808,9 +798,9 @@ mod tests {
     fn find_and_replace_across_multipage_document() {
         let mut doc = Document::new_a4("Catalog");
         let p2 = doc.add_page("Page 2", 210.0, 297.0, 3.0);
-        let p1_layer = doc.pages[0].layers[0].id;
-        let p2_layer = doc.pages[1].layers[0].id;
-        assert_eq!(doc.pages[1].id, p2);
+        let p1_layer = doc.pages()[0].layers[0].id;
+        let p2_layer = doc.pages()[1].layers[0].id;
+        assert_eq!(doc.pages()[1].id, p2);
 
         // Page 1: blue rect + red-ish rect + Arial text + lens rect
         let r1 = doc
@@ -864,7 +854,7 @@ mod tests {
         )
         .with_fill(Fill::Solid(Color::rgb(0.93, 0.12, 0.11)))
         .with_outline(OutlineStyle::hairline(Color::KEY_BLACK));
-        r2_obj.lens = Some(LensConfig::new(LensKind::Invert));
+        r2_obj.lens = Some(LensConfig::new(coree_core::LensKind::Invert));
         let r2 = doc.add_object(r2_obj, Some(p2_layer)).unwrap();
 
         let t2 = doc
@@ -901,11 +891,11 @@ mod tests {
         assert_eq!(rep_color.matched_ids, vec![r1, r2]);
         assert_eq!(rep_color.modified_ids, vec![r1, r2]);
         assert_eq!(
-            doc.objects[&r1].fill,
+            doc.object(r1).unwrap().fill,
             Fill::Solid(Color::cmyk(0.0, 1.0, 1.0, 0.0))
         );
         assert_eq!(
-            doc.objects[&r2].fill,
+            doc.object(r2).unwrap().fill,
             Fill::Solid(Color::cmyk(0.0, 1.0, 1.0, 0.0))
         );
 
@@ -923,7 +913,7 @@ mod tests {
             },
         );
         assert_eq!(rep_font.matched_ids, vec![t1, t2]);
-        let NodePayload::ArtisticText(ref at1) = doc.objects[&t1].payload else {
+        let NodePayload::ArtisticText(ref at1) = doc.object(t1).unwrap().payload else {
             panic!();
         };
         assert_eq!(at1.runs[0].style.font_family, "Cairo");
@@ -949,7 +939,7 @@ mod tests {
             },
         );
         assert_eq!(rep_text.matched_ids, vec![t1, t2]);
-        let NodePayload::ArtisticText(ref at2) = doc.objects[&t2].payload else {
+        let NodePayload::ArtisticText(ref at2) = doc.object(t2).unwrap().payload else {
             panic!();
         };
         assert_eq!(at2.plain_text(), "Copyright 2026 coree");
@@ -967,7 +957,7 @@ mod tests {
             &ReplaceAction::ConvertOverprint { overprint: true },
         );
         assert_eq!(rep_ov.matched_ids, vec![r2]);
-        assert!(doc.objects[&r2].outline.overprint);
+        assert!(doc.object(r2).unwrap().outline.overprint);
 
         let rep_w = find_and_replace(
             &mut doc,
@@ -978,7 +968,94 @@ mod tests {
             },
         );
         assert_eq!(rep_w.modified_ids, vec![r2]);
-        assert!(!doc.objects[&r2].outline.is_hairline);
-        assert!((doc.objects[&r2].outline.width_mm - 0.5).abs() < 1e-9);
+        assert!(!doc.object(r2).unwrap().outline.is_hairline);
+        assert!((doc.object(r2).unwrap().outline.width_mm - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cql_parser_and_evaluator_handles_units_models_and_boolean_logic() {
+        let mut doc = Document::new_a4("CQL Suite");
+
+        // CutContour hairline rectangle
+        let cut = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "CutLine",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 50.0,
+                        height: 30.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::cut_contour()),
+                None,
+            )
+            .unwrap();
+
+        // Thick 2pt CMYK curve with overprint
+        let mut thick_curve = SceneObject::new(
+            ObjectId(0),
+            "Heavy Stroke",
+            NodePayload::Path(coree_core::BezierPath::from_rect(
+                coree_core::Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+            )),
+        )
+        .with_fill(Fill::Solid(Color::CYAN));
+        thick_curve.outline = OutlineStyle::solid(Color::KEY_BLACK, 2.0 * 25.4 / 72.0);
+        thick_curve.outline.overprint = true;
+        let c1 = doc.add_object(thick_curve, None).unwrap();
+
+        // Spot Arabic text
+        let t1 = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Title",
+                    NodePayload::ArtisticText(ArtisticText::from_plain(
+                        "شعار تجريبي",
+                        TextStyle {
+                            font_family: "Cairo".to_owned(),
+                            fill: Color::spot("Pantone185", 1.0, [0.0, 0.9, 0.8, 0.0]),
+                            ..TextStyle::default()
+                        },
+                    )),
+                )
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            evaluate_cql_query(
+                &doc,
+                FindScope::WholeDocument,
+                "@color == 'CutContour' and @outline.hairline"
+            )
+            .unwrap(),
+            vec![cut]
+        );
+        assert_eq!(
+            evaluate_cql_query(
+                &doc,
+                FindScope::WholeDocument,
+                "@type == 'curve' and @outline.width >= 1.9pt and @outline.overprint == true"
+            )
+            .unwrap(),
+            vec![c1]
+        );
+        assert_eq!(
+            evaluate_cql_query(
+                &doc,
+                FindScope::WholeDocument,
+                "(@fill.model == 'spot' or @fill.model == 'rgb') and @text contains 'تجريبي' and not @locked"
+            )
+            .unwrap(),
+            vec![t1]
+        );
+        assert!(parse_cql_query("@type == 'unclosed").is_err());
     }
 }

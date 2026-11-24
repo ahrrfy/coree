@@ -1,5 +1,6 @@
 # Rust / Cargo build outputs
 /target
+/fuzz/target
 /dist
 **/*.rs.bk
 *.pdb

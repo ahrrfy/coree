@@ -148,8 +148,8 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
             "expected era '{expected_era}', got '{}'",
             parsed.report.format_era
         );
-        assert!(!parsed.document.pages.is_empty());
-        assert!(!parsed.document.objects.is_empty());
+        assert!(!parsed.document.pages().is_empty());
+        assert!(!parsed.document.objects().is_empty());
         assert!(!parsed.report.chunks.is_empty());
     }
 
@@ -157,7 +157,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
     for ver in [CdrWriteVersion::RiffV12, CdrWriteVersion::ZipX6] {
         let cdt_bytes = export_cdt_bytes(&sample, ver).expect("export cdt");
         let rep = import_cdt_bytes(&cdt_bytes, &limits).expect("import cdt");
-        assert!(!rep.document.objects.is_empty());
+        assert!(!rep.document.objects().is_empty());
         let inspected = import_and_inspect_binary_bytes(&cdt_bytes, &limits).expect("inspect cdt");
         assert!(matches!(
             inspected.report.detected_format,
@@ -188,7 +188,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
         }
         let parsed = import_and_inspect_binary_bytes(&cmx_bytes, &limits).expect("import cmx");
         assert_eq!(parsed.report.detected_format, expected_fmt);
-        assert!(!parsed.document.objects.is_empty());
+        assert!(!parsed.document.objects().is_empty());
     }
 
     // 4. Multi-layer .cpt (native CPT9 + RIFF CPT)
@@ -198,8 +198,8 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
             parsed.report.detected_format,
             ContainerFormat::Cpt { .. }
         ));
-        assert!(!parsed.document.assets.is_empty());
-        assert!(!parsed.document.objects.is_empty());
+        assert!(!parsed.document.assets().is_empty());
+        assert!(!parsed.document.objects().is_empty());
     }
 
     // 5. Unknown-Chunk Passthrough byte-for-byte preservation across round-trip
@@ -207,7 +207,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
     let pass1 = import_and_inspect_binary_bytes(&unk_bytes, &limits).expect("parse unk pass1");
     let xdoc_orig = pass1
         .document
-        .unknown_doc_chunks
+        .unknown_doc_chunks()
         .iter()
         .find(|c| &c.fourcc == b"XDOC")
         .expect("XDOC preserved on import")
@@ -215,7 +215,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
         .clone();
     let xobj_orig = pass1
         .document
-        .objects
+        .objects()
         .values()
         .flat_map(|o| o.unknown_chunks.iter())
         .find(|c| &c.fourcc == b"XOBJ")
@@ -230,13 +230,13 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
         let pass2 = import_and_inspect_binary_bytes(&rt_bytes, &limits).expect("re-import unk");
         let xdoc_rt = pass2
             .document
-            .unknown_doc_chunks
+            .unknown_doc_chunks()
             .iter()
             .find(|c| &c.fourcc == b"XDOC")
             .expect("XDOC survives round-trip");
         let xobj_rt = pass2
             .document
-            .objects
+            .objects()
             .values()
             .flat_map(|o| o.unknown_chunks.iter())
             .find(|c| &c.fourcc == b"XOBJ")
@@ -255,7 +255,7 @@ fn e2e_f01_f15_cdr_cdt_cmx_cpt_passthrough_cp1256_inspector_and_adversarial() {
         import_and_inspect_binary_bytes(&cp1256_bytes, &limits).expect("import CP1256 CDR");
     let decoded_texts: Vec<String> = cp1256_parsed
         .document
-        .objects
+        .objects()
         .values()
         .filter_map(|o| match &o.payload {
             NodePayload::ArtisticText(t) => Some(t.plain_text()),
@@ -772,7 +772,7 @@ fn e2e_f02_f04_f06_f07_effects_mesh_smartfill_knife_vsd_and_all_9_booleans() {
     doc.create_powerclip(pc_container, &[pc_child])
         .expect("create PowerClip");
     assert!(matches!(
-        doc.objects[&pc_container].payload,
+        doc.object(pc_container).unwrap().payload,
         NodePayload::PowerClip { .. }
     ));
 
@@ -1003,7 +1003,7 @@ fn e2e_f03_f05_arabic_rtl_kashida_text_on_path_curves_table_dims_connectors_mult
 
     // VectorTable + Dimensions + Connectors + Multipage + Master Layer
     let mut doc = build_showcase_multipage_doc();
-    assert_eq!(doc.pages.len(), 3);
+    assert_eq!(doc.pages().len(), 3);
 
     // Verify VectorTable cell merge + insert_row invariant safety
     let mut table = VectorTable::new(3, 3, 25.0, 10.0);
@@ -1303,7 +1303,16 @@ fn e2e_f11_f12_f13_f14_f16_f17_full_production_pipeline_and_rhai_macros() {
     assert!(sep_knockout.spot_plate("CutContour").is_some());
     let rgba_knockout = simulate_overprint_rgba(&sep_knockout);
 
-    sep_doc.objects.get_mut(&yellow_id).unwrap().blend_mode = BlendMode::Multiply;
+    let mut sep_hist = coree_core::CommandHistory::default();
+    sep_hist
+        .execute(
+            &mut sep_doc,
+            coree_core::CommandOp::SetBlendMode {
+                ids: vec![yellow_id],
+                blend_mode: BlendMode::Multiply,
+            },
+        )
+        .expect("set blend mode");
     let sep_overprint = compute_separations(&sep_doc, 0, &SeparationOptions::default()).unwrap();
     let rgba_overprint = simulate_overprint_rgba(&sep_overprint);
     assert!(
@@ -1331,7 +1340,7 @@ fn e2e_f11_f12_f13_f14_f16_f17_full_production_pipeline_and_rhai_macros() {
         },
     )
     .expect("N-Up imposition");
-    assert_eq!(nup.pages.len(), 1);
+    assert_eq!(nup.pages().len(), 1);
 
     let booklet = impose_document(
         &multi_doc,
@@ -1341,7 +1350,7 @@ fn e2e_f11_f12_f13_f14_f16_f17_full_production_pipeline_and_rhai_macros() {
         },
     )
     .expect("Booklet imposition");
-    assert_eq!(booklet.pages.len(), 4);
+    assert_eq!(booklet.pages().len(), 4);
 
     let banner = Document::new("Banner", 600.0, 400.0, ColorMode::Cmyk, 150.0);
     let tiled = impose_document(
@@ -1353,7 +1362,7 @@ fn e2e_f11_f12_f13_f14_f16_f17_full_production_pipeline_and_rhai_macros() {
         },
     )
     .expect("Tiling imposition");
-    assert!(tiled.pages.len() >= 4);
+    assert!(tiled.pages().len() >= 4);
 
     let marks = generate_print_marks(&mut sep_doc, 0, &PrintMarksOptions::default())
         .expect("generate print marks");
@@ -1475,9 +1484,9 @@ fn e2e_f11_f12_f13_f14_f16_f17_full_production_pipeline_and_rhai_macros() {
     let csv = "Name,ArabicName\nAhmed,أحمد\nLayla,ليلى\n";
     let table = PrintMergeTable::from_csv(csv).unwrap();
     let merged = apply_print_merge(&tpl, &table, &PrintMergeOptions::default()).unwrap();
-    assert_eq!(merged.pages.len(), 2);
+    assert_eq!(merged.pages().len(), 2);
     let all_merged_text: String = merged
-        .objects
+        .objects()
         .values()
         .filter_map(|o| match &o.payload {
             NodePayload::ArtisticText(t) => Some(t.plain_text()),
@@ -1628,12 +1637,12 @@ fn e2e_f18_sqlite_wal_crash_recovery_post_save_and_undo_checkpoint() {
         let db = StorageDb::open(&db_path).expect("open WAL db");
         assert_eq!(db.journal_mode().unwrap().to_ascii_lowercase(), "wal");
         let mut app = StudioApp::new_with_storage(db);
-        doc_id_1 = app.active_tab().unwrap().document.id.to_string();
+        doc_id_1 = app.active_tab().unwrap().document.id().to_string();
         app.select_tool(ToolId::Rectangle);
         app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 30.0, 20.0));
         app.commit_drawn_box(Rect2D::from_xywh(50.0, 10.0, 30.0, 20.0));
         app.commit_drawn_box(Rect2D::from_xywh(90.0, 10.0, 30.0, 20.0));
-        assert_eq!(app.active_tab().unwrap().document.objects.len(), 3);
+        assert_eq!(app.active_tab().unwrap().document.objects().len(), 3);
         // Simulate sudden crash (drop without shutdown_cleanly)
     }
     {
@@ -1647,16 +1656,16 @@ fn e2e_f18_sqlite_wal_crash_recovery_post_save_and_undo_checkpoint() {
             .expect("unclean session 1 detected");
         app.recover_unclean_session(&sess.document_id, &sess.session_id)
             .expect("recover session 1");
-        assert_eq!(app.active_tab().unwrap().document.objects.len(), 3);
+        assert_eq!(app.active_tab().unwrap().document.objects().len(), 3);
 
         // Phase 2: Save -> Post-save edit (rotates WAL session) -> Undo -> Redo -> Post-undo crash
         app.save_active_as(&save_path).expect("save active");
         app.select_tool(ToolId::Ellipse);
         app.commit_drawn_box(Rect2D::from_xywh(10.0, 40.0, 25.0, 25.0)); // 4th object
         app.commit_drawn_box(Rect2D::from_xywh(45.0, 40.0, 25.0, 25.0)); // 5th object
-        assert_eq!(app.active_tab().unwrap().document.objects.len(), 5);
+        assert_eq!(app.active_tab().unwrap().document.objects().len(), 5);
         app.undo().expect("undo 5th object -> checkpoint snapshot");
-        assert_eq!(app.active_tab().unwrap().document.objects.len(), 4);
+        assert_eq!(app.active_tab().unwrap().document.objects().len(), 4);
         // Crash right after post-save edit + undo!
     }
     {
@@ -1671,7 +1680,7 @@ fn e2e_f18_sqlite_wal_crash_recovery_post_save_and_undo_checkpoint() {
         app.recover_unclean_session(&sess.document_id, &sess.session_id)
             .expect("recover post-save+undo session");
         assert_eq!(
-            app.active_tab().unwrap().document.objects.len(),
+            app.active_tab().unwrap().document.objects().len(),
             4,
             "must preserve post-save 4th object AND NOT resurrect undone 5th object"
         );
@@ -2403,9 +2412,9 @@ fn build_showcase_multipage_doc() -> Document {
         ColorMode::Cmyk,
         150.0,
     );
-    doc.multipage_view = true;
-    doc.pages[0].name = "Page 1 — Cover".to_owned();
-    let p1_id = doc.pages[0].id;
+    doc.set_multipage_view(true);
+    let p1_id = doc.pages()[0].id;
+    doc.rename_page(p1_id, "Page 1 — Cover").unwrap();
     let p2_id = doc.add_page("Page 2 — Specs", 148.0, 105.0, 0.0);
     let p3_id = doc.add_page("Page 3 — Cut & QR", 148.0, 105.0, 0.0);
 
@@ -2451,7 +2460,7 @@ fn build_showcase_multipage_doc() -> Document {
     .unwrap();
 
     // Page 1 — Dark Graphite Cover
-    let p1_layer = doc.pages[0].layers[0].id;
+    let p1_layer = doc.pages()[0].layers[0].id;
     doc.add_object(
         SceneObject::new(
             ObjectId(0),
@@ -2553,7 +2562,7 @@ fn build_showcase_multipage_doc() -> Document {
     .unwrap();
 
     // Page 2 — Vector Table & Graphic Specs
-    let p2_layer = doc.pages.iter().find(|p| p.id == p2_id).unwrap().layers[0].id;
+    let p2_layer = doc.pages().iter().find(|p| p.id == p2_id).unwrap().layers[0].id;
     doc.add_object(
         SceneObject::new(
             ObjectId(0),
@@ -2624,7 +2633,7 @@ fn build_showcase_multipage_doc() -> Document {
     }
 
     // Page 3 — Kiss-Cut Sticker Sheet & Vector QR Code
-    let p3_layer = doc.pages.iter().find(|p| p.id == p3_id).unwrap().layers[0].id;
+    let p3_layer = doc.pages().iter().find(|p| p.id == p3_id).unwrap().layers[0].id;
     doc.add_object(
         SceneObject::new(
             ObjectId(0),

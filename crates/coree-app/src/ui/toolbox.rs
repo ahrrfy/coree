@@ -122,8 +122,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 }
 
                                 // Tooltip showing tool name + active profile shortcut + double-click shortcut
-                                let sc = primary_tool
-                                    .shortcut_action()
+                                let sc = crate::state::tool_shortcut_action(primary_tool)
                                     .map(|a| shortcut_label(app.shortcut_profile, a))
                                     .unwrap_or("");
                                 let dbl_hint = match primary_tool {
@@ -220,8 +219,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                         ui.set_min_width(216.0);
                         for &tool in TOOL_GROUPS[g] {
                             let selected = app.active_tool == tool;
-                            let sc = tool
-                                .shortcut_action()
+                            let sc = crate::state::tool_shortcut_action(tool)
                                 .map(|a| shortcut_label(app.shortcut_profile, a))
                                 .unwrap_or("");
                             let row_resp = ui.horizontal(|ui| {
@@ -318,16 +316,59 @@ fn paint_tool_icon(
                 color,
             );
         }
-        ToolId::Smooth | ToolId::Smear | ToolId::Twirl | ToolId::AttractRepel | ToolId::Roughen => {
-            // Circular sculpt nib + deformed edge wave
-            painter.circle_stroke(c, w.min(h) * 0.40, s);
-            let wave = vec![
-                pos2(r.left() + 2.0, c.y + 2.0),
-                pos2(c.x - 2.0, c.y - 3.0),
-                pos2(c.x + 2.0, c.y + 3.0),
-                pos2(r.right() - 2.0, c.y - 2.0),
+        ToolId::Smooth => {
+            painter.circle_stroke(c - vec2(1.5, 1.5), w.min(h) * 0.30, accent_s);
+            let pts: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let t = i as f32 / 10.0;
+                    pos2(
+                        r.left() + 1.5 + t * (w - 3.0),
+                        c.y + (t * std::f32::consts::TAU * 0.7).sin() * (h * 0.28),
+                    )
+                })
+                .collect();
+            painter.add(Shape::line(pts, s));
+        }
+        ToolId::Smear => {
+            let edge = vec![
+                pos2(r.left() + 2.5, r.top() + 1.5),
+                pos2(c.x, c.y - 2.0),
+                pos2(r.right() - 2.0, c.y + 1.0),
+                pos2(c.x + 1.0, r.bottom() - 2.0),
+                pos2(r.left() + 2.5, r.bottom() - 1.5),
             ];
-            painter.add(Shape::line(wave, thin));
+            painter.add(Shape::line(edge, s));
+            painter.circle_filled(pos2(r.right() - 2.2, c.y + 1.0), 2.0, amber);
+        }
+        ToolId::Twirl => {
+            let max_rad = w.min(h) * 0.43;
+            let pts: Vec<Pos2> = (0..22)
+                .map(|i| {
+                    let t = i as f32 / 21.0;
+                    let a = t * std::f32::consts::TAU * 1.9;
+                    let rad = t * max_rad;
+                    pos2(c.x + rad * a.cos(), c.y + rad * a.sin())
+                })
+                .collect();
+            painter.add(Shape::line(pts, s));
+            painter.circle_filled(c, 1.7, accent);
+        }
+        ToolId::AttractRepel => {
+            painter.circle_filled(c, 2.2, amber);
+            painter.line_segment([pos2(r.left() + 1.5, c.y), pos2(c.x - 4.0, c.y)], s);
+            painter.line_segment([pos2(r.right() - 1.5, c.y), pos2(c.x + 4.0, c.y)], s);
+            painter.circle_stroke(c, w.min(h) * 0.44, thin);
+        }
+        ToolId::Roughen => {
+            let saw = vec![
+                pos2(r.left() + 1.5, r.bottom() - 3.0),
+                pos2(r.left() + 4.5, r.top() + 3.0),
+                pos2(c.x - 1.0, c.y + 2.0),
+                pos2(c.x + 2.5, r.top() + 2.0),
+                pos2(r.right() - 4.0, c.y + 3.5),
+                pos2(r.right() - 1.5, r.top() + 4.5),
+            ];
+            painter.add(Shape::line(saw, s));
         }
         ToolId::Crop => {
             // Classic interlocking crop corner brackets
@@ -418,7 +459,21 @@ fn paint_tool_icon(
             painter.line_segment([pos2(r.left() + 1.5, c.y), pos2(r.right() - 1.5, c.y)], s);
             painter.circle_filled(c, 2.0, color);
         }
-        ToolId::Bezier | ToolId::Pen => {
+        ToolId::Bezier => {
+            // Cubic Bezier curve chord with two opposing tangent handles + square cusp anchor
+            let p0 = pos2(r.left() + 2.0, r.bottom() - 3.0);
+            let p1 = pos2(r.right() - 2.0, r.top() + 3.0);
+            painter.line_segment([p0, pos2(c.x + 1.0, r.top() + 3.0)], accent_s);
+            painter.line_segment([pos2(c.x - 1.0, r.bottom() - 3.0), p1], accent_s);
+            painter.rect_filled(
+                Rect::from_center_size(c, vec2(4.5, 4.5)),
+                CornerRadius::ZERO,
+                color,
+            );
+            painter.circle_filled(pos2(c.x + 1.0, r.top() + 3.0), 1.6, amber);
+            painter.circle_filled(pos2(c.x - 1.0, r.bottom() - 3.0), 1.6, amber);
+        }
+        ToolId::Pen => {
             // Crisp fountain pen nib + tip anchor
             let nib = vec![
                 pos2(c.x, r.top() + 1.0),
@@ -450,13 +505,7 @@ fn paint_tool_icon(
                 color,
             );
         }
-        ToolId::Freehand
-        | ToolId::BSpline
-        | ToolId::Polyline
-        | ToolId::ThreePointCurve
-        | ToolId::SmartDrawing
-        | ToolId::LiveSketch
-        | ToolId::ArtisticMedia => {
+        ToolId::Freehand => {
             let pts = vec![
                 pos2(r.left() + 1.0, r.bottom() - h * 0.18),
                 pos2(c.x - w * 0.14, r.top() + h * 0.18),
@@ -464,6 +513,94 @@ fn paint_tool_icon(
                 pos2(r.right() - 1.0, r.top() + h * 0.18),
             ];
             painter.add(Shape::line(pts, s));
+        }
+        ToolId::BSpline => {
+            // Control polygon cage + smooth interpolated spine
+            let ctrl_pts = [
+                pos2(r.left() + 2.0, r.bottom() - 2.5),
+                pos2(c.x, r.top() + 2.0),
+                pos2(r.right() - 2.0, r.bottom() - 2.5),
+            ];
+            painter.line_segment([ctrl_pts[0], ctrl_pts[1]], accent_s);
+            painter.line_segment([ctrl_pts[1], ctrl_pts[2]], accent_s);
+            painter.circle_filled(ctrl_pts[1], 1.8, amber);
+            painter.add(Shape::line(
+                vec![ctrl_pts[0], pos2(c.x, c.y - 1.5), ctrl_pts[2]],
+                s,
+            ));
+        }
+        ToolId::Polyline => {
+            let pts = vec![
+                pos2(r.left() + 1.5, r.bottom() - 2.5),
+                pos2(c.x - 2.0, r.top() + 3.0),
+                pos2(c.x + 2.5, c.y + 2.0),
+                pos2(r.right() - 1.5, r.top() + 2.0),
+            ];
+            painter.add(Shape::line(pts.clone(), s));
+            for p in &pts {
+                painter.rect_filled(
+                    Rect::from_center_size(*p, vec2(2.6, 2.6)),
+                    CornerRadius::ZERO,
+                    accent,
+                );
+            }
+        }
+        ToolId::ThreePointCurve => {
+            let a = pos2(r.left() + 2.0, r.bottom() - 3.0);
+            let b = pos2(r.right() - 2.0, r.bottom() - 3.0);
+            let apex = pos2(c.x, r.top() + 2.5);
+            painter.add(Shape::line(vec![a, apex, b], s));
+            painter.circle_filled(a, 1.7, color);
+            painter.circle_filled(b, 1.7, color);
+            painter.circle_filled(apex, 2.0, amber);
+        }
+        ToolId::SmartDrawing => {
+            painter.add(Shape::line(
+                vec![
+                    pos2(r.left() + 2.0, r.bottom() - 3.0),
+                    pos2(c.x, c.y + 2.0),
+                    pos2(r.right() - 2.5, r.top() + 4.0),
+                ],
+                s,
+            ));
+            // Smart sparkle glyph in top-left corner
+            let sp = pos2(r.left() + 4.0, r.top() + 4.0);
+            painter.line_segment(
+                [sp - vec2(3.0, 0.0), sp + vec2(3.0, 0.0)],
+                amber_stroke_or(amber),
+            );
+            painter.line_segment(
+                [sp - vec2(0.0, 3.0), sp + vec2(0.0, 3.0)],
+                amber_stroke_or(amber),
+            );
+        }
+        ToolId::LiveSketch => {
+            painter.add(Shape::line(
+                vec![
+                    pos2(r.left() + 1.5, r.bottom() - 4.0),
+                    pos2(c.x, r.top() + 3.0),
+                    pos2(r.right() - 2.5, c.y + 2.0),
+                ],
+                thin,
+            ));
+            painter.add(Shape::line(
+                vec![
+                    pos2(r.left() + 3.0, c.y + 2.0),
+                    pos2(c.x + 2.0, r.top() + 5.0),
+                    pos2(r.right() - 1.5, c.y),
+                ],
+                s,
+            ));
+        }
+        ToolId::ArtisticMedia => {
+            // Tapered variable-width calligraphic brushstroke polygon
+            let poly = vec![
+                pos2(r.left() + 1.5, r.bottom() - 2.0),
+                pos2(c.x - 2.5, c.y - 3.5),
+                pos2(r.right() - 1.5, r.top() + 2.0),
+                pos2(c.x + 2.5, c.y + 3.5),
+            ];
+            painter.add(Shape::convex_polygon(poly, color.gamma_multiply(0.85), s));
         }
         ToolId::Rectangle | ToolId::ThreePointRectangle => {
             painter.rect_filled(
@@ -651,17 +788,66 @@ fn paint_tool_icon(
                 color.gamma_multiply(0.25),
             );
         }
-        ToolId::DropShadow | ToolId::BlockShadow | ToolId::Distort | ToolId::Envelope => {
+        ToolId::DropShadow => {
             let r1 = Rect::from_min_size(r.left_top() + vec2(1.0, 1.0), vec2(w * 0.62, h * 0.62));
             let r2 = Rect::from_min_size(
                 r.left_top() + vec2(w * 0.34, h * 0.34),
                 vec2(w * 0.62, h * 0.62),
             );
-            painter.rect_filled(r2, CornerRadius::same(1), accent.gamma_multiply(0.45));
-            painter.rect_filled(r1, CornerRadius::same(1), color.gamma_multiply(0.18));
+            painter.rect_filled(r2, CornerRadius::same(2), color.gamma_multiply(0.28));
+            painter.rect_filled(r1, CornerRadius::same(1), accent.gamma_multiply(0.24));
             painter.rect_stroke(r1, CornerRadius::same(1), s, StrokeKind::Inside);
         }
-        ToolId::ColorEyedropper | ToolId::AttributesEyedropper => {
+        ToolId::BlockShadow => {
+            let r1 = Rect::from_min_size(r.left_top() + vec2(1.0, 1.0), vec2(w * 0.56, h * 0.56));
+            let poly = vec![
+                r1.right_top(),
+                r.right_bottom() - vec2(1.5, 1.5),
+                pos2(r1.left() + w * 0.36, r.bottom() - 1.5),
+                r1.left_bottom(),
+            ];
+            painter.add(Shape::convex_polygon(
+                poly,
+                color.gamma_multiply(0.65),
+                thin,
+            ));
+            painter.rect_stroke(r1, CornerRadius::ZERO, s, StrokeKind::Inside);
+        }
+        ToolId::Distort => {
+            // Pinched/pushed 4-corner star-warp polygon
+            let pts = vec![
+                r.left_top() + vec2(1.5, 1.5),
+                pos2(c.x, c.y - 2.0),
+                r.right_top() + vec2(-1.5, 1.5),
+                pos2(c.x + 2.0, c.y),
+                r.right_bottom() + vec2(-1.5, -1.5),
+                pos2(c.x, c.y + 2.0),
+                r.left_bottom() + vec2(1.5, -1.5),
+                pos2(c.x - 2.0, c.y),
+            ];
+            painter.add(Shape::closed_line(pts, s));
+        }
+        ToolId::Envelope => {
+            // Curved warp cage
+            let cage = vec![
+                r.left_top() + vec2(1.5, 2.5),
+                pos2(c.x, r.top() + 0.5),
+                r.right_top() + vec2(-1.5, 2.5),
+                r.right_bottom() + vec2(-1.5, -2.5),
+                pos2(c.x, r.bottom() - 0.5),
+                r.left_bottom() + vec2(1.5, -2.5),
+            ];
+            painter.add(Shape::closed_line(cage, accent_s));
+            painter.line_segment(
+                [pos2(r.left() + 2.0, c.y), pos2(r.right() - 2.0, c.y)],
+                thin,
+            );
+            painter.line_segment(
+                [pos2(c.x, r.top() + 1.0), pos2(c.x, r.bottom() - 1.0)],
+                thin,
+            );
+        }
+        ToolId::ColorEyedropper => {
             painter.line_segment(
                 [
                     r.left_bottom() + vec2(2.0, -2.0),
@@ -671,6 +857,30 @@ fn paint_tool_icon(
             );
             painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 3.1, amber);
         }
+        ToolId::AttributesEyedropper => {
+            painter.line_segment(
+                [
+                    r.left_bottom() + vec2(2.0, -2.0),
+                    r.right_top() + vec2(-4.0, 4.0),
+                ],
+                Stroke::new(1.8, color),
+            );
+            painter.circle_filled(r.right_top() + vec2(-4.0, 4.0), 2.8, accent);
+            painter.line_segment(
+                [
+                    r.right_bottom() + vec2(-5.5, -2.5),
+                    r.right_bottom() + vec2(-1.0, -2.5),
+                ],
+                thin,
+            );
+            painter.line_segment(
+                [
+                    r.right_bottom() + vec2(-5.5, -5.0),
+                    r.right_bottom() + vec2(-1.0, -5.0),
+                ],
+                thin,
+            );
+        }
         ToolId::MeshFill => {
             let g = r.shrink(1.5);
             painter.rect_filled(g, CornerRadius::same(1), accent.gamma_multiply(0.18));
@@ -679,7 +889,7 @@ fn paint_tool_icon(
             painter.line_segment([pos2(c.x, g.top()), pos2(c.x, g.bottom())], accent_s);
             painter.circle_filled(c, 2.4, amber);
         }
-        ToolId::InteractiveFill | ToolId::SmartFill => {
+        ToolId::InteractiveFill => {
             let g = r.shrink(1.5);
             painter.rect_filled(g, CornerRadius::same(1), accent.gamma_multiply(0.25));
             painter.rect_stroke(g, CornerRadius::same(1), s, StrokeKind::Inside);
@@ -692,6 +902,17 @@ fn paint_tool_icon(
             );
             painter.circle_filled(r.left_bottom() + vec2(3.5, -3.5), 2.2, color);
             painter.circle_filled(r.right_top() + vec2(-3.5, 3.5), 2.2, amber);
+        }
+        ToolId::SmartFill => {
+            // Paint bucket pouring into enclosed area
+            let bucket = vec![
+                pos2(r.left() + 3.0, c.y),
+                pos2(c.x + 1.5, r.top() + 2.5),
+                pos2(r.right() - 3.5, c.y + 1.5),
+                pos2(c.x - 1.0, r.bottom() - 2.5),
+            ];
+            painter.add(Shape::closed_line(bucket, s));
+            painter.circle_filled(r.right_bottom() - vec2(3.0, 2.5), 2.3, accent);
         }
         ToolId::LensTool => {
             painter.circle_stroke(c, w.min(h) * 0.44, s);
@@ -712,12 +933,44 @@ fn paint_tool_icon(
                 color,
             );
         }
-        ToolId::BitmapBrush | ToolId::BitmapEraser | ToolId::CloneStamp | ToolId::Smudge => {
+        ToolId::BitmapBrush => {
             painter.line_segment(
                 [r.right_top() + vec2(-2.0, 2.0), c],
                 Stroke::new(2.0, color),
             );
-            painter.circle_filled(r.left_bottom() + vec2(4.5, -4.5), 3.1, color);
+            painter.circle_filled(r.left_bottom() + vec2(4.5, -4.5), 3.1, accent);
+        }
+        ToolId::BitmapEraser => {
+            let er = vec![
+                pos2(r.left() + 2.0, c.y + 1.5),
+                pos2(c.x + 1.5, r.top() + 2.5),
+                pos2(r.right() - 1.5, c.y - 1.0),
+                pos2(c.x - 1.5, r.bottom() - 2.0),
+            ];
+            painter.add(Shape::convex_polygon(er, amber.gamma_multiply(0.35), s));
+        }
+        ToolId::CloneStamp => {
+            painter.line_segment(
+                [pos2(c.x, r.top() + 2.5), pos2(c.x, c.y + 1.5)],
+                Stroke::new(2.2, color),
+            );
+            painter.circle_filled(pos2(c.x, r.top() + 2.8), 2.4, color);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(r.left() + 2.0, r.bottom() - 4.5),
+                    pos2(r.right() - 2.0, r.bottom() - 2.0),
+                ),
+                CornerRadius::ZERO,
+                accent,
+            );
+        }
+        ToolId::Smudge => {
+            painter.line_segment([r.right_top() + vec2(-2.5, 2.5), c - vec2(1.0, -1.0)], s);
+            painter.circle_stroke(pos2(c.x - 2.5, c.y + 2.5), 2.5, accent_s);
         }
     }
+}
+
+fn amber_stroke_or(c: Color32) -> Stroke {
+    Stroke::new(1.2, c)
 }

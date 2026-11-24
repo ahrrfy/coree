@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! Comprehensive TDD integration & pixel-verification test suite for `coree-render`.
 
@@ -16,14 +17,15 @@ use coree_core::{
 use coree_render::{
     apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,
     apply_kashida_elongation, apply_raster_filter, clone_stamp_stroke, compute_page_layouts,
-    compute_smart_fill, convert_object_to_bitmap, erase_stroke, hit_test_node, hit_test_point,
-    hit_test_rect, list_glyphs_for_block, paint_brush_stroke, paragraph_to_curves,
-    raster_flood_fill, render_page_to_rgba, render_page_to_rgba_with_options, render_svg_to_rgba,
-    resample, smudge_stroke, text_on_path_to_curves, text_to_curves, trace_raster,
-    trace_raster_to_mm, BackendPaint, CanvasBackend, DirtyTileCache, DodgeBurnMode,
-    DynamicGuideKind, FillRule, GlyphBlockFilter, OutlinePreset, PixelRect, RasterMask,
-    RenderOptions, RgbaBuffer, SceneRenderer, SnapEngine, SnapOptions, StrokeParams, TextEngine,
-    TinySkiaBackend, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport, TILE_SIZE_PX,
+    compute_smart_fill, convert_object_to_bitmap, convert_object_to_bitmap_with_bounds,
+    erase_stroke, hit_test_node, hit_test_point, hit_test_rect, list_glyphs_for_block,
+    paint_brush_stroke, paragraph_to_curves, raster_flood_fill, render_page_to_rgba,
+    render_page_to_rgba_with_options, render_svg_to_rgba, resample, smudge_stroke,
+    text_on_path_to_curves, text_to_curves, trace_raster, trace_raster_to_mm, BackendPaint,
+    CanvasBackend, DirtyTileCache, DodgeBurnMode, DynamicGuideKind, FillRule, GlyphBlockFilter,
+    OutlinePreset, PixelRect, RasterMask, RenderOptions, RgbaBuffer, SceneRenderer, SnapEngine,
+    SnapOptions, StrokeParams, TextEngine, TinySkiaBackend, ToneRange, TraceConfig, TraceMode,
+    ViewMode, Viewport, TILE_SIZE_PX,
 };
 
 fn rect_obj(x: f64, y: f64, w: f64, h: f64, fill: Fill) -> SceneObject {
@@ -212,7 +214,14 @@ fn tinyskia_backend_and_dirty_tile_cache_exact_parity() {
     // 3. Mutate r2 and mark ONLY r2's rect dirty -> fewer than all 6 tiles re-render,
     //    and output matches a freshly rendered DirtyTileCache bit-for-bit!
     let r2_bounds = doc.object_bounds(r2).unwrap();
-    doc.objects.get_mut(&r2).unwrap().fill = Fill::Solid(Color::rgba8(240, 200, 10, 255));
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetFill {
+            ids: vec![r2],
+            fill: Fill::Solid(Color::rgba8(240, 200, 10, 255)),
+        },
+    )
+    .unwrap();
     cache.mark_dirty(r2_bounds);
     let dirty_count = cache.dirty_tile_count();
     assert!(
@@ -573,7 +582,9 @@ fn lens_frozen_viewpoint_and_remove_face_work_accurately() {
     assert!(renderer.get_frozen_lens(lens_id).is_some());
 
     // Move frozen lens from red side to blue side (x: 15 -> 60)
-    doc_fr.objects.get_mut(&lens_id).unwrap().transform = Affine2D::translate(60.0, 30.0);
+    doc_fr
+        .set_object_transform(lens_id, Affine2D::translate(60.0, 30.0))
+        .unwrap();
     let mut b2 = TinySkiaBackend::new(283, 283).unwrap();
     renderer.render_document(&doc_fr, &vp, ViewMode::Enhanced, &opts, &mut b2);
     let after = b2.into_rgba();
@@ -804,7 +815,7 @@ fn mesh_fill_effects_powerclip_and_blendmodes_render_cleanly() {
 #[test]
 fn multipage_master_layers_tables_dimensions_connectors_and_all_fills() {
     let mut doc = Document::new("Multi", 100.0, 100.0, ColorMode::Rgb, 72.0);
-    let p1 = doc.pages[0].id;
+    let p1 = doc.pages()[0].id;
     let _p2 = doc.add_page("Page 2", 100.0, 100.0, 3.0);
     let _p3 = doc.add_page("Page 3", 100.0, 100.0, 3.0);
 
@@ -863,7 +874,7 @@ fn multipage_master_layers_tables_dimensions_connectors_and_all_fills() {
         vec![make_circle(5.0, 5.0, 3.0, Color::rgba8(200, 40, 120, 255))],
     );
     let sym_id = sym.id;
-    doc_rich.symbols.insert(sym_id, sym);
+    doc_rich.insert_symbol(sym);
 
     let fills = vec![
         Fill::ConicalGradient {
@@ -1511,10 +1522,13 @@ fn smart_fill_extracts_exact_enclosed_overlap_region() {
 #[test]
 fn hit_test_and_snap_engine_and_svg_render() {
     let mut doc = Document::new("SnapHit", 200.0, 200.0, ColorMode::Rgb, 96.0);
-    doc.grid.visible = true;
-    doc.grid.spacing_x_mm = 10.0;
-    doc.grid.spacing_y_mm = 10.0;
-    doc.grid.subdivisions = 1;
+    doc.set_grid(coree_core::GridConfig {
+        visible: true,
+        spacing_x_mm: 10.0,
+        spacing_y_mm: 10.0,
+        subdivisions: 1,
+        ..doc.grid()
+    });
     doc.add_guide(GuideOrientation::Vertical(75.0), false);
     doc.add_guide(GuideOrientation::Horizontal(120.0), false);
 
@@ -1705,12 +1719,12 @@ fn distort_envelope_perspective_symmetry_fountain_transparency_and_outline_style
     });
     doc.add_object(sym, None).unwrap();
 
-    // 5. FountainLinear Transparency (fades from 1.0 on left to 0.0 on right)
+    // 5. FountainLinear Transparency (fades from 1.0 on local left to 0.0 on local right)
     let mut trans = make_rect(10.0, 60.0, 50.0, 30.0, Color::rgba8(220, 20, 20, 255));
     trans.effects.push(Effect::Transparency {
         mode: TransparencyMode::FountainLinear {
-            start: Point2D::new(10.0, 75.0),
-            end: Point2D::new(60.0, 75.0),
+            start: Point2D::new(0.0, 15.0),
+            end: Point2D::new(50.0, 15.0),
             start_alpha: 1.0,
             end_alpha: 0.0,
         },
@@ -1816,9 +1830,14 @@ fn edge_cases_nan_safety_viewport_math_and_remaining_variants() {
     //    PerspectiveGrid (TwoPoint + Isometric), Angular/Callout3Pt Dimensions,
     //    BitmapPattern, Group opacity, and Multipage rendering!
     let mut doc2 = Document::new("AllVariants", 140.0, 100.0, ColorMode::Rgb, 72.0);
-    doc2.grid.visible = true;
-    doc2.grid.show_dots = true;
-    doc2.perspective_grid.enabled = true;
+    doc2.set_grid(coree_core::GridConfig {
+        visible: true,
+        show_dots: true,
+        ..doc2.grid()
+    });
+    let mut pg = doc2.perspective_grid().clone();
+    pg.enabled = true;
+    doc2.set_perspective_grid(pg);
     doc2.add_guide(
         GuideOrientation::Angled {
             origin: Point2D::new(70.0, 50.0),
@@ -1856,11 +1875,11 @@ fn edge_cases_nan_safety_viewport_math_and_remaining_variants() {
     });
     doc2.add_object(ct_in, None).unwrap();
 
-    // FountainRadial Transparency
+    // FountainRadial Transparency (object-local center around make_circle origin)
     let mut rad_t = make_circle(78.0, 18.0, 12.0, Color::rgba8(30, 80, 230, 255));
     rad_t.effects.push(Effect::Transparency {
         mode: TransparencyMode::FountainRadial {
-            center: Point2D::new(78.0, 18.0),
+            center: Point2D::ZERO,
             radius: 12.0,
             inner_alpha: 1.0,
             outer_alpha: 0.0,
@@ -1942,7 +1961,14 @@ fn edge_cases_nan_safety_viewport_math_and_remaining_variants() {
         )
         .unwrap();
     let grp = doc2.group_objects(&[g1, g2], "TranslucentGroup").unwrap();
-    doc2.objects.get_mut(&grp).unwrap().opacity = 0.5;
+    coree_core::apply_command(
+        &mut doc2,
+        &coree_core::CommandOp::SetOpacity {
+            ids: vec![grp],
+            opacity: 0.5,
+        },
+    )
+    .unwrap();
 
     let mut opts = RenderOptions::interactive();
     opts.show_margin_guides = true;
@@ -2088,13 +2114,13 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
     )
     .unwrap();
     let _p1 = doc.add_page("Page 2", 100.0, 100.0, 0.0);
-    doc.active_page_index = 1;
+    doc.set_active_page_index(1).unwrap();
     doc.add_object(
         make_rect(10.0, 10.0, 40.0, 40.0, Color::rgba8(30, 60, 230, 255)),
         None,
     )
     .unwrap();
-    doc.active_page_index = 0;
+    doc.set_active_page_index(0).unwrap();
 
     let vp = Viewport::new(300, 300);
     let mut opts = RenderOptions::export();
@@ -2109,7 +2135,7 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
     );
 
     // Switch active page WITHOUT calling mark_all_dirty()
-    doc.active_page_index = 1;
+    doc.set_active_page_index(1).unwrap();
     let rerendered_page =
         cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
     assert!(
@@ -2124,14 +2150,14 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
     );
 
     // Toggle doc.multipage_view WITHOUT touching viewport.multipage_view or mark_all_dirty()
-    doc.multipage_view = true;
+    doc.set_multipage_view(true);
     let rerendered_mp =
         cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
     assert!(
         rerendered_mp > 0,
         "Toggling doc.multipage_view must invalidate tile cache"
     );
-    doc.multipage_view = false;
+    doc.set_multipage_view(false);
     let _ = cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
 
     // Mutate RenderOptions (page_bg) WITHOUT calling mark_all_dirty()
@@ -2287,7 +2313,7 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         remove_face: false,
     });
     let mut frozen_doc = build_lens_doc(frozen_obj);
-    let frozen_id = *frozen_doc.pages[0].layers[0].objects.last().unwrap();
+    let frozen_id = *frozen_doc.pages()[0].layers[0].objects.last().unwrap();
     let (_, tiled_frozen) = compare_direct_vs_tiled(&frozen_doc, "Cross-tile Frozen Lens");
 
     // Verify left of seam (x=220px, y=135px) is inverted red = cyan, right of seam (x=290px, y=135px) is inverted green = magenta
@@ -2312,7 +2338,9 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         &export_opts,
         &mut persist_renderer,
     );
-    frozen_doc.objects.get_mut(&frozen_id).unwrap().transform = Affine2D::translate(10.0, 50.0);
+    frozen_doc
+        .set_object_transform(frozen_id, Affine2D::translate(10.0, 50.0))
+        .unwrap();
     persist_cache.mark_all_dirty();
     let moved_frozen = persist_cache.render_viewport(
         &frozen_doc,
@@ -2364,7 +2392,8 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
     });
     let wf_id = doc.add_object(wf_lens, None).unwrap();
     let grp_id = doc.group_objects(&[wf_id], "LensGroup").unwrap();
-    doc.objects.get_mut(&grp_id).unwrap().transform = Affine2D::translate(60.0, 10.0);
+    doc.set_object_transform(grp_id, Affine2D::translate(60.0, 10.0))
+        .unwrap();
 
     let img_wf = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
     // Blue square's right edge sits at x=78mm, y=15..35mm, strictly inside the grouped lens [60..90, 10..40]!
@@ -2387,12 +2416,19 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
 
     // 2. Grouped Invert lens with `remove_face = true`: must invert blue box [60..78] to yellow
     //    while leaving blank page [82..88] pure white!
-    doc.objects.get_mut(&wf_id).unwrap().lens = Some(LensConfig {
-        kind: LensKind::Invert,
-        frozen: false,
-        viewpoint: None,
-        remove_face: true,
-    });
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetLens {
+            ids: vec![wf_id],
+            lens: Some(LensConfig {
+                kind: LensKind::Invert,
+                frozen: false,
+                viewpoint: None,
+                remove_face: true,
+            }),
+        },
+    )
+    .unwrap();
     let img_rf = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
     let over_blue = pixel_at_mm(&img_rf, 68.0, 25.0);
     let over_blank = pixel_at_mm(&img_rf, 84.0, 25.0);
@@ -2407,12 +2443,19 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
 
     // 3. Grouped Invert lens with page-space `viewpoint = (22.5, 22.5)` (center of red square):
     //    must sample the red square at (22.5, 22.5) and show cyan inside the grouped lens at (75, 25)!
-    doc.objects.get_mut(&wf_id).unwrap().lens = Some(LensConfig {
-        kind: LensKind::Invert,
-        frozen: false,
-        viewpoint: Some(Point2D::new(22.5, 22.5)),
-        remove_face: false,
-    });
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetLens {
+            ids: vec![wf_id],
+            lens: Some(LensConfig {
+                kind: LensKind::Invert,
+                frozen: false,
+                viewpoint: Some(Point2D::new(22.5, 22.5)),
+                remove_face: false,
+            }),
+        },
+    )
+    .unwrap();
     let img_vp = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
     let vp_px = pixel_at_mm(&img_vp, 75.0, 25.0);
     assert!(
@@ -2571,7 +2614,7 @@ fn regression_6_hit_test_locked_layer_grouped_objects_and_snap_angled_guide() {
     let mut doc = Document::new("HitSnapRegression", 200.0, 200.0, ColorMode::Rgb, 96.0);
 
     // 1. Locked layer MUST block hit_test_point & hit_test_rect even when obj.locked == false
-    let page0_id = doc.pages[0].id;
+    let page0_id = doc.pages()[0].id;
     let locked_layer_id = doc
         .add_layer(page0_id, "LockedLayer", false, MasterLayerScope::None)
         .unwrap();
@@ -2581,13 +2624,9 @@ fn regression_6_hit_test_locked_layer_grouped_objects_and_snap_angled_guide() {
             Some(locked_layer_id),
         )
         .unwrap();
-    assert!(!doc.objects[&locked_obj_id].locked);
-    doc.pages[0]
-        .layers
-        .iter_mut()
-        .find(|l| l.id == locked_layer_id)
-        .unwrap()
-        .locked = true;
+    assert!(!doc.object(locked_obj_id).unwrap().locked);
+    doc.set_layer_flags(locked_layer_id, None, Some(true), None, None)
+        .unwrap();
 
     assert_eq!(
         hit_test_point(&doc, 0, Point2D::new(25.0, 25.0), 1.0),
@@ -2618,7 +2657,8 @@ fn regression_6_hit_test_locked_layer_grouped_objects_and_snap_angled_guide() {
     let tid = doc.add_object(table_obj, None).unwrap();
     let txid = doc.add_object(text_obj, None).unwrap();
     let grp_id = doc.group_objects(&[tid, txid], "MovedGroup").unwrap();
-    doc.objects.get_mut(&grp_id).unwrap().transform = Affine2D::translate(100.0, 80.0);
+    doc.set_object_transform(grp_id, Affine2D::translate(100.0, 80.0))
+        .unwrap();
 
     // Should hit the table inside the translated group at (115, 90), NOT at local (15, 10)
     assert_eq!(
@@ -2678,7 +2718,7 @@ fn regression_7_vector_pattern_bevel_wireframe_dims_trace_and_arabic() {
             tile_h: 10.0,
         });
     sym.objects.push(self_ref_obj);
-    pat_doc.symbols.insert(sym_id, sym);
+    pat_doc.insert_symbol(sym);
     let host_obj = make_rect(5.0, 5.0, 40.0, 40.0, Color::WHITE).with_fill(Fill::VectorPattern {
         symbol_id: sym_id,
         tile_w: 10.0,
@@ -2967,11 +3007,7 @@ fn icc_live_cmyk_soft_proofing_gamut_warning_and_tile_cache_invalidation() {
     let mut g_opts = RenderOptions::interactive();
     let _ = cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &g_opts, &mut renderer);
     // Move existing guide in-place without changing guides.len()
-    doc.guides
-        .iter_mut()
-        .find(|g| g.id == gid)
-        .unwrap()
-        .orientation = GuideOrientation::Vertical(55.0);
+    doc.set_guide_orientation(gid, GuideOrientation::Vertical(55.0));
     g_opts.show_guidelines = true;
     assert!(
         cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &g_opts, &mut renderer) > 0,
@@ -3475,4 +3511,5635 @@ fn regression_8_audit_fixes_lenses_effects_arabic_diacritics_mesh_powerclip_and_
         conn_px[0] > 180 && conn_px[1] < 60,
         "Transformed standalone Connector must render red at (60,35): {conn_px:?}"
     );
+}
+
+#[test]
+fn r16_text_on_path_nested_group_and_convert_to_bitmap() {
+    let mut doc = Document::new("R16TOPGroup", 220.0, 250.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+
+    // Host line y = 20 in [0..80], TextOnPath inside Translate(70, 90) Group -> world y = 110 (never 200!)
+    let host_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "HostLine",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(0.0, 20.0),
+                    Point2D::new(80.0, 20.0),
+                )),
+            )
+            .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+    let style = TextStyle {
+        font_size_pt: 24.0,
+        fill: Color::rgba8(200, 10, 10, 255),
+        ..TextStyle::default()
+    };
+    let top_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "TOP",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("HELLO", style.clone()),
+                    path_id: host_id,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let grp_id = doc.group_objects(&[host_id, top_id], "TOPGrp").unwrap();
+    doc.transform_object(grp_id, Affine2D::translate(70.0, 90.0))
+        .unwrap();
+
+    let bmp = convert_object_to_bitmap(&doc, top_id, 96.0).unwrap();
+    let non_zero_bmp = bmp
+        .rgba_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(
+        non_zero_bmp > 50,
+        "convert_object_to_bitmap on nested TextOnPath must have > 50 ink pixels, got {non_zero_bmp}"
+    );
+
+    let img = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+    let px_per_mm: f64 = 96.0 / 25.4;
+    let mut ink_near_110 = 0usize;
+    let mut ink_near_200 = 0usize;
+    for py in 0..img.height {
+        let y_mm = f64::from(py) / px_per_mm;
+        for px in 0..img.width {
+            let x_mm = f64::from(px) / px_per_mm;
+            let i = ((py * img.width + px) * 4) as usize;
+            let [r, g, b, _] = [
+                img.rgba[i],
+                img.rgba[i + 1],
+                img.rgba[i + 2],
+                img.rgba[i + 3],
+            ];
+            if r > 180 && g < 100 && b < 100 && (70.0..=160.0).contains(&x_mm) {
+                if (95.0..=118.0).contains(&y_mm) {
+                    ink_near_110 += 1;
+                }
+                if (185.0..=210.0).contains(&y_mm) {
+                    ink_near_200 += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        ink_near_110 > 30,
+        "nested TextOnPath must render at y ~ 110 mm, got {ink_near_110}"
+    );
+    assert_eq!(
+        ink_near_200, 0,
+        "nested TextOnPath must not double-translate to y ~ 200 mm"
+    );
+
+    // Rotated Group variant + effects on TextOnPath
+    let mut top_eff = doc.object(top_id).unwrap().clone();
+    top_eff.effects.push(Effect::DropShadow {
+        dx_mm: 2.0,
+        dy_mm: 2.0,
+        blur_mm: 1.0,
+        opacity: 0.5,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Middle,
+    });
+    let eff_top = doc.add_object(top_eff, Some(lid)).unwrap();
+    let rot_grp = doc.group_objects(&[eff_top], "RotTOPGrp").unwrap();
+    doc.transform_object(
+        rot_grp,
+        Affine2D::translate(30.0, 40.0).compose(&Affine2D::rotate(0.35)),
+    )
+    .unwrap();
+    let eff_bmp = convert_object_to_bitmap(&doc, eff_top, 96.0).unwrap();
+    let eff_ink = eff_bmp
+        .rgba_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(
+        eff_ink > 50,
+        "nested TextOnPath with effects must render into bitmap, got {eff_ink}"
+    );
+}
+
+#[test]
+fn r16_isolated_group_and_transparency_with_connector_and_symbol() {
+    // 1. Isolated Group (opacity = 0.5) containing a Connector nested inside Translate(60, 60) Group
+    let mut doc = Document::new("R16IsoGroupConn", 160.0, 160.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+    let mut conn = ConnectorObject::between_objects(
+        ObjectId(999),
+        AnchorPoint::Center,
+        ObjectId(999),
+        AnchorPoint::Center,
+        ConnectorStyle::Straight,
+    );
+    conn.from_obj = None;
+    conn.to_obj = None;
+    conn.from_fallback = Point2D::new(10.0, 20.0);
+    conn.to_fallback = Point2D::new(50.0, 20.0);
+    let conn_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Conn", NodePayload::Connector(conn))
+                .with_outline(OutlineStyle::solid(Color::rgba8(220, 20, 20, 255), 3.0)),
+            Some(lid),
+        )
+        .unwrap();
+    let inner_id = doc.group_objects(&[conn_id], "IsoGrp").unwrap();
+    coree_core::CommandHistory::new(8)
+        .execute(
+            &mut doc,
+            coree_core::CommandOp::SetOpacity {
+                ids: vec![inner_id],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+    let outer_id = doc.group_objects(&[inner_id], "OuterGrp").unwrap();
+    doc.transform_object(outer_id, Affine2D::translate(60.0, 60.0))
+        .unwrap();
+
+    let bmp = convert_object_to_bitmap(&doc, inner_id, 96.0).unwrap();
+    let max_alpha = bmp
+        .rgba_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| p[3])
+        .max()
+        .unwrap_or(0);
+    assert!(
+        (100..=145).contains(&max_alpha),
+        "isolated Group opacity 0.5 containing Connector must have max_alpha in [100, 145], got {max_alpha}"
+    );
+
+    // 2. Isolated Group (opacity = 0.5) AND Effect::Transparency inside a SymbolDef
+    let mut sdoc = Document::new("R16SymIso", 120.0, 120.0, ColorMode::Rgb, 96.0);
+    let slid = sdoc.pages()[0].layers[0].id;
+    let child_rect = SceneObject::new(
+        ObjectId(10),
+        "SymChild",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(20, 40, 220, 255)))
+    .with_outline(OutlineStyle::none());
+    let mut grp_in_sym = SceneObject::new(
+        ObjectId(11),
+        "SymIsoGrp",
+        NodePayload::Group(vec![ObjectId(10)]),
+    );
+    grp_in_sym.opacity = 0.5;
+    let mut trans_rect = SceneObject::new(
+        ObjectId(12),
+        "SymTransRect",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(20, 200, 40, 255)))
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(45.0, 0.0));
+    trans_rect.effects.push(Effect::Transparency {
+        mode: TransparencyMode::Uniform(0.5),
+        blend_mode: BlendMode::Normal,
+    });
+    let sym = SymbolDef::new("IsoSym", vec![child_rect, grp_in_sym, trans_rect]);
+    let sym_id = sym.id;
+    sdoc.upsert_symbol(sym);
+    let inst_id = sdoc
+        .add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(10.0, 10.0)),
+            Some(slid),
+        )
+        .unwrap();
+    let sym_bmp = convert_object_to_bitmap(&sdoc, inst_id, 96.0).unwrap();
+    let sym_max_alpha = sym_bmp
+        .rgba_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| p[3])
+        .max()
+        .unwrap_or(0);
+    assert!(
+        sym_max_alpha > 80 && sym_max_alpha <= 145,
+        "SymbolInstance with opacity=0.5 Group & Uniform(0.5) Transparency must cap alpha <= 145, got {sym_max_alpha}"
+    );
+
+    // 3. render_isolated_object_to_rgba on ArtisticText with obj.transform + nested Connector
+    let at_id = sdoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "TransformedAT",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "EXPORT",
+                    TextStyle {
+                        font_size_pt: 20.0,
+                        fill: Color::BLACK,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_transform(Affine2D::translate(35.0, 60.0)),
+            Some(slid),
+        )
+        .unwrap();
+    let (at_bb, at_buf) =
+        coree_render::render_isolated_object_to_rgba(&sdoc, 0, at_id, Affine2D::IDENTITY, 96.0)
+            .unwrap()
+            .expect("ArtisticText isolated render");
+    assert!(
+        at_bb.min_x >= 20.0 && at_bb.min_y >= 30.0,
+        "isolated ArtisticText bounds must include obj.transform: {at_bb:?}"
+    );
+    let at_ink = at_buf
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(at_ink > 30, "isolated ArtisticText must render visible ink");
+
+    let (conn_bb, conn_buf) = coree_render::render_isolated_object_to_rgba(
+        &doc,
+        0,
+        conn_id,
+        Affine2D::translate(60.0, 60.0),
+        96.0,
+    )
+    .unwrap()
+    .expect("nested Connector isolated render");
+    assert!(
+        (conn_bb.min_x - 60.0).abs() < 15.0 && (conn_bb.min_y - 70.0).abs() < 15.0,
+        "nested Connector isolated bounds must not double-apply parent_xf: {conn_bb:?}"
+    );
+    let conn_ink = conn_buf
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(conn_ink > 30, "nested Connector must render visible ink");
+}
+
+#[test]
+fn r16_hit_test_non_aabb_rotated_and_symbol_and_rect() {
+    let rot45 =
+        Affine2D::translate(50.0, 50.0).compose(&Affine2D::rotate(std::f64::consts::FRAC_PI_4));
+    // Center of a 100x10 bar transformed by rot45: (50,5) -> (50 + 50*cos45 - 5*sin45, 50 + 50*sin45 + 5*cos45)
+    let on_bar = rot45.transform_point(Point2D::new(50.0, 5.0));
+    // Empty corner inside world AABB of the 45-deg rotated 100x10 bar
+    let empty_aabb_corner = Point2D::new(50.0, 120.0);
+
+    // Test rotated Raster, ArtisticText, ParagraphText, Table, and SymbolInstance
+    for kind in 0..5 {
+        let mut doc = Document::new("R16HitNonAABB", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let obj = match kind {
+            0 => {
+                let asset =
+                    RasterAsset::new(10, 10, vec![255u8; 400], 96.0, ColorMode::Rgb).unwrap();
+                let aid = doc.register_asset(asset);
+                SceneObject::new(
+                    ObjectId(0),
+                    "RotRaster",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid,
+                        width_mm: 100.0,
+                        height_mm: 10.0,
+                        crop_rect: None,
+                        filters: Vec::new(),
+                    }),
+                )
+            }
+            1 => SceneObject::new(
+                ObjectId(0),
+                "RotAT",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "WIDE TEXT BAR",
+                    TextStyle {
+                        font_size_pt: 24.0,
+                        ..TextStyle::default()
+                    },
+                )),
+            ),
+            2 => SceneObject::new(
+                ObjectId(0),
+                "RotPara",
+                NodePayload::ParagraphText(ParagraphText::new(
+                    "Para Bar",
+                    Vec2D::new(100.0, 10.0),
+                    TextStyle::default(),
+                )),
+            ),
+            3 => SceneObject::new(
+                ObjectId(0),
+                "RotTable",
+                NodePayload::Table(VectorTable::new(1, 2, 50.0, 10.0)),
+            ),
+            _ => {
+                // SymbolInstance with two separated 10x10 rects at x=0 and x=90
+                let left = SceneObject::new(
+                    ObjectId(1),
+                    "Left",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 10.0, 10.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(Color::BLACK));
+                let right = SceneObject::new(
+                    ObjectId(2),
+                    "Right",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        90.0, 0.0, 10.0, 10.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(Color::BLACK));
+                let grp = SceneObject::new(
+                    ObjectId(3),
+                    "SymGrp",
+                    NodePayload::Group(vec![ObjectId(1), ObjectId(2)]),
+                );
+                let sym = SymbolDef::new("SplitSym", vec![left, right, grp]);
+                let sym_id = sym.id;
+                doc.upsert_symbol(sym);
+                SceneObject::new(ObjectId(0), "RotSym", NodePayload::SymbolInstance(sym_id))
+            }
+        };
+        let oid = doc
+            .add_object(obj.with_transform(rot45), Some(lid))
+            .unwrap();
+
+        if kind == 4 {
+            // SymbolInstance: left & right rects hit, gap at x=50 misses, empty corner misses!
+            let on_left = rot45.transform_point(Point2D::new(5.0, 5.0));
+            assert_eq!(hit_test_point(&doc, 0, on_left, 0.5), Some(oid));
+            assert_eq!(
+                hit_test_point(&doc, 0, on_bar, 0.5),
+                None,
+                "SymbolInstance gap must not hit"
+            );
+            assert_eq!(hit_test_point(&doc, 0, empty_aabb_corner, 0.5), None);
+        } else {
+            if kind != 1 {
+                assert_eq!(
+                    hit_test_point(&doc, 0, on_bar, 0.5),
+                    Some(oid),
+                    "kind {kind} rotated body must hit"
+                );
+            } else {
+                // ArtisticText estimated bounds center
+                let at_center = match &doc.object(oid).unwrap().payload {
+                    NodePayload::ArtisticText(at) => {
+                        rot45.transform_point(at.estimated_bounds().center())
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(hit_test_point(&doc, 0, at_center, 0.5), Some(oid));
+            }
+            assert_eq!(
+                hit_test_point(&doc, 0, empty_aabb_corner, 0.5),
+                None,
+                "kind {kind} empty rotated AABB corner must NOT false-hit"
+            );
+        }
+
+        // hit_test_rect(..., false) must ignore empty AABB corner and catch intersecting marquee
+        let empty_marquee = Rect2D::from_xywh(48.0, 118.0, 4.0, 4.0);
+        assert!(
+            hit_test_rect(&doc, 0, empty_marquee, false).is_empty(),
+            "kind {kind} empty AABB corner marquee must return empty"
+        );
+        let hit_pt = if kind == 4 {
+            rot45.transform_point(Point2D::new(5.0, 5.0))
+        } else if kind == 1 {
+            match &doc.object(oid).unwrap().payload {
+                NodePayload::ArtisticText(at) => {
+                    rot45.transform_point(at.estimated_bounds().center())
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            on_bar
+        };
+        let hit_marquee = Rect2D::from_xywh(hit_pt.x - 1.0, hit_pt.y - 1.0, 2.0, 2.0);
+        assert_eq!(hit_test_rect(&doc, 0, hit_marquee, false), vec![oid]);
+    }
+
+    // Diagonal TextOnPath inside Translate(30, 20) Group
+    let mut tdoc = Document::new("R16HitTOP", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let tlid = tdoc.pages()[0].layers[0].id;
+    let host_id = tdoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "DiagHost",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(0.0, 0.0),
+                    Point2D::new(100.0, 100.0),
+                )),
+            ),
+            Some(tlid),
+        )
+        .unwrap();
+    let top_id = tdoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "DiagTOP",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("DIAGONAL", TextStyle::default()),
+                    path_id: host_id,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(tlid),
+        )
+        .unwrap();
+    let grp_id = tdoc.group_objects(&[host_id, top_id], "DiagGrp").unwrap();
+    tdoc.transform_object(grp_id, Affine2D::translate(30.0, 20.0))
+        .unwrap();
+    // On diagonal (80, 70) -> hits grp_id; at empty AABB corner (120, 25) -> None!
+    assert_eq!(
+        hit_test_point(&tdoc, 0, Point2D::new(80.0, 70.0), 1.0),
+        Some(grp_id)
+    );
+    assert_eq!(
+        hit_test_point(&tdoc, 0, Point2D::new(120.0, 25.0), 1.0),
+        None
+    );
+}
+
+#[test]
+fn r17_transparency_fountain_linear_and_radial_with_transformed_and_grouped_objects() {
+    let mut doc = Document::new("R17 Transparency", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. FountainLinear on object with non-identity obj.transform = translate(80, 80)
+    let mut lin_obj = rect_obj(
+        80.0,
+        80.0,
+        80.0,
+        40.0,
+        Fill::Solid(Color::rgba8(220, 30, 30, 255)),
+    );
+    lin_obj.effects.push(Effect::Transparency {
+        mode: TransparencyMode::FountainLinear {
+            start: Point2D::new(0.0, 20.0),
+            end: Point2D::new(80.0, 20.0),
+            start_alpha: 1.0,
+            end_alpha: 0.0,
+        },
+        blend_mode: BlendMode::Normal,
+    });
+    doc.add_object(lin_obj, Some(lid)).unwrap();
+
+    // 2. FountainRadial inside a rotated + translated Group
+    let mut rad_obj = rect_obj(
+        0.0,
+        0.0,
+        40.0,
+        40.0,
+        Fill::Solid(Color::rgba8(30, 30, 220, 255)),
+    );
+    rad_obj.effects.push(Effect::Transparency {
+        mode: TransparencyMode::FountainRadial {
+            center: Point2D::new(20.0, 20.0),
+            radius: 20.0,
+            inner_alpha: 1.0,
+            outer_alpha: 0.0,
+        },
+        blend_mode: BlendMode::Normal,
+    });
+    let rad_id = doc.add_object(rad_obj, Some(lid)).unwrap();
+    let grp_id = doc.group_objects(&[rad_id], "RotTransGrp").unwrap();
+    doc.transform_object(
+        grp_id,
+        Affine2D::translate(40.0, 30.0).compose(&Affine2D::rotate_deg(45.0)),
+    )
+    .unwrap();
+
+    let mut opts = RenderOptions::export();
+    opts.page_bg = Color::TRANSPARENT;
+    let img = render_page_to_rgba_with_options(&doc, 0, 25.4, ViewMode::Enhanced, &opts).unwrap();
+    assert_eq!((img.width, img.height), (200, 200));
+
+    let sample = |buf: &[u8], w: u32, x: u32, y: u32| -> [u8; 4] {
+        let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+
+    // Over white page sheet: FountainLinear left edge (82, 100) is red; right edge (158, 100) fades to near-white
+    let left_px = sample(&img.rgba, img.width, 82, 100);
+    let right_px = sample(&img.rgba, img.width, 158, 100);
+    assert!(
+        left_px[0] > 180 && left_px[1] < 60,
+        "FountainLinear left edge must be opaque red, got {left_px:?}"
+    );
+    assert!(
+        right_px[1] > 235 && right_px[2] > 235,
+        "FountainLinear right edge must fade to near-white over paper, got {right_px:?}"
+    );
+
+    // Also render onto a transparent surface directly to verify true alpha ramp [>200 -> <40]
+    let lin_id = doc.pages()[0].layers[0].objects[0];
+    let mut tback = TinySkiaBackend::new(200, 200).unwrap();
+    tback.clear(Color::TRANSPARENT);
+    SceneRenderer::new().render_single_object(
+        &doc,
+        lin_id,
+        &Viewport::for_export(200, 200, 25.4),
+        ViewMode::Enhanced,
+        &opts,
+        &mut tback,
+    );
+    let tbuf = tback.into_rgba();
+    let t_left = sample(&tbuf.rgba, tbuf.width, 82, 100);
+    let t_right = sample(&tbuf.rgba, tbuf.width, 158, 100);
+    assert!(
+        t_left[3] > 200 && t_left[0] > 180,
+        "transparent FountainLinear left edge must be opaque red, got {t_left:?}"
+    );
+    assert!(
+        t_right[3] < 40,
+        "transparent FountainLinear right edge must fade to low alpha, got {t_right:?}"
+    );
+
+    // FountainRadial inside rotated Group: world center of rotated [0..40, 0..40] around (40,30)
+    let mut rback = TinySkiaBackend::new(200, 200).unwrap();
+    rback.clear(Color::TRANSPARENT);
+    SceneRenderer::new().render_single_object(
+        &doc,
+        grp_id,
+        &Viewport::for_export(200, 200, 25.4),
+        ViewMode::Enhanced,
+        &opts,
+        &mut rback,
+    );
+    let rbuf = rback.into_rgba();
+    let rad_center = doc.world_object_bounds(rad_id).unwrap().center();
+    let cx = rad_center.x.round() as u32;
+    let cy = rad_center.y.round() as u32;
+    let center_px = sample(&rbuf.rgba, rbuf.width, cx, cy);
+    assert!(
+        center_px[3] > 200 && center_px[2] > 180,
+        "FountainRadial center at ({cx}, {cy}) must be opaque blue, got {center_px:?}"
+    );
+    // Corner at radius >= 20 from center must fade toward 0
+    let corner = doc
+        .world_transform_of(rad_id)
+        .unwrap()
+        .transform_point(Point2D::new(2.0, 2.0));
+    let corner_px = sample(
+        &rbuf.rgba,
+        rbuf.width,
+        corner.x.round() as u32,
+        corner.y.round() as u32,
+    );
+    assert!(
+        corner_px[3] < 40,
+        "FountainRadial outer corner must fade to low alpha, got {corner_px:?}"
+    );
+}
+
+#[test]
+fn r17_isolated_group_600_dpi_low_zoom_and_symbol_and_symmetry_text_on_path() {
+    // 1. Isolated Group (opacity = 0.5) with scale_with_object wide stroke at 600 DPI and low zoom
+    let mut doc = Document::new("R17 Iso600", 50.0, 50.0, ColorMode::Rgb, 600.0);
+    let lid = doc.pages()[0].layers[0].id;
+    let mut wide_rect = rect_obj(
+        15.0,
+        15.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(0, 120, 255, 255)),
+    );
+    wide_rect.outline = OutlineStyle {
+        color: Color::rgba8(255, 0, 0, 255),
+        width_mm: 10.0,
+        scale_with_object: true,
+        ..OutlineStyle::default()
+    };
+    let rid = doc.add_object(wide_rect, Some(lid)).unwrap();
+    let grp_id = doc.group_objects(&[rid], "IsoWideGrp").unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetOpacity {
+            ids: vec![grp_id],
+            opacity: 0.5,
+        },
+    )
+    .unwrap();
+
+    let mut opts = RenderOptions::export();
+    opts.page_bg = Color::TRANSPARENT;
+    let px_per_mm_600 = 600.0_f64 / 25.4;
+    let dim_600 = (50.0 * px_per_mm_600).round() as u32;
+    let mut back_600 = TinySkiaBackend::new(dim_600, dim_600).unwrap();
+    back_600.clear(Color::TRANSPARENT);
+    SceneRenderer::new().render_single_object(
+        &doc,
+        grp_id,
+        &Viewport::for_export(dim_600, dim_600, 600.0),
+        ViewMode::Enhanced,
+        &opts,
+        &mut back_600,
+    );
+    let hi_dpi = back_600.into_rgba();
+    let max_alpha_600 = hi_dpi
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| p[3])
+        .max()
+        .unwrap_or(0);
+    assert!(
+        (115..=142).contains(&max_alpha_600),
+        "600 DPI isolated Group (opacity=0.5) must preserve ~128 alpha without MAX_SURFACE_DIM_PX fallback, got {max_alpha_600}"
+    );
+
+    // Low zoom (1.27 DPI -> 0.05 px/mm) on 2000mm page with 100mm wide stroke
+    let mut lo_doc = Document::new("R17 LowZoom", 2000.0, 2000.0, ColorMode::Rgb, 96.0);
+    let lo_lid = lo_doc.pages()[0].layers[0].id;
+    let mut lo_rect = rect_obj(
+        800.0,
+        800.0,
+        200.0,
+        200.0,
+        Fill::Solid(Color::rgba8(0, 200, 0, 255)),
+    );
+    lo_rect.outline = OutlineStyle {
+        color: Color::rgba8(0, 0, 255, 255),
+        width_mm: 160.0,
+        scale_with_object: false,
+        ..OutlineStyle::default()
+    };
+    let lo_rid = lo_doc.add_object(lo_rect, Some(lo_lid)).unwrap();
+    let lo_grp = lo_doc.group_objects(&[lo_rid], "LowZoomIso").unwrap();
+    coree_core::apply_command(
+        &mut lo_doc,
+        &coree_core::CommandOp::SetOpacity {
+            ids: vec![lo_grp],
+            opacity: 0.5,
+        },
+    )
+    .unwrap();
+    let lo_img =
+        render_page_to_rgba_with_options(&lo_doc, 0, 1.27, ViewMode::Enhanced, &opts).unwrap();
+    let blue_ink = lo_img
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] < 180 && p[2] > 180 && p[3] > 60)
+        .count();
+    assert!(
+        blue_ink > 10,
+        "low-zoom isolated Group must render wide stroke without clipping, got {blue_ink} blue px"
+    );
+
+    // 2. TextOnPath inside SymbolInstance renders on symbol's host curve (y ~ 90), not fallback origin
+    let mut sdoc = Document::new("R17 SymTOP", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let sym_host_id = ObjectId(7001);
+    let sym_host = SceneObject::new(
+        sym_host_id,
+        "SymHost",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(10.0, 30.0),
+            Point2D::new(90.0, 30.0),
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    let blue_text = TextStyle {
+        fill: Color::rgba8(0, 0, 220, 255),
+        ..TextStyle::default()
+    };
+    let mut sym_top = SceneObject::new(
+        ObjectId(7002),
+        "SymTOP",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain("SYMBOL_CURVE", blue_text.clone()),
+            path_id: sym_host_id,
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(0, 0, 220, 255)))
+    .with_outline(OutlineStyle::none());
+    sym_top.transform = Affine2D::translate(0.0, 0.0);
+    let sym = SymbolDef::new("SymWithTOP", vec![sym_host, sym_top]);
+    let sym_id = sym.id;
+    sdoc.insert_symbol(sym);
+    sdoc.add_object(
+        SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id))
+            .with_transform(Affine2D::translate(20.0, 60.0)),
+        None,
+    )
+    .unwrap();
+
+    let sym_img =
+        render_page_to_rgba_with_options(&sdoc, 0, 25.4, ViewMode::Enhanced, &opts).unwrap();
+    let ink_at_host_y90 = (75..100)
+        .flat_map(|y| (20..120).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let i = (y * sym_img.width as usize + x) * 4;
+            sym_img.rgba[i + 3] > 30 && sym_img.rgba[i] < 120 && sym_img.rgba[i + 2] > 150
+        })
+        .count();
+    let ink_at_origin_y30 = (0..45)
+        .flat_map(|y| (0..100).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let i = (y * sym_img.width as usize + x) * 4;
+            sym_img.rgba[i + 3] > 30
+                && (sym_img.rgba[i] < 245 || sym_img.rgba[i + 1] < 245 || sym_img.rgba[i + 2] < 245)
+        })
+        .count();
+    assert!(
+        ink_at_host_y90 > 20 && ink_at_origin_y30 == 0,
+        "SymbolInstance TextOnPath must render at host curve y=90 (ink={ink_at_host_y90}), not origin y<=45 (ink={ink_at_origin_y30})"
+    );
+
+    // 3. TextOnPath with Effect::Symmetry (4-fold around (100, 100)) renders in all 4 quadrants
+    let mut ydoc = Document::new("R17 SymEffTOP", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let ylid = ydoc.pages()[0].layers[0].id;
+    let yhost = ydoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "YHost",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(30.0, 40.0),
+                    Point2D::new(90.0, 40.0),
+                )),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none()),
+            Some(ylid),
+        )
+        .unwrap();
+    let mut ytop = SceneObject::new(
+        ObjectId(0),
+        "YSymTOP",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain("SYM_PATH", blue_text),
+            path_id: yhost,
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(0, 60, 220, 255)))
+    .with_outline(OutlineStyle::none());
+    ytop.effects.push(Effect::Symmetry {
+        axes: 4,
+        mirror: true,
+        origin: Point2D::new(100.0, 100.0),
+    });
+    ydoc.add_object(ytop, Some(ylid)).unwrap();
+    let yimg = render_page_to_rgba_with_options(&ydoc, 0, 25.4, ViewMode::Enhanced, &opts).unwrap();
+    let count_quad = |x0: usize, x1: usize, y0: usize, y1: usize| -> usize {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let i = (y * yimg.width as usize + x) * 4;
+                yimg.rgba[i + 3] > 30 && yimg.rgba[i] < 120 && yimg.rgba[i + 2] > 150
+            })
+            .count()
+    };
+    let tl = count_quad(10, 95, 10, 95);
+    let tr = count_quad(105, 190, 10, 95);
+    let bl = count_quad(10, 95, 105, 190);
+    let br = count_quad(105, 190, 105, 190);
+    assert!(
+        tl > 20 && tr > 20 && bl > 20 && br > 20,
+        "TextOnPath + Effect::Symmetry must render in all 4 quadrants (tl={tl}, tr={tr}, bl={bl}, br={br})"
+    );
+}
+
+#[test]
+fn r17_convert_object_to_bitmap_captures_blend_and_wide_drop_shadow() {
+    // 1. Effect::Blend target + intermediate steps captured without clipping
+    let mut bdoc = Document::new("R17 BlendBmp", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let lid = bdoc.pages()[0].layers[0].id;
+    let target_id = bdoc
+        .add_object(
+            rect_obj(
+                110.0,
+                20.0,
+                20.0,
+                20.0,
+                Fill::Solid(Color::rgba8(0, 0, 255, 255)),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let mut src = rect_obj(
+        10.0,
+        20.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(255, 0, 0, 255)),
+    );
+    src.effects.push(Effect::Blend {
+        target_id,
+        steps: 6,
+        rotation_deg: 0.0,
+        along_path: None,
+    });
+    let src_id = bdoc.add_object(src, Some(lid)).unwrap();
+
+    let (blend_asset, blend_bounds) =
+        convert_object_to_bitmap_with_bounds(&bdoc, src_id, 96.0).unwrap();
+    assert!(
+        blend_bounds.min_x <= 6.5 && blend_bounds.max_x >= 133.5,
+        "Blend padded bounds {blend_bounds:?} must span source [10..30] through target [110..130]"
+    );
+    assert!(
+        blend_asset.width >= 470,
+        "Blend bitmap width must span full ~128mm at 96 DPI (>=470px), got {}",
+        blend_asset.width
+    );
+    // Verify intermediate blend step around world x=70 is rendered in the bitmap
+    let px_per_mm: f64 = 96.0 / 25.4;
+    let mid_x = ((70.0 - blend_bounds.min_x) * px_per_mm).round() as u32;
+    let mid_y = ((30.0 - blend_bounds.min_y) * px_per_mm).round() as u32;
+    let mid_ink = ((mid_x.saturating_sub(25))..=(mid_x + 25).min(blend_asset.width - 1))
+        .filter(|&x| {
+            let idx = ((mid_y as usize) * (blend_asset.width as usize) + (x as usize)) * 4;
+            blend_asset.rgba_bytes[idx + 3] > 30
+        })
+        .count();
+    assert!(
+        mid_ink > 0,
+        "Blend bitmap must contain intermediate step pixels around world x=70mm"
+    );
+
+    // 2. Wide DropShadow (dx=20, dy=15, blur=4) captured without clipping
+    let mut sdoc = Document::new("R17 ShadowBmp", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let slid = sdoc.pages()[0].layers[0].id;
+    let mut sh_obj = rect_obj(
+        20.0,
+        20.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(20, 180, 20, 255)),
+    );
+    sh_obj.effects.push(Effect::DropShadow {
+        dx_mm: 20.0,
+        dy_mm: 15.0,
+        blur_mm: 4.0,
+        opacity: 0.8,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Outside,
+    });
+    let sh_id = sdoc.add_object(sh_obj, Some(slid)).unwrap();
+    let (sh_asset, sh_bounds) = convert_object_to_bitmap_with_bounds(&sdoc, sh_id, 96.0).unwrap();
+    assert!(
+        sh_bounds.max_x >= 60.0 && sh_bounds.max_y >= 55.0,
+        "DropShadow padded bounds {sh_bounds:?} must cover shifted shadow [40..60, 35..55]"
+    );
+    let sx = ((50.0 - sh_bounds.min_x) * px_per_mm).round() as u32;
+    let sy = ((45.0 - sh_bounds.min_y) * px_per_mm).round() as u32;
+    let sidx = ((sy as usize) * (sh_asset.width as usize) + (sx as usize)) * 4;
+    assert!(
+        sh_asset.rgba_bytes[sidx + 3] > 20,
+        "DropShadow bitmap must contain visible shadow pixel at (50, 45), got alpha={}",
+        sh_asset.rgba_bytes[sidx + 3]
+    );
+}
+
+#[test]
+fn w1b_r18_dirty_tile_cache_group_child_drop_shadow_seam_and_symmetry_mark_object_dirty() {
+    // 1. Non-isolated Group containing child with DropShadow crossing x=256px (64mm at 101.6 DPI) seam
+    let mut doc = Document::new("R18 GroupShadow Seam", 210.0, 297.0, ColorMode::Rgb, 101.6);
+    let lid = doc.pages()[0].layers[0].id;
+    let mut child = rect_obj(
+        25.0,
+        80.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(30, 120, 220, 255)),
+    );
+    child.effects.push(Effect::DropShadow {
+        dx_mm: 25.0,
+        dy_mm: 0.0,
+        blur_mm: 3.0,
+        opacity: 0.85,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Outside,
+    });
+    let child_id = doc.add_object(child, Some(lid)).unwrap();
+    let _grp_id = doc.group_objects(&[child_id], "ShadowGrp").unwrap();
+
+    let vp = Viewport::for_export(768, 512, 101.6);
+    let mut opts = RenderOptions::interactive();
+    opts.show_page_shadow = false;
+    opts.show_grid = false;
+
+    let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut renderer_tiled = SceneRenderer::new();
+    let tiled = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer_tiled);
+
+    let mut direct_backend = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+    let mut renderer_direct = SceneRenderer::new();
+    renderer_direct.render_document(&doc, &vp, ViewMode::Enhanced, &opts, &mut direct_backend);
+    let direct = direct_backend.into_rgba();
+
+    assert_eq!(
+        tiled.rgba, direct.rgba,
+        "DirtyTileCache with Group-child DropShadow crossing 256px tile seam must match direct render bit-for-bit"
+    );
+
+    // 2. Effect::Symmetry invalidation via mark_object_dirty & object_visual_world_bounds
+    let mut sdoc = Document::new("R18 Symmetry Dirty", 210.0, 297.0, ColorMode::Rgb, 101.6);
+    let slid = sdoc.pages()[0].layers[0].id;
+    let mut sym_rect = rect_obj(
+        10.0,
+        70.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(240, 20, 20, 255)),
+    );
+    sym_rect.effects.push(Effect::Symmetry {
+        axes: 2,
+        mirror: false,
+        origin: Point2D::new(80.0, 80.0),
+    });
+    let sid = sdoc.add_object(sym_rect, Some(slid)).unwrap();
+    let vis_bb = coree_render::object_visual_world_bounds(&sdoc, sid).unwrap();
+    assert!(
+        vis_bb.max_x >= 150.0,
+        "object_visual_world_bounds must include symmetry clone [130..150], got {vis_bb:?}"
+    );
+
+    let mut scache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut sr1 = SceneRenderer::new();
+    let _ = scache.render_viewport(&sdoc, &vp, ViewMode::Enhanced, &opts, &mut sr1);
+
+    // Edit fill from red to blue and invalidate ONLY via mark_object_dirty
+    coree_core::apply_command(
+        &mut sdoc,
+        &coree_core::CommandOp::SetFill {
+            ids: vec![sid],
+            fill: Fill::Solid(Color::rgba8(20, 30, 240, 255)),
+        },
+    )
+    .unwrap();
+    scache.mark_object_dirty(&sdoc, sid);
+    let updated_tiled = scache.render_viewport(&sdoc, &vp, ViewMode::Enhanced, &opts, &mut sr1);
+
+    let mut s_direct_backend = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+    let mut sr2 = SceneRenderer::new();
+    sr2.render_document(&sdoc, &vp, ViewMode::Enhanced, &opts, &mut s_direct_backend);
+    let s_direct = s_direct_backend.into_rgba();
+    assert_eq!(
+        updated_tiled.rgba, s_direct.rgba,
+        "mark_object_dirty on Effect::Symmetry must invalidate clone tiles bit-for-bit"
+    );
+}
+
+#[test]
+fn w1b_r18_hit_test_connector_inside_symbol_instance() {
+    use coree_core::{AnchorPoint, ConnectorObject, ConnectorStyle, SymbolDef};
+
+    let mut doc = Document::new_a4("R18 Symbol Connector HitTest");
+    let b1_id = ObjectId(9001);
+    let b2_id = ObjectId(9002);
+    let c_id = ObjectId(9003);
+    let b1 = SceneObject::new(
+        b1_id,
+        "Box1",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 10.0, 10.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN));
+    let b2 = SceneObject::new(
+        b2_id,
+        "Box2",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            70.0, 10.0, 10.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN));
+    let mut conn = ConnectorObject::between_objects(
+        b1_id,
+        AnchorPoint::Center,
+        b2_id,
+        AnchorPoint::Center,
+        ConnectorStyle::Straight,
+    );
+    conn.from_fallback = Point2D::ZERO;
+    conn.to_fallback = Point2D::ZERO;
+    let sym = SymbolDef::new(
+        "SymWithConn",
+        vec![
+            b1,
+            b2,
+            SceneObject::new(c_id, "SymConn", NodePayload::Connector(conn))
+                .with_outline(OutlineStyle::solid(Color::BLACK, 1.0)),
+        ],
+    );
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    let inst_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(20.0, 40.0)),
+            None,
+        )
+        .unwrap();
+
+    // Connector runs horizontally at y=55 from x=35 to x=95 in world mm
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(65.0, 55.0), 1.5),
+        Some(inst_id),
+        "hit_test_point must hit Connector inside SymbolInstance"
+    );
+    assert_eq!(
+        hit_test_rect(&doc, 0, Rect2D::from_xywh(60.0, 50.0, 10.0, 10.0), false),
+        vec![inst_id],
+        "hit_test_rect must hit Connector inside SymbolInstance"
+    );
+}
+
+#[test]
+fn w1b_r18_render_isolated_object_non_frozen_lens_master_and_grouped_top_connector() {
+    use coree_core::{
+        AnchorPoint, ConnectorObject, ConnectorStyle, LensConfig, LensKind, MasterLayerScope,
+        TextOnPath,
+    };
+
+    // 1. Non-frozen Lens::Invert over a Master-layer opaque red rectangle on Page 2
+    let mut doc = Document::new("R18 Isolated Lens", 120.0, 120.0, ColorMode::Rgb, 96.0);
+    let p1_id = doc.pages()[0].id;
+    let master_lid = doc
+        .add_layer(p1_id, "MasterBg", false, MasterLayerScope::AllPages)
+        .unwrap();
+    doc.add_object(
+        rect_obj(
+            20.0,
+            20.0,
+            60.0,
+            60.0,
+            Fill::Solid(Color::rgba8(255, 0, 0, 255)),
+        ),
+        Some(master_lid),
+    )
+    .unwrap();
+    let _p2_id = doc.add_page("Page 2", 120.0, 120.0, 3.0);
+    let p2_lid = doc.pages()[1].layers[0].id;
+    let mut lens_obj = rect_obj(40.0, 40.0, 20.0, 20.0, Fill::None);
+    lens_obj.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: false,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let lens_id = doc.add_object(lens_obj, Some(p2_lid)).unwrap();
+
+    let (lens_bb, lens_buf) =
+        coree_render::render_isolated_object_to_rgba(&doc, 1, lens_id, Affine2D::IDENTITY, 96.0)
+            .unwrap()
+            .expect("non-frozen Invert lens isolated render");
+    let cx =
+        (((50.0 - lens_bb.min_x) / lens_bb.width()) * f64::from(lens_buf.width)).floor() as u32;
+    let cy =
+        (((50.0 - lens_bb.min_y) / lens_bb.height()) * f64::from(lens_buf.height)).floor() as u32;
+    let cidx = ((cy as usize) * (lens_buf.width as usize) + (cx as usize)) * 4;
+    let center_px = &lens_buf.rgba[cidx..cidx + 4];
+    assert!(
+        center_px[3] > 200 && center_px[0] < 30 && center_px[1] > 220 && center_px[2] > 220,
+        "non-frozen Invert lens over Master red rect must produce opaque cyan at center, got {center_px:?}"
+    );
+    // Corner outside the lens must remain transparent [0,0,0,0]
+    assert_eq!(&lens_buf.rgba[0..4], &[0, 0, 0, 0]);
+
+    // 2. Grouped+rotated TextOnPath and Connector called with parent_xf = IDENTITY
+    let mut gdoc = Document::new("R18 Grouped Isolated", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let glid = gdoc.pages()[0].layers[0].id;
+    let host = gdoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "HostPath",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(0.0, 0.0),
+                    Point2D::new(50.0, 0.0),
+                )),
+            ),
+            Some(glid),
+        )
+        .unwrap();
+    let top_id = gdoc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "GroupedTop",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain(
+                        "ISOLATED",
+                        TextStyle {
+                            font_size_pt: 16.0,
+                            fill: Color::BLACK,
+                            ..TextStyle::default()
+                        },
+                    ),
+                    path_id: host,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(glid),
+        )
+        .unwrap();
+    let b_a = gdoc
+        .add_object(
+            rect_obj(0.0, 20.0, 10.0, 10.0, Fill::Solid(Color::CYAN)),
+            Some(glid),
+        )
+        .unwrap();
+    let b_b = gdoc
+        .add_object(
+            rect_obj(40.0, 20.0, 10.0, 10.0, Fill::Solid(Color::CYAN)),
+            Some(glid),
+        )
+        .unwrap();
+    let mut gconn = ConnectorObject::between_objects(
+        b_a,
+        AnchorPoint::Center,
+        b_b,
+        AnchorPoint::Center,
+        ConnectorStyle::Straight,
+    );
+    gconn.from_fallback = Point2D::ZERO;
+    gconn.to_fallback = Point2D::ZERO;
+    let conn_id = gdoc
+        .add_object(
+            SceneObject::new(ObjectId(0), "GroupedConn", NodePayload::Connector(gconn))
+                .with_outline(OutlineStyle::solid(Color::BLACK, 1.0)),
+            Some(glid),
+        )
+        .unwrap();
+    let grp = gdoc
+        .group_objects(&[host, top_id, b_a, b_b, conn_id], "RotGroup")
+        .unwrap();
+    gdoc.transform_object(
+        grp,
+        Affine2D::translate(80.0, 80.0).compose(&Affine2D::rotate_deg(45.0)),
+    )
+    .unwrap();
+
+    let (top_bb, top_buf) =
+        coree_render::render_isolated_object_to_rgba(&gdoc, 0, top_id, Affine2D::IDENTITY, 96.0)
+            .unwrap()
+            .expect("grouped TextOnPath isolated render");
+    let top_ink = top_buf
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(
+        top_bb.min_x >= 60.0 && top_bb.min_y >= 60.0 && top_ink > 30,
+        "grouped TextOnPath isolated render must reflect world bounds & ink: bb={top_bb:?}, ink={top_ink}"
+    );
+
+    let (conn_bb, conn_buf) =
+        coree_render::render_isolated_object_to_rgba(&gdoc, 0, conn_id, Affine2D::IDENTITY, 96.0)
+            .unwrap()
+            .expect("grouped Connector isolated render");
+    let conn_ink = conn_buf
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 20)
+        .count();
+    assert!(
+        conn_bb.min_x >= 50.0 && conn_bb.min_y >= 60.0 && conn_ink > 20,
+        "grouped Connector isolated render must reflect world bounds & ink: bb={conn_bb:?}, ink={conn_ink}"
+    );
+}
+
+#[test]
+fn w1b_r18_oversized_transparency_effect_and_group_symmetry_text_on_path_connector() {
+    use coree_core::{AnchorPoint, ConnectorObject, ConnectorStyle, TextOnPath, TransparencyMode};
+
+    // 1. Oversized object (> MAX_SURFACE_DIM_PX = 16384) with Effect::Transparency FountainLinear
+    struct LargeSurfaceBackend {
+        w: u32,
+        h: u32,
+        drawn: Option<coree_render::RgbaBuffer>,
+    }
+    impl CanvasBackend for LargeSurfaceBackend {
+        fn width(&self) -> u32 {
+            self.w
+        }
+        fn height(&self) -> u32 {
+            self.h
+        }
+        fn clear(&mut self, _color: Color) {}
+        fn set_flatten_tolerance(&mut self, _tolerance: Option<f64>) {}
+        fn fill_path(
+            &mut self,
+            _path: &BezierPath,
+            _paint: &coree_render::BackendPaint,
+            _rule: FillRule,
+            _transform: Affine2D,
+        ) {
+        }
+        fn stroke_path(
+            &mut self,
+            _path: &BezierPath,
+            _stroke: &coree_render::StrokeParams,
+            _transform: Affine2D,
+        ) {
+        }
+        fn draw_pixmap(
+            &mut self,
+            image: &coree_render::RgbaBuffer,
+            _transform: Affine2D,
+            _opacity: f32,
+            _blend_mode: BlendMode,
+            _smooth: bool,
+        ) {
+            self.drawn = Some(image.clone());
+        }
+        fn push_clip(&mut self, _path: &BezierPath, _rule: FillRule, _transform: Affine2D) {}
+        fn pop_clip(&mut self) {}
+        fn read_region(&self, rect: coree_render::PixelRect) -> coree_render::RgbaBuffer {
+            coree_render::RgbaBuffer::new_transparent(rect.width, rect.height)
+        }
+        fn composite_region(
+            &mut self,
+            _rect: coree_render::PixelRect,
+            src: &coree_render::RgbaBuffer,
+            _opacity: f32,
+            _blend_mode: BlendMode,
+        ) {
+            self.drawn = Some(src.clone());
+        }
+        fn snapshot_rgba(&self) -> coree_render::RgbaBuffer {
+            coree_render::RgbaBuffer::new_transparent(1, 1)
+        }
+        fn into_rgba(self) -> coree_render::RgbaBuffer {
+            self.drawn
+                .unwrap_or_else(|| coree_render::RgbaBuffer::new_transparent(1, 1))
+        }
+    }
+
+    let mut big_doc = Document::new("R18 Oversized Trans", 4600.0, 40.0, ColorMode::Rgb, 96.0);
+    let big_lid = big_doc.pages()[0].layers[0].id;
+    let mut wide_rect = rect_obj(
+        10.0,
+        5.0,
+        4500.0,
+        20.0,
+        Fill::Solid(Color::rgba8(220, 30, 30, 255)),
+    );
+    wide_rect.effects.push(Effect::Transparency {
+        mode: TransparencyMode::FountainLinear {
+            start: Point2D::new(0.0, 0.0),
+            end: Point2D::new(4500.0, 0.0),
+            start_alpha: 1.0,
+            end_alpha: 0.2,
+        },
+        blend_mode: BlendMode::Normal,
+    });
+    big_doc.add_object(wide_rect, Some(big_lid)).unwrap();
+    let mut opts = RenderOptions::export();
+    opts.page_bg = Color::TRANSPARENT;
+    opts.canvas_bg = Color::TRANSPARENT;
+    let mut big_backend = LargeSurfaceBackend {
+        w: 17500,
+        h: 160,
+        drawn: None,
+    };
+    let big_vp = Viewport::for_export(17500, 160, 96.0);
+    let mut renderer = SceneRenderer::new();
+    renderer.render_document(
+        &big_doc,
+        &big_vp,
+        ViewMode::Enhanced,
+        &opts,
+        &mut big_backend,
+    );
+    let big_rgba = big_backend
+        .drawn
+        .expect("Oversized (>16384px) Effect::Transparency must render via downscaled buffer");
+    let mid_y = big_rgba.height / 2;
+    let left_a = big_rgba.get_pixel(big_rgba.width / 10, mid_y).unwrap()[3];
+    let right_a = big_rgba
+        .get_pixel((big_rgba.width * 9) / 10, mid_y)
+        .unwrap()[3];
+    assert!(
+        left_a > 180 && right_a > 40 && left_a > right_a + 80,
+        "Oversized FountainLinear Effect::Transparency must preserve gradient ramp: left_a={left_a}, right_a={right_a}"
+    );
+
+    // 2. Group-level Effect::Symmetry propagates into child TextOnPath and Connector
+    let mut sym_doc = Document::new("R18 GroupSym", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let sym_lid = sym_doc.pages()[0].layers[0].id;
+    let hp = sym_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "SymHost",
+                NodePayload::Path(BezierPath::from_line(
+                    Point2D::new(20.0, 30.0),
+                    Point2D::new(60.0, 30.0),
+                )),
+            ),
+            Some(sym_lid),
+        )
+        .unwrap();
+    let g_top = sym_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "GrpTop",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain(
+                        "MMMM",
+                        TextStyle {
+                            font_size_pt: 18.0,
+                            fill: Color::rgba8(20, 40, 220, 255),
+                            ..TextStyle::default()
+                        },
+                    ),
+                    path_id: hp,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(sym_lid),
+        )
+        .unwrap();
+    let b1 = sym_doc
+        .add_object(rect_obj(20.0, 50.0, 10.0, 10.0, Fill::None), Some(sym_lid))
+        .unwrap();
+    let b2 = sym_doc
+        .add_object(rect_obj(50.0, 50.0, 10.0, 10.0, Fill::None), Some(sym_lid))
+        .unwrap();
+    let g_conn = sym_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "GrpConn",
+                NodePayload::Connector(ConnectorObject::between_objects(
+                    b1,
+                    AnchorPoint::Center,
+                    b2,
+                    AnchorPoint::Center,
+                    ConnectorStyle::Straight,
+                )),
+            )
+            .with_outline(OutlineStyle::solid(Color::rgba8(220, 20, 20, 255), 1.5)),
+            Some(sym_lid),
+        )
+        .unwrap();
+    let grp = sym_doc
+        .group_objects(&[hp, g_top, b1, b2, g_conn], "SymGroup")
+        .unwrap();
+    coree_core::apply_command(
+        &mut sym_doc,
+        &coree_core::CommandOp::AddEffect {
+            id: grp,
+            effect: Effect::Symmetry {
+                axes: 2,
+                mirror: false,
+                origin: Point2D::new(100.0, 100.0),
+            },
+        },
+    )
+    .unwrap();
+
+    let mut sym_opts = RenderOptions::export();
+    sym_opts.page_bg = Color::WHITE;
+    let rendered = coree_render::render_page_to_rgba_with_options(
+        &sym_doc,
+        0,
+        96.0,
+        ViewMode::Enhanced,
+        &sym_opts,
+    )
+    .unwrap();
+    // 2-fold 180-deg symmetry about (100,100) maps y=25..35 -> y=165..175 (TextOnPath)
+    // and y=55 -> y=145, x=140..175 (Connector)
+    let px_per_mm: f64 = 96.0 / 25.4;
+    let mut top_mirror_blue = 0usize;
+    let mut conn_mirror_red = 0usize;
+    for y_mm in 160..=178 {
+        let py = (f64::from(y_mm) * px_per_mm).round() as u32;
+        for x_mm in 135..=185 {
+            let px = (f64::from(x_mm) * px_per_mm).round() as u32;
+            let p = rendered.pixel(px, py);
+            if p[2] > 150 && p[0] < 100 {
+                top_mirror_blue += 1;
+            }
+        }
+    }
+    for y_mm in 140..=150 {
+        let py = (f64::from(y_mm) * px_per_mm).round() as u32;
+        for x_mm in 140..=175 {
+            let px = (f64::from(x_mm) * px_per_mm).round() as u32;
+            let p = rendered.pixel(px, py);
+            if p[0] > 150 && p[2] < 100 {
+                conn_mirror_red += 1;
+            }
+        }
+    }
+    assert!(
+        top_mirror_blue > 10,
+        "Group-level Effect::Symmetry must mirror child TextOnPath, found {top_mirror_blue} blue px"
+    );
+    assert!(
+        conn_mirror_red > 10,
+        "Group-level Effect::Symmetry must mirror child Connector, found {conn_mirror_red} red px"
+    );
+}
+
+#[test]
+fn w1b_r19_rotated_drop_shadow_tile_seam_invariance_and_symmetry_child_dirty() {
+    // 1. 12-deg rotated DropShadow (FeatherDirection::Outside, dx=30, blur=4) crossing x=256/y=256 seams
+    //    both inside a Group and ungrouped must render with 0 diff px vs single-pass SceneRenderer.
+    for grouped in [true, false] {
+        let mut doc = Document::new("R19 RotShadow", 200.0, 200.0, ColorMode::Rgb, 101.6);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut sh = rect_obj(
+            0.0,
+            0.0,
+            24.0,
+            24.0,
+            Fill::Solid(Color::rgba8(40, 120, 240, 255)),
+        )
+        .with_transform(
+            Affine2D::translate(34.0, 34.0).compose(&Affine2D::rotate(12.0_f64.to_radians())),
+        );
+        sh.effects.push(Effect::DropShadow {
+            dx_mm: 30.0,
+            dy_mm: 24.0,
+            blur_mm: 4.0,
+            opacity: 0.8,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Outside,
+        });
+        let rid = doc.add_object(sh, Some(lid)).unwrap();
+        if grouped {
+            doc.group_objects(&[rid], "RotShadowGroup").unwrap();
+        }
+
+        let vp = Viewport::for_export(768, 512, 101.6);
+        let mut opts = RenderOptions::export();
+        opts.page_bg = Color::WHITE;
+
+        let mut direct_back = TinySkiaBackend::new(768, 512).unwrap();
+        SceneRenderer::new().render_document(
+            &doc,
+            &vp,
+            ViewMode::Enhanced,
+            &opts,
+            &mut direct_back,
+        );
+        let direct = direct_back.into_rgba();
+
+        let mut cache = DirtyTileCache::new(768, 512);
+        let mut renderer = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        let tiled = cache.composite_to_rgba();
+
+        let diffs: Vec<_> = direct
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(tiled.rgba.as_chunks::<4>().0.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, b))| (i % 768, i / 768, *a, *b))
+            .collect();
+        assert_eq!(
+            diffs.len(),
+            0,
+            "12-deg rotated DropShadow (grouped={grouped}) must have 0 diff px across 256px seams: {diffs:?}"
+        );
+    }
+
+    // 2. Edit child fill inside Group with Effect::Symmetry + mark_object_dirty(child_id) -> 0 diff px
+    let mut sdoc = Document::new("R19 SymChildDirty", 200.0, 200.0, ColorMode::Rgb, 101.6);
+    let slid = sdoc.pages()[0].layers[0].id;
+    let r1 = sdoc
+        .add_object(
+            rect_obj(
+                10.0,
+                10.0,
+                20.0,
+                20.0,
+                Fill::Solid(Color::rgba8(220, 20, 20, 255)),
+            ),
+            Some(slid),
+        )
+        .unwrap();
+    let grp_id = sdoc.group_objects(&[r1], "SymGrp").unwrap();
+    coree_core::apply_command(
+        &mut sdoc,
+        &coree_core::CommandOp::AddEffect {
+            id: grp_id,
+            effect: Effect::Symmetry {
+                axes: 2,
+                mirror: false,
+                origin: Point2D::new(80.0, 80.0),
+            },
+        },
+    )
+    .unwrap();
+
+    let svp = Viewport::for_export(768, 768, 101.6);
+    let mut sopts = RenderOptions::export();
+    sopts.page_bg = Color::WHITE;
+    let mut scache = DirtyTileCache::new(768, 768);
+    let mut srenderer = SceneRenderer::new();
+    scache.render_dirty_tiles(&sdoc, &svp, ViewMode::Enhanced, &sopts, &mut srenderer);
+
+    // Mutate ONLY child `r1` and call mark_object_dirty(&sdoc, r1)
+    coree_core::apply_command(
+        &mut sdoc,
+        &coree_core::CommandOp::SetFill {
+            ids: vec![r1],
+            fill: Fill::Solid(Color::rgba8(20, 40, 220, 255)),
+        },
+    )
+    .unwrap();
+    scache.mark_object_dirty(&sdoc, r1);
+    scache.render_dirty_tiles(&sdoc, &svp, ViewMode::Enhanced, &sopts, &mut srenderer);
+    let tiled_after = scache.composite_to_rgba();
+
+    let mut direct_after_back = TinySkiaBackend::new(768, 768).unwrap();
+    SceneRenderer::new().render_document(
+        &sdoc,
+        &svp,
+        ViewMode::Enhanced,
+        &sopts,
+        &mut direct_after_back,
+    );
+    let direct_after = direct_after_back.into_rgba();
+    let sym_diff = tiled_after
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(direct_after.rgba.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        sym_diff, 0,
+        "mark_object_dirty on child inside Symmetry Group must invalidate clone tiles (0 diff px)"
+    );
+}
+
+#[test]
+fn w1b_r19_intra_group_lens_isolated_render_and_convert_object_to_bitmap_and_hit_test_cycle() {
+    // 1. Non-frozen Lens::Invert inside translated Group with preceding Red sibling over Master Green
+    let mut doc = Document::new("R19 IntraGroupLens", 120.0, 120.0, ColorMode::Rgb, 96.0);
+    let p0_id = doc.pages()[0].id;
+    let master_lid = doc
+        .add_layer(p0_id, "MasterGreen", false, MasterLayerScope::AllPages)
+        .unwrap();
+    doc.add_object(
+        rect_obj(
+            0.0,
+            0.0,
+            120.0,
+            120.0,
+            Fill::Solid(Color::rgba8(0, 255, 0, 255)),
+        ),
+        Some(master_lid),
+    )
+    .unwrap();
+    let lid = doc.pages()[0].layers[0].id;
+    let below_in_grp = doc
+        .add_object(
+            rect_obj(
+                0.0,
+                0.0,
+                30.0,
+                30.0,
+                Fill::Solid(Color::rgba8(255, 0, 0, 255)),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let mut lens_obj = rect_obj(0.0, 0.0, 20.0, 20.0, Fill::None);
+    lens_obj.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: false,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let lens_id = doc.add_object(lens_obj, Some(lid)).unwrap();
+    let grp_id = doc
+        .group_objects(&[below_in_grp, lens_id], "LensGrp")
+        .unwrap();
+    doc.transform_object(grp_id, Affine2D::translate(30.0, 30.0))
+        .unwrap();
+
+    // Isolated render of lens_id must sample Red sibling (at 30..60) -> Cyan [0,255,255,255]
+    let (lbb, lbuf) =
+        coree_render::render_isolated_object_to_rgba(&doc, 0, lens_id, Affine2D::IDENTITY, 96.0)
+            .unwrap()
+            .expect("isolated intra-group lens");
+    let cx = (((40.0 - lbb.min_x) / lbb.width()) * f64::from(lbuf.width)).floor() as u32;
+    let cy = (((40.0 - lbb.min_y) / lbb.height()) * f64::from(lbuf.height)).floor() as u32;
+    let lpx = lbuf.get_pixel(cx, cy).unwrap();
+    assert!(
+        lpx[3] > 240 && lpx[0] < 15 && lpx[1] > 240 && lpx[2] > 240,
+        "Intra-group Invert lens over Red sibling must render Cyan [0,255,255,255], got {lpx:?}"
+    );
+
+    // 2. convert_object_to_bitmap_with_bounds on non-frozen Lens::Invert over Red rect -> opaque Cyan
+    let (bmp_lens, bmp_lens_bb) =
+        convert_object_to_bitmap_with_bounds(&doc, lens_id, 96.0).unwrap();
+    let bcx = (((40.0 - bmp_lens_bb.min_x) / bmp_lens_bb.width()) * f64::from(bmp_lens.width))
+        .floor() as u32;
+    let bcy = (((40.0 - bmp_lens_bb.min_y) / bmp_lens_bb.height()) * f64::from(bmp_lens.height))
+        .floor() as u32;
+    let bidx = ((bcy as usize) * (bmp_lens.width as usize) + (bcx as usize)) * 4;
+    let bpx = &bmp_lens.rgba_bytes[bidx..bidx + 4];
+    assert!(
+        bpx[3] > 240 && bpx[0] < 15 && bpx[1] > 240 && bpx[2] > 240,
+        "convert_object_to_bitmap_with_bounds on non-frozen Invert lens must be opaque Cyan, got {bpx:?}"
+    );
+
+    // 3. convert_object_to_bitmap_with_bounds on Group whose child has Effect::Symmetry
+    let mut sdoc = Document::new("R19 BmpChildSym", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let slid = sdoc.pages()[0].layers[0].id;
+    let mut cshape = rect_obj(
+        10.0,
+        10.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(0, 120, 220, 255)),
+    );
+    cshape.effects.push(Effect::Symmetry {
+        axes: 2,
+        mirror: false,
+        origin: Point2D::new(80.0, 80.0),
+    });
+    let cid = sdoc.add_object(cshape, Some(slid)).unwrap();
+    let sgrp = sdoc.group_objects(&[cid], "ChildSymGrp").unwrap();
+    let (_sym_bmp, sym_bb) = convert_object_to_bitmap_with_bounds(&sdoc, sgrp, 96.0).unwrap();
+    assert!(
+        sym_bb.max_x >= 150.0 && sym_bb.max_y >= 150.0,
+        "convert_object_to_bitmap_with_bounds on Group with child Symmetry must cover mirrored clone [130..150]: {sym_bb:?}"
+    );
+
+    // 4. hit_test.rs sym_sub_world_bounds on asymmetric CycleA <-> CycleB inside SymbolDef
+    let mut hdoc = Document::new("R19 HitCycle", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let hlid = hdoc.pages()[0].layers[0].id;
+    let cyc_a = SceneObject::new(
+        ObjectId(1),
+        "SymCycA",
+        NodePayload::Connector(ConnectorObject {
+            from_obj: None,
+            from_anchor: AnchorPoint::Center,
+            from_fallback: Point2D::new(0.0, 0.0),
+            to_obj: Some(ObjectId(2)),
+            to_anchor: AnchorPoint::Center,
+            to_fallback: Point2D::new(120.0, 120.0),
+            style: ConnectorStyle::Straight,
+            corner_radius_mm: 0.0,
+        }),
+    );
+    let cyc_b = SceneObject::new(
+        ObjectId(2),
+        "SymCycB",
+        NodePayload::Connector(ConnectorObject {
+            from_obj: Some(ObjectId(1)),
+            from_anchor: AnchorPoint::Center,
+            from_fallback: Point2D::new(10.0, 10.0),
+            to_obj: None,
+            to_anchor: AnchorPoint::Center,
+            to_fallback: Point2D::new(100.0, 100.0),
+            style: ConnectorStyle::Straight,
+            corner_radius_mm: 0.0,
+        }),
+    );
+    // Outer connector referencing from_obj=CycleA and to_obj=CycleB in same cache
+    let outer_conn = SceneObject::new(
+        ObjectId(3),
+        "OuterConn",
+        NodePayload::Connector(ConnectorObject {
+            from_obj: Some(ObjectId(1)),
+            from_anchor: AnchorPoint::BottomRight,
+            from_fallback: Point2D::ZERO,
+            to_obj: Some(ObjectId(2)),
+            to_anchor: AnchorPoint::TopLeft,
+            to_fallback: Point2D::ZERO,
+            style: ConnectorStyle::Straight,
+            corner_radius_mm: 0.0,
+        }),
+    )
+    .with_outline(OutlineStyle::solid(Color::BLACK, 2.0));
+    let hit_sym_id = coree_core::SymbolId::new();
+    hdoc.upsert_symbol(SymbolDef {
+        id: hit_sym_id,
+        name: "HitCycleSym".into(),
+        objects: vec![cyc_a, cyc_b, outer_conn],
+    });
+    let inst = hdoc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(hit_sym_id)),
+            Some(hlid),
+        )
+        .unwrap();
+    // OuterConn routes from CycleA bottom-right (100,100) to CycleB top-left (10,10), passing through (55,55)
+    assert_eq!(
+        coree_render::hit_test_point(&hdoc, 0, Point2D::new(55.0, 55.0), 3.0),
+        Some(inst),
+        "hit_test_point must hit SymbolInstance connector over cyclic SymCycA <-> SymCycB"
+    );
+}
+
+fn count_rgba_diff(a: &RgbaBuffer, b: &RgbaBuffer) -> usize {
+    a.rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.rgba.as_chunks::<4>().0.iter())
+        .filter(|(p, q)| p != q)
+        .count()
+}
+
+fn render_direct_rgba(doc: &Document, vp: &Viewport, opts: &RenderOptions) -> RgbaBuffer {
+    let mut back = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+    SceneRenderer::new().render_document(doc, vp, ViewMode::Enhanced, opts, &mut back);
+    back.into_rgba()
+}
+
+#[test]
+fn w1b_r20_isolated_group_and_powerclip_lens_and_explicit_parent_xf() {
+    use coree_core::{apply_command, CommandOp, LensConfig, LensKind};
+    use coree_render::{
+        convert_object_to_bitmap_with_bounds, render_isolated_object_to_rgba, DirtyTileCache,
+        RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+
+    // 1. Isolated Group(opacity=0.5) containing frozen=false AND frozen=true Lens::Invert crossing x=256px seam
+    for frozen in [false, true] {
+        let mut doc = Document::new("R20 IsoGrpLens", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(make_rect(10.0, 10.0, 150.0, 150.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(30.0, 20.0, 80.0, 80.0, Color::TRANSPARENT);
+        let mut cfg = LensConfig::new(LensKind::Invert);
+        cfg.frozen = frozen;
+        lens.lens = Some(cfg);
+        let lens_id = doc.add_object(lens, Some(lid)).unwrap();
+        let grp_id = doc.group_objects(&[lens_id], "IsoGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetOpacity {
+                ids: vec![grp_id],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(768, 768, 96.0);
+        let opts = RenderOptions::export();
+        let full = render_direct_rgba(&doc, &vp, &opts);
+        let cx = ((70.0 / 25.4) * 96.0) as u32;
+        let cy = ((60.0 / 25.4) * 96.0) as u32;
+        let px = full.get_pixel(cx, cy).unwrap();
+        // 0.5 * Cyan [0,255,255] over Red [255,0,0] => [~128, ~128, ~128, 255] (never pure Red [255,0,0,255])
+        assert!(
+            px[0] < 180 && px[1] > 80 && px[2] > 80,
+            "Group(opacity=0.5) Lens::Invert(frozen={frozen}) must blend Cyan over Red, got {px:?}"
+        );
+
+        let mut cache = DirtyTileCache::new(768, 768);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+        let tiled = cache.composite_to_rgba();
+        let diff = count_rgba_diff(&full, &tiled);
+        assert_eq!(
+            diff, 0,
+            "Group(opacity=0.5) Lens::Invert(frozen={frozen}) must have 0 diff px across 256px tile seam"
+        );
+    }
+
+    // 2. Red-filled PowerClip over Master Green containing Lens::Invert(frozen=false & true)
+    for frozen in [false, true] {
+        let mut doc = Document::new("R20 PowerClipLens", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let mlid = doc
+            .add_layer(
+                doc.pages()[0].id,
+                "Master",
+                true,
+                coree_core::MasterLayerScope::AllPages,
+            )
+            .unwrap();
+        doc.add_object(make_rect(0.0, 0.0, 200.0, 200.0, green.clone()), Some(mlid))
+            .unwrap();
+        let lid = doc.pages()[0].layers[0].id;
+        let mut lens = make_rect(40.0, 15.0, 60.0, 60.0, Color::TRANSPARENT);
+        let mut cfg = LensConfig::new(LensKind::Invert);
+        cfg.frozen = frozen;
+        lens.lens = Some(cfg);
+        let lens_id = doc.add_object(lens, Some(lid)).unwrap();
+
+        let pc_container = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "RedPCContainer",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        20.0, 10.0, 100.0, 100.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(red.clone())),
+                Some(lid),
+            )
+            .unwrap();
+        let _pc_id = doc.create_powerclip(pc_container, &[lens_id]).unwrap();
+
+        // 2a. convert_object_to_bitmap_with_bounds on child Lens must sample Red fill -> Cyan [0,255,255,255]
+        let (bmp, _bb) = convert_object_to_bitmap_with_bounds(&doc, lens_id, 96.0).unwrap();
+        let bidx =
+            (((bmp.height / 2) as usize) * (bmp.width as usize) + (bmp.width / 2) as usize) * 4;
+        let bpx = &bmp.rgba_bytes[bidx..bidx + 4];
+        assert_eq!(
+            bpx,
+            [0, 255, 255, 255],
+            "convert_object_to_bitmap_with_bounds(frozen={frozen}) inside Red PowerClip must invert Red -> Cyan"
+        );
+
+        // 2b. render_isolated_object_to_rgba on child Lens must sample Red fill -> Cyan [0,255,255,255]
+        let (_iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, lens_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let ipx = iso_buf
+            .get_pixel(iso_buf.width / 2, iso_buf.height / 2)
+            .unwrap();
+        assert_eq!(
+            ipx,
+            [0, 255, 255, 255],
+            "render_isolated_object_to_rgba(frozen={frozen}) inside Red PowerClip must invert Red -> Cyan"
+        );
+
+        // 2c. Full-page vs DirtyTileCache across x=256px seam == 0 diff px
+        let vp = Viewport::for_export(768, 768, 96.0);
+        let opts = RenderOptions::export();
+        let full = render_direct_rgba(&doc, &vp, &opts);
+        let mut cache = DirtyTileCache::new(768, 768);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+        let tiled = cache.composite_to_rgba();
+        assert_eq!(
+            count_rgba_diff(&full, &tiled),
+            0,
+            "Red PowerClip Lens(frozen={frozen}) must have 0 diff px across x=256px seam"
+        );
+    }
+
+    // 3. render_isolated_object_to_rgba with explicit parent_xf=translate(50,50) on intra-group Lens over Red sibling
+    let mut gdoc = Document::new("R20 ExplicitParentXf", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let glid = gdoc.pages()[0].layers[0].id;
+    let red_sib = gdoc
+        .add_object(make_rect(0.0, 0.0, 40.0, 40.0, red), Some(glid))
+        .unwrap();
+    let mut g_lens = make_rect(10.0, 10.0, 20.0, 20.0, Color::TRANSPARENT);
+    g_lens.lens = Some(LensConfig::new(LensKind::Invert));
+    let g_lens_id = gdoc.add_object(g_lens, Some(glid)).unwrap();
+    let _grp = gdoc.group_objects(&[red_sib, g_lens_id], "SibGrp").unwrap();
+
+    let (iso_bb, iso_buf) =
+        render_isolated_object_to_rgba(&gdoc, 0, g_lens_id, Affine2D::translate(50.0, 50.0), 96.0)
+            .unwrap()
+            .unwrap();
+    assert!(
+        iso_bb.min_x > 50.0 && iso_bb.min_y > 50.0,
+        "explicit parent_xf must shift isolated bbox to ~[57..83]: {iso_bb:?}"
+    );
+    let cpx = iso_buf
+        .get_pixel(iso_buf.width / 2, iso_buf.height / 2)
+        .unwrap();
+    assert_eq!(
+        cpx,
+        [0, 255, 255, 255],
+        "render_isolated_object_to_rgba with explicit parent_xf must shift Red sibling to sample Cyan"
+    );
+}
+
+#[test]
+fn w1b_r20_symbol_connector_dag_render_and_mutually_recursive_symbols() {
+    use coree_core::{AnchorPoint, ConnectorObject, ConnectorStyle, SymbolDef, SymbolId};
+    use coree_render::{RenderOptions, SceneRenderer, TinySkiaBackend};
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+
+    let mut doc = Document::new("R20 SymRenderDAG", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. N=40 diamond Connector DAG inside SymbolDef rendered via SceneRenderer::render_document < 50ms
+    let mut sym_objs = Vec::new();
+    let base = SceneObject::new(
+        ObjectId(1),
+        "Base",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 10.0, 20.0, 20.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(blue));
+    sym_objs.push(base);
+    let mut prev_id = ObjectId(1);
+    for i in 2..=41u64 {
+        let conn = ConnectorObject::between_objects(
+            prev_id,
+            AnchorPoint::Left,
+            prev_id,
+            AnchorPoint::Right,
+            ConnectorStyle::Straight,
+        );
+        let cid = ObjectId(i);
+        sym_objs.push(
+            SceneObject::new(cid, format!("C{i}"), NodePayload::Connector(conn))
+                .with_outline(OutlineStyle::solid(Color::BLACK, 1.0)),
+        );
+        prev_id = cid;
+    }
+    let dag_sym = SymbolDef::new("DiamondDagSym", sym_objs);
+    let dag_sym_id = dag_sym.id;
+    doc.insert_symbol(dag_sym);
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "DagInst",
+            NodePayload::SymbolInstance(dag_sym_id),
+        ),
+        Some(lid),
+    )
+    .unwrap();
+
+    // 2. Mutually recursive SymbolDefs (S1 <-> S2)
+    let s1_id = SymbolId::new();
+    let s2_id = SymbolId::new();
+    doc.upsert_symbol(SymbolDef {
+        id: s1_id,
+        name: "S1".into(),
+        objects: vec![
+            SceneObject::new(
+                ObjectId(1),
+                "R1",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    50.0, 50.0, 20.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(red)),
+            SceneObject::new(ObjectId(2), "RefS2", NodePayload::SymbolInstance(s2_id)),
+        ],
+    });
+    doc.upsert_symbol(SymbolDef {
+        id: s2_id,
+        name: "S2".into(),
+        objects: vec![
+            SceneObject::new(
+                ObjectId(1),
+                "R2",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    80.0, 50.0, 20.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(green)),
+            SceneObject::new(ObjectId(2), "RefS1", NodePayload::SymbolInstance(s1_id)),
+        ],
+    });
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "RecInst", NodePayload::SymbolInstance(s1_id)),
+        Some(lid),
+    )
+    .unwrap();
+
+    let vp = Viewport::for_export(512, 512, 96.0);
+    let opts = RenderOptions::export();
+    let mut backend = TinySkiaBackend::new(512, 512).unwrap();
+    let mut renderer = SceneRenderer::new();
+    let t0 = std::time::Instant::now();
+    renderer.render_document(&doc, &vp, ViewMode::Enhanced, &opts, &mut backend);
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed.as_millis() < 50,
+        "SceneRenderer::render_document on N=40 diamond Connector DAG + S1<->S2 cycle must finish in < 50ms, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn w1b_r20_dirty_tile_cache_dependents_and_group_deform_effects() {
+    use coree_core::{
+        apply_command, AnchorPoint, ArtisticText, CommandOp, ConnectorObject, ConnectorStyle,
+        Effect, EnvelopeMode, TextOnPath, TextStyle,
+    };
+    use coree_render::{
+        convert_object_to_bitmap_with_bounds, DirtyTileCache, RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let gray = Color::rgba8(128, 128, 128, 255);
+
+    let vp = Viewport::for_export(512, 512, 96.0);
+    let opts = RenderOptions::export();
+
+    // 1. Blend target move -> mark_object_dirty(target) -> 0 diff px
+    {
+        let mut doc = Document::new("R20 BlendDirty", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let b_tgt = doc
+            .add_object(make_rect(90.0, 20.0, 25.0, 25.0, blue.clone()), Some(lid))
+            .unwrap();
+        let mut b_src = make_rect(10.0, 20.0, 25.0, 25.0, red.clone());
+        b_src.effects.push(Effect::Blend {
+            target_id: b_tgt,
+            steps: 5,
+            rotation_deg: 0.0,
+            along_path: None,
+        });
+        doc.add_object(b_src, Some(lid)).unwrap();
+
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+
+        cache.mark_object_dirty(&doc, b_tgt);
+        doc.set_object_transform(b_tgt, Affine2D::translate(0.0, 60.0))
+            .unwrap();
+        cache.mark_object_dirty(&doc, b_tgt);
+
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+        let tiled = cache.composite_to_rgba();
+        let fresh = render_direct_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_rgba_diff(&fresh, &tiled),
+            0,
+            "Moving Blend target + mark_object_dirty must yield 0 diff px"
+        );
+    }
+
+    // 2. Connector endpoint move -> mark_object_dirty(endpoint) -> 0 diff px
+    {
+        let mut doc = Document::new("R20 ConnDirty", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let s1 = doc
+            .add_object(make_rect(10.0, 10.0, 20.0, 20.0, red.clone()), Some(lid))
+            .unwrap();
+        let s2 = doc
+            .add_object(make_rect(90.0, 10.0, 20.0, 20.0, blue), Some(lid))
+            .unwrap();
+        let conn = ConnectorObject::between_objects(
+            s1,
+            AnchorPoint::Center,
+            s2,
+            AnchorPoint::Center,
+            ConnectorStyle::Straight,
+        );
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Conn", NodePayload::Connector(conn))
+                .with_outline(OutlineStyle::solid(Color::BLACK, 2.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+
+        cache.mark_object_dirty(&doc, s2);
+        doc.set_object_transform(s2, Affine2D::translate(0.0, 70.0))
+            .unwrap();
+        cache.mark_object_dirty(&doc, s2);
+
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+        let tiled = cache.composite_to_rgba();
+        let mut fresh_cache = DirtyTileCache::new(512, 512);
+        fresh_cache.render_dirty_tiles(
+            &doc,
+            &vp,
+            ViewMode::Enhanced,
+            &opts,
+            &mut SceneRenderer::new(),
+        );
+        let fresh_tiled = fresh_cache.composite_to_rgba();
+        assert_eq!(
+            count_rgba_diff(&fresh_tiled, &tiled),
+            0,
+            "Moving Connector endpoint + mark_object_dirty must match fresh DirtyTileCache with 0 diff px"
+        );
+        // Also verify old connector midpoint (50mm, 20mm) is completely cleared (white background)
+        let old_mid_x = ((50.0 / 25.4) * 96.0) as u32;
+        let old_mid_y = ((20.0 / 25.4) * 96.0) as u32;
+        assert_eq!(
+            tiled.get_pixel(old_mid_x, old_mid_y).unwrap(),
+            [255, 255, 255, 255],
+            "Old connector pixels must be cleared after moving endpoint"
+        );
+    }
+
+    // 3. TextOnPath host move -> mark_object_dirty(host) -> 0 diff px
+    {
+        let mut doc = Document::new("R20 TopDirty", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let host = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(10.0, 20.0),
+                        Point2D::new(110.0, 20.0),
+                    )),
+                )
+                .with_outline(OutlineStyle::solid(gray, 0.5)),
+                Some(lid),
+            )
+            .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Top",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("ONPATH", TextStyle::default()),
+                    path_id: host,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+
+        cache.mark_object_dirty(&doc, host);
+        doc.set_object_transform(host, Affine2D::translate(0.0, 60.0))
+            .unwrap();
+        cache.mark_object_dirty(&doc, host);
+
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+        let tiled = cache.composite_to_rgba();
+        let fresh = render_direct_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_rgba_diff(&fresh, &tiled),
+            0,
+            "Moving TextOnPath host + mark_object_dirty must yield 0 diff px"
+        );
+    }
+
+    // 4. Group with Effect::Envelope and Effect::Perspective renders ink inside deformed cage corners
+    for eff in [
+        Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(90.0, 0.0),
+                Point2D::new(90.0, 80.0),
+                Point2D::new(0.0, 80.0),
+            ],
+        },
+        Effect::Perspective {
+            quad: [
+                Point2D::new(0.0, 0.0),
+                Point2D::new(90.0, 0.0),
+                Point2D::new(90.0, 80.0),
+                Point2D::new(0.0, 80.0),
+            ],
+        },
+    ] {
+        let mut doc = Document::new("R20 GrpDeform", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let child = doc
+            .add_object(make_rect(0.0, 0.0, 40.0, 30.0, red.clone()), Some(lid))
+            .unwrap();
+        let grp = doc.group_objects(&[child], "DeformGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: eff,
+            },
+        )
+        .unwrap();
+
+        let (bmp, bb) = convert_object_to_bitmap_with_bounds(&doc, grp, 96.0).unwrap();
+        assert!(
+            bb.max_x >= 90.0 && bb.max_y >= 80.0,
+            "Group deform bounds {bb:?}"
+        );
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let mut corner_ink_px = 0usize;
+        for y in 0..bmp.height {
+            let wy = bb.min_y + (f64::from(y) + 0.5) / px_per_mm;
+            if !(60.0..=75.0).contains(&wy) {
+                continue;
+            }
+            for x in 0..bmp.width {
+                let wx = bb.min_x + (f64::from(x) + 0.5) / px_per_mm;
+                if !(60.0..=80.0).contains(&wx) {
+                    continue;
+                }
+                let idx = ((y as usize) * (bmp.width as usize) + (x as usize)) * 4;
+                if bmp.rgba_bytes[idx + 3] > 200 {
+                    corner_ink_px += 1;
+                }
+            }
+        }
+        assert!(
+            corner_ink_px > 500,
+            "Group with Envelope/Perspective must render deformed ink in expanded corner [60..80, 60..75], got {corner_ink_px} px"
+        );
+    }
+}
+
+#[test]
+fn w1b_r21_group_deform_child_features_isolated_bounds_and_sym_external_conn() {
+    use coree_core::{
+        apply_command, AnchorPoint, CommandOp, ConnectorObject, ConnectorStyle, LensConfig,
+        LensKind, SymbolDef, TableCell, TransparencyMode, VectorTable,
+    };
+    use coree_render::{
+        convert_object_to_bitmap_with_bounds, render_isolated_object_to_rgba, DirtyTileCache,
+        RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let black = Color::rgba8(0, 0, 0, 255);
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px = ((x_mm / 25.4) * 96.0) as u32;
+        let py = ((y_mm / 25.4) * 96.0) as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let cage = vec![
+        Point2D::new(0.0, 0.0),
+        Point2D::new(120.0, 0.0),
+        Point2D::new(120.0, 80.0),
+        Point2D::new(0.0, 80.0),
+    ];
+
+    // 1. challenger2-r20-2 (a): Group(Envelope | Perspective | Distort) + [Red, Lens::Invert] => Cyan [0,255,255,255]
+    for eff in [
+        Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: cage.clone(),
+        },
+        Effect::Perspective {
+            quad: [cage[0], cage[1], cage[2], cage[3]],
+        },
+        Effect::Distort {
+            kind: coree_core::DistortKind::PushPull,
+            amplitude: 5.0,
+            frequency: 2.0,
+            center: Point2D::new(60.0, 40.0),
+        },
+    ] {
+        let mut doc = Document::new("R21 GrpDeformLens", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let r = doc
+            .add_object(make_rect(10.0, 10.0, 100.0, 60.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(20.0, 20.0, 80.0, 40.0, Color::TRANSPARENT);
+        lens.lens = Some(LensConfig::new(LensKind::Invert));
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[r, l_id], "DeformLensGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: eff,
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 60.0, 40.0);
+        assert_eq!(
+            px,
+            [0, 255, 255, 255],
+            "Group deform + child Lens::Invert must invert Red -> Cyan, got {px:?}"
+        );
+    }
+
+    // 2. challenger2-r20-2 (b): Group + Envelope + child DropShadow preserves shadow ink
+    {
+        let mut doc = Document::new("R21 GrpEnvChildShadow", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut child = make_rect(10.0, 10.0, 40.0, 30.0, red.clone());
+        child.effects.push(Effect::DropShadow {
+            dx_mm: 20.0,
+            dy_mm: 20.0,
+            blur_mm: 1.0,
+            opacity: 0.9,
+            color: black.clone(),
+            feather_direction: coree_core::FeatherDirection::Middle,
+        });
+        let c_id = doc.add_object(child, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[c_id], "EnvShadowGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(80.0, 10.0),
+                        Point2D::new(80.0, 60.0),
+                        Point2D::new(10.0, 60.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(500, 500, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 70.0, 55.0);
+        assert_ne!(
+            px,
+            [255, 255, 255, 255],
+            "Group+Envelope must preserve child DropShadow ink at (70,55)mm, got {px:?}"
+        );
+    }
+
+    // 3. challenger2-r20-2 (c): Group + Envelope + child VectorTable deforms Table into cage
+    {
+        let mut doc = Document::new("R21 GrpEnvTable", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut tbl = VectorTable::new(2, 2, 20.0, 15.0);
+        tbl.cells[0] = TableCell {
+            fill: Fill::Solid(blue.clone()),
+            ..tbl.cells[0].clone()
+        };
+        tbl.cells[3] = TableCell {
+            fill: Fill::Solid(red.clone()),
+            ..tbl.cells[3].clone()
+        };
+        let t_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Tbl", NodePayload::Table(tbl))
+                    .with_transform(Affine2D::translate(10.0, 10.0)),
+                Some(lid),
+            )
+            .unwrap();
+        let grp = doc.group_objects(&[t_id], "EnvTblGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: cage.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 100.0, 65.0);
+        assert_ne!(
+            px,
+            [255, 255, 255, 255],
+            "Group+Envelope must deform child VectorTable into expanded corner (100,65)mm, got {px:?}"
+        );
+    }
+
+    // 4. challenger2-r20-2 (d): Group + Envelope + child Effect::Transparency blends properly
+    {
+        let mut doc = Document::new("R21 GrpEnvTrans", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let bg = doc
+            .add_object(make_rect(10.0, 10.0, 40.0, 30.0, blue.clone()), Some(lid))
+            .unwrap();
+        let mut fg = make_rect(10.0, 10.0, 40.0, 30.0, red.clone());
+        fg.effects.push(Effect::Transparency {
+            mode: TransparencyMode::Uniform(0.5),
+            blend_mode: BlendMode::Normal,
+        });
+        let fg_id = doc.add_object(fg, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[bg, fg_id], "EnvTransGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage,
+                },
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 60.0, 40.0);
+        assert!(
+            px[0] > 80 && px[2] > 80 && px[0] < 200,
+            "Group+Envelope+child Transparency(0.5) must blend Red over Blue, got {px:?}"
+        );
+    }
+
+    // 5. challenger2-r20-3: render_isolated_object_to_rgba on Group + Envelope (IDENTITY & translate(50,50))
+    {
+        let mut doc = Document::new("R21 IsoGrpEnv", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let child = doc
+            .add_object(make_rect(10.0, 10.0, 20.0, 20.0, red.clone()), Some(lid))
+            .unwrap();
+        let grp = doc.group_objects(&[child], "IsoEnvGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(60.0, 10.0),
+                        Point2D::new(60.0, 50.0),
+                        Point2D::new(10.0, 50.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let (bb_id, buf_id) =
+            render_isolated_object_to_rgba(&doc, 0, grp, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        assert!(
+            bb_id.max_x >= 60.0 && bb_id.max_y >= 50.0,
+            "render_isolated_object_to_rgba(IDENTITY) Group+Envelope must enclose [10..60,10..50], got {bb_id:?}"
+        );
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((50.0 - bb_id.min_x) * px_per_mm) as u32;
+        let iy = ((40.0 - bb_id.min_y) * px_per_mm) as u32;
+        assert_eq!(
+            buf_id.get_pixel(ix, iy).unwrap(),
+            [255, 0, 0, 255],
+            "Isolated Group+Envelope must render Red ink at (50,40)mm"
+        );
+
+        let (bb_tr, buf_tr) =
+            render_isolated_object_to_rgba(&doc, 0, grp, Affine2D::translate(50.0, 50.0), 96.0)
+                .unwrap()
+                .unwrap();
+        assert!(
+            bb_tr.max_x >= 110.0 && bb_tr.max_y >= 100.0,
+            "render_isolated_object_to_rgba(translate(50,50)) Group+Envelope must enclose [60..110,60..100], got {bb_tr:?}"
+        );
+        let tx = ((100.0 - bb_tr.min_x) * px_per_mm) as u32;
+        let ty = ((90.0 - bb_tr.min_y) * px_per_mm) as u32;
+        assert_eq!(
+            buf_tr.get_pixel(tx, ty).unwrap(),
+            [255, 0, 0, 255],
+            "Isolated Group+Envelope with parent_xf=translate(50,50) must render Red ink at (100,90)mm"
+        );
+    }
+
+    // 6. challenger2-r20-1 (render): convert_object_to_bitmap_with_bounds on Group at [100..160, 100..150]
+    {
+        let mut doc = Document::new("R21 FarBmp", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let child = doc
+            .add_object(make_rect(100.0, 100.0, 40.0, 30.0, red.clone()), Some(lid))
+            .unwrap();
+        let grp = doc.group_objects(&[child], "FarGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(100.0, 100.0),
+                        Point2D::new(160.0, 100.0),
+                        Point2D::new(160.0, 150.0),
+                        Point2D::new(100.0, 150.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+        let (_bmp, bb) = convert_object_to_bitmap_with_bounds(&doc, grp, 96.0).unwrap();
+        assert!(
+            bb.min_x >= 95.0 && bb.min_y >= 95.0,
+            "convert_object_to_bitmap_with_bounds for Far Group+Envelope must have min_x/y >= 95, got {bb:?}"
+        );
+    }
+
+    // 7. challenger2-r20-4 (tile cache): SymbolDef Connector to external scene object across x=256px seam
+    {
+        let mut doc = Document::new("R21 SymExtConn", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let ext_a = doc
+            .add_object(make_rect(10.0, 60.0, 10.0, 10.0, red.clone()), Some(lid))
+            .unwrap();
+        let ext_b = doc
+            .add_object(make_rect(40.0, 60.0, 10.0, 10.0, blue), Some(lid))
+            .unwrap();
+        let sym_conn = SceneObject::new(
+            ObjectId(1),
+            "ExtConn",
+            NodePayload::Connector(ConnectorObject::between_objects(
+                ext_a,
+                AnchorPoint::Center,
+                ext_b,
+                AnchorPoint::Center,
+                ConnectorStyle::Straight,
+            )),
+        )
+        .with_outline(OutlineStyle::solid(black, 1.0));
+        let sym = SymbolDef::new("ExtConnSym", vec![sym_conn]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(512, 512, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut r = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+
+        cache.mark_object_dirty(&doc, ext_b);
+        doc.set_object_transform(ext_b, Affine2D::translate(80.0, 0.0))
+            .unwrap();
+        cache.mark_object_dirty(&doc, ext_b);
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut r);
+
+        let tiled = cache.composite_to_rgba();
+        let fresh = render_direct_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_rgba_diff(&fresh, &tiled),
+            0,
+            "SymbolDef Connector to external object moved across x=256px seam must yield 0 diff px"
+        );
+    }
+
+    // 8. Reviewer 1 R20 Caveat (renderer.rs:945-949): Group(opacity=0.5)+SingleArc(base_h=200>cage_h=20) inside SymbolDef
+    {
+        let mut doc = Document::new("R21 SymGrpSingleArc", 500.0, 500.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut leaf = make_rect(0.0, 0.0, 100.0, 200.0, red);
+        leaf.id = ObjectId(1);
+        let mut grp = SceneObject::new(
+            ObjectId(2),
+            "SymArcGrp",
+            NodePayload::Group(vec![ObjectId(1)]),
+        );
+        grp.opacity = 0.5;
+        grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::SingleArc,
+            cage: vec![
+                Point2D::new(0.0, 350.0),
+                Point2D::new(100.0, 350.0),
+                Point2D::new(100.0, 370.0),
+                Point2D::new(0.0, 370.0),
+            ],
+        });
+        let sym = SymbolDef::new("SymIsoArc", vec![leaf, grp]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "SymIsoInst",
+                NodePayload::SymbolInstance(sym_id),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 1600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let apex_px = sample_mm(&buf, 50.0, 338.0);
+        assert_ne!(
+            apex_px,
+            [255, 255, 255, 255],
+            "Isolated Group(opacity=0.5)+SingleArc inside SymbolDef must render apex ink at (50,338)mm, got {apex_px:?}"
+        );
+    }
+}
+
+#[test]
+fn w1b_r22_deformed_group_offscreen_lens_remove_face_tile_seams_and_isolated_bounds() {
+    use coree_core::{
+        apply_command, AnchorPoint, CommandOp, ConnectorObject, ConnectorStyle, DimensionKind,
+        DimensionObject, LensConfig, LensKind, SymbolDef, TableCell, VectorTable,
+    };
+    use coree_render::{
+        render_isolated_object_to_rgba, DirtyTileCache, RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let black = Color::rgba8(0, 0, 0, 255);
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px = ((x_mm / 25.4) * 96.0) as u32;
+        let py = ((y_mm / 25.4) * 96.0) as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let shifted_cage = vec![
+        Point2D::new(80.0, 80.0),
+        Point2D::new(140.0, 80.0),
+        Point2D::new(140.0, 140.0),
+        Point2D::new(80.0, 140.0),
+    ];
+
+    // 1. Shifted Group(Envelope) + [Red, Lens::Invert] in render_isolated_object_to_rgba & OuterGroup(opacity=0.5)
+    {
+        let mut doc = Document::new("R22 Iso & OuterOp", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let r = doc
+            .add_object(make_rect(10.0, 10.0, 40.0, 40.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(10.0, 10.0, 40.0, 40.0, Color::TRANSPARENT);
+        lens.lens = Some(LensConfig::new(LensKind::Invert));
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[r, l_id], "ShiftedEnvLens").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: shifted_cage.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+        // 1a. render_isolated_object_to_rgba -> Cyan [0, 255, 255, 255] at (110, 110)mm
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, grp, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((110.0 - iso_bb.min_x) * px_per_mm) as u32;
+        let iy = ((110.0 - iso_bb.min_y) * px_per_mm) as u32;
+        assert_eq!(
+            iso_buf.get_pixel(ix, iy).unwrap(),
+            [0, 255, 255, 255],
+            "render_isolated_object_to_rgba on shifted Group(Envelope)+[Red,Lens::Invert] must render Cyan"
+        );
+
+        // 1b. OuterGroup(opacity=0.5) -> ~[128, 255, 255, 255]
+        let outer = doc.group_objects(&[grp], "OuterOp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetOpacity {
+                ids: vec![outer],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 110.0, 110.0);
+        assert!(
+            px[0].abs_diff(128) <= 3 && px[1] >= 252 && px[2] >= 252,
+            "OuterGroup(opacity=0.5)->Group(Envelope)+[Red,Lens::Invert] must blend Cyan over White (~128,255,255), got {px:?}"
+        );
+    }
+
+    // 2. Group(opacity=0.5, Envelope) + PowerClip(Red) -> Lens::Invert
+    {
+        let mut doc = Document::new("R22 EnvOpPowerClip", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let cont = doc
+            .add_object(make_rect(10.0, 10.0, 40.0, 40.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(10.0, 10.0, 40.0, 40.0, Color::TRANSPARENT);
+        lens.lens = Some(LensConfig::new(LensKind::Invert));
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let pc = doc.create_powerclip(cont, &[l_id]).unwrap();
+        let grp = doc.group_objects(&[pc], "EnvOpPCGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetOpacity {
+                ids: vec![grp],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: shifted_cage.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let px = sample_mm(&buf, 110.0, 110.0);
+        assert!(
+            px[0].abs_diff(128) <= 3 && px[1] >= 252 && px[2] >= 252,
+            "Group(opacity=0.5,Envelope)+PowerClip(Red)->Lens::Invert must render ~[128,255,255], got {px:?}"
+        );
+    }
+
+    // 3. Direct render_document on shifted Group(Envelope)+[Red, Lens::Invert(remove_face=true)]
+    {
+        let mut doc = Document::new("R22 RemoveFace", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let r = doc
+            .add_object(make_rect(10.0, 10.0, 40.0, 40.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(10.0, 10.0, 40.0, 40.0, Color::TRANSPARENT);
+        let mut cfg = LensConfig::new(LensKind::Invert);
+        cfg.remove_face = true;
+        lens.lens = Some(cfg);
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[r, l_id], "RmFaceGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: shifted_cage.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        assert_eq!(
+            sample_mm(&buf, 110.0, 110.0),
+            [0, 255, 255, 255],
+            "remove_face=true inside shifted Group(Envelope) must invert deformed Red -> Cyan"
+        );
+    }
+
+    // 4. DirtyTileCache Lens::frozen=true & Lens::Magnify(2x) across x=256px seam (0 diff px)
+    for kind in [
+        ("FrozenInvert", true, LensKind::Invert),
+        ("Magnify2x", false, LensKind::Magnify { amount: 2.0 }),
+    ] {
+        let mut doc = Document::new(kind.0, 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let r = doc
+            .add_object(make_rect(10.0, 10.0, 40.0, 50.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(10.0, 10.0, 40.0, 50.0, Color::TRANSPARENT);
+        let mut cfg = LensConfig::new(kind.2);
+        cfg.frozen = kind.1;
+        lens.lens = Some(cfg);
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[r, l_id], "TileSeamLensGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(130.0, 10.0),
+                        Point2D::new(130.0, 90.0),
+                        Point2D::new(10.0, 90.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(512, 512, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut sr = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut sr);
+        let tiled = cache.composite_to_rgba();
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_rgba_diff(&direct, &tiled),
+            0,
+            "{}: DirtyTileCache vs direct render across x=256px must have 0 diff px",
+            kind.0
+        );
+    }
+
+    // 5. Nested deformed Group: OuterGroup(Envelope1)->InnerGroup(Envelope2)->[Red, Lens::Invert]
+    {
+        let mut doc = Document::new("R22 NestedDeformLens", 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let r = doc
+            .add_object(make_rect(10.0, 10.0, 20.0, 20.0, red.clone()), Some(lid))
+            .unwrap();
+        let mut lens = make_rect(10.0, 10.0, 20.0, 20.0, Color::TRANSPARENT);
+        lens.lens = Some(LensConfig::new(LensKind::Invert));
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let inner = doc.group_objects(&[r, l_id], "InnerEnv").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: inner,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(50.0, 10.0),
+                        Point2D::new(50.0, 50.0),
+                        Point2D::new(10.0, 50.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+        let outer = doc.group_objects(&[inner], "OuterEnv").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: outer,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: shifted_cage,
+                },
+            },
+        )
+        .unwrap();
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, outer, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((110.0 - iso_bb.min_x) * px_per_mm) as u32;
+        let iy = ((110.0 - iso_bb.min_y) * px_per_mm) as u32;
+        assert_eq!(
+            iso_buf.get_pixel(ix, iy).unwrap(),
+            [0, 255, 255, 255],
+            "Nested deformed Groups + Lens::Invert in render_isolated_object_to_rgba must render Cyan"
+        );
+    }
+
+    // 6. Group(Envelope)->SubGrp(opacity=0.5 | Multiply)->Leaf(DropShadow dx=-20) crossing x=256px (0 diff px)
+    for (label, opacity, blend) in [
+        ("Opacity0.5", 0.5_f32, BlendMode::Normal),
+        ("Multiply", 1.0_f32, BlendMode::Multiply),
+    ] {
+        let mut doc = Document::new(label, 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let bg = doc
+            .add_object(make_rect(40.0, 20.0, 70.0, 50.0, green.clone()), Some(lid))
+            .unwrap();
+        let mut leaf = make_rect(72.0, 20.0, 30.0, 30.0, red.clone());
+        leaf.effects.push(Effect::DropShadow {
+            dx_mm: -20.0,
+            dy_mm: 0.0,
+            blur_mm: 2.0,
+            opacity: 0.85,
+            color: black.clone(),
+            feather_direction: coree_core::FeatherDirection::Middle,
+        });
+        let leaf_id = doc.add_object(leaf, Some(lid)).unwrap();
+        let sub_grp = doc.group_objects(&[leaf_id], "SubIsoGrp").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetOpacity {
+                ids: vec![sub_grp],
+                opacity,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetBlendMode {
+                ids: vec![sub_grp],
+                blend_mode: blend,
+            },
+        )
+        .unwrap();
+        let outer = doc.group_objects(&[bg, sub_grp], "OuterEnvShadow").unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: outer,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(40.0, 20.0),
+                        Point2D::new(110.0, 20.0),
+                        Point2D::new(110.0, 70.0),
+                        Point2D::new(40.0, 70.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(512, 512, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(512, 512);
+        let mut sr = SceneRenderer::new();
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut sr);
+        let tiled = cache.composite_to_rgba();
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_rgba_diff(&direct, &tiled),
+            0,
+            "Group(Envelope)->SubGrp({label})->Leaf(DropShadow dx=-20) across x=256px must have 0 diff px"
+        );
+    }
+
+    // 7. render_isolated_object_to_rgba on deformed Table, Dimension, and SymbolInstance(Group+Envelope)
+    {
+        let mut doc = Document::new(
+            "R22 IsoDeformedPayloads",
+            300.0,
+            300.0,
+            ColorMode::Rgb,
+            96.0,
+        );
+        let lid = doc.pages()[0].layers[0].id;
+        let rot_tr = Affine2D::translate(50.0, 50.0).compose(&Affine2D::rotate_deg(30.0));
+
+        // 7a. Table(20x20) + Envelope([0..60, 0..50])
+        let mut tbl = VectorTable::new(2, 2, 10.0, 10.0);
+        for cell in &mut tbl.cells {
+            *cell = TableCell {
+                fill: Fill::Solid(red.clone()),
+                ..cell.clone()
+            };
+        }
+        let mut tbl_obj = SceneObject::new(ObjectId(0), "DeformTable", NodePayload::Table(tbl));
+        tbl_obj.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(60.0, 0.0),
+                Point2D::new(60.0, 50.0),
+                Point2D::new(0.0, 50.0),
+            ],
+        });
+        let tbl_id = doc.add_object(tbl_obj, Some(lid)).unwrap();
+        let (t_id_bb, _) =
+            render_isolated_object_to_rgba(&doc, 0, tbl_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        assert!(
+            t_id_bb.max_x >= 60.0 && t_id_bb.max_y >= 50.0,
+            "Isolated deformed Table(IDENTITY) must enclose [0..60,0..50], got {t_id_bb:?}"
+        );
+        let exp_t_corner = rot_tr.transform_point(Point2D::new(60.0, 50.0));
+        let (t_rot_bb, _) = render_isolated_object_to_rgba(&doc, 0, tbl_id, rot_tr, 96.0)
+            .unwrap()
+            .unwrap();
+        assert!(
+            t_rot_bb.contains_point(exp_t_corner),
+            "Isolated deformed Table(translate*rotate) {t_rot_bb:?} must enclose {exp_t_corner:?}"
+        );
+
+        // 7b. Dimension + Envelope([10..70, 5..60])
+        let mut dim_obj = SceneObject::new(
+            ObjectId(0),
+            "DeformDim",
+            NodePayload::Dimension(DimensionObject::linear(
+                DimensionKind::Horizontal,
+                Point2D::new(10.0, 10.0),
+                Point2D::new(20.0, 10.0),
+                5.0,
+            )),
+        );
+        dim_obj.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(10.0, 5.0),
+                Point2D::new(70.0, 5.0),
+                Point2D::new(70.0, 60.0),
+                Point2D::new(10.0, 60.0),
+            ],
+        });
+        let dim_id = doc.add_object(dim_obj, Some(lid)).unwrap();
+        let (d_id_bb, _) =
+            render_isolated_object_to_rgba(&doc, 0, dim_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        assert!(
+            d_id_bb.max_x >= 70.0 && d_id_bb.max_y >= 60.0,
+            "Isolated deformed Dimension(IDENTITY) must enclose [10..70,5..60], got {d_id_bb:?}"
+        );
+        let exp_d_corner = rot_tr.transform_point(Point2D::new(70.0, 60.0));
+        let (d_rot_bb, _) = render_isolated_object_to_rgba(&doc, 0, dim_id, rot_tr, 96.0)
+            .unwrap()
+            .unwrap();
+        assert!(
+            d_rot_bb.contains_point(exp_d_corner),
+            "Isolated deformed Dimension(translate*rotate) {d_rot_bb:?} must enclose {exp_d_corner:?}"
+        );
+
+        // 7c. SymbolInstance(Group([10..30, 10..30]) + Envelope([10..60, 10..50]))
+        let mut sym_leaf = make_rect(10.0, 10.0, 20.0, 20.0, blue);
+        sym_leaf.id = ObjectId(201);
+        let mut sym_grp = SceneObject::new(
+            ObjectId(202),
+            "SymEnvGrp",
+            NodePayload::Group(vec![ObjectId(201)]),
+        );
+        sym_grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(10.0, 10.0),
+                Point2D::new(60.0, 10.0),
+                Point2D::new(60.0, 50.0),
+                Point2D::new(10.0, 50.0),
+            ],
+        });
+        let sym = SymbolDef::new("IsoDeformSym", vec![sym_leaf, sym_grp]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "IsoDeformSymInst",
+                    NodePayload::SymbolInstance(sym_id),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        let (s_id_bb, s_id_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        assert!(
+            s_id_bb.max_x >= 60.0 && s_id_bb.max_y >= 50.0,
+            "Isolated SymbolInstance(Group+Envelope)(IDENTITY) must enclose [10..60,10..50], got {s_id_bb:?}"
+        );
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let sx = ((50.0 - s_id_bb.min_x) * px_per_mm) as u32;
+        let sy = ((40.0 - s_id_bb.min_y) * px_per_mm) as u32;
+        assert_eq!(
+            s_id_buf.get_pixel(sx, sy).unwrap(),
+            [0, 0, 255, 255],
+            "Isolated SymbolInstance(Group+Envelope) must render Blue ink at deformed (50,40)mm"
+        );
+        let exp_s_corner = rot_tr.transform_point(Point2D::new(60.0, 50.0));
+        let (s_rot_bb, _) = render_isolated_object_to_rgba(&doc, 0, inst, rot_tr, 96.0)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s_rot_bb.contains_point(exp_s_corner),
+            "Isolated SymbolInstance(Group+Envelope)(translate*rotate) {s_rot_bb:?} must enclose {exp_s_corner:?}"
+        );
+    }
+
+    // 8. reviewer-r21-2: compute_children_local_bounds inside SymbolDef Group(opacity=0.5, SingleArc) with Connector
+    {
+        let mut doc = Document::new("R22 SymGrpConnArc", 500.0, 500.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut a = make_rect(0.0, 0.0, 10.0, 10.0, red.clone());
+        a.id = ObjectId(101);
+        let mut b = make_rect(90.0, 190.0, 10.0, 10.0, red);
+        b.id = ObjectId(102);
+        let mut conn = SceneObject::new(
+            ObjectId(103),
+            "SymArcConn",
+            NodePayload::Connector(ConnectorObject::between_objects(
+                ObjectId(101),
+                AnchorPoint::Center,
+                ObjectId(102),
+                AnchorPoint::Center,
+                ConnectorStyle::Straight,
+            )),
+        )
+        .with_outline(OutlineStyle::solid(black, 2.0));
+        conn.id = ObjectId(103);
+        let mut grp = SceneObject::new(
+            ObjectId(104),
+            "SymArcConnGrp",
+            NodePayload::Group(vec![ObjectId(101), ObjectId(102), ObjectId(103)]),
+        );
+        grp.opacity = 0.5;
+        grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::SingleArc,
+            cage: vec![
+                Point2D::new(0.0, 350.0),
+                Point2D::new(100.0, 350.0),
+                Point2D::new(100.0, 370.0),
+                Point2D::new(0.0, 370.0),
+            ],
+        });
+        let sym = SymbolDef::new("SymConnArc", vec![a, b, conn, grp]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "SymConnArcInst",
+                NodePayload::SymbolInstance(sym_id),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+        let vp = Viewport::for_export(600, 1600, 96.0);
+        let buf = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        let mid_px = sample_mm(&buf, 50.0, 360.0);
+        assert_ne!(
+            mid_px,
+            [255, 255, 255, 255],
+            "SymbolDef Group(opacity=0.5,SingleArc) with Connector must render deformed ink, got {mid_px:?}"
+        );
+    }
+}
+
+#[test]
+fn w1b_r23_symbol_lens_backdrop_scaled_distort_tiles_connector_effects_and_top_parent_xf() {
+    use coree_core::{
+        AnchorPoint, BlendMode, ConnectorObject, ConnectorStyle, DistortKind, EnvelopeMode,
+        LensConfig, LensKind, ParametricShape, TextOnPath,
+    };
+    use coree_render::{
+        convert_object_to_bitmap_with_bounds, render_isolated_object_to_rgba, DirtyTileCache,
+        RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let black = Color::BLACK;
+
+    let make_rect = |x: f64, y: f64, w: f64, h: f64, fill: Color| -> SceneObject {
+        SceneObject::new(
+            ObjectId(0),
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+
+    let render_direct_rgba =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut r = SceneRenderer::new();
+            let mut b = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+            r.render_document(doc, vp, ViewMode::Enhanced, opts, &mut b);
+            b.into_rgba()
+        };
+
+    let render_tiled_rgba =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+            cache.mark_all_dirty();
+            let mut r = SceneRenderer::new();
+            cache.render_viewport(doc, vp, ViewMode::Enhanced, opts, &mut r)
+        };
+
+    let count_diff = |a: &coree_render::RgbaBuffer, b: &coree_render::RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(p, q)| p != q)
+            .count()
+    };
+
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let px = (x_mm * px_per_mm).round() as u32;
+        let py = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let ink_bbox_mm = |bb: Rect2D, buf: &coree_render::RgbaBuffer| -> Option<Rect2D> {
+        let px_per_mm_x = f64::from(buf.width) / bb.width().max(1e-6);
+        let px_per_mm_y = f64::from(buf.height) / bb.height().max(1e-6);
+        let mut acc: Option<Rect2D> = None;
+        for y in 0..buf.height {
+            for x in 0..buf.width {
+                if buf.get_pixel(x, y).unwrap()[3] > 20 {
+                    let mx = bb.min_x + (f64::from(x) + 0.5) / px_per_mm_x;
+                    let my = bb.min_y + (f64::from(y) + 0.5) / px_per_mm_y;
+                    let pt_r = Rect2D::new(mx, my, mx, my);
+                    acc = Some(match acc {
+                        Some(prev) => prev.union(pt_r),
+                        None => pt_r,
+                    });
+                }
+            }
+        }
+        acc
+    };
+
+    // 1. challenger2-r22-1 + R2 minors: SymbolInstance + Lens (flat & Group(Envelope), frozen, remove_face, opacity, Magnify)
+    for use_deformed_group in [false, true] {
+        for &(frozen, remove_face, lens_op, is_magnify) in &[
+            (true, false, 1.0_f32, false),
+            (false, true, 1.0_f32, false),
+            (false, false, 0.5_f32, false),
+            (false, false, 1.0_f32, true),
+        ] {
+            let mut doc = Document::new("R23 SymLens", 300.0, 300.0, ColorMode::Rgb, 96.0);
+            let lid = doc.pages()[0].layers[0].id;
+            let mut bg_red = make_rect(10.0, 10.0, 40.0, 40.0, red.clone());
+            bg_red.id = ObjectId(101);
+            let lens_kind = if is_magnify {
+                LensKind::Magnify { amount: 2.0 }
+            } else {
+                LensKind::Invert
+            };
+            let mut lens_obj = SceneObject::new(
+                ObjectId(102),
+                "SymLens",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(30.0, 10.0));
+            lens_obj.opacity = lens_op;
+            lens_obj.lens = Some(LensConfig {
+                kind: lens_kind,
+                frozen,
+                viewpoint: None,
+                remove_face,
+            });
+            let objs = if use_deformed_group {
+                let mut grp = SceneObject::new(
+                    ObjectId(103),
+                    "SymDefGrp",
+                    NodePayload::Group(vec![ObjectId(101), ObjectId(102)]),
+                );
+                grp.effects.push(Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(120.0, 10.0),
+                        Point2D::new(120.0, 90.0),
+                        Point2D::new(10.0, 90.0),
+                    ],
+                });
+                vec![bg_red, lens_obj, grp]
+            } else {
+                vec![bg_red, lens_obj]
+            };
+            let sym = SymbolDef::new("LensSym", objs);
+            let sym_id = sym.id;
+            doc.insert_symbol(sym);
+            let inst = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        "LensSymInst",
+                        NodePayload::SymbolInstance(sym_id),
+                    ),
+                    Some(lid),
+                )
+                .unwrap();
+
+            // Sample point inside overlap (both Red & Lens) and lens-only region (outside Red)
+            let (ov_x, ov_y, empty_x, empty_y) = if use_deformed_group {
+                (65.0, 50.0, 105.0, 50.0)
+            } else {
+                (40.0, 30.0, 60.0, 30.0)
+            };
+
+            let vp = Viewport::for_export(600, 600, 96.0);
+            let opts = RenderOptions::export();
+            let direct = render_direct_rgba(&doc, &vp, &opts);
+            let tiled = render_tiled_rgba(&doc, &vp, &opts);
+            let diff = count_diff(&direct, &tiled);
+            assert_eq!(
+                diff, 0,
+                "SymbolInstance(def_grp={use_deformed_group}, frozen={frozen}, rm={remove_face}, op={lens_op}, mag={is_magnify}) DirtyTileCache diff must be 0, got {diff}"
+            );
+
+            let (iso_bb, iso_buf) =
+                render_isolated_object_to_rgba(&doc, 0, inst, Affine2D::IDENTITY, 96.0)
+                    .unwrap()
+                    .unwrap();
+            let ix = ((ov_x - iso_bb.min_x) / iso_bb.width() * f64::from(iso_buf.width)) as u32;
+            let iy = ((ov_y - iso_bb.min_y) / iso_bb.height() * f64::from(iso_buf.height)) as u32;
+            let iso_px = iso_buf.get_pixel(ix, iy).unwrap();
+            let dir_px = sample_mm(&direct, ov_x, ov_y);
+
+            if is_magnify {
+                assert_eq!(
+                    dir_px,
+                    [255, 0, 0, 255],
+                    "SymbolInstance Magnify overlap must be Red"
+                );
+                assert_eq!(
+                    iso_px,
+                    [255, 0, 0, 255],
+                    "Isolated SymbolInstance Magnify overlap must be Red"
+                );
+            } else if (lens_op - 0.5).abs() < 0.05 {
+                // 50%-opaque Cyan [0, 255, 255] over Red [255, 0, 0] inside SymbolInstance = [128, 128, 128, 255]
+                assert_eq!(dir_px, [128, 128, 128, 255]);
+                assert_eq!(iso_px, [128, 128, 128, 255]);
+            } else {
+                assert_eq!(
+                    dir_px,
+                    [0, 255, 255, 255],
+                    "SymbolInstance Invert(frozen={frozen}, rm={remove_face}) overlap must be Cyan"
+                );
+                assert_eq!(
+                    iso_px,
+                    [0, 255, 255, 255],
+                    "Isolated SymbolInstance Invert(frozen={frozen}, rm={remove_face}) overlap must be Cyan"
+                );
+                if remove_face {
+                    // Empty area under lens (outside Red) must remain transparent/white page, not inverted black!
+                    let empty_dir = sample_mm(&direct, empty_x, empty_y);
+                    assert_eq!(
+                        empty_dir,
+                        [255, 255, 255, 255],
+                        "remove_face=true outside Red must preserve white page"
+                    );
+                    let ex = ((empty_x - iso_bb.min_x) / iso_bb.width() * f64::from(iso_buf.width))
+                        as u32;
+                    let ey = ((empty_y - iso_bb.min_y) / iso_bb.height()
+                        * f64::from(iso_buf.height)) as u32;
+                    assert_eq!(
+                        iso_buf.get_pixel(ex, ey).unwrap()[3],
+                        0,
+                        "Isolated remove_face=true outside Red must have alpha=0"
+                    );
+                }
+            }
+
+            if !use_deformed_group && frozen {
+                let (bmp, _) = convert_object_to_bitmap_with_bounds(&doc, inst, 96.0).unwrap();
+                assert!(
+                    bmp.rgba_bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|p| p == &[0, 255, 255, 255]),
+                    "convert_object_to_bitmap on SymbolInstance(frozen Lens) must contain Cyan"
+                );
+            }
+        }
+    }
+
+    // 1b. SymbolInstance wrapping Group(opacity=0.5, Envelope) + [Red, Invert] (render_isolated_object_to_rgba + DirtyTileCache)
+    {
+        let mut doc = Document::new("R23 SymGrpOp05Lens", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut bg_red = make_rect(10.0, 10.0, 40.0, 40.0, red.clone());
+        bg_red.id = ObjectId(301);
+        let mut lens_obj = SceneObject::new(
+            ObjectId(302),
+            "SymGrpLens",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 40.0,
+                height: 40.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(30.0, 10.0));
+        lens_obj.lens = Some(LensConfig::new(LensKind::Invert));
+        let mut grp = SceneObject::new(
+            ObjectId(303),
+            "SymOp05EnvGrp",
+            NodePayload::Group(vec![ObjectId(301), ObjectId(302)]),
+        );
+        grp.opacity = 0.5;
+        grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(10.0, 10.0),
+                Point2D::new(120.0, 10.0),
+                Point2D::new(120.0, 90.0),
+                Point2D::new(10.0, 90.0),
+            ],
+        });
+        let sym = SymbolDef::new("SymOp05Lens", vec![bg_red, lens_obj, grp]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "SymOp05LensInst",
+                    NodePayload::SymbolInstance(sym_id),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        let vp = Viewport::for_export(600, 600, 96.0);
+        let opts = RenderOptions::export();
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        assert_eq!(sample_mm(&direct, 65.0, 50.0), [128, 255, 255, 255]);
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let ix = ((65.0 - iso_bb.min_x) / iso_bb.width() * f64::from(iso_buf.width)) as u32;
+        let iy = ((50.0 - iso_bb.min_y) / iso_bb.height() * f64::from(iso_buf.height)) as u32;
+        assert_eq!(iso_buf.get_pixel(ix, iy).unwrap(), [0, 255, 255, 128]);
+    }
+
+    // 2. challenger2-r22-2: 10x scaled PushPull Distort & off-center Twister in DirtyTileCache (0 diff px)
+    for distort_kind in [DistortKind::PushPull, DistortKind::Twister] {
+        let mut doc = Document::new("R23 ScaledDistortTiles", 800.0, 800.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut leaf = make_rect(4.0, 4.0, 4.0, 4.0, red.clone());
+        leaf.effects.push(Effect::Distort {
+            kind: distort_kind,
+            amplitude: if matches!(distort_kind, DistortKind::PushPull) {
+                50.0
+            } else {
+                15.0
+            },
+            frequency: 4.0,
+            center: if matches!(distort_kind, DistortKind::PushPull) {
+                Point2D::new(6.0, 6.0)
+            } else {
+                Point2D::new(-4.0, 6.0)
+            },
+        });
+        let leaf_id = doc.add_object(leaf, Some(lid)).unwrap();
+        let grp = doc.group_objects(&[leaf_id], "ScaledDistortGrp").unwrap();
+        doc.set_object_transform(grp, Affine2D::scale(10.0, 10.0))
+            .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::SetOpacity {
+                ids: vec![grp],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(800, 800, 96.0);
+        let opts = RenderOptions::export();
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        let big_diffs: Vec<_> = direct
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(tiled.rgba.as_chunks::<4>().0.iter())
+            .enumerate()
+            .filter(|(_, (p, q))| p.iter().zip(q.iter()).any(|(&a, &b)| a.abs_diff(b) > 16))
+            .collect();
+        assert_eq!(
+            big_diffs.len(),
+            0,
+            "10x scaled Distort({distort_kind:?}) DirtyTileCache across 800x800 tiles must have 0 dropped/mismatched (>16 LSB) pixels, got {} (first={:?})",
+            big_diffs.len(),
+            big_diffs.first()
+        );
+    }
+
+    // 3. challenger2-r22-3: Standalone Connector honors obj.effects (Envelope)
+    {
+        let mut doc = Document::new("R23 ConnEffects", 120.0, 100.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut conn = ConnectorObject::between_objects(
+            ObjectId(999),
+            AnchorPoint::Center,
+            ObjectId(999),
+            AnchorPoint::Center,
+            ConnectorStyle::Straight,
+        );
+        conn.from_obj = None;
+        conn.to_obj = None;
+        conn.from_fallback = Point2D::new(10.0, 15.0);
+        conn.to_fallback = Point2D::new(30.0, 25.0);
+        let mut conn_obj = SceneObject::new(ObjectId(0), "EnvConn", NodePayload::Connector(conn))
+            .with_outline(OutlineStyle::solid(blue, 2.0));
+        conn_obj.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(10.0, 10.0),
+                Point2D::new(90.0, 10.0),
+                Point2D::new(90.0, 70.0),
+                Point2D::new(10.0, 70.0),
+            ],
+        });
+        let conn_id = doc.add_object(conn_obj, Some(lid)).unwrap();
+
+        let vp = Viewport::for_export(454, 378, 96.0);
+        let direct = render_direct_rgba(&doc, &vp, &RenderOptions::export());
+        // Diagonal (10,15)->(30,25) mapped into [10..90, 10..70] lands on (10,10)->(90,70), passing through (50,40)!
+        assert_eq!(
+            sample_mm(&direct, 50.0, 40.0),
+            [0, 0, 255, 255],
+            "Standalone Connector+Envelope must render deformed blue ink at (50,40)mm"
+        );
+        assert_eq!(
+            sample_mm(&direct, 20.0, 20.0),
+            [255, 255, 255, 255],
+            "Standalone Connector+Envelope must not render at undeformed (20,20)mm"
+        );
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, conn_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let ink = ink_bbox_mm(iso_bb, &iso_buf).unwrap();
+        assert!(
+            ink.min_x < 12.0 && ink.max_x > 85.0 && ink.min_y < 12.0 && ink.max_y > 65.0,
+            "Isolated standalone Connector+Envelope ink bbox {ink:?} must span deformed [10..90, 10..70]"
+        );
+    }
+
+    // 4. challenger2-r22-4: Standalone TextOnPath with non-identity parent_xf in render_isolated_object_to_rgba
+    {
+        let mut doc = Document::new("R23 TopParentXf", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let host = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(10.0, 20.0),
+                        Point2D::new(70.0, 20.0),
+                    )),
+                )
+                .with_outline(OutlineStyle::none()),
+                Some(lid),
+            )
+            .unwrap();
+        let mut top_obj = SceneObject::new(
+            ObjectId(0),
+            "EnvTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain(
+                    "HELLO",
+                    TextStyle {
+                        font_size_pt: 24.0,
+                        fill: black,
+                        ..TextStyle::default()
+                    },
+                ),
+                path_id: host,
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        top_obj.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(10.0, 10.0),
+                Point2D::new(90.0, 10.0),
+                Point2D::new(90.0, 70.0),
+                Point2D::new(10.0, 70.0),
+            ],
+        });
+        let top_id = doc.add_object(top_obj, Some(lid)).unwrap();
+
+        let rot_tr = Affine2D::translate(50.0, 50.0).compose(&Affine2D::rotate_deg(30.0));
+        let (rot_bb, rot_buf) = render_isolated_object_to_rgba(&doc, 0, top_id, rot_tr, 96.0)
+            .unwrap()
+            .unwrap();
+        let rot_ink = ink_bbox_mm(rot_bb, &rot_buf).expect("non-empty rotated TextOnPath ink");
+        let exp_cage = rot_tr
+            .try_transform_rect(Rect2D::from_xywh(10.0, 10.0, 80.0, 60.0))
+            .unwrap();
+        assert!(
+            rot_ink.min_x >= exp_cage.min_x - 2.0
+                && rot_ink.min_y >= exp_cage.min_y - 2.0
+                && rot_ink.max_x <= exp_cage.max_x + 2.0
+                && rot_ink.max_y <= exp_cage.max_y + 2.0,
+            "Standalone TextOnPath+Envelope under parent_xf={rot_tr:?} ink {rot_ink:?} must lie inside transformed cage {exp_cage:?}"
+        );
+        assert!(
+            rot_ink.min_x > 20.0 && rot_ink.min_y > 55.0,
+            "Standalone TextOnPath+Envelope under parent_xf must be translated+rotated (not left at [10..90,10..70]): {rot_ink:?}"
+        );
+
+        // Also test undeformed TextOnPath under non-identity parent_xf
+        let plain_top_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "PlainTOP",
+                    NodePayload::TextOnPath(TextOnPath {
+                        text: ArtisticText::from_plain(
+                            "WORLD",
+                            TextStyle {
+                                font_size_pt: 20.0,
+                                fill: Color::BLACK,
+                                ..TextStyle::default()
+                            },
+                        ),
+                        path_id: host,
+                        offset_mm: 0.0,
+                        distance_mm: 0.0,
+                        flip_vertical: false,
+                        flip_horizontal: false,
+                    }),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        let (p_rot_bb, p_rot_buf) =
+            render_isolated_object_to_rgba(&doc, 0, plain_top_id, rot_tr, 96.0)
+                .unwrap()
+                .unwrap();
+        let p_rot_ink = ink_bbox_mm(p_rot_bb, &p_rot_buf).expect("non-empty plain rotated TOP ink");
+        assert!(
+            p_rot_ink.min_x > 35.0 && p_rot_ink.min_y > 50.0,
+            "Standalone undeformed TextOnPath under parent_xf must transform ink into {p_rot_bb:?}, got {p_rot_ink:?}"
+        );
+    }
+
+    // Suppress unused BlendMode import if needed by verifying lens blend mode compatibility
+    let _ = BlendMode::Normal;
+}
+
+#[test]
+fn w1b_r24_frozen_lens_key_isolation_for_symbols_zero_ids_and_symmetry() {
+    use coree_core::{LensConfig, LensKind, ParametricShape, SymbolDef};
+    use coree_render::{DirtyTileCache, RenderOptions, SceneRenderer};
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: &Color| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill.clone()))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+
+    let render_direct_rgba =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut r = SceneRenderer::new();
+            let mut b = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+            r.render_document(doc, vp, ViewMode::Enhanced, opts, &mut b);
+            b.into_rgba()
+        };
+
+    let render_tiled_rgba =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+            cache.mark_all_dirty();
+            let mut r = SceneRenderer::new();
+            cache.render_viewport(doc, vp, ViewMode::Enhanced, opts, &mut r)
+        };
+
+    let count_diff = |a: &coree_render::RgbaBuffer, b: &coree_render::RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(p, q)| p != q)
+            .count()
+    };
+
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let px = (x_mm * px_per_mm).round() as u32;
+        let py = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let opts = RenderOptions::export();
+    // 520x260px at 96 DPI spans two 256px tile columns (seam at ~67.73mm)
+    let vp = Viewport::for_export(520, 260, 96.0);
+
+    // 1. Two SymbolInstances of the same SymbolDef containing a frozen Lens (ObjectId(77))
+    // positioned over Red (crossing x=256px seam) and Green (in second tile column)
+    {
+        let mut doc = Document::new("TwoSymInstFrozen", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 5.0, 5.0, 75.0, 50.0, &red),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            make_rect(ObjectId(0), 85.0, 5.0, 45.0, 50.0, &green),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut sym_lens = make_rect(ObjectId(77), 0.0, 0.0, 30.0, 30.0, &Color::TRANSPARENT);
+        sym_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let sym = SymbolDef::new("FrozenLensSym", vec![sym_lens]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Inst1", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(52.0, 15.0)),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Inst2", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(92.0, 15.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_diff(&direct, &tiled),
+            0,
+            "Two SymbolInstances with frozen lens must produce 0 diff px between render_document and DirtyTileCache"
+        );
+        // Inst1 over Red -> Cyan [0, 255, 255, 255] on both sides of x=256px seam (67.73mm)
+        assert_eq!(sample_mm(&direct, 60.0, 30.0), [0, 255, 255, 255]);
+        assert_eq!(sample_mm(&direct, 72.0, 30.0), [0, 255, 255, 255]);
+        // Inst2 over Green -> Magenta [255, 0, 255, 255]
+        assert_eq!(sample_mm(&direct, 105.0, 30.0), [255, 0, 255, 255]);
+    }
+
+    // 2. Two ObjectId(0) frozen:true lenses inside a single SymbolDef over Red and Blue
+    {
+        let mut doc = Document::new("TwoZeroIdFrozenInSym", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 5.0, 5.0, 50.0, 50.0, &red),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            make_rect(ObjectId(0), 65.0, 5.0, 50.0, 50.0, &blue),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut lens1 = make_rect(ObjectId(0), 10.0, 10.0, 30.0, 30.0, &Color::TRANSPARENT);
+        lens1.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let mut lens2 = make_rect(ObjectId(0), 70.0, 10.0, 30.0, 30.0, &Color::TRANSPARENT);
+        lens2.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let sym = SymbolDef::new("DualZeroIdFrozenSym", vec![lens1, lens2]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_diff(&direct, &tiled),
+            0,
+            "Dual ObjectId(0) frozen lenses in one SymbolDef must produce 0 diff px"
+        );
+        assert_eq!(sample_mm(&direct, 25.0, 25.0), [0, 255, 255, 255]);
+        assert_eq!(sample_mm(&direct, 85.0, 25.0), [255, 255, 0, 255]);
+    }
+
+    // 3. Effect::Symmetry on Lens(frozen=true) over Red (left) and Green (right)
+    {
+        let mut doc = Document::new("SymmetryFrozenLens", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 5.0, 5.0, 50.0, 50.0, &red),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            make_rect(ObjectId(0), 65.0, 5.0, 50.0, 50.0, &green),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut sym_lens = make_rect(ObjectId(0), 15.0, 15.0, 30.0, 30.0, &Color::TRANSPARENT);
+        sym_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        sym_lens.effects.push(Effect::Symmetry {
+            axes: 1,
+            mirror: true,
+            origin: Point2D::new(60.0, 30.0),
+        });
+        doc.add_object(sym_lens, Some(lid)).unwrap();
+
+        let direct = render_direct_rgba(&doc, &vp, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(
+            count_diff(&direct, &tiled),
+            0,
+            "Effect::Symmetry on frozen lens must produce 0 diff px between render_document and DirtyTileCache"
+        );
+        assert_eq!(sample_mm(&direct, 30.0, 30.0), [0, 255, 255, 255]);
+        assert_eq!(sample_mm(&direct, 90.0, 30.0), [255, 0, 255, 255]);
+    }
+}
+
+#[test]
+fn w1b_r24_symbol_instance_opacity_blend_mode_and_deformed_zero_id_roots() {
+    use coree_core::{BlendMode, EnvelopeMode, LensConfig, LensKind, ParametricShape, SymbolDef};
+    use coree_render::{
+        render_isolated_object_to_rgba, DirtyTileCache, RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: &Color| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill.clone()))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+
+    let render_rgba = |doc: &Document,
+                       vp: &Viewport,
+                       mode: ViewMode,
+                       opts: &RenderOptions|
+     -> coree_render::RgbaBuffer {
+        let mut r = SceneRenderer::new();
+        let mut b = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+        r.render_document(doc, vp, mode, opts, &mut b);
+        b.into_rgba()
+    };
+
+    let render_tiled_rgba =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+            cache.mark_all_dirty();
+            let mut r = SceneRenderer::new();
+            cache.render_viewport(doc, vp, ViewMode::Enhanced, opts, &mut r)
+        };
+
+    let count_diff = |a: &coree_render::RgbaBuffer, b: &coree_render::RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(p, q)| p != q)
+            .count()
+    };
+
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let px = (x_mm * px_per_mm).round() as u32;
+        let py = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let opts = RenderOptions::export();
+    let vp = Viewport::for_export(520, 700, 96.0);
+
+    // 1. Standalone SymbolInstance with opacity=0.5 (direct, tiled, isolated, and wireframe)
+    {
+        let mut doc = Document::new("SymOpacity", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let sym = SymbolDef::new(
+            "RedSym",
+            vec![make_rect(ObjectId(0), 10.0, 10.0, 80.0, 60.0, &red)],
+        );
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let mut inst_obj =
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id));
+        inst_obj.opacity = 0.5;
+        let inst_id = doc.add_object(inst_obj, Some(lid)).unwrap();
+
+        let direct = render_rgba(&doc, &vp, ViewMode::Enhanced, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        let px = sample_mm(&direct, 50.0, 40.0);
+        assert!(
+            px[0] == 255 && (px[1] as i16 - 128).abs() <= 2 && (px[2] as i16 - 128).abs() <= 2,
+            "SymbolInstance(opacity=0.5) over white must render ~[255,128,128,255], got {px:?}"
+        );
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let iso_px = iso_buf
+            .get_pixel(iso_buf.width / 2, iso_buf.height / 2)
+            .unwrap();
+        assert!(
+            iso_bb.contains_point(Point2D::new(50.0, 40.0))
+                && iso_px[0] == 255
+                && iso_px[1] == 0
+                && iso_px[2] == 0
+                && (iso_px[3] as i16 - 128).abs() <= 2,
+            "Isolated SymbolInstance(opacity=0.5) must have alpha ~128, got {iso_px:?}"
+        );
+
+        let wire = render_rgba(&doc, &vp, ViewMode::Wireframe, &opts);
+        assert_ne!(
+            sample_mm(&wire, 10.0, 40.0),
+            [255, 255, 255, 255],
+            "Wireframe mode must still stroke SymbolInstance outline"
+        );
+    }
+
+    // 2. SymbolInstance with blend_mode=Multiply over Blue
+    {
+        let mut doc = Document::new("SymMultiply", 300.0, 300.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 5.0, 5.0, 100.0, 80.0, &blue),
+            Some(lid),
+        )
+        .unwrap();
+        let sym = SymbolDef::new(
+            "RedSym",
+            vec![make_rect(ObjectId(0), 10.0, 10.0, 80.0, 60.0, &red)],
+        );
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let mut inst_obj =
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id));
+        inst_obj.blend_mode = BlendMode::Multiply;
+        doc.add_object(inst_obj, Some(lid)).unwrap();
+
+        let direct = render_rgba(&doc, &vp, ViewMode::Enhanced, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        assert_eq!(
+            sample_mm(&direct, 50.0, 40.0),
+            [0, 0, 0, 255],
+            "Red SymbolInstance with Multiply over Blue must produce Black"
+        );
+    }
+
+    // 3. Group(Envelope) -> SymbolInstance(opacity=0.5) and SymbolInstance with ObjectId(0) roots (shape + frozen lens)
+    {
+        let mut doc = Document::new(
+            "DefGrpSymZeroIdAndOpacity",
+            300.0,
+            300.0,
+            ColorMode::Rgb,
+            96.0,
+        );
+        let lid = doc.pages()[0].layers[0].id;
+        let sym_green = SymbolDef::new(
+            "ZeroGreenSym",
+            vec![make_rect(ObjectId(0), 10.0, 10.0, 80.0, 60.0, &green)],
+        );
+        let sym_green_id = sym_green.id;
+        doc.insert_symbol(sym_green);
+
+        let mut zero_lens = make_rect(ObjectId(0), 10.0, 10.0, 80.0, 60.0, &Color::TRANSPARENT);
+        zero_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let sym_lens = SymbolDef::new(
+            "ZeroRedFrozenLensSym",
+            vec![
+                make_rect(ObjectId(0), 10.0, 10.0, 80.0, 60.0, &red),
+                zero_lens,
+            ],
+        );
+        let sym_lens_id = sym_lens.id;
+        doc.insert_symbol(sym_lens);
+
+        let mut inst_green = SceneObject::new(
+            ObjectId(0),
+            "InstGreen",
+            NodePayload::SymbolInstance(sym_green_id),
+        );
+        inst_green.opacity = 0.5;
+        let inst_green_id = doc.add_object(inst_green, Some(lid)).unwrap();
+        let grp_green_id = doc.group_objects(&[inst_green_id], "EnvGrpGreen").unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: grp_green_id,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(90.0, 10.0),
+                        Point2D::new(110.0, 80.0),
+                        Point2D::new(10.0, 80.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let inst_lens_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "InstLens",
+                    NodePayload::SymbolInstance(sym_lens_id),
+                )
+                .with_transform(Affine2D::translate(0.0, 90.0)),
+                Some(lid),
+            )
+            .unwrap();
+        let grp_lens_id = doc.group_objects(&[inst_lens_id], "EnvGrpLens").unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: grp_lens_id,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 100.0),
+                        Point2D::new(90.0, 100.0),
+                        Point2D::new(110.0, 170.0),
+                        Point2D::new(10.0, 170.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let direct = render_rgba(&doc, &vp, ViewMode::Enhanced, &opts);
+        let tiled = render_tiled_rgba(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+
+        let gpx = sample_mm(&direct, 50.0, 45.0);
+        assert!(
+            (gpx[0] as i16 - 128).abs() <= 2 && gpx[1] == 255 && (gpx[2] as i16 - 128).abs() <= 2,
+            "Deformed Group(Envelope) -> SymbolInstance(ObjectId(0) Green, opacity=0.5) must render ~[128,255,128,255], got {gpx:?}"
+        );
+        // Extended envelope corner at x=95, y=72 must contain deformed green ink (not dropped!)
+        let gpx_ext = sample_mm(&direct, 95.0, 72.0);
+        assert!(
+            gpx_ext[0] < 200 && gpx_ext[1] == 255,
+            "Deformed Envelope shear region must contain ObjectId(0) symbol root ink, got {gpx_ext:?}"
+        );
+
+        let lpx = sample_mm(&direct, 50.0, 135.0);
+        assert_eq!(
+            lpx,
+            [0, 255, 255, 255],
+            "Deformed Group(Envelope) -> SymbolInstance(ObjectId(0) Red + ObjectId(0) frozen Invert) must render Cyan"
+        );
+        let (_, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, grp_lens_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let has_cyan = iso_buf
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0] < 20 && p[1] > 235 && p[2] > 235 && p[3] > 235);
+        assert!(
+            has_cyan,
+            "Isolated Group(Envelope)->SymbolInstance(ObjectId(0) frozen Invert) must contain Cyan"
+        );
+    }
+}
+
+#[test]
+fn w1b_r25_symmetry_container_chained_frozen_lenses_and_isolated_backdrop() {
+    use coree_core::{CommandOp, LensConfig, LensKind, ParametricShape, SymbolDef};
+    use coree_render::{
+        render_isolated_object_to_rgba, DirtyTileCache, RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: &Color| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill.clone()))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+    let render_direct =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut r = SceneRenderer::new();
+            let mut b = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+            r.render_document(doc, vp, ViewMode::Enhanced, opts, &mut b);
+            b.into_rgba()
+        };
+    let render_tiled =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+            cache.mark_all_dirty();
+            let mut r = SceneRenderer::new();
+            cache.render_viewport(doc, vp, ViewMode::Enhanced, opts, &mut r)
+        };
+    let count_diff = |a: &coree_render::RgbaBuffer, b: &coree_render::RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(p, q)| p != q)
+            .count()
+    };
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let px = (x_mm * px_per_mm).round() as u32;
+        let py = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let opts = RenderOptions::export();
+    let vp = Viewport::for_export(560, 300, 96.0);
+
+    // P4b & P4c: SymbolInstance with Effect::Symmetry (opacity=0.99 and opacity=1.0)
+    // containing chained [Lens1(Invert, frozen=true), Lens2(Invert, frozen=true)] over Red left / Green right
+    for &opacity in &[0.99_f32, 1.0_f32] {
+        let mut doc = Document::new("SymInstSymChain", 300.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 10.0, 10.0, 45.0, 45.0, &red),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            make_rect(ObjectId(0), 80.0, 10.0, 45.0, 45.0, &green),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut l1 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
+        l1.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let mut l2 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
+        l2.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let sym = SymbolDef::new("ChainedFrozenSym", vec![l1, l2]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+
+        let mut inst = SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id));
+        inst.opacity = opacity;
+        inst.effects.push(Effect::Symmetry {
+            axes: 1,
+            mirror: true,
+            origin: Point2D::new(67.5, 32.5),
+        });
+        let inst_id = doc.add_object(inst, Some(lid)).unwrap();
+
+        let direct = render_direct(&doc, &vp, &opts);
+        let tiled = render_tiled(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+
+        let left_px = sample_mm(&direct, 32.5, 32.5);
+        let right_px = sample_mm(&direct, 102.5, 32.5);
+        assert!(
+            left_px[0] >= 250 && left_px[1] <= 5 && left_px[2] <= 5,
+            "Left branch (opacity={opacity}) must double-invert Red back to Red, got {left_px:?}"
+        );
+        assert!(
+            right_px[0] <= 5 && right_px[1] >= 250 && right_px[2] <= 5,
+            "Right branch (opacity={opacity}) must double-invert Green back to Green, got {right_px:?}"
+        );
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let rx = ((102.5 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let ry = ((32.5 - iso_bb.min_y) * px_per_mm).round() as u32;
+        let iso_right = iso_buf.get_pixel(rx, ry).unwrap();
+        assert!(
+            iso_right[0] <= 5 && iso_right[1] >= 250 && iso_right[2] <= 5 && iso_right[3] >= 250,
+            "Isolated right branch (opacity={opacity}) must render Green, got {iso_right:?}"
+        );
+    }
+
+    // P5b: Group(Effect::Symmetry, opacity=0.99) containing [Lens1(Invert, frozen=true), Lens2(Invert, frozen=false)]
+    {
+        let mut doc = Document::new("GrpSymChain", 300.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(ObjectId(0), 10.0, 10.0, 45.0, 45.0, &red),
+            Some(lid),
+        )
+        .unwrap();
+        doc.add_object(
+            make_rect(ObjectId(0), 80.0, 10.0, 45.0, 45.0, &green),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut l1 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
+        l1.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let mut l2 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
+        l2.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let l1_id = doc.add_object(l1, Some(lid)).unwrap();
+        let l2_id = doc.add_object(l2, Some(lid)).unwrap();
+        let grp_id = doc.group_objects(&[l1_id, l2_id], "SymGrp").unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &CommandOp::SetOpacity {
+                ids: vec![grp_id],
+                opacity: 0.99,
+            },
+        )
+        .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &CommandOp::AddEffect {
+                id: grp_id,
+                effect: Effect::Symmetry {
+                    axes: 1,
+                    mirror: true,
+                    origin: Point2D::new(67.5, 32.5),
+                },
+            },
+        )
+        .unwrap();
+
+        let direct = render_direct(&doc, &vp, &opts);
+        let tiled = render_tiled(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+
+        let left_px = sample_mm(&direct, 32.5, 32.5);
+        let right_px = sample_mm(&direct, 102.5, 32.5);
+        assert!(
+            left_px[0] >= 250 && left_px[1] <= 5 && left_px[2] <= 5,
+            "Group left branch must double-invert Red to Red, got {left_px:?}"
+        );
+        assert!(
+            right_px[0] <= 5 && right_px[1] >= 250 && right_px[2] <= 5,
+            "Group right branch must double-invert Green to Green, got {right_px:?}"
+        );
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, grp_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let rx = ((102.5 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let ry = ((32.5 - iso_bb.min_y) * px_per_mm).round() as u32;
+        let iso_right = iso_buf.get_pixel(rx, ry).unwrap();
+        assert!(
+            iso_right[0] <= 5 && iso_right[1] >= 250 && iso_right[2] <= 5 && iso_right[3] >= 250,
+            "Isolated Group right branch must render Green, got {iso_right:?}"
+        );
+    }
+}
+
+#[test]
+fn w1b_r25_symbol_def_zero_id_powerclip_and_group_containers() {
+    use coree_core::{EnvelopeMode, LensConfig, LensKind, ParametricShape, SymbolDef};
+    use coree_render::{
+        render_isolated_object_to_rgba, DirtyTileCache, RenderOptions, SceneRenderer,
+    };
+
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: &Color| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill.clone()))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+    let render_direct =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut r = SceneRenderer::new();
+            let mut b = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+            r.render_document(doc, vp, ViewMode::Enhanced, opts, &mut b);
+            b.into_rgba()
+        };
+    let render_tiled =
+        |doc: &Document, vp: &Viewport, opts: &RenderOptions| -> coree_render::RgbaBuffer {
+            let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+            cache.mark_all_dirty();
+            let mut r = SceneRenderer::new();
+            cache.render_viewport(doc, vp, ViewMode::Enhanced, opts, &mut r)
+        };
+    let count_diff = |a: &coree_render::RgbaBuffer, b: &coree_render::RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(p, q)| p != q)
+            .count()
+    };
+    let sample_mm = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let px = (x_mm * px_per_mm).round() as u32;
+        let py = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(px, py).unwrap()
+    };
+
+    let opts = RenderOptions::export();
+    // 520x300px crosses x=256px tile seam (~67.73mm)
+    let vp = Viewport::for_export(520, 300, 96.0);
+
+    // 1. SymbolDef with ObjectId(0) PowerClip(fill=Green) -> [ObjectId(2) Lens::Invert(frozen=true)]
+    {
+        let mut doc = Document::new("ZeroIdPowerClipInSym", 300.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let mut inner_lens = make_rect(ObjectId(2), 55.0, 10.0, 40.0, 40.0, &Color::TRANSPARENT);
+        inner_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let pc = SceneObject::new(
+            ObjectId(0),
+            "ZeroPC",
+            NodePayload::PowerClip {
+                container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(
+                    55.0, 10.0, 40.0, 40.0,
+                ))),
+                container_parametric: None,
+                lock_contents: true,
+                contents: vec![ObjectId(2)],
+            },
+        )
+        .with_fill(Fill::Solid(green.clone()))
+        .with_outline(OutlineStyle::none());
+        let sym = SymbolDef::new("ZeroPCSym", vec![pc, inner_lens]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+                Some(lid),
+            )
+            .unwrap();
+
+        let direct = render_direct(&doc, &vp, &opts);
+        let tiled = render_tiled(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        assert_eq!(sample_mm(&direct, 75.0, 30.0), [255, 0, 255, 255]);
+        assert_eq!(sample_mm(&tiled, 75.0, 30.0), [255, 0, 255, 255]);
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((75.0 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iy = ((30.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        assert_eq!(iso_buf.get_pixel(ix, iy).unwrap(), [255, 0, 255, 255]);
+    }
+
+    // 2. SymbolDef with ObjectId(0) Group(Envelope) -> [ObjectId(1) Red, ObjectId(2) Lens(frozen/remove_face)]
+    for &(frozen, remove_face) in &[(true, false), (false, true)] {
+        let mut doc = Document::new("ZeroIdDefGrpInSym", 300.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let red_child = make_rect(ObjectId(1), 50.0, 10.0, 30.0, 30.0, &red);
+        let mut lens_child = make_rect(ObjectId(2), 50.0, 10.0, 30.0, 30.0, &Color::TRANSPARENT);
+        lens_child.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen,
+            viewpoint: None,
+            remove_face,
+        });
+        let mut def_grp = SceneObject::new(
+            ObjectId(0),
+            "ZeroEnvGrp",
+            NodePayload::Group(vec![ObjectId(1), ObjectId(2)]),
+        );
+        def_grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(50.0, 10.0),
+                Point2D::new(100.0, 10.0),
+                Point2D::new(100.0, 40.0),
+                Point2D::new(50.0, 40.0),
+            ],
+        });
+        let sym = SymbolDef::new("ZeroEnvSym", vec![def_grp, red_child, lens_child]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+                Some(lid),
+            )
+            .unwrap();
+
+        let direct = render_direct(&doc, &vp, &opts);
+        let tiled = render_tiled(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        assert_eq!(sample_mm(&direct, 85.0, 25.0), [0, 255, 255, 255]);
+        assert_eq!(sample_mm(&tiled, 85.0, 25.0), [0, 255, 255, 255]);
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((85.0 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iy = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        assert_eq!(iso_buf.get_pixel(ix, iy).unwrap(), [0, 255, 255, 255]);
+    }
+
+    // 3. SymbolDef with undeformed ObjectId(0) Group(translate(50, 0)) -> [ObjectId(1) Red, ObjectId(2) Lens(frozen/remove_face)]
+    for &(frozen, remove_face) in &[(true, false), (false, true)] {
+        let mut doc = Document::new("ZeroIdTransGrpInSym", 300.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let red_child = make_rect(ObjectId(1), 10.0, 10.0, 35.0, 35.0, &red);
+        let mut lens_child = make_rect(ObjectId(2), 10.0, 10.0, 35.0, 35.0, &Color::TRANSPARENT);
+        lens_child.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen,
+            viewpoint: None,
+            remove_face,
+        });
+        let trans_grp = SceneObject::new(
+            ObjectId(0),
+            "ZeroTransGrp",
+            NodePayload::Group(vec![ObjectId(1), ObjectId(2)]),
+        )
+        .with_transform(Affine2D::translate(50.0, 0.0));
+        let sym = SymbolDef::new("ZeroTransSym", vec![trans_grp, red_child, lens_child]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+                Some(lid),
+            )
+            .unwrap();
+
+        let direct = render_direct(&doc, &vp, &opts);
+        let tiled = render_tiled(&doc, &vp, &opts);
+        assert_eq!(count_diff(&direct, &tiled), 0);
+        assert_eq!(sample_mm(&direct, 75.0, 25.0), [0, 255, 255, 255]);
+        assert_eq!(sample_mm(&tiled, 75.0, 25.0), [0, 255, 255, 255]);
+
+        let (iso_bb, iso_buf) =
+            render_isolated_object_to_rgba(&doc, 0, inst_id, Affine2D::IDENTITY, 96.0)
+                .unwrap()
+                .unwrap();
+        let px_per_mm: f64 = 96.0 / 25.4;
+        let ix = ((75.0 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iy = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        assert_eq!(iso_buf.get_pixel(ix, iy).unwrap(), [0, 255, 255, 255]);
+    }
+}
+
+#[test]
+fn w1b_r25_dirty_tile_cache_warms_off_tile_frozen_lenses_and_persists_on_move() {
+    use coree_core::{CommandOp, LensConfig, LensKind, ParametricShape, SymbolDef};
+    use coree_render::{DirtyTileCache, RenderOptions, SceneRenderer};
+
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: &Color| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(fill.clone()))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(x, y))
+    };
+
+    let mut doc = Document::new("OffTileFrozenMove", 300.0, 200.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+    doc.add_object(
+        make_rect(ObjectId(0), 100.0, 10.0, 90.0, 50.0, &blue),
+        Some(lid),
+    )
+    .unwrap();
+    doc.add_object(
+        make_rect(ObjectId(0), 100.0, 80.0, 90.0, 50.0, &green),
+        Some(lid),
+    )
+    .unwrap();
+
+    // Place both standalone Lens(frozen=true) and SymbolInstance(Lens(frozen=true)) at x > 100mm (outside Tile (0,0))
+    let mut standalone = make_rect(ObjectId(0), 105.0, 15.0, 25.0, 25.0, &Color::TRANSPARENT);
+    standalone.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: true,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let standalone_id = doc.add_object(standalone, Some(lid)).unwrap();
+
+    let mut sym_lens = make_rect(ObjectId(0), 0.0, 0.0, 25.0, 25.0, &Color::TRANSPARENT);
+    sym_lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: true,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let sym = SymbolDef::new("OffTileMoveSym", vec![sym_lens]);
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    let inst_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(145.0, 15.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+    let vp = Viewport::for_export(768, 512, 96.0);
+    let opts = RenderOptions::export();
+    let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut renderer = SceneRenderer::new();
+
+    let frame1 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+    let px_per_mm: f64 = 96.0 / 25.4;
+    let p1_s = frame1
+        .get_pixel(
+            (117.5 * px_per_mm).round() as u32,
+            (27.5 * px_per_mm).round() as u32,
+        )
+        .unwrap();
+    let p1_i = frame1
+        .get_pixel(
+            (157.5 * px_per_mm).round() as u32,
+            (27.5 * px_per_mm).round() as u32,
+        )
+        .unwrap();
+    assert_eq!(p1_s, [255, 255, 0, 255]);
+    assert_eq!(p1_i, [255, 255, 0, 255]);
+
+    // Move both frozen lenses over the Green rect and re-render via DirtyTileCache
+    coree_core::apply_command(
+        &mut doc,
+        &CommandOp::TransformObjects {
+            ids: vec![standalone_id, inst_id],
+            affine: Affine2D::translate(0.0, 70.0),
+        },
+    )
+    .unwrap();
+    cache.mark_object_dirty(&doc, standalone_id);
+    cache.mark_object_dirty(&doc, inst_id);
+    let frame2 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+    let p2_s = frame2
+        .get_pixel(
+            (117.5 * px_per_mm).round() as u32,
+            (97.5 * px_per_mm).round() as u32,
+        )
+        .unwrap();
+    let p2_i = frame2
+        .get_pixel(
+            (157.5 * px_per_mm).round() as u32,
+            (97.5 * px_per_mm).round() as u32,
+        )
+        .unwrap();
+    assert_eq!(
+        p2_s,
+        [255, 255, 0, 255],
+        "Moved off-tile standalone frozen lens must preserve its Yellow snapshot over Green"
+    );
+    assert_eq!(
+        p2_i,
+        [255, 255, 0, 255],
+        "Moved off-tile SymbolInstance frozen lens must preserve its Yellow snapshot over Green"
+    );
+}
+
+#[test]
+fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated_warm() {
+    let px_per_mm: f64 = 96.0 / 25.4;
+    let red = Color::rgba8(255, 0, 0, 255);
+    let green = Color::rgba8(0, 255, 0, 255);
+    let blue = Color::rgba8(0, 0, 255, 255);
+    let white = Color::WHITE;
+
+    let make_rect = |id: ObjectId, x: f64, y: f64, w: f64, h: f64, fill: Fill| -> SceneObject {
+        SceneObject::new(
+            id,
+            "Rect",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(x, y, w, h))),
+        )
+        .with_fill(fill)
+        .with_outline(OutlineStyle::none())
+    };
+
+    let render_both = |doc: &Document, w: u32, h: u32| -> (RgbaBuffer, RgbaBuffer) {
+        let vp = Viewport::for_export(w, h, 96.0);
+        let opts = RenderOptions::export();
+        let mut r1 = SceneRenderer::new();
+        let mut b1 = TinySkiaBackend::new(w, h).unwrap();
+        r1.render_document(doc, &vp, ViewMode::Enhanced, &opts, &mut b1);
+        let direct = b1.into_rgba();
+
+        let mut cache = DirtyTileCache::new(w, h);
+        let mut r2 = SceneRenderer::new();
+        let tiled = cache.render_viewport(doc, &vp, ViewMode::Enhanced, &opts, &mut r2);
+        (direct, tiled)
+    };
+
+    let diff_count = |a: &RgbaBuffer, b: &RgbaBuffer| -> usize {
+        a.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.rgba.as_chunks::<4>().0.iter())
+            .filter(|(pa, pb)| pa != pb)
+            .count()
+    };
+
+    // 1. BUG-A1: Group(Envelope) -> Group(Effect::Symmetry, opacity=0.99) -> [Red, Lens(Invert, frozen=true)]
+    //    spanning x=256px (67.73mm) tile seam over Blue background.
+    {
+        let mut doc = Document::new_a4("R26 EnvThenSymGrp Frozen");
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(
+                ObjectId(0),
+                0.0,
+                0.0,
+                160.0,
+                80.0,
+                Fill::Solid(blue.clone()),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+        let r_id = doc
+            .add_object(
+                make_rect(
+                    ObjectId(0),
+                    40.0,
+                    15.0,
+                    15.0,
+                    20.0,
+                    Fill::Solid(red.clone()),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        let mut lens = make_rect(ObjectId(0), 40.0, 15.0, 15.0, 20.0, Fill::None);
+        lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![r_id, l_id],
+                name: "InnerSymGrp".into(),
+            },
+        )
+        .unwrap();
+        let sym_grp_id = doc.parent_container_of(r_id).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::SetOpacity {
+                ids: vec![sym_grp_id],
+                opacity: 0.99,
+            },
+        )
+        .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: sym_grp_id,
+                effect: Effect::Symmetry {
+                    axes: 2,
+                    mirror: false,
+                    origin: Point2D::new(67.73, 25.0),
+                },
+            },
+        )
+        .unwrap();
+        // Anchor covering [40..95.46, 15..35] so Envelope identity cage matches full bounds
+        let anchor_id = doc
+            .add_object(
+                make_rect(ObjectId(0), 40.0, 15.0, 55.46, 20.0, Fill::None),
+                Some(lid),
+            )
+            .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![anchor_id, sym_grp_id],
+                name: "OuterEnvGrp".into(),
+            },
+        )
+        .unwrap();
+        let env_grp_id = doc.parent_container_of(sym_grp_id).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: env_grp_id,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(40.0, 15.0),
+                        Point2D::new(95.46, 15.0),
+                        Point2D::new(95.46, 35.0),
+                        Point2D::new(40.0, 35.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let (direct, tiled) = render_both(&doc, 512, 256);
+        assert_eq!(
+            diff_count(&direct, &tiled),
+            0,
+            "BUG-A1: DirtyTileCache must match render_document with 0 diff pixels"
+        );
+        let b1_x = (87.96 * px_per_mm).round() as u32;
+        let b1_y = (25.0 * px_per_mm).round() as u32;
+        let px_d = direct.get_pixel(b1_x, b1_y).unwrap();
+        let px_t = tiled.get_pixel(b1_x, b1_y).unwrap();
+        assert!(
+            px_d[0] <= 5 && px_d[1] >= 250 && px_d[2] >= 250,
+            "BUG-A1 direct Branch 1 must be Cyan (~[0,255,255]), got {px_d:?}"
+        );
+        assert_eq!(px_d, px_t);
+
+        let (iso_bb, iso_buf) = coree_render::render_isolated_object_to_rgba(
+            &doc,
+            0,
+            env_grp_id,
+            Affine2D::IDENTITY,
+            96.0,
+        )
+        .unwrap()
+        .unwrap();
+        let iso_x = ((87.96 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iso_y = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        let px_iso = iso_buf.get_pixel(iso_x, iso_y).unwrap();
+        assert!(
+            px_iso[0] <= 5 && px_iso[1] >= 250 && px_iso[2] >= 250,
+            "BUG-A1 isolated Branch 1 must be Cyan (~[0,255,255]), got {px_iso:?}"
+        );
+    }
+
+    // 2. BUG-A2: Group(Envelope) -> PowerClip(fill=Green, Symmetry) -> [Lens(Invert, frozen=true)]
+    //    crossing x=256px (67.73mm) over Blue background -> Magenta [255, 0, 255, 255] on BOTH Branch 0 and Branch 1.
+    {
+        let mut doc = Document::new_a4("R26 EnvThenSymPC Frozen");
+        let lid = doc.pages()[0].layers[0].id;
+        doc.add_object(
+            make_rect(
+                ObjectId(0),
+                0.0,
+                0.0,
+                160.0,
+                80.0,
+                Fill::Solid(blue.clone()),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut lens = make_rect(ObjectId(0), 15.0, 15.0, 30.0, 20.0, Fill::None);
+        lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        let pc_id = doc
+            .add_object(
+                make_rect(
+                    ObjectId(0),
+                    15.0,
+                    15.0,
+                    30.0,
+                    20.0,
+                    Fill::Solid(green.clone()),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::CreatePowerClip {
+                container_id: pc_id,
+                content_ids: vec![l_id],
+            },
+        )
+        .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: pc_id,
+                effect: Effect::Symmetry {
+                    axes: 2,
+                    mirror: false,
+                    origin: Point2D::new(50.0, 25.0),
+                },
+            },
+        )
+        .unwrap();
+        let anchor_id = doc
+            .add_object(
+                make_rect(ObjectId(0), 15.0, 15.0, 70.0, 20.0, Fill::None),
+                Some(lid),
+            )
+            .unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![anchor_id, pc_id],
+                name: "OuterEnvGrp".into(),
+            },
+        )
+        .unwrap();
+        let env_grp_id = doc.parent_container_of(pc_id).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: env_grp_id,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(15.0, 15.0),
+                        Point2D::new(85.0, 15.0),
+                        Point2D::new(85.0, 35.0),
+                        Point2D::new(15.0, 35.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let (direct, tiled) = render_both(&doc, 512, 256);
+        assert_eq!(
+            diff_count(&direct, &tiled),
+            0,
+            "BUG-A2: DirtyTileCache must match render_document with 0 diff pixels"
+        );
+        let b0_x = (30.0 * px_per_mm).round() as u32;
+        let b0_y = (25.0 * px_per_mm).round() as u32;
+        let b1_x = (70.0 * px_per_mm).round() as u32;
+        let b1_y = (25.0 * px_per_mm).round() as u32;
+        assert_eq!(
+            direct.get_pixel(b0_x, b0_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 direct Branch 0 must be Magenta"
+        );
+        assert_eq!(
+            tiled.get_pixel(b0_x, b0_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 tiled Branch 0 must be Magenta"
+        );
+        assert_eq!(
+            direct.get_pixel(b1_x, b1_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 direct Branch 1 must be Magenta"
+        );
+        assert_eq!(
+            tiled.get_pixel(b1_x, b1_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 tiled Branch 1 must be Magenta"
+        );
+
+        let (iso_bb, iso_buf) = coree_render::render_isolated_object_to_rgba(
+            &doc,
+            0,
+            env_grp_id,
+            Affine2D::IDENTITY,
+            96.0,
+        )
+        .unwrap()
+        .unwrap();
+        let iso_b0_x = ((30.0 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iso_b0_y = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        let iso_b1_x = ((70.0 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iso_b1_y = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        assert_eq!(
+            iso_buf.get_pixel(iso_b0_x, iso_b0_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 isolated Branch 0 must be Magenta"
+        );
+        assert_eq!(
+            iso_buf.get_pixel(iso_b1_x, iso_b1_y).unwrap(),
+            [255, 0, 255, 255],
+            "BUG-A2 isolated Branch 1 must be Magenta"
+        );
+    }
+
+    // 3. BUG-A3 + 1A-9: Group(Envelope) & SymbolDef(ObjectId(0) Group(Envelope)) wrapping
+    //    Group(Symmetry) -> [Red, Lens(Invert, remove_face=true)] + Wireframe lens.
+    {
+        let mut doc = Document::new_a4("R26 SymDef ZeroEnv Sym RmFace");
+        let lid = doc.pages()[0].layers[0].id;
+        let sym_red = make_rect(
+            ObjectId(1),
+            15.0,
+            15.0,
+            15.0,
+            20.0,
+            Fill::Solid(red.clone()),
+        );
+        let mut sym_lens = make_rect(ObjectId(2), 15.0, 15.0, 15.0, 20.0, Fill::None);
+        sym_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: false,
+            viewpoint: None,
+            remove_face: true,
+        });
+        let mut sym_inner = SceneObject::new(
+            ObjectId(3),
+            "InnerSym",
+            NodePayload::Group(vec![ObjectId(1), ObjectId(2)]),
+        );
+        sym_inner.effects.push(Effect::Symmetry {
+            axes: 2,
+            mirror: false,
+            origin: Point2D::new(50.0, 25.0),
+        });
+        let sym_anchor = make_rect(ObjectId(4), 15.0, 15.0, 70.0, 20.0, Fill::None);
+        let mut sym_zero_env = SceneObject::new(
+            ObjectId(0),
+            "ZeroEnv",
+            NodePayload::Group(vec![ObjectId(4), ObjectId(3)]),
+        );
+        sym_zero_env.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(15.0, 15.0),
+                Point2D::new(85.0, 15.0),
+                Point2D::new(85.0, 35.0),
+                Point2D::new(15.0, 35.0),
+            ],
+        });
+        let sym = SymbolDef::new(
+            "ZeroEnvSym",
+            vec![sym_red, sym_lens, sym_inner, sym_anchor, sym_zero_env],
+        );
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+                Some(lid),
+            )
+            .unwrap();
+
+        let (direct, tiled) = render_both(&doc, 384, 256);
+        assert_eq!(diff_count(&direct, &tiled), 0);
+        let b1_x = (77.5 * px_per_mm).round() as u32;
+        let b1_y = (25.0 * px_per_mm).round() as u32;
+        assert_eq!(
+            direct.get_pixel(b1_x, b1_y).unwrap(),
+            [0, 255, 255, 255],
+            "1A-9: Branch 1 remove_face inside SymbolDef(ZeroEnv->Sym) must be Cyan"
+        );
+        assert_eq!(tiled.get_pixel(b1_x, b1_y).unwrap(), [0, 255, 255, 255]);
+
+        let (iso_bb, iso_buf) = coree_render::render_isolated_object_to_rgba(
+            &doc,
+            0,
+            inst_id,
+            Affine2D::IDENTITY,
+            96.0,
+        )
+        .unwrap()
+        .unwrap();
+        let iso_x = ((77.5 - iso_bb.min_x) * px_per_mm).round() as u32;
+        let iso_y = ((25.0 - iso_bb.min_y) * px_per_mm).round() as u32;
+        assert_eq!(iso_buf.get_pixel(iso_x, iso_y).unwrap(), [0, 255, 255, 255]);
+
+        // Also verify Wireframe lens inside Group(Envelope) -> Group(Symmetry) draws Branch 1 edges
+        let mut wf_doc = Document::new_a4("R26 EnvSym WireframeLens");
+        let wlid = wf_doc.pages()[0].layers[0].id;
+        let wr = wf_doc
+            .add_object(
+                make_rect(
+                    ObjectId(0),
+                    15.0,
+                    15.0,
+                    15.0,
+                    20.0,
+                    Fill::Solid(red.clone()),
+                ),
+                Some(wlid),
+            )
+            .unwrap();
+        let mut wl = make_rect(ObjectId(0), 10.0, 10.0, 25.0, 30.0, Fill::None);
+        wl.lens = Some(LensConfig {
+            kind: LensKind::Wireframe {
+                override_outline: Some(blue.clone()),
+                override_fill: Some(white),
+            },
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let wl_id = wf_doc.add_object(wl, Some(wlid)).unwrap();
+        coree_core::apply_command(
+            &mut wf_doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![wr, wl_id],
+                name: "WSym".into(),
+            },
+        )
+        .unwrap();
+        let w_sym_id = wf_doc.parent_container_of(wr).unwrap();
+        coree_core::apply_command(
+            &mut wf_doc,
+            &coree_core::CommandOp::AddEffect {
+                id: w_sym_id,
+                effect: Effect::Symmetry {
+                    axes: 2,
+                    mirror: false,
+                    origin: Point2D::new(50.0, 25.0),
+                },
+            },
+        )
+        .unwrap();
+        let w_anc = wf_doc
+            .add_object(
+                make_rect(ObjectId(0), 10.0, 10.0, 80.0, 30.0, Fill::None),
+                Some(wlid),
+            )
+            .unwrap();
+        coree_core::apply_command(
+            &mut wf_doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![w_anc, w_sym_id],
+                name: "WEnv".into(),
+            },
+        )
+        .unwrap();
+        let w_env_id = wf_doc.parent_container_of(w_sym_id).unwrap();
+        coree_core::apply_command(
+            &mut wf_doc,
+            &coree_core::CommandOp::AddEffect {
+                id: w_env_id,
+                effect: Effect::Envelope {
+                    mode: EnvelopeMode::Straight,
+                    cage: vec![
+                        Point2D::new(10.0, 10.0),
+                        Point2D::new(90.0, 10.0),
+                        Point2D::new(90.0, 40.0),
+                        Point2D::new(10.0, 40.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+        let (wf_d, wf_t) = render_both(&wf_doc, 384, 256);
+        assert_eq!(diff_count(&wf_d, &wf_t), 0);
+        // Left branch inner rect edge x=15mm vs Right branch inner rect edge x=70mm should both have blue strokes
+        let has_blue_near = |buf: &RgbaBuffer, x_mm: f64| -> bool {
+            let cx = (x_mm * px_per_mm).round() as i32;
+            let cy = (25.0 * px_per_mm).round() as i32;
+            (-3..=3).any(|dx| {
+                let px = buf.get_pixel((cx + dx) as u32, cy as u32).unwrap();
+                px[2] > px[0] && px[2] >= 200
+            })
+        };
+        assert!(has_blue_near(&wf_d, 15.0));
+        assert!(
+            has_blue_near(&wf_d, 70.0),
+            "Branch 1 Wireframe lens inside Envelope->Symmetry must draw blue wireframe stroke on reflected child"
+        );
+    }
+
+    // 4. Minor (T5-AdvCaseC-OffVpIsoGrpFrozen): Off-viewport Group(opacity=0.5) containing
+    //    Lens(Invert, frozen=true) warms its snapshot on frame 1 in DirtyTileCache and retains it when moved.
+    {
+        let mut doc = Document::new_a4("R26 OffVp IsoGrp Frozen");
+        let lid = doc.pages()[0].layers[0].id;
+        // Green backdrop inside viewport (x=0..80mm)
+        doc.add_object(
+            make_rect(ObjectId(0), 0.0, 0.0, 80.0, 60.0, Fill::Solid(green)),
+            Some(lid),
+        )
+        .unwrap();
+        // Red backdrop completely off-viewport (x=150..180mm; viewport is 384px = 101.6mm wide)
+        doc.add_object(
+            make_rect(ObjectId(0), 150.0, 10.0, 30.0, 30.0, Fill::Solid(red)),
+            Some(lid),
+        )
+        .unwrap();
+        let mut lens = make_rect(ObjectId(0), 150.0, 10.0, 30.0, 30.0, Fill::None);
+        lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let l_id = doc.add_object(lens, Some(lid)).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::Group {
+                ids: vec![l_id],
+                name: "OffVpIsoGrp".into(),
+            },
+        )
+        .unwrap();
+        let grp_id = doc.parent_container_of(l_id).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::SetOpacity {
+                ids: vec![grp_id],
+                opacity: 0.5,
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(384, 256, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        let mut renderer = SceneRenderer::new();
+
+        let _frame1 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        assert!(
+            renderer.get_frozen_lens(l_id).is_some(),
+            "Off-viewport isolated Group(opacity=0.5) must warm descendant frozen lens in Frame 1"
+        );
+
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::TransformObjects {
+                ids: vec![grp_id],
+                affine: Affine2D::translate(-130.0, 0.0),
+            },
+        )
+        .unwrap();
+        cache.mark_object_dirty(&doc, grp_id);
+        let frame2 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        let px = frame2
+            .get_pixel(
+                (35.0 * px_per_mm).round() as u32,
+                (25.0 * px_per_mm).round() as u32,
+            )
+            .unwrap();
+        // Frozen Red->Cyan [0,255,255] at opacity=0.5 over Green [0,255,0] => ~[0,255,128,255] (NOT gray [128,128,128])
+        assert!(
+            px[0] <= 5 && px[1] >= 250 && px[2] >= 120 && px[2] <= 136,
+            "Moved off-viewport isolated Group frozen lens must retain Cyan snapshot over Green (~[0,255,128]), got {px:?}"
+        );
+    }
+}
+
+#[test]
+fn w1b_r27_zero_opacity_frozen_lens_does_not_stay_unwarmed() {
+    let mut doc = Document::new_a4("R27 Zero Opacity Frozen Lens");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // Backdrop
+    doc.add_object(
+        rect_obj(
+            0.0,
+            0.0,
+            80.0,
+            60.0,
+            Fill::Solid(Color::rgba8(0, 255, 0, 255)),
+        ),
+        Some(lid),
+    )
+    .unwrap();
+
+    // 1. Standalone Lens(frozen=true) with opacity = 0.0
+    let mut zero_lens = rect_obj(10.0, 10.0, 20.0, 20.0, Fill::None);
+    zero_lens.opacity = 0.0;
+    zero_lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: true,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let zero_lens_id = doc.add_object(zero_lens, Some(lid)).unwrap();
+
+    // 2. Group(opacity = 0.0) containing an otherwise-visible Lens(frozen=true)
+    let mut child_lens = rect_obj(40.0, 10.0, 20.0, 20.0, Fill::None);
+    child_lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: true,
+        viewpoint: None,
+        remove_face: false,
+    });
+    let child_lens_id = doc.add_object(child_lens, Some(lid)).unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::Group {
+            ids: vec![child_lens_id],
+            name: "ZeroOpacityGrp".into(),
+        },
+    )
+    .unwrap();
+    let zero_grp_id = doc.parent_container_of(child_lens_id).unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetOpacity {
+            ids: vec![zero_grp_id],
+            opacity: 0.0,
+        },
+    )
+    .unwrap();
+
+    let vp = Viewport::for_export(384, 256, 96.0);
+    let opts = RenderOptions::export();
+    let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut renderer = SceneRenderer::new();
+
+    assert!(
+        !renderer.has_unwarmed_frozen_lens(&doc, false),
+        "opacity == 0.0 Group/Lens(frozen=true) must be skipped by has_unwarmed_frozen_lens before render"
+    );
+    let _frame = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+    assert!(
+        !renderer.has_unwarmed_frozen_lens(&doc, false),
+        "opacity == 0.0 Group/Lens(frozen=true) must not leave has_unwarmed_frozen_lens == true after rendering"
+    );
+    assert!(renderer.get_frozen_lens(zero_lens_id).is_none());
+    assert!(renderer.get_frozen_lens(child_lens_id).is_none());
+}
+
+#[test]
+fn w1b_r28_powerclip_with_lens_ignores_child_frozen_lens_warm_check() {
+    for pc_frozen in [false, true] {
+        let mut doc = Document::new(
+            "R28 PowerClip Lens WarmCheck",
+            100.0,
+            100.0,
+            ColorMode::Rgb,
+            96.0,
+        );
+        let lid = doc.pages()[0].layers[0].id;
+
+        doc.add_object(
+            rect_obj(
+                0.0,
+                0.0,
+                80.0,
+                80.0,
+                Fill::Solid(Color::rgba8(240, 20, 20, 255)),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+        let mut child_lens = rect_obj(15.0, 15.0, 20.0, 20.0, Fill::None);
+        child_lens.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let child_id = doc.add_object(child_lens, Some(lid)).unwrap();
+
+        let mut pc = rect_obj(10.0, 10.0, 40.0, 40.0, Fill::None);
+        pc.outline = OutlineStyle::none();
+        pc.lens = Some(LensConfig {
+            kind: LensKind::Brighten { rate_pct: 20.0 },
+            frozen: pc_frozen,
+            viewpoint: None,
+            remove_face: false,
+        });
+        let pc_id = doc.add_object(pc, Some(lid)).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::CreatePowerClip {
+                container_id: pc_id,
+                content_ids: vec![child_id],
+            },
+        )
+        .unwrap();
+
+        let vp = Viewport::for_export(384, 384, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        let mut renderer = SceneRenderer::new();
+
+        assert_eq!(renderer.has_unwarmed_frozen_lens(&doc, false), pc_frozen);
+        let _frame = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        assert!(
+            !renderer.has_unwarmed_frozen_lens(&doc, false),
+            "PowerClip with own lens(frozen={pc_frozen}) must not report child frozen lens as unwarmed"
+        );
+    }
+}
+
+#[test]
+fn w1b_r28_remove_face_ignores_invisible_and_zero_opacity_artwork() {
+    let mut doc = Document::new(
+        "R28 RemoveFace Invisible",
+        100.0,
+        100.0,
+        ColorMode::Rgb,
+        72.0,
+    );
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. Invisible Fill::None + OutlineStyle::none() rect under Lens(Invert, remove_face=true)
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "InvisibleRect",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                5.0, 5.0, 20.0, 20.0,
+            ))),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none()),
+        Some(lid),
+    )
+    .unwrap();
+
+    // 2. opacity == 0.0 red rect under Lens(Invert, remove_face=true)
+    let mut zero_op = rect_obj(
+        30.0,
+        5.0,
+        20.0,
+        20.0,
+        Fill::Solid(Color::rgba8(255, 0, 0, 255)),
+    );
+    zero_op.opacity = 0.0;
+    doc.add_object(zero_op, Some(lid)).unwrap();
+
+    // 3. Empty invisible PowerClip & empty invisible VectorTable
+    let empty_pc = SceneObject::new(
+        ObjectId(0),
+        "EmptyInvisiblePC",
+        NodePayload::PowerClip {
+            container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(
+                55.0, 5.0, 20.0, 20.0,
+            ))),
+            container_parametric: None,
+            contents: Vec::new(),
+            lock_contents: false,
+        },
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    doc.add_object(empty_pc, Some(lid)).unwrap();
+
+    let mut empty_tbl = coree_core::VectorTable::new(1, 1, 20.0, 20.0);
+    empty_tbl.border_style = OutlineStyle::none();
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "EmptyInvisibleTable",
+            NodePayload::Table(empty_tbl),
+        )
+        .with_transform(Affine2D::translate(75.0, 5.0))
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none()),
+        Some(lid),
+    )
+    .unwrap();
+
+    let mut lens = rect_obj(0.0, 0.0, 98.0, 30.0, Fill::None);
+    lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: false,
+        viewpoint: None,
+        remove_face: true,
+    });
+    doc.add_object(lens, Some(lid)).unwrap();
+
+    // 4. Deformed Group(Distort) -> [Invisible anchor, Group(Symmetry) -> [Partial Red, Lens(Invert, remove_face=true)]]
+    let anchor = SceneObject::new(
+        ObjectId(0),
+        "Anchor",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 40.0, 80.0, 40.0,
+        ))),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    let anchor_id = doc.add_object(anchor, Some(lid)).unwrap();
+
+    let red = rect_obj(
+        15.0,
+        45.0,
+        15.0,
+        30.0,
+        Fill::Solid(Color::rgba8(255, 0, 0, 255)),
+    );
+    let red_id = doc.add_object(red, Some(lid)).unwrap();
+    let mut sym_lens = rect_obj(10.0, 40.0, 35.0, 40.0, Fill::None);
+    sym_lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: false,
+        viewpoint: None,
+        remove_face: true,
+    });
+    let sym_lens_id = doc.add_object(sym_lens, Some(lid)).unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::Group {
+            ids: vec![red_id, sym_lens_id],
+            name: "SymGrp".into(),
+        },
+    )
+    .unwrap();
+    let sym_grp_id = doc.parent_container_of(red_id).unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::AddEffect {
+            id: sym_grp_id,
+            effect: Effect::Symmetry {
+                axes: 2,
+                mirror: false,
+                origin: Point2D::new(50.0, 60.0),
+            },
+        },
+    )
+    .unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::Group {
+            ids: vec![anchor_id, sym_grp_id],
+            name: "DistortGrp".into(),
+        },
+    )
+    .unwrap();
+    let dist_grp_id = doc.parent_container_of(sym_grp_id).unwrap();
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::AddEffect {
+            id: dist_grp_id,
+            effect: Effect::Distort {
+                kind: coree_core::DistortKind::PushPull,
+                amplitude: 0.0,
+                frequency: 1.0,
+                center: Point2D::new(50.0, 60.0),
+            },
+        },
+    )
+    .unwrap();
+
+    let img = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    for &(x_mm, y_mm, label) in &[
+        (15.0, 15.0, "Fill::None+Outline::none"),
+        (40.0, 15.0, "opacity==0.0"),
+        (65.0, 15.0, "empty invisible PowerClip"),
+        (85.0, 15.0, "empty invisible Table"),
+        (37.0, 60.0, "Branch0 uncovered over invisible anchor"),
+        (63.0, 60.0, "Branch1 uncovered over invisible anchor"),
+    ] {
+        let px = pixel_at_mm(&img, x_mm, y_mm);
+        assert_eq!(
+            px,
+            [255, 255, 255, 255],
+            "{label} at ({x_mm}, {y_mm}) must leave blank page untouched, got {px:?}"
+        );
+    }
+    assert_eq!(pixel_at_mm(&img, 22.0, 60.0), [0, 255, 255, 255]);
+    assert_eq!(pixel_at_mm(&img, 77.0, 60.0), [0, 255, 255, 255]);
 }

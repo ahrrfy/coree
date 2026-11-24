@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Clean-room Corel PHOTO-PAINT (`.cpt`) multi-layer raster container reader
+//! Clean-room `.cpt` multi-layer raster container reader
 //! (and test fixture writer), supporting `CPT7FILE`, `CPT8FILE`, `CPT9FILE`,
 //! and RIFF `CPT ` containers with RGB/RGBA/CMYK/Gray color models, multi-layer
 //! raster strips, separate alpha mask channels, and Raw / PackBits-RLE / Zlib /
@@ -11,11 +11,11 @@ use crate::coord::{decode_cdr_text, CODEPAGE_UTF8};
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{decompress_deflate_bounded, decompress_zlib_bounded, ByteReader, CodecLimits};
 use crate::riff::{parse_riff_with_budget, write_riff, RiffDocument, RiffEndian, RiffNode};
-use crate::{CorelFormat, ImportReport};
+use crate::{CdrFormat, ImportReport};
 use coree_core::{
     math::{sanitize_f32, MM_PER_INCH},
-    Affine2D, BlendMode, Color, ColorMode, Document, Layer, LayerId, NodePayload, Page, PageId,
-    RasterAsset, RasterLayerData, SceneObject,
+    Affine2D, BezierPath, BlendMode, Color, ColorMode, Document, Layer, LayerId, NodePayload, Page,
+    PageId, RasterAsset, RasterFilter, RasterLayerData, SceneObject,
 };
 use flate2::{
     write::{DeflateEncoder, ZlibEncoder},
@@ -23,7 +23,7 @@ use flate2::{
 };
 use std::io::Write;
 
-/// Pixel color model inside a `.cpt` PHOTO-PAINT container.
+/// Pixel color model inside a `.cpt` raster container (8-bpc and 16-bpc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum CptColorModel {
@@ -31,6 +31,10 @@ pub enum CptColorModel {
     Rgba32 = 2,
     Cmyk32 = 3,
     Gray8 = 4,
+    Rgb48 = 5,
+    Rgba64 = 6,
+    Cmyk64 = 7,
+    Gray16 = 8,
 }
 
 impl CptColorModel {
@@ -41,6 +45,10 @@ impl CptColorModel {
             2 => Some(Self::Rgba32),
             3 => Some(Self::Cmyk32),
             4 => Some(Self::Gray8),
+            5 => Some(Self::Rgb48),
+            6 => Some(Self::Rgba64),
+            7 => Some(Self::Cmyk64),
+            8 => Some(Self::Gray16),
             _ => None,
         }
     }
@@ -51,14 +59,22 @@ impl CptColorModel {
             Self::Rgb24 => 3,
             Self::Rgba32 | Self::Cmyk32 => 4,
             Self::Gray8 => 1,
+            Self::Rgb48 => 6,
+            Self::Rgba64 | Self::Cmyk64 => 8,
+            Self::Gray16 => 2,
         }
     }
 
     #[must_use]
     pub const fn to_core_color_mode(self) -> ColorMode {
         match self {
-            Self::Cmyk32 => ColorMode::Cmyk,
-            Self::Rgb24 | Self::Rgba32 | Self::Gray8 => ColorMode::Rgb,
+            Self::Cmyk32 | Self::Cmyk64 => ColorMode::Cmyk,
+            Self::Rgb24
+            | Self::Rgba32
+            | Self::Gray8
+            | Self::Rgb48
+            | Self::Rgba64
+            | Self::Gray16 => ColorMode::Rgb,
         }
     }
 
@@ -69,6 +85,10 @@ impl CptColorModel {
             Self::Rgba32 => "RGBA",
             Self::Cmyk32 => "CMYK",
             Self::Gray8 => "Gray",
+            Self::Rgb48 => "RGB48",
+            Self::Rgba64 => "RGBA64",
+            Self::Cmyk64 => "CMYK64",
+            Self::Gray16 => "Gray16",
         }
     }
 }
@@ -118,6 +138,30 @@ pub struct CptLayerSpec {
     pub rows_per_strip: u32,
 }
 
+/// Structured `.cpt` object/layer representation carrying 8-bpc or 16-bpc pixels,
+/// alpha mask, optional vector clip path, adjustment filters, and Spot channels.
+#[derive(Debug, Clone)]
+pub struct CPTObject {
+    pub name: String,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub dpi_x: f32,
+    pub dpi_y: f32,
+    pub opacity: u8,
+    pub blend_mode: BlendMode,
+    pub visible: bool,
+    pub locked: bool,
+    pub color_model: CptColorModel,
+    pub compression: CptCompression,
+    pub raw_pixels: Vec<u8>,
+    pub alpha_mask: Option<Vec<u8>>,
+    pub clip_mask: Option<BezierPath>,
+    pub adjustments: Vec<RasterFilter>,
+    pub spot_channels: Vec<(String, Color)>,
+}
+
 /// Detailed result of parsing a `.cpt` file (including version and optional RIFF tree).
 #[derive(Debug, Clone)]
 pub struct ParsedCpt {
@@ -149,12 +193,12 @@ pub fn detect_cpt_version(bytes: &[u8]) -> Option<u8> {
     None
 }
 
-/// Imports a Corel PHOTO-PAINT (`.cpt`) file from raw bytes.
+/// Imports a `.cpt` multi-layer raster file from raw bytes.
 pub fn import_cpt_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportReport> {
     let parsed = parse_cpt_bytes(bytes, limits)?;
     Ok(ImportReport {
         document: parsed.document,
-        detected_format: CorelFormat::Cpt {
+        detected_format: CdrFormat::Cpt {
             version: parsed.version,
         },
         warnings: parsed.warnings,
@@ -227,8 +271,10 @@ fn parse_cpt_native(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> 
         canvas_model.to_core_color_mode(),
         dpi_x,
     );
-    doc.pages[0].layers.clear();
-    doc.metadata.source_format = Some(format!("CPT v{version}"));
+    if let Some(p0) = doc.page_mut(0) {
+        p0.layers.clear();
+    }
+    doc.metadata_mut().source_format = Some(format!("CPT v{version}"));
 
     let mut budget_remaining = limits.max_uncompressed_bytes;
     limits.consume_budget(&mut budget_remaining, bytes.len() as u64)?;
@@ -355,30 +401,71 @@ fn parse_cpt_native(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> 
             None
         };
 
-        insert_cpt_layer_into_doc(
-            &mut doc,
-            limits,
-            &mut budget_remaining,
-            &name,
+        // Optional vector clip mask, adjustment filters, and spot channels (`CLIP` / `ADJT` / `SPOT`)
+        let mut clip_mask: Option<BezierPath> = None;
+        let mut adjustments: Vec<RasterFilter> = Vec::new();
+        let mut spot_channels: Vec<(String, Color)> = Vec::new();
+        for _ in 0..8 {
+            if r.remaining() < 8 {
+                break;
+            }
+            let pos = bytes.len() - r.remaining();
+            let peek = &bytes[pos..pos + 4];
+            if peek != b"CLIP" && peek != b"ADJT" && peek != b"SPOT" {
+                break;
+            }
+            let ext_tag = r.read_fourcc("CPT ext tag")?;
+            let ext_len = usize::try_from(r.read_u32_le("CPT ext len")?)
+                .map_err(|_| CdrError::ArithmeticOverflow("CPT ext len"))?;
+            let ext_bytes = r.read_bytes(ext_len, "CPT ext payload")?;
+            match &ext_tag {
+                b"CLIP" => {
+                    if let Ok(path) = serde_json::from_slice::<BezierPath>(ext_bytes) {
+                        clip_mask = Some(path);
+                    }
+                }
+                b"ADJT" => {
+                    if let Ok(adj) = serde_json::from_slice::<Vec<RasterFilter>>(ext_bytes) {
+                        adjustments = adj;
+                    }
+                }
+                b"SPOT" => {
+                    if let Ok(spots) = serde_json::from_slice::<Vec<(String, Color)>>(ext_bytes) {
+                        spot_channels = spots;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let cpt_obj = CPTObject {
+            name: name.clone(),
             offset_x,
             offset_y,
-            lw,
-            lh,
+            width: lw,
+            height: lh,
             dpi_x,
             dpi_y,
-            opacity_u8,
+            opacity: opacity_u8,
             blend_mode,
             visible,
             locked,
-            lmodel,
-            &raw_pixels,
-            alpha_mask.as_deref(),
-        )?;
+            color_model: lmodel,
+            compression,
+            raw_pixels,
+            alpha_mask,
+            clip_mask,
+            adjustments,
+            spot_channels,
+        };
+        insert_cpt_object_into_doc(&mut doc, limits, &mut budget_remaining, &cpt_obj)?;
     }
 
-    if doc.pages[0].layers.is_empty() {
+    if doc.pages()[0].layers.is_empty() {
         let lid = LayerId(doc.alloc_id());
-        doc.pages[0].layers.push(Layer::new(lid, "Background"));
+        if let Some(p0) = doc.page_mut(0) {
+            p0.layers.push(Layer::new(lid, "Background"));
+        }
     }
 
     Ok(ParsedCpt {
@@ -433,8 +520,10 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
         canvas_model.to_core_color_mode(),
         dpi_x,
     );
-    doc.pages[0].layers.clear();
-    doc.metadata.source_format = Some("CPT RIFF".to_owned());
+    if let Some(p0) = doc.page_mut(0) {
+        p0.layers.clear();
+    }
+    doc.metadata_mut().source_format = Some("CPT RIFF".to_owned());
 
     let warnings = Vec::new();
     let mut layer_count = 0usize;
@@ -524,32 +613,52 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
                 None
             };
 
+            let clip_mask = node
+                .find_chunk(b"clip")
+                .and_then(|cb| serde_json::from_slice::<BezierPath>(cb).ok());
+            let adjustments = node
+                .find_chunk(b"adjt")
+                .and_then(|ab| serde_json::from_slice::<Vec<RasterFilter>>(ab).ok())
+                .unwrap_or_default();
+            let spot_channels = node
+                .find_chunk(b"spot")
+                .and_then(|sb| serde_json::from_slice::<Vec<(String, Color)>>(sb).ok())
+                .unwrap_or_default();
+
             let _ = children;
-            insert_cpt_layer_into_doc(
-                &mut doc,
-                limits,
-                &mut budget_remaining,
-                if name.is_empty() { "Layer" } else { &name },
-                ox,
-                oy,
-                lw,
-                lh,
+            let cpt_obj = CPTObject {
+                name: if name.is_empty() {
+                    "Layer".to_owned()
+                } else {
+                    name
+                },
+                offset_x: ox,
+                offset_y: oy,
+                width: lw,
+                height: lh,
                 dpi_x,
                 dpi_y,
                 opacity,
-                blend,
-                (flags & 0x01) != 0,
-                (flags & 0x02) != 0,
-                lmodel,
-                &raw_pixels,
-                alpha_mask.as_deref(),
-            )?;
+                blend_mode: blend,
+                visible: (flags & 0x01) != 0,
+                locked: (flags & 0x02) != 0,
+                color_model: lmodel,
+                compression: comp,
+                raw_pixels,
+                alpha_mask,
+                clip_mask,
+                adjustments,
+                spot_channels,
+            };
+            insert_cpt_object_into_doc(&mut doc, limits, &mut budget_remaining, &cpt_obj)?;
         }
     }
 
-    if doc.pages[0].layers.is_empty() {
+    if doc.pages()[0].layers.is_empty() {
         let lid = LayerId(doc.alloc_id());
-        doc.pages[0].layers.push(Layer::new(lid, "Background"));
+        if let Some(p0) = doc.page_mut(0) {
+            p0.layers.push(Layer::new(lid, "Background"));
+        }
     }
 
     Ok(ParsedCpt {
@@ -561,26 +670,17 @@ fn parse_cpt_riff(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCpt> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_cpt_layer_into_doc(
+fn insert_cpt_object_into_doc(
     doc: &mut Document,
     limits: &CodecLimits,
     budget_remaining: &mut u64,
-    name: &str,
-    offset_x: i32,
-    offset_y: i32,
-    lw: u32,
-    lh: u32,
-    dpi_x: f32,
-    dpi_y: f32,
-    opacity_u8: u8,
-    blend_mode: BlendMode,
-    visible: bool,
-    locked: bool,
-    model: CptColorModel,
-    raw_pixels: &[u8],
-    alpha_mask: Option<&[u8]>,
+    obj_spec: &CPTObject,
 ) -> CdrResult<()> {
+    let lw = obj_spec.width;
+    let lh = obj_spec.height;
+    let raw_pixels = &obj_spec.raw_pixels;
+    let alpha_mask = obj_spec.alpha_mask.as_deref();
+
     let pixel_count = (lw as usize)
         .checked_mul(lh as usize)
         .ok_or(CdrError::ArithmeticOverflow("CPT pixel count"))?;
@@ -591,7 +691,7 @@ fn insert_cpt_layer_into_doc(
     limits.consume_budget(budget_remaining, rgba_bytes as u64)?;
     let mut rgba = Vec::with_capacity(rgba_bytes);
 
-    match model {
+    match obj_spec.color_model {
         CptColorModel::Rgb24 => {
             for i in 0..pixel_count {
                 let s = i * 3;
@@ -629,46 +729,124 @@ fn insert_cpt_layer_into_doc(
                 rgba.extend_from_slice(&[v, v, v, a]);
             }
         }
+        CptColorModel::Rgb48 => {
+            for i in 0..pixel_count {
+                let s = i * 6;
+                let r8 = (u16::from_le_bytes([raw_pixels[s], raw_pixels[s + 1]]) >> 8) as u8;
+                let g8 = (u16::from_le_bytes([raw_pixels[s + 2], raw_pixels[s + 3]]) >> 8) as u8;
+                let b8 = (u16::from_le_bytes([raw_pixels[s + 4], raw_pixels[s + 5]]) >> 8) as u8;
+                let a = alpha_mask.map_or(255, |m| m[i]);
+                rgba.extend_from_slice(&[r8, g8, b8, a]);
+            }
+        }
+        CptColorModel::Rgba64 => {
+            for i in 0..pixel_count {
+                let s = i * 8;
+                let r8 = (u16::from_le_bytes([raw_pixels[s], raw_pixels[s + 1]]) >> 8) as u8;
+                let g8 = (u16::from_le_bytes([raw_pixels[s + 2], raw_pixels[s + 3]]) >> 8) as u8;
+                let b8 = (u16::from_le_bytes([raw_pixels[s + 4], raw_pixels[s + 5]]) >> 8) as u8;
+                let base_a =
+                    (u16::from_le_bytes([raw_pixels[s + 6], raw_pixels[s + 7]]) >> 8) as u8;
+                let a = match alpha_mask {
+                    Some(m) => ((u16::from(base_a) * u16::from(m[i])) / 255) as u8,
+                    None => base_a,
+                };
+                rgba.extend_from_slice(&[r8, g8, b8, a]);
+            }
+        }
+        CptColorModel::Cmyk64 => {
+            for i in 0..pixel_count {
+                let s = i * 8;
+                let c = f32::from(u16::from_le_bytes([raw_pixels[s], raw_pixels[s + 1]])) / 65535.0;
+                let m =
+                    f32::from(u16::from_le_bytes([raw_pixels[s + 2], raw_pixels[s + 3]])) / 65535.0;
+                let y =
+                    f32::from(u16::from_le_bytes([raw_pixels[s + 4], raw_pixels[s + 5]])) / 65535.0;
+                let k =
+                    f32::from(u16::from_le_bytes([raw_pixels[s + 6], raw_pixels[s + 7]])) / 65535.0;
+                let [r8, g8, b8, _] = Color::cmyk(c, m, y, k).to_rgba8();
+                let a = alpha_mask.map_or(255, |mask| mask[i]);
+                rgba.extend_from_slice(&[r8, g8, b8, a]);
+            }
+        }
+        CptColorModel::Gray16 => {
+            for i in 0..pixel_count {
+                let s = i * 2;
+                let v = (u16::from_le_bytes([raw_pixels[s], raw_pixels[s + 1]]) >> 8) as u8;
+                let a = alpha_mask.map_or(255, |m| m[i]);
+                rgba.extend_from_slice(&[v, v, v, a]);
+            }
+        }
     }
 
-    let asset = RasterAsset::new(lw, lh, rgba, dpi_x, model.to_core_color_mode())?;
+    for (spot_name, spot_color) in &obj_spec.spot_channels {
+        doc.document_palette_mut()
+            .add_unique(spot_name, spot_color.clone());
+    }
+
+    let asset = RasterAsset::new(
+        lw,
+        lh,
+        rgba,
+        obj_spec.dpi_x,
+        obj_spec.color_model.to_core_color_mode(),
+    )?;
     let asset_id = doc.register_asset(asset);
 
     let layer_id = LayerId(doc.alloc_id());
-    let mut layer = Layer::new(layer_id, name);
-    layer.visible = visible;
-    layer.locked = locked;
+    let mut layer = Layer::new(layer_id, &obj_spec.name);
+    layer.visible = obj_spec.visible;
+    layer.locked = obj_spec.locked;
 
     let oid = doc.alloc_object_id();
-    let w_mm = f64::from(lw) * MM_PER_INCH / f64::from(dpi_x);
-    let h_mm = f64::from(lh) * MM_PER_INCH / f64::from(dpi_y);
-    let tx_mm = f64::from(offset_x) * MM_PER_INCH / f64::from(dpi_x);
-    let ty_mm = f64::from(offset_y) * MM_PER_INCH / f64::from(dpi_y);
+    let w_mm = f64::from(lw) * MM_PER_INCH / f64::from(obj_spec.dpi_x);
+    let h_mm = f64::from(lh) * MM_PER_INCH / f64::from(obj_spec.dpi_y);
+    let tx_mm = f64::from(obj_spec.offset_x) * MM_PER_INCH / f64::from(obj_spec.dpi_x);
+    let ty_mm = f64::from(obj_spec.offset_y) * MM_PER_INCH / f64::from(obj_spec.dpi_y);
 
     let mut obj = SceneObject::new(
         oid,
-        name,
+        &obj_spec.name,
         NodePayload::Raster(RasterLayerData {
             asset_id,
             width_mm: w_mm,
             height_mm: h_mm,
-            filters: Vec::new(),
+            filters: obj_spec.adjustments.clone(),
             crop_rect: None,
         }),
     );
     obj.transform = Affine2D::translate(tx_mm, ty_mm);
     obj.fill = coree_core::Fill::None;
     obj.outline = coree_core::OutlineStyle::none();
-    obj.opacity = f32::from(opacity_u8) / 255.0;
-    obj.blend_mode = blend_mode;
-    obj.visible = visible;
-    obj.locked = locked;
+    obj.opacity = f32::from(obj_spec.opacity) / 255.0;
+    obj.blend_mode = obj_spec.blend_mode;
+    obj.visible = obj_spec.visible;
+    obj.locked = obj_spec.locked;
 
-    doc.objects.insert(oid, obj);
-    layer.objects.push(oid);
-    if doc.pages.is_empty() {
+    let _ = doc.insert_loaded_object(obj);
+    let top_oid = if let Some(ref clip_path) = obj_spec.clip_mask {
+        let clip_oid = doc.alloc_object_id();
+        let mut clip_obj = SceneObject::new(
+            clip_oid,
+            format!("{} Clip", obj_spec.name),
+            NodePayload::PowerClip {
+                container: Box::new(clip_path.clone()),
+                container_parametric: None,
+                lock_contents: true,
+                contents: vec![oid],
+            },
+        );
+        clip_obj.visible = obj_spec.visible;
+        clip_obj.locked = obj_spec.locked;
+        let _ = doc.insert_loaded_object(clip_obj);
+        clip_oid
+    } else {
+        oid
+    };
+    layer.objects.push(top_oid);
+    if doc.pages().is_empty() {
         let pid = PageId(doc.alloc_id());
-        doc.pages.push(Page {
+        doc.push_loaded_page(Page {
             id: pid,
             name: "Canvas".to_owned(),
             width_mm: w_mm,
@@ -676,9 +854,10 @@ fn insert_cpt_layer_into_doc(
             bleed_mm: 0.0,
             facing_pages: false,
             layers: vec![layer],
+            unknown_chunks: Vec::new(),
         });
-    } else {
-        doc.pages[0].layers.push(layer);
+    } else if let Some(p0) = doc.page_mut(0) {
+        p0.layers.push(layer);
     }
     Ok(())
 }
@@ -991,4 +1170,409 @@ pub fn write_cpt_riff_bytes(
         form_type: *b"CPT ",
         children: nodes,
     })
+}
+
+/// Writes structured [`CPTObject`] layers (including clip masks, adjustment layers,
+/// Spot channels, and 16-bpc formats) into a native `CPT9FILE` stream.
+pub fn write_cpt_objects_bytes(
+    title: &str,
+    canvas_width: u32,
+    canvas_height: u32,
+    canvas_model: CptColorModel,
+    dpi: f32,
+    objects: &[CPTObject],
+) -> CdrResult<Vec<u8>> {
+    let specs: Vec<CptLayerSpec> = objects
+        .iter()
+        .map(|o| CptLayerSpec {
+            name: o.name.clone(),
+            offset_x: o.offset_x,
+            offset_y: o.offset_y,
+            width: o.width,
+            height: o.height,
+            opacity: o.opacity,
+            blend_mode: o.blend_mode,
+            visible: o.visible,
+            locked: o.locked,
+            color_model: o.color_model,
+            compression: o.compression,
+            raw_pixels: o.raw_pixels.clone(),
+            alpha_mask: o.alpha_mask.as_ref().map(|m| (o.compression, m.clone())),
+            rows_per_strip: 0,
+        })
+        .collect();
+    if objects
+        .iter()
+        .all(|o| o.clip_mask.is_none() && o.adjustments.is_empty() && o.spot_channels.is_empty())
+    {
+        return write_cpt_bytes(
+            9,
+            title,
+            canvas_width,
+            canvas_height,
+            canvas_model,
+            dpi,
+            &specs,
+        );
+    }
+
+    // Write each object via `write_cpt_bytes` and inject `CLIP`/`ADJT`/`SPOT` blocks per layer.
+    let mut out = write_cpt_bytes(
+        9,
+        title,
+        canvas_width,
+        canvas_height,
+        canvas_model,
+        dpi,
+        &[],
+    )?;
+    let count_off = 8 + 4 + 4 + 4 + 2 + 2 + 4 + 4;
+    out[count_off..count_off + 4].copy_from_slice(&(objects.len() as u32).to_le_bytes());
+
+    for obj in objects {
+        let single = write_cpt_bytes(
+            9,
+            "",
+            canvas_width,
+            canvas_height,
+            canvas_model,
+            dpi,
+            &[CptLayerSpec {
+                name: obj.name.clone(),
+                offset_x: obj.offset_x,
+                offset_y: obj.offset_y,
+                width: obj.width,
+                height: obj.height,
+                opacity: obj.opacity,
+                blend_mode: obj.blend_mode,
+                visible: obj.visible,
+                locked: obj.locked,
+                color_model: obj.color_model,
+                compression: obj.compression,
+                raw_pixels: obj.raw_pixels.clone(),
+                alpha_mask: obj
+                    .alpha_mask
+                    .as_ref()
+                    .map(|m| (obj.compression, m.clone())),
+                rows_per_strip: 0,
+            }],
+        )?;
+        // Header for empty title is 8 (magic) + 4 (header_size) + 26 (fields) = 38 bytes.
+        out.extend_from_slice(&single[38..]);
+        if let Some(ref clip) = obj.clip_mask {
+            if let Ok(cb) = serde_json::to_vec(clip) {
+                out.extend_from_slice(b"CLIP");
+                out.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+                out.extend_from_slice(&cb);
+            }
+        }
+        if !obj.adjustments.is_empty() {
+            if let Ok(ab) = serde_json::to_vec(&obj.adjustments) {
+                out.extend_from_slice(b"ADJT");
+                out.extend_from_slice(&(ab.len() as u32).to_le_bytes());
+                out.extend_from_slice(&ab);
+            }
+        }
+        if !obj.spot_channels.is_empty() {
+            if let Ok(sb) = serde_json::to_vec(&obj.spot_channels) {
+                out.extend_from_slice(b"SPOT");
+                out.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                out.extend_from_slice(&sb);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coree_core::Rect2D;
+
+    #[test]
+    fn cpt_object_roundtrips_clip_mask_adjustments_and_spot_channels() {
+        let obj = CPTObject {
+            name: "Photo".to_owned(),
+            offset_x: 4,
+            offset_y: 8,
+            width: 2,
+            height: 2,
+            dpi_x: 300.0,
+            dpi_y: 300.0,
+            opacity: 200,
+            blend_mode: BlendMode::Multiply,
+            visible: true,
+            locked: false,
+            color_model: CptColorModel::Rgba32,
+            compression: CptCompression::Zlib,
+            raw_pixels: vec![255u8; 16],
+            alpha_mask: Some(vec![128u8; 4]),
+            clip_mask: Some(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            ))),
+            adjustments: vec![RasterFilter::BrightnessContrast {
+                brightness: 0.2,
+                contrast: 0.1,
+            }],
+            spot_channels: vec![(
+                "CutContour".to_owned(),
+                Color::spot("CutContour", 1.0, [0.0, 1.0, 0.0, 0.0]),
+            )],
+        };
+        let bytes =
+            write_cpt_objects_bytes("Clipped", 2, 2, CptColorModel::Rgba32, 300.0, &[obj]).unwrap();
+        let parsed = parse_cpt_bytes(&bytes, &CodecLimits::default()).unwrap();
+        let rt_doc = &parsed.document;
+        assert!(rt_doc
+            .document_palette()
+            .swatches
+            .iter()
+            .any(|s| s.name == "CutContour"));
+        let top_oid = rt_doc.pages()[0].layers[0].objects[0];
+        match &rt_doc.object(top_oid).unwrap().payload {
+            NodePayload::PowerClip { contents, .. } => {
+                let inner = rt_doc.object(contents[0]).unwrap();
+                match &inner.payload {
+                    NodePayload::Raster(r) => assert_eq!(r.filters.len(), 1),
+                    other => panic!("expected Raster inside PowerClip, got {other:?}"),
+                }
+            }
+            other => panic!("expected PowerClip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cpt_16bpc_models_gray16_rgb48_rgba64_cmyk64_decode_accurately() {
+        // 1) Gray16
+        let g16: Vec<u8> = [0xFFFFu16, 0x8000u16]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_gray = write_cpt_bytes(
+            9,
+            "G16",
+            2,
+            1,
+            CptColorModel::Gray16,
+            300.0,
+            &[CptLayerSpec {
+                name: "G".into(),
+                offset_x: 0,
+                offset_y: 0,
+                width: 2,
+                height: 1,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                locked: false,
+                color_model: CptColorModel::Gray16,
+                compression: CptCompression::Raw,
+                raw_pixels: g16,
+                alpha_mask: None,
+                rows_per_strip: 0,
+            }],
+        )
+        .unwrap();
+        let pg = parse_cpt_bytes(&b_gray, &CodecLimits::default()).unwrap();
+        let a_g = pg.document.assets().values().next().unwrap();
+        assert_eq!(&a_g.rgba_bytes[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&a_g.rgba_bytes[4..8], &[128, 128, 128, 255]);
+
+        // 2) Rgb48
+        let rgb48: Vec<u8> = [0xFFFFu16, 0x0000u16, 0x4000u16]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_rgb = write_cpt_bytes(
+            9,
+            "R48",
+            1,
+            1,
+            CptColorModel::Rgb48,
+            300.0,
+            &[CptLayerSpec {
+                name: "R".into(),
+                offset_x: 0,
+                offset_y: 0,
+                width: 1,
+                height: 1,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                locked: false,
+                color_model: CptColorModel::Rgb48,
+                compression: CptCompression::Raw,
+                raw_pixels: rgb48,
+                alpha_mask: None,
+                rows_per_strip: 0,
+            }],
+        )
+        .unwrap();
+        let pr = parse_cpt_bytes(&b_rgb, &CodecLimits::default()).unwrap();
+        let a_r = pr.document.assets().values().next().unwrap();
+        assert_eq!(&a_r.rgba_bytes[0..4], &[255, 0, 64, 255]);
+
+        // 3) Rgba64 & Cmyk64
+        let rgba64: Vec<u8> = [0x8000u16, 0x4000u16, 0x2000u16, 0xC000u16]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_rgba = write_cpt_riff_bytes(
+            "R64",
+            1,
+            1,
+            CptColorModel::Rgba64,
+            300.0,
+            &[CptLayerSpec {
+                name: "RA".into(),
+                offset_x: 0,
+                offset_y: 0,
+                width: 1,
+                height: 1,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                locked: false,
+                color_model: CptColorModel::Rgba64,
+                compression: CptCompression::Raw,
+                raw_pixels: rgba64,
+                alpha_mask: None,
+                rows_per_strip: 0,
+            }],
+        )
+        .unwrap();
+        let pra = parse_cpt_bytes(&b_rgba, &CodecLimits::default()).unwrap();
+        let a_ra = pra.document.assets().values().next().unwrap();
+        assert_eq!(&a_ra.rgba_bytes[0..4], &[128, 64, 32, 192]);
+
+        let cmyk64: Vec<u8> = [0x0000u16, 0xFFFFu16, 0xFFFFu16, 0x0000u16]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_cmyk = write_cpt_bytes(
+            9,
+            "C64",
+            1,
+            1,
+            CptColorModel::Cmyk64,
+            300.0,
+            &[CptLayerSpec {
+                name: "C".into(),
+                offset_x: 0,
+                offset_y: 0,
+                width: 1,
+                height: 1,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                locked: false,
+                color_model: CptColorModel::Cmyk64,
+                compression: CptCompression::Raw,
+                raw_pixels: cmyk64,
+                alpha_mask: None,
+                rows_per_strip: 0,
+            }],
+        )
+        .unwrap();
+        let pc = parse_cpt_bytes(&b_cmyk, &CodecLimits::default()).unwrap();
+        assert_eq!(pc.color_model, CptColorModel::Cmyk64);
+    }
+
+    #[test]
+    fn cpt_riff_with_clip_and_spot_chunks_roundtrips() {
+        let clip_json = serde_json::to_vec(&BezierPath::from_rect(Rect2D::from_xywh(
+            1.0, 2.0, 5.0, 5.0,
+        )))
+        .unwrap();
+        let spot_json = serde_json::to_vec(&vec![(
+            "Varnish".to_owned(),
+            Color::spot("Varnish", 1.0, [0.2, 0.0, 0.8, 0.0]),
+        )])
+        .unwrap();
+
+        let riff_bytes = write_cpt_riff_bytes(
+            "RiffExt",
+            2,
+            2,
+            CptColorModel::Rgb24,
+            300.0,
+            &[CptLayerSpec {
+                name: "Base".into(),
+                offset_x: 0,
+                offset_y: 0,
+                width: 2,
+                height: 2,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                locked: false,
+                color_model: CptColorModel::Rgb24,
+                compression: CptCompression::Raw,
+                raw_pixels: vec![120u8; 12],
+                alpha_mask: None,
+                rows_per_strip: 0,
+            }],
+        )
+        .unwrap();
+        let mut tree =
+            parse_riff_with_budget(&riff_bytes, &CodecLimits::default(), &mut 1_000_000, true)
+                .unwrap();
+        for n in &mut tree.children {
+            if let RiffNode::List {
+                list_type,
+                children,
+                ..
+            } = n
+            {
+                if list_type == b"layr" {
+                    children.push(RiffNode::chunk(*b"clip", clip_json.clone()));
+                    children.push(RiffNode::chunk(*b"spot", spot_json.clone()));
+                }
+            }
+        }
+        let ext_bytes = write_riff(&tree).unwrap();
+        let parsed = parse_cpt_bytes(&ext_bytes, &CodecLimits::default()).unwrap();
+        assert!(parsed
+            .document
+            .document_palette()
+            .swatches
+            .iter()
+            .any(|s| s.name == "Varnish"));
+        let oid = parsed.document.pages()[0].layers[0].objects[0];
+        assert!(matches!(
+            parsed.document.object(oid).unwrap().payload,
+            NodePayload::PowerClip { .. }
+        ));
+    }
+
+    #[test]
+    fn cpt_malformed_or_truncated_extension_blocks_handled_safely() {
+        let obj = CPTObject {
+            name: "Safe".to_owned(),
+            offset_x: 0,
+            offset_y: 0,
+            width: 2,
+            height: 2,
+            dpi_x: 300.0,
+            dpi_y: 300.0,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            visible: true,
+            locked: false,
+            color_model: CptColorModel::Gray8,
+            compression: CptCompression::Raw,
+            raw_pixels: vec![10, 20, 30, 40],
+            alpha_mask: None,
+            clip_mask: None,
+            adjustments: vec![],
+            spot_channels: vec![],
+        };
+        let mut bytes =
+            write_cpt_objects_bytes("Safe", 2, 2, CptColorModel::Gray8, 300.0, &[obj]).unwrap();
+        // Append truncated `CLIP` block claiming 1000 bytes
+        bytes.extend_from_slice(b"CLIP");
+        bytes.extend_from_slice(&1000u32.to_le_bytes());
+        bytes.extend_from_slice(b"{broken");
+        assert!(parse_cpt_bytes(&bytes, &CodecLimits::default()).is_err());
+    }
 }

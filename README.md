@@ -27,9 +27,15 @@ All images below are rendered directly by `coree render` (verified 100.0% pixel-
 - **Repository:** [https://github.com/ahrrfy/coree](https://github.com/ahrrfy/coree)
 - **License:** Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) (Rust ecosystem gold standard: MIT's maximum global adoption + Apache-2.0's explicit patent grant & trademark non-grant; see [NOTICE](NOTICE))
 - **Feature Parity:** **100.0 / 100** (`68/68` must-have capabilities complete across all 13 feature areas — see [replica/parity.md](replica/parity.md))
-- **Verified Quality:** `#![forbid(unsafe_code)]` across all 7 crates, **323/323** automated unit/integration/E2E/adversarial tests passing (`0` open S1/S2 bugs across 105 verified audit fixes), `cargo clippy --workspace --all-targets -- -D warnings` clean, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
+- **Verified Quality:** `#![forbid(unsafe_code)]` across all 7 crates, **336/336** automated unit/integration/E2E/adversarial tests passing (`0` open S1/S2 bugs across 116 verified audit fixes), `cargo clippy --workspace --all-targets -- -D warnings` clean, **35/35** WCAG 2.2 AA/AAA contrast pairs passing, and **100.0%** deterministic pixel-identical rendering verified via `imgdiff.py`.
 
 ---
+
+### What's New in `v0.3.1` (Building on `v0.3.0` & `v0.2.x`)
+
+- **Precision Geometry, Curves & Scene Graph (`coree-core`):** Philip Schneider cubic Bézier curve re-fitting (`fit_cubic_bezier_subpath`) preserving sharp corners across `boolean.rs` and `erase_circle`, `MasterLayerScope::{OddPages,EvenPages}` spatial index & hit-testing, composed `world_xf` on `ConnectorObject` & `convert_to_curves_with_outliner`, and undo-safe `CommandHistory::gc_document_assets`.
+- **ICC v4 CLUT & Rendering Fidelity (`coree-core`, `coree-render`):** Arbitrary-dimension ICC v4 `mAB`/`mBA` CLUTs with `RenderingIntent` & media white-point adaptation, cached `SoftProofLut3D`, live text effects, `999`-step multi-subpath `Blend`, C¹ Catmull-Rom `MeshFill`, `960px` curve-refit `SmartFill`, shaped Kashida `ForceJustifyKashida`, and `Frozen` lens Rayon tile pre-warm.
+- **Prepress, `coree-cql` Search, CDR & Security (`coree-cdr`, `coree-storage`, `coree-prod`, `coree-app`):** `compute_separations_with_text_outliner`, `coree-cql` Find/Replace query parser & UI filter bar, pure-Rust SFNT `name` collector, gzipped `.snapshot.json.gz` autosaves, Unix `0o700`/`0o600` IPC lockfile hardening, composed `Group`/`PowerClip` transform & lock enforcement across 26+ tools, live `PrintPreviewDialog` sheet thumbnails, distinct per-tool icons, and Arabic localized dockers.
 
 ### What's New in `v0.3.0` (Including `v0.2.x` Engine Upgrades)
 
@@ -62,13 +68,13 @@ Download the latest release assets from [GitHub Releases](https://github.com/ahr
 
 - **Ubuntu / Debian (`.deb` — Recommended for Debian/Ubuntu/Mint/Pop!_OS):**
   ```bash
-  sudo apt install ./coree_0.3.0_amd64.deb
+  sudo apt install ./coree_0.3.1_amd64.deb
   ```
   Installs `/usr/bin/coree`, desktop entry, canonical `application/vnd.corel-draw` MIME rules (eliminates ZIP icons on `.cdr` files!), SVG app & MIME icons, GNOME/freedesktop `coree.thumbnailer`, and AppStream metainfo.
 - **Universal Portable `.AppImage` (Any Linux distro, zero install):**
   ```bash
-  chmod +x coree-v0.3.0-x86_64.AppImage
-  ./coree-v0.3.0-x86_64.AppImage
+  chmod +x coree-v0.3.1-x86_64.AppImage
+  ./coree-v0.3.1-x86_64.AppImage
   ```
 - **Offline-Sandboxed Flatpak:**
   Build locally from [packaging/linux/flatpak/io.github.ahrrfy.coree.yml](packaging/linux/flatpak/io.github.ahrrfy.coree.yml) (strictly sandboxed with Wayland/X11/DRI and **no network access**):
@@ -100,8 +106,8 @@ Build native `.deb` or `.AppImage` locally without `sudo`:
 
 #### Option 3 — Windows (`x86_64`): MSI Installer or Portable ZIP
 Download from [GitHub Releases](https://github.com/ahrrfy/coree/releases):
-- **Windows Installer (`.msi`):** Double-click `coree-v0.3.0-x86_64-windows-setup.msi` — installs GUI `coree.exe` (with embedded `coree.ico`, `PerMonitorV2` HiDPI & `UTF-8` Arabic filename manifest) and CLI companion **`coree.com`**, Start Menu & Desktop shortcuts, `PATH` entry, and full Windows Registry file associations (`coree.Document` + `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.psd`).
-- **Portable `.zip` (Zero Admin):** Extract `coree-v0.3.0-x86_64-windows-portable.zip` anywhere and run `coree.exe` (or `coree.com` from PowerShell/CMD for synchronous CLI output). Optionally double-click `register-file-associations.cmd` to register `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt`/`.svg`/`.dxf`/`.plt` in `HKCU` without Administrator privileges!
+- **Windows Installer (`.msi`):** Double-click `coree-v0.3.1-x86_64-windows-setup.msi` — installs GUI `coree.exe` (with embedded `coree.ico`, `PerMonitorV2` HiDPI & `UTF-8` Arabic filename manifest) and CLI companion **`coree.com`**, Start Menu & Desktop shortcuts, `PATH` entry, and full Windows Registry file associations (`coree.Document` + `OpenWithProgids` for `.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.eps`, `.dxf`, `.plt`, `.psd`).
+- **Portable `.zip` (Zero Admin):** Extract `coree-v0.3.1-x86_64-windows-portable.zip` anywhere and run `coree.exe` (or `coree.com` from PowerShell/CMD for synchronous CLI output). Optionally double-click `register-file-associations.cmd` to register `.coree`/`.cdr`/`.cdt`/`.cmx`/`.cpt`/`.svg`/`.dxf`/`.plt` in `HKCU` without Administrator privileges!
 
 To build from source on Windows (MSVC, MinGW-w64, or WiX v4 `.msi`), see [packaging/windows/build-windows.md](packaging/windows/build-windows.md).
 
@@ -170,6 +176,10 @@ cargo fmt --all -- --check
 
 **`coree`** حزمة رسوميات متجهية وتخطيط صفحات متعددة واستوديو صور نقطية وقص ونقش بالليزر وإنتاج طباعي مفتوحة المصدر ومبنية بالكامل من الصفر (Clean-Room) بلغة **Rust** وبترخيص مزدوج **`MIT OR Apache-2.0`**. صُمّمت لمطابع الأوفست والديجيتال وورش القص بالليزر والفايبر والراوتر والفينيل ومصممي اللافتات والعبوات والخط العربي على **لينكس** و**ويندوز**، وتعمل **محلياً بالكامل بنسبة 100%** دون اشتراكات أو حسابات أو سحابة إجبارية أو تتبع.
 
+### أبرز مزايا الإصدار `v0.3.1` (`v0.3.0` + تدقيق المعمارية والدقة والأمان)
+- **دقة المنحنيات وإدارة الألوان ICC v4 والتحكم بالعُقد (`coree-core`, `coree-render`):** إعادة تركيب منحنيات بيزييه التكعيبية (`fit_cubic_bezier_subpath`) في العمليات البولينية والممحاة، ودعم جداول `mAB`/`mBA` في ICC v4 مع ذاكرة `SoftProofLut3D`، ومزج حتى 999 خطوة، وتعبئة شبكية `C¹ Catmull-Rom`، و`SmartFill` بدقة 960 بكسل، ومطّ الكشيدة بعد التشكيل `ForceJustifyKashida`، وفصل الألوان للنصوص عبر `TextEngine`.
+- **البحث `coree-cql` وضغط الحفظ التلقائي والأمان (`coree-prod`, `coree-storage`, `coree-app`):** محلل استعلامات `coree-cql`، وجامع جداول خطوط SFNT، وضغط `gzip` للحفظ التلقائي، وأذونات `0700`/`0600` لملفات IPC، وتوحيد التحويلات الموروثة والأقفال عبر 26+ أداة، ومعاينة حية لمساحة الطباعة، وأيقونات مميزة، ولوحات عربية كاملة (`336/336` اختباراً ناجحاً).
+
 ### أبرز مزايا الإصدار `v0.3.0`
 - **تصدير طباعي دقيق بدون مربعات صماء (`PDF`, `EPS`, `SVG`) + طباعة نظامية (`Ctrl+P`):** تحويل النصوص العربية واللاتينية إلى منحنيات بيزييه حقيقية عبر `cosmic-text`/`swash`، وتصدير `/Separation` لألوان Spot (`CutContour`)، والتدرجات `/ShadingType 2/3`، و`/OutputIntents` مع دعم ملفات `.icc`/`.icm` المخصصة ومعاينة طباعية حية، إضافة إلى إرسال الطباعة مباشرة إلى طابعات Linux (`CUPS`) وWindows.
 - **محرك `.cdr` شامل عبر الأجيال (`coree-cdr`):** دعم قراءة/كتابة RIFF (`v4–v13`) وZIP (`X4–X5`) وZCF الحديث (`X6–2025` / `v16–26`)، وتصحيح مقياس التدرجات المحلي (mm) ووراثة أنماط `document.cdss`، وأوزان الخطوط الرقمية والعربية (`RTL`/`bidi_font_family`/`OpenType`)، وكتل `arrw`/`bmpf`/`vpat`/`clrs`، واستعادة النصوص العربية القديمة `CP1256`.
@@ -178,7 +188,7 @@ cargo fmt --all -- --check
 
 ### التثبيت على لينكس وويندوز
 
-- **لينكس (Ubuntu/Debian `.deb`):** `sudo apt install ./coree_0.3.0_amd64.deb`
+- **لينكس (Ubuntu/Debian `.deb`):** `sudo apt install ./coree_0.3.1_amd64.deb`
 - **لينكس (التثبيت المحلي من المصدر بدون `sudo`):**
   ```bash
   git clone https://github.com/ahrrfy/coree.git
@@ -186,7 +196,7 @@ cargo fmt --all -- --check
   ./packaging/linux/install-linux.sh
   ~/.local/bin/coree --diagnostics
   ```
-- **ويندوز:** شغّل المثبّت `coree-v0.3.0-x86_64-windows-setup.msi` أو فك ضغط النسخة المحمولة `coree-v0.3.0-x86_64-windows-portable.zip` (تضم `coree.exe` و`coree.com` وسكربت ربط الملفات بضغطة واحدة `register-file-associations.cmd`).
+- **ويندوز:** شغّل المثبّت `coree-v0.3.1-x86_64-windows-setup.msi` أو فك ضغط النسخة المحمولة `coree-v0.3.1-x86_64-windows-portable.zip` (تضم `coree.exe` و`coree.com` وسكربت ربط الملفات بضغطة واحدة `register-file-associations.cmd`).
 
 ---
 

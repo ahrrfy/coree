@@ -4,8 +4,10 @@
 //! strict foreign keys, schema version tracking, and automatic execution of
 //! the exact DDL from `replica/schema.sql`.
 
+use crate::autosave::AsyncAutosaveHandle;
 use crate::error::{StorageError, StorageResult};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -239,8 +241,19 @@ CREATE INDEX IF NOT EXISTS idx_app_preferences_category
 /// Local offline SQLite storage handle for `coree`.
 pub struct StorageDb {
     pub(crate) conn: Connection,
+    db_path: Option<PathBuf>,
     data_dir: PathBuf,
+    last_quarantined_path: Option<PathBuf>,
+    pub(crate) autosave_worker: Option<AsyncAutosaveHandle>,
     _temp_guard: Option<TempDir>,
+}
+
+impl Drop for StorageDb {
+    fn drop(&mut self) {
+        if let Some(mut worker) = self.autosave_worker.take() {
+            worker.shutdown();
+        }
+    }
 }
 
 impl StorageDb {
@@ -266,6 +279,11 @@ impl StorageDb {
     }
 
     /// Opens a file-backed SQLite database at `db_path` with an explicit local `data_dir`.
+    ///
+    /// Automatically detects corrupted or truncated SQLite databases (`!= "SQLite format 3\0"`
+    /// header, `SQLITE_CORRUPT`/`SQLITE_NOTADB`, or failed `PRAGMA quick_check(1)`), quarantines
+    /// the corrupt DB and `-wal`/`-shm` sidecars to `.corrupt.<ts>.bak` (`0o600`), preserves all
+    /// `<data_dir>/autosave/*.snapshot.json.gz` blobs, and re-initializes a clean WAL database.
     pub fn open_with_data_dir(db_path: &Path, data_dir: PathBuf) -> StorageResult<Self> {
         if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -273,12 +291,34 @@ impl StorageDb {
         }
         std::fs::create_dir_all(&data_dir)?;
         harden_dir_permissions(&data_dir)?;
-        let conn = Connection::open(db_path)?;
-        configure_and_migrate(&conn, true)?;
+
+        let mut quarantined_bak: Option<PathBuf> = None;
+        let quarantine = |p: &Path| quarantine_corrupt_database(p);
+        if db_path.exists() {
+            let meta = std::fs::metadata(db_path)?;
+            if meta.len() > 0 && !has_valid_sqlite_header(db_path) {
+                quarantined_bak = Some(quarantine(db_path)?);
+            }
+        }
+
+        let conn = match open_and_verify_wal_db(db_path) {
+            Ok(c) => c,
+            Err(err) if is_corruption_or_format_error(&err) && db_path.exists() => {
+                quarantined_bak = Some(quarantine(db_path)?);
+                open_and_verify_wal_db(db_path)?
+            }
+            Err(err) => return Err(err),
+        };
+
         harden_file_permissions(db_path)?;
+        let autosave_dir = data_dir.join("autosave");
+        let worker = AsyncAutosaveHandle::spawn(Some(db_path.to_path_buf()), autosave_dir)?;
         Ok(Self {
             conn,
+            db_path: Some(db_path.to_path_buf()),
             data_dir,
+            last_quarantined_path: quarantined_bak,
+            autosave_worker: Some(worker),
             _temp_guard: None,
         })
     }
@@ -290,11 +330,29 @@ impl StorageDb {
         let data_dir = tmp.path().to_path_buf();
         let conn = Connection::open_in_memory()?;
         configure_and_migrate(&conn, false)?;
+        let autosave_dir = data_dir.join("autosave");
+        let worker = AsyncAutosaveHandle::spawn(None, autosave_dir)?;
         Ok(Self {
             conn,
+            db_path: None,
             data_dir,
+            last_quarantined_path: None,
+            autosave_worker: Some(worker),
             _temp_guard: Some(tmp),
         })
+    }
+
+    /// Returns the backup `.corrupt.<ts>.bak` path if opening this database required
+    /// quarantining a corrupted SQLite file.
+    #[must_use]
+    pub fn last_quarantined_backup(&self) -> Option<&Path> {
+        self.last_quarantined_path.as_deref()
+    }
+
+    /// Returns the backing SQLite file path (`None` for in-memory databases).
+    #[must_use]
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
     }
 
     /// Returns the currently applied schema version from `schema_migrations`.
@@ -378,7 +436,90 @@ pub(crate) fn harden_file_permissions(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> StorageResult<()> {
+fn has_valid_sqlite_header(db_path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(db_path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    &header == b"SQLite format 3\0"
+}
+
+fn is_corruption_or_format_error(err: &StorageError) -> bool {
+    match err {
+        StorageError::Sqlite(sql_err) => matches!(
+            sql_err.sqlite_error_code(),
+            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt | ErrorCode::SchemaChanged)
+        ),
+        StorageError::RecoveryFailed(_) => true,
+        _ => false,
+    }
+}
+
+fn open_and_verify_wal_db(db_path: &Path) -> StorageResult<Connection> {
+    let conn = Connection::open(db_path)?;
+    configure_and_migrate(&conn, true)?;
+    let check: String = conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if !check.eq_ignore_ascii_case("ok") {
+        return Err(StorageError::RecoveryFailed(format!(
+            "SQLite PRAGMA quick_check(1) failed: {check}"
+        )));
+    }
+    Ok(conn)
+}
+
+/// Quarantines a corrupted SQLite database file (plus any `-wal` / `-shm` sidecars) to
+/// `<db_path>.corrupt.<timestamp>.bak` (`0o600` permissions) while leaving `autosave/` intact.
+pub fn quarantine_corrupt_database(db_path: &Path) -> StorageResult<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let base_name = db_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("coree.db");
+    let parent = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut attempt = 0u32;
+    let backup_path = loop {
+        let suffix = if attempt == 0 {
+            format!("{base_name}.corrupt.{ts}.bak")
+        } else {
+            format!("{base_name}.corrupt.{ts}.{attempt}.bak")
+        };
+        let candidate = parent.join(suffix);
+        if !candidate.exists() {
+            break candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    };
+
+    if db_path.exists() {
+        std::fs::rename(db_path, &backup_path)?;
+        harden_file_permissions(&backup_path)?;
+    }
+
+    for sidecar_ext in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.display(), sidecar_ext));
+        if sidecar.exists() {
+            let sidecar_bak = PathBuf::from(format!(
+                "{}{}.corrupt.{}.bak",
+                db_path.display(),
+                sidecar_ext,
+                ts
+            ));
+            let _ = std::fs::rename(&sidecar, &sidecar_bak);
+            let _ = harden_file_permissions(&sidecar_bak);
+        }
+    }
+
+    Ok(backup_path)
+}
+
+pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> StorageResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     if enable_wal {
@@ -481,7 +622,7 @@ mod tests {
 
         let doc = coree_core::Document::new_a4("Perm Check");
         let snap = db
-            .save_snapshot(&doc.id.to_string(), "Perm Check", None, &doc)
+            .save_snapshot(&doc.id().to_string(), "Perm Check", None, &doc)
             .unwrap();
         let snap_mode = std::fs::metadata(&snap.snapshot_blob_path)
             .unwrap()
@@ -489,5 +630,75 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(snap_mode, 0o600);
+    }
+
+    #[test]
+    fn corrupt_sqlite_db_is_quarantined_and_cleanly_reinitialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("coree.db");
+        let corrupt_bytes = b"NOT_A_VALID_SQLITE_DATABASE_HEADER_PAYLOAD_CORRUPTED";
+        std::fs::write(&db_path, corrupt_bytes).unwrap();
+
+        let db = StorageDb::open(&db_path).expect("corrupt DB must quarantine and re-initialize");
+        let backup = db
+            .last_quarantined_backup()
+            .expect("quarantine backup path must be recorded")
+            .to_path_buf();
+        assert!(backup.exists(), "quarantined backup file must exist");
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".corrupt."),
+            "backup filename must contain .corrupt."
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), corrupt_bytes);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let bak_mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(bak_mode, 0o600);
+        }
+
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.journal_mode().unwrap().to_ascii_lowercase(), "wal");
+        assert!(db.foreign_keys_enabled().unwrap());
+    }
+
+    #[test]
+    fn corrupt_wal_sidecar_quarantine_preserves_autosave_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("coree.db");
+        let autosave_dir = dir.path().join("autosave");
+        std::fs::create_dir_all(&autosave_dir).unwrap();
+        let preserved_blob = autosave_dir.join("preserved.snapshot.json.gz");
+        std::fs::write(&preserved_blob, b"preserved-autosave-bytes").unwrap();
+
+        // Truncated header + bogus WAL sidecar
+        std::fs::write(&db_path, b"SQLite format 3").unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        std::fs::write(&wal_path, b"corrupt-wal-frames").unwrap();
+
+        let db = StorageDb::open(&db_path).unwrap();
+        assert!(db.last_quarantined_backup().is_some());
+        let quarantined_wal = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.contains("-wal.corrupt.") && name.ends_with(".bak")
+            })
+            .expect("stale corrupt WAL sidecar must be quarantined to -wal.corrupt.<ts>.bak");
+        assert_eq!(
+            std::fs::read(&quarantined_wal).unwrap(),
+            b"corrupt-wal-frames"
+        );
+        assert_eq!(
+            std::fs::read(&preserved_blob).unwrap(),
+            b"preserved-autosave-bytes"
+        );
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     }
 }

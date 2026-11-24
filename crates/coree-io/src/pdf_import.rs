@@ -171,9 +171,9 @@ pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     let first_spec = &pages_spec[0];
     let (first_w_mm, first_h_mm, _) = page_geometry(first_spec);
     let mut doc = Document::new(doc_title, first_w_mm, first_h_mm, ColorMode::Rgb, 300.0);
-    doc.metadata.source_format = Some("pdf".to_owned());
-    doc.metadata.author = info_author;
-    doc.metadata.subject = info_subject;
+    doc.metadata_mut().source_format = Some("pdf".to_owned());
+    doc.metadata_mut().author = info_author;
+    doc.metadata_mut().subject = info_subject;
 
     let total_pages = pages_spec.len();
     let per_image_budget = if total_pages <= 4 {
@@ -192,17 +192,14 @@ pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     for (page_idx, spec) in pages_spec.iter().enumerate() {
         let (w_mm, h_mm, page_to_mm) = page_geometry(spec);
         let layer_id = if page_idx == 0 {
-            ctx.doc.pages[0].width_mm = w_mm;
-            ctx.doc.pages[0].height_mm = h_mm;
-            ctx.doc.pages[0].layers[0].id
+            ctx.doc.set_page_dimensions(0, w_mm, h_mm)?;
+            ctx.doc.pages()[0].layers[0].id
         } else {
             let pid = ctx
                 .doc
                 .add_page(format!("Page {}", page_idx + 1), w_mm, h_mm, 0.0);
             ctx.doc
-                .pages
-                .iter()
-                .find(|p| p.id == pid)
+                .page_by_id(pid)
                 .map(|p| p.layers[0].id)
                 .ok_or_else(|| pdf_err("failed to locate created page"))?
         };
@@ -221,7 +218,7 @@ pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     }
 
     if ctx.saw_cmyk && !ctx.saw_rgb {
-        ctx.doc.color_mode = ColorMode::Cmyk;
+        ctx.doc.set_color_mode(ColorMode::Cmyk);
     }
     ctx.doc.refresh_document_palette();
     Ok(doc)
@@ -3509,7 +3506,7 @@ mod tests {
 
         // Second page with curved shape
         let p2 = doc.add_page("Page 2", 150.0, 100.0, 0.0);
-        let p2_layer = doc.pages.iter().find(|p| p.id == p2).unwrap().layers[0].id;
+        let p2_layer = doc.page_by_id(p2).unwrap().layers[0].id;
         doc.add_object(
             SceneObject::new(
                 ObjectId(0),
@@ -3536,17 +3533,17 @@ mod tests {
         let pdf_bytes = export_pdf_to_bytes(&doc, &opts).unwrap();
         let imported = import_pdf_bytes(&pdf_bytes, "Fallback").unwrap();
 
-        assert_eq!(imported.pages.len(), 2);
-        assert!((imported.pages[0].width_mm - 100.0).abs() < 0.1);
-        assert!((imported.pages[0].height_mm - 80.0).abs() < 0.1);
-        assert!((imported.pages[1].width_mm - 150.0).abs() < 0.1);
-        assert!((imported.pages[1].height_mm - 100.0).abs() < 0.1);
+        assert_eq!(imported.pages().len(), 2);
+        assert!((imported.pages()[0].width_mm - 100.0).abs() < 0.1);
+        assert!((imported.pages()[0].height_mm - 80.0).abs() < 0.1);
+        assert!((imported.pages()[1].width_mm - 150.0).abs() < 0.1);
+        assert!((imported.pages()[1].height_mm - 100.0).abs() < 0.1);
 
         // Verify page 1 recovered vector path, text, and raster image
-        let p1_objs: Vec<&SceneObject> = imported.pages[0].layers[0]
+        let p1_objs: Vec<&SceneObject> = imported.pages()[0].layers[0]
             .objects
             .iter()
-            .filter_map(|id| imported.objects.get(id))
+            .filter_map(|id| imported.object(*id))
             .collect();
         assert!(p1_objs
             .iter()
@@ -3558,10 +3555,10 @@ mod tests {
         assert!(p1_objs
             .iter()
             .any(|o| matches!(&o.payload, NodePayload::Raster(_))));
-        assert!(!imported.assets.is_empty());
+        assert!(!imported.assets().is_empty());
 
         // Verify page 2 has the curved badge
-        assert!(!imported.pages[1].layers[0].objects.is_empty());
+        assert!(!imported.pages()[1].layers[0].objects.is_empty());
     }
 
     #[test]
@@ -3696,12 +3693,12 @@ mod tests {
         pdf.extend_from_slice(tail.as_bytes());
 
         let doc = import_pdf_bytes(&pdf, "PDF 1.5 XRefStream").unwrap();
-        assert_eq!(doc.pages.len(), 1);
+        assert_eq!(doc.pages().len(), 1);
         // MediaBox was 200x100 pt, Rotate 90 -> swapped to 100x200 pt!
-        assert!((doc.pages[0].width_mm - 100.0 * PT_TO_MM).abs() < 0.1);
-        assert!((doc.pages[0].height_mm - 200.0 * PT_TO_MM).abs() < 0.1);
-        assert_eq!(doc.objects.len(), 2); // Form XObject rect + UTF-16BE "OK" text
-        assert!(doc.objects.values().any(|o| matches!(
+        assert!((doc.pages()[0].width_mm - 100.0 * PT_TO_MM).abs() < 0.1);
+        assert!((doc.pages()[0].height_mm - 200.0 * PT_TO_MM).abs() < 0.1);
+        assert_eq!(doc.object_count(), 2); // Form XObject rect + UTF-16BE "OK" text
+        assert!(doc.objects().values().any(|o| matches!(
             &o.payload,
             NodePayload::ArtisticText(t) if t.plain_text() == "OK"
         )));
@@ -3786,8 +3783,8 @@ mod tests {
 4 0 obj\n<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 3 /Length 8 >>\nstream\n12345678\nendstream\nendobj\n\
 5 0 obj\n<< /Length 7 >>\nstream\n/Im1 Do\nendstream\nendobj\n%%EOF\n";
         let doc = import_pdf_bytes(bad_bpc_pdf, "BadBpc").unwrap();
-        assert_eq!(doc.pages.len(), 1);
-        assert!(doc.assets.is_empty());
+        assert_eq!(doc.pages().len(), 1);
+        assert!(doc.assets().is_empty());
 
         // 4. ASCII85 `z` amplification & repeated /Contents array cap must reject cleanly
         let z_bomb = vec![b'z'; 1000];

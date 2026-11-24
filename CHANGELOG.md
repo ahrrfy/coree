@@ -4,6 +4,26 @@ All notable changes to **`coree`** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-22
+
+### Fixed & Added (Deep Atomic Architecture, Precision, Security & UI Audit — `BUG-106`–`BUG-116`)
+- **Geometry, Curves & Scene Graph (`coree-core`):**
+  - Implemented Philip Schneider cubic Bézier curve re-fitting (`fit_cubic_bezier_subpath`) preserving sharp corners across `boolean.rs` and `erase_circle`, and fixed the `erase_circle` open-subpath tail drop/duplication bug (`BUG-106`).
+  - Aligned `build_spatial_index` and `hit_test` with `MasterLayerScope::{OddPages,EvenPages}`, resolved composed ancestor `world_xf` on `ConnectorObject` endpoints and `convert_to_curves_with_outliner`, and added undo-safe `CommandHistory::gc_document_assets` garbage collection (`BUG-107`).
+- **ICC v4 Color Management & Rendering Engine (`coree-core`, `coree-render`):**
+  - Implemented arbitrary-dimension ICC v4 `mAB`/`mBA` CLUT parsing (`IccV4Lut`) with `RenderingIntent` and media white-point adaptation, and cached `SoftProofLut3D` inside `SceneRenderer` (`BUG-108`).
+  - Added live text effects (`render_text_pieces_with_effects`), 999-step multi-subpath `Blend`, C¹ Catmull-Rom 10×10 `MeshFill`, `960px` curve-refit `SmartFill`, shaped `measure_run_advance_mm` Kashida + `TextAlign::ForceJustifyKashida`, and `Frozen` lens pre-warm enabling parallel Rayon tile rendering (`BUG-111`).
+- **CDR Codec & Compressed Autosave (`coree-cdr`, `coree-storage`):**
+  - Removed wrong-asset fallback on missing `bmp_ref` in `cdr_riff.rs`, preserved unrecognized nested `lgob`/`pwrp` `LIST` chunks in `unknown_chunks`, and rendered real `64×64` document previews in ZIP `thumbnail.bmp` (`BUG-110`).
+  - Added streaming gzip compression (`.snapshot.json.gz`) in `autosave.rs` with backward-compatible magic sniffing and surfaced SQLite open errors with an explicit UI toast in `StudioApp::new_desktop` (`BUG-109`).
+- **Prepress, CQL Query Engine & Font Collection (`coree-prod`, `coree-app`):**
+  - Added `compute_separations_with_text_outliner` wired to `TextEngine` plus `SymbolInstance` spot discovery and text/table separation rasterization (`BUG-112`).
+  - Built clean-room `coree-cql` query parser/evaluator (`parse_cql_query`, `evaluate_cql_query`) with unit conversions, boolean AST, and Find/Replace UI quick-filter bar, plus a pure-Rust bounded SFNT `name` table reader in `collect_for_output` (`BUG-113`).
+- **Security, Nested Transforms & Studio UI (`coree-app`):**
+  - Enforced Unix `0o700` parent directory and `0o600` atomic lockfile permissions in `ipc.rs` (`BUG-114`).
+  - Unified composed ancestor `world_transform_of_or_local` / `world_inverse_transform_of` and `is_object_editable_in_doc` lock checks across 26+ canvas/tool/drag/node-editing paths (`BUG-115`).
+  - Added live visual sheet/bleed/crop/imposition preview thumbnail in `PrintPreviewDialog`, distinct per-tool vector icons, Property Bar parameters for Ellipse/Impact/BasicShapes/ArtisticMedia/Curves/Dimensions/Connectors, and Arabic UAX #9 localized `DockerTab::title_for` titles (`336 / 336` workspace tests passing, `BUG-116`).
+
 ## [0.3.0] - 2026-11-22
 
 ### Added & Hardened (Wave D — Deep Parity, Performance, Print & OS Integration)

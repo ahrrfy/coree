@@ -169,7 +169,7 @@ impl PdfObjectStore {
 
 /// Exports `doc` to a print-ready PDF 1.7 byte buffer.
 pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<Vec<u8>> {
-    if doc.pages.is_empty() {
+    if doc.pages().is_empty() {
         return Err(IoError::InvalidFormat {
             format: "pdf".into(),
             message: "document has no pages".into(),
@@ -179,10 +179,10 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
     let page_indices: Vec<usize> = match &opts.pages {
         Some(list) => {
             for &idx in list {
-                if idx >= doc.pages.len() {
+                if idx >= doc.pages().len() {
                     return Err(IoError::PageOutOfRange {
                         page_index: idx,
-                        page_count: doc.pages.len(),
+                        page_count: doc.pages().len(),
                     });
                 }
             }
@@ -194,13 +194,13 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
             }
             list.clone()
         }
-        None => (0..doc.pages.len()).collect(),
+        None => (0..doc.pages().len()).collect(),
     };
 
     let use_cmyk = match opts.color_space {
         PdfColorSpace::DeviceCmyk => true,
         PdfColorSpace::DeviceRgb => false,
-        PdfColorSpace::DocumentDefault => doc.color_mode == ColorMode::Cmyk,
+        PdfColorSpace::DocumentDefault => doc.color_mode() == ColorMode::Cmyk,
     };
 
     let mut store = PdfObjectStore::new();
@@ -220,7 +220,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
 
     // Pre-register embedded raster assets as PDF Image XObjects
     let mut image_xobjects: BTreeMap<coree_core::ImageAssetId, (String, usize)> = BTreeMap::new();
-    for (img_idx, (&asset_id, asset)) in doc.assets.iter().enumerate() {
+    for (img_idx, (&asset_id, asset)) in doc.assets().iter().enumerate() {
         let name = format!("Im{}", img_idx + 1);
         let xobj_id = add_raster_xobject(&mut store, asset, use_cmyk)?;
         image_xobjects.insert(asset_id, (name, xobj_id));
@@ -232,7 +232,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
     let mut page_obj_ids = Vec::with_capacity(page_indices.len());
 
     for &page_index in &page_indices {
-        let page = &doc.pages[page_index];
+        let page = &doc.pages()[page_index];
         if !page.width_mm.is_finite()
             || page.width_mm <= 0.0
             || !page.height_mm.is_finite()
@@ -299,7 +299,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
 
         // Emit applicable master layers from OTHER pages first (bottom), then target page's own layers.
         let mut ordered_layers = Vec::new();
-        for (p_idx, p) in doc.pages.iter().enumerate() {
+        for (p_idx, p) in doc.pages().iter().enumerate() {
             if p_idx == page_index {
                 continue;
             }
@@ -328,7 +328,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         for layer in ordered_layers {
             let mut visited = HashSet::new();
             for &oid in &layer.objects {
-                if let Some(obj) = doc.objects.get(&oid) {
+                if let Some(obj) = doc.object(oid) {
                     emit_pdf_object(
                         &ctx,
                         obj,
@@ -453,8 +453,8 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
     store.set(pages_root_id, pages_dict.into_bytes());
 
     // Embed ISO 32000-1 /OutputIntents ICC profile stream (custom doc ICC or clean-room CMYK/sRGB ICC v2)
-    let raw_icc = if let Some(ref bytes) = doc.custom_icc_profile {
-        bytes.clone()
+    let raw_icc = if let Some(bytes) = doc.custom_icc_profile() {
+        bytes.to_vec()
     } else if use_cmyk {
         generate_minimal_cmyk_icc_v2(
             "ISO Coated v2 CMYK (coree Clean-Room)",
@@ -516,8 +516,8 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
 
     let info_dict = format!(
         "<< /Title ({}) /Author ({}) /Creator (coree) /Producer (coree-io PDF 1.7 Writer) >>",
-        escape_pdf_string(&doc.title),
-        escape_pdf_string(&doc.metadata.author)
+        escape_pdf_string(doc.title()),
+        escape_pdf_string(&doc.metadata().author)
     );
     store.set(info_id, info_dict.into_bytes());
 
@@ -898,8 +898,8 @@ fn emit_pdf_object(
                     emit,
                     out,
                 );
-                let label =
-                    dim.compute_measurement_with_dpi(ctx.doc.default_unit, f64::from(ctx.doc.dpi));
+                let label = dim
+                    .compute_measurement_with_dpi(ctx.doc.default_unit(), f64::from(ctx.doc.dpi()));
                 let mid = dim.p1.midpoint(dim.p2);
                 let at = ArtisticText::from_plain(label, dim.text_style.clone());
                 emit_pdf_artistic_text(
@@ -931,7 +931,7 @@ fn emit_pdf_object(
             }
             NodePayload::Group(children) => {
                 for &cid in children {
-                    if let Some(child) = ctx.doc.objects.get(&cid) {
+                    if let Some(child) = ctx.doc.object(cid) {
                         emit_pdf_object(
                             ctx,
                             child,
@@ -969,7 +969,7 @@ fn emit_pdf_object(
                 emit_pdf_path_ops(ctx, &clip_path, out);
                 out.push_str("W n\n");
                 for &cid in contents {
-                    if let Some(child) = ctx.doc.objects.get(&cid) {
+                    if let Some(child) = ctx.doc.object(cid) {
                         emit_pdf_object(
                             ctx,
                             child,
@@ -998,7 +998,7 @@ fn emit_pdf_object(
                 }
             }
             NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = ctx.doc.symbols.get(sym_id) {
+                if let Some(sym) = ctx.doc.symbol(*sym_id) {
                     for sub in &sym.objects {
                         let mut sym_visited = HashSet::new();
                         emit_pdf_object(
@@ -2023,7 +2023,7 @@ mod tests {
     fn pdf_1_7_cmyk_print_ready_multipage_with_marks_and_valid_xref() {
         let mut doc = Document::new_a4("Business Flyer");
         let p2 = doc.add_page("Back", 210.0, 297.0, 3.0);
-        let p2_layer = doc.pages.iter().find(|p| p.id == p2).unwrap().layers[0].id;
+        let p2_layer = doc.page_by_id(p2).unwrap().layers[0].id;
 
         let mut rect = SceneObject::new(
             ObjectId(0),

@@ -32,8 +32,14 @@ impl StudioApp {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        let page_idx = tab.document.active_page_index;
-        match compute_separations(&tab.document, page_idx, &SeparationOptions::default()) {
+        let page_idx = tab.document.active_page_index();
+        let mut text_engine = TextEngine::new();
+        match compute_separations_with_text_outliner(
+            &tab.document,
+            page_idx,
+            &SeparationOptions::default(),
+            |obj, doc| outline_text_object_with_engine(&mut text_engine, obj, doc),
+        ) {
             Ok(sep) => {
                 let plate_count = sep.plates.len();
                 let tac = sep.max_tac_pct;
@@ -51,37 +57,104 @@ impl StudioApp {
     pub fn generate_cut_contour_active(&mut self) {
         let offset = self.production_state.cut_offset_mm;
         let spot = self.production_state.cut_spot_name.clone();
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        let targets: Vec<ObjectId> = if !tab.selection.is_empty() {
-            tab.selection.objects.clone()
-        } else {
-            tab.document
-                .active_page()
-                .map(|p| {
-                    p.layers
-                        .iter()
-                        .filter(|l| !l.is_cut_layer && l.visible)
-                        .flat_map(|l| l.objects.iter().copied())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        match generate_cut_contour(&mut tab.document, &targets, offset, &spot) {
-            Ok(res) => {
-                tab.selection.select_single(&tab.document, res.object_id);
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
+        let plan: Result<(Vec<CommandOp>, ObjectId, String, f64), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let targets: Vec<ObjectId> = if !tab.selection.is_empty() {
+                tab.selection.objects.clone()
+            } else {
+                tab.document
+                    .active_page()
+                    .map(|p| {
+                        p.layers
+                            .iter()
+                            .filter(|l| !l.is_cut_layer && l.visible)
+                            .flat_map(|l| l.objects.iter().copied())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let existing_layers: HashSet<LayerId> = tab
+                .document
+                .pages()
+                .iter()
+                .flat_map(|p| p.layers.iter().map(|l| l.id))
+                .collect();
+
+            tab.history
+                .begin_transaction(&tab.document, "Generate CutContour")
+                .map_err(|e| e.to_string())?;
+            let res = match generate_cut_contour(&mut tab.document, &targets, offset, &spot) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            if !existing_layers.contains(&res.layer_id) {
+                let page_id = tab
+                    .document
+                    .pages()
+                    .iter()
+                    .find(|p| p.layers.iter().any(|l| l.id == res.layer_id))
+                    .map(|p| p.id)
+                    .ok_or_else(|| {
+                        let _ = tab.history.cancel_transaction(&mut tab.document);
+                        "cut contour layer missing from page".to_owned()
+                    })?;
+                if let Some(layer) = tab.document.find_layer(res.layer_id) {
+                    ops.push(CommandOp::AddLayer {
+                        page_id,
+                        name: layer.name.clone(),
+                        is_cut_layer: layer.is_cut_layer,
+                        master_scope: layer.master_scope,
+                    });
+                }
+            } else {
+                ops.push(CommandOp::SetLayerFlags {
+                    layer_id: res.layer_id,
+                    visible: Some(true),
+                    locked: None,
+                    printable: Some(true),
+                    is_cut_layer: Some(true),
+                });
+            }
+            if let Some(obj) = tab.document.object(res.object_id) {
+                ops.push(CommandOp::create_object(obj.clone(), Some(res.layer_id)));
+            }
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, res.object_id, res.spot_name, res.cut_length_mm))
+        })();
+
+        match plan {
+            Ok((ops, object_id, spot_name, cut_length_mm)) => {
+                if !ops.is_empty() {
+                    let cmd = if ops.len() == 1 {
+                        ops.into_iter().next().expect("len == 1")
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(e) = self.execute_command(cmd) {
+                        self.push_toast(format!("CutContour failed: {e}"), true);
+                        return;
+                    }
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.selection.select_single(&tab.document, object_id);
+                }
                 self.push_toast(
-                    format!(
-                        "Created {} ({:.1} mm cut path)",
-                        res.spot_name, res.cut_length_mm
-                    ),
+                    format!("Created {spot_name} ({cut_length_mm:.1} mm cut path)"),
                     false,
                 );
             }
-            Err(e) => self.push_toast(format!("CutContour failed: {e}"), true),
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("CutContour failed: {e}"), true);
+                }
+            }
         }
     }
 
@@ -116,97 +189,345 @@ impl StudioApp {
                 tuck_flap_mm: 14.0,
             },
         };
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        let page_idx = tab.document.active_page_index;
-        match generate_dieline(&mut tab.document, page_idx, &kind, Point2D::new(10.0, 10.0)) {
-            Ok(res) => {
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
+        let plan: Result<(Vec<CommandOp>, f64, f64), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let page_idx = tab.document.active_page_index();
+            let page_id = tab
+                .document
+                .page(page_idx)
+                .map(|p| p.id)
+                .ok_or_else(|| "active page out of range".to_owned())?;
+            let existing_layers: HashSet<LayerId> = tab
+                .document
+                .pages()
+                .iter()
+                .flat_map(|p| p.layers.iter().map(|l| l.id))
+                .collect();
+
+            tab.history
+                .begin_transaction(&tab.document, "Generate Dieline")
+                .map_err(|e| e.to_string())?;
+            let res = match generate_dieline(
+                &mut tab.document,
+                page_idx,
+                &kind,
+                Point2D::new(10.0, 10.0),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            for lid in [res.cut_layer_id, res.crease_layer_id] {
+                if !existing_layers.contains(&lid) {
+                    if let Some(layer) = tab.document.find_layer(lid) {
+                        ops.push(CommandOp::AddLayer {
+                            page_id,
+                            name: layer.name.clone(),
+                            is_cut_layer: layer.is_cut_layer,
+                            master_scope: layer.master_scope,
+                        });
+                    }
+                } else {
+                    ops.push(CommandOp::SetLayerFlags {
+                        layer_id: lid,
+                        visible: Some(true),
+                        locked: None,
+                        printable: Some(true),
+                        is_cut_layer: Some(true),
+                    });
+                }
+            }
+            for &oid in &res.cut_object_ids {
+                if let Some(obj) = tab.document.object(oid) {
+                    ops.push(CommandOp::create_object(
+                        obj.clone(),
+                        Some(res.cut_layer_id),
+                    ));
+                }
+            }
+            for &oid in &res.crease_object_ids {
+                if let Some(obj) = tab.document.object(oid) {
+                    ops.push(CommandOp::create_object(
+                        obj.clone(),
+                        Some(res.crease_layer_id),
+                    ));
+                }
+            }
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, res.cut_length_mm, res.crease_length_mm))
+        })();
+
+        match plan {
+            Ok((ops, cut_length_mm, crease_length_mm)) => {
+                if !ops.is_empty() {
+                    let cmd = if ops.len() == 1 {
+                        ops.into_iter().next().expect("len == 1")
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(e) = self.execute_command(cmd) {
+                        self.push_toast(format!("Dieline error: {e}"), true);
+                        return;
+                    }
+                }
                 self.push_toast(
-                    format!(
-                        "Dieline generated: Cut {:.0} mm | Crease {:.0} mm",
-                        res.cut_length_mm, res.crease_length_mm
-                    ),
+                    format!("Dieline generated: Cut {cut_length_mm:.0} mm | Crease {crease_length_mm:.0} mm"),
                     false,
                 );
             }
-            Err(e) => self.push_toast(format!("Dieline error: {e}"), true),
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("Dieline error: {e}"), true);
+                }
+            }
         }
     }
 
     /// Inserts a crisp 1D vector barcode onto the active page.
     pub fn insert_barcode_active(&mut self) {
-        let sym = self.production_state.barcode_symbology;
-        let payload = self.production_state.barcode_payload.clone();
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(layer_id) = self.ensure_active_creation_layer() else {
             return;
         };
-        let layer_id = tab.active_layer_id;
-        match add_barcode_to_document(
-            &mut tab.document,
-            sym,
-            &payload,
-            Point2D::new(20.0, 20.0),
-            &BarcodeOptions::default(),
-            layer_id,
-        ) {
-            Ok(oid) => {
-                tab.selection.select_single(&tab.document, oid);
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
+        let sym = self.production_state.barcode_symbology;
+        let payload = self.production_state.barcode_payload.clone();
+        let plan: Result<(Vec<CommandOp>, ObjectId), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            tab.history
+                .begin_transaction(&tab.document, "Insert Barcode")
+                .map_err(|e| e.to_string())?;
+            let group_id = match add_barcode_to_document(
+                &mut tab.document,
+                sym,
+                &payload,
+                Point2D::new(20.0, 20.0),
+                &BarcodeOptions::default(),
+                layer_id,
+            ) {
+                Ok(oid) => oid,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            if let Some(group_obj) = tab.document.object(group_id).cloned() {
+                if let NodePayload::Group(ref children) = group_obj.payload {
+                    for &cid in children {
+                        if let Some(child_obj) = tab.document.object(cid) {
+                            ops.push(CommandOp::create_object(child_obj.clone(), layer_id));
+                        }
+                    }
+                    ops.push(CommandOp::Group {
+                        ids: children.clone(),
+                        name: group_obj.name.clone(),
+                    });
+                    if group_obj.transform != Affine2D::IDENTITY {
+                        ops.push(CommandOp::TransformObjects {
+                            ids: vec![group_id],
+                            affine: group_obj.transform,
+                        });
+                    }
+                }
+            }
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, group_id))
+        })();
+
+        match plan {
+            Ok((ops, oid)) => {
+                if !ops.is_empty() {
+                    let cmd = if ops.len() == 1 {
+                        ops.into_iter().next().expect("len == 1")
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(e) = self.execute_command(cmd) {
+                        self.push_toast(format!("Barcode error: {e}"), true);
+                        return;
+                    }
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.selection.select_single(&tab.document, oid);
+                }
                 self.push_toast(format!("Inserted {sym:?} barcode"), false);
             }
-            Err(e) => self.push_toast(format!("Barcode error: {e}"), true),
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("Barcode error: {e}"), true);
+                }
+            }
         }
     }
 
     /// Inserts a crisp vector QR code onto the active page.
     pub fn insert_qr_active(&mut self) {
+        let Some(layer_id) = self.ensure_active_creation_layer() else {
+            return;
+        };
         let payload = self.production_state.qr_payload.clone();
         let opts = QrCodeOptions {
             size_mm: self.production_state.qr_size_mm.clamp(8.0, 500.0),
             ec_level: self.production_state.qr_ec,
             ..QrCodeOptions::default()
         };
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        let layer_id = tab.active_layer_id;
-        match add_qr_code_to_document(
-            &mut tab.document,
-            &payload,
-            Point2D::new(25.0, 25.0),
-            &opts,
-            layer_id,
-        ) {
-            Ok(oid) => {
-                tab.selection.select_single(&tab.document, oid);
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
+        let plan: Result<(Vec<CommandOp>, ObjectId), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            tab.history
+                .begin_transaction(&tab.document, "Insert QR Code")
+                .map_err(|e| e.to_string())?;
+            let group_id = match add_qr_code_to_document(
+                &mut tab.document,
+                &payload,
+                Point2D::new(25.0, 25.0),
+                &opts,
+                layer_id,
+            ) {
+                Ok(oid) => oid,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            if let Some(group_obj) = tab.document.object(group_id).cloned() {
+                if let NodePayload::Group(ref children) = group_obj.payload {
+                    for &cid in children {
+                        if let Some(child_obj) = tab.document.object(cid) {
+                            ops.push(CommandOp::create_object(child_obj.clone(), layer_id));
+                        }
+                    }
+                    ops.push(CommandOp::Group {
+                        ids: children.clone(),
+                        name: group_obj.name.clone(),
+                    });
+                    if group_obj.transform != Affine2D::IDENTITY {
+                        ops.push(CommandOp::TransformObjects {
+                            ids: vec![group_id],
+                            affine: group_obj.transform,
+                        });
+                    }
+                }
+            }
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, group_id))
+        })();
+
+        match plan {
+            Ok((ops, oid)) => {
+                if !ops.is_empty() {
+                    let cmd = if ops.len() == 1 {
+                        ops.into_iter().next().expect("len == 1")
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(e) = self.execute_command(cmd) {
+                        self.push_toast(format!("QR error: {e}"), true);
+                        return;
+                    }
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.selection.select_single(&tab.document, oid);
+                }
                 self.push_toast("Inserted vector QR Code", false);
             }
-            Err(e) => self.push_toast(format!("QR error: {e}"), true),
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("QR error: {e}"), true);
+                }
+            }
         }
     }
 
     /// Generates vector print marks (crop, bleed, registration, color bars, page slug) on the active page.
     pub fn add_print_marks_active(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        let page_idx = tab.document.active_page_index;
-        match generate_print_marks(&mut tab.document, page_idx, &PrintMarksOptions::default()) {
-            Ok(res) => {
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
-                self.push_toast(
-                    format!("Added {} print mark object(s)", res.total_objects()),
-                    false,
-                );
+        let plan: Result<(Vec<CommandOp>, usize), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let page_idx = tab.document.active_page_index();
+            let page_id = tab
+                .document
+                .page(page_idx)
+                .map(|p| p.id)
+                .ok_or_else(|| "active page out of range".to_owned())?;
+            let existing_layers: HashSet<LayerId> = tab
+                .document
+                .pages()
+                .iter()
+                .flat_map(|p| p.layers.iter().map(|l| l.id))
+                .collect();
+
+            tab.history
+                .begin_transaction(&tab.document, "Add Print Marks")
+                .map_err(|e| e.to_string())?;
+            let res = match generate_print_marks(
+                &mut tab.document,
+                page_idx,
+                &PrintMarksOptions::default(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            if !existing_layers.contains(&res.layer_id) {
+                if let Some(layer) = tab.document.find_layer(res.layer_id) {
+                    ops.push(CommandOp::AddLayer {
+                        page_id,
+                        name: layer.name.clone(),
+                        is_cut_layer: layer.is_cut_layer,
+                        master_scope: layer.master_scope,
+                    });
+                }
             }
-            Err(e) => self.push_toast(format!("Print marks failed: {e}"), true),
+            let mut new_obj_ids = Vec::with_capacity(res.total_objects());
+            new_obj_ids.extend(res.crop_mark_ids.iter().copied());
+            new_obj_ids.extend(res.bleed_mark_ids.iter().copied());
+            new_obj_ids.extend(res.registration_target_ids.iter().copied());
+            new_obj_ids.extend(res.color_bar_ids.iter().copied());
+            if let Some(slug) = res.page_slug_id {
+                new_obj_ids.push(slug);
+            }
+            for oid in new_obj_ids {
+                if let Some(obj) = tab.document.object(oid) {
+                    ops.push(CommandOp::create_object(obj.clone(), Some(res.layer_id)));
+                }
+            }
+            let total = res.total_objects();
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, total))
+        })();
+
+        match plan {
+            Ok((ops, total)) => {
+                if !ops.is_empty() {
+                    if let Err(e) = self.execute_command(CommandOp::Batch(ops)) {
+                        self.push_toast(format!("Print marks failed: {e}"), true);
+                        return;
+                    }
+                }
+                self.push_toast(format!("Added {total} print mark object(s)"), false);
+            }
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("Print marks failed: {e}"), true);
+                }
+            }
         }
     }
 
@@ -237,7 +558,7 @@ impl StudioApp {
         };
         match impose_document(&doc, &mode) {
             Ok(imposed) => {
-                let n = imposed.pages.len();
+                let n = imposed.pages().len();
                 self.new_document(imposed);
                 self.push_toast(format!("Imposed into {n} press sheet(s)"), false);
             }
@@ -260,7 +581,7 @@ impl StudioApp {
         };
         match apply_print_merge(&doc, &table, &PrintMergeOptions::default()) {
             Ok(merged) => {
-                let pages = merged.pages.len();
+                let pages = merged.pages().len();
                 self.new_document(merged);
                 self.push_toast(format!("Print Merge generated {pages} page(s)"), false);
             }
@@ -288,114 +609,239 @@ impl StudioApp {
 
     /// Traces the selected raster object via `coree_render::trace_raster_to_mm` and adds grouped vector curves.
     pub fn trace_selected_raster(&mut self) -> Result<usize, String> {
+        let layer_id = self.active_creation_layer_or_err()?;
         let cfg = self.trace_state.to_config();
         let is_centerline = matches!(cfg.mode, TraceMode::CenterlineTrace);
-        let tab = self
-            .tabs
-            .get_mut(self.active_tab)
-            .ok_or_else(|| "no active document".to_owned())?;
+        let (ops, created_ids, count) = {
+            let tab = self
+                .tabs
+                .get(self.active_tab)
+                .ok_or_else(|| "no active document".to_owned())?;
 
-        // Find selected raster object (or first raster on active page)
-        let target_id = tab
-            .selection
-            .objects
-            .iter()
-            .copied()
-            .find(|id| {
-                tab.document
-                    .objects
-                    .get(id)
-                    .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
-            })
-            .or_else(|| {
-                tab.document
-                    .objects
-                    .iter()
-                    .find(|(_, o)| matches!(o.payload, NodePayload::Raster(_)))
-                    .map(|(&id, _)| id)
-            })
-            .ok_or_else(|| "select a raster bitmap object to run Vector Trace".to_owned())?;
-
-        let (asset, w_mm, h_mm, xf) = {
-            let obj = tab
-                .document
+            // Find selected raster object (or first raster on active page)
+            let target_id = tab
+                .selection
                 .objects
-                .get(&target_id)
-                .ok_or_else(|| "raster object missing".to_owned())?;
-            let NodePayload::Raster(ref r) = obj.payload else {
-                return Err("object is not a raster".to_owned());
+                .iter()
+                .copied()
+                .find(|id| {
+                    tab.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+                })
+                .or_else(|| {
+                    let active_page_idx = tab.document.active_page_index();
+                    tab.document
+                        .objects()
+                        .iter()
+                        .find(|(&id, o)| {
+                            matches!(o.payload, NodePayload::Raster(_))
+                                && is_object_editable_in_doc(&tab.document, id)
+                                && enclosing_layer_of_object(&tab.document, id).is_some_and(|lid| {
+                                    tab.document.pages().iter().enumerate().any(|(p_idx, p)| {
+                                        p.layers.iter().any(|l| {
+                                            l.id == lid
+                                                && Document::layer_applies_to_page(
+                                                    l,
+                                                    p_idx,
+                                                    active_page_idx,
+                                                )
+                                        })
+                                    })
+                                })
+                        })
+                        .map(|(&id, _)| id)
+                })
+                .ok_or_else(|| "select a raster bitmap object to run Vector Trace".to_owned())?;
+
+            let (asset, filters, crop_rect, w_mm, h_mm, xf) = {
+                let obj = tab
+                    .document
+                    .object(target_id)
+                    .ok_or_else(|| "raster object missing".to_owned())?;
+                let NodePayload::Raster(ref r) = obj.payload else {
+                    return Err("object is not a raster".to_owned());
+                };
+                let asset = tab
+                    .document
+                    .asset(r.asset_id)
+                    .cloned()
+                    .ok_or_else(|| "embedded raster asset missing".to_owned())?;
+                let xf = tab
+                    .document
+                    .world_transform_of(target_id)
+                    .unwrap_or(obj.transform);
+                (
+                    asset,
+                    r.filters.clone(),
+                    r.crop_rect,
+                    r.width_mm,
+                    r.height_mm,
+                    xf,
+                )
             };
-            let asset = tab
-                .document
-                .assets
-                .get(&r.asset_id)
-                .cloned()
-                .ok_or_else(|| "embedded raster asset missing".to_owned())?;
-            (asset, r.width_mm, r.height_mm, obj.transform)
+
+            if !w_mm.is_finite() || w_mm <= 0.0 || !h_mm.is_finite() || h_mm <= 0.0 {
+                return Err("raster has invalid dimensions".to_owned());
+            }
+
+            let filtered_asset = if filters.is_empty() {
+                asset
+            } else {
+                coree_render::apply_raster_filters(&asset, &filters)
+            };
+
+            let (trace_asset, offset_x_mm, offset_y_mm, trace_w_mm, trace_h_mm) = if let Some(cr) =
+                crop_rect.filter(|c| c.is_finite())
+            {
+                let vis_min_x = cr.min_x.max(0.0);
+                let vis_min_y = cr.min_y.max(0.0);
+                let vis_max_x = cr.max_x.min(w_mm);
+                let vis_max_y = cr.max_y.min(h_mm);
+                if vis_max_x - vis_min_x <= 1e-6 || vis_max_y - vis_min_y <= 1e-6 {
+                    return Err("cropped raster region is empty (outside image bounds)".to_owned());
+                }
+                let aw = filtered_asset.width;
+                let ah = filtered_asset.height;
+                if aw < 2 || ah < 2 {
+                    return Err("raster resolution too small to trace".to_owned());
+                }
+                let px_per_mm_x = f64::from(aw) / w_mm;
+                let px_per_mm_y = f64::from(ah) / h_mm;
+                let mut x0 = (vis_min_x * px_per_mm_x)
+                    .floor()
+                    .clamp(0.0, (aw - 1) as f64) as u32;
+                let mut y0 = (vis_min_y * px_per_mm_y)
+                    .floor()
+                    .clamp(0.0, (ah - 1) as f64) as u32;
+                let mut x1 = (vis_max_x * px_per_mm_x)
+                    .ceil()
+                    .clamp((x0 + 1) as f64, aw as f64) as u32;
+                let mut y1 = (vis_max_y * px_per_mm_y)
+                    .ceil()
+                    .clamp((y0 + 1) as f64, ah as f64) as u32;
+                if x1 - x0 < 2 {
+                    if x1 < aw {
+                        x1 += 1;
+                    } else {
+                        x0 = x0.saturating_sub(1);
+                    }
+                }
+                if y1 - y0 < 2 {
+                    if y1 < ah {
+                        y1 += 1;
+                    } else {
+                        y0 = y0.saturating_sub(1);
+                    }
+                }
+                let cw = x1 - x0;
+                let ch = y1 - y0;
+                let mut cropped_bytes = Vec::with_capacity((cw * ch * 4) as usize);
+                for row in y0..y1 {
+                    let start = ((row * aw + x0) * 4) as usize;
+                    let end = ((row * aw + x1) * 4) as usize;
+                    cropped_bytes.extend_from_slice(&filtered_asset.rgba_bytes[start..end]);
+                }
+                let cropped_asset = RasterAsset::new(
+                    cw,
+                    ch,
+                    cropped_bytes,
+                    filtered_asset.source_dpi,
+                    filtered_asset.color_mode,
+                )
+                .map_err(|e| e.to_string())?;
+                (
+                    cropped_asset,
+                    f64::from(x0) / px_per_mm_x,
+                    f64::from(y0) / px_per_mm_y,
+                    f64::from(cw) / px_per_mm_x,
+                    f64::from(ch) / px_per_mm_y,
+                )
+            } else {
+                (filtered_asset, 0.0, 0.0, w_mm, h_mm)
+            };
+
+            let traced = trace_raster_to_mm(&trace_asset, trace_w_mm, trace_h_mm, &cfg);
+            let count = traced.len();
+            if count == 0 {
+                return Err("trace produced 0 contours (adjust detail or colors)".to_owned());
+            }
+
+            let mut next_id = tab.document.next_id().max(1);
+            let mut ops = Vec::with_capacity(count + 1);
+            let mut created_ids = Vec::with_capacity(count);
+            for (idx, (mut path, color)) in traced.into_iter().enumerate() {
+                if offset_x_mm.abs() > 1e-9 || offset_y_mm.abs() > 1e-9 {
+                    path.transform(&Affine2D::translate(offset_x_mm, offset_y_mm));
+                }
+                let oid = ObjectId(next_id);
+                next_id = next_id.saturating_add(1);
+                let mut obj = SceneObject::new(
+                    oid,
+                    format!("Traced Curve {}", idx + 1),
+                    NodePayload::Path(path),
+                )
+                .with_transform(xf);
+                if is_centerline {
+                    obj.fill = Fill::None;
+                    obj.outline = OutlineStyle::solid(color, 0.25);
+                } else {
+                    obj.fill = Fill::Solid(color);
+                    obj.outline = OutlineStyle::none();
+                }
+                created_ids.push(oid);
+                ops.push(CommandOp::create_object(obj, layer_id));
+            }
+            if created_ids.len() > 1 {
+                ops.push(CommandOp::Group {
+                    ids: created_ids.clone(),
+                    name: "Vector Trace Result".to_owned(),
+                });
+            }
+            (ops, created_ids, count)
         };
 
-        let traced = trace_raster_to_mm(&asset, w_mm, h_mm, &cfg);
-        let count = traced.len();
-        if count == 0 {
-            return Err("trace produced 0 contours (adjust detail or colors)".to_owned());
-        }
-
-        let mut created_ids = Vec::with_capacity(count);
-        for (idx, (path, color)) in traced.into_iter().enumerate() {
-            let mut obj = SceneObject::new(
-                ObjectId(0),
-                format!("Traced Curve {}", idx + 1),
-                NodePayload::Path(path),
-            )
-            .with_transform(xf);
-            if is_centerline {
-                obj.fill = Fill::None;
-                obj.outline = OutlineStyle::solid(color, 0.25);
-            } else {
-                obj.fill = Fill::Solid(color);
-                obj.outline = OutlineStyle::none();
+        let cmd = if ops.len() == 1 {
+            ops.into_iter().next().expect("len == 1")
+        } else {
+            CommandOp::Batch(ops)
+        };
+        self.execute_command(cmd)?;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if created_ids.len() > 1 {
+                if let Some(gid) = tab.document.parent_container_of(created_ids[0]) {
+                    tab.selection.select_single(&tab.document, gid);
+                }
+            } else if let Some(&single) = created_ids.first() {
+                tab.selection.select_single(&tab.document, single);
             }
-            if let Ok(nid) = tab.document.add_object(obj, tab.active_layer_id) {
-                created_ids.push(nid);
-            }
+            tab.needs_rerender = true;
         }
-        if created_ids.len() > 1 {
-            if let Ok(gid) = tab
-                .document
-                .group_objects(&created_ids, "Vector Trace Result")
-            {
-                tab.selection.select_single(&tab.document, gid);
-            }
-        } else if let Some(&single) = created_ids.first() {
-            tab.selection.select_single(&tab.document, single);
-        }
-        tab.mark_modified();
-        self.checkpoint_wal_snapshot_active();
         self.push_toast(format!("Vector Trace created {count} curve(s)"), false);
         Ok(count)
     }
 
     /// Converts the first selected vector object into an embedded raster bitmap at `dpi`.
-    /// Matches `coree_render::convert_object_to_bitmap`'s 4.0 mm stroke/shadow padding so
-    /// the rasterized object aligns 1:1 in world space with zero shrink or shift.
+    /// Uses `coree_render::convert_object_to_bitmap_with_bounds` so the resulting `RasterLayerData`
+    /// shares the exact padded world rect (`4.0 + spatial_bounds_padding_mm + effect_bounds_padding_mm`
+    /// plus `Blend`/`Extrude25D` extents) and aligns 1:1 in world space with zero shrink or shift.
     pub fn convert_selection_to_bitmap(&mut self) {
+        let Some(layer_id) = self.ensure_active_creation_layer() else {
+            return;
+        };
         let dpi = self.bitmap_state.convert_dpi.clamp(36.0, 1200.0);
-        let outcome = {
-            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let plan = {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
                 return;
             };
             let Some(&target_id) = tab.selection.objects.first() else {
                 self.push_toast("Select an object to Convert to Bitmap", false);
                 return;
             };
-            let Some(bb) = tab.document.object_bounds(target_id) else {
-                return;
-            };
-            let padded = bb.expand(4.0);
-            match convert_object_to_bitmap(&tab.document, target_id, dpi as f32) {
-                Ok(asset) => {
+            match convert_object_to_bitmap_with_bounds(&tab.document, target_id, dpi) {
+                Ok((asset, padded)) => {
+                    let expected_id = ObjectId(tab.document.next_id().max(1));
                     let aid = asset.id;
-                    tab.document.assets.insert(aid, asset);
                     let raster_obj = SceneObject::new(
                         ObjectId(0),
                         "Rasterized Bitmap",
@@ -410,22 +856,30 @@ impl StudioApp {
                     .with_fill(Fill::None)
                     .with_outline(OutlineStyle::none())
                     .with_transform(Affine2D::translate(padded.min_x, padded.min_y));
-                    if let Ok(nid) = tab.document.add_object(raster_obj, tab.active_layer_id) {
-                        tab.selection.select_single(&tab.document, nid);
-                        tab.mark_modified();
-                        Ok(())
-                    } else {
-                        Err("failed to attach rasterized bitmap".to_owned())
-                    }
+                    Ok((
+                        expected_id,
+                        CommandOp::Batch(vec![
+                            CommandOp::RegisterAsset { asset },
+                            CommandOp::create_object(raster_obj, layer_id),
+                        ]),
+                    ))
                 }
                 Err(e) => Err(format!("Convert to Bitmap failed: {e}")),
             }
         };
-        match outcome {
-            Ok(()) => {
-                self.checkpoint_wal_snapshot_active();
-                self.push_toast(format!("Converted to bitmap at {dpi:.0} DPI"), false);
-            }
+        match plan {
+            Ok((expected_id, cmd)) => match self.execute_command(cmd) {
+                Ok(()) => {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        if tab.document.has_object(expected_id) {
+                            tab.selection.select_single(&tab.document, expected_id);
+                        }
+                    }
+                    self.checkpoint_wal_snapshot_active();
+                    self.push_toast(format!("Converted to bitmap at {dpi:.0} DPI"), false);
+                }
+                Err(e) => self.push_toast(format!("Convert to Bitmap failed: {e}"), true),
+            },
             Err(err) => self.push_toast(err, true),
         }
     }
@@ -437,54 +891,68 @@ impl StudioApp {
         };
         let target = tab.selection.objects.iter().copied().find(|id| {
             tab.document
-                .objects
-                .get(id)
+                .object(*id)
                 .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
         });
         let Some(id) = target else {
             self.push_toast("Select a raster bitmap first", false);
             return;
         };
-        let mut data = match &tab.document.objects[&id].payload {
+        let mut data = match &tab.document.objects()[&id].payload {
             NodePayload::Raster(r) => r.clone(),
             _ => return,
         };
         data.filters.push(filter);
-        let _ = self.execute_command(CommandOp::UpdateRaster { id, data });
-        self.push_toast("Applied non-destructive bitmap filter", false);
+        match self.execute_command(CommandOp::UpdateRaster { id, data }) {
+            Ok(()) => self.push_toast("Applied non-destructive bitmap filter", false),
+            Err(e) => self.push_toast(e, true),
+        }
     }
 
     /// Resamples the selected raster object's underlying bitmap to `(new_w, new_h)`.
     pub fn resample_selected_bitmap(&mut self, new_w: u32, new_h: u32) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        let target = tab.selection.objects.iter().copied().find(|id| {
-            tab.document
-                .objects
-                .get(id)
-                .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
-        });
-        let Some(id) = target else {
-            self.push_toast("Select a raster bitmap to Resample", false);
-            return;
-        };
-        let asset_id = match &tab.document.objects[&id].payload {
-            NodePayload::Raster(r) => r.asset_id,
-            _ => return,
-        };
-        let Some(orig) = tab.document.assets.get(&asset_id) else {
-            return;
-        };
-        match resample(orig, new_w.clamp(4, 8192), new_h.clamp(4, 8192)) {
-            Ok(mut resized) => {
-                resized.id = asset_id;
-                tab.document.assets.insert(asset_id, resized);
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
-                self.push_toast(format!("Resampled bitmap to {new_w}x{new_h} px"), false);
+        let plan: Result<CommandOp, String> = {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return;
+            };
+            let target = tab.selection.objects.iter().copied().find(|id| {
+                tab.document
+                    .object(*id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+            });
+            let Some(id) = target else {
+                self.push_toast("Select a raster bitmap to Resample", false);
+                return;
+            };
+            let mut data = match &tab.document.objects()[&id].payload {
+                NodePayload::Raster(r) => r.clone(),
+                _ => return,
+            };
+            let Some(orig) = tab.document.asset(data.asset_id) else {
+                return;
+            };
+            match resample(orig, new_w.clamp(4, 8192), new_h.clamp(4, 8192)) {
+                Ok(mut resized) => {
+                    let new_asset_id = coree_core::ImageAssetId::new();
+                    resized.id = new_asset_id;
+                    data.asset_id = new_asset_id;
+                    Ok(CommandOp::Batch(vec![
+                        CommandOp::RegisterAsset { asset: resized },
+                        CommandOp::UpdateRaster { id, data },
+                    ]))
+                }
+                Err(e) => Err(format!("Resample failed: {e}")),
             }
-            Err(e) => self.push_toast(format!("Resample failed: {e}"), true),
+        };
+        match plan {
+            Ok(cmd) => match self.execute_command(cmd) {
+                Ok(()) => {
+                    self.checkpoint_wal_snapshot_active();
+                    self.push_toast(format!("Resampled bitmap to {new_w}x{new_h} px"), false);
+                }
+                Err(e) => self.push_toast(format!("Resample failed: {e}"), true),
+            },
+            Err(e) => self.push_toast(e, true),
         }
     }
 
@@ -534,24 +1002,66 @@ impl StudioApp {
         ids
     }
 
-    /// Runs `coree_prod::find_and_replace` with explicit `action`.
+    /// Evaluates the clean-room CQL query in `find_replace_state.cql_query` and selects matches.
+    pub fn run_cql_select(&mut self) -> Result<Vec<ObjectId>, String> {
+        let scope = self.find_replace_state.scope;
+        let query = self.find_replace_state.cql_query.clone();
+        let res = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("No active document".to_owned());
+            };
+            let matched =
+                evaluate_cql_query(&tab.document, scope, &query).map_err(|e| e.to_string())?;
+            tab.selection.select_many(&tab.document, &matched);
+            tab.metrics_dirty = true;
+            matched
+        };
+        self.find_replace_state.last_cql_error = None;
+        self.find_replace_state.last_report = Some(FindReplaceReport {
+            matched_ids: res.clone(),
+            modified_ids: Vec::new(),
+            replacements_applied: 0,
+        });
+        self.push_toast(format!("CQL matched {} object(s)", res.len()), false);
+        Ok(res)
+    }
+
+    /// Runs `coree_prod::find_and_replace` via [`CommandOp::FindAndReplace`] with explicit `action`.
     pub fn run_find_and_replace_action(&mut self, action: ReplaceAction) -> FindReplaceReport {
         let query = self.build_find_query();
         let rep = {
-            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
                 return FindReplaceReport::default();
             };
-            let rep = find_and_replace(&mut tab.document, &query, &action);
-            if !rep.matched_ids.is_empty() {
-                tab.selection.select_many(&tab.document, &rep.matched_ids);
+            if matches!(action, ReplaceAction::SelectMatches) {
+                let matched_ids = find_objects(&tab.document, &query);
+                FindReplaceReport {
+                    matched_ids,
+                    modified_ids: Vec::new(),
+                    replacements_applied: 0,
+                }
+            } else {
+                coree_core::preview_find_and_replace(&tab.document, &query, &action)
             }
-            if !rep.modified_ids.is_empty() {
-                tab.mark_modified();
-            }
-            rep
         };
-        if !rep.modified_ids.is_empty() {
-            self.checkpoint_wal_snapshot_active();
+        if matches!(action, ReplaceAction::SelectMatches) || rep.modified_ids.is_empty() {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if !rep.matched_ids.is_empty() {
+                    tab.selection.select_many(&tab.document, &rep.matched_ids);
+                    tab.metrics_dirty = true;
+                }
+            }
+        } else {
+            if let Err(err) = self.execute_command(CommandOp::FindAndReplace { query, action }) {
+                self.push_toast(format!("Find & Replace failed: {err}"), true);
+                return FindReplaceReport::default();
+            }
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if !rep.matched_ids.is_empty() {
+                    tab.selection.select_many(&tab.document, &rep.matched_ids);
+                    tab.metrics_dirty = true;
+                }
+            }
         }
         self.find_replace_state.last_report = Some(rep.clone());
         self.push_toast(
@@ -589,20 +1099,36 @@ impl StudioApp {
 
     /// Executes `script` inside `coree_prod::macros` strict sandbox against the active document.
     pub fn run_rhai_script(&mut self, script: &str) -> Result<usize, String> {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return Err("no active document".to_owned());
+        let planned = {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let cfg = MacroSandboxConfig::default();
+            if script.contains("// coree recorded macro") {
+                plan_recorded_macro_ops(script, &cfg)
+            } else {
+                plan_macro_ops(&tab.document, script, &BTreeMap::new(), &cfg)
+            }
         };
-        let cfg = MacroSandboxConfig::default();
-        // Support both recorded-command scripts and production macro scripts cleanly
-        let res = if script.contains("// coree recorded macro") {
-            run_recorded_macro(&mut tab.document, &mut tab.history, script, &cfg)
-        } else {
-            run_macro(&mut tab.document, script, &BTreeMap::new(), &cfg)
-        };
-        match res {
-            Ok(exec) => {
-                tab.mark_modified();
-                self.checkpoint_wal_snapshot_active();
+        match planned {
+            Ok((exec, ops)) => {
+                if !ops.is_empty() {
+                    let cmd = if ops.len() == 1 {
+                        ops.into_iter().next().expect("len == 1")
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(err_str) = self.execute_command(cmd) {
+                        self.macro_state.last_error = Some(err_str.clone());
+                        self.push_toast(format!("Macro error: {err_str}"), true);
+                        return Err(err_str);
+                    }
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.sync_active_layer();
+                        tab.needs_rerender = true;
+                    }
+                    self.checkpoint_wal_snapshot_active();
+                }
                 self.macro_state.output_logs = exec.logs;
                 self.macro_state.last_error = None;
                 self.push_toast(
@@ -693,11 +1219,8 @@ impl StudioApp {
         self.active_tool = tool;
         self.open_flyout_group = None;
         if let Some(tab) = self.active_tab_mut() {
-            tab.poly_points_mm.clear();
-            tab.bezier_draft_nodes.clear();
-            tab.three_point_curve_chord = None;
-            tab.three_point_shape_chord = None;
-            tab.live_sketch_strokes.clear();
+            tab.tool_core.set_active_tool(tool);
+            tab.transient_overlay = TransientOverlay::default();
             if tool != ToolId::Crop {
                 tab.pending_crop_rect = None;
             }
@@ -729,6 +1252,10 @@ impl StudioApp {
         self.active_tool = ToolId::Zoom;
         self.group_active_tools[ToolId::Zoom.group_index()] = ToolId::Zoom;
         self.open_flyout_group = None;
+        if let Some(tab) = self.active_tab_mut() {
+            tab.tool_core.set_active_tool(ToolId::Zoom);
+            tab.transient_overlay = TransientOverlay::default();
+        }
     }
 
     /// Completes a one-shot `F2` zoom operation by restoring the previous tool if armed.
@@ -1015,58 +1542,104 @@ impl StudioApp {
     }
 
     /// Resizes the active page tightly around its visible content with `margin_mm` padding
-    /// (undoable via transactional history snapshot + WAL checkpoint).
+    /// via real `TransformObjects` + `SetPageProperties` `CommandOp`s (100% undoable & WAL-journaled).
     pub fn autofit_active_page(&mut self, margin_mm: f64) {
-        let outcome = {
-            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-                return;
+        let plan: Result<(Vec<CommandOp>, f64, f64), String> = (|| {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return Err("no active document".to_owned());
             };
-            let page_idx = tab.document.active_page_index;
-            let tx_started = tab
-                .history
-                .begin_transaction(&tab.document, "Autofit Page to Content")
-                .is_ok();
-            let res = tab.document.autofit_page_to_content(page_idx, margin_mm);
-            match res {
-                Ok((w, h)) => {
-                    if tx_started {
-                        let _ = tab.history.execute(
-                            &mut tab.document,
-                            CommandOp::TransformObjects {
-                                ids: Vec::new(),
-                                affine: Affine2D::IDENTITY,
-                            },
-                        );
-                        let _ = tab.history.commit_transaction(&tab.document);
+            let doc = &tab.document;
+            let page_idx = doc.active_page_index();
+            let page = doc
+                .page(page_idx)
+                .ok_or_else(|| "active page out of range".to_owned())?;
+            let page_id = page.id;
+            let margin = if margin_mm.is_finite() {
+                margin_mm.clamp(0.0, 5_000.0)
+            } else {
+                0.0
+            };
+
+            let mut visible_ids = Vec::new();
+            let mut all_page_obj_ids = Vec::new();
+            let mut seen = HashSet::new();
+            for layer in &page.layers {
+                for &oid in &layer.objects {
+                    if seen.insert(oid) {
+                        all_page_obj_ids.push(oid);
+                        if layer.visible {
+                            if let Some(obj) = doc.object(oid) {
+                                if obj.visible {
+                                    visible_ids.push(oid);
+                                }
+                            }
+                        }
                     }
-                    tab.fit_active_page();
-                    tab.mark_modified();
-                    Ok((w, h))
-                }
-                Err(err) => {
-                    if tx_started {
-                        let _ = tab.history.cancel_transaction(&mut tab.document);
-                    }
-                    Err(err.to_string())
                 }
             }
-        };
-        match outcome {
-            Ok((w, h)) => {
+
+            let bounds = doc
+                .combined_bounds(&visible_ids)
+                .ok_or_else(|| "page has no visible content to autofit".to_owned())?;
+            if !bounds.is_finite() {
+                return Err("visible content bounds are non-finite".to_owned());
+            }
+
+            let dx = margin - bounds.min_x;
+            let dy = margin - bounds.min_y;
+            let new_w = (bounds.width() + 2.0 * margin).clamp(1.0, 50_000.0);
+            let new_h = (bounds.height() + 2.0 * margin).clamp(1.0, 50_000.0);
+
+            let mut ops = Vec::new();
+            if !all_page_obj_ids.is_empty() && (dx.abs() > 1e-9 || dy.abs() > 1e-9) {
+                ops.push(CommandOp::TransformObjects {
+                    ids: all_page_obj_ids,
+                    affine: Affine2D::translate(dx, dy),
+                });
+            }
+            ops.push(CommandOp::SetPageProperties {
+                page_id,
+                name: None,
+                width_mm: Some(new_w),
+                height_mm: Some(new_h),
+                bleed_mm: None,
+                facing_pages: None,
+            });
+            Ok((ops, new_w, new_h))
+        })();
+
+        match plan {
+            Ok((ops, w, h)) => {
+                let cmd = if ops.len() == 1 {
+                    ops.into_iter().next().expect("len == 1")
+                } else {
+                    CommandOp::Batch(ops)
+                };
+                if let Err(err) = self.execute_command(cmd) {
+                    self.push_toast(format!("Autofit Page failed: {err}"), true);
+                    return;
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.fit_active_page();
+                }
                 self.checkpoint_wal_snapshot_active();
                 self.push_toast(
                     format!("Autofit page to {w:.1} × {h:.1} mm (margin {margin_mm:.1} mm)"),
                     false,
                 );
             }
-            Err(err) => self.push_toast(format!("Autofit Page failed: {err}"), true),
+            Err(err) => {
+                if err != "no active document" {
+                    self.push_toast(format!("Autofit Page failed: {err}"), true);
+                }
+            }
         }
     }
 
     /// Recomputes `laser_plan_preview` from the active page (and active selection if non-empty).
     pub fn refresh_laser_plan_preview(&mut self) {
         let plan_res = self.active_tab().map(|tab| {
-            let page_idx = tab.document.active_page_index;
+            let page_idx = tab.document.active_page_index();
             let sel = if tab.selection.is_empty() {
                 None
             } else {
@@ -1112,7 +1685,7 @@ impl StudioApp {
         let Some(tab) = self.active_tab() else {
             return Err("no active document".to_owned());
         };
-        let page_idx = tab.document.active_page_index;
+        let page_idx = tab.document.active_page_index();
         let sel = if tab.selection.is_empty() {
             None
         } else {
@@ -1215,7 +1788,7 @@ impl StudioApp {
         // 2. Append into selected ArtisticText / ParagraphText / TextOnPath
         let edit_op = self.active_tab().and_then(|tab| {
             let oid = tab.selection.objects.iter().copied().find(|id| {
-                tab.document.objects.get(id).is_some_and(|o| {
+                tab.document.object(*id).is_some_and(|o| {
                     matches!(
                         o.payload,
                         NodePayload::ArtisticText(_)
@@ -1224,7 +1797,7 @@ impl StudioApp {
                     )
                 })
             })?;
-            let obj = tab.document.objects.get(&oid)?;
+            let obj = tab.document.object(oid)?;
             let mut payload = obj.payload.clone();
             match &mut payload {
                 NodePayload::ArtisticText(art) => {
@@ -1262,35 +1835,26 @@ impl StudioApp {
             Some(CommandOp::EditText { id: oid, payload })
         });
         if let Some(op) = edit_op {
-            let _ = self.execute_command(op);
-            self.push_toast(format!("Inserted glyph '{glyph}'"), false);
+            match self.execute_command(op) {
+                Ok(()) => self.push_toast(format!("Inserted glyph '{glyph}'"), false),
+                Err(e) => self.push_toast(e, true),
+            }
             return;
         }
         // 3. Otherwise create a new ArtisticText object at page center
-        let (pos, layer_id) = self
+        let Some(_layer_id) = self.ensure_active_creation_layer() else {
+            return;
+        };
+        let pos = self
             .active_tab()
-            .map(|t| {
-                let c = t
-                    .document
-                    .active_page()
-                    .map_or(Point2D::new(80.0, 80.0), |p| p.trim_rect().center());
-                (c, t.active_layer_id)
-            })
-            .unwrap_or((Point2D::new(80.0, 80.0), None));
+            .and_then(|t| t.document.active_page())
+            .map_or(Point2D::new(80.0, 80.0), |p| p.trim_rect().center());
         let art = ArtisticText::from_plain(glyph.to_owned(), self.default_text_style.clone());
         let obj = SceneObject::new(ObjectId(0), "Glyph", NodePayload::ArtisticText(art))
             .with_fill(Fill::Solid(self.default_text_style.fill.clone()))
             .with_outline(OutlineStyle::none())
             .with_transform(Affine2D::translate(pos.x, pos.y));
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            if let Some(tab) = self.active_tab_mut() {
-                if let Some(&last_id) = tab.document.objects.keys().last() {
-                    tab.selection.select_single(&tab.document, last_id);
-                }
-            }
+        if self.create_object_on_active_layer(obj).is_some() {
             self.push_toast(format!("Inserted glyph '{glyph}'"), false);
         }
     }
@@ -1381,7 +1945,7 @@ impl StudioApp {
             .active_tab()
             .and_then(|t| {
                 let id = t.selection.objects.first()?;
-                t.document.objects.get(id).map(|o| o.fill.clone())
+                t.document.object(*id).map(|o| o.fill.clone())
             })
             .unwrap_or_else(|| self.default_fill.clone());
         self.edit_fill_draft = initial;
@@ -1401,7 +1965,7 @@ impl StudioApp {
             .active_tab()
             .and_then(|t| {
                 let id = t.selection.objects.first()?;
-                t.document.objects.get(id).map(|o| o.outline.clone())
+                t.document.object(*id).map(|o| o.outline.clone())
             })
             .unwrap_or_else(|| self.default_outline.clone());
         self.outline_pen_draft = initial;
@@ -1457,6 +2021,11 @@ impl StudioApp {
             }
             ShortcutAction::ToggleFullScreenPreview => {
                 self.full_screen_preview = !self.full_screen_preview;
+                if self.full_screen_preview {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.cancel_active_drag();
+                    }
+                }
                 self.push_toast(
                     if self.full_screen_preview {
                         "Full-Screen Preview (press Esc or F9 to exit)"
@@ -1468,8 +2037,9 @@ impl StudioApp {
             }
             ShortcutAction::PrevPage => {
                 if let Some(t) = self.active_tab_mut() {
-                    if t.document.active_page_index > 0 {
-                        t.document.active_page_index -= 1;
+                    let cur = t.document.active_page_index();
+                    if cur > 0 {
+                        let _ = t.document.set_active_page_index(cur - 1);
                         t.selection.clear();
                         t.sync_active_layer();
                         t.needs_rerender = true;
@@ -1478,8 +2048,9 @@ impl StudioApp {
             }
             ShortcutAction::NextPage => {
                 if let Some(t) = self.active_tab_mut() {
-                    if t.document.active_page_index + 1 < t.document.pages.len() {
-                        t.document.active_page_index += 1;
+                    let cur = t.document.active_page_index();
+                    if cur + 1 < t.document.pages().len() {
+                        let _ = t.document.set_active_page_index(cur + 1);
                         t.selection.clear();
                         t.sync_active_layer();
                         t.needs_rerender = true;
@@ -1548,17 +2119,9 @@ impl StudioApp {
             ShortcutAction::RepeatLastCommand => self.repeat_last_command(),
             ShortcutAction::DeleteSelection => {
                 // If actively drafting a Bezier/Pen/BSpline/Polyline path, pop the last node
-                let popped_draft = self.active_tab_mut().is_some_and(|tab| {
-                    if !tab.bezier_draft_nodes.is_empty() {
-                        tab.bezier_draft_nodes.pop();
-                        return true;
-                    }
-                    if !tab.poly_points_mm.is_empty() {
-                        tab.poly_points_mm.pop();
-                        return true;
-                    }
-                    false
-                });
+                let popped_draft = self
+                    .active_tab_mut()
+                    .is_some_and(|tab| tab.tool_core.pop_last_draft_point());
                 if popped_draft {
                     return;
                 }
@@ -1608,21 +2171,13 @@ impl StudioApp {
                 {
                     self.cancel_inline_text_edit();
                 } else if let Some(tab) = self.active_tab_mut() {
-                    let cleared_draft = !matches!(tab.drag_state, CanvasDragState::Idle)
-                        || !tab.bezier_draft_nodes.is_empty()
-                        || !tab.poly_points_mm.is_empty()
-                        || tab.three_point_curve_chord.is_some()
-                        || tab.three_point_shape_chord.is_some()
+                    let cleared_draft = tab.tool_core.has_active_draft_or_drag()
                         || tab.pending_crop_rect.is_some()
                         || tab.raster_mask_rect_mm.is_some();
                     tab.cancel_active_drag();
-                    tab.poly_points_mm.clear();
-                    tab.bezier_draft_nodes.clear();
-                    tab.three_point_curve_chord = None;
-                    tab.three_point_shape_chord = None;
+                    let _ = tab.tool_core.cancel_all();
                     tab.pending_crop_rect = None;
                     tab.raster_mask_rect_mm = None;
-                    tab.live_sketch_strokes.clear();
                     if !cleared_draft {
                         if !tab.selection.is_empty() {
                             tab.selection.clear();
@@ -1769,7 +2324,7 @@ impl StudioApp {
     pub fn save_as_file_dialog(&mut self) {
         let default_name = self
             .active_tab()
-            .map(|t| format!("{}.coree", t.document.title))
+            .map(|t| format!("{}.coree", t.document.title()))
             .unwrap_or_else(|| "Untitled.coree".to_owned());
         let picked = rfd::FileDialog::new()
             .set_title("Save Document As")
@@ -2084,8 +2639,7 @@ impl StudioApp {
         // All Tools across all 15 Toolbox Flyout groups
         for group in TOOL_GROUPS {
             for &tool in group {
-                let sc = tool
-                    .shortcut_action()
+                let sc = crate::state::tool_shortcut_action(tool)
                     .map(|a| shortcut_label(p, a))
                     .unwrap_or("");
                 list.push(PaletteCommand {
@@ -2173,10 +2727,23 @@ impl StudioApp {
             }
             "prod.printmarks" => self.add_print_marks_active(),
             "view.multipage" => {
-                if let Some(t) = self.active_tab_mut() {
-                    t.document.multipage_view = !t.document.multipage_view;
-                    t.viewport.multipage_view = t.document.multipage_view;
-                    t.needs_rerender = true;
+                let next = self.active_tab().map(|t| !t.document.multipage_view());
+                if let Some(next) = next {
+                    let _ = self.execute_command(CommandOp::SetDocumentProperties {
+                        title: None,
+                        color_mode: None,
+                        default_unit: None,
+                        dpi: None,
+                        multipage_view: Some(next),
+                        active_page_index: None,
+                        metadata: None,
+                        custom_icc_profile: None,
+                        clear_custom_icc: false,
+                    });
+                    if let Some(t) = self.active_tab_mut() {
+                        t.viewport.multipage_view = next;
+                        t.needs_rerender = true;
+                    }
                 }
             }
             "view.wireframe" => {

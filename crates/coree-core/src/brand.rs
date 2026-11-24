@@ -29,9 +29,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TRADEMARK_NOTICE: &str = "\
 coree is an independent, clean-room open-source vector graphics and print \
 production suite licensed under MIT OR Apache-2.0. It is NOT affiliated with, endorsed \
-by, sponsored by, or connected in any way to Corel Corporation, Alludo, or \
-Pantone LLC. Corel, CorelDRAW, Corel PHOTO-PAINT, and PowerTRACE are \
-trademarks or registered trademarks of Corel Corporation and/or Alludo. \
+by, sponsored by, or connected in any way to any proprietary vector-graphics, \
+raster-editing, or color-system vendor (including Pantone LLC). All third-party \
+product names, company names, and trademarks belong to their respective owners. \
 PANTONE is a trademark of Pantone LLC. No proprietary source code, assets, \
 or licensed color books are included. References to file formats such as \
 .cdr, .cdt, .cmx, .cpt, .svg, .pdf, .eps, .dxf, and .plt are strictly \

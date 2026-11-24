@@ -18,7 +18,9 @@ use crate::laser_plugin::{
     export_laser_dxf_r12, export_laser_eps, export_laser_gcode, export_laser_plt, export_laser_svg,
     plan_laser_toolpath, GcodeDialect, LaserJobConfig, LaserOperationKind, LaserToolpathPlan,
 };
-use crate::macros::{run_macro, MacroExecutionResult, MacroSandboxConfig, MacroValue};
+use crate::macros::{
+    plan_macro_ops, run_macro_with_ops, MacroExecutionResult, MacroSandboxConfig, MacroValue,
+};
 use coree_core::{Document, ObjectId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -1118,13 +1120,7 @@ pub fn launch_external_bridge(
     Ok(child.id())
 }
 
-/// Loads and executes a `PluginKind::RhaiScript` plugin against `doc` inside the strict Rhai sandbox.
-pub fn run_rhai_plugin(
-    doc: &mut Document,
-    plugin: &PluginManifest,
-    vars: &BTreeMap<String, MacroValue>,
-    sandbox: &MacroSandboxConfig,
-) -> ProdResult<MacroExecutionResult> {
+fn read_rhai_plugin_script(plugin: &PluginManifest) -> ProdResult<String> {
     plugin.validate()?;
     let PluginKind::RhaiScript {
         ref script_file, ..
@@ -1142,8 +1138,43 @@ pub fn run_rhai_plugin(
         ))
     })?;
     let script_path = resolve_contained_script(plugin_dir, script_file)?;
-    let script = fs::read_to_string(&script_path)?;
-    run_macro(doc, &script, vars, sandbox)
+    Ok(fs::read_to_string(&script_path)?)
+}
+
+/// Plans a `PluginKind::RhaiScript` plugin against `doc` inside the strict Rhai sandbox,
+/// returning the execution summary and exact replayable [`coree_core::CommandOp`] sequence
+/// without mutating `doc`.
+pub fn plan_rhai_plugin_ops(
+    doc: &Document,
+    plugin: &PluginManifest,
+    vars: &BTreeMap<String, MacroValue>,
+    sandbox: &MacroSandboxConfig,
+) -> ProdResult<(MacroExecutionResult, Vec<coree_core::CommandOp>)> {
+    let script = read_rhai_plugin_script(plugin)?;
+    plan_macro_ops(doc, &script, vars, sandbox)
+}
+
+/// Loads and executes a `PluginKind::RhaiScript` plugin against `doc` inside the strict Rhai sandbox,
+/// returning both the execution summary and the exact replayable [`coree_core::CommandOp`] sequence.
+pub fn run_rhai_plugin_with_ops(
+    doc: &mut Document,
+    plugin: &PluginManifest,
+    vars: &BTreeMap<String, MacroValue>,
+    sandbox: &MacroSandboxConfig,
+) -> ProdResult<(MacroExecutionResult, Vec<coree_core::CommandOp>)> {
+    let script = read_rhai_plugin_script(plugin)?;
+    run_macro_with_ops(doc, &script, vars, sandbox)
+}
+
+/// Loads and executes a `PluginKind::RhaiScript` plugin against `doc` inside the strict Rhai sandbox.
+pub fn run_rhai_plugin(
+    doc: &mut Document,
+    plugin: &PluginManifest,
+    vars: &BTreeMap<String, MacroValue>,
+    sandbox: &MacroSandboxConfig,
+) -> ProdResult<MacroExecutionResult> {
+    let (res, _ops) = run_rhai_plugin_with_ops(doc, plugin, vars, sandbox)?;
+    Ok(res)
 }
 
 /// Installs a well-documented sample custom plugin (`custom-laser-example/plugin.json` +
@@ -1762,7 +1793,7 @@ auto_hatch = false
         )
         .unwrap();
         assert!(res.commands_executed >= 1);
-        assert!(doc.pages[0]
+        assert!(doc.pages()[0]
             .layers
             .iter()
             .any(|l| l.is_cut_layer && !l.objects.is_empty()));

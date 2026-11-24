@@ -22,10 +22,10 @@ pub use assets::{
     RecentDocumentRecord, TemplateRecord, WorkspaceLayoutRecord,
 };
 pub use autosave::{
-    sha256_hex, AutosaveSnapshotInfo, JournalEntry, UncleanSession, DEFAULT_SESSION_ID,
-    MAX_SNAPSHOT_BYTES,
+    sha256_hex, AutosaveSnapshotInfo, DifferentialSnapshotPatch, JournalEntry, UncleanSession,
+    DEFAULT_SESSION_ID, MAX_SNAPSHOT_BYTES,
 };
-pub use db::{StorageDb, SCHEMA_SQL, SCHEMA_VERSION};
+pub use db::{quarantine_corrupt_database, StorageDb, SCHEMA_SQL, SCHEMA_VERSION};
 pub use error::{StorageError, StorageResult};
 pub use fonts::{
     inspect_font_bytes, standard_font_directories, FontQuery, FontRecord, FontScanReport,

@@ -486,7 +486,7 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             let view_mode: ViewMode = (*view).into();
             if *multipage {
                 let mut doc = opened.document;
-                doc.multipage_view = true;
+                doc.set_multipage_view(true);
                 let safe_dpi = dpi.clamp(1.0, 2400.0);
                 let opts = RenderOptions::export();
                 let layouts = compute_page_layouts(&doc, true, opts.multipage_gap_mm);
@@ -648,7 +648,7 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             Ok(CliOutcome::Printed(format!(
                 "Merged {} record(s) into {} page(s). {msg}",
                 table.rows.len(),
-                merged.pages.len()
+                merged.pages().len()
             )))
         }
         Commands::Collect {
@@ -1003,7 +1003,7 @@ pub fn build_diagnostics_report() -> String {
     format!(
         "{} v{} ({})\n\
          Repository: {}\n\
-         Workspace Crates: {}, {}, {}, {}, {}, {}\n\
+         Workspace Crates: {}, {}, {}, {}, {}, {}, {}\n\
          Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025 / .cdr.zip), .cdt (.cdt.zip), .cmx (16/32-bit), .cpt, .svg, .svgz, .pdf, .ai, .eps, .dxf, .plt (HPGL), .psd, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal\n\
          Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .plt (HPGL), .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
          Built-in Laser & Plotter Plugins: {} ({})\n\
@@ -1014,6 +1014,7 @@ pub fn build_diagnostics_report() -> String {
         brand.license,
         brand.repo_url,
         coree_core::CRATE_NAME,
+        coree_tools::CRATE_NAME,
         coree_cdr::CRATE_NAME,
         coree_io::CRATE_NAME,
         coree_storage::CRATE_NAME,

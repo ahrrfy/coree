@@ -249,7 +249,7 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
 
     let mut issues = Vec::new();
 
-    if doc.pages.is_empty() {
+    if doc.pages().is_empty() {
         issues.push(PreflightIssue {
             severity: PreflightSeverity::Error,
             kind: PreflightIssueKind::EmptyDocument,
@@ -262,17 +262,45 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
         });
     }
 
-    for page in &doc.pages {
+    let mut seen_layer_state_checks: HashSet<LayerId> = HashSet::new();
+    let pages = doc.pages();
+    for (p_idx, page) in pages.iter().enumerate() {
         for layer in &page.layers {
-            check_layer(doc, page, layer, &safe_rules, &mut issues);
+            if Document::layer_applies_to_page(layer, p_idx, p_idx) {
+                check_layer(
+                    doc,
+                    page,
+                    layer,
+                    &safe_rules,
+                    &mut seen_layer_state_checks,
+                    &mut issues,
+                );
+            }
+        }
+        for (owner_idx, owner_page) in pages.iter().enumerate() {
+            if owner_idx == p_idx {
+                continue;
+            }
+            for layer in &owner_page.layers {
+                if Document::layer_applies_to_page(layer, owner_idx, p_idx) {
+                    check_layer(
+                        doc,
+                        page,
+                        layer,
+                        &safe_rules,
+                        &mut seen_layer_state_checks,
+                        &mut issues,
+                    );
+                }
+            }
         }
     }
 
     PreflightReport {
-        document_title: doc.title.clone(),
-        color_mode: doc.color_mode,
-        page_count: doc.pages.len(),
-        object_count: doc.objects.len(),
+        document_title: doc.title().to_owned(),
+        color_mode: doc.color_mode(),
+        page_count: doc.pages().len(),
+        object_count: doc.object_count(),
         issues,
     }
 }
@@ -287,9 +315,13 @@ fn check_layer(
     page: &Page,
     layer: &Layer,
     rules: &PreflightRules,
+    seen_layer_state_checks: &mut HashSet<LayerId>,
     issues: &mut Vec<PreflightIssue>,
 ) {
-    if rules.check_layer_states && !layer.objects.is_empty() {
+    if rules.check_layer_states
+        && !layer.objects.is_empty()
+        && seen_layer_state_checks.insert(layer.id)
+    {
         if !layer.visible || !layer.printable {
             let state = match (layer.visible, layer.printable) {
                 (false, false) => "hidden and non-printable",
@@ -368,7 +400,7 @@ fn check_object_recursive(
     if depth > MAX_SCENE_DEPTH || !visiting.insert(oid) {
         return;
     }
-    if let Some(obj) = doc.objects.get(&oid) {
+    if let Some(obj) = doc.object(oid) {
         let world_xf = parent_xf.compose(&obj.transform);
         check_object(
             doc,
@@ -496,7 +528,7 @@ fn check_object(
     }
 
     // 1a. RGB inside CMYK document check
-    if rules.check_rgb_in_cmyk && doc.color_mode == ColorMode::Cmyk && !is_marks {
+    if rules.check_rgb_in_cmyk && doc.color_mode() == ColorMode::Cmyk && !is_marks {
         let mut flagged_rgb = false;
         for (source, color) in &colors {
             if is_screen_rgb_color(color) && !flagged_rgb {
@@ -558,7 +590,7 @@ fn check_object(
 
     // 2. Raster image checks (missing asset, effective DPI, RGB raster in CMYK doc)
     if let NodePayload::Raster(raster) = &obj.payload {
-        match doc.assets.get(&raster.asset_id) {
+        match doc.asset(raster.asset_id) {
             None => {
                 issues.push(PreflightIssue {
                     severity: PreflightSeverity::Error,
@@ -576,7 +608,7 @@ fn check_object(
             }
             Some(asset) => {
                 if rules.check_rgb_in_cmyk
-                    && doc.color_mode == ColorMode::Cmyk
+                    && doc.color_mode() == ColorMode::Cmyk
                     && asset.color_mode == ColorMode::Rgb
                 {
                     issues.push(PreflightIssue {
@@ -768,8 +800,8 @@ mod tests {
     #[test]
     fn preflight_detects_every_issue_class() {
         let mut doc = Document::new_a4("Preflight Stress Test");
-        let page_id = doc.pages[0].id;
-        doc.pages[0].bleed_mm = 3.0;
+        let page_id = doc.pages()[0].id;
+        doc.set_page_bleed(0, 3.0).unwrap();
 
         // 1. RGB object inside CMYK document
         let rgb_id = doc
@@ -934,7 +966,7 @@ mod tests {
     #[test]
     fn clean_cmyk_document_passes_preflight() {
         let mut doc = Document::new_a4("Clean Print Job");
-        doc.pages[0].bleed_mm = 3.0;
+        doc.set_page_bleed(0, 3.0).unwrap();
         // Full bleed background from -3..-3 to 213..300
         doc.add_object(
             rect(-3.0, -3.0, 216.0, 303.0)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Clean-room RIFF / RIFX binary container reader and writer, including
-//! Corel `LIST cmpr` Zlib-compressed block streams with `CPng` chunk-size tables.
+//! CDR `LIST cmpr` Zlib-compressed block streams with `CPng` chunk-size tables.
 
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{decompress_zlib_bounded, ByteReader, CodecLimits};
@@ -494,7 +494,7 @@ fn parse_chunk_sequence(
     Ok(nodes)
 }
 
-/// Parses the body of a Corel `LIST cmpr` Zlib-compressed chunk block.
+/// Parses the body of a CDR `LIST cmpr` Zlib-compressed chunk block.
 ///
 /// Layout after `LIST <size> cmpr`:
 /// - `u32` compressed stream byte length
@@ -588,7 +588,7 @@ pub fn write_riff(doc: &RiffDocument) -> CdrResult<Vec<u8>> {
     Ok(out)
 }
 
-/// Encodes `children` into the payload of a Corel `LIST cmpr` block (excluding the
+/// Encodes `children` into the payload of a CDR `LIST cmpr` block (excluding the
 /// outer `"LIST"`, size, and `"cmpr"` bytes).
 pub fn encode_cmpr_body(
     children: &[RiffNode],

@@ -9,10 +9,9 @@ impl StudioApp {
         if !rect.is_finite() || (rect.width() < 0.5 && rect.height() < 0.5) {
             return;
         }
-        let Some(tab) = self.active_tab() else {
+        if self.active_tab().is_none() {
             return;
-        };
-        let layer_id = tab.active_layer_id;
+        }
         let fill = self.default_fill.clone();
         let outline = self.default_outline.clone();
         let ts = &self.tool_settings;
@@ -23,7 +22,7 @@ impl StudioApp {
                 if let Some(tab) = self.active_tab_mut() {
                     let hits = coree_render::hit_test_rect(
                         &tab.document,
-                        tab.document.active_page_index,
+                        tab.document.active_page_index(),
                         rect,
                         false,
                     );
@@ -402,18 +401,23 @@ impl StudioApp {
                 return;
             }
             ToolId::SmartFill => {
+                let Some(layer_id) = self.ensure_active_creation_layer() else {
+                    return;
+                };
                 let created = self.active_tab().and_then(|tab| {
                     coree_render::create_smart_fill_object(
                         &tab.document,
-                        tab.document.active_page_index,
+                        tab.document.active_page_index(),
                         rect.center(),
                         self.default_fill.clone(),
                         self.default_outline.clone(),
                     )
                 });
                 if let Some(obj) = created {
-                    let _ = self.execute_command(CommandOp::create_object(obj, layer_id));
-                    self.push_toast("Created Smart Fill region", false);
+                    match self.execute_command(CommandOp::create_object(obj, layer_id)) {
+                        Ok(()) => self.push_toast("Created Smart Fill region", false),
+                        Err(e) => self.push_toast(e, true),
+                    }
                 }
                 return;
             }
@@ -436,12 +440,7 @@ impl StudioApp {
                 .with_outline(OutlineStyle::solid(Color::KEY_BLACK, 0.25))
                 .with_transform(Affine2D::translate(rect.center().x, rect.center().y));
                 obj.lens = Some(lens);
-                let _ = self.execute_command(CommandOp::create_object(obj, layer_id));
-                if let Some(tab) = self.active_tab_mut() {
-                    if let Some(&last_id) = tab.document.objects.keys().last() {
-                        tab.selection.select_single(&tab.document, last_id);
-                    }
-                }
+                let _ = self.create_object_on_active_layer(obj);
                 return;
             }
 
@@ -494,12 +493,7 @@ impl StudioApp {
                 outline
             })
             .with_transform(xf);
-        let _ = self.execute_command(CommandOp::create_object(obj, layer_id));
-        if let Some(tab) = self.active_tab_mut() {
-            if let Some(&last_id) = tab.document.objects.keys().last() {
-                tab.selection.select_single(&tab.document, last_id);
-            }
-        }
+        let _ = self.create_object_on_active_layer(obj);
     }
 
     // -------------------------------------------------------------------------
@@ -517,17 +511,18 @@ impl StudioApp {
             }
             if self.treat_all_objects_as_filled {
                 if let Some(NodePayload::PowerClip { contents, .. }) =
-                    tab.document.objects.get(&pc_id).map(|o| &o.payload)
+                    tab.document.object(pc_id).map(|o| &o.payload)
                 {
                     for &cid in contents.iter().rev() {
-                        let Some(obj) = tab.document.objects.get(&cid) else {
+                        let Some(obj) = tab.document.object(cid) else {
                             continue;
                         };
                         if !obj.visible || obj.locked {
                             continue;
                         }
                         if let Some(wp) = tab.document.world_path_of(cid) {
-                            if wp.contains_point(world_pt) {
+                            if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt)
+                            {
                                 return Some(cid);
                             }
                         } else if let Some(bb) = tab.document.world_object_bounds(cid) {
@@ -539,25 +534,25 @@ impl StudioApp {
                 }
             }
         }
-        let page_idx = tab.document.active_page_index;
+        let page_idx = tab.document.active_page_index();
         if let Some(hit) = hit_test_point(&tab.document, page_idx, world_pt, tol_mm) {
             return Some(hit);
         }
         if self.treat_all_objects_as_filled {
-            let page = tab.document.pages.get(page_idx)?;
+            let page = tab.document.page(page_idx)?;
             for layer in page.layers.iter().rev() {
                 if !layer.visible || layer.locked {
                     continue;
                 }
                 for &oid in layer.objects.iter().rev() {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if !obj.visible || obj.locked {
                         continue;
                     }
                     if let Some(wp) = tab.document.world_path_of(oid) {
-                        if wp.contains_point(world_pt) {
+                        if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
                             return Some(oid);
                         }
                     } else if let Some(bb) = tab.document.object_bounds(oid) {
@@ -584,7 +579,7 @@ impl StudioApp {
         };
         let candidates = coree_render::hit_test_rect(
             &tab.document,
-            tab.document.active_page_index,
+            tab.document.active_page_index(),
             poly_bb,
             false,
         );
@@ -648,93 +643,17 @@ impl StudioApp {
     /// Stamps a duplicate during an active live-preview drag (`MovingSelection`,
     /// `ScalingSelection`, `RotatingSelection`, `SkewingSelection`, or `FreeTransforming`)
     /// WITHOUT polluting `CommandHistory` snapshots with uncommitted mid-drag transforms!
-    ///
-    /// Temporarily restores dragged objects to their pre-drag transforms before executing
-    /// `stamp_duplicate_with_affine(live_affine)` so the `before` snapshot holds exact
-    /// pre-drag state and the stamped duplicate lands at the exact live cursor transform,
-    /// then immediately re-applies the live preview transforms so dragging continues smoothly.
+    /// Stamps a persistent duplicate at the live drag transform without interrupting the active
+    /// pointer gesture. Since [`ToolCore`] never mutates `Document` mid-drag, `tab.document`
+    /// already holds the exact pre-drag state.
     pub fn stamp_duplicate_during_active_drag(&mut self) -> Result<Vec<ObjectId>, String> {
-        // Phase 1: Snapshot live preview transforms and restore exact pre-drag transforms
-        let restored: Option<(Affine2D, Vec<(ObjectId, Affine2D)>)> =
-            self.active_tab_mut().and_then(|tab| match &tab.drag_state {
-                CanvasDragState::MovingSelection {
-                    accum_dx, accum_dy, ..
-                } => {
-                    let dx = *accum_dx;
-                    let dy = *accum_dy;
-                    let live_affine = Affine2D::translate(dx, dy);
-                    let inv = Affine2D::translate(-dx, -dy);
-                    let editable: Vec<ObjectId> = tab
-                        .selection
-                        .objects
-                        .iter()
-                        .copied()
-                        .filter(|&id| is_object_editable_in_doc(&tab.document, id))
-                        .collect();
-                    let mut live_xfs = Vec::with_capacity(editable.len());
-                    for id in editable {
-                        if let Some(obj) = tab.document.objects.get_mut(&id) {
-                            live_xfs.push((id, obj.transform));
-                            if dx.abs() > 1e-6 || dy.abs() > 1e-6 {
-                                obj.transform = inv.compose(&obj.transform);
-                            }
-                        }
-                    }
-                    Some((live_affine, live_xfs))
-                }
-                CanvasDragState::ScalingSelection {
-                    orig_transforms,
-                    last_affine,
-                    ..
-                }
-                | CanvasDragState::RotatingSelection {
-                    orig_transforms,
-                    last_affine,
-                    ..
-                }
-                | CanvasDragState::SkewingSelection {
-                    orig_transforms,
-                    last_affine,
-                    ..
-                }
-                | CanvasDragState::FreeTransforming {
-                    orig_transforms,
-                    last_affine,
-                    ..
-                } => {
-                    let live_affine = *last_affine;
-                    let origs = orig_transforms.clone();
-                    let mut live_xfs = Vec::with_capacity(origs.len());
-                    for (id, orig_xf) in origs {
-                        if let Some(obj) = tab.document.objects.get_mut(&id) {
-                            live_xfs.push((id, obj.transform));
-                            obj.transform = orig_xf;
-                        }
-                    }
-                    Some((live_affine, live_xfs))
-                }
-                _ => None,
-            });
-
-        let Some((live_affine, live_xfs)) = restored else {
+        let live_affine = self
+            .active_tab()
+            .and_then(|tab| tab.tool_core.active_live_world_transform());
+        let Some(live_affine) = live_affine else {
             return Ok(Vec::new());
         };
-
-        // Phase 2: Stamp duplicate at `live_affine` against the clean pre-drag document
-        let result = self.stamp_duplicate_with_affine(live_affine);
-
-        // Phase 3: Always re-apply the live preview transforms to the dragged originals
-        if let Some(tab) = self.active_tab_mut() {
-            for (id, live_xf) in live_xfs {
-                if let Some(obj) = tab.document.objects.get_mut(&id) {
-                    obj.transform = live_xf;
-                }
-            }
-            tab.tile_cache.mark_all_dirty();
-            tab.needs_rerender = true;
-        }
-
-        result
+        self.stamp_duplicate_with_affine(live_affine)
     }
 
     /// Applies an interactive `FreeTransform` around `anchor_mm` from `start_mm` to `current_mm`.
@@ -767,8 +686,7 @@ impl StudioApp {
         else {
             return false;
         };
-        self.execute_command(CommandOp::TransformObjects { ids, affine })
-            .is_ok()
+        self.apply_world_transform_to_selection(&ids, affine)
     }
 
     // -------------------------------------------------------------------------
@@ -783,7 +701,7 @@ impl StudioApp {
         if tab.selection.is_empty() {
             let hits = coree_render::hit_test_rect(
                 &tab.document,
-                tab.document.active_page_index,
+                tab.document.active_page_index(),
                 rect,
                 false,
             );
@@ -795,7 +713,7 @@ impl StudioApp {
         }
         let mut count = 0usize;
         for &oid in &tab.selection.objects {
-            let Some(obj) = tab.document.objects.get(&oid) else {
+            let Some(obj) = tab.document.object(oid) else {
                 continue;
             };
             let NodePayload::Path(ref path) = obj.payload else {
@@ -833,81 +751,41 @@ impl StudioApp {
         if orig_shape == new_shape {
             return false;
         }
-        enum ShapeCommitPlan {
-            TopLevel(Box<SceneObject>, LayerId),
-            Nested,
-        }
-        let plan = self.active_tab_mut().and_then(|tab| {
-            if !is_object_editable_in_doc(&tab.document, object_id) {
-                if let Some(obj) = tab.document.objects.get_mut(&object_id) {
-                    obj.payload = NodePayload::Shape(orig_shape.clone());
-                }
-                return None;
-            }
-            let layer_id = tab.document.layer_of_object(object_id);
-            let has_parent =
-                layer_id.is_some() || tab.document.parent_container_of(object_id).is_some();
-            if !has_parent {
-                return None;
-            }
-            let obj = tab.document.objects.get_mut(&object_id)?;
-            // Restore original before capturing `before` snapshot so Undo is exact
-            obj.payload = NodePayload::Shape(orig_shape);
-            if let Some(lid) = layer_id {
-                let mut updated = obj.clone();
-                updated.payload = NodePayload::Shape(new_shape.clone());
-                Some(ShapeCommitPlan::TopLevel(Box::new(updated), lid))
-            } else {
-                Some(ShapeCommitPlan::Nested)
-            }
+        let ready = self.active_tab().is_some_and(|tab| {
+            is_object_editable_in_doc(&tab.document, object_id)
+                && (tab.document.layer_of_object(object_id).is_some()
+                    || tab.document.parent_container_of(object_id).is_some())
+                && tab
+                    .document
+                    .object(object_id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::Shape(_)))
         });
-        match plan {
-            Some(ShapeCommitPlan::TopLevel(updated_obj, lid)) => self
-                .execute_command(CommandOp::create_object(*updated_obj, Some(lid)))
-                .is_ok(),
-            Some(ShapeCommitPlan::Nested) => {
-                // Inside a `Group` or `PowerClip`: update in-place inside a `CommandHistory`
-                // transaction so Undo/Redo restores exact shape WITHOUT adding `object_id`
-                // onto any top-level layer!
-                let committed = {
-                    let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-                        return false;
-                    };
-                    let tx_ok = tab
-                        .history
-                        .begin_transaction(&tab.document, "Edit Parametric Shape")
-                        .is_ok();
-                    if let Some(obj) = tab.document.objects.get_mut(&object_id) {
-                        obj.payload = NodePayload::Shape(new_shape);
-                    } else {
-                        if tx_ok {
-                            let _ = tab.history.cancel_transaction(&mut tab.document);
-                        }
-                        return false;
-                    }
-                    tab.document.touch();
-                    let noop = CommandOp::TransformObjects {
-                        ids: Vec::new(),
-                        affine: Affine2D::IDENTITY,
-                    };
-                    if tab.history.execute(&mut tab.document, noop).is_err() {
-                        if tx_ok {
-                            let _ = tab.history.cancel_transaction(&mut tab.document);
-                        }
-                        return false;
-                    }
-                    if tx_ok && tab.history.commit_transaction(&tab.document).is_err() {
-                        return false;
-                    }
-                    tab.mark_modified();
-                    true
-                };
-                if committed {
-                    self.checkpoint_wal_snapshot_active();
-                }
-                committed
-            }
-            None => false,
+        if !ready {
+            return false;
+        }
+        let committed = self
+            .execute_command(CommandOp::EditShape {
+                id: object_id,
+                shape: new_shape,
+            })
+            .is_ok();
+        if committed {
+            self.checkpoint_wal_snapshot_active();
+        }
+        committed
+    }
+
+    fn build_edit_path_op(doc: &Document, id: ObjectId, path: BezierPath) -> CommandOp {
+        if doc
+            .object(id)
+            .is_some_and(|o| matches!(o.payload, NodePayload::Path(_)))
+        {
+            CommandOp::EditPath { id, path }
+        } else {
+            CommandOp::Batch(vec![
+                CommandOp::ConvertToCurves { id },
+                CommandOp::EditPath { id, path },
+            ])
         }
     }
 
@@ -924,7 +802,7 @@ impl StudioApp {
                 if !is_object_editable_in_doc(&tab.document, oid) {
                     return None;
                 }
-                let obj = tab.document.objects.get(&oid)?;
+                let obj = tab.document.object(oid)?;
                 match &obj.payload {
                     NodePayload::Path(p) => Some((oid, p.clone())),
                     NodePayload::Shape(s) => Some((oid, s.to_bezier_path())),
@@ -953,7 +831,7 @@ impl StudioApp {
             }
             if let Some(tab) = self.active_tab() {
                 for (oid, mut refs) in by_obj {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if obj.locked {
@@ -985,24 +863,27 @@ impl StudioApp {
                         }
                     }
                     if changed {
-                        ops.push(CommandOp::EditPath { id: oid, path });
+                        ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                     }
                 }
             }
         } else {
-            for (oid, mut path) in self.selected_editable_paths() {
-                if path
-                    .subpaths
-                    .first()
-                    .is_some_and(|sp| sp.segment_count() > 0)
-                {
-                    if let Ok(ins) = path.add_node_at(0, 0, 0.5) {
-                        newly_selected.push(NodeRef {
-                            object_id: oid,
-                            subpath_index: 0,
-                            node_index: ins,
-                        });
-                        ops.push(CommandOp::EditPath { id: oid, path });
+            let paths = self.selected_editable_paths();
+            if let Some(tab) = self.active_tab() {
+                for (oid, mut path) in paths {
+                    if path
+                        .subpaths
+                        .first()
+                        .is_some_and(|sp| sp.segment_count() > 0)
+                    {
+                        if let Ok(ins) = path.add_node_at(0, 0, 0.5) {
+                            newly_selected.push(NodeRef {
+                                object_id: oid,
+                                subpath_index: 0,
+                                node_index: ins,
+                            });
+                            ops.push(Self::build_edit_path_op(&tab.document, oid, path));
+                        }
                     }
                 }
             }
@@ -1046,7 +927,7 @@ impl StudioApp {
         let mut ops = Vec::new();
         if let Some(tab) = self.active_tab() {
             for (oid, mut refs) in by_obj {
-                let Some(obj) = tab.document.objects.get(&oid) else {
+                let Some(obj) = tab.document.object(oid) else {
                     continue;
                 };
                 if obj.locked {
@@ -1100,7 +981,7 @@ impl StudioApp {
         if selected_nodes.len() >= 2 && selected_nodes[0].object_id == selected_nodes[1].object_id {
             let oid = selected_nodes[0].object_id;
             let edited = self.active_tab().and_then(|tab| {
-                let obj = tab.document.objects.get(&oid)?;
+                let obj = tab.document.object(oid)?;
                 if obj.locked {
                     return None;
                 }
@@ -1132,21 +1013,25 @@ impl StudioApp {
         }
 
         // 2. Fallback: join endpoints of any open subpath on the primary selected path
-        for (oid, mut path) in self.selected_editable_paths() {
-            let mut joined = false;
-            for sp_idx in 0..path.subpaths.len() {
-                if !path.subpaths[sp_idx].closed && path.subpaths[sp_idx].nodes.len() >= 2 {
-                    let last = path.subpaths[sp_idx].nodes.len() - 1;
-                    if path.join_nodes(sp_idx, 0, sp_idx, last).is_ok() {
-                        joined = true;
+        let fallback_op = self.active_tab().and_then(|tab| {
+            for (oid, mut path) in self.selected_editable_paths() {
+                let mut joined = false;
+                for sp_idx in 0..path.subpaths.len() {
+                    if !path.subpaths[sp_idx].closed && path.subpaths[sp_idx].nodes.len() >= 2 {
+                        let last = path.subpaths[sp_idx].nodes.len() - 1;
+                        if path.join_nodes(sp_idx, 0, sp_idx, last).is_ok() {
+                            joined = true;
+                        }
                     }
                 }
+                if joined {
+                    return Some(Self::build_edit_path_op(&tab.document, oid, path));
+                }
             }
-            if joined
-                && self
-                    .execute_command(CommandOp::EditPath { id: oid, path })
-                    .is_ok()
-            {
+            None
+        });
+        if let Some(cmd) = fallback_op {
+            if self.execute_command(cmd).is_ok() {
                 self.push_toast("Joined open curve endpoints", false);
                 return true;
             }
@@ -1171,7 +1056,7 @@ impl StudioApp {
             }
             if let Some(tab) = self.active_tab() {
                 for (oid, mut refs) in by_obj {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if obj.locked {
@@ -1192,14 +1077,17 @@ impl StudioApp {
                         }
                     }
                     if changed {
-                        ops.push(CommandOp::EditPath { id: oid, path });
+                        ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                     }
                 }
             }
         } else {
-            for (oid, mut path) in self.selected_editable_paths() {
-                if !path.subpaths.is_empty() && path.break_at_node(0, 0).is_ok() {
-                    ops.push(CommandOp::EditPath { id: oid, path });
+            let paths = self.selected_editable_paths();
+            if let Some(tab) = self.active_tab() {
+                for (oid, mut path) in paths {
+                    if !path.subpaths.is_empty() && path.break_at_node(0, 0).is_ok() {
+                        ops.push(Self::build_edit_path_op(&tab.document, oid, path));
+                    }
                 }
             }
         }
@@ -1239,7 +1127,7 @@ impl StudioApp {
             }
             if let Some(tab) = self.active_tab() {
                 for (oid, refs) in by_obj {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if obj.locked {
@@ -1256,18 +1144,21 @@ impl StudioApp {
                             let _ = path.convert_segment_to_line(sp_idx, n_idx.min(sc - 1));
                         }
                     }
-                    ops.push(CommandOp::EditPath { id: oid, path });
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
             }
         } else {
-            for (oid, mut path) in self.selected_editable_paths() {
-                for sp_idx in 0..path.subpaths.len() {
-                    let sc = path.subpaths[sp_idx].segment_count();
-                    for seg_idx in 0..sc {
-                        let _ = path.convert_segment_to_line(sp_idx, seg_idx);
+            let paths = self.selected_editable_paths();
+            if let Some(tab) = self.active_tab() {
+                for (oid, mut path) in paths {
+                    for sp_idx in 0..path.subpaths.len() {
+                        let sc = path.subpaths[sp_idx].segment_count();
+                        for seg_idx in 0..sc {
+                            let _ = path.convert_segment_to_line(sp_idx, seg_idx);
+                        }
                     }
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
-                ops.push(CommandOp::EditPath { id: oid, path });
             }
         }
         if ops.is_empty() {
@@ -1303,7 +1194,7 @@ impl StudioApp {
             }
             if let Some(tab) = self.active_tab() {
                 for (oid, refs) in by_obj {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if obj.locked {
@@ -1320,18 +1211,21 @@ impl StudioApp {
                             let _ = path.convert_segment_to_curve(sp_idx, n_idx.min(sc - 1));
                         }
                     }
-                    ops.push(CommandOp::EditPath { id: oid, path });
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
             }
         } else {
-            for (oid, mut path) in self.selected_editable_paths() {
-                for sp_idx in 0..path.subpaths.len() {
-                    let sc = path.subpaths[sp_idx].segment_count();
-                    for seg_idx in 0..sc {
-                        let _ = path.convert_segment_to_curve(sp_idx, seg_idx);
+            let paths = self.selected_editable_paths();
+            if let Some(tab) = self.active_tab() {
+                for (oid, mut path) in paths {
+                    for sp_idx in 0..path.subpaths.len() {
+                        let sc = path.subpaths[sp_idx].segment_count();
+                        for seg_idx in 0..sc {
+                            let _ = path.convert_segment_to_curve(sp_idx, seg_idx);
+                        }
                     }
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
-                ops.push(CommandOp::EditPath { id: oid, path });
             }
         }
         if ops.is_empty() {
@@ -1367,7 +1261,7 @@ impl StudioApp {
             }
             if let Some(tab) = self.active_tab() {
                 for (oid, refs) in by_obj {
-                    let Some(obj) = tab.document.objects.get(&oid) else {
+                    let Some(obj) = tab.document.object(oid) else {
                         continue;
                     };
                     if obj.locked {
@@ -1400,18 +1294,21 @@ impl StudioApp {
                         }
                         let _ = path.set_node_kind(sp_idx, n_idx, kind);
                     }
-                    ops.push(CommandOp::EditPath { id: oid, path });
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
             }
         } else {
-            for (oid, mut path) in self.selected_editable_paths() {
-                for sp_idx in 0..path.subpaths.len() {
-                    let len = path.subpaths[sp_idx].nodes.len();
-                    for n_idx in 0..len {
-                        let _ = path.set_node_kind(sp_idx, n_idx, kind);
+            let paths = self.selected_editable_paths();
+            if let Some(tab) = self.active_tab() {
+                for (oid, mut path) in paths {
+                    for sp_idx in 0..path.subpaths.len() {
+                        let len = path.subpaths[sp_idx].nodes.len();
+                        for n_idx in 0..len {
+                            let _ = path.set_node_kind(sp_idx, n_idx, kind);
+                        }
                     }
+                    ops.push(Self::build_edit_path_op(&tab.document, oid, path));
                 }
-                ops.push(CommandOp::EditPath { id: oid, path });
             }
         }
         if ops.is_empty() {
@@ -1432,16 +1329,20 @@ impl StudioApp {
 
     /// Shape Property Bar: reverses traversal direction of all subpaths on selected path(s).
     pub fn shape_reverse_subpaths(&mut self) -> bool {
-        let ops: Vec<CommandOp> = self
-            .selected_editable_paths()
-            .into_iter()
-            .map(|(oid, mut path)| {
-                for sp_idx in 0..path.subpaths.len() {
-                    let _ = path.reverse_subpath(sp_idx);
-                }
-                CommandOp::EditPath { id: oid, path }
-            })
-            .collect();
+        let paths = self.selected_editable_paths();
+        let ops: Vec<CommandOp> = if let Some(tab) = self.active_tab() {
+            paths
+                .into_iter()
+                .map(|(oid, mut path)| {
+                    for sp_idx in 0..path.subpaths.len() {
+                        let _ = path.reverse_subpath(sp_idx);
+                    }
+                    Self::build_edit_path_op(&tab.document, oid, path)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if ops.is_empty() {
             return false;
         }
@@ -1460,16 +1361,20 @@ impl StudioApp {
 
     /// Shape Property Bar: closes all open subpaths on selected path(s).
     pub fn shape_close_curve(&mut self) -> bool {
-        let ops: Vec<CommandOp> = self
-            .selected_editable_paths()
-            .into_iter()
-            .map(|(oid, mut path)| {
-                for sp_idx in 0..path.subpaths.len() {
-                    let _ = path.auto_close(sp_idx);
-                }
-                CommandOp::EditPath { id: oid, path }
-            })
-            .collect();
+        let paths = self.selected_editable_paths();
+        let ops: Vec<CommandOp> = if let Some(tab) = self.active_tab() {
+            paths
+                .into_iter()
+                .map(|(oid, mut path)| {
+                    for sp_idx in 0..path.subpaths.len() {
+                        let _ = path.auto_close(sp_idx);
+                    }
+                    Self::build_edit_path_op(&tab.document, oid, path)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if ops.is_empty() {
             return false;
         }
@@ -1493,7 +1398,7 @@ impl StudioApp {
         };
         tab.selection.node_selection.clear();
         for &oid in &tab.selection.objects {
-            let Some(obj) = tab.document.objects.get(&oid) else {
+            let Some(obj) = tab.document.object(oid) else {
                 continue;
             };
             let NodePayload::Path(ref path) = obj.payload else {
@@ -1519,14 +1424,18 @@ impl StudioApp {
         } else {
             0.5
         };
-        let ops: Vec<CommandOp> = self
-            .selected_editable_paths()
-            .into_iter()
-            .map(|(oid, mut path)| {
-                path.reduce_nodes(tol);
-                CommandOp::EditPath { id: oid, path }
-            })
-            .collect();
+        let paths = self.selected_editable_paths();
+        let ops: Vec<CommandOp> = if let Some(tab) = self.active_tab() {
+            paths
+                .into_iter()
+                .map(|(oid, mut path)| {
+                    path.reduce_nodes(tol);
+                    Self::build_edit_path_op(&tab.document, oid, path)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if ops.is_empty() {
             return false;
         }
@@ -1567,22 +1476,27 @@ impl StudioApp {
 
         // Locate target vector object: selected first, else hovered within brush radius
         let target_id = self.active_tab().and_then(|tab| {
-            let sel = tab.selection.objects.iter().copied().find(|id| {
-                tab.document.objects.get(id).is_some_and(|o| {
-                    !o.locked && matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_))
-                })
+            let sel = tab.selection.objects.iter().copied().find(|&id| {
+                is_object_editable_in_doc(&tab.document, id)
+                    && tab.document.object(id).is_some_and(|o| {
+                        matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_))
+                    })
             });
             if sel.is_some() {
                 return sel;
             }
             for &pt in points {
-                if let Some(hit) =
-                    hit_test_point(&tab.document, tab.document.active_page_index, pt, radius_mm)
-                {
-                    if tab.document.objects.get(&hit).is_some_and(|o| {
-                        !o.locked
-                            && matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_))
-                    }) {
+                if let Some(hit) = hit_test_point(
+                    &tab.document,
+                    tab.document.active_page_index(),
+                    pt,
+                    radius_mm,
+                ) {
+                    if is_object_editable_in_doc(&tab.document, hit)
+                        && tab.document.object(hit).is_some_and(|o| {
+                            matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_))
+                        })
+                    {
                         return Some(hit);
                     }
                 }
@@ -1593,14 +1507,17 @@ impl StudioApp {
             return false;
         };
 
-        let edited = self.active_tab().and_then(|tab| {
-            let obj = tab.document.objects.get(&oid)?;
+        let edited_op = self.active_tab().and_then(|tab| {
+            if !is_object_editable_in_doc(&tab.document, oid) {
+                return None;
+            }
+            let obj = tab.document.object(oid)?;
             let mut path = match &obj.payload {
                 NodePayload::Path(p) => p.clone(),
                 NodePayload::Shape(s) => s.to_bezier_path(),
                 _ => return None,
             };
-            let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+            let inv = world_inverse_transform_of(&tab.document, oid);
             let scale_est = ((inv.m[0].hypot(inv.m[1]) + inv.m[2].hypot(inv.m[3])) * 0.5).max(1e-3);
             let local_radius = radius_mm * scale_est;
 
@@ -1645,16 +1562,13 @@ impl StudioApp {
                     _ => return None,
                 }
             }
-            Some(path)
+            Some(Self::build_edit_path_op(&tab.document, oid, path))
         });
 
-        let Some(path) = edited else {
+        let Some(cmd) = edited_op else {
             return false;
         };
-        if self
-            .execute_command(CommandOp::EditPath { id: oid, path })
-            .is_ok()
-        {
+        if self.execute_command(cmd).is_ok() {
             if let Some(tab) = self.active_tab_mut() {
                 tab.selection.select_single(&tab.document, oid);
             }
@@ -1675,14 +1589,15 @@ impl StudioApp {
         if !crop.is_finite() || crop.width() < 1.0 || crop.height() < 1.0 {
             return false;
         }
-        let outcome = {
-            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let plan = {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
                 return false;
             };
-            let page_idx = tab.document.active_page_index;
-            let Some(page) = tab.document.pages.get(page_idx) else {
+            let page_idx = tab.document.active_page_index();
+            let Some(page) = tab.document.page(page_idx) else {
                 return false;
             };
+            let page_id = page.id;
             let mut outside_ids = Vec::new();
             let mut inside_ids = Vec::new();
             let mut seen = HashSet::new();
@@ -1694,7 +1609,7 @@ impl StudioApp {
                     if !seen.insert(oid) {
                         continue;
                     }
-                    if let Some(obj) = tab.document.objects.get(&oid) {
+                    if let Some(obj) = tab.document.object(oid) {
                         if obj.locked {
                             continue;
                         }
@@ -1723,100 +1638,218 @@ impl StudioApp {
                     affine: Affine2D::translate(-crop.min_x, -crop.min_y),
                 });
             }
-            if ops.is_empty() {
-                ops.push(CommandOp::TransformObjects {
-                    ids: Vec::new(),
-                    affine: Affine2D::IDENTITY,
-                });
-            }
-
-            let tx_ok = tab
-                .history
-                .begin_transaction(&tab.document, "Crop Page")
-                .is_ok();
-            let exec_res = tab
-                .history
-                .execute(&mut tab.document, CommandOp::Batch(ops));
-            if exec_res.is_err() {
-                if tx_ok {
-                    let _ = tab.history.cancel_transaction(&mut tab.document);
-                }
-                return false;
-            }
             let new_w = crop.width().clamp(1.0, 50_000.0);
             let new_h = crop.height().clamp(1.0, 50_000.0);
-            if let Some(page_mut) = tab.document.pages.get_mut(page_idx) {
-                page_mut.width_mm = new_w;
-                page_mut.height_mm = new_h;
-            }
-            if tx_ok {
-                let _ = tab.history.commit_transaction(&tab.document);
-            }
-            tab.pending_crop_rect = None;
-            tab.fit_active_page();
-            tab.mark_modified();
-            Some((new_w, new_h, outside_ids.len()))
+            ops.push(CommandOp::SetPageProperties {
+                page_id,
+                name: None,
+                width_mm: Some(new_w),
+                height_mm: Some(new_h),
+                bleed_mm: None,
+                facing_pages: None,
+            });
+            (ops, new_w, new_h, outside_ids.len())
         };
 
-        if let Some((w, h, removed)) = outcome {
-            self.checkpoint_wal_snapshot_active();
-            self.push_toast(
-                format!("Cropped page to {w:.1} × {h:.1} mm ({removed} outside object(s) removed)"),
-                false,
-            );
-            true
+        let (ops, w, h, removed) = plan;
+        let cmd = if ops.len() == 1 {
+            ops.into_iter().next().expect("len == 1")
         } else {
-            false
+            CommandOp::Batch(ops)
+        };
+        if self.execute_command(cmd).is_err() {
+            return false;
         }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.pending_crop_rect = None;
+            tab.tool_core.pending_crop_rect = None;
+            tab.transient_overlay = TransientOverlay::default();
+            tab.fit_active_page();
+        }
+        self.checkpoint_wal_snapshot_active();
+        self.push_toast(
+            format!("Cropped page to {w:.1} × {h:.1} mm ({removed} outside object(s) removed)"),
+            false,
+        );
+        true
     }
 
     /// Slices the selected (or line-intersected) vector shape along segment `a -> b`.
     pub fn apply_knife_cut(&mut self, a: Point2D, b: Point2D) -> usize {
-        let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
+        #[allow(clippy::too_many_arguments)]
+        fn collect_cuttable_targets(
+            doc: &Document,
+            id: ObjectId,
+            a: Point2D,
+            b: Point2D,
+            cut_bb: Rect2D,
+            depth: usize,
+            visiting: &mut HashSet<ObjectId>,
+            out: &mut Vec<ObjectId>,
+        ) {
+            if depth > 64 || !visiting.insert(id) {
+                return;
+            }
+            if !is_object_editable_in_doc(doc, id) {
+                return;
+            }
+            let Some(obj) = doc.object(id) else {
+                return;
+            };
+            match &obj.payload {
+                NodePayload::Path(_) | NodePayload::Shape(_) => {
+                    if doc
+                        .world_object_bounds(id)
+                        .is_some_and(|wb| wb.intersects(cut_bb))
+                    {
+                        out.push(id);
+                    }
+                }
+                NodePayload::Group(children) => {
+                    for &cid in children.iter().rev() {
+                        collect_cuttable_targets(doc, cid, a, b, cut_bb, depth + 1, visiting, out);
+                    }
+                }
+                NodePayload::PowerClip { contents, .. } => {
+                    let Some(pc_wp) = doc.world_path_of(id) else {
+                        return;
+                    };
+                    if !pc_wp.bounding_box().is_some_and(|bb| bb.intersects(cut_bb)) {
+                        return;
+                    }
+                    let enters_pc = pc_wp.contains_point(a)
+                        || pc_wp.contains_point(b)
+                        || coree_core::knife_cut(&pc_wp, a, b, true).len() > 1
+                        || coree_core::knife_cut(&pc_wp, a, b, false).len() > 1;
+                    if enters_pc {
+                        for &cid in contents.iter().rev() {
+                            collect_cuttable_targets(
+                                doc,
+                                cid,
+                                a,
+                                b,
+                                cut_bb,
+                                depth + 1,
+                                visiting,
+                                out,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let cut_bb = Rect2D::from_points(a, b).expand(1.0);
         let knife_plan = self.active_tab().and_then(|tab| {
-            let oid = tab
-                .selection
-                .objects
-                .iter()
-                .copied()
-                .find(|id| tab.document.world_path_of(*id).is_some())
-                .or_else(|| {
-                    coree_render::hit_test_rect(
+            let mut visiting = HashSet::new();
+            let mut candidates = Vec::new();
+            if tab.selection.objects.is_empty() {
+                let hits = coree_render::hit_test_rect(
+                    &tab.document,
+                    tab.document.active_page_index(),
+                    cut_bb,
+                    false,
+                );
+                for hit_id in hits {
+                    collect_cuttable_targets(
                         &tab.document,
-                        tab.document.active_page_index,
+                        hit_id,
+                        a,
+                        b,
                         cut_bb,
-                        false,
-                    )
-                    .into_iter()
-                    .find(|id| tab.document.world_path_of(*id).is_some())
-                })?;
-            let wp = tab.document.world_path_of(oid)?;
-            let obj = tab.document.objects.get(&oid)?;
-            if obj.locked {
-                return None;
+                        0,
+                        &mut visiting,
+                        &mut candidates,
+                    );
+                }
+            } else {
+                for &id in &tab.selection.objects {
+                    collect_cuttable_targets(
+                        &tab.document,
+                        id,
+                        a,
+                        b,
+                        cut_bb,
+                        0,
+                        &mut visiting,
+                        &mut candidates,
+                    );
+                }
             }
-            let pieces = coree_core::knife_cut(&wp, a, b, true);
-            if pieces.len() <= 1 {
-                return None;
+
+            let mut chosen: Option<(ObjectId, &SceneObject, Vec<BezierPath>)> = None;
+            for oid in candidates {
+                if !is_object_editable_in_doc(&tab.document, oid) {
+                    continue;
+                }
+                let target_layer_id =
+                    enclosing_layer_of_object(&tab.document, oid).or(tab.active_layer_id);
+                if target_layer_id
+                    .is_some_and(|lid| tab.document.find_layer(lid).is_some_and(|l| l.locked))
+                {
+                    continue;
+                }
+                let Some(wp) = tab.document.world_path_of(oid) else {
+                    continue;
+                };
+                let Some(obj) = tab.document.object(oid) else {
+                    continue;
+                };
+                let pieces = coree_core::knife_cut(&wp, a, b, true);
+                if pieces.len() > 1 {
+                    chosen = Some((oid, obj, pieces));
+                    break;
+                }
             }
-            let mut next_id = tab.document.next_id.max(1);
+
+            let (oid, obj, pieces) = chosen?;
+            let obj_world = world_transform_of_or_local(&tab.document, oid);
+            let (inv_piece_xf, preserved_transform) = if let Some(inv_world) = obj_world.inverse() {
+                (inv_world, obj.transform)
+            } else {
+                let inv_parent = tab
+                    .document
+                    .parent_container_of(oid)
+                    .and_then(|pid| tab.document.world_transform_of(pid))
+                    .and_then(|xf| xf.inverse())
+                    .unwrap_or(Affine2D::IDENTITY);
+                (inv_parent, Affine2D::IDENTITY)
+            };
+
+            let mut next_id = tab.document.next_id().max(1);
             let mut new_ids = Vec::with_capacity(pieces.len());
-            let mut ops = vec![CommandOp::DeleteObjects { ids: vec![oid] }];
+            let mut replacements = Vec::with_capacity(pieces.len());
             for (i, piece) in pieces.into_iter().enumerate() {
                 let nid = ObjectId(next_id);
                 next_id = next_id.saturating_add(1);
                 new_ids.push(nid);
+                let local_piece = piece.transformed(&inv_piece_xf);
                 let mut new_obj = SceneObject::new(
                     nid,
                     format!("{} Slice {}", obj.name, i + 1),
-                    NodePayload::Path(piece),
+                    NodePayload::Path(local_piece),
                 );
+                new_obj.transform = preserved_transform;
                 new_obj.fill = obj.fill.clone();
                 new_obj.outline = obj.outline.clone();
-                ops.push(CommandOp::create_object(new_obj, layer_id));
+                new_obj.effects = obj.effects.clone();
+                new_obj.lens = obj.lens.clone();
+                new_obj.style_id = obj.style_id;
+                new_obj.opacity = obj.opacity;
+                new_obj.blend_mode = obj.blend_mode;
+                new_obj.visible = obj.visible;
+                new_obj.printable = obj.printable;
+                new_obj.unknown_chunks = obj.unknown_chunks.clone();
+                replacements.push(new_obj);
             }
-            Some((CommandOp::Batch(ops), new_ids))
+            Some((
+                CommandOp::ReplaceObjectInParent {
+                    id: oid,
+                    replacements,
+                },
+                new_ids,
+            ))
         });
 
         if let Some((op, new_ids)) = knife_plan {
@@ -1837,25 +1870,32 @@ impl StudioApp {
     pub fn apply_virtual_segment_delete_at(&mut self, pt: Point2D) -> bool {
         let edit_op = self.active_tab().and_then(|tab| {
             let tol = (8.0 / tab.viewport.px_per_mm()).max(2.0);
-            let oid = hit_test_point(&tab.document, tab.document.active_page_index, pt, tol)?;
-            let obj = tab.document.objects.get(&oid)?;
-            if obj.locked {
+            let oid = hit_test_point(&tab.document, tab.document.active_page_index(), pt, tol)?;
+            if !is_object_editable_in_doc(&tab.document, oid) {
+                return None;
+            }
+            if !tab
+                .document
+                .object(oid)
+                .is_some_and(|o| matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_)))
+            {
                 return None;
             }
             let target_path = tab.document.world_path_of(oid)?;
             let cutters: Vec<BezierPath> = tab
                 .document
-                .objects
+                .objects()
                 .keys()
                 .filter(|&&id| id != oid)
                 .filter_map(|&id| tab.document.world_path_of(id))
                 .collect();
             let updated_world = coree_core::virtual_segment_delete(&target_path, &cutters, pt, tol);
-            let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
-            Some(CommandOp::EditPath {
-                id: oid,
-                path: updated_world.transformed(&inv),
-            })
+            let inv = world_inverse_transform_of(&tab.document, oid);
+            Some(Self::build_edit_path_op(
+                &tab.document,
+                oid,
+                updated_world.transformed(&inv),
+            ))
         });
         if let Some(op) = edit_op {
             if self.execute_command(op).is_ok() {
@@ -1874,20 +1914,24 @@ impl StudioApp {
         let radius = self.tool_settings.eraser_radius_mm.max(0.25);
         let step = (radius * 0.4).max(0.25);
         let edit = self.active_tab().and_then(|tab| {
+            let is_editable_vector = |id: ObjectId| {
+                tab.document.object(id).is_some_and(|o| {
+                    matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_))
+                }) && tab.document.world_path_of(id).is_some()
+            };
             let oid = tab
                 .selection
                 .objects
                 .iter()
                 .copied()
-                .find(|id| tab.document.world_path_of(*id).is_some())
+                .find(|&id| is_editable_vector(id))
                 .or_else(|| {
                     points.iter().find_map(|&p| {
-                        hit_test_point(&tab.document, tab.document.active_page_index, p, radius)
-                            .filter(|id| tab.document.world_path_of(*id).is_some())
+                        hit_test_point(&tab.document, tab.document.active_page_index(), p, radius)
+                            .filter(|&id| is_editable_vector(id))
                     })
                 })?;
-            let obj = tab.document.objects.get(&oid)?;
-            if obj.locked {
+            if !is_object_editable_in_doc(&tab.document, oid) {
                 return None;
             }
             let wp = tab.document.world_path_of(oid)?;
@@ -1917,11 +1961,12 @@ impl StudioApp {
             let combined = BezierPath {
                 subpaths: pieces.into_iter().flat_map(|p| p.subpaths).collect(),
             };
-            let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
-            Some(CommandOp::EditPath {
-                id: oid,
-                path: combined.transformed(&inv),
-            })
+            let inv = world_inverse_transform_of(&tab.document, oid);
+            Some(Self::build_edit_path_op(
+                &tab.document,
+                oid,
+                combined.transformed(&inv),
+            ))
         });
         if let Some(op) = edit {
             self.execute_command(op).is_ok()
@@ -1936,34 +1981,26 @@ impl StudioApp {
 
     /// Appends a node to the active Bézier/Pen draft (pulling symmetric `handle_in`/`handle_out` when `handle_out` is `Some`).
     pub fn bezier_add_point(&mut self, pos: Point2D, handle_out: Option<Point2D>) {
-        let Some(tab) = self.active_tab_mut() else {
-            return;
-        };
-        let node = if let Some(ho) = handle_out {
-            if ho.distance_to(pos) > 0.35 {
-                let v = ho - pos;
-                PathNode::new(pos, Some(pos - v), Some(ho), NodeKind::Symmetrical)
-            } else {
-                PathNode::corner(pos)
-            }
-        } else {
-            PathNode::corner(pos)
-        };
-        tab.bezier_draft_nodes.push(node);
-        tab.poly_points_mm.push(pos);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.tool_core.bezier_add_point(pos, handle_out);
+        }
     }
 
     /// Commits the drafted `bezier_draft_nodes` as a real cubic [`BezierPath`] (open or closed).
     pub fn bezier_finish(&mut self, closed: bool) -> Option<ObjectId> {
-        let (nodes, layer_id) = {
-            let tab = self.active_tab_mut()?;
-            let nodes = std::mem::take(&mut tab.bezier_draft_nodes);
-            tab.poly_points_mm.clear();
-            (nodes, tab.active_layer_id)
-        };
-        if nodes.len() < 2 {
+        if self
+            .active_tab()
+            .is_none_or(|t| t.tool_core.bezier_draft_nodes.len() < 2)
+        {
             return None;
         }
+        self.ensure_active_creation_layer()?;
+        let nodes = {
+            let tab = self.active_tab_mut()?;
+            let nodes = std::mem::take(&mut tab.tool_core.bezier_draft_nodes);
+            tab.tool_core.poly_points_mm.clear();
+            nodes
+        };
         let path = BezierPath::from_subpath(Subpath { nodes, closed });
         let fill = if closed {
             self.default_fill.clone()
@@ -1977,20 +2014,7 @@ impl StudioApp {
         )
         .with_fill(fill)
         .with_outline(self.default_outline.clone());
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            let created_id = self
-                .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
-            if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
-                tab.selection.select_single(&tab.document, id);
-            }
-            created_id
-        } else {
-            None
-        }
+        self.create_object_on_active_layer(obj)
     }
 
     /// Builds a smooth Catmull-Rom / B-spline cubic [`BezierPath`] through `pts` and commits it.
@@ -1999,7 +2023,6 @@ impl StudioApp {
             return None;
         }
         let path = bspline_to_bezier_path(pts, closed);
-        let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
         let fill = if closed {
             self.default_fill.clone()
         } else {
@@ -2008,20 +2031,7 @@ impl StudioApp {
         let obj = SceneObject::new(ObjectId(0), "B-Spline", NodePayload::Path(path))
             .with_fill(fill)
             .with_outline(self.default_outline.clone());
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            let created_id = self
-                .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
-            if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
-                tab.selection.select_single(&tab.document, id);
-            }
-            created_id
-        } else {
-            None
-        }
+        self.create_object_on_active_layer(obj)
     }
 
     /// Commits a 3-Point Curve: chord `(p1, p2)` bent cleanly through control apex `p3`
@@ -2036,25 +2046,14 @@ impl StudioApp {
             return None;
         }
         let path = three_point_arc_path(p1, p2, p3);
-        let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
         let obj = SceneObject::new(ObjectId(0), "3-Point Curve", NodePayload::Path(path))
             .with_fill(Fill::None)
             .with_outline(self.default_outline.clone());
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            let created_id = self
-                .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
-            if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
-                tab.three_point_curve_chord = None;
-                tab.selection.select_single(&tab.document, id);
-            }
-            created_id
-        } else {
-            None
+        let created_id = self.create_object_on_active_layer(obj)?;
+        if let Some(tab) = self.active_tab_mut() {
+            tab.tool_core.three_point_curve_chord = None;
         }
+        Some(created_id)
     }
 
     /// Commits a 3-Point Rectangle or 3-Point Ellipse from baseline `p1 -> p2` and height point `p3`.
@@ -2075,7 +2074,6 @@ impl StudioApp {
         let perp = Vec2D::new(-u.y, u.x);
         let signed_h = (p3 - p1).dot(perp);
         let height = signed_h.abs().max(1.0);
-        let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
         let ts = &self.tool_settings;
 
         let (name, payload, xf) = if tool == ToolId::ThreePointEllipse {
@@ -2113,21 +2111,11 @@ impl StudioApp {
             .with_fill(self.default_fill.clone())
             .with_outline(self.default_outline.clone())
             .with_transform(xf);
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            let created_id = self
-                .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
-            if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
-                tab.three_point_shape_chord = None;
-                tab.selection.select_single(&tab.document, id);
-            }
-            created_id
-        } else {
-            None
+        let created_id = self.create_object_on_active_layer(obj)?;
+        if let Some(tab) = self.active_tab_mut() {
+            tab.tool_core.three_point_shape_chord = None;
         }
+        Some(created_id)
     }
 
     /// Confirms an in-progress interactive tool action (`Enter` key): commits Crop box,
@@ -2144,22 +2132,21 @@ impl StudioApp {
         }
         if self
             .active_tab()
-            .is_some_and(|t| t.bezier_draft_nodes.len() >= 2)
+            .is_some_and(|t| t.tool_core.bezier_draft_nodes.len() >= 2)
         {
             return self.bezier_finish(false).is_some();
         }
         if self
             .active_tab()
-            .is_some_and(|t| t.poly_points_mm.len() >= 2)
+            .is_some_and(|t| t.tool_core.poly_points_mm.len() >= 2)
         {
             let pts = self
                 .active_tab_mut()
-                .map(|t| std::mem::take(&mut t.poly_points_mm))
+                .map(|t| std::mem::take(&mut t.tool_core.poly_points_mm))
                 .unwrap_or_default();
             if self.active_tool == ToolId::BSpline {
                 return self.commit_bspline_points(&pts, false).is_some();
             }
-            let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
             let path = BezierPath::from_polygon(pts, false);
             let obj = SceneObject::new(
                 ObjectId(0),
@@ -2168,9 +2155,7 @@ impl StudioApp {
             )
             .with_fill(Fill::None)
             .with_outline(self.default_outline.clone());
-            return self
-                .execute_command(CommandOp::create_object(obj, layer_id))
-                .is_ok();
+            return self.create_object_on_active_layer(obj).is_some();
         }
         false
     }
@@ -2191,7 +2176,7 @@ impl StudioApp {
             return;
         };
         let (buf, resolved_pos, resolved_para, resolved_size) = if let Some(oid) = object_id {
-            if let Some(obj) = tab.document.objects.get(&oid) {
+            if let Some(obj) = tab.document.object(oid) {
                 let pos = Point2D::new(obj.transform.m[4], obj.transform.m[5]);
                 match &obj.payload {
                     NodePayload::ArtisticText(art) => {
@@ -2220,9 +2205,9 @@ impl StudioApp {
 
     /// Commits the active on-canvas inline text edit via undoable `CommandOp`.
     pub fn commit_inline_text_edit(&mut self) -> bool {
-        let Some((edit, layer_id)) = self
+        let Some(edit) = self
             .active_tab_mut()
-            .and_then(|t| t.inline_text_edit.take().map(|e| (e, t.active_layer_id)))
+            .and_then(|t| t.inline_text_edit.take())
         else {
             return false;
         };
@@ -2231,7 +2216,7 @@ impl StudioApp {
         }
         if let Some(oid) = edit.object_id {
             let payload_opt = self.active_tab().and_then(|tab| {
-                let obj = tab.document.objects.get(&oid)?;
+                let obj = tab.document.object(oid)?;
                 match &obj.payload {
                     NodePayload::ArtisticText(art) => {
                         let style = art
@@ -2258,9 +2243,13 @@ impl StudioApp {
                 }
             });
             if let Some(payload) = payload_opt {
-                return self
-                    .execute_command(CommandOp::EditText { id: oid, payload })
-                    .is_ok();
+                return match self.execute_command(CommandOp::EditText { id: oid, payload }) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        false
+                    }
+                };
             }
             return false;
         }
@@ -2290,19 +2279,7 @@ impl StudioApp {
                 edit.world_pos_mm.x,
                 edit.world_pos_mm.y,
             ));
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            if let Some(tab) = self.active_tab_mut() {
-                if let Some(&last_id) = tab.document.objects.keys().last() {
-                    tab.selection.select_single(&tab.document, last_id);
-                }
-            }
-            true
-        } else {
-            false
-        }
+        self.create_object_on_active_layer(obj).is_some()
     }
 
     /// Cancels the active on-canvas inline text edit without modifying the document.
@@ -2326,7 +2303,7 @@ impl StudioApp {
     ) -> Option<(ObjectId, AnchorPoint, Point2D)> {
         let search_tol = tol_mm.max(6.0);
         let oid = hit_test_point(doc, page_index, pt, search_tol)?;
-        let obj = doc.objects.get(&oid)?;
+        let obj = doc.object(oid)?;
         if matches!(obj.payload, NodePayload::Connector(_)) {
             return None;
         }
@@ -2356,12 +2333,12 @@ impl StudioApp {
         end_mm: Point2D,
         right_angle: bool,
     ) -> Option<ObjectId> {
-        let (layer_id, from_snap, to_snap) = {
+        let (from_snap, to_snap) = {
             let tab = self.active_tab()?;
-            let pidx = tab.document.active_page_index;
+            let pidx = tab.document.active_page_index();
             let from_s = Self::find_nearest_object_anchor(&tab.document, pidx, start_mm, 8.0);
             let to_s = Self::find_nearest_object_anchor(&tab.document, pidx, end_mm, 8.0);
-            (tab.active_layer_id, from_s, to_s)
+            (from_s, to_s)
         };
         let (from_obj, from_anchor, from_fallback) = match from_snap {
             Some((oid, anc, pos)) => (Some(oid), anc, pos),
@@ -2396,20 +2373,7 @@ impl StudioApp {
         )
         .with_fill(Fill::None)
         .with_outline(self.default_outline.clone());
-        if self
-            .execute_command(CommandOp::create_object(obj, layer_id))
-            .is_ok()
-        {
-            let created_id = self
-                .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
-            if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
-                tab.selection.select_single(&tab.document, id);
-            }
-            created_id
-        } else {
-            None
-        }
+        self.create_object_on_active_layer(obj)
     }
 
     // -------------------------------------------------------------------------
@@ -2447,8 +2411,7 @@ impl StudioApp {
     pub fn ensure_envelope_on_object(&mut self, object_id: ObjectId) -> Option<usize> {
         let existing = self.active_tab().and_then(|tab| {
             tab.document
-                .objects
-                .get(&object_id)?
+                .object(object_id)?
                 .effects
                 .iter()
                 .position(|e| matches!(e, Effect::Envelope { .. }))
@@ -2485,8 +2448,7 @@ impl StudioApp {
         {
             self.active_tab().and_then(|tab| {
                 tab.document
-                    .objects
-                    .get(&object_id)?
+                    .object(object_id)?
                     .effects
                     .iter()
                     .position(|e| matches!(e, Effect::Envelope { .. }))
@@ -2513,8 +2475,13 @@ impl StudioApp {
                     .copied()
                     .find(|&id| is_object_editable_in_doc(&tab.document, id))
             } else {
-                hit_test_point(&tab.document, tab.document.active_page_index, start_mm, 8.0)
-                    .filter(|&id| is_object_editable_in_doc(&tab.document, id))
+                hit_test_point(
+                    &tab.document,
+                    tab.document.active_page_index(),
+                    start_mm,
+                    8.0,
+                )
+                .filter(|&id| is_object_editable_in_doc(&tab.document, id))
             }
         });
         let Some(oid) = target_id else {
@@ -2538,8 +2505,7 @@ impl StudioApp {
             ToolId::DropShadow => {
                 let idx = self.active_tab().and_then(|t| {
                     t.document
-                        .objects
-                        .get(&oid)?
+                        .object(oid)?
                         .effects
                         .iter()
                         .position(|e| matches!(e, Effect::DropShadow { .. }))
@@ -2561,8 +2527,7 @@ impl StudioApp {
             ToolId::BlockShadow => {
                 let idx = self.active_tab().and_then(|t| {
                     t.document
-                        .objects
-                        .get(&oid)?
+                        .object(oid)?
                         .effects
                         .iter()
                         .position(|e| matches!(e, Effect::BlockShadow { .. }))
@@ -2584,7 +2549,7 @@ impl StudioApp {
                 let (idx, wb) = self
                     .active_tab()
                     .map(|t| {
-                        let i = t.document.objects.get(&oid).and_then(|o| {
+                        let i = t.document.object(oid).and_then(|o| {
                             o.effects
                                 .iter()
                                 .position(|e| matches!(e, Effect::Contour { .. }))
@@ -2622,20 +2587,20 @@ impl StudioApp {
                 let (idx, target_b) = self
                     .active_tab()
                     .map(|t| {
-                        let i = t.document.objects.get(&oid).and_then(|o| {
+                        let i = t.document.object(oid).and_then(|o| {
                             o.effects
                                 .iter()
                                 .position(|e| matches!(e, Effect::Blend { .. }))
                         });
-                        let hit_b =
-                            hit_test_point(&t.document, t.document.active_page_index, end_mm, 12.0)
-                                .filter(|&id| id != oid)
-                                .or_else(|| {
-                                    t.selection.objects.iter().copied().find(|&id| id != oid)
-                                })
-                                .or_else(|| {
-                                    t.document.objects.keys().copied().find(|&id| id != oid)
-                                });
+                        let hit_b = hit_test_point(
+                            &t.document,
+                            t.document.active_page_index(),
+                            end_mm,
+                            12.0,
+                        )
+                        .filter(|&id| id != oid)
+                        .or_else(|| t.selection.objects.iter().copied().find(|&id| id != oid))
+                        .or_else(|| t.document.objects().keys().copied().find(|&id| id != oid));
                         (i, hit_b)
                     })
                     .unwrap_or((None, None));
@@ -2657,15 +2622,13 @@ impl StudioApp {
                 let (idx, local_center) = self
                     .active_tab()
                     .map(|t| {
-                        let obj = t.document.objects.get(&oid);
+                        let obj = t.document.object(oid);
                         let i = obj.and_then(|o| {
                             o.effects
                                 .iter()
                                 .position(|e| matches!(e, Effect::Distort { .. }))
                         });
-                        let inv = obj
-                            .and_then(|o| o.transform.inverse())
-                            .unwrap_or(Affine2D::IDENTITY);
+                        let inv = world_inverse_transform_of(&t.document, oid);
                         (i, inv.transform_point(start_mm))
                     })
                     .unwrap_or((None, Point2D::ZERO));
@@ -2685,11 +2648,11 @@ impl StudioApp {
                 };
                 // Warp the nearest cage node toward local end_mm
                 let warped = self.active_tab().and_then(|tab| {
-                    let obj = tab.document.objects.get(&oid)?;
+                    let obj = tab.document.object(oid)?;
                     let Effect::Envelope { mode, mut cage } = obj.effects.get(idx)?.clone() else {
                         return None;
                     };
-                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let inv = world_inverse_transform_of(&tab.document, oid);
                     let ls = inv.transform_point(start_mm);
                     let le = inv.transform_point(end_mm);
                     if let Some((best_i, _)) = cage.iter().enumerate().min_by(|a, b| {
@@ -2709,8 +2672,7 @@ impl StudioApp {
             ToolId::Extrude25D => {
                 let idx = self.active_tab().and_then(|t| {
                     t.document
-                        .objects
-                        .get(&oid)?
+                        .object(oid)?
                         .effects
                         .iter()
                         .position(|e| matches!(e, Effect::Extrude25D { .. }))
@@ -2730,15 +2692,13 @@ impl StudioApp {
                 let (idx, local_start, local_end) = self
                     .active_tab()
                     .map(|t| {
-                        let obj = t.document.objects.get(&oid);
+                        let obj = t.document.object(oid);
                         let i = obj.and_then(|o| {
                             o.effects
                                 .iter()
                                 .position(|e| matches!(e, Effect::Transparency { .. }))
                         });
-                        let inv = obj
-                            .and_then(|o| o.transform.inverse())
-                            .unwrap_or(Affine2D::IDENTITY);
+                        let inv = world_inverse_transform_of(&t.document, oid);
                         (
                             i,
                             inv.transform_point(start_mm),
@@ -2799,7 +2759,7 @@ impl StudioApp {
 
         if force_sample || !self.tool_settings.eyedropper_apply_mode {
             let sampled = self.active_tab().and_then(|tab| {
-                let obj = tab.document.objects.get(&oid)?;
+                let obj = tab.document.object(oid)?;
                 Some((obj.fill.clone(), obj.outline.clone(), obj.effects.clone()))
             });
             let Some((fill, outline, effects)) = sampled else {
@@ -2872,7 +2832,7 @@ impl StudioApp {
                 if !t.selection.objects.is_empty() {
                     t.selection.objects.clone()
                 } else {
-                    hit_test_point(&t.document, t.document.active_page_index, start_mm, 8.0)
+                    hit_test_point(&t.document, t.document.active_page_index(), start_mm, 8.0)
                         .into_iter()
                         .collect()
                 }
@@ -2891,8 +2851,7 @@ impl StudioApp {
                         if !is_object_editable_in_doc(&t.document, oid) {
                             return None;
                         }
-                        let obj = t.document.objects.get(&oid)?;
-                        let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                        let inv = world_inverse_transform_of(&t.document, oid);
                         let fill = Fill::LinearGradient {
                             start: inv.transform_point(start_mm),
                             end: inv.transform_point(end_mm),
@@ -2941,8 +2900,13 @@ impl StudioApp {
                     .copied()
                     .find(|&id| is_object_editable_in_doc(&tab.document, id))
             } else {
-                hit_test_point(&tab.document, tab.document.active_page_index, start_mm, 8.0)
-                    .filter(|&id| is_object_editable_in_doc(&tab.document, id))
+                hit_test_point(
+                    &tab.document,
+                    tab.document.active_page_index(),
+                    start_mm,
+                    8.0,
+                )
+                .filter(|&id| is_object_editable_in_doc(&tab.document, id))
             }
         });
         let Some(oid) = oid else {
@@ -2957,8 +2921,8 @@ impl StudioApp {
         let cols = self.properties_state.mesh_cols.max(2);
 
         let updated_fill = self.active_tab().and_then(|tab| {
-            let obj = tab.document.objects.get(&oid)?;
-            let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+            let obj = tab.document.object(oid)?;
+            let inv = world_inverse_transform_of(&tab.document, oid);
             let mut mesh = match &obj.fill {
                 Fill::MeshFill { .. } => obj.fill.clone(),
                 _ => {
@@ -3011,46 +2975,50 @@ impl StudioApp {
     /// creates a clean 150 DPI transparent page raster layer on an unlocked visible layer via
     /// `CommandOp::create_object` so raster tools NEVER silently no-op or paint locked/hidden layers!
     pub fn ensure_raster_target_at(&mut self, world_pt: Point2D) -> Option<ObjectId> {
-        let existing =
-            self.active_tab().and_then(|tab| {
-                tab.selection
-                    .objects
-                    .iter()
-                    .copied()
-                    .find(|&id| {
+        let existing = self.active_tab().and_then(|tab| {
+            tab.selection
+                .objects
+                .iter()
+                .copied()
+                .find(|&id| {
+                    is_object_editable_in_doc(&tab.document, id)
+                        && tab
+                            .document
+                            .object(id)
+                            .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+                })
+                .or_else(|| {
+                    hit_test_point(
+                        &tab.document,
+                        tab.document.active_page_index(),
+                        world_pt,
+                        4.0,
+                    )
+                    .filter(|&id| {
                         is_object_editable_in_doc(&tab.document, id)
                             && tab
                                 .document
-                                .objects
-                                .get(&id)
+                                .object(id)
                                 .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
                     })
-                    .or_else(|| {
-                        hit_test_point(&tab.document, tab.document.active_page_index, world_pt, 4.0)
-                            .filter(|&id| {
-                                is_object_editable_in_doc(&tab.document, id)
-                                    && tab.document.objects.get(&id).is_some_and(|o| {
-                                        matches!(o.payload, NodePayload::Raster(_))
-                                    })
+                })
+                .or_else(|| {
+                    tab.document.active_page().and_then(|p| {
+                        p.layers
+                            .iter()
+                            .rev()
+                            .filter(|l| l.visible && !l.locked)
+                            .find_map(|l| {
+                                l.objects.iter().rev().copied().find(|&id| {
+                                    is_object_editable_in_doc(&tab.document, id)
+                                        && tab.document.object(id).is_some_and(|o| {
+                                            matches!(o.payload, NodePayload::Raster(_))
+                                        })
+                                })
                             })
                     })
-                    .or_else(|| {
-                        tab.document.active_page().and_then(|p| {
-                            p.layers
-                                .iter()
-                                .rev()
-                                .filter(|l| l.visible && !l.locked)
-                                .find_map(|l| {
-                                    l.objects.iter().rev().copied().find(|&id| {
-                                        is_object_editable_in_doc(&tab.document, id)
-                                            && tab.document.objects.get(&id).is_some_and(|o| {
-                                                matches!(o.payload, NodePayload::Raster(_))
-                                            })
-                                    })
-                                })
-                        })
-                    })
-            });
+                })
+        });
         if existing.is_some() {
             return existing;
         }
@@ -3077,7 +3045,7 @@ impl StudioApp {
                             .map(|l| l.id)
                     })
                 })?;
-            Some((w, h, tab.document.color_mode, Some(target_layer)))
+            Some((w, h, tab.document.color_mode(), Some(target_layer)))
         }) else {
             self.push_toast("Cannot paint: all layers are locked or hidden", true);
             return None;
@@ -3092,9 +3060,6 @@ impl StudioApp {
         let asset = RasterAsset::new(px_w, px_h, rgba, dpi as f32, color_mode).ok()?;
         let asset_id = asset.id;
 
-        if let Some(tab) = self.active_tab_mut() {
-            tab.document.assets.insert(asset_id, asset);
-        }
         let raster_obj = SceneObject::new(
             ObjectId(0),
             "Bitmap Layer (150 DPI)",
@@ -3110,12 +3075,15 @@ impl StudioApp {
         .with_outline(OutlineStyle::none());
 
         if self
-            .execute_command(CommandOp::create_object(raster_obj, layer_id))
+            .execute_command(CommandOp::Batch(vec![
+                CommandOp::RegisterAsset { asset },
+                CommandOp::create_object(raster_obj, layer_id),
+            ]))
             .is_ok()
         {
             let created_id = self
                 .active_tab()
-                .and_then(|t| t.document.objects.keys().last().copied());
+                .and_then(|t| t.document.objects().keys().last().copied());
             if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
                 tab.selection.select_single(&tab.document, id);
             }
@@ -3162,11 +3130,11 @@ impl StudioApp {
             if !is_object_editable_in_doc(&tab.document, oid) {
                 return None;
             }
-            let obj = tab.document.objects.get(&oid)?;
+            let obj = tab.document.object(oid)?;
             let NodePayload::Raster(ref r) = obj.payload else {
                 return None;
             };
-            let orig_asset = tab.document.assets.get(&r.asset_id)?;
+            let orig_asset = tab.document.asset(r.asset_id)?;
             if orig_asset.width == 0 || orig_asset.height == 0 {
                 return None;
             }
@@ -3179,7 +3147,7 @@ impl StudioApp {
                 updated_data,
                 r.width_mm.max(1e-3),
                 r.height_mm.max(1e-3),
-                obj.transform.inverse().unwrap_or(Affine2D::IDENTITY),
+                world_inverse_transform_of(&tab.document, oid),
                 tab.raster_mask_rect_mm,
             ))
         });
@@ -3269,32 +3237,25 @@ impl StudioApp {
             }
         }
 
-        let new_asset_id = new_asset.id;
-        if let Some(tab) = self.active_tab_mut() {
-            tab.document.assets.insert(new_asset_id, new_asset);
-        } else {
-            return false;
-        }
         if self
-            .execute_command(CommandOp::UpdateRaster {
-                id: oid,
-                data: updated_data,
-            })
+            .execute_command(CommandOp::Batch(vec![
+                CommandOp::RegisterAsset { asset: new_asset },
+                CommandOp::UpdateRaster {
+                    id: oid,
+                    data: updated_data,
+                },
+            ]))
             .is_ok()
         {
             self.checkpoint_wal_snapshot_active();
             true
         } else {
-            if let Some(tab) = self.active_tab_mut() {
-                tab.document.assets.remove(&new_asset_id);
-            }
             false
         }
     }
 
     /// Creates an ArtisticText object at `pos_mm`.
     pub fn insert_artistic_text_at(&mut self, pos_mm: Point2D) {
-        let layer_id = self.active_tab().and_then(|t| t.active_layer_id);
         let text = ArtisticText::from_plain(
             self.tool_settings.text_insert_draft.clone(),
             self.default_text_style.clone(),
@@ -3307,43 +3268,14 @@ impl StudioApp {
         .with_fill(Fill::Solid(self.default_text_style.fill.clone()))
         .with_outline(OutlineStyle::none())
         .with_transform(Affine2D::translate(pos_mm.x, pos_mm.y));
-        let _ = self.execute_command(CommandOp::create_object(obj, layer_id));
-        if let Some(tab) = self.active_tab_mut() {
-            if let Some(&last_id) = tab.document.objects.keys().last() {
-                tab.selection.select_single(&tab.document, last_id);
-            }
-        }
+        let _ = self.create_object_on_active_layer(obj);
     }
 
     /// Computes the object-local bounding box of `id` (before `obj.transform`), matching
     /// `coree-render`'s local coordinate space for `MeshFill`, `Distort`, `Envelope`, and `Perspective`.
     #[must_use]
     pub fn object_local_bounds(doc: &Document, id: ObjectId) -> Option<Rect2D> {
-        let obj = doc.objects.get(&id)?;
-        let direct = match &obj.payload {
-            NodePayload::Path(p) => p.bounding_box(),
-            NodePayload::Shape(s) => s.to_bezier_path().bounding_box(),
-            NodePayload::ArtisticText(t) => Some(t.estimated_bounds()),
-            NodePayload::ParagraphText(t) => Some(t.bounding_box()),
-            NodePayload::TextOnPath(top) => Some(top.text.estimated_bounds()),
-            NodePayload::Raster(r) => match r.crop_rect {
-                Some(cr) if cr.is_finite() => Some(cr),
-                None if r.width_mm.is_finite() && r.height_mm.is_finite() => {
-                    Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
-                }
-                _ => None,
-            },
-            NodePayload::Table(t) => Some(t.to_bounding_box()),
-            NodePayload::Dimension(d) => Some(d.bounding_box()),
-            NodePayload::PowerClip { container, .. } => container.bounding_box(),
-            NodePayload::Connector(_) | NodePayload::Group(_) | NodePayload::SymbolInstance(_) => {
-                doc.object_bounds(id).and_then(|wb| {
-                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
-                    inv.try_transform_rect(wb)
-                })
-            }
-        };
-        direct.filter(|r| r.is_finite())
+        doc.local_object_bounds(id)
     }
 
     /// Object-local bounding box of the primary selected object on the active tab.

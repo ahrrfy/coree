@@ -10,9 +10,10 @@ use crate::state::{
 };
 use crate::theme::{core_color_to_egui, egui_color_to_core, ThemeTokens, PROPERTY_BAR_HEIGHT};
 use coree_core::{
-    Affine2D, AlignOp, BlendMode, BooleanOp, CommandOp, ContourMode, CornerStyle, DistortKind,
-    EllipseMode, EnvelopeMode, Fill, GradientStop, NodePayload, ParametricShape, Point2D, Rect2D,
-    TextAlign, TextDirection, Unit, ZOrderOp,
+    Affine2D, AlignOp, ArtisticWidthProfile, BasicShapeKind, BlendMode, BooleanOp, CommandOp,
+    ContourMode, CornerStyle, DistortKind, EllipseMode, EnvelopeMode, Fill, GradientStop,
+    ImpactStyle, NodePayload, ParametricShape, Point2D, Rect2D, TextAlign, TextDirection, Unit,
+    ZOrderOp,
 };
 use coree_render::{ToneRange, ViewMode};
 use egui::{
@@ -170,7 +171,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             &tokens,
                             StdIcon::Paste,
                             "Paste (Ctrl+V)",
-                            !app.clipboard_objects.is_empty(),
+                            app.has_clipboard_content(),
                             false,
                         ) {
                             app.paste_clipboard();
@@ -221,6 +222,8 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         }
 
                         // View Mode combo & Snap toggles
+                        let mut pending_multipage: Option<bool> = None;
+                        let mut pending_grid: Option<coree_core::GridConfig> = None;
                         if let Some(tab) = app.active_tab_mut() {
                             ComboBox::from_id_salt("std_view_mode")
                                 .width(84.0)
@@ -246,12 +249,13 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                 });
 
                             if ui
-                                .selectable_label(tab.document.multipage_view, "⊞ Pages")
+                                .selectable_label(tab.document.multipage_view(), "⊞ Pages")
                                 .on_hover_text("Toggle Multipage View")
                                 .clicked()
                             {
-                                tab.document.multipage_view = !tab.document.multipage_view;
-                                tab.viewport.multipage_view = tab.document.multipage_view;
+                                let next = !tab.document.multipage_view();
+                                pending_multipage = Some(next);
+                                tab.viewport.multipage_view = next;
                                 tab.needs_rerender = true;
                             }
 
@@ -259,9 +263,27 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             ui.checkbox(&mut tab.snap_options.objects, "Snap Obj");
                             ui.checkbox(&mut tab.snap_options.guidelines, "Guides");
                             ui.checkbox(&mut tab.snap_options.grid, "Grid");
-                            if tab.snap_options.grid != tab.document.grid.snap {
-                                tab.document.grid.snap = tab.snap_options.grid;
+                            if tab.snap_options.grid != tab.document.grid().snap {
+                                let mut g = tab.document.grid();
+                                g.snap = tab.snap_options.grid;
+                                pending_grid = Some(g);
                             }
+                        }
+                        if let Some(next) = pending_multipage {
+                            let _ = app.execute_command(CommandOp::SetDocumentProperties {
+                                title: None,
+                                color_mode: None,
+                                default_unit: None,
+                                dpi: None,
+                                multipage_view: Some(next),
+                                active_page_index: None,
+                                metadata: None,
+                                custom_icc_profile: None,
+                                clear_custom_icc: false,
+                            });
+                        }
+                        if let Some(config) = pending_grid {
+                            let _ = app.execute_command(CommandOp::SetGridConfig { config });
                         }
 
                         ui.separator();
@@ -1135,7 +1157,7 @@ fn show_text_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens
 
     let selected_text = app.active_tab().and_then(|t| {
         let oid = *t.selection.objects.first()?;
-        let obj = t.document.objects.get(&oid)?;
+        let obj = t.document.object(oid)?;
         match &obj.payload {
             NodePayload::ArtisticText(_) | NodePayload::ParagraphText(_) => {
                 Some((oid, obj.payload.clone()))
@@ -1408,18 +1430,22 @@ fn render_text_style_strip(
 
 fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
     let mut autofit_clicked = false;
+    let mut pending_page_cmd: Option<CommandOp> = None;
+    let mut pending_unit_cmd: Option<CommandOp> = None;
     {
         let Some(tab) = app.active_tab_mut() else {
             return;
         };
-        let mut page_modified = false;
-        if let Some(page) = tab.document.active_page_mut() {
+        if let Some(page) = tab.document.active_page() {
+            let page_id = page.id;
+            let cur_w = page.width_mm;
+            let cur_h = page.height_mm;
             // Page Preset combo
             let active_preset_name = PAGE_PRESETS
                 .iter()
                 .find(|(_, pw, ph)| {
-                    ((page.width_mm - *pw).abs() < 0.5 && (page.height_mm - *ph).abs() < 0.5)
-                        || ((page.width_mm - *ph).abs() < 0.5 && (page.height_mm - *pw).abs() < 0.5)
+                    ((cur_w - *pw).abs() < 0.5 && (cur_h - *ph).abs() < 0.5)
+                        || ((cur_w - *ph).abs() < 0.5 && (cur_h - *pw).abs() < 0.5)
                 })
                 .map_or("Custom", |(n, _, _)| *n);
             ComboBox::from_id_salt("prop_page_preset")
@@ -1431,15 +1457,20 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                             .selectable_label(active_preset_name == name, name)
                             .clicked()
                         {
-                            page.width_mm = pw;
-                            page.height_mm = ph;
-                            page_modified = true;
+                            pending_page_cmd = Some(CommandOp::SetPageProperties {
+                                page_id,
+                                name: None,
+                                width_mm: Some(pw),
+                                height_mm: Some(ph),
+                                bleed_mm: None,
+                                facing_pages: None,
+                            });
                         }
                     }
                 });
 
-            let mut w = page.width_mm;
-            let mut h = page.height_mm;
+            let mut w = cur_w;
+            let mut h = cur_h;
             let w_chg = ui
                 .add(
                     DragValue::new(&mut w)
@@ -1457,19 +1488,30 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 )
                 .changed();
             if w_chg || h_chg {
-                page.width_mm = w;
-                page.height_mm = h;
-                page_modified = true;
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: Some(w),
+                    height_mm: Some(h),
+                    bleed_mm: None,
+                    facing_pages: None,
+                });
             }
-            let is_portrait = page.height_mm >= page.width_mm;
+            let is_portrait = cur_h >= cur_w;
             if ui
                 .selectable_label(is_portrait, "▯")
                 .on_hover_text("Portrait Orientation")
                 .clicked()
                 && !is_portrait
             {
-                std::mem::swap(&mut page.width_mm, &mut page.height_mm);
-                page_modified = true;
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: Some(cur_h),
+                    height_mm: Some(cur_w),
+                    bleed_mm: None,
+                    facing_pages: None,
+                });
             }
             if ui
                 .selectable_label(!is_portrait, "▭")
@@ -1477,19 +1519,24 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 .clicked()
                 && is_portrait
             {
-                std::mem::swap(&mut page.width_mm, &mut page.height_mm);
-                page_modified = true;
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: Some(cur_h),
+                    height_mm: Some(cur_w),
+                    bleed_mm: None,
+                    facing_pages: None,
+                });
             }
-        }
-        if page_modified {
-            tab.mark_modified();
         }
         ui.separator();
 
         // Units
+        let cur_unit = tab.document.default_unit();
+        let mut next_unit = cur_unit;
         ComboBox::from_id_salt("prop_unit")
             .width(58.0)
-            .selected_text(tab.document.default_unit.suffix())
+            .selected_text(cur_unit.suffix())
             .show_ui(ui, |ui| {
                 for u in [
                     Unit::Millimeter,
@@ -1499,9 +1546,22 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                     Unit::Point,
                     Unit::Pixel,
                 ] {
-                    ui.selectable_value(&mut tab.document.default_unit, u, u.suffix());
+                    ui.selectable_value(&mut next_unit, u, u.suffix());
                 }
             });
+        if next_unit != cur_unit {
+            pending_unit_cmd = Some(CommandOp::SetDocumentProperties {
+                title: None,
+                color_mode: None,
+                default_unit: Some(next_unit),
+                dpi: None,
+                multipage_view: None,
+                active_page_index: None,
+                metadata: None,
+                custom_icc_profile: None,
+                clear_custom_icc: false,
+            });
+        }
         ui.separator();
 
         // Nudge & Duplicate Offsets
@@ -1525,20 +1585,42 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 .suffix(" mm"),
         );
     }
+    if let Some(cmd) = pending_page_cmd {
+        if let Err(err) = app.execute_command(cmd) {
+            app.push_toast(format!("Page update failed: {err}"), true);
+        } else if let Some(tab) = app.active_tab_mut() {
+            tab.needs_rerender = true;
+        }
+    }
+    if let Some(cmd) = pending_unit_cmd {
+        let _ = app.execute_command(cmd);
+    }
 
+    let lang = app.ui_language;
     ui.separator();
-    ui.checkbox(&mut app.treat_all_objects_as_filled, "Treat as Filled")
-        .on_hover_text("Select hollow/unfilled shapes by clicking anywhere inside them");
+    ui.checkbox(
+        &mut app.treat_all_objects_as_filled,
+        lang.tr_ui("Treat as Filled", "معاملة الكائن كممتلئ"),
+    )
+    .on_hover_text(lang.tr_ui(
+        "Select hollow/unfilled shapes by clicking anywhere inside them",
+        "تحديد الأشكال المفرغة عند النقر داخلها",
+    ));
 
     if ui
-        .small_button(RichText::new("Autofit Page").color(tokens.accent))
-        .on_hover_text("Resize active page tightly around artwork (+5 mm margin)")
+        .small_button(
+            RichText::new(lang.tr_ui("Autofit Page", "ملاءمة الصفحة")).color(tokens.accent),
+        )
+        .on_hover_text(lang.tr_ui(
+            "Resize active page tightly around artwork (+5 mm margin)",
+            "تعديل مقاس الصفحة تلقائياً حول المحتوى (+5 مم)",
+        ))
         .clicked()
     {
         autofit_clicked = true;
     }
 
-    // Creation-tool parameters when a parametric shape tool is active
+    // Creation-tool parameters when a parametric, curve, dimension, connector, or table tool is active
     match app.active_tool {
         ToolId::Rectangle | ToolId::ThreePointRectangle => {
             ui.separator();
@@ -1546,8 +1628,26 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 DragValue::new(&mut app.tool_settings.rect_corner_radius_mm)
                     .range(0.0..=100.0)
                     .speed(0.2)
-                    .prefix("Corner R: ")
+                    .prefix(lang.tr_ui("Corner R: ", "نصف القطر: "))
                     .suffix(" mm"),
+            );
+        }
+        ToolId::Ellipse | ToolId::ThreePointEllipse => {
+            ui.separator();
+            ui.selectable_value(
+                &mut app.tool_settings.ellipse_mode,
+                EllipseMode::Full,
+                lang.tr_ui("Ellipse", "بيضاوي كامل"),
+            );
+            ui.selectable_value(
+                &mut app.tool_settings.ellipse_mode,
+                EllipseMode::Pie,
+                lang.tr_ui("Pie", "قطاع دائري"),
+            );
+            ui.selectable_value(
+                &mut app.tool_settings.ellipse_mode,
+                EllipseMode::Arc,
+                lang.tr_ui("Arc", "قوس"),
             );
         }
         ToolId::Polygon => {
@@ -1555,7 +1655,7 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
             ui.add(
                 DragValue::new(&mut app.tool_settings.polygon_sides)
                     .range(3..=64)
-                    .prefix("Sides: "),
+                    .prefix(lang.tr_ui("Sides: ", "الأضلاع: ")),
             );
         }
         ToolId::Star | ToolId::ComplexStar => {
@@ -1563,13 +1663,13 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
             ui.add(
                 DragValue::new(&mut app.tool_settings.star_points)
                     .range(3..=64)
-                    .prefix("Points: "),
+                    .prefix(lang.tr_ui("Points: ", "النقاط: ")),
             );
             ui.add(
                 DragValue::new(&mut app.tool_settings.star_inner_ratio)
                     .range(0.1..=0.9)
                     .speed(0.02)
-                    .prefix("Sharpness: "),
+                    .prefix(lang.tr_ui("Sharpness: ", "الحدة: ")),
             );
         }
         ToolId::Spiral => {
@@ -1578,21 +1678,137 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 DragValue::new(&mut app.tool_settings.spiral_revolutions)
                     .range(1.0..=20.0)
                     .speed(0.5)
-                    .prefix("Revs: "),
+                    .prefix(lang.tr_ui("Revs: ", "اللفات: ")),
             );
-            ui.checkbox(&mut app.tool_settings.spiral_logarithmic, "Logarithmic");
+            ui.checkbox(
+                &mut app.tool_settings.spiral_logarithmic,
+                lang.tr_ui("Logarithmic", "لوغاريتمي"),
+            );
+        }
+        ToolId::Impact => {
+            ui.separator();
+            ui.add(
+                DragValue::new(&mut app.tool_settings.impact_rays)
+                    .range(4..=128)
+                    .prefix(lang.tr_ui("Rays: ", "الأشعة: ")),
+            );
+            ui.selectable_value(
+                &mut app.tool_settings.impact_style,
+                ImpactStyle::Radial,
+                lang.tr_ui("Radial", "شعاعي"),
+            );
+            ui.selectable_value(
+                &mut app.tool_settings.impact_style,
+                ImpactStyle::Parallel,
+                lang.tr_ui("Parallel", "متوازي"),
+            );
+        }
+        ToolId::BasicShapes => {
+            ui.separator();
+            ComboBox::from_id_salt("prop_basic_shape")
+                .width(120.0)
+                .selected_text(format!("{:?}", app.tool_settings.basic_shape_kind))
+                .show_ui(ui, |ui| {
+                    for kind in [
+                        BasicShapeKind::ArrowRight,
+                        BasicShapeKind::ArrowLeft,
+                        BasicShapeKind::DoubleArrow,
+                        BasicShapeKind::Banner,
+                        BasicShapeKind::Callout,
+                        BasicShapeKind::Heart,
+                        BasicShapeKind::Cross,
+                        BasicShapeKind::Diamond,
+                        BasicShapeKind::Trapezoid,
+                    ] {
+                        ui.selectable_value(
+                            &mut app.tool_settings.basic_shape_kind,
+                            kind,
+                            format!("{kind:?}"),
+                        );
+                    }
+                });
+        }
+        ToolId::ArtisticMedia => {
+            ui.separator();
+            ui.add(
+                DragValue::new(&mut app.tool_settings.artistic_media_width_mm)
+                    .range(0.4..=50.0)
+                    .speed(0.2)
+                    .prefix(lang.tr_ui("Brush W: ", "عرض الفرشاة: "))
+                    .suffix(" mm"),
+            );
+            ComboBox::from_id_salt("prop_artistic_profile")
+                .width(110.0)
+                .selected_text(format!("{:?}", app.tool_settings.artistic_media_profile))
+                .show_ui(ui, |ui| {
+                    for prof in [
+                        ArtisticWidthProfile::TaperBoth,
+                        ArtisticWidthProfile::TaperStart,
+                        ArtisticWidthProfile::TaperEnd,
+                        ArtisticWidthProfile::Wave,
+                        ArtisticWidthProfile::Uniform,
+                    ] {
+                        ui.selectable_value(
+                            &mut app.tool_settings.artistic_media_profile,
+                            prof.clone(),
+                            format!("{prof:?}"),
+                        );
+                    }
+                });
+        }
+        ToolId::Freehand
+        | ToolId::BSpline
+        | ToolId::Polyline
+        | ToolId::ThreePointCurve
+        | ToolId::SmartDrawing
+        | ToolId::LiveSketch
+        | ToolId::Bezier
+        | ToolId::Pen => {
+            ui.separator();
+            ui.add(
+                DragValue::new(&mut app.tool_settings.shape_reduce_tolerance_mm)
+                    .range(0.05..=8.0)
+                    .speed(0.05)
+                    .prefix(lang.tr_ui("Smoothness: ", "التنعيم: "))
+                    .suffix(" mm"),
+            );
+        }
+        ToolId::ParallelDimension
+        | ToolId::HvDimension
+        | ToolId::AngularDimension
+        | ToolId::SegmentDimension
+        | ToolId::ThreePointCallout => {
+            ui.separator();
+            ui.add(
+                DragValue::new(&mut app.tool_settings.dimension_offset_mm)
+                    .range(1.0..=100.0)
+                    .speed(0.5)
+                    .prefix(lang.tr_ui("Offset: ", "إزاحة البعد: "))
+                    .suffix(" mm"),
+            );
+        }
+        ToolId::StraightConnector | ToolId::RightAngleConnector => {
+            ui.separator();
+            ui.label(
+                RichText::new(lang.tr_ui(
+                    "Connector: drag between object anchors to route live link",
+                    "الموصل: اسحب بين نقاط الارتباط لإنشاء ربط تلقائي",
+                ))
+                .size(11.0)
+                .color(tokens.text_muted),
+            );
         }
         ToolId::GraphPaper => {
             ui.separator();
             ui.add(
                 DragValue::new(&mut app.tool_settings.graph_cols)
                     .range(1..=30)
-                    .prefix("Cols: "),
+                    .prefix(lang.tr_ui("Cols: ", "الأعمدة: ")),
             );
             ui.add(
                 DragValue::new(&mut app.tool_settings.graph_rows)
                     .range(1..=30)
-                    .prefix("Rows: "),
+                    .prefix(lang.tr_ui("Rows: ", "الصفوف: ")),
             );
         }
         ToolId::Table => {
@@ -1600,12 +1816,12 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
             ui.add(
                 DragValue::new(&mut app.tool_settings.table_cols)
                     .range(1..=20)
-                    .prefix("Cols: "),
+                    .prefix(lang.tr_ui("Cols: ", "الأعمدة: ")),
             );
             ui.add(
                 DragValue::new(&mut app.tool_settings.table_rows)
                     .range(1..=20)
-                    .prefix("Rows: "),
+                    .prefix(lang.tr_ui("Rows: ", "الصفوف: ")),
             );
         }
         _ => {}
@@ -1659,10 +1875,7 @@ fn show_selected_objects_property_bar(
             .changed();
         if x_chg || y_chg {
             let affine = Affine2D::translate(x - anchor_pt.x, y - anchor_pt.y);
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
 
         let w_chg = ui
@@ -1698,10 +1911,7 @@ fn show_selected_objects_property_bar(
             let affine = Affine2D::translate(anchor_pt.x, anchor_pt.y)
                 .compose(&Affine2D::scale(sx_final, sy))
                 .compose(&Affine2D::translate(-anchor_pt.x, -anchor_pt.y));
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
 
         ui.separator();
@@ -1720,10 +1930,7 @@ fn show_selected_objects_property_bar(
             && rot_step.abs() > 1e-4
         {
             let affine = Affine2D::rotate_about(rot_step.to_radians(), anchor_pt);
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
         if ui
             .small_button("90°")
@@ -1731,10 +1938,7 @@ fn show_selected_objects_property_bar(
             .clicked()
         {
             let affine = Affine2D::rotate_about(90.0_f64.to_radians(), anchor_pt);
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
         if ui
             .small_button("⇄")
@@ -1744,10 +1948,7 @@ fn show_selected_objects_property_bar(
             let affine = Affine2D::translate(anchor_pt.x, anchor_pt.y)
                 .compose(&Affine2D::scale(-1.0, 1.0))
                 .compose(&Affine2D::translate(-anchor_pt.x, -anchor_pt.y));
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
         if ui
             .small_button("⇅")
@@ -1757,10 +1958,7 @@ fn show_selected_objects_property_bar(
             let affine = Affine2D::translate(anchor_pt.x, anchor_pt.y)
                 .compose(&Affine2D::scale(1.0, -1.0))
                 .compose(&Affine2D::translate(-anchor_pt.x, -anchor_pt.y));
-            let _ = app.execute_command(CommandOp::TransformObjects {
-                ids: sel_ids.to_vec(),
-                affine,
-            });
+            let _ = app.apply_world_transform_to_selection(sel_ids, affine);
         }
     }
 
@@ -1799,7 +1997,7 @@ fn show_selected_objects_property_bar(
         // Single selection: outline + parametric shape / text controls
         let payload_snapshot = app
             .active_tab()
-            .and_then(|t| t.document.objects.get(&single_id))
+            .and_then(|t| t.document.object(single_id))
             .map(|o| (o.payload.clone(), o.outline.clone(), o.lens.clone()));
 
         if let Some((payload, mut outline, lens_opt)) = payload_snapshot {

@@ -162,9 +162,9 @@ fn import_svg_str_named(
     let height_mm = (f64::from(tree.size().height()) * PX_TO_MM_96).max(1.0);
 
     let mut doc = Document::new(title, width_mm, height_mm, ColorMode::Rgb, 96.0);
-    doc.metadata.source_format = Some("svg".to_owned());
-    let page_id = doc.pages[0].id;
-    let default_layer_id = doc.pages[0].layers[0].id;
+    doc.metadata_mut().source_format = Some("svg".to_owned());
+    let page_id = doc.pages()[0].id;
+    let default_layer_id = doc.pages()[0].layers[0].id;
 
     let mut created_named_layers = false;
     let mut imported_text_via_usvg = false;
@@ -240,13 +240,13 @@ fn import_svg_str_named(
     }
 
     // Remove empty placeholder "Layer 1" when named SVG layers were created cleanly.
-    if created_named_layers && doc.pages[0].layers.len() > 1 {
-        if let Some(pos) = doc.pages[0]
+    if created_named_layers && doc.pages()[0].layers.len() > 1 {
+        if let Some(pos) = doc.pages()[0]
             .layers
             .iter()
             .position(|l| l.id == default_layer_id && l.objects.is_empty())
         {
-            doc.pages[0].layers.remove(pos);
+            doc.remove_page_layer(0, pos);
         }
     }
 
@@ -427,9 +427,7 @@ fn import_usvg_node_inner(
                 let id = doc.add_object(obj, Some(lid))?;
                 Ok(Some(id))
             } else {
-                let id = doc.alloc_object_id();
-                obj.id = id;
-                doc.objects.insert(id, obj);
+                let id = doc.insert_loaded_object(obj)?;
                 Ok(Some(id))
             }
         }
@@ -460,9 +458,7 @@ fn import_usvg_node_inner(
                 let id = doc.add_object(obj, Some(lid))?;
                 Ok(Some(id))
             } else {
-                let id = doc.alloc_object_id();
-                obj.id = id;
-                doc.objects.insert(id, obj);
+                let id = doc.insert_loaded_object(obj)?;
                 Ok(Some(id))
             }
         }
@@ -501,9 +497,7 @@ fn import_usvg_node_inner(
                     let id = doc.add_object(obj, Some(lid))?;
                     Ok(Some(id))
                 } else {
-                    let id = doc.alloc_object_id();
-                    obj.id = id;
-                    doc.objects.insert(id, obj);
+                    let id = doc.insert_loaded_object(obj)?;
                     Ok(Some(id))
                 }
             }
@@ -537,9 +531,7 @@ fn import_usvg_node_inner(
                     let id = doc.add_object(obj, Some(lid))?;
                     Ok(Some(id))
                 } else {
-                    let id = doc.alloc_object_id();
-                    obj.id = id;
-                    doc.objects.insert(id, obj);
+                    let id = doc.insert_loaded_object(obj)?;
                     Ok(Some(id))
                 }
             }
@@ -636,9 +628,7 @@ fn import_usvg_node_inner(
                 let id = doc.add_object(obj, Some(lid))?;
                 Ok(Some(id))
             } else {
-                let id = doc.alloc_object_id();
-                obj.id = id;
-                doc.objects.insert(id, obj);
+                let id = doc.insert_loaded_object(obj)?;
                 Ok(Some(id))
             }
         }
@@ -1082,9 +1072,9 @@ fn convert_usvg_blend_mode(bm: usvg::BlendMode) -> BlendMode {
 
 /// Exports `page_index` of `doc` as a clean SVG 1.1 XML string (millimeter `viewBox`).
 pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<String> {
-    let page = doc.pages.get(page_index).ok_or(IoError::PageOutOfRange {
+    let page = doc.page(page_index).ok_or(IoError::PageOutOfRange {
         page_index,
-        page_count: doc.pages.len(),
+        page_count: doc.pages().len(),
     })?;
 
     let page_w = if page.width_mm.is_finite() && page.width_mm > 0.0 {
@@ -1104,7 +1094,7 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
 
     // Emit applicable master layers from OTHER pages first (bottom), then target page's own layers.
     let mut layers_to_emit = Vec::new();
-    for (p_idx, p) in doc.pages.iter().enumerate() {
+    for (p_idx, p) in doc.pages().iter().enumerate() {
         if p_idx == page_index {
             continue;
         }
@@ -1144,7 +1134,7 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
         );
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
-            if let Some(obj) = doc.objects.get(&oid) {
+            if let Some(obj) = doc.object(oid) {
                 write_svg_object(
                     doc,
                     page_index,
@@ -1168,7 +1158,7 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
         out,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" version=\"1.1\" width=\"{page_w:.4}mm\" height=\"{page_h:.4}mm\" viewBox=\"0 0 {page_w:.4} {page_h:.4}\">"
     );
-    let _ = writeln!(out, "  <title>{}</title>", escape_xml_text(&doc.title));
+    let _ = writeln!(out, "  <title>{}</title>", escape_xml_text(doc.title()));
     if !defs.is_empty() {
         out.push_str("  <defs>\n");
         out.push_str(&defs);
@@ -1449,7 +1439,7 @@ fn write_svg_object(
                 }
             }
             NodePayload::Raster(raster) => {
-                if let Some(asset) = doc.assets.get(&raster.asset_id) {
+                if let Some(asset) = doc.asset(raster.asset_id) {
                     if let Ok(png) = export_raster_to_bytes(
                         asset.width,
                         asset.height,
@@ -1521,7 +1511,8 @@ fn write_svg_object(
                     defs,
                     def_counter,
                 );
-                let label = dim.compute_measurement_with_dpi(doc.default_unit, f64::from(doc.dpi));
+                let label =
+                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
                 let mid = dim.p1.midpoint(dim.p2);
                 let _ = writeln!(
                     body,
@@ -1582,7 +1573,7 @@ fn write_svg_object(
                     "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
                 );
                 for &cid in children {
-                    if let Some(child) = doc.objects.get(&cid) {
+                    if let Some(child) = doc.object(cid) {
                         write_svg_object(
                             doc,
                             page_index,
@@ -1628,7 +1619,7 @@ fn write_svg_object(
                 }
                 let _ = writeln!(body, "{pad}  <g clip-path=\"url(#{clip_id})\">");
                 for &cid in contents {
-                    if let Some(child) = doc.objects.get(&cid) {
+                    if let Some(child) = doc.object(cid) {
                         write_svg_object(
                             doc,
                             page_index,
@@ -1657,7 +1648,7 @@ fn write_svg_object(
                 let _ = writeln!(body, "{pad}</g>");
             }
             NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = doc.symbols.get(sym_id) {
+                if let Some(sym) = doc.symbol(*sym_id) {
                     let _ = writeln!(
                         body,
                         "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
@@ -1855,7 +1846,7 @@ fn format_svg_paint_attrs_with_doc(
             tile_w,
             tile_h,
         } => {
-            if let Some(asset) = doc.assets.get(image_id) {
+            if let Some(asset) = doc.asset(*image_id) {
                 if let Ok(png) = export_raster_to_bytes(
                     asset.width,
                     asset.height,
@@ -1889,7 +1880,7 @@ fn format_svg_paint_attrs_with_doc(
             tile_w,
             tile_h,
         } => {
-            if let Some(sym) = doc.symbols.get(symbol_id) {
+            if let Some(sym) = doc.symbol(*symbol_id) {
                 *def_counter += 1;
                 let pid = format!("vpat-{}", *def_counter);
                 let tw = tile_w.max(1.0);
@@ -2088,7 +2079,7 @@ mod tests {
     #[test]
     fn svg_export_and_reimport_roundtrip_preserves_layers_gradients_strokes_and_rtl() {
         let mut doc = Document::new("SVG Roundtrip", 100.0, 80.0, ColorMode::Rgb, 96.0);
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let artwork_layer = doc
             .add_layer(page_id, "Artwork", false, MasterLayerScope::None)
             .unwrap();
@@ -2163,25 +2154,28 @@ mod tests {
         assert!(svg_str.contains("data:image/png;base64,"));
 
         let imported = import_svg_str(&svg_str).unwrap();
-        assert!((imported.pages[0].width_mm - 100.0).abs() < 0.2);
-        assert!((imported.pages[0].height_mm - 80.0).abs() < 0.2);
-        assert!(imported.pages[0].layers.iter().any(|l| l.name == "Artwork"));
+        assert!((imported.pages()[0].width_mm - 100.0).abs() < 0.2);
+        assert!((imported.pages()[0].height_mm - 80.0).abs() < 0.2);
+        assert!(imported.pages()[0]
+            .layers
+            .iter()
+            .any(|l| l.name == "Artwork"));
         assert!(
             imported
-                .objects
+                .objects()
                 .values()
                 .any(|o| matches!(o.fill, Fill::LinearGradient { .. })),
             "expected LinearGradient to round-trip"
         );
         assert!(
             imported
-                .objects
+                .objects()
                 .values()
                 .any(|o| !o.outline.dash_pattern.is_empty()),
             "expected stroke dash pattern to round-trip"
         );
         assert!(
-            !imported.assets.is_empty(),
+            !imported.assets().is_empty(),
             "expected embedded PNG image to round-trip"
         );
     }

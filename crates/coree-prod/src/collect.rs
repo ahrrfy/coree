@@ -13,6 +13,7 @@ use image::{ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Configuration options for [`collect_for_output`].
@@ -124,7 +125,7 @@ pub fn collect_for_output(
 
     // 1. Document JSON
     let document_json_path = if options.include_document_json {
-        let safe_name = sanitize_filename(&doc.title, "document");
+        let safe_name = sanitize_filename(doc.title(), "document");
         let rel = format!("{safe_name}.coree.json");
         let full = output_dir.join(&rel);
         let json = serde_json::to_string_pretty(doc)?;
@@ -137,10 +138,10 @@ pub fn collect_for_output(
 
     // 2. Extract embedded raster assets into `images/`
     let mut extracted_images = Vec::new();
-    if options.extract_images && !doc.assets.is_empty() {
+    if options.extract_images && !doc.assets().is_empty() {
         let images_dir = output_dir.join("images");
         fs::create_dir_all(&images_dir)?;
-        for (&asset_id, asset) in &doc.assets {
+        for (&asset_id, asset) in doc.assets() {
             if asset.width == 0 || asset.height == 0 {
                 return Err(ProdError::ImageError(format!(
                     "raster asset {asset_id} has zero dimensions ({}x{})",
@@ -272,15 +273,15 @@ pub fn collect_for_output(
     written_files.push("manifest.json".to_owned());
     let manifest = ProductionManifest {
         format: "coree-collect-for-output/v1".to_owned(),
-        document_title: doc.title.clone(),
-        color_mode: doc.color_mode,
-        dpi: if doc.dpi.is_finite() && doc.dpi > 0.0 {
-            doc.dpi
+        document_title: doc.title().to_owned(),
+        color_mode: doc.color_mode(),
+        dpi: if doc.dpi().is_finite() && doc.dpi() > 0.0 {
+            doc.dpi()
         } else {
             300.0
         },
         pages: doc
-            .pages
+            .pages()
             .iter()
             .map(|p| PageSummary {
                 name: p.name.clone(),
@@ -302,7 +303,7 @@ pub fn collect_for_output(
                 layer_count: p.layers.len(),
             })
             .collect(),
-        total_objects: doc.objects.len(),
+        total_objects: doc.object_count(),
         spot_inks: spot_inks.clone(),
         used_fonts: used_fonts.clone(),
         extracted_images: extracted_images.clone(),
@@ -338,9 +339,9 @@ pub fn collect_for_output(
 fn collect_used_font_families(doc: &Document) -> Vec<String> {
     let mut set = BTreeSet::new();
     let all_objs = doc
-        .objects
+        .objects()
         .values()
-        .chain(doc.symbols.values().flat_map(|s| s.objects.iter()));
+        .chain(doc.symbols().values().flat_map(|s| s.objects.iter()));
 
     for obj in all_objs {
         match &obj.payload {
@@ -391,9 +392,9 @@ fn collect_spot_inks(doc: &Document) -> Vec<String> {
     };
 
     let all_objs = doc
-        .objects
+        .objects()
         .values()
-        .chain(doc.symbols.values().flat_map(|s| s.objects.iter()));
+        .chain(doc.symbols().values().flat_map(|s| s.objects.iter()));
 
     for obj in all_objs {
         for c in obj.fill.referenced_colors() {
@@ -471,24 +472,205 @@ fn build_font_search_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
+const MAX_SFNT_NAME_TABLE_BYTES: usize = 1_048_576;
+
 fn normalize_font_key(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
-fn index_font_files(dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
-    let mut index = BTreeMap::new();
-    for dir in dirs {
-        if dir.is_dir() {
-            scan_font_dir(dir, 0, &mut index);
+fn insert_font_candidate(
+    index: &mut BTreeMap<String, (PathBuf, u8)>,
+    key: String,
+    path: &Path,
+    priority: u8,
+) {
+    if key.is_empty() {
+        return;
+    }
+    match index.get_mut(&key) {
+        Some((existing_path, existing_prio)) => {
+            if priority > *existing_prio {
+                *existing_path = path.to_path_buf();
+                *existing_prio = priority;
+            }
+        }
+        None => {
+            index.insert(key, (path.to_path_buf(), priority));
         }
     }
-    index
 }
 
-fn scan_font_dir(dir: &Path, depth: usize, index: &mut BTreeMap<String, PathBuf>) {
+fn decode_sfnt_name_bytes(platform_id: u16, encoding_id: u16, raw: &[u8]) -> Option<String> {
+    if platform_id == 0 || (platform_id == 3 && matches!(encoding_id, 0 | 1 | 10)) {
+        if raw.len() < 2 {
+            return None;
+        }
+        let units: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        let s = String::from_utf16_lossy(&units);
+        let trimmed = s.trim_matches('\0').trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    } else if platform_id == 1 && encoding_id == 0 {
+        let s: String = raw.iter().map(|&b| char::from(b)).collect();
+        let trimmed = s.trim_matches('\0').trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
+fn extract_sfnt_face_names(file: &mut fs::File, face_offset: u64, out: &mut Vec<(String, u8)>) {
+    let Ok(_) = file.seek(SeekFrom::Start(face_offset)) else {
+        return;
+    };
+    let mut hdr = [0u8; 12];
+    if file.read_exact(&mut hdr).is_err() {
+        return;
+    }
+    let sfnt_tag = &hdr[0..4];
+    if sfnt_tag != [0x00, 0x01, 0x00, 0x00]
+        && sfnt_tag != b"OTTO"
+        && sfnt_tag != b"true"
+        && sfnt_tag != b"typ1"
+    {
+        return;
+    }
+    let num_tables = usize::from(u16::from_be_bytes([hdr[4], hdr[5]])).min(128);
+    let mut dir = vec![0u8; num_tables * 16];
+    if file.read_exact(&mut dir).is_err() {
+        return;
+    }
+
+    let mut name_range: Option<(u64, usize)> = None;
+    for rec in dir.as_chunks::<16>().0 {
+        if &rec[0..4] == b"name" {
+            let offset = u64::from(u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]));
+            let len = u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
+            if (6..=MAX_SFNT_NAME_TABLE_BYTES).contains(&len) {
+                name_range = Some((offset, len));
+            }
+            break;
+        }
+    }
+    let Some((name_off, name_len)) = name_range else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(name_off)).is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; name_len];
+    if file.read_exact(&mut buf).is_err() {
+        return;
+    }
+
+    let count = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+    let storage_off = usize::from(u16::from_be_bytes([buf[4], buf[5]]));
+    if 6usize.saturating_add(count.saturating_mul(12)) > buf.len() || storage_off > buf.len() {
+        return;
+    }
+
+    let mut is_regular = false;
+    let mut is_non_regular = false;
+    let mut families = Vec::new();
+    let mut full_or_ps = Vec::new();
+
+    for i in 0..count {
+        let off = 6 + i * 12;
+        let platform_id = u16::from_be_bytes([buf[off], buf[off + 1]]);
+        let encoding_id = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
+        let name_id = u16::from_be_bytes([buf[off + 6], buf[off + 7]]);
+        let str_len = usize::from(u16::from_be_bytes([buf[off + 8], buf[off + 9]]));
+        let str_off = usize::from(u16::from_be_bytes([buf[off + 10], buf[off + 11]]));
+
+        if !matches!(name_id, 1 | 2 | 4 | 6 | 16 | 17 | 21) {
+            continue;
+        }
+        let Some(start) = storage_off.checked_add(str_off) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(str_len) else {
+            continue;
+        };
+        if end > buf.len() {
+            continue;
+        }
+        let Some(decoded) = decode_sfnt_name_bytes(platform_id, encoding_id, &buf[start..end])
+        else {
+            continue;
+        };
+        let key = normalize_font_key(&decoded);
+        if key.is_empty() {
+            continue;
+        }
+        match name_id {
+            2 | 17 => {
+                if matches!(key.as_str(), "regular" | "book" | "roman" | "normal") {
+                    is_regular = true;
+                } else {
+                    is_non_regular = true;
+                }
+            }
+            1 | 16 | 21 => families.push(key),
+            4 | 6 => full_or_ps.push(key),
+            _ => {}
+        }
+    }
+
+    let family_prio = if is_regular || !is_non_regular { 3 } else { 2 };
+    for fam in families {
+        out.push((fam, family_prio));
+    }
+    for full in full_or_ps {
+        out.push((full, 3));
+    }
+}
+
+fn read_sfnt_index_keys(path: &Path) -> Vec<(String, u8)> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut head = [0u8; 12];
+    if file.read_exact(&mut head).is_err() {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    if &head[0..4] == b"ttcf" {
+        let num_fonts = u32::from_be_bytes([head[8], head[9], head[10], head[11]]).min(32);
+        let mut offsets_raw = vec![0u8; (num_fonts as usize) * 4];
+        if file.read_exact(&mut offsets_raw).is_err() {
+            return keys;
+        }
+        for chunk in offsets_raw.as_chunks::<4>().0 {
+            let off = u64::from(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            extract_sfnt_face_names(&mut file, off, &mut keys);
+        }
+    } else {
+        extract_sfnt_face_names(&mut file, 0, &mut keys);
+    }
+    keys
+}
+
+fn index_font_files(dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
+    let mut ranked = BTreeMap::new();
+    for dir in dirs {
+        if dir.is_dir() {
+            scan_font_dir(dir, 0, &mut ranked);
+        }
+    }
+    ranked
+        .into_iter()
+        .map(|(k, (path, _prio))| (k, path))
+        .collect()
+}
+
+fn scan_font_dir(dir: &Path, depth: usize, index: &mut BTreeMap<String, (PathBuf, u8)>) {
     if depth > 4 || index.len() >= 10_000 {
         return;
     }
@@ -513,8 +695,11 @@ fn scan_font_dir(dir: &Path, depth: usize, index: &mut BTreeMap<String, PathBuf>
             if matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc" | "woff2")) {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let key = normalize_font_key(stem);
-                    if !key.is_empty() {
-                        index.entry(key).or_insert(path);
+                    insert_font_candidate(index, key, &path, 1);
+                }
+                if !matches!(ext.as_deref(), Some("woff2")) {
+                    for (sfnt_key, prio) in read_sfnt_index_keys(&path) {
+                        insert_font_candidate(index, sfnt_key, &path, prio);
                     }
                 }
             }
@@ -589,7 +774,7 @@ mod tests {
         let bundle_dir = tmp.path().join("handoff_bundle");
 
         let mut doc = Document::new_a4("Packaging Handoff / 2026");
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let cut_layer = doc
             .add_layer(page_id, "CutContour", true, MasterLayerScope::None)
             .unwrap();
@@ -687,9 +872,90 @@ mod tests {
         // Verify manifest.json deserializes cleanly
         let manifest_raw = fs::read_to_string(&report.manifest_path).unwrap();
         let manifest: ProductionManifest = serde_json::from_str(&manifest_raw).unwrap();
-        assert_eq!(manifest.document_title, doc.title);
+        assert_eq!(manifest.document_title, doc.title());
         assert_eq!(manifest.extracted_images.len(), 1);
         assert!(bundle_dir.join("fonts/fonts.txt").is_file());
         assert!(bundle_dir.join("fonts/fonts_manifest.json").is_file());
+    }
+
+    fn build_mock_sfnt_with_names(records: &[(u16, &str)]) -> Vec<u8> {
+        let mut string_pool = Vec::new();
+        let mut raw_records = Vec::new();
+        for &(name_id, text) in records {
+            let off = string_pool.len() as u16;
+            let mut utf16_bytes = Vec::new();
+            for unit in text.encode_utf16() {
+                utf16_bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            let len = utf16_bytes.len() as u16;
+            string_pool.extend_from_slice(&utf16_bytes);
+            raw_records.push((name_id, off, len));
+        }
+
+        let name_header_and_recs = 6 + raw_records.len() * 12;
+        let mut name_table = Vec::new();
+        name_table.extend_from_slice(&0u16.to_be_bytes()); // format 0
+        name_table.extend_from_slice(&(raw_records.len() as u16).to_be_bytes());
+        name_table.extend_from_slice(&(name_header_and_recs as u16).to_be_bytes());
+        for (name_id, off, len) in raw_records {
+            name_table.extend_from_slice(&3u16.to_be_bytes()); // Windows platformID
+            name_table.extend_from_slice(&1u16.to_be_bytes()); // Unicode BMP encodingID
+            name_table.extend_from_slice(&0x0409u16.to_be_bytes()); // en-US
+            name_table.extend_from_slice(&name_id.to_be_bytes());
+            name_table.extend_from_slice(&len.to_be_bytes());
+            name_table.extend_from_slice(&off.to_be_bytes());
+        }
+        name_table.extend_from_slice(&string_pool);
+
+        let name_offset: u32 = 12 + 16;
+        let mut sfnt = Vec::new();
+        sfnt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // TrueType sfnt version
+        sfnt.extend_from_slice(&1u16.to_be_bytes()); // numTables = 1
+        sfnt.extend_from_slice(&[0u8; 6]); // searchRange / entrySelector / rangeShift
+        sfnt.extend_from_slice(b"name");
+        sfnt.extend_from_slice(&0u32.to_be_bytes()); // checkSum
+        sfnt.extend_from_slice(&name_offset.to_be_bytes());
+        sfnt.extend_from_slice(&(name_table.len() as u32).to_be_bytes());
+        sfnt.extend_from_slice(&name_table);
+        sfnt
+    }
+
+    #[test]
+    fn collects_fonts_whose_filenames_differ_from_sfnt_family_including_arabic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let font_vault = tmp.path().join("system_fonts");
+        fs::create_dir_all(&font_vault).unwrap();
+
+        // Bold face stored in generic cryptic filename `aa_bold.ttf`
+        fs::write(
+            font_vault.join("aa_bold.ttf"),
+            build_mock_sfnt_with_names(&[(1, "Courier New"), (2, "Bold"), (4, "Courier New Bold")]),
+        )
+        .unwrap();
+
+        // Regular face stored in `cour.ttf` — Regular must win bare family key over Bold
+        fs::write(
+            font_vault.join("cour.ttf"),
+            build_mock_sfnt_with_names(&[
+                (1, "Courier New"),
+                (2, "Regular"),
+                (6, "CourierNewPSMT"),
+            ]),
+        )
+        .unwrap();
+
+        // Arabic family name in SFNT table stored inside `ar_01.otf`
+        fs::write(
+            font_vault.join("ar_01.otf"),
+            build_mock_sfnt_with_names(&[(1, "أميري"), (2, "Regular")]),
+        )
+        .unwrap();
+
+        let index = index_font_files(&[font_vault]);
+        let matched_cour = match_font_file("Courier New", &index).unwrap();
+        assert_eq!(matched_cour.file_name().unwrap(), "cour.ttf");
+
+        let matched_arabic = match_font_file("أميري", &index).unwrap();
+        assert_eq!(matched_arabic.file_name().unwrap(), "ar_01.otf");
     }
 }

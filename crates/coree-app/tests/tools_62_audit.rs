@@ -9,7 +9,7 @@
 
 use coree_app::shortcuts::{resolve_shortcut, ShortcutAction, ShortcutProfile};
 use coree_app::state::{
-    CanvasDragState, NodeSmoothness, RasterBrushOp, StudioApp, ToolId, WorkspacePreset, TOOL_GROUPS,
+    NodeSmoothness, PointerEvent, RasterBrushOp, StudioApp, ToolId, WorkspacePreset, TOOL_GROUPS,
 };
 use coree_core::{
     Affine2D, AlignOp, BezierPath, Color, ColorMode, CommandOp, ContourMode, CornerStyle, Effect,
@@ -51,7 +51,7 @@ fn add_rect(
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -82,7 +82,7 @@ fn add_open_curve(app: &mut StudioApp) -> ObjectId {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -131,19 +131,42 @@ fn audit_all_62_tools_exhaustive_zero_noops() {
             app.convert_selection_to_curves();
         }
 
-        let before_count = app.active_tab().unwrap().document.objects.len();
+        let before_count = app.active_tab().unwrap().document.objects().len();
         let before_zoom = app.active_tab().unwrap().viewport.zoom;
         let before_pan = app.active_tab().unwrap().viewport.pan_mm;
         let before_page = {
             let p = app.active_tab().unwrap().document.active_page().unwrap();
             (p.width_mm, p.height_mm)
         };
-        let before_r1_xf = app.active_tab().unwrap().document.objects[&r1].transform;
-        let before_r1_payload = app.active_tab().unwrap().document.objects[&r1]
+        let before_r1_xf = app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(r1)
+            .unwrap()
+            .transform;
+        let before_r1_payload = app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(r1)
+            .unwrap()
             .payload
             .clone();
-        let before_r1_fill = app.active_tab().unwrap().document.objects[&r1].fill.clone();
-        let before_r1_effects = app.active_tab().unwrap().document.objects[&r1]
+        let before_r1_fill = app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(r1)
+            .unwrap()
+            .fill
+            .clone();
+        let before_r1_effects = app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(r1)
+            .unwrap()
             .effects
             .len();
 
@@ -178,7 +201,7 @@ fn audit_all_62_tools_exhaustive_zero_noops() {
         app.commit_drawn_box(drag_rect);
 
         let tab = app.active_tab().unwrap();
-        let after_count = tab.document.objects.len();
+        let after_count = tab.document.objects().len();
         let after_zoom = tab.viewport.zoom;
         let after_pan = tab.viewport.pan_mm;
         let after_page = {
@@ -190,18 +213,18 @@ fn audit_all_62_tools_exhaustive_zero_noops() {
             ToolId::Pick | ToolId::FreehandPick => {
                 tab.selection.contains(r1) && tab.selection.contains(r2)
             }
-            ToolId::FreeTransform => tab.document.objects[&r1].transform != before_r1_xf,
+            ToolId::FreeTransform => tab.document.object(r1).unwrap().transform != before_r1_xf,
             ToolId::ShapeNode => !tab.selection.node_selection.is_empty(),
             ToolId::Smooth
             | ToolId::Smear
             | ToolId::Twirl
             | ToolId::AttractRepel
-            | ToolId::Roughen => tab.document.objects[&r1].payload != before_r1_payload,
+            | ToolId::Roughen => tab.document.object(r1).unwrap().payload != before_r1_payload,
             ToolId::Crop => after_page != before_page && after_page.0 < 60.0,
             ToolId::Knife => after_count > before_count,
             ToolId::VirtualSegmentDelete | ToolId::Eraser => {
-                tab.document.objects[&r1].payload != before_r1_payload
-                    || tab.document.objects[&r2].payload != before_r1_payload
+                tab.document.object(r1).unwrap().payload != before_r1_payload
+                    || tab.document.object(r2).unwrap().payload != before_r1_payload
             }
             ToolId::Zoom => (after_zoom - before_zoom).abs() > 1e-3,
             ToolId::Pan => after_pan.distance_to(before_pan) > 1.0,
@@ -212,18 +235,20 @@ fn audit_all_62_tools_exhaustive_zero_noops() {
             | ToolId::Distort
             | ToolId::Envelope
             | ToolId::Extrude25D
-            | ToolId::Transparency => tab.document.objects[&r1].effects.len() > before_r1_effects,
+            | ToolId::Transparency => {
+                tab.document.object(r1).unwrap().effects.len() > before_r1_effects
+            }
             ToolId::ColorEyedropper | ToolId::AttributesEyedropper => {
                 app.tool_settings.eyedropper_apply_mode
                     && app.default_fill == Fill::Solid(Color::MAGENTA)
             }
             ToolId::InteractiveFill | ToolId::MeshFill => {
-                tab.document.objects[&r1].fill != before_r1_fill
+                tab.document.object(r1).unwrap().fill != before_r1_fill
             }
             ToolId::MaskSelect => tab.raster_mask_rect_mm == Some(drag_rect),
             ToolId::BitmapBrush | ToolId::BitmapEraser | ToolId::CloneStamp | ToolId::Smudge => {
                 // Auto-creates a 150 DPI transparent raster layer and registers its asset!
-                after_count > before_count && !tab.document.assets.is_empty()
+                after_count > before_count && !tab.document.assets().is_empty()
             }
             // All shape, curve, text, table, dimension, connector, smart-fill & lens creation tools
             _ => after_count > before_count,
@@ -241,11 +266,12 @@ fn audit_all_62_tools_exhaustive_zero_noops() {
 fn audit_raster_studio_all_8_ops_and_auto_create_layer() {
     let mut app = StudioApp::new_headless();
     // Use a 60x60 mm page so auto-created 150 DPI raster (~354x354 px) runs all 8 ops + 8x Undo/Redo rapidly in debug mode
-    if let Some(page) = app.active_tab_mut().unwrap().document.pages.get_mut(0) {
-        page.width_mm = 60.0;
-        page.height_mm = 60.0;
-    }
-    assert!(app.active_tab().unwrap().document.assets.is_empty());
+    app.active_tab_mut()
+        .unwrap()
+        .document
+        .set_page_dimensions(0, 60.0, 60.0)
+        .unwrap();
+    assert!(app.active_tab().unwrap().document.assets().is_empty());
 
     // 1. Paint on an empty canvas -> auto-creates 150 DPI transparent raster layer and paints pixels!
     app.set_raster_brush_op(RasterBrushOp::Paint);
@@ -258,17 +284,17 @@ fn audit_raster_studio_all_8_ops_and_auto_create_layer() {
 
     let current_rgba = |a: &StudioApp, oid: ObjectId| -> Vec<u8> {
         let tab = a.active_tab().unwrap();
-        let NodePayload::Raster(ref r) = tab.document.objects[&oid].payload else {
+        let NodePayload::Raster(ref r) = tab.document.object(oid).unwrap().payload else {
             panic!("expected raster object {oid:?}");
         };
-        tab.document.assets[&r.asset_id].rgba_bytes.clone()
+        tab.document.asset(r.asset_id).unwrap().rgba_bytes.clone()
     };
 
     let raster_oid = *app
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -424,7 +450,14 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // 1. Live ParametricShape editing: Rectangle corners + Undo/Redo
     let rect_id = add_rect(&mut app, "Param Rect", 20.0, 20.0, 80.0, 50.0, Color::CYAN);
-    let orig_shape = match &app.active_tab().unwrap().document.objects[&rect_id].payload {
+    let orig_shape = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(rect_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Shape(s) => s.clone(),
         _ => panic!("expected shape"),
     };
@@ -437,12 +470,22 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
     };
     assert!(app.commit_parametric_shape_edit(rect_id, orig_shape.clone(), rounded_shape.clone()));
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&rect_id].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(rect_id)
+            .unwrap()
+            .payload,
         NodePayload::Shape(rounded_shape)
     );
     app.undo().expect("undo parametric edit");
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&rect_id].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(rect_id)
+            .unwrap()
+            .payload,
         NodePayload::Shape(orig_shape)
     );
 
@@ -465,11 +508,18 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
-    let orig_ell = match &app.active_tab().unwrap().document.objects[&ell_id].payload {
+    let orig_ell = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(ell_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Shape(s) => s.clone(),
         _ => panic!("expected ellipse"),
     };
@@ -482,7 +532,12 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
     };
     assert!(app.commit_parametric_shape_edit(ell_id, orig_ell, pie_ell.clone()));
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&ell_id].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(ell_id)
+            .unwrap()
+            .payload,
         NodePayload::Shape(pie_ell)
     );
 
@@ -496,7 +551,14 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (b) reduce_nodes (removes collinear midpoint (50, 20) along (20,20)-(80,20)!)
     assert!(app.shape_reduce_nodes(0.5));
-    let reduced_count = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let reduced_count = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.node_count(),
         _ => 0,
     };
@@ -504,7 +566,14 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (c) add_node
     assert!(app.shape_add_node());
-    let after_add = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let after_add = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.node_count(),
         _ => 0,
     };
@@ -512,7 +581,13 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (d) set_node_smoothness (Smooth & Symmetrical)
     assert!(app.shape_set_node_smoothness(NodeSmoothness::Smooth));
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         let sel = app.active_tab().unwrap().selection.node_selection.nodes[0];
         assert_eq!(
@@ -523,7 +598,13 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (e) convert_to_curve & (f) convert_to_line
     assert!(app.shape_convert_to_curve());
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         let any_handles = p.subpaths[0]
             .nodes
@@ -537,7 +618,13 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
         .node_selection
         .clear();
     assert!(app.shape_convert_to_line());
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         let any_handles = p.subpaths[0]
             .nodes
@@ -547,12 +634,26 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
     }
 
     // (g) reverse_subpaths
-    let first_before = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let first_before = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.subpaths[0].nodes[0].pos,
         _ => Point2D::ZERO,
     };
     assert!(app.shape_reverse_subpaths());
-    let first_after = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let first_after = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.subpaths[0].nodes[0].pos,
         _ => Point2D::ZERO,
     };
@@ -563,14 +664,26 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (h) close_curve
     assert!(app.shape_close_curve());
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         assert!(p.subpaths[0].closed);
     }
 
     // (i) break_curve
     assert!(app.shape_break_curve());
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         assert!(
             !p.subpaths[0].closed,
@@ -580,13 +693,26 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
 
     // (j) join_nodes (joins endpoints of open curve back closed!)
     assert!(app.shape_join_nodes());
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&curve_id].payload
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
     {
         assert!(p.subpaths[0].closed, "join_nodes must close open endpoints");
     }
 
     // (k) delete_selected_nodes (and Delete shortcut in ShapeNode mode!)
-    let count_before_del = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let count_before_del = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.node_count(),
         _ => 0,
     };
@@ -601,7 +727,14 @@ fn audit_shape_node_parametric_and_all_11_property_bar_ops() {
         .node_selection
         .select_single(nref);
     app.handle_shortcut(ShortcutAction::DeleteSelection);
-    let count_after_del = match &app.active_tab().unwrap().document.objects[&curve_id].payload {
+    let count_after_del = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(curve_id)
+        .unwrap()
+        .payload
+    {
         NodePayload::Path(p) => p.node_count(),
         _ => 0,
     };
@@ -651,7 +784,7 @@ fn audit_all_5_vector_sculpt_tools_deform_geometry() {
             "sculpt tool {tool:?} (invert={shift_invert}) failed"
         );
 
-        let obj = &app.active_tab().unwrap().document.objects[&rid];
+        let obj = app.active_tab().unwrap().document.object(rid).unwrap();
         let NodePayload::Path(ref edited) = obj.payload else {
             panic!("sculpt tool {tool:?} must convert ParametricShape to BezierPath");
         };
@@ -664,7 +797,12 @@ fn audit_all_5_vector_sculpt_tools_deform_geometry() {
         // Undo must restore original ParametricShape cleanly!
         app.undo().expect("undo sculpt");
         assert!(matches!(
-            app.active_tab().unwrap().document.objects[&rid].payload,
+            app.active_tab()
+                .unwrap()
+                .document
+                .object(rid)
+                .unwrap()
+                .payload,
             NodePayload::Shape(ParametricShape::Rectangle { .. })
         ));
     }
@@ -686,7 +824,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(53.0, 47.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::DropShadow { dx_mm, dy_mm, .. } if (*dx_mm - 8.0).abs() < 1e-3 && (*dy_mm - 7.0).abs() < 1e-3)));
@@ -697,7 +840,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(55.0, 52.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::BlockShadow { .. })));
@@ -708,7 +856,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(90.0, 40.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(
@@ -723,7 +876,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(22.0, 22.0),
         Point2D::new(30.0, 30.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(
@@ -740,7 +898,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(135.0, 40.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::Blend { target_id, .. } if *target_id == b)));
@@ -751,7 +914,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(65.0, 50.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::Distort { .. })));
@@ -762,7 +930,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 20.0),
         Point2D::new(45.0, 10.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::Envelope { cage, .. } if cage.len() == 8)));
@@ -773,7 +946,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(45.0, 40.0),
         Point2D::new(95.0, 15.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(e, Effect::Extrude25D { .. })));
@@ -784,7 +962,12 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(20.0, 40.0),
         Point2D::new(70.0, 40.0),
     ));
-    assert!(app.active_tab().unwrap().document.objects[&a]
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(a)
+        .unwrap()
         .effects
         .iter()
         .any(|e| matches!(
@@ -801,7 +984,7 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         Point2D::new(26.0, 25.0),
         Some(Color::MAGENTA),
     ));
-    match &app.active_tab().unwrap().document.objects[&a].fill {
+    match &app.active_tab().unwrap().document.object(a).unwrap().fill {
         Fill::MeshFill { rows, cols, nodes } => {
             assert!(*rows >= 2 && *cols >= 2);
             assert_eq!(nodes.len(), rows * cols);
@@ -833,7 +1016,7 @@ fn audit_crop_tool_real_crop_and_undo() {
     assert!((page.width_mm - 80.0).abs() < 1e-3);
     assert!((page.height_mm - 60.0).abs() < 1e-3);
     assert!(
-        !tab.document.objects.contains_key(&outside),
+        !tab.document.has_object(outside),
         "outside object must be removed"
     );
     let new_bb = tab.document.object_bounds(inside).unwrap();
@@ -848,7 +1031,7 @@ fn audit_crop_tool_real_crop_and_undo() {
     let page = tab.document.active_page().unwrap();
     assert!((page.width_mm - 210.0).abs() < 1e-3);
     assert!((page.height_mm - 297.0).abs() < 1e-3);
-    assert!(tab.document.objects.contains_key(&outside));
+    assert!(tab.document.has_object(outside));
     let restored_bb = tab.document.object_bounds(inside).unwrap();
     assert!((restored_bb.min_x - 50.0).abs() < 1e-3 && (restored_bb.min_y - 50.0).abs() < 1e-3);
 }
@@ -921,7 +1104,14 @@ fn audit_bezier_pen_handle_pull_close_bspline_and_3pt_curve() {
     app.bezier_add_point(Point2D::new(80.0, 20.0), Some(Point2D::new(90.0, 40.0)));
     app.bezier_add_point(Point2D::new(50.0, 70.0), None);
     let pen_id = app.bezier_finish(true).expect("commit closed pen curve");
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&pen_id].payload {
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(pen_id)
+        .unwrap()
+        .payload
+    {
         assert!(p.subpaths[0].closed);
         assert_eq!(p.subpaths[0].nodes.len(), 3);
         assert!(p.subpaths[0].nodes[0].handle_out.is_some());
@@ -938,7 +1128,14 @@ fn audit_bezier_pen_handle_pull_close_bspline_and_3pt_curve() {
             Point2D::new(50.0, 10.0),
         )
         .expect("commit 3-point curve");
-    if let NodePayload::Path(ref p) = app.active_tab().unwrap().document.objects[&arc_id].payload {
+    if let NodePayload::Path(ref p) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(arc_id)
+        .unwrap()
+        .payload
+    {
         let (mid, _) = p.point_and_tangent_at_t(0.5).expect("midpoint");
         assert!(
             mid.distance_to(Point2D::new(50.0, 10.0)) < 0.5,
@@ -958,7 +1155,12 @@ fn audit_bezier_pen_handle_pull_close_bspline_and_3pt_curve() {
         )
         .expect("3-point rect");
     assert!(matches!(
-        app.active_tab().unwrap().document.objects[&r3].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(r3)
+            .unwrap()
+            .payload,
         NodePayload::Shape(ParametricShape::Rectangle { .. })
     ));
 }
@@ -978,7 +1180,7 @@ fn audit_eyedropper_sample_apply_connectors_and_inline_text() {
     // Second click applies to Dst!
     assert!(app.eyedropper_click(Point2D::new(120.0, 40.0), false, false));
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&dst].fill,
+        app.active_tab().unwrap().document.object(dst).unwrap().fill,
         Fill::Solid(Color::MAGENTA)
     );
     // Shift+Click re-samples!
@@ -989,8 +1191,13 @@ fn audit_eyedropper_sample_apply_connectors_and_inline_text() {
     let conn_id = app
         .commit_connector_drag(Point2D::new(58.0, 40.0), Point2D::new(102.0, 40.0), true)
         .expect("commit connector");
-    if let NodePayload::Connector(ref c) =
-        app.active_tab().unwrap().document.objects[&conn_id].payload
+    if let NodePayload::Connector(ref c) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(conn_id)
+        .unwrap()
+        .payload
     {
         assert_eq!(c.from_obj, Some(src));
         assert_eq!(c.to_obj, Some(dst));
@@ -1016,12 +1223,17 @@ fn audit_eyedropper_sample_apply_connectors_and_inline_text() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
-    if let NodePayload::ArtisticText(ref art) =
-        app.active_tab().unwrap().document.objects[&text_id].payload
+    if let NodePayload::ArtisticText(ref art) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(text_id)
+        .unwrap()
+        .payload
     {
         assert_eq!(art.plain_text(), "شكر وتقدير coree");
     } else {
@@ -1038,8 +1250,13 @@ fn audit_eyedropper_sample_apply_connectors_and_inline_text() {
         .buffer
         .push_str(" v0.2");
     assert!(app.commit_inline_text_edit());
-    if let NodePayload::ArtisticText(ref art) =
-        app.active_tab().unwrap().document.objects[&text_id].payload
+    if let NodePayload::ArtisticText(ref art) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(text_id)
+        .unwrap()
+        .payload
     {
         assert_eq!(art.plain_text(), "شكر وتقدير coree v0.2");
     }
@@ -1150,10 +1367,10 @@ fn audit_muscle_memory_shortcuts_combine_break_apart_and_nudge() {
         false,
     );
     assert_eq!(plus_act, Some(ShortcutAction::DuplicateInPlace));
-    let before_dup = app.active_tab().unwrap().document.objects.len();
+    let before_dup = app.active_tab().unwrap().document.objects().len();
     app.handle_shortcut(plus_act.unwrap());
     assert_eq!(
-        app.active_tab().unwrap().document.objects.len(),
+        app.active_tab().unwrap().document.objects().len(),
         before_dup + 1
     );
     let dup_id = app.active_tab().unwrap().selection.objects[0];
@@ -1175,10 +1392,10 @@ fn audit_muscle_memory_shortcuts_combine_break_apart_and_nudge() {
         let tab = app.active_tab_mut().unwrap();
         tab.selection.select_many(&tab.document, &[r1, r2]);
     }
-    let count_pre_combine = app.active_tab().unwrap().document.objects.len();
+    let count_pre_combine = app.active_tab().unwrap().document.objects().len();
     app.handle_shortcut(ShortcutAction::Combine);
     assert_eq!(
-        app.active_tab().unwrap().document.objects.len(),
+        app.active_tab().unwrap().document.objects().len(),
         count_pre_combine - 1,
         "Ctrl+L Combine merges 2 shapes into 1 compound BezierPath"
     );
@@ -1186,7 +1403,7 @@ fn audit_muscle_memory_shortcuts_combine_break_apart_and_nudge() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -1196,7 +1413,7 @@ fn audit_muscle_memory_shortcuts_combine_break_apart_and_nudge() {
     }
     app.handle_shortcut(ShortcutAction::BreakApart);
     assert_eq!(
-        app.active_tab().unwrap().document.objects.len(),
+        app.active_tab().unwrap().document.objects().len(),
         count_pre_combine,
         "Ctrl+K Break Apart splits compound path back into 2 paths"
     );
@@ -1289,13 +1506,18 @@ fn audit_workspaces_autofit_glyphs_laser_preview_and_headless_ui_overlays() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
     app.insert_glyph_at_selection("بسم");
-    if let NodePayload::ArtisticText(ref art) =
-        app.active_tab().unwrap().document.objects[&g_id].payload
+    if let NodePayload::ArtisticText(ref art) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(g_id)
+        .unwrap()
+        .payload
     {
         assert_eq!(art.plain_text(), "★بسم");
     } else {
@@ -1420,7 +1642,7 @@ fn regression_cut_copy_paste_group_and_powerclip_deep_clone() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -1457,11 +1679,11 @@ fn regression_cut_copy_paste_group_and_powerclip_deep_clone() {
 
     {
         let doc = &app.active_tab().unwrap().document;
-        let orig_grp_children: HashSet<ObjectId> = match &doc.objects[&group_id].payload {
+        let orig_grp_children: HashSet<ObjectId> = match &doc.object(group_id).unwrap().payload {
             NodePayload::Group(v) => v.iter().copied().collect(),
             other => panic!("expected Group, got {other:?}"),
         };
-        let new_grp_children: HashSet<ObjectId> = match &doc.objects[&pasted_group].payload {
+        let new_grp_children: HashSet<ObjectId> = match &doc.object(pasted_group).unwrap().payload {
             NodePayload::Group(v) => v.iter().copied().collect(),
             other => panic!("expected pasted Group, got {other:?}"),
         };
@@ -1471,14 +1693,14 @@ fn regression_cut_copy_paste_group_and_powerclip_deep_clone() {
             "Copy+Paste Group must not alias child IDs!"
         );
         for cid in &new_grp_children {
-            assert!(doc.objects.contains_key(cid), "pasted group child missing");
+            assert!(doc.has_object(*cid), "pasted group child missing");
         }
 
-        let orig_pc_contents: HashSet<ObjectId> = match &doc.objects[&pc_container].payload {
+        let orig_pc_contents: HashSet<ObjectId> = match &doc.object(pc_container).unwrap().payload {
             NodePayload::PowerClip { contents, .. } => contents.iter().copied().collect(),
             other => panic!("expected PowerClip, got {other:?}"),
         };
-        let new_pc_contents: HashSet<ObjectId> = match &doc.objects[&pasted_pc].payload {
+        let new_pc_contents: HashSet<ObjectId> = match &doc.object(pasted_pc).unwrap().payload {
             NodePayload::PowerClip { contents, .. } => contents.iter().copied().collect(),
             other => panic!("expected pasted PowerClip, got {other:?}"),
         };
@@ -1488,21 +1710,13 @@ fn regression_cut_copy_paste_group_and_powerclip_deep_clone() {
             "Copy+Paste PowerClip must not alias content IDs!"
         );
         for cid in &new_pc_contents {
-            assert!(
-                doc.objects.contains_key(cid),
-                "pasted powerclip child missing"
-            );
+            assert!(doc.has_object(*cid), "pasted powerclip child missing");
         }
     }
 
     // Undo removes Copy+Paste cleanly
     app.undo().expect("undo copy-paste");
-    assert!(!app
-        .active_tab()
-        .unwrap()
-        .document
-        .objects
-        .contains_key(&pasted_group));
+    assert!(!app.active_tab().unwrap().document.has_object(pasted_group));
 
     // --- Cut + Paste must survive deletion of originals and preserve ALL descendants ---
     {
@@ -1513,34 +1727,34 @@ fn regression_cut_copy_paste_group_and_powerclip_deep_clone() {
     assert_eq!(app.cut_selection(), 2);
     {
         let doc = &app.active_tab().unwrap().document;
-        assert!(!doc.objects.contains_key(&group_id));
-        assert!(!doc.objects.contains_key(&g_c1));
-        assert!(!doc.objects.contains_key(&pc_container));
-        assert!(!doc.objects.contains_key(&pc_child1));
+        assert!(!doc.has_object(group_id));
+        assert!(!doc.has_object(g_c1));
+        assert!(!doc.has_object(pc_container));
+        assert!(!doc.has_object(pc_child1));
     }
 
     let cut_pasted = app.paste_clipboard();
     assert_eq!(cut_pasted.len(), 2);
     {
         let doc = &app.active_tab().unwrap().document;
-        match &doc.objects[&cut_pasted[0]].payload {
+        match &doc.object(cut_pasted[0]).unwrap().payload {
             NodePayload::Group(children) => {
                 assert_eq!(children.len(), 2, "Cut+Paste Group lost descendants!");
                 for cid in children {
                     assert!(
-                        doc.objects.contains_key(cid),
+                        doc.has_object(*cid),
                         "Cut+Paste Group has dangling child {cid:?}"
                     );
                 }
             }
             other => panic!("expected Group after Cut+Paste, got {other:?}"),
         }
-        match &doc.objects[&cut_pasted[1]].payload {
+        match &doc.object(cut_pasted[1]).unwrap().payload {
             NodePayload::PowerClip { contents, .. } => {
                 assert_eq!(contents.len(), 2, "Cut+Paste PowerClip lost descendants!");
                 for cid in contents {
                     assert!(
-                        doc.objects.contains_key(cid),
+                        doc.has_object(*cid),
                         "Cut+Paste PowerClip has dangling content {cid:?}"
                     );
                 }
@@ -1566,8 +1780,7 @@ fn regression_raster_zero_dim_floodfill_no_panic() {
     app.active_tab_mut()
         .unwrap()
         .document
-        .assets
-        .insert(aid, zero_asset);
+        .insert_asset_if_absent(zero_asset);
     let obj = SceneObject::new(
         ObjectId(0),
         "Degenerate 0x0 Raster",
@@ -1585,7 +1798,7 @@ fn regression_raster_zero_dim_floodfill_no_panic() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -1610,19 +1823,34 @@ fn regression_left_drag_right_click_stamp_duplicate_undo_integrity() {
     let mut app = StudioApp::new_headless();
     let a = add_rect(&mut app, "A", 10.0, 10.0, 30.0, 20.0, Color::CYAN);
 
-    // Begin MovingSelection drag, move live by +50mm
+    // Begin MovingSelection drag, move live by +50mm via ToolCore (zero mid-drag Document mutation!)
     {
         let tab = app.active_tab_mut().unwrap();
         tab.selection.select_single(&tab.document, a);
-        tab.document.objects.get_mut(&a).unwrap().transform =
-            Affine2D::translate(50.0, 0.0).compose(&tab.document.objects[&a].transform);
-        tab.drag_state = CanvasDragState::MovingSelection {
-            start_mm: Point2D::new(20.0, 20.0),
-            last_mm: Point2D::new(70.0, 20.0),
-            accum_dx: 50.0,
-            accum_dy: 0.0,
-        };
+        tab.snap_options.grid = false;
+        tab.snap_options.guidelines = false;
+        tab.snap_options.objects = false;
+        tab.snap_options.page_edges = false;
+        tab.snap_options.nodes = false;
+        tab.snap_options.dynamic_guides = false;
     }
+    app.run_tool_pointer_down(&PointerEvent::primary(Point2D::new(20.0, 20.0), [0.0, 0.0]));
+    app.run_tool_pointer_move(&PointerEvent::primary(
+        Point2D::new(70.0, 20.0),
+        [50.0, 0.0],
+    ));
+    assert!(
+        (app.active_tab()
+            .unwrap()
+            .document
+            .object_bounds(a)
+            .unwrap()
+            .min_x
+            - 10.0)
+            .abs()
+            < 1e-4,
+        "Document must NOT be mutated mid-drag"
+    );
 
     // Right-click stamp B at live position (x = 60)!
     let stamped = app
@@ -1644,21 +1872,15 @@ fn regression_left_drag_right_click_stamp_duplicate_undo_integrity() {
         .min_x;
     assert!((b_x - 60.0).abs() < 1e-3, "B must land at x=60, got {b_x}");
 
-    // Continue dragging A +50 -> +80 (delta +30), then finish drag cleanly
-    {
-        let tab = app.active_tab_mut().unwrap();
-        tab.document.objects.get_mut(&a).unwrap().transform =
-            Affine2D::translate(30.0, 0.0).compose(&tab.document.objects[&a].transform);
-        tab.drag_state = CanvasDragState::Idle;
-        // Finish drag rollback -80 + commit TransformObjects(+80)
-        tab.document.objects.get_mut(&a).unwrap().transform =
-            Affine2D::translate(-80.0, 0.0).compose(&tab.document.objects[&a].transform);
-    }
-    app.execute_command(CommandOp::TransformObjects {
-        ids: vec![a],
-        affine: Affine2D::translate(80.0, 0.0),
-    })
-    .expect("commit final drag");
+    // Continue dragging A +50 -> +80 (delta +30), then release to commit TransformObjects(+80)
+    app.run_tool_pointer_move(&PointerEvent::primary(
+        Point2D::new(100.0, 20.0),
+        [80.0, 0.0],
+    ));
+    app.run_tool_pointer_up(&PointerEvent::primary(
+        Point2D::new(100.0, 20.0),
+        [80.0, 0.0],
+    ));
 
     assert!(
         (app.active_tab()
@@ -1687,10 +1909,7 @@ fn regression_left_drag_right_click_stamp_duplicate_undo_integrity() {
     // Undo #2: removes B and keeps A cleanly at x=10 (NOT corrupted to x=60!)
     app.undo().expect("undo #2 (stamp B)");
     let tab = app.active_tab().unwrap();
-    assert!(
-        !tab.document.objects.contains_key(&b),
-        "Undo #2 must remove B"
-    );
+    assert!(!tab.document.has_object(b), "Undo #2 must remove B");
     let a_after_u2 = tab.document.object_bounds(a).unwrap().min_x;
     assert!(
         (a_after_u2 - 10.0).abs() < 1e-3,
@@ -1701,25 +1920,18 @@ fn regression_left_drag_right_click_stamp_duplicate_undo_integrity() {
     {
         let tab = app.active_tab_mut().unwrap();
         tab.selection.select_single(&tab.document, a);
-        tab.document.objects.get_mut(&a).unwrap().transform =
-            Affine2D::translate(50.0, 0.0).compose(&tab.document.objects[&a].transform);
-        tab.drag_state = CanvasDragState::MovingSelection {
-            start_mm: Point2D::new(20.0, 20.0),
-            last_mm: Point2D::new(70.0, 20.0),
-            accum_dx: 50.0,
-            accum_dy: 0.0,
-        };
     }
+    app.run_tool_pointer_down(&PointerEvent::primary(Point2D::new(20.0, 20.0), [0.0, 0.0]));
+    app.run_tool_pointer_move(&PointerEvent::primary(
+        Point2D::new(70.0, 20.0),
+        [50.0, 0.0],
+    ));
     let c = app.stamp_duplicate_during_active_drag().unwrap()[0];
-    {
-        let tab = app.active_tab_mut().unwrap();
-        tab.document.objects.get_mut(&a).unwrap().transform =
-            Affine2D::translate(30.0, 0.0).compose(&tab.document.objects[&a].transform);
-        if let CanvasDragState::MovingSelection { accum_dx, .. } = &mut tab.drag_state {
-            *accum_dx = 80.0;
-        }
-        tab.cancel_active_drag();
-    }
+    app.run_tool_pointer_move(&PointerEvent::primary(
+        Point2D::new(100.0, 20.0),
+        [80.0, 0.0],
+    ));
+    app.active_tab_mut().unwrap().cancel_active_drag();
     assert!(
         (app.active_tab()
             .unwrap()
@@ -1734,7 +1946,7 @@ fn regression_left_drag_right_click_stamp_duplicate_undo_integrity() {
     );
     app.undo().expect("undo stamp C");
     let tab = app.active_tab().unwrap();
-    assert!(!tab.document.objects.contains_key(&c));
+    assert!(!tab.document.has_object(c));
     assert!(
         (tab.document.object_bounds(a).unwrap().min_x - 10.0).abs() < 1e-3,
         "Undo after Esc must keep A at x=10"
@@ -1780,8 +1992,7 @@ fn regression_locked_layer_and_nested_container_invariants() {
     app.active_tab_mut()
         .unwrap()
         .document
-        .assets
-        .insert(lra_id, locked_raster_asset);
+        .insert_asset_if_absent(locked_raster_asset);
     let lr_obj = SceneObject::new(
         ObjectId(0),
         "Locked Raster",
@@ -1799,7 +2010,7 @@ fn regression_locked_layer_and_nested_container_invariants() {
         .active_tab()
         .unwrap()
         .document
-        .objects
+        .objects()
         .keys()
         .last()
         .unwrap();
@@ -1819,13 +2030,13 @@ fn regression_locked_layer_and_nested_container_invariants() {
     assert!(app.apply_crop_rect(Rect2D::from_xywh(40.0, 40.0, 80.0, 60.0)));
     {
         let doc = &app.active_tab().unwrap().document;
-        assert!(!doc.objects.contains_key(&unlocked_outside));
+        assert!(!doc.has_object(unlocked_outside));
         assert!(
             (doc.object_bounds(unlocked_inside).unwrap().min_x - 10.0).abs() < 1e-3,
             "unlocked inside object must shift by -40"
         );
         assert!(
-            doc.objects.contains_key(&locked_outside),
+            doc.has_object(locked_outside),
             "object on locked layer must NOT be deleted by Crop"
         );
         assert!(
@@ -1902,7 +2113,14 @@ fn regression_locked_layer_and_nested_container_invariants() {
         name: "ParamGroup".to_owned(),
     })
     .unwrap();
-    let orig_nested = match &app.active_tab().unwrap().document.objects[&grp_rect].payload {
+    let orig_nested = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(grp_rect)
+        .unwrap()
+        .payload
+    {
         NodePayload::Shape(s) => s.clone(),
         _ => panic!("expected shape"),
     };
@@ -1921,7 +2139,7 @@ fn regression_locked_layer_and_nested_container_invariants() {
     {
         let doc = &app.active_tab().unwrap().document;
         assert_eq!(
-            doc.objects[&grp_rect].payload,
+            doc.object(grp_rect).unwrap().payload,
             NodePayload::Shape(updated_nested.clone())
         );
         assert_eq!(
@@ -1933,12 +2151,22 @@ fn regression_locked_layer_and_nested_container_invariants() {
     }
     app.undo().expect("undo nested parametric edit");
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&grp_rect].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(grp_rect)
+            .unwrap()
+            .payload,
         NodePayload::Shape(orig_nested)
     );
     app.redo().expect("redo nested parametric edit");
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&grp_rect].payload,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(grp_rect)
+            .unwrap()
+            .payload,
         NodePayload::Shape(updated_nested)
     );
 
@@ -1964,7 +2192,11 @@ fn regression_locked_layer_and_nested_container_invariants() {
         Some(Color::CYAN),
     ));
     assert!(
-        app.active_tab().unwrap().document.objects[&locked_inside]
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(locked_inside)
+            .unwrap()
             .effects
             .is_empty(),
         "locked layer object must remain untouched"
@@ -1993,17 +2225,25 @@ fn regression_locked_layer_and_nested_container_invariants() {
         Point2D::new(140.0, 120.0),
         Point2D::new(140.0, 112.0),
     ));
-    app.active_tab_mut()
+    app.execute_command(CommandOp::SetObjectLocked {
+        ids: vec![direct_locked],
+        locked: true,
+    })
+    .unwrap();
+    let fill_before = app
+        .active_tab()
         .unwrap()
         .document
-        .objects
-        .get_mut(&direct_locked)
+        .object(direct_locked)
         .unwrap()
-        .locked = true;
-    let fill_before = app.active_tab().unwrap().document.objects[&direct_locked]
         .fill
         .clone();
-    let effects_before = app.active_tab().unwrap().document.objects[&direct_locked]
+    let effects_before = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(direct_locked)
+        .unwrap()
         .effects
         .clone();
     assert!(
@@ -2025,11 +2265,21 @@ fn regression_locked_layer_and_nested_container_invariants() {
         Some(Color::MAGENTA),
     ));
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&direct_locked].fill,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(direct_locked)
+            .unwrap()
+            .fill,
         fill_before
     );
     assert_eq!(
-        app.active_tab().unwrap().document.objects[&direct_locked].effects,
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(direct_locked)
+            .unwrap()
+            .effects,
         effects_before
     );
 }

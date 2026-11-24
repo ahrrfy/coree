@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 #![forbid(unsafe_code)]
 
-//! Clean-room 100% Pure-Rust CorelDRAW (`.cdr`, `.cdt`, `.cmx`, `.cpt`) format
+//! Clean-room 100% Pure-Rust `.cdr`, `.cdt`, `.cmx`, `.cpt` format
 //! engine with hardened security limits, Arabic CP1256 legacy text decoding,
 //! Unknown-Chunk Passthrough, and the CDR Structural Inspector.
 //!
-//! CorelDRAW, Corel, and PHOTO-PAINT are registered trademarks of Corel Corporation / Alludo.
 //! `coree-cdr` is an independent clean-room open-source implementation with zero
 //! proprietary code or C/C++ dependencies.
 
@@ -38,8 +37,8 @@ pub use cmx::{export_cmx, export_cmx_bytes, export_cmx_bytes_with_endian, CmxPre
 pub use error::{CdrError, CdrResult};
 pub use fixtures::generate_sample_document;
 pub use inspector::{
-    format_report, inspect_corel_bytes, inspect_corel_bytes_with_limits, inspect_corel_file,
-    inspect_corel_file_with_limits, CdrInspectionReport, ChunkSummary, UnknownChunkSummary,
+    format_report, inspect_cdr_bytes, inspect_cdr_bytes_with_limits, inspect_cdr_file,
+    inspect_cdr_file_with_limits, CdrInspectionReport, ChunkSummary, UnknownChunkSummary,
     ZipEntrySummary,
 };
 pub use limits::{
@@ -51,24 +50,24 @@ pub use zcf::extract_cdr_preview_png;
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-cdr";
 
-/// Detected Corel binary container format and version era.
+/// Detected CDR/CDT/CMX/CPT binary container format and version era.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CorelFormat {
+pub enum CdrFormat {
     /// Classic RIFF `.cdr` (v3–v13 / X3).
     CdrRiff { version: u16 },
     /// ZIP/OPC `.cdr` (X4–X5 with `content/riffData.cdr`).
     CdrZipX4,
     /// ZIP/OPC `.cdr` (X6–2025 with `content/root.dat` + `content/data/*.dat`).
     CdrZipX6,
-    /// Classic RIFF `.cdt` CorelDRAW Template.
+    /// Classic RIFF `.cdt` template.
     CdtRiff { version: u16 },
-    /// ZIP/OPC `.cdt` CorelDRAW Template.
+    /// ZIP/OPC `.cdt` template.
     CdtZip,
-    /// 16-bit Corel Presentation Exchange (`.cmx`).
+    /// 16-bit Presentation Exchange (`.cmx`).
     Cmx16,
-    /// 32-bit Corel Presentation Exchange (`.cmx`).
+    /// 32-bit Presentation Exchange (`.cmx`).
     Cmx32,
-    /// Corel PHOTO-PAINT (`.cpt`) multi-layer raster image.
+    /// Multi-layer raster image container (`.cpt`).
     Cpt { version: u8 },
 }
 
@@ -84,46 +83,43 @@ pub enum CdrWriteVersion {
     ZipX6,
 }
 
-/// Result returned by unified Corel file importers.
+/// Result returned by unified CDR/CDT/CMX/CPT file importers.
 #[derive(Debug, Clone)]
 pub struct ImportReport {
     pub document: Document,
-    pub detected_format: CorelFormat,
+    pub detected_format: CdrFormat,
     pub warnings: Vec<String>,
 }
 
-/// Auto-detects the Corel container format from raw file bytes (enforcing security checks
+/// Auto-detects the container format from raw file bytes (enforcing security checks
 /// on ZIP archives).
-pub fn detect_format(bytes: &[u8]) -> CdrResult<CorelFormat> {
+pub fn detect_format(bytes: &[u8]) -> CdrResult<CdrFormat> {
     detect_format_with_limits(bytes, &CodecLimits::default())
 }
 
 /// Auto-detects the container format under explicit [`CodecLimits`], validating full
 /// container integrity (`vrsn`, `tmpt`, ZIP/RIFF/CMX/CPT structure) so results always
-/// match [`import_corel_bytes_with_limits`].
-pub fn detect_format_with_limits(bytes: &[u8], limits: &CodecLimits) -> CdrResult<CorelFormat> {
-    import_corel_bytes_with_limits(bytes, limits).map(|report| report.detected_format)
+/// match [`import_cdr_bytes_with_limits`].
+pub fn detect_format_with_limits(bytes: &[u8], limits: &CodecLimits) -> CdrResult<CdrFormat> {
+    import_cdr_bytes_with_limits(bytes, limits).map(|report| report.detected_format)
 }
 
-/// Imports any supported Corel format (`.cdr` RIFF/X4/X6+, `.cdt`, `.cmx` 16/32-bit, `.cpt`)
+/// Imports any supported format (`.cdr` RIFF/X4/X6+, `.cdt`, `.cmx` 16/32-bit, `.cpt`)
 /// from raw bytes using default [`CodecLimits`].
-pub fn import_corel_bytes(bytes: &[u8]) -> CdrResult<ImportReport> {
-    import_corel_bytes_with_limits(bytes, &CodecLimits::default())
+pub fn import_cdr_bytes(bytes: &[u8]) -> CdrResult<ImportReport> {
+    import_cdr_bytes_with_limits(bytes, &CodecLimits::default())
 }
 
-/// Imports any supported Corel format from raw bytes under explicit [`CodecLimits`].
-pub fn import_corel_bytes_with_limits(
-    bytes: &[u8],
-    limits: &CodecLimits,
-) -> CdrResult<ImportReport> {
+/// Imports any supported container format from raw bytes under explicit [`CodecLimits`].
+pub fn import_cdr_bytes_with_limits(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportReport> {
     if is_zip_bytes(bytes) {
         let parsed = parse_cdr_zip(bytes, limits)?;
         let detected_format = if parsed.is_template {
-            CorelFormat::CdtZip
+            CdrFormat::CdtZip
         } else {
             match parsed.era {
-                CdrZipEra::X4 => CorelFormat::CdrZipX4,
-                CdrZipEra::X6 => CorelFormat::CdrZipX6,
+                CdrZipEra::X4 => CdrFormat::CdrZipX4,
+                CdrZipEra::X6 => CdrFormat::CdrZipX6,
             }
         };
         return Ok(ImportReport {
@@ -145,11 +141,11 @@ pub fn import_corel_bytes_with_limits(
         if is_cdr_form_type(&form) || is_cdt_form_type(&form) {
             let parsed = parse_cdr_riff(bytes, limits, &HashMap::new())?;
             let detected_format = if parsed.is_template {
-                CorelFormat::CdtRiff {
+                CdrFormat::CdtRiff {
                     version: parsed.version,
                 }
             } else {
-                CorelFormat::CdrRiff {
+                CdrFormat::CdrRiff {
                     version: parsed.version,
                 }
             };
@@ -167,15 +163,15 @@ pub fn import_corel_bytes_with_limits(
 }
 
 /// Imports any supported `.cdr`/`.cdt`/`.cmx`/`.cpt` file from disk using default [`CodecLimits`].
-pub fn import_corel_file(path: &Path) -> CdrResult<ImportReport> {
-    import_corel_file_with_limits(path, &CodecLimits::default())
+pub fn import_cdr_file(path: &Path) -> CdrResult<ImportReport> {
+    import_cdr_file_with_limits(path, &CodecLimits::default())
 }
 
 /// Imports any supported `.cdr`/`.cdt`/`.cmx`/`.cpt` file from disk under explicit [`CodecLimits`],
 /// enforcing bounded disk reads before parsing.
-pub fn import_corel_file_with_limits(path: &Path, limits: &CodecLimits) -> CdrResult<ImportReport> {
+pub fn import_cdr_file_with_limits(path: &Path, limits: &CodecLimits) -> CdrResult<ImportReport> {
     let bytes = read_file_bounded(path, limits)?;
-    import_corel_bytes_with_limits(&bytes, limits)
+    import_cdr_bytes_with_limits(&bytes, limits)
 }
 
 /// Exports `doc` to `.cdr` bytes in the requested [`CdrWriteVersion`].

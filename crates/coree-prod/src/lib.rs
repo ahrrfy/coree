@@ -37,8 +37,9 @@ pub use cut_packaging::{
 };
 pub use error::{ProdError, ProdResult};
 pub use find_replace::{
-    find_and_replace, find_objects, ColorMatch, FindQuery, FindReplaceReport, FindScope,
-    LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
+    cql_matches_object, evaluate_cql_query, find_and_replace, find_objects, find_objects_cql,
+    parse_cql_query, ColorMatch, CqlCompareOp, CqlExpr, CqlLiteral, FindQuery, FindReplaceReport,
+    FindScope, LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
 };
 pub use laser_plugin::{
     apply_kerf_offset, default_laser_layer_rules, export_laser_dxf_r12, export_laser_eps,
@@ -47,25 +48,26 @@ pub use laser_plugin::{
     LaserOperationKind, LaserOrigin, LaserToolpathPlan, ToolpathSegment,
 };
 pub use macros::{
-    builtin_macros, find_builtin_macro, run_macro, run_recorded_macro, BuiltinMacro,
-    MacroExecutionResult, MacroSandboxConfig, MacroValue,
+    builtin_macros, find_builtin_macro, plan_macro_ops, plan_recorded_macro_ops, run_macro,
+    run_macro_with_ops, run_recorded_macro, BuiltinMacro, MacroExecutionResult, MacroSandboxConfig,
+    MacroValue,
 };
 pub use plugins::{
     default_plugin_dirs, detect_executable, discover_plugins, export_for_plugin,
-    install_sample_plugin_template, launch_external_bridge, run_rhai_plugin,
-    substitute_bridge_args, PluginCategory, PluginExportFormat, PluginExportOutcome, PluginKind,
-    PluginManifest, PluginRegistry, MAX_BRIDGE_ARGS, MAX_PLUGINS_PER_DIR,
-    MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_SCRIPT_BYTES,
+    install_sample_plugin_template, launch_external_bridge, plan_rhai_plugin_ops, run_rhai_plugin,
+    run_rhai_plugin_with_ops, substitute_bridge_args, PluginCategory, PluginExportFormat,
+    PluginExportOutcome, PluginKind, PluginManifest, PluginRegistry, MAX_BRIDGE_ARGS,
+    MAX_PLUGINS_PER_DIR, MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_SCRIPT_BYTES,
 };
 pub use preflight::{
     run_preflight, PreflightIssue, PreflightIssueKind, PreflightReport, PreflightRules,
     PreflightSeverity,
 };
 pub use prepress::{
-    booklet_signature_order, compute_separations, generate_print_marks, impose_document,
-    simulate_overprint_rgba, ImpositionMode, PrintMarksOptions, PrintMarksResult,
-    SeparationChannel, SeparationOptions, SeparationPlate, SeparationResult,
-    PRINT_MARKS_LAYER_NAME, TILE_MARKS_LAYER_NAME,
+    booklet_signature_order, compute_separations, compute_separations_with_text_outliner,
+    generate_print_marks, impose_document, simulate_overprint_rgba, ImpositionMode,
+    PrintMarksOptions, PrintMarksResult, SeparationChannel, SeparationOptions, SeparationPlate,
+    SeparationResult, PRINT_MARKS_LAYER_NAME, TILE_MARKS_LAYER_NAME,
 };
 pub use print_merge::{
     apply_print_merge, substitute_placeholders, PrintMergeOptions, PrintMergeTable,

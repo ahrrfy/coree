@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![forbid(unsafe_code)]
 
 //! End-to-end integration tests for `coree-cdr`:
 //! - Round-trip fidelity across CDR RIFF v12, CDR X4 ZIP, CDR X6+ ZIP, CDT, and CMX (16/32-bit)
-//! - Multi-layer CPT PHOTO-PAINT import (Raw, PackBits RLE, Zlib, Deflate, RGB/CMYK/Gray + Alpha Masks)
+//! - Multi-layer CPT raster import (Raw, PackBits RLE, Zlib, Deflate, RGB/CMYK/Gray + Alpha Masks)
 //! - Legacy Arabic Windows-1256 (CP1256) explicit & auto-detected decoding
 //! - Unknown-Chunk Passthrough byte-for-byte preservation across container generations
 //! - CDR Structural Inspector accuracy & report formatting
@@ -26,11 +27,11 @@ use coree_cdr::{
         sample_cp1256_arabic_cdr_bytes, sample_cpt_multilayer_bytes, sample_cpt_riff_bytes,
         sample_unknown_chunk_cdr_bytes,
     },
-    format_report, generate_sample_document, import_cdt_bytes, import_corel_bytes,
-    import_corel_bytes_with_limits, import_corel_file, import_corel_file_with_limits,
-    inspect_corel_bytes, inspect_corel_file, inspect_corel_file_with_limits,
+    format_report, generate_sample_document, import_cdr_bytes, import_cdr_bytes_with_limits,
+    import_cdr_file, import_cdr_file_with_limits, import_cdt_bytes, inspect_cdr_bytes,
+    inspect_cdr_file, inspect_cdr_file_with_limits,
     riff::{write_riff, RiffDocument, RiffEndian, RiffNode},
-    CdrError, CdrWriteVersion, CmxPrecision, CodecLimits, CorelFormat,
+    CdrError, CdrFormat, CdrWriteVersion, CmxPrecision, CodecLimits,
 };
 use coree_core::{
     BasicShapeKind, BezierPath, BlendMode, Color, ColorMapMode, ColorMode, CornerStyle, Document,
@@ -72,7 +73,7 @@ impl Drop for TempDirGuard {
 }
 
 fn find_obj_by_name<'a>(doc: &'a Document, name: &str) -> &'a SceneObject {
-    doc.objects
+    doc.objects()
         .values()
         .find(|o| o.name == name)
         .unwrap_or_else(|| panic!("expected object named '{name}' in document"))
@@ -80,17 +81,17 @@ fn find_obj_by_name<'a>(doc: &'a Document, name: &str) -> &'a SceneObject {
 
 fn assert_showcase_cdr_fidelity(orig: &Document, restored: &Document) {
     // 1. Multi-page structure
-    assert_eq!(restored.pages.len(), 2);
-    assert!((restored.pages[0].width_mm - 210.0).abs() < 0.01);
-    assert!((restored.pages[0].height_mm - 297.0).abs() < 0.01);
-    assert!((restored.pages[1].width_mm - 215.9).abs() < 0.01);
-    assert!((restored.pages[1].height_mm - 279.4).abs() < 0.01);
-    assert_eq!(restored.pages[1].name, "Back Cover");
+    assert_eq!(restored.pages().len(), 2);
+    assert!((restored.pages()[0].width_mm - 210.0).abs() < 0.01);
+    assert!((restored.pages()[0].height_mm - 297.0).abs() < 0.01);
+    assert!((restored.pages()[1].width_mm - 215.9).abs() < 0.01);
+    assert!((restored.pages()[1].height_mm - 279.4).abs() < 0.01);
+    assert_eq!(restored.pages()[1].name, "Back Cover");
 
     // 2. Layers + CutContour flag
-    assert_eq!(restored.pages[0].layers.len(), 2);
-    assert!(restored.pages[0].layers[1].is_cut_layer);
-    assert_eq!(restored.pages[0].layers[1].name, "CutContour");
+    assert_eq!(restored.pages()[0].layers.len(), 2);
+    assert!(restored.pages()[0].layers[1].is_cut_layer);
+    assert_eq!(restored.pages()[0].layers[1].name, "CutContour");
 
     // 3. Hero Curve: cubic handles, NodeKind (Symmetrical/Smooth/Cusp), closed flag, gradient, dash outline, affine transform
     let curve = find_obj_by_name(restored, "Hero Curve");
@@ -192,11 +193,11 @@ fn assert_showcase_cdr_fidelity(orig: &Document, restored: &Document) {
     }
 
     // 6. Embedded Bitmap pixel-for-pixel fidelity
-    let orig_asset = orig.assets.values().next().expect("orig asset");
+    let orig_asset = orig.assets().values().next().expect("orig asset");
     let rest_bmp_obj = find_obj_by_name(restored, "Embedded Swatch Bitmap");
     match &rest_bmp_obj.payload {
         NodePayload::Raster(r) => {
-            let asset = restored.assets.get(&r.asset_id).expect("restored asset");
+            let asset = restored.asset(r.asset_id).expect("restored asset");
             assert_eq!(asset.width, orig_asset.width);
             assert_eq!(asset.height, orig_asset.height);
             assert_eq!(asset.rgba_bytes, orig_asset.rgba_bytes);
@@ -264,10 +265,10 @@ fn assert_showcase_cdr_fidelity(orig: &Document, restored: &Document) {
     ));
 
     // 9. Unknown-Chunk Passthrough on document and object
-    assert_eq!(restored.unknown_doc_chunks.len(), 1);
-    assert_eq!(&restored.unknown_doc_chunks[0].fourcc, b"XDOC");
+    assert_eq!(restored.unknown_doc_chunks().len(), 1);
+    assert_eq!(&restored.unknown_doc_chunks()[0].fourcc, b"XDOC");
     assert_eq!(
-        restored.unknown_doc_chunks[0].raw_bytes,
+        restored.unknown_doc_chunks()[0].raw_bytes,
         b"coree-passthrough-doc-payload!"
     );
     assert_eq!(curve.unknown_chunks.len(), 1);
@@ -285,11 +286,8 @@ fn cdr_riff_v12_full_roundtrip() {
     assert_eq!(&bytes[0..4], b"RIFF");
     assert_eq!(&bytes[8..12], b"CDRC");
 
-    let report = import_corel_bytes(&bytes).unwrap();
-    assert_eq!(
-        report.detected_format,
-        CorelFormat::CdrRiff { version: 1200 }
-    );
+    let report = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(report.detected_format, CdrFormat::CdrRiff { version: 1200 });
     assert!(
         report.warnings.is_empty(),
         "unexpected warnings: {:?}",
@@ -314,12 +312,15 @@ fn cdr_zip_x4_roundtrip_and_opc_layout() {
     assert!(names.contains(&"color/documentPalette.xml".to_owned()));
     assert!(names.contains(&"preview/thumbnail.bmp".to_owned()));
 
-    let report = import_corel_bytes(&bytes).unwrap();
-    assert_eq!(report.detected_format, CorelFormat::CdrZipX4);
-    assert_eq!(report.document.metadata.author, "coree contributors");
-    assert_eq!(report.document.metadata.subject, "Vector & Print Showcase");
+    let report = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(report.detected_format, CdrFormat::CdrZipX4);
+    assert_eq!(report.document.metadata().author, "coree contributors");
     assert_eq!(
-        report.document.metadata.keywords,
+        report.document.metadata().subject,
+        "Vector & Print Showcase"
+    );
+    assert_eq!(
+        report.document.metadata().keywords,
         vec!["vector", "arabic", "cmyk"]
     );
     assert_showcase_cdr_fidelity(&orig, &report.document);
@@ -344,8 +345,8 @@ fn cdr_zip_x6_roundtrip_and_externalized_data_files() {
     assert!(names.contains(&"color/documentPalette.xml".to_owned()));
     assert!(names.contains(&"preview/thumbnail.bmp".to_owned()));
 
-    let report = import_corel_bytes(&bytes).unwrap();
-    assert_eq!(report.detected_format, CorelFormat::CdrZipX6);
+    let report = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(report.detected_format, CdrFormat::CdrZipX6);
     assert_showcase_cdr_fidelity(&orig, &report.document);
 }
 
@@ -357,37 +358,37 @@ fn cdt_template_riff_and_zip_roundtrip_plus_disk_io() {
     // CDT ZIP X4
     let cdt_x4_path = tmp.file("template_x4.cdt");
     export_cdt(&orig, &cdt_x4_path, CdrWriteVersion::ZipX4).unwrap();
-    let rep_x4 = import_corel_file(&cdt_x4_path).unwrap();
-    assert_eq!(rep_x4.detected_format, CorelFormat::CdtZip);
+    let rep_x4 = import_cdr_file(&cdt_x4_path).unwrap();
+    assert_eq!(rep_x4.detected_format, CdrFormat::CdtZip);
     assert_showcase_cdr_fidelity(&orig, &rep_x4.document);
 
     // CDT ZIP X6
     let cdt_x6_bytes = export_cdt_bytes(&orig, CdrWriteVersion::ZipX6).unwrap();
     let rep_x6 = import_cdt_bytes(&cdt_x6_bytes, &CodecLimits::default()).unwrap();
-    assert_eq!(rep_x6.detected_format, CorelFormat::CdtZip);
+    assert_eq!(rep_x6.detected_format, CdrFormat::CdtZip);
     assert_showcase_cdr_fidelity(&orig, &rep_x6.document);
 
     // CDT RIFF v12
     let cdt_riff_bytes = export_cdt_bytes(&orig, CdrWriteVersion::RiffV12).unwrap();
-    let rep_riff = import_corel_bytes(&cdt_riff_bytes).unwrap();
+    let rep_riff = import_cdr_bytes(&cdt_riff_bytes).unwrap();
     assert_eq!(
         rep_riff.detected_format,
-        CorelFormat::CdtRiff { version: 1200 }
+        CdrFormat::CdtRiff { version: 1200 }
     );
     assert_showcase_cdr_fidelity(&orig, &rep_riff.document);
 
-    // Disk export_cdr + export_cmx + inspect_corel_file
+    // Disk export_cdr + export_cmx + inspect_cdr_file
     let cdr_path = tmp.file("design.cdr");
     export_cdr(&orig, &cdr_path, CdrWriteVersion::ZipX6).unwrap();
-    let inspected = inspect_corel_file(&cdr_path).unwrap();
-    assert_eq!(inspected.detected_format, CorelFormat::CdrZipX6);
+    let inspected = inspect_cdr_file(&cdr_path).unwrap();
+    assert_eq!(inspected.detected_format, CdrFormat::CdrZipX6);
     assert_eq!(inspected.page_count, 2);
 
     let cmx_path = tmp.file("exchange.cmx");
     export_cmx(&orig, &cmx_path).unwrap();
-    let cmx_rep = import_corel_file(&cmx_path).unwrap();
-    assert_eq!(cmx_rep.detected_format, CorelFormat::Cmx32);
-    assert_eq!(cmx_rep.document.pages.len(), 2);
+    let cmx_rep = import_cdr_file(&cmx_path).unwrap();
+    assert_eq!(cmx_rep.detected_format, CdrFormat::Cmx32);
+    assert_eq!(cmx_rep.document.pages().len(), 2);
 }
 
 #[test]
@@ -397,21 +398,21 @@ fn cmx_16bit_and_32bit_roundtrip() {
     for (precision, expected_fmt, bytes) in [
         (
             CmxPrecision::Bit16,
-            CorelFormat::Cmx16,
+            CdrFormat::Cmx16,
             sample_cmx_16bit_bytes(),
         ),
         (
             CmxPrecision::Bit32,
-            CorelFormat::Cmx32,
+            CdrFormat::Cmx32,
             sample_cmx_32bit_bytes(),
         ),
     ] {
-        let rep = import_corel_bytes(&bytes).unwrap();
+        let rep = import_cdr_bytes(&bytes).unwrap();
         assert_eq!(rep.detected_format, expected_fmt, "precision {precision:?}");
         let doc = &rep.document;
-        assert_eq!(doc.pages.len(), 2);
-        assert_eq!(doc.pages[0].layers.len(), 2);
-        assert!(doc.pages[0].layers[1].is_cut_layer);
+        assert_eq!(doc.pages().len(), 2);
+        assert_eq!(doc.pages()[0].layers.len(), 2);
+        assert!(doc.pages()[0].layers[1].is_cut_layer);
 
         // Verify Hero Curve, Group, Arabic text, and DrawImage survived
         let curve = find_obj_by_name(doc, "Hero Curve");
@@ -435,18 +436,18 @@ fn cmx_16bit_and_32bit_roundtrip() {
         let bmp_obj = find_obj_by_name(doc, "Embedded Swatch Bitmap");
         match &bmp_obj.payload {
             NodePayload::Raster(r) => {
-                let asset = doc.assets.get(&r.asset_id).expect("CMX rimg asset");
+                let asset = doc.asset(r.asset_id).expect("CMX rimg asset");
                 assert_eq!(asset.width, 4);
                 assert_eq!(asset.height, 4);
-                let orig_asset = orig.assets.values().next().unwrap();
+                let orig_asset = orig.assets().values().next().unwrap();
                 assert_eq!(asset.rgba_bytes, orig_asset.rgba_bytes);
             }
             other => panic!("expected Raster in CMX, got {other:?}"),
         }
 
         // Document-level unknown chunk passthrough in CMX
-        assert_eq!(doc.unknown_doc_chunks.len(), 1);
-        assert_eq!(&doc.unknown_doc_chunks[0].fourcc, b"XDOC");
+        assert_eq!(doc.unknown_doc_chunks().len(), 1);
+        assert_eq!(&doc.unknown_doc_chunks()[0].fourcc, b"XDOC");
     }
 
     // Re-export CMX directly via export_cmx_bytes
@@ -457,19 +458,19 @@ fn cmx_16bit_and_32bit_roundtrip() {
 #[test]
 fn cpt_multilayer_raster_and_alpha_mask_import() {
     let bytes = sample_cpt_multilayer_bytes();
-    let rep = import_corel_bytes(&bytes).unwrap();
-    assert_eq!(rep.detected_format, CorelFormat::Cpt { version: 9 });
+    let rep = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(rep.detected_format, CdrFormat::Cpt { version: 9 });
 
     let doc = &rep.document;
-    assert_eq!(doc.pages.len(), 1);
-    assert_eq!(doc.pages[0].layers.len(), 3);
-    assert_eq!(doc.assets.len(), 3);
+    assert_eq!(doc.pages().len(), 1);
+    assert_eq!(doc.pages()[0].layers.len(), 3);
+    assert_eq!(doc.assets().len(), 3);
 
     // Layer 1: Background RGB (Raw)
     let bg = find_obj_by_name(doc, "Background RGB");
     assert_eq!(bg.blend_mode, BlendMode::Normal);
     if let NodePayload::Raster(r) = &bg.payload {
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         assert_eq!((asset.width, asset.height), (8, 6));
         assert_eq!(&asset.rgba_bytes[0..4], &[0, 0, 220, 255]);
         assert_eq!(&asset.rgba_bytes[4..8], &[30, 0, 220, 255]);
@@ -483,7 +484,7 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     assert!((mag.opacity - (204.0 / 255.0)).abs() < 1e-4);
     assert!(mag.transform.m[4] > 0.0 && mag.transform.m[5] > 0.0); // offset_x=2, offset_y=1
     if let NodePayload::Raster(r) = &mag.payload {
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         assert_eq!(asset.color_mode, ColorMode::Cmyk);
         // Process Magenta CMYK(0,1,0,0) -> RGB(255, 0, 255), alpha = 128 from Zlib mask
         assert_eq!(&asset.rgba_bytes[0..4], &[255, 0, 255, 128]);
@@ -496,7 +497,7 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     assert_eq!(gray.blend_mode, BlendMode::Screen);
     assert!(gray.locked);
     if let NodePayload::Raster(r) = &gray.payload {
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         assert_eq!(&asset.rgba_bytes[0..4], &[200, 200, 200, 255]);
         assert_eq!(&asset.rgba_bytes[4..8], &[200, 200, 200, 64]);
     } else {
@@ -504,11 +505,11 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     }
 
     // Also verify RIFF `CPT ` and CPT7/CPT8 magic variants
-    let riff_cpt = import_corel_bytes(&sample_cpt_riff_bytes()).unwrap();
-    assert_eq!(riff_cpt.detected_format, CorelFormat::Cpt { version: 9 });
+    let riff_cpt = import_cdr_bytes(&sample_cpt_riff_bytes()).unwrap();
+    assert_eq!(riff_cpt.detected_format, CdrFormat::Cpt { version: 9 });
     let riff_obj = find_obj_by_name(&riff_cpt.document, "RIFF Raster");
     if let NodePayload::Raster(r) = &riff_obj.payload {
-        let asset = &riff_cpt.document.assets[&r.asset_id];
+        let asset = &riff_cpt.document.assets()[&r.asset_id];
         assert_eq!(&asset.rgba_bytes[0..4], &[100, 150, 200, 180]);
     } else {
         panic!("expected RIFF CPT raster");
@@ -539,19 +540,19 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
         }],
     )
     .unwrap();
-    let rep7 = import_corel_bytes(&cpt7).unwrap();
-    assert_eq!(rep7.detected_format, CorelFormat::Cpt { version: 7 });
+    let rep7 = import_cdr_bytes(&cpt7).unwrap();
+    assert_eq!(rep7.detected_format, CdrFormat::Cpt { version: 7 });
 }
 
 #[test]
 fn cp1256_arabic_legacy_cdr_decoding_explicit_and_autodetected() {
     let bytes = sample_cp1256_arabic_cdr_bytes();
-    let rep = import_corel_bytes(&bytes).unwrap();
-    assert_eq!(rep.detected_format, CorelFormat::CdrRiff { version: 900 });
+    let rep = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(rep.detected_format, CdrFormat::CdrRiff { version: 900 });
 
     let texts: Vec<(String, TextDirection)> = rep
         .document
-        .objects
+        .objects()
         .values()
         .filter_map(|o| match &o.payload {
             NodePayload::ArtisticText(t) => Some((t.plain_text(), t.effective_direction())),
@@ -581,10 +582,10 @@ fn unknown_chunk_passthrough_byte_for_byte_across_all_cdr_generations() {
     let expected_obj = vec![0xFE, 0xDC, 0xBA, 0x98, 0x76];
 
     // Step 1: Import original RIFF
-    let step1 = import_corel_bytes(&orig_bytes).unwrap().document;
-    assert_eq!(step1.unknown_doc_chunks.len(), 1);
-    assert_eq!(&step1.unknown_doc_chunks[0].fourcc, b"XDOC");
-    assert_eq!(step1.unknown_doc_chunks[0].raw_bytes, expected_doc);
+    let step1 = import_cdr_bytes(&orig_bytes).unwrap().document;
+    assert_eq!(step1.unknown_doc_chunks().len(), 1);
+    assert_eq!(&step1.unknown_doc_chunks()[0].fourcc, b"XDOC");
+    assert_eq!(step1.unknown_doc_chunks()[0].raw_bytes, expected_doc);
     let obj1 = find_obj_by_name(&step1, "Box With Custom Chunk");
     assert_eq!(obj1.unknown_chunks.len(), 1);
     assert_eq!(&obj1.unknown_chunks[0].fourcc, b"XOBJ");
@@ -592,8 +593,8 @@ fn unknown_chunk_passthrough_byte_for_byte_across_all_cdr_generations() {
 
     // Step 2: Export -> RiffV12 -> re-import
     let riff_re = export_cdr_bytes(&step1, CdrWriteVersion::RiffV12).unwrap();
-    let step2 = import_corel_bytes(&riff_re).unwrap().document;
-    assert_eq!(step2.unknown_doc_chunks[0].raw_bytes, expected_doc);
+    let step2 = import_cdr_bytes(&riff_re).unwrap().document;
+    assert_eq!(step2.unknown_doc_chunks()[0].raw_bytes, expected_doc);
     assert_eq!(
         find_obj_by_name(&step2, "Box With Custom Chunk").unknown_chunks[0].raw_bytes,
         expected_obj
@@ -601,8 +602,8 @@ fn unknown_chunk_passthrough_byte_for_byte_across_all_cdr_generations() {
 
     // Step 3: Export -> ZipX4 -> re-import
     let x4_re = export_cdr_bytes(&step2, CdrWriteVersion::ZipX4).unwrap();
-    let step3 = import_corel_bytes(&x4_re).unwrap().document;
-    assert_eq!(step3.unknown_doc_chunks[0].raw_bytes, expected_doc);
+    let step3 = import_cdr_bytes(&x4_re).unwrap().document;
+    assert_eq!(step3.unknown_doc_chunks()[0].raw_bytes, expected_doc);
     assert_eq!(
         find_obj_by_name(&step3, "Box With Custom Chunk").unknown_chunks[0].raw_bytes,
         expected_obj
@@ -610,8 +611,8 @@ fn unknown_chunk_passthrough_byte_for_byte_across_all_cdr_generations() {
 
     // Step 4: Export -> ZipX6 -> re-import
     let x6_re = export_cdr_bytes(&step3, CdrWriteVersion::ZipX6).unwrap();
-    let step4 = import_corel_bytes(&x6_re).unwrap().document;
-    assert_eq!(step4.unknown_doc_chunks[0].raw_bytes, expected_doc);
+    let step4 = import_cdr_bytes(&x6_re).unwrap().document;
+    assert_eq!(step4.unknown_doc_chunks()[0].raw_bytes, expected_doc);
     assert_eq!(
         find_obj_by_name(&step4, "Box With Custom Chunk").unknown_chunks[0].raw_bytes,
         expected_obj
@@ -723,7 +724,7 @@ fn powerclip_all_parametric_shapes_and_advanced_fills_roundtrip() {
     );
 
     let bytes = export_cdr_bytes(&doc, CdrWriteVersion::ZipX6).unwrap();
-    let restored = import_corel_bytes(&bytes).unwrap().document;
+    let restored = import_cdr_bytes(&bytes).unwrap().document;
 
     let pc = find_obj_by_name(&restored, "Clip Frame");
     match &pc.payload {
@@ -756,10 +757,10 @@ fn powerclip_all_parametric_shapes_and_advanced_fills_roundtrip() {
 #[test]
 fn cdr_inspector_accuracy_across_all_formats() {
     // 1. RIFF v12
-    let riff_rep = inspect_corel_bytes(&sample_cdr_riff_v12_bytes()).unwrap();
+    let riff_rep = inspect_cdr_bytes(&sample_cdr_riff_v12_bytes()).unwrap();
     assert_eq!(
         riff_rep.detected_format,
-        CorelFormat::CdrRiff { version: 1200 }
+        CdrFormat::CdrRiff { version: 1200 }
     );
     assert_eq!(riff_rep.page_count, 2);
     assert_eq!(riff_rep.layer_count, 3);
@@ -779,15 +780,15 @@ fn cdr_inspector_accuracy_across_all_formats() {
     assert!(formatted.contains("XOBJ"));
 
     // 2. X4 & X6 ZIP
-    let x4_rep = inspect_corel_bytes(&sample_cdr_zip_x4_bytes()).unwrap();
-    assert_eq!(x4_rep.detected_format, CorelFormat::CdrZipX4);
+    let x4_rep = inspect_cdr_bytes(&sample_cdr_zip_x4_bytes()).unwrap();
+    assert_eq!(x4_rep.detected_format, CdrFormat::CdrZipX4);
     assert!(x4_rep
         .zip_entries
         .iter()
         .any(|e| e.name == "content/riffData.cdr"));
 
-    let x6_rep = inspect_corel_bytes(&sample_cdr_zip_x6_bytes()).unwrap();
-    assert_eq!(x6_rep.detected_format, CorelFormat::CdrZipX6);
+    let x6_rep = inspect_cdr_bytes(&sample_cdr_zip_x6_bytes()).unwrap();
+    assert_eq!(x6_rep.detected_format, CdrFormat::CdrZipX6);
     assert!(x6_rep
         .zip_entries
         .iter()
@@ -799,15 +800,15 @@ fn cdr_inspector_accuracy_across_all_formats() {
     assert!(x6_rep.format_report().contains("ZIP Entries"));
 
     // 3. CDT, CMX, CPT
-    let cdt_rep = inspect_corel_bytes(&sample_cdt_bytes()).unwrap();
-    assert_eq!(cdt_rep.detected_format, CorelFormat::CdtZip);
+    let cdt_rep = inspect_cdr_bytes(&sample_cdt_bytes()).unwrap();
+    assert_eq!(cdt_rep.detected_format, CdrFormat::CdtZip);
 
-    let cmx_rep = inspect_corel_bytes(&sample_cmx_32bit_bytes()).unwrap();
-    assert_eq!(cmx_rep.detected_format, CorelFormat::Cmx32);
+    let cmx_rep = inspect_cdr_bytes(&sample_cmx_32bit_bytes()).unwrap();
+    assert_eq!(cmx_rep.detected_format, CdrFormat::Cmx32);
     assert_eq!(cmx_rep.page_count, 2);
 
-    let cpt_rep = inspect_corel_bytes(&sample_cpt_multilayer_bytes()).unwrap();
-    assert_eq!(cpt_rep.detected_format, CorelFormat::Cpt { version: 9 });
+    let cpt_rep = inspect_cdr_bytes(&sample_cpt_multilayer_bytes()).unwrap();
+    assert_eq!(cpt_rep.detected_format, CdrFormat::Cpt { version: 9 });
     assert_eq!(cpt_rep.layer_count, 3);
     assert_eq!(cpt_rep.bitmap_count, 3);
 }
@@ -833,21 +834,21 @@ fn dib_and_bmp_24bit_8bit_1bit_and_topdown_decoding() {
 #[test]
 fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
     // 1. Empty, truncated header, garbage bytes, truncated chunk
-    assert!(import_corel_bytes(&[]).is_err());
-    assert!(import_corel_bytes(&malformed_truncated_header()).is_err());
-    assert!(import_corel_bytes(&malformed_garbage_bytes()).is_err());
-    assert!(import_corel_bytes(&malformed_truncated_chunk()).is_err());
-    assert!(inspect_corel_bytes(&malformed_truncated_header()).is_err());
-    assert!(inspect_corel_bytes(&malformed_garbage_bytes()).is_err());
+    assert!(import_cdr_bytes(&[]).is_err());
+    assert!(import_cdr_bytes(&malformed_truncated_header()).is_err());
+    assert!(import_cdr_bytes(&malformed_garbage_bytes()).is_err());
+    assert!(import_cdr_bytes(&malformed_truncated_chunk()).is_err());
+    assert!(inspect_cdr_bytes(&malformed_truncated_header()).is_err());
+    assert!(inspect_cdr_bytes(&malformed_garbage_bytes()).is_err());
 
     // 2. Zip-Slip (`../../etc/passwd`)
-    let slip_err = import_corel_bytes(&malformed_zip_slip_bytes()).unwrap_err();
+    let slip_err = import_cdr_bytes(&malformed_zip_slip_bytes()).unwrap_err();
     assert!(
         matches!(slip_err, CdrError::ZipSlipDetected { .. }),
         "expected ZipSlipDetected, got {slip_err:?}"
     );
     assert!(matches!(
-        inspect_corel_bytes(&malformed_zip_slip_bytes()).unwrap_err(),
+        inspect_cdr_bytes(&malformed_zip_slip_bytes()).unwrap_err(),
         CdrError::ZipSlipDetected { .. }
     ));
 
@@ -861,7 +862,7 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
             zip.write_all(b"evil").unwrap();
             zip.finish().unwrap();
         }
-        let err = import_corel_bytes(&cursor.into_inner()).unwrap_err();
+        let err = import_cdr_bytes(&cursor.into_inner()).unwrap_err();
         assert!(
             matches!(err, CdrError::ZipSlipDetected { .. }),
             "path '{evil_name}' should fail with ZipSlipDetected, got {err:?}"
@@ -869,7 +870,7 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
     }
 
     // 3. Zip-Bomb (high compression ratio & bounded streaming size cap)
-    let bomb_err = import_corel_bytes(&malformed_zip_bomb_bytes()).unwrap_err();
+    let bomb_err = import_cdr_bytes(&malformed_zip_bomb_bytes()).unwrap_err();
     assert!(
         matches!(
             bomb_err,
@@ -878,10 +879,10 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
         ),
         "expected Zip-Bomb rejection, got {bomb_err:?}"
     );
-    assert!(inspect_corel_bytes(&malformed_zip_bomb_bytes()).is_err());
+    assert!(inspect_cdr_bytes(&malformed_zip_bomb_bytes()).is_err());
 
     // 4. Zlib Bomb hidden inside RIFF `LIST cmpr`
-    let cmpr_bomb_err = import_corel_bytes(&malformed_cmpr_zlib_bomb_bytes()).unwrap_err();
+    let cmpr_bomb_err = import_cdr_bytes(&malformed_cmpr_zlib_bomb_bytes()).unwrap_err();
     assert!(
         matches!(
             cmpr_bomb_err,
@@ -892,19 +893,19 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
     );
 
     // 5. 200-deep nested RIFF `LIST`
-    let deep_err = import_corel_bytes(&malformed_deep_nested_riff_bytes(200)).unwrap_err();
+    let deep_err = import_cdr_bytes(&malformed_deep_nested_riff_bytes(200)).unwrap_err();
     assert!(
         matches!(deep_err, CdrError::DepthLimitExceeded { .. }),
         "expected DepthLimitExceeded, got {deep_err:?}"
     );
 
     // 6. Huge bitmap dimensions in CDR (`65536x65536`) and CPT (`100000x100000`)
-    let bmp_err = import_corel_bytes(&malformed_huge_bitmap_cdr_bytes()).unwrap_err();
+    let bmp_err = import_cdr_bytes(&malformed_huge_bitmap_cdr_bytes()).unwrap_err();
     assert!(
         matches!(bmp_err, CdrError::InvalidBitmapDimensions { .. }),
         "expected InvalidBitmapDimensions for CDR, got {bmp_err:?}"
     );
-    let cpt_err = import_corel_bytes(&malformed_huge_bitmap_cpt_bytes()).unwrap_err();
+    let cpt_err = import_cdr_bytes(&malformed_huge_bitmap_cpt_bytes()).unwrap_err();
     assert!(
         matches!(cpt_err, CdrError::InvalidBitmapDimensions { .. }),
         "expected InvalidBitmapDimensions for CPT, got {cpt_err:?}"
@@ -936,7 +937,7 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
     ))
     .unwrap();
     // Should never panic or OOM (records non-fatal warning on malformed loda)
-    let parsed_evil = import_corel_bytes(&evil_riff).unwrap();
+    let parsed_evil = import_cdr_bytes(&evil_riff).unwrap();
     assert!(!parsed_evil.warnings.is_empty());
 
     // 8. Tight custom CodecLimits byte cap rejects normal X4 ZIP cleanly
@@ -945,7 +946,7 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
         ..CodecLimits::default()
     };
     let cap_err =
-        import_corel_bytes_with_limits(&sample_cdr_zip_x4_bytes(), &tiny_limits).unwrap_err();
+        import_cdr_bytes_with_limits(&sample_cdr_zip_x4_bytes(), &tiny_limits).unwrap_err();
     assert!(matches!(
         cap_err,
         CdrError::UncompressedSizeLimitExceeded { .. }
@@ -976,19 +977,19 @@ fn adversarial_security_suite_rejects_all_attacks_with_zero_panics() {
     for sample in &valid_corpus {
         // Every prefix length up to 128 + strided prefixes across full length
         for len in 0..sample.len().min(128) {
-            let _ = import_corel_bytes(&sample[..len]);
-            let _ = inspect_corel_bytes(&sample[..len]);
+            let _ = import_cdr_bytes(&sample[..len]);
+            let _ = inspect_cdr_bytes(&sample[..len]);
         }
         let step = (sample.len() / 32).max(1);
         for len in (0..sample.len()).step_by(step) {
-            let _ = import_corel_bytes(&sample[..len]);
+            let _ = import_cdr_bytes(&sample[..len]);
         }
         // Deterministic single-byte mutations across key offsets
         for offset in (0..sample.len().min(256)).step_by(7) {
             let mut mutated = sample.clone();
             mutated[offset] ^= 0xFF;
-            let _ = import_corel_bytes(&mutated);
-            let _ = inspect_corel_bytes(&mutated);
+            let _ = import_cdr_bytes(&mutated);
+            let _ = inspect_cdr_bytes(&mutated);
         }
     }
 }
@@ -1101,7 +1102,7 @@ fn cpt_rle_bomb_rejected_before_allocating() {
     cpt.extend_from_slice(&[0x81, 0x00, 0x81, 0x00, 0x81, 0x00, 0x81, 0x00, 0x81, 0x00]);
     cpt.push(0); // no mask
 
-    let err = import_corel_bytes(&cpt).unwrap_err();
+    let err = import_cdr_bytes(&cpt).unwrap_err();
     assert!(
         matches!(err, CdrError::CompressionRatioExceeded { .. }),
         "expected CompressionRatioExceeded for RLE bomb, got {err:?}"
@@ -1155,56 +1156,56 @@ fn cdr_zip_x6_multiple_external_bitmaps_roundtrip() {
     assert!(names.contains(&"content/data/0001.dat".to_owned()));
     assert!(names.contains(&"content/data/0002.dat".to_owned()));
 
-    let restored = import_corel_bytes(&bytes).unwrap().document;
-    assert_eq!(restored.assets.len(), 2);
+    let restored = import_cdr_bytes(&bytes).unwrap().document;
+    assert_eq!(restored.assets().len(), 2);
     let o1 = find_obj_by_name(&restored, "Img One");
     let o2 = find_obj_by_name(&restored, "Img Two");
     if let (NodePayload::Raster(r1), NodePayload::Raster(r2)) = (&o1.payload, &o2.payload) {
-        assert_eq!(restored.assets[&r1.asset_id].rgba_bytes, a1.rgba_bytes);
-        assert_eq!(restored.assets[&r2.asset_id].rgba_bytes, a2.rgba_bytes);
+        assert_eq!(restored.assets()[&r1.asset_id].rgba_bytes, a1.rgba_bytes);
+        assert_eq!(restored.assets()[&r2.asset_id].rgba_bytes, a2.rgba_bytes);
     } else {
         panic!("expected both raster objects");
     }
 }
 
 #[test]
-fn detect_format_matches_all_eight_corel_formats() {
+fn detect_format_matches_all_eight_cdr_formats() {
     use coree_cdr::detect_format;
 
     assert_eq!(
         detect_format(&sample_cdr_riff_v12_bytes()).unwrap(),
-        CorelFormat::CdrRiff { version: 1200 }
+        CdrFormat::CdrRiff { version: 1200 }
     );
     assert_eq!(
         detect_format(&sample_cdr_zip_x4_bytes()).unwrap(),
-        CorelFormat::CdrZipX4
+        CdrFormat::CdrZipX4
     );
     assert_eq!(
         detect_format(&sample_cdr_zip_x6_bytes()).unwrap(),
-        CorelFormat::CdrZipX6
+        CdrFormat::CdrZipX6
     );
     assert_eq!(
         detect_format(
             &export_cdt_bytes(&generate_sample_document(), CdrWriteVersion::RiffV12).unwrap()
         )
         .unwrap(),
-        CorelFormat::CdtRiff { version: 1200 }
+        CdrFormat::CdtRiff { version: 1200 }
     );
     assert_eq!(
         detect_format(&sample_cdt_bytes()).unwrap(),
-        CorelFormat::CdtZip
+        CdrFormat::CdtZip
     );
     assert_eq!(
         detect_format(&sample_cmx_16bit_bytes()).unwrap(),
-        CorelFormat::Cmx16
+        CdrFormat::Cmx16
     );
     assert_eq!(
         detect_format(&sample_cmx_32bit_bytes()).unwrap(),
-        CorelFormat::Cmx32
+        CdrFormat::Cmx32
     );
     assert_eq!(
         detect_format(&sample_cpt_multilayer_bytes()).unwrap(),
-        CorelFormat::Cpt { version: 9 }
+        CdrFormat::Cpt { version: 9 }
     );
 }
 
@@ -1225,11 +1226,11 @@ fn regression_1_bounded_disk_read_and_cumulative_zip_cmpr_multidib_budget() {
         ..CodecLimits::default()
     };
     assert!(matches!(
-        import_corel_file_with_limits(&cdr_path, &tiny).unwrap_err(),
+        import_cdr_file_with_limits(&cdr_path, &tiny).unwrap_err(),
         CdrError::UncompressedSizeLimitExceeded { limit: 256 }
     ));
     assert!(matches!(
-        inspect_corel_file_with_limits(&cdr_path, &tiny).unwrap_err(),
+        inspect_cdr_file_with_limits(&cdr_path, &tiny).unwrap_err(),
         CdrError::UncompressedSizeLimitExceeded { limit: 256 }
     ));
 
@@ -1271,7 +1272,7 @@ fn regression_1_bounded_disk_read_and_cumulative_zip_cmpr_multidib_budget() {
     };
     assert!(
         matches!(
-            import_corel_bytes_with_limits(&zip_bytes, &cap_100k).unwrap_err(),
+            import_cdr_bytes_with_limits(&zip_bytes, &cap_100k).unwrap_err(),
             CdrError::UncompressedSizeLimitExceeded { limit: 100_000 }
         ),
         "cumulative ZIP + LIST cmpr must exceed 100_000 budget"
@@ -1318,7 +1319,7 @@ fn regression_1_bounded_disk_read_and_cumulative_zip_cmpr_multidib_budget() {
     };
     assert!(
         matches!(
-            import_corel_bytes_with_limits(&multi_dib_cdr, &cap_200k).unwrap_err(),
+            import_cdr_bytes_with_limits(&multi_dib_cdr, &cap_200k).unwrap_err(),
             CdrError::UncompressedSizeLimitExceeded { limit: 200_000 }
         ),
         "cumulative multi-DIB RGBA allocations must be bounded by max_uncompressed_bytes"
@@ -1354,7 +1355,7 @@ fn regression_1_bounded_disk_read_and_cumulative_zip_cmpr_multidib_budget() {
     )
     .unwrap();
     assert!(matches!(
-        import_corel_bytes_with_limits(&multi_cpt, &cap_100k).unwrap_err(),
+        import_cdr_bytes_with_limits(&multi_cpt, &cap_100k).unwrap_err(),
         CdrError::UncompressedSizeLimitExceeded { limit: 100_000 }
     ));
 }
@@ -1374,7 +1375,7 @@ fn regression_2_zip_duplicates_datafilelist_amplification_and_forged_compressed_
         zip.write_all(&valid_riff).unwrap();
         zip.finish().unwrap();
     }
-    let dup_err = import_corel_bytes(&dup_cur.into_inner()).unwrap_err();
+    let dup_err = import_cdr_bytes(&dup_cur.into_inner()).unwrap_err();
     assert!(
         matches!(dup_err, CdrError::ZipError(ref msg) if msg.contains("duplicate")),
         "expected duplicate ZIP entry rejection, got {dup_err:?}"
@@ -1397,7 +1398,7 @@ fn regression_2_zip_duplicates_datafilelist_amplification_and_forged_compressed_
             if name == "content/dataFileList.dat" {
                 // Store uncompressed (1:1 ratio) so ratio guard passes and deduplication is exercised directly!
                 dst.start_file(&name, stored).unwrap();
-                let mut repeated = String::from("content/root.dat\n");
+                let mut repeated = String::from("data/data0.dat\n");
                 for _ in 0..2000 {
                     repeated.push_str("data/0001.dat\n");
                 }
@@ -1409,14 +1410,14 @@ fn regression_2_zip_duplicates_datafilelist_amplification_and_forged_compressed_
         }
         dst.finish().unwrap();
     }
-    // Tight budget (64 KiB): without deduplication, 2000x `data/0001.dat` (~240 KiB) blows past 64 KiB!
+    // Tight budget (96 KiB): without deduplication, 2000x `data/0001.dat` (~32 MiB) blows past 96 KiB!
     let tight = CodecLimits {
-        max_uncompressed_bytes: 64 * 1024,
+        max_uncompressed_bytes: 96 * 1024,
         ..CodecLimits::default()
     };
-    let amp_rep = import_corel_bytes_with_limits(&amp_cur.into_inner(), &tight).unwrap();
-    assert_eq!(amp_rep.detected_format, CorelFormat::CdrZipX6);
-    assert_eq!(amp_rep.document.assets.len(), 1);
+    let amp_rep = import_cdr_bytes_with_limits(&amp_cur.into_inner(), &tight).unwrap();
+    assert_eq!(amp_rep.detected_format, CdrFormat::CdrZipX6);
+    assert_eq!(amp_rep.document.assets().len(), 1);
 
     // 2c. Forged central-directory `compressed_size` > archive length must be rejected
     let mut forged = sample_cdr_zip_x4_bytes();
@@ -1428,7 +1429,7 @@ fn regression_2_zip_duplicates_datafilelist_amplification_and_forged_compressed_
     // In ZIP CDFH, `compressed_size` (u32 LE) is at offset +20 from `PK\x01\x02`
     let huge_comp: u32 = 16 * 1024 * 1024;
     forged[cd_pos + 20..cd_pos + 24].copy_from_slice(&huge_comp.to_le_bytes());
-    let forged_err = import_corel_bytes(&forged).unwrap_err();
+    let forged_err = import_cdr_bytes(&forged).unwrap_err();
     assert!(
         matches!(forged_err, CdrError::ZipError(ref msg) if msg.contains("forged")),
         "expected forged compressed_size rejection, got {forged_err:?}"
@@ -1440,21 +1441,21 @@ fn regression_3_cmx_rifx_big_endian_and_open_group_flush() {
     // 3a. Big-endian `RIFX` CMX (both 16-bit and 32-bit) round-trips cleanly!
     let orig = generate_sample_document();
     for (prec, expected_fmt) in [
-        (CmxPrecision::Bit16, CorelFormat::Cmx16),
-        (CmxPrecision::Bit32, CorelFormat::Cmx32),
+        (CmxPrecision::Bit16, CdrFormat::Cmx16),
+        (CmxPrecision::Bit32, CdrFormat::Cmx32),
     ] {
         let rifx = export_cmx_bytes_with_endian(&orig, prec, RiffEndian::Big).unwrap();
         assert_eq!(&rifx[0..4], b"RIFX");
-        let rep = import_corel_bytes(&rifx).unwrap();
+        let rep = import_cdr_bytes(&rifx).unwrap();
         assert_eq!(rep.detected_format, expected_fmt);
-        assert_eq!(rep.document.pages.len(), 2);
-        assert_eq!(rep.document.pages[0].layers.len(), 2);
+        assert_eq!(rep.document.pages().len(), 2);
+        assert_eq!(rep.document.pages()[0].layers.len(), 2);
         let ar = find_obj_by_name(&rep.document, "Arabic Headline");
         match &ar.payload {
             NodePayload::ArtisticText(t) => assert_eq!(t.plain_text(), "مرحباً بكم في كوري"),
             other => panic!("expected Arabic text in RIFX CMX, got {other:?}"),
         }
-        assert_eq!(rep.document.assets.len(), 1);
+        assert_eq!(rep.document.assets().len(), 1);
     }
 
     // 3b. Unclosed `CMD_BEGIN_GROUP` across `CMD_BEGIN_LAYER` / `CMD_BEGIN_PAGE`, AND
@@ -1504,18 +1505,21 @@ fn regression_3_cmx_rifx_big_endian_and_open_group_flush() {
     ))
     .unwrap();
 
-    let parsed = import_corel_bytes(&cmx_bytes).unwrap().document;
-    assert_eq!(parsed.pages.len(), 2);
+    let parsed = import_cdr_bytes(&cmx_bytes).unwrap().document;
+    assert_eq!(parsed.pages().len(), 2);
     // Page 1 must hold both groups on its layers (zero orphaned objects, zero leak into Page 2!)
-    assert!(parsed.pages[1].layers.iter().all(|l| l.objects.is_empty()));
+    assert!(parsed.pages()[1]
+        .layers
+        .iter()
+        .all(|l| l.objects.is_empty()));
     let attached_ids: Vec<ObjectId> = parsed
-        .pages
+        .pages()
         .iter()
         .flat_map(|p| p.layers.iter())
         .flat_map(|l| l.objects.iter().copied())
         .collect();
-    assert_eq!(attached_ids.len(), parsed.objects.len());
-    assert_eq!(parsed.objects.len(), 2);
+    assert_eq!(attached_ids.len(), parsed.object_count());
+    assert_eq!(parsed.object_count(), 2);
 }
 
 #[test]
@@ -1589,37 +1593,37 @@ fn regression_4_cmpr_resource_pass_order_and_unknown_list_passthrough() {
     ))
     .unwrap();
 
-    let doc1 = import_corel_bytes(&cdr).unwrap().document;
-    let obj1 = doc1.objects.values().next().expect("resolved object");
+    let doc1 = import_cdr_bytes(&cdr).unwrap().document;
+    let obj1 = doc1.objects().values().next().expect("resolved object");
     assert_eq!(
         obj1.fill,
         Fill::Solid(Color::CYAN),
         "compressed page must resolve subsequent sibling LIST fill"
     );
-    assert_eq!(doc1.unknown_doc_chunks.len(), 1);
-    assert_eq!(&doc1.unknown_doc_chunks[0].fourcc, b"LIST");
-    assert_eq!(&doc1.unknown_doc_chunks[0].raw_bytes[0..4], b"XGRP");
+    assert_eq!(doc1.unknown_doc_chunks().len(), 1);
+    assert_eq!(&doc1.unknown_doc_chunks()[0].fourcc, b"LIST");
+    assert_eq!(&doc1.unknown_doc_chunks()[0].raw_bytes[0..4], b"XGRP");
     assert_eq!(obj1.unknown_chunks.len(), 1);
     assert_eq!(&obj1.unknown_chunks[0].fourcc, b"LIST");
     assert_eq!(&obj1.unknown_chunks[0].raw_bytes[0..4], b"XOPL");
 
     // Re-export to compressed RiffV12 AND ZipX6 and verify byte-for-byte nested LIST passthrough!
-    let expected_doc_raw = doc1.unknown_doc_chunks[0].raw_bytes.clone();
+    let expected_doc_raw = doc1.unknown_doc_chunks()[0].raw_bytes.clone();
     let expected_obj_raw = obj1.unknown_chunks[0].raw_bytes.clone();
 
     let re_riff = export_cdr_bytes(&doc1, CdrWriteVersion::RiffV12).unwrap();
-    let doc2 = import_corel_bytes(&re_riff).unwrap().document;
-    assert_eq!(doc2.unknown_doc_chunks[0].raw_bytes, expected_doc_raw);
+    let doc2 = import_cdr_bytes(&re_riff).unwrap().document;
+    assert_eq!(doc2.unknown_doc_chunks()[0].raw_bytes, expected_doc_raw);
     assert_eq!(
-        doc2.objects.values().next().unwrap().unknown_chunks[0].raw_bytes,
+        doc2.objects().values().next().unwrap().unknown_chunks[0].raw_bytes,
         expected_obj_raw
     );
 
     let re_x6 = export_cdr_bytes(&doc2, CdrWriteVersion::ZipX6).unwrap();
-    let doc3 = import_corel_bytes(&re_x6).unwrap().document;
-    assert_eq!(doc3.unknown_doc_chunks[0].raw_bytes, expected_doc_raw);
+    let doc3 = import_cdr_bytes(&re_x6).unwrap().document;
+    assert_eq!(doc3.unknown_doc_chunks()[0].raw_bytes, expected_doc_raw);
     assert_eq!(
-        doc3.objects.values().next().unwrap().unknown_chunks[0].raw_bytes,
+        doc3.objects().values().next().unwrap().unknown_chunks[0].raw_bytes,
         expected_obj_raw
     );
 }
@@ -1686,14 +1690,14 @@ fn regression_6_detect_format_truncation_and_vrsn_tmpt_consistency() {
     // Truncated 12-byte RIFF header must FAIL detect_format (consistent with import/inspect!)
     let trunc_riff = b"RIFF\xFF\x00\x00\x00CDRC";
     assert!(detect_format(trunc_riff).is_err());
-    assert!(import_corel_bytes(trunc_riff).is_err());
-    assert!(inspect_corel_bytes(trunc_riff).is_err());
+    assert!(import_cdr_bytes(trunc_riff).is_err());
+    assert!(inspect_cdr_bytes(trunc_riff).is_err());
 
     // Truncated 8-byte CPT header must FAIL detect_format consistently
     assert!(detect_format(b"CPT9FILE").is_err());
 
     // RIFF `CDRC` carrying `vrsn = 1300` and `tmpt` marker must detect `CdtRiff { version: 1300 }`
-    // consistently across detect_format, import_corel_bytes, and inspect_corel_bytes!
+    // consistently across detect_format, import_cdr_bytes, and inspect_cdr_bytes!
     let tmpt_riff = write_riff(&RiffDocument::new(
         *b"CDRC",
         vec![
@@ -1703,14 +1707,14 @@ fn regression_6_detect_format_truncation_and_vrsn_tmpt_consistency() {
         ],
     ))
     .unwrap();
-    let expected = CorelFormat::CdtRiff { version: 1300 };
+    let expected = CdrFormat::CdtRiff { version: 1300 };
     assert_eq!(detect_format(&tmpt_riff).unwrap(), expected);
     assert_eq!(
-        import_corel_bytes(&tmpt_riff).unwrap().detected_format,
+        import_cdr_bytes(&tmpt_riff).unwrap().detected_format,
         expected
     );
     assert_eq!(
-        inspect_corel_bytes(&tmpt_riff).unwrap().detected_format,
+        inspect_cdr_bytes(&tmpt_riff).unwrap().detected_format,
         expected
     );
 }
@@ -2338,7 +2342,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     use coree_core::Affine2D;
 
     let bytes = build_zcf_v23_fixture_bytes();
-    assert_eq!(detect_format(&bytes).unwrap(), CorelFormat::CdrZipX6);
+    assert_eq!(detect_format(&bytes).unwrap(), CdrFormat::CdrZipX6);
 
     let parsed = parse_cdr_zip(&bytes, &CodecLimits::default()).unwrap();
     assert_eq!(parsed.era, CdrZipEra::X6);
@@ -2351,10 +2355,10 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     );
 
     let doc = &parsed.document;
-    assert_eq!(doc.color_mode, ColorMode::Cmyk);
+    assert_eq!(doc.color_mode(), ColorMode::Cmyk);
     // 3 real pages (Master Page excluded cleanly!), 1 user layer each (`Guides` omitted)
-    assert_eq!(doc.pages.len(), 3);
-    for p in &doc.pages {
+    assert_eq!(doc.pages().len(), 3);
+    for p in doc.pages() {
         assert!((p.width_mm - 210.0).abs() < 0.01);
         assert!((p.height_mm - 297.0).abs() < 0.01);
         assert_eq!(p.layers.len(), 1);
@@ -2363,7 +2367,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
 
     // Document palette: 5 authentic CMYK swatches
     let pal_names: Vec<&str> = doc
-        .document_palette
+        .document_palette()
         .swatches
         .iter()
         .map(|s| s.name.as_str())
@@ -2374,8 +2378,8 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     );
 
     // Page 1: Group has IDENTITY transform (not double-applied!), 2 children (cubic curve + flipped chamfered rect)
-    assert_eq!(doc.pages[0].layers[0].objects.len(), 1);
-    let grp = &doc.objects[&doc.pages[0].layers[0].objects[0]];
+    assert_eq!(doc.pages()[0].layers[0].objects.len(), 1);
+    let grp = &doc.objects()[&doc.pages()[0].layers[0].objects[0]];
     assert_eq!(grp.transform, Affine2D::IDENTITY);
     assert!(!grp.outline.is_visible());
     let NodePayload::Group(ref children) = grp.payload else {
@@ -2384,7 +2388,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     assert_eq!(children.len(), 2);
 
     // P1 Child 0: Curve with authentic 0xC0 cubic Bezier control handles preserved + Red CMYK hairline + no fill
-    let p1_curve = &doc.objects[&children[0]];
+    let p1_curve = &doc.objects()[&children[0]];
     assert_eq!(p1_curve.fill, Fill::None);
     assert!(p1_curve.outline.is_visible());
     assert!((p1_curve.outline.width_mm - 0.0762).abs() < 1e-4);
@@ -2401,7 +2405,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     assert!(cbb.min_x >= 0.0 && cbb.max_x <= 210.0 && cbb.min_y >= 0.0 && cbb.max_y <= 297.0);
 
     // P1 Child 1: Horizontally flipped Chamfered Rectangle -> Top-Left chamfer = 35mm!
-    let p1_rect = &doc.objects[&children[1]];
+    let p1_rect = &doc.objects()[&children[1]];
     assert_eq!(p1_rect.outline.color, Color::cmyk(0.0, 0.0, 0.0, 1.0));
     let NodePayload::Shape(ParametricShape::Rectangle {
         width,
@@ -2423,8 +2427,8 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     assert!(corner_radii[1].abs() < 1e-3);
 
     // Page 2: Unflipped Chamfered Rectangle (TR chamfer = 35mm) + Solid-Yellow Ellipse (explicit none outline)
-    assert_eq!(doc.pages[1].layers[0].objects.len(), 2);
-    let p2_rect = &doc.objects[&doc.pages[1].layers[0].objects[0]];
+    assert_eq!(doc.pages()[1].layers[0].objects.len(), 2);
+    let p2_rect = &doc.objects()[&doc.pages()[1].layers[0].objects[0]];
     if let NodePayload::Shape(ParametricShape::Rectangle {
         width,
         height,
@@ -2444,7 +2448,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     } else {
         panic!("expected Rectangle on P2");
     }
-    let p2_ell = &doc.objects[&doc.pages[1].layers[0].objects[1]];
+    let p2_ell = &doc.objects()[&doc.pages()[1].layers[0].objects[1]];
     assert_eq!(p2_ell.fill, Fill::Solid(Color::YELLOW));
     assert!(
         !p2_ell.outline.is_visible(),
@@ -2457,8 +2461,8 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     ));
 
     // Page 3: Arabic UTF-16LE Artistic Text inheriting `~artistic~` CDSS defaults
-    assert_eq!(doc.pages[2].layers[0].objects.len(), 1);
-    let p3_txt = &doc.objects[&doc.pages[2].layers[0].objects[0]];
+    assert_eq!(doc.pages()[2].layers[0].objects.len(), 1);
+    let p3_txt = &doc.objects()[&doc.pages()[2].layers[0].objects[0]];
     let NodePayload::ArtisticText(ref at) = p3_txt.payload else {
         panic!("expected ArtisticText on Page 3");
     };
@@ -2467,7 +2471,7 @@ fn zcf_v23_authentic_indirect_multipage_and_cdss_palette_verification() {
     assert_eq!(at.runs[0].style.font_family, "Noto Naskh Arabic");
 
     // Structural Inspector matches resolved ZCF metadata
-    let rep = inspect_corel_bytes(&bytes).unwrap();
+    let rep = inspect_cdr_bytes(&bytes).unwrap();
     assert_eq!(rep.version_number, Some(2300));
     assert_eq!(rep.page_count, 3);
     assert_eq!(rep.layer_count, 3);
@@ -2544,8 +2548,8 @@ fn audit_fixes_group_outline_none_cpt_rifx_and_cmx_rlin_guard() {
         export_cdr_bytes(&doc, CdrWriteVersion::RiffV12).unwrap(),
         export_cmx_bytes(&doc, CmxPrecision::Bit32).unwrap(),
     ] {
-        let rep = import_corel_bytes(&bytes).unwrap();
-        for obj in rep.document.objects.values() {
+        let rep = import_cdr_bytes(&bytes).unwrap();
+        for obj in rep.document.objects().values() {
             if matches!(obj.payload, NodePayload::Group(_)) {
                 assert!(
                     !obj.outline.is_visible(),
@@ -2594,8 +2598,8 @@ fn audit_fixes_group_outline_none_cpt_rifx_and_cmx_rlin_guard() {
     })
     .unwrap();
     let parsed_cpt = parse_cpt_bytes(&rifx_cpt, &CodecLimits::default()).unwrap();
-    assert_eq!(parsed_cpt.document.objects.len(), 1);
-    let raster_obj = parsed_cpt.document.objects.values().next().unwrap();
+    assert_eq!(parsed_cpt.document.objects().len(), 1);
+    let raster_obj = parsed_cpt.document.objects().values().next().unwrap();
     assert!(!raster_obj.outline.is_visible());
 
     // 3. CMX `rlin` with bogus dash_count = 500 stops cleanly with warning and zero panics
@@ -2609,7 +2613,7 @@ fn audit_fixes_group_outline_none_cpt_rifx_and_cmx_rlin_guard() {
         vec![RiffNode::chunk(*b"rlin", bad_rlin)],
     ))
     .unwrap();
-    let cmx_rep = import_corel_bytes(&bad_cmx).unwrap();
+    let cmx_rep = import_cdr_bytes(&bad_cmx).unwrap();
     assert!(cmx_rep
         .warnings
         .iter()
@@ -2693,9 +2697,9 @@ fn regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape() 
         ],
     );
     let overflow_bytes = write_riff(&overflow_doc).unwrap();
-    let rep = import_corel_bytes(&overflow_bytes).unwrap();
-    assert_eq!(rep.document.objects.len(), 2);
-    for obj in rep.document.objects.values() {
+    let rep = import_cdr_bytes(&overflow_bytes).unwrap();
+    assert_eq!(rep.document.objects().len(), 2);
+    for obj in rep.document.objects().values() {
         assert!(
             obj.transform.is_finite(),
             "transform must stay finite: {:?}",
@@ -2780,8 +2784,8 @@ fn regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape() 
             ),
         ],
     );
-    let amp_rep = import_corel_bytes(&write_riff(&amp_doc).unwrap()).unwrap();
-    assert_eq!(amp_rep.document.objects.len(), 0);
+    let amp_rep = import_cdr_bytes(&write_riff(&amp_doc).unwrap()).unwrap();
+    assert_eq!(amp_rep.document.objects().len(), 0);
     assert!(
         amp_rep.warnings.len() >= 2,
         "expected malformed loda warnings for both overlapping chunks, got {:?}",
@@ -2880,9 +2884,9 @@ fn regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape() 
             ),
         ],
     );
-    let fild_rep = import_corel_bytes(&write_riff(&fild_doc).unwrap()).unwrap();
-    assert_eq!(fild_rep.document.objects.len(), 2);
-    for rect_obj in fild_rep.document.objects.values() {
+    let fild_rep = import_cdr_bytes(&write_riff(&fild_doc).unwrap()).unwrap();
+    assert_eq!(fild_rep.document.objects().len(), 2);
+    for rect_obj in fild_rep.document.objects().values() {
         assert_eq!(rect_obj.fill, Fill::Solid(Color::CYAN));
     }
 
@@ -2895,4 +2899,1018 @@ fn regression_7_verifier_s1_s2_trfd_overflow_loda_amp_fild29_and_rdf_unescape() 
     </rdf:Description></rdf:RDF></x:xmpmeta>"#;
     let ti = parse_textinfo_xml(tricky_xml);
     assert_eq!(ti.layer_names, vec!["Cut </rdf:li> Layer", "A &lt; B"]);
+}
+
+#[test]
+fn zcf_x6_writer_indirects_all_chunks_including_16b_xobj_and_derefs_mcfg_layr() {
+    use coree_cdr::cdr_zip::{parse_cdr_zip, write_cdr_zip};
+    use coree_cdr::riff::parse_riff_with_budget;
+    use coree_core::{UnknownCdrChunk, Vec2D};
+
+    // (a) 16-byte unknown chunk (`XOBJ` = b"COREE_T4_XOBJ_v1") round-trips through write_cdr_zip(X6)
+    let mut doc = Document::new_a4("ZCF All-Chunk Indirection");
+    doc.set_title("Tier1ZcfTitle");
+    let lid = doc.pages()[0].layers[0].id;
+    let mut obj = SceneObject::new(
+        ObjectId(0),
+        "WithXobj",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 10.0, 30.0, 20.0,
+        ))),
+    );
+    obj.unknown_chunks.push(UnknownCdrChunk {
+        fourcc: *b"XOBJ",
+        version_hint: 2400,
+        raw_bytes: b"COREE_T4_XOBJ_v1".to_vec(),
+    });
+    doc.add_object(obj, Some(lid)).unwrap();
+
+    let zip_bytes = write_cdr_zip(&doc, CdrZipEra::X6, false).unwrap();
+
+    // Inspect content/root.dat directly: every leaf chunk must be a valid 16B ZCF pointer
+    let mut archive = ZipArchive::new(Cursor::new(&zip_bytes)).unwrap();
+    let mut root_buf = Vec::new();
+    std::io::Read::read_to_end(
+        &mut archive.by_name("content/root.dat").unwrap(),
+        &mut root_buf,
+    )
+    .unwrap();
+    let mut data0_buf = Vec::new();
+    std::io::Read::read_to_end(
+        &mut archive.by_name("content/data/data0.dat").unwrap(),
+        &mut data0_buf,
+    )
+    .unwrap();
+    let mut budget = CodecLimits::default().max_uncompressed_bytes;
+    let raw_tree =
+        parse_riff_with_budget(&root_buf, &CodecLimits::default(), &mut budget, false).unwrap();
+
+    fn verify_all_16b_zcf_pointers(nodes: &[RiffNode], data0_len: usize) {
+        for node in nodes {
+            match node {
+                RiffNode::List { children, .. } => verify_all_16b_zcf_pointers(children, data0_len),
+                RiffNode::Chunk { fourcc, data, .. } => {
+                    assert_eq!(
+                        data.len(),
+                        16,
+                        "chunk '{}' in CDRO root.dat must be a 16B ZCF pointer, got {}B",
+                        String::from_utf8_lossy(fourcc),
+                        data.len()
+                    );
+                    let fidx = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let dlen = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    let doff = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                    if fidx == u32::MAX {
+                        assert!(fourcc != b"loda" && dlen <= 8);
+                    } else {
+                        assert_eq!(fidx, 0);
+                        assert!(dlen > 0 && doff + dlen <= data0_len);
+                    }
+                }
+            }
+        }
+    }
+    verify_all_16b_zcf_pointers(&raw_tree.children, data0_buf.len());
+
+    let parsed = parse_cdr_zip(&zip_bytes, &CodecLimits::default()).unwrap();
+    assert_eq!(parsed.document.title(), "Tier1ZcfTitle");
+    let p_oid = parsed.document.pages()[0].layers[0].objects[0];
+    let p_obj = parsed.document.object(p_oid).unwrap();
+    assert_eq!(p_obj.unknown_chunks.len(), 1);
+    assert_eq!(&p_obj.unknown_chunks[0].fourcc, b"XOBJ");
+    assert_eq!(p_obj.unknown_chunks[0].raw_bytes, b"COREE_T4_XOBJ_v1");
+
+    // (b) External 16-byte ZCF pointers on `mcfg` and `layr` dereference cleanly
+    let mut doc_mcfg = Vec::new();
+    doc_mcfg.extend_from_slice(&1_500_000i32.to_le_bytes()); // 150mm
+    doc_mcfg.extend_from_slice(&2_000_000i32.to_le_bytes()); // 200mm
+    doc_mcfg.push(0); // CMYK
+    doc_mcfg.extend_from_slice(&300.0f32.to_le_bytes());
+    doc_mcfg.extend_from_slice(&5u16.to_le_bytes());
+    doc_mcfg.extend_from_slice(b"Tier1");
+
+    let mut page_mcfg = Vec::new();
+    page_mcfg.extend_from_slice(&1_500_000i32.to_le_bytes());
+    page_mcfg.extend_from_slice(&2_000_000i32.to_le_bytes());
+    page_mcfg.extend_from_slice(&30_000i32.to_le_bytes());
+    page_mcfg.push(0);
+    page_mcfg.extend_from_slice(&6u16.to_le_bytes());
+    page_mcfg.extend_from_slice(b"Page 1");
+
+    let mut layr_hdr = Vec::new();
+    layr_hdr.push(0x05);
+    layr_hdr.push(0);
+    layr_hdr.extend_from_slice(&7u16.to_le_bytes());
+    layr_hdr.extend_from_slice(b"Layer 1");
+
+    let mut data_blob = Vec::new();
+    let doc_mcfg_ptr = zcf_ext_ptr(0, &mut data_blob, &doc_mcfg);
+    let page_mcfg_ptr = zcf_ext_ptr(0, &mut data_blob, &page_mcfg);
+    let layr_ptr = zcf_ext_ptr(0, &mut data_blob, &layr_hdr);
+
+    let root_zcf = RiffDocument::new(
+        *b"CDRO",
+        vec![
+            RiffNode::chunk(*b"vrsn", zcf_inline_ptr(&1600u16.to_le_bytes())),
+            RiffNode::list(
+                *b"doc ",
+                vec![
+                    RiffNode::chunk(*b"mcfg", doc_mcfg_ptr),
+                    RiffNode::list(
+                        *b"page",
+                        vec![
+                            RiffNode::chunk(*b"mcfg", page_mcfg_ptr),
+                            RiffNode::list(*b"layr", vec![RiffNode::chunk(*b"layr", layr_ptr)]),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    );
+    let root_zcf_bytes = write_riff(&root_zcf).unwrap();
+
+    let mut zcur = Cursor::new(Vec::new());
+    {
+        let mut zw = ZipWriter::new(&mut zcur);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zw.start_file("mimetype", stored).unwrap();
+        zw.write_all(b"application/x-vnd.corel.zcf.draw.document+zip")
+            .unwrap();
+        zw.start_file("content/root.dat", deflated).unwrap();
+        zw.write_all(&root_zcf_bytes).unwrap();
+        zw.start_file("content/data/0000.dat", deflated).unwrap();
+        zw.write_all(&data_blob).unwrap();
+        zw.start_file("content/dataFileList.dat", deflated).unwrap();
+        zw.write_all(b"data/0000.dat\n").unwrap();
+        zw.finish().unwrap();
+    }
+    let zcf_rep = import_cdr_bytes(&zcur.into_inner()).unwrap();
+    assert_eq!(zcf_rep.document.title(), "Tier1");
+    let pg = &zcf_rep.document.pages()[0];
+    assert!((pg.width_mm - 150.0).abs() < 0.05);
+    assert!((pg.height_mm - 200.0).abs() < 0.05);
+    assert_eq!(pg.layers[0].name, "Layer 1");
+    let _ = Vec2D::ZERO;
+}
+
+#[test]
+fn group_loda_unknown_args_and_cdr_shifted_blend_linked_frame_round_trip() {
+    use coree_core::{Effect, ParagraphText, TextStyle, UnknownCdrChunk, Vec2D};
+
+    let mut doc = Document::new_a4("Group LODA & Shifted Refs");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // Delete an initial object so remaining ObjectIds start > 1 and shift on re-import
+    let dummy = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "DummyToDelete",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 4.0, 4.0))),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let _ = doc.remove_object(dummy);
+
+    let c1 = doc
+        .insert_loaded_object(SceneObject::new(
+            ObjectId(0),
+            "GrpChild",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                5.0, 5.0, 10.0, 10.0,
+            ))),
+        ))
+        .unwrap();
+    let mut grp = SceneObject::new(ObjectId(0), "GrpWithLodaUnk", NodePayload::Group(vec![c1]));
+    let mut raw_loda_unk = Vec::new();
+    raw_loda_unk.extend_from_slice(&0x00FFu32.to_le_bytes());
+    raw_loda_unk.extend_from_slice(b"GRP_UNK_LODA");
+    grp.unknown_chunks.push(UnknownCdrChunk {
+        fourcc: *b"LODA",
+        version_hint: 1200,
+        raw_bytes: raw_loda_unk.clone(),
+    });
+    doc.add_object(grp, Some(lid)).unwrap();
+
+    let spine_oid = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BlendSpine",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    15.0, 15.0, 30.0, 10.0,
+                ))),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let target_oid = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BlendTarget",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    50.0, 15.0, 15.0, 15.0,
+                ))),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let mut blend_src = SceneObject::new(
+        ObjectId(0),
+        "BlendSource",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            15.0, 35.0, 12.0, 12.0,
+        ))),
+    );
+    blend_src.effects.push(Effect::Blend {
+        target_id: target_oid,
+        steps: 6,
+        rotation_deg: 0.0,
+        along_path: Some(spine_oid),
+    });
+    doc.add_object(blend_src, Some(lid)).unwrap();
+
+    let next_para_oid = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Para2",
+                NodePayload::ParagraphText(ParagraphText::new(
+                    "Frame two",
+                    Vec2D::new(40.0, 20.0),
+                    TextStyle::default(),
+                )),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+    let mut p1 = ParagraphText::new("Frame one", Vec2D::new(40.0, 20.0), TextStyle::default());
+    p1.linked_next_frame = Some(next_para_oid);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "Para1", NodePayload::ParagraphText(p1)),
+        Some(lid),
+    )
+    .unwrap();
+
+    let cdr_bytes = export_cdr_bytes(&doc, CdrWriteVersion::RiffV12).unwrap();
+    let rep = import_cdr_bytes(&cdr_bytes).unwrap();
+    let objs = &rep.document.pages()[0].layers[0].objects;
+    assert_eq!(objs.len(), 6);
+
+    let re_grp = rep.document.object(objs[0]).unwrap();
+    assert!(
+        re_grp
+            .unknown_chunks
+            .iter()
+            .any(|u| &u.fourcc == b"LODA" && u.raw_bytes == raw_loda_unk),
+        "Group LODA 0x00FF unknown arg must round-trip, got {:?}",
+        re_grp.unknown_chunks
+    );
+
+    let new_spine = objs[1];
+    let new_target = objs[2];
+    let new_blend_src = objs[3];
+    let new_para2 = objs[4];
+    let new_para1 = objs[5];
+
+    assert_ne!(new_target, target_oid, "IDs must shift on re-import");
+    match rep.document.object(new_blend_src).unwrap().effects.first() {
+        Some(Effect::Blend {
+            target_id,
+            along_path,
+            ..
+        }) => {
+            assert_eq!(*target_id, new_target);
+            assert_eq!(*along_path, Some(new_spine));
+        }
+        other => panic!("expected Blend effect, got {other:?}"),
+    }
+    match &rep.document.object(new_para1).unwrap().payload {
+        NodePayload::ParagraphText(para) => {
+            assert_eq!(para.linked_next_frame, Some(new_para2));
+        }
+        other => panic!("expected ParagraphText, got {other:?}"),
+    }
+}
+
+#[test]
+fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbols() {
+    use coree_core::{RasterAsset, RasterLayerData, SymbolDef, VectorTable};
+
+    let mut doc = Document::new_a4("CMX All ImageAssetId Contexts");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 5 distinct assets — each used ONLY in its respective context
+    let px_pc_raster = [
+        201, 10, 20, 255, 11, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255,
+    ];
+    let px_pc_pat = [
+        10, 210, 30, 255, 12, 24, 36, 255, 48, 60, 72, 255, 84, 96, 108, 255,
+    ];
+    let px_top_pat = [
+        20, 30, 220, 255, 15, 25, 35, 255, 45, 55, 65, 255, 75, 85, 95, 255,
+    ];
+    let px_tbl_pat = [
+        230, 200, 10, 255, 18, 28, 38, 255, 48, 58, 68, 255, 78, 88, 98, 255,
+    ];
+    let px_sym_raster = [
+        180, 20, 240, 255, 21, 31, 41, 255, 51, 61, 71, 255, 81, 91, 101, 255,
+    ];
+
+    let aid_pc_raster = doc.register_asset(
+        RasterAsset::new(2, 2, px_pc_raster.to_vec(), 300.0, ColorMode::Rgb).unwrap(),
+    );
+    let aid_pc_pat = doc
+        .register_asset(RasterAsset::new(2, 2, px_pc_pat.to_vec(), 150.0, ColorMode::Rgb).unwrap());
+    let aid_top_pat = doc.register_asset(
+        RasterAsset::new(2, 2, px_top_pat.to_vec(), 200.0, ColorMode::Rgb).unwrap(),
+    );
+    let aid_tbl_pat = doc.register_asset(
+        RasterAsset::new(2, 2, px_tbl_pat.to_vec(), 250.0, ColorMode::Rgb).unwrap(),
+    );
+    let aid_sym_raster = doc.register_asset(
+        RasterAsset::new(2, 2, px_sym_raster.to_vec(), 300.0, ColorMode::Rgb).unwrap(),
+    );
+
+    // (a) PowerClip containing NodePayload::Raster (asset not used outside)
+    // (b) PowerClip containing Fill::BitmapPattern (asset not used outside)
+    let pc_raster_child = doc
+        .insert_loaded_object(SceneObject::new(
+            ObjectId(0),
+            "PcOnlyRaster",
+            NodePayload::Raster(RasterLayerData {
+                asset_id: aid_pc_raster,
+                width_mm: 18.0,
+                height_mm: 12.0,
+                filters: Vec::new(),
+                crop_rect: None,
+            }),
+        ))
+        .unwrap();
+    let pc_pat_child = doc
+        .insert_loaded_object(
+            SceneObject::new(
+                ObjectId(0),
+                "PcOnlyBitmapPat",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    12.0, 12.0, 14.0, 14.0,
+                ))),
+            )
+            .with_fill(Fill::BitmapPattern {
+                image_id: aid_pc_pat,
+                tile_w: 6.0,
+                tile_h: 6.0,
+            }),
+        )
+        .unwrap();
+    let pc = SceneObject::new(
+        ObjectId(0),
+        "PowerClipWithAssets",
+        NodePayload::PowerClip {
+            container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(
+                10.0, 10.0, 40.0, 40.0,
+            ))),
+            container_parametric: None,
+            lock_contents: true,
+            contents: vec![pc_raster_child, pc_pat_child],
+        },
+    );
+    doc.add_object(pc, Some(lid)).unwrap();
+
+    // (c) Top-level Path with Fill::BitmapPattern
+    let top_pat = SceneObject::new(
+        ObjectId(0),
+        "TopBitmapPat",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            60.0, 10.0, 25.0, 25.0,
+        ))),
+    )
+    .with_fill(Fill::BitmapPattern {
+        image_id: aid_top_pat,
+        tile_w: 5.0,
+        tile_h: 5.0,
+    });
+    doc.add_object(top_pat, Some(lid)).unwrap();
+
+    // (d) VectorTable cell with Fill::BitmapPattern
+    let mut tbl = VectorTable::new(2, 2, 30.0, 20.0);
+    tbl.cells[1].fill = Fill::BitmapPattern {
+        image_id: aid_tbl_pat,
+        tile_w: 4.0,
+        tile_h: 4.0,
+    };
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "TableBitmapPat", NodePayload::Table(tbl)),
+        Some(lid),
+    )
+    .unwrap();
+
+    // (e) SymbolDef containing NodePayload::Raster
+    let sym = SymbolDef::new(
+        "RasterSymbol",
+        vec![SceneObject::new(
+            ObjectId(1),
+            "SymRaster",
+            NodePayload::Raster(RasterLayerData {
+                asset_id: aid_sym_raster,
+                width_mm: 10.0,
+                height_mm: 10.0,
+                filters: Vec::new(),
+                crop_rect: None,
+            }),
+        )],
+    );
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id)),
+        Some(lid),
+    )
+    .unwrap();
+
+    for prec in [CmxPrecision::Bit32, CmxPrecision::Bit16] {
+        let bytes = export_cmx_bytes(&doc, prec).unwrap();
+        let rt = coree_cdr::cmx::parse_cmx_bytes(&bytes, &CodecLimits::default()).unwrap();
+        assert_eq!(
+            rt.document.assets().len(),
+            5,
+            "all 5 CMX assets must be emitted in rimg"
+        );
+
+        let rt_pc = find_obj_by_name(&rt.document, "PowerClipWithAssets");
+        let NodePayload::PowerClip { contents, .. } = &rt_pc.payload else {
+            panic!("expected PowerClipWithAssets");
+        };
+        assert_eq!(contents.len(), 2);
+
+        let rt_pc_r = rt.document.object(contents[0]).unwrap();
+        let NodePayload::Raster(r_pc) = &rt_pc_r.payload else {
+            panic!("expected Raster inside PowerClip");
+        };
+        let a_pc_r = rt
+            .document
+            .asset(r_pc.asset_id)
+            .expect("PowerClip Raster asset must resolve");
+        assert_eq!((a_pc_r.width, a_pc_r.height), (2, 2));
+        assert_eq!(a_pc_r.rgba_bytes, px_pc_raster);
+
+        let rt_pc_p = rt.document.object(contents[1]).unwrap();
+        let Fill::BitmapPattern {
+            image_id: pc_pat_id,
+            ..
+        } = rt_pc_p.fill
+        else {
+            panic!("expected BitmapPattern inside PowerClip");
+        };
+        let a_pc_p = rt
+            .document
+            .asset(pc_pat_id)
+            .expect("PowerClip BitmapPattern asset must resolve");
+        assert_eq!((a_pc_p.width, a_pc_p.height), (2, 2));
+        assert_eq!(a_pc_p.rgba_bytes, px_pc_pat);
+
+        let rt_top = find_obj_by_name(&rt.document, "TopBitmapPat");
+        let Fill::BitmapPattern {
+            image_id: top_pat_id,
+            ..
+        } = rt_top.fill
+        else {
+            panic!("expected TopBitmapPat Fill::BitmapPattern");
+        };
+        let a_top = rt
+            .document
+            .asset(top_pat_id)
+            .expect("top-level BitmapPattern asset must resolve");
+        assert_eq!((a_top.width, a_top.height), (2, 2));
+        assert_eq!(a_top.rgba_bytes, px_top_pat);
+
+        let rt_tbl = find_obj_by_name(&rt.document, "TableBitmapPat");
+        let NodePayload::Table(tbl_rt) = &rt_tbl.payload else {
+            panic!("expected TableBitmapPat");
+        };
+        let Fill::BitmapPattern {
+            image_id: tbl_pat_id,
+            ..
+        } = tbl_rt.cells[1].fill
+        else {
+            panic!("expected Table cell BitmapPattern");
+        };
+        let a_tbl = rt
+            .document
+            .asset(tbl_pat_id)
+            .expect("Table cell BitmapPattern asset must resolve");
+        assert_eq!((a_tbl.width, a_tbl.height), (2, 2));
+        assert_eq!(a_tbl.rgba_bytes, px_tbl_pat);
+
+        let rt_sym = rt
+            .document
+            .symbol(sym_id)
+            .expect("SymbolDef must survive CMX round-trip");
+        let NodePayload::Raster(r_sym) = &rt_sym.objects[0].payload else {
+            panic!("expected Raster inside SymbolDef");
+        };
+        let a_sym = rt
+            .document
+            .asset(r_sym.asset_id)
+            .expect("SymbolDef Raster asset must resolve");
+        assert_eq!((a_sym.width, a_sym.height), (2, 2));
+        assert_eq!(a_sym.rgba_bytes, px_sym_raster);
+    }
+}
+
+#[test]
+fn cdr_riff_and_zip_remap_symbol_raster_and_table_cell_bitmap_pattern() {
+    use coree_core::{RasterAsset, RasterLayerData, SymbolDef, VectorTable};
+
+    let mut doc = Document::new_a4("CDR Symbol & Table Asset Remap");
+    let lid = doc.pages()[0].layers[0].id;
+
+    let px_sym = [
+        120, 40, 210, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255,
+    ];
+    let px_tbl = [
+        30, 190, 140, 255, 15, 25, 35, 255, 45, 55, 65, 255, 75, 85, 95, 255,
+    ];
+
+    let aid_sym =
+        doc.register_asset(RasterAsset::new(2, 2, px_sym.to_vec(), 300.0, ColorMode::Rgb).unwrap());
+    let aid_tbl =
+        doc.register_asset(RasterAsset::new(2, 2, px_tbl.to_vec(), 240.0, ColorMode::Rgb).unwrap());
+
+    let sym = SymbolDef::new(
+        "LogoSym",
+        vec![SceneObject::new(
+            ObjectId(1),
+            "SymBmp",
+            NodePayload::Raster(RasterLayerData {
+                asset_id: aid_sym,
+                width_mm: 16.0,
+                height_mm: 16.0,
+                filters: Vec::new(),
+                crop_rect: None,
+            }),
+        )],
+    );
+    let sym_id = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id)),
+        Some(lid),
+    )
+    .unwrap();
+
+    let mut tbl = VectorTable::new(2, 2, 30.0, 20.0);
+    tbl.cells[2].fill = Fill::BitmapPattern {
+        image_id: aid_tbl,
+        tile_w: 5.0,
+        tile_h: 5.0,
+    };
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "TblWithBmp", NodePayload::Table(tbl)),
+        Some(lid),
+    )
+    .unwrap();
+
+    for ver in [
+        CdrWriteVersion::RiffV12,
+        CdrWriteVersion::ZipX4,
+        CdrWriteVersion::ZipX6,
+    ] {
+        let bytes = export_cdr_bytes(&doc, ver).unwrap();
+        let rt = import_cdr_bytes(&bytes).unwrap();
+        assert_eq!(
+            rt.document.assets().len(),
+            2,
+            "both assets must survive {ver:?}"
+        );
+
+        let rt_sym = rt.document.symbol(sym_id).expect("SymbolDef must survive");
+        let NodePayload::Raster(r_sym) = &rt_sym.objects[0].payload else {
+            panic!("expected Raster inside SymbolDef");
+        };
+        let a_sym = rt
+            .document
+            .asset(r_sym.asset_id)
+            .expect("SymbolDef Raster ImageAssetId must resolve");
+        assert_eq!((a_sym.width, a_sym.height), (2, 2));
+        assert_eq!(a_sym.rgba_bytes, px_sym);
+
+        let rt_tbl = find_obj_by_name(&rt.document, "TblWithBmp");
+        let NodePayload::Table(t_rt) = &rt_tbl.payload else {
+            panic!("expected Table");
+        };
+        let Fill::BitmapPattern {
+            image_id: tbl_id, ..
+        } = t_rt.cells[2].fill
+        else {
+            panic!("expected Table cell BitmapPattern");
+        };
+        let a_tbl = rt
+            .document
+            .asset(tbl_id)
+            .expect("Table cell BitmapPattern ImageAssetId must resolve");
+        assert_eq!((a_tbl.width, a_tbl.height), (2, 2));
+        assert_eq!(a_tbl.rgba_bytes, px_tbl);
+    }
+}
+
+#[test]
+fn cdr_zip_x6_raster_and_colliding_unknown_0001_dat_both_survive_without_duplicate_zip_error() {
+    use coree_core::{RasterAsset, RasterLayerData};
+
+    let mut doc = Document::new_a4("X6 Filename Collision Guard");
+    let lid = doc.pages()[0].layers[0].id;
+    let px = [
+        255, 80, 40, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255,
+    ];
+    let aid =
+        doc.register_asset(RasterAsset::new(2, 2, px.to_vec(), 300.0, ColorMode::Rgb).unwrap());
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "BmpObj",
+            NodePayload::Raster(RasterLayerData {
+                asset_id: aid,
+                width_mm: 20.0,
+                height_mm: 20.0,
+                filters: Vec::new(),
+                crop_rect: None,
+            }),
+        ),
+        Some(lid),
+    )
+    .unwrap();
+
+    let unknown_0001 = b"OPAQUE_X6_UNKNOWN_0001_PAYLOAD".to_vec();
+    let unknown_bmp_0001 = b"OPAQUE_X6_UNKNOWN_BMP_0001_PAYLOAD".to_vec();
+    doc.insert_unknown_data_file("content/data/0001.dat", unknown_0001.clone());
+    doc.insert_unknown_data_file("content/data/bmp_0001.dat", unknown_bmp_0001.clone());
+
+    let bytes = export_cdr_bytes(&doc, CdrWriteVersion::ZipX6)
+        .expect("ZipX6 export must avoid Duplicate filename collision");
+    let rt = import_cdr_bytes(&bytes).unwrap();
+    assert_eq!(
+        rt.document
+            .unknown_data_files()
+            .get("content/data/0001.dat"),
+        Some(&unknown_0001)
+    );
+    assert_eq!(
+        rt.document
+            .unknown_data_files()
+            .get("content/data/bmp_0001.dat"),
+        Some(&unknown_bmp_0001)
+    );
+
+    let bmp_obj = find_obj_by_name(&rt.document, "BmpObj");
+    let NodePayload::Raster(r) = &bmp_obj.payload else {
+        panic!("expected Raster");
+    };
+    let asset = rt
+        .document
+        .asset(r.asset_id)
+        .expect("Raster asset must survive collision avoidance");
+    assert_eq!((asset.width, asset.height), (2, 2));
+    assert_eq!(asset.rgba_bytes, px);
+}
+
+#[test]
+fn zcf_cdro_partial_0x00c9_without_fill_inherits_0x00c8_cdss_fill() {
+    let mut curve_arg = Vec::new();
+    curve_arg.extend_from_slice(&4u32.to_le_bytes());
+    for (x, y) in [(0i32, 0i32), (100_000, 0), (100_000, 100_000), (0, 100_000)] {
+        curve_arg.extend_from_slice(&x.to_le_bytes());
+        curve_arg.extend_from_slice(&y.to_le_bytes());
+    }
+    curve_arg.extend_from_slice(&[0x0C, 0x08, 0x08, 0x48]);
+
+    let loda_inherit = build_zcf_loda(
+        0x03,
+        &[
+            (0x00C8, 100u32.to_le_bytes().to_vec()),
+            (
+                0x00C9,
+                build_zcf_c9(r#"{"outline":{"width":"20000","color":"RGB255,USER,0,0,255,100"}}"#),
+            ),
+            (0x001E, curve_arg.clone()),
+        ],
+    );
+    let loda_explicit_none = build_zcf_loda(
+        0x03,
+        &[
+            (0x00C8, 100u32.to_le_bytes().to_vec()),
+            (0x00C9, build_zcf_c9(r#"{"fill":{"type":"0"}}"#)),
+            (0x001E, curve_arg),
+        ],
+    );
+
+    let mut data0 = Vec::new();
+    let ptr_inherit = zcf_ext_ptr(0, &mut data0, &loda_inherit);
+    let ptr_explicit_none = zcf_ext_ptr(0, &mut data0, &loda_explicit_none);
+
+    let root = RiffDocument::new(
+        *b"CDRO",
+        vec![
+            RiffNode::chunk(*b"vrsn", zcf_inline_ptr(&2400u16.to_le_bytes())),
+            RiffNode::list(*b"doc ", vec![]),
+            RiffNode::list(
+                *b"page",
+                vec![RiffNode::list(
+                    *b"layr",
+                    vec![
+                        RiffNode::list(*b"obj ", vec![RiffNode::chunk(*b"loda", ptr_inherit)]),
+                        RiffNode::list(
+                            *b"obj ",
+                            vec![RiffNode::chunk(*b"loda", ptr_explicit_none)],
+                        ),
+                    ],
+                )],
+            ),
+        ],
+    );
+    let root_bytes = write_riff(&root).unwrap();
+
+    let cdss = r#"{
+        "version": 24,
+        "style": {
+            "100": {
+                "fill": {"type": "1", "primaryColor": "RGB255,USER,220,40,40,100"}
+            }
+        }
+    }"#;
+
+    let mut zcur = Cursor::new(Vec::new());
+    {
+        let mut zw = ZipWriter::new(&mut zcur);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zw.start_file("mimetype", stored).unwrap();
+        zw.write_all(b"application/x-vnd.corel.zcf.draw.document+zip")
+            .unwrap();
+        zw.start_file("content/root.dat", deflated).unwrap();
+        zw.write_all(&root_bytes).unwrap();
+        zw.start_file("content/data/data0.dat", deflated).unwrap();
+        zw.write_all(&data0).unwrap();
+        zw.start_file("content/dataFileList.dat", deflated).unwrap();
+        zw.write_all(b"data/data0.dat\n").unwrap();
+        zw.start_file("styles/document.cdss", deflated).unwrap();
+        zw.write_all(cdss.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let rep = import_cdr_bytes(&zcur.into_inner()).unwrap();
+    let objs = &rep.document.pages()[0].layers[0].objects;
+    assert_eq!(objs.len(), 2);
+
+    let o_inherit = rep.document.object(objs[0]).unwrap();
+    match &o_inherit.fill {
+        Fill::Solid(Color::Rgba { r, g, b, .. }) => {
+            assert!((*r - 220.0 / 255.0).abs() < 0.01);
+            assert!((*g - 40.0 / 255.0).abs() < 0.01);
+            assert!((*b - 40.0 / 255.0).abs() < 0.01);
+        }
+        other => panic!("expected inherited red Solid fill from 0x00C8 cdss, got {other:?}"),
+    }
+    assert!((o_inherit.outline.width_mm - 2.0).abs() < 0.01);
+
+    let o_none = rep.document.object(objs[1]).unwrap();
+    assert!(
+        matches!(o_none.fill, Fill::None),
+        "explicit 0x00C9 fill type=0 must override 0x00C8 cdss, got {:?}",
+        o_none.fill
+    );
+}
+
+#[test]
+fn cmx_roundtrip_preserves_group_transform_and_object_flags_opacity_blend() {
+    use coree_core::{
+        Affine2D, ArtisticText, ParagraphText, RasterAsset, RasterLayerData, TextStyle, Vec2D,
+    };
+
+    let mut doc = Document::new_a4("CMX Transform & Attrs Roundtrip");
+    let lid = doc.pages()[0].layers[0].id;
+
+    let px = [
+        200, 50, 75, 255, 20, 40, 60, 255, 80, 100, 120, 255, 140, 160, 180, 255,
+    ];
+    let aid =
+        doc.register_asset(RasterAsset::new(2, 2, px.to_vec(), 300.0, ColorMode::Rgb).unwrap());
+
+    let grp_xf = Affine2D::translate(15.0, 25.0).compose(&Affine2D::rotate(0.5));
+    let raster_xf = Affine2D::translate(20.0, 30.0).compose(&Affine2D::rotate(-0.25));
+    let art_xf = Affine2D::translate(40.0, 60.0).compose(&Affine2D::rotate(0.3));
+    let para_xf = Affine2D::translate(50.0, 90.0).compose(&Affine2D::rotate(-0.4));
+
+    // 1. Transformed Group with default flags/opacity/blend (pure CMD_BEGIN_GROUP Y-up transform)
+    let child_plain_id = doc
+        .insert_loaded_object(
+            SceneObject::new(
+                ObjectId(0),
+                "GroupPlainChild",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    5.0, 5.0, 20.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::rgba(0.2, 0.6, 0.8, 1.0))),
+        )
+        .unwrap();
+    let mut grp_plain = SceneObject::new(
+        ObjectId(0),
+        "GroupPlainTransformed",
+        NodePayload::Group(vec![child_plain_id]),
+    );
+    grp_plain.transform = grp_xf;
+    doc.add_object(grp_plain, Some(lid)).unwrap();
+
+    // 2. Transformed Group with hidden/locked/non-printable/opacity/Multiply
+    let child_attr_id = doc
+        .insert_loaded_object(
+            SceneObject::new(
+                ObjectId(0),
+                "GroupAttrChild",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    10.0, 10.0, 30.0, 15.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::rgba(0.9, 0.2, 0.1, 1.0))),
+        )
+        .unwrap();
+    let mut grp_attr = SceneObject::new(
+        ObjectId(0),
+        "GroupWithAttrs",
+        NodePayload::Group(vec![child_attr_id]),
+    );
+    grp_attr.transform = grp_xf;
+    grp_attr.visible = false;
+    grp_attr.locked = true;
+    grp_attr.printable = false;
+    grp_attr.opacity = 0.4;
+    grp_attr.blend_mode = BlendMode::Multiply;
+    doc.add_object(grp_attr, Some(lid)).unwrap();
+
+    // 3. Raster (DrawImage) with transform + flags/opacity/Screen
+    let mut img = SceneObject::new(
+        ObjectId(0),
+        "RasterWithAttrs",
+        NodePayload::Raster(RasterLayerData {
+            asset_id: aid,
+            width_mm: 24.0,
+            height_mm: 18.0,
+            filters: Vec::new(),
+            crop_rect: None,
+        }),
+    );
+    img.transform = raster_xf;
+    img.visible = false;
+    img.locked = true;
+    img.printable = false;
+    img.opacity = 0.5;
+    img.blend_mode = BlendMode::Screen;
+    doc.add_object(img, Some(lid)).unwrap();
+
+    // 4. ArtisticText with transform + flags/opacity/Overlay
+    let mut art = SceneObject::new(
+        ObjectId(0),
+        "ArtisticWithAttrs",
+        NodePayload::ArtisticText(ArtisticText::from_plain("CMX Art", TextStyle::default())),
+    );
+    art.transform = art_xf;
+    art.visible = false;
+    art.locked = true;
+    art.printable = false;
+    art.opacity = 0.65;
+    art.blend_mode = BlendMode::Overlay;
+    doc.add_object(art, Some(lid)).unwrap();
+
+    // 5. ParagraphText with transform + flags/opacity/Darken
+    let mut para = SceneObject::new(
+        ObjectId(0),
+        "ParagraphWithAttrs",
+        NodePayload::ParagraphText(ParagraphText::new(
+            "CMX Para",
+            Vec2D::new(60.0, 35.0),
+            TextStyle::default(),
+        )),
+    );
+    para.transform = para_xf;
+    para.visible = false;
+    para.locked = true;
+    para.printable = false;
+    para.opacity = 0.75;
+    para.blend_mode = BlendMode::Darken;
+    doc.add_object(para, Some(lid)).unwrap();
+
+    // 6. Path (CMD_POLY_CURVE) with flags/opacity/Difference
+    let mut path_obj = SceneObject::new(
+        ObjectId(0),
+        "PathWithAttrs",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            12.0, 14.0, 22.0, 16.0,
+        ))),
+    );
+    path_obj.visible = false;
+    path_obj.locked = true;
+    path_obj.printable = false;
+    path_obj.opacity = 0.35;
+    path_obj.blend_mode = BlendMode::Difference;
+    doc.add_object(path_obj, Some(lid)).unwrap();
+
+    let xf_err = |a: &Affine2D, b: &Affine2D| -> f64 {
+        a.m.iter()
+            .zip(b.m.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    };
+
+    for (prec, endian) in [
+        (CmxPrecision::Bit32, RiffEndian::Little),
+        (CmxPrecision::Bit32, RiffEndian::Big),
+        (CmxPrecision::Bit16, RiffEndian::Little),
+    ] {
+        let bytes = export_cmx_bytes_with_endian(&doc, prec, endian).unwrap();
+        let rt = import_cdr_bytes(&bytes).unwrap();
+
+        let rt_grp_plain = find_obj_by_name(&rt.document, "GroupPlainTransformed");
+        let err_plain = xf_err(&rt_grp_plain.transform, &grp_xf);
+        assert!(
+            err_plain < 1e-3,
+            "{prec:?}/{endian:?} GroupPlainTransformed xf err={err_plain}"
+        );
+        let NodePayload::Group(plain_children) = &rt_grp_plain.payload else {
+            panic!("expected GroupPlainTransformed to be Group");
+        };
+        assert_eq!(plain_children.len(), 1);
+        assert_eq!(
+            rt.document.object(plain_children[0]).unwrap().name,
+            "GroupPlainChild"
+        );
+
+        let rt_grp_attr = find_obj_by_name(&rt.document, "GroupWithAttrs");
+        let err_attr = xf_err(&rt_grp_attr.transform, &grp_xf);
+        assert!(
+            err_attr < 1e-3,
+            "{prec:?}/{endian:?} GroupWithAttrs xf err={err_attr}"
+        );
+        assert!(!rt_grp_attr.visible);
+        assert!(rt_grp_attr.locked);
+        assert!(!rt_grp_attr.printable);
+        assert!((rt_grp_attr.opacity - 0.4).abs() < 1e-4);
+        assert_eq!(rt_grp_attr.blend_mode, BlendMode::Multiply);
+        let NodePayload::Group(attr_children) = &rt_grp_attr.payload else {
+            panic!("expected GroupWithAttrs to be Group");
+        };
+        assert_eq!(attr_children.len(), 1);
+        assert_eq!(
+            rt.document.object(attr_children[0]).unwrap().name,
+            "GroupAttrChild"
+        );
+
+        let rt_img = find_obj_by_name(&rt.document, "RasterWithAttrs");
+        assert!(xf_err(&rt_img.transform, &raster_xf) < 1e-3);
+        assert!(!rt_img.visible);
+        assert!(rt_img.locked);
+        assert!(!rt_img.printable);
+        assert!((rt_img.opacity - 0.5).abs() < 1e-4);
+        assert_eq!(rt_img.blend_mode, BlendMode::Screen);
+        let NodePayload::Raster(r_rt) = &rt_img.payload else {
+            panic!("expected RasterWithAttrs to be Raster");
+        };
+        let asset_rt = rt.document.asset(r_rt.asset_id).unwrap();
+        assert_eq!(asset_rt.rgba_bytes, px);
+
+        let rt_art = find_obj_by_name(&rt.document, "ArtisticWithAttrs");
+        assert!(xf_err(&rt_art.transform, &art_xf) < 1e-3);
+        assert!(!rt_art.visible);
+        assert!(rt_art.locked);
+        assert!(!rt_art.printable);
+        assert!((rt_art.opacity - 0.65).abs() < 1e-4);
+        assert_eq!(rt_art.blend_mode, BlendMode::Overlay);
+        let NodePayload::ArtisticText(art_rt) = &rt_art.payload else {
+            panic!("expected ArtisticWithAttrs to be ArtisticText");
+        };
+        assert_eq!(art_rt.plain_text(), "CMX Art");
+
+        let rt_para = find_obj_by_name(&rt.document, "ParagraphWithAttrs");
+        assert!(xf_err(&rt_para.transform, &para_xf) < 1e-3);
+        assert!(!rt_para.visible);
+        assert!(rt_para.locked);
+        assert!(!rt_para.printable);
+        assert!((rt_para.opacity - 0.75).abs() < 1e-4);
+        assert_eq!(rt_para.blend_mode, BlendMode::Darken);
+        let NodePayload::ParagraphText(para_rt) = &rt_para.payload else {
+            panic!("expected ParagraphWithAttrs to be ParagraphText");
+        };
+        assert_eq!(para_rt.plain_text(), "CMX Para");
+        assert_eq!(para_rt.frame_size, Vec2D::new(60.0, 35.0));
+
+        let rt_path = find_obj_by_name(&rt.document, "PathWithAttrs");
+        assert!(!rt_path.visible);
+        assert!(rt_path.locked);
+        assert!(!rt_path.printable);
+        assert!((rt_path.opacity - 0.35).abs() < 1e-4);
+        assert_eq!(rt_path.blend_mode, BlendMode::Difference);
+    }
 }

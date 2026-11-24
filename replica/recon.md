@@ -1,7 +1,7 @@
 # Recon map: CorelDRAW Graphics Suite (Desktop — Windows / macOS; rebuilt natively for Linux-first & Windows as `coree`)
 
 Scope: Full offline desktop vector illustration, multi-page layout, 11 interactive Lenses, vector/bitmap Effects, integrated Raster Photo Studio, PowerTRACE bitmap-to-vector tracing, commercial Prepress/Imposition/Preflight/Barcode/Print Merge/DXF/PLT, CutContour/Parametric Dielines/Path Meter, Arabic RTL/Kashida & legacy CP1256 `.cdr` support, Unknown-Chunk Passthrough + CDR Inspector, and Serializable Command Journal / Rhai Macro Recorder.
-For: Print shops, sign makers, packaging/laser/vinyl cutting workshops, Arabic/MENA & international studios, and independent designers on Linux and Windows who want a fast, 100% offline, zero-subscription MPL-2.0 pure-Rust production studio.
+For: Print shops, sign makers, packaging/laser/vinyl cutting workshops, Arabic/MENA & international studios, and independent designers on Linux and Windows who want a fast, 100% offline, zero-subscription `MIT OR Apache-2.0` pure-Rust production studio.
 Date: 2026-11-21
 
 ## Sources
@@ -222,7 +222,7 @@ Relationships: `Document 1-n Page`, `Document 1-n Layer (Master)`, `Page 1-n Lay
 
 ## Feature matrix
 
-See [features.csv](file:///run/media/ahmed/DATA/coreldraw%20me/replica/features.csv) (102 total rows, validated cleanly via `parity.py`):
+See [features.csv](features.csv) (102 total rows, validated cleanly via `parity.py`):
 - **Counted CorelDRAW parity rows (`original=yes`, active):** **86** (`must`: 68, `should`: 17, `could`: 1) across 13 areas (`workspace`, `pages`, `selection`, `drawing`, `technical`, `color-fill`, `typography`, `effects`, `lenses`, `photo-studio`, `powertrace`, `prepress`, `codecs`).
 - **Out-of-scope (`skip`):** **6**.
 - **`coree` differentiators from `replica-entrepreneur` (`original=no`):** **10** (`must`: 8, `should`: 2).
@@ -231,7 +231,7 @@ See [features.csv](file:///run/media/ahmed/DATA/coreldraw%20me/replica/features.
 
 - **Corel Cloud storage, online file sync & web collaboration comments** — `coree` is strictly 100% offline-first with zero cloud servers or network sockets.
 - **CorelDRAW Web browser app & iPad companion app** — Desktop-first native Linux and Windows scope only.
-- **User accounts, license activation servers & subscription billing** — Zero accounts, zero DRM, zero telemetry under MPL-2.0.
+- **User accounts, license activation servers & subscription billing** — Zero accounts, zero DRM, zero telemetry under `MIT OR Apache-2.0`.
 - **Licensed Pantone® books & proprietary encrypted vendor color libraries** — Trademarked/licensed third-party data; `coree` provides open CMYK/RGB/Lab palettes plus user-defined Spot Color channels (including open `CutContour`/`PerfCutContour`/`Crease` presets) and palette import.
 - **Proprietary Corel clipart, stock photos, licensed Monotype fonts & cloud AI credit packs** — Copyrighted third-party assets; users use local system fonts and their own assets.
 - **Windows-only COM / VBA / VSTA macro runtime** — Platform-locked proprietary Windows automation; replaced cleanly by cross-platform Rhai scripting generated directly from the `DocumentCommand` log.
@@ -244,4 +244,4 @@ Hard parts:
 2. High-performance 2D vector/raster rendering (`tiny-skia` + `rstar` R-Tree + Rayon dirty tiles) covering all 11 interactive Lenses, Mesh Fills, PowerClips, Boolean shaping (`i_overlay`), and CMYK/Spot overprint simulation at 60 FPS on 10,000+ objects.
 3. Native Arabic RTL/Kashida bidirectional text shaping (`cosmic-text`), PowerTRACE vectorization, and commercial prepress (CMYK PDF/X-1a/4, Imposition, Separations, DXF, HPGL `.plt`).
 
-Size: **L–XL** (staged across vertical-slice milestones in [architecture.md](file:///run/media/ahmed/DATA/coreldraw%20me/replica/architecture.md)).
+Size: **L–XL** (staged across vertical-slice milestones in [architecture.md](architecture.md)).

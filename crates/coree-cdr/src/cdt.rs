@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Clean-room CorelDRAW Template (`.cdt`) reader and writer supporting both
+//! Clean-room CDR Template (`.cdt`) reader and writer supporting both
 //! RIFF (`CDT*`) and ZIP/OPC (`X4–X5` / `X6+`) template containers.
 
 use crate::cdr_riff::{
@@ -9,22 +9,22 @@ use crate::cdr_riff::{
 use crate::cdr_zip::{is_zip_bytes, parse_cdr_zip, write_cdr_zip, CdrZipEra};
 use crate::error::{CdrError, CdrResult};
 use crate::limits::CodecLimits;
-use crate::{CdrWriteVersion, CorelFormat, ImportReport};
+use crate::{CdrFormat, CdrWriteVersion, ImportReport};
 use coree_core::Document;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Imports a CorelDRAW Template (`.cdt`) from raw bytes (either RIFF or ZIP container).
+/// Imports a CDR Template (`.cdt`) from raw bytes (either RIFF or ZIP container).
 pub fn import_cdt_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportReport> {
     if is_zip_bytes(bytes) {
         let parsed = parse_cdr_zip(bytes, limits)?;
         let mut doc = parsed.document;
-        if doc.metadata.source_format.is_none() {
-            doc.metadata.source_format = Some("CDT ZIP".to_owned());
+        if doc.metadata().source_format.is_none() {
+            doc.metadata_mut().source_format = Some("CDT ZIP".to_owned());
         }
         Ok(ImportReport {
             document: doc,
-            detected_format: CorelFormat::CdtZip,
+            detected_format: CdrFormat::CdtZip,
             warnings: parsed.warnings,
         })
     } else {
@@ -36,7 +36,7 @@ pub fn import_cdt_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportR
         }
         Ok(ImportReport {
             document: parsed.document,
-            detected_format: CorelFormat::CdtRiff {
+            detected_format: CdrFormat::CdtRiff {
                 version: parsed.version,
             },
             warnings: parsed.warnings,
@@ -44,7 +44,7 @@ pub fn import_cdt_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportR
     }
 }
 
-/// Exports `doc` as a CorelDRAW Template (`.cdt`) in the selected container version.
+/// Exports `doc` as a CDR Template (`.cdt`) in the selected container version.
 pub fn export_cdt_bytes(doc: &Document, version: CdrWriteVersion) -> CdrResult<Vec<u8>> {
     match version {
         CdrWriteVersion::RiffV12 => {
@@ -64,7 +64,7 @@ pub fn export_cdt_bytes(doc: &Document, version: CdrWriteVersion) -> CdrResult<V
     }
 }
 
-/// Writes `doc` to `path` as a CorelDRAW Template (`.cdt`).
+/// Writes `doc` to `path` as a CDR Template (`.cdt`).
 pub fn export_cdt(doc: &Document, path: &Path, version: CdrWriteVersion) -> CdrResult<()> {
     let bytes = export_cdt_bytes(doc, version)?;
     std::fs::write(path, bytes)?;

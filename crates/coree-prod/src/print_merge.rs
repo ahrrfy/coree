@@ -13,7 +13,7 @@ use crate::barcode::{
 };
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{clone_document_shell, clone_page_contents_into, get_page};
-use coree_core::{Affine2D, Document, LayerId, NodePayload, ObjectId, Point2D, TextRun};
+use coree_core::{Affine2D, Document, LayerId, NodePayload, ObjectId, Point2D};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -297,7 +297,7 @@ pub fn apply_print_merge(
         ));
     }
 
-    let mut out = clone_document_shell(template_doc, format!("{} (Merged)", template_doc.title));
+    let mut out = clone_document_shell(template_doc, format!("{} (Merged)", template_doc.title()));
 
     for row_idx in 0..table.rows.len() {
         let mut fields = table.row_map(row_idx);
@@ -310,7 +310,7 @@ pub fn apply_print_merge(
 
         let page_name = substitute_placeholders(&options.page_name_pattern, &fields);
         out.add_page(page_name, tpl_w, tpl_h, tpl_bleed);
-        let dst_page_idx = out.pages.len() - 1;
+        let dst_page_idx = out.pages().len() - 1;
 
         let top_ids = clone_page_contents_into(
             template_doc,
@@ -322,7 +322,7 @@ pub fn apply_print_merge(
         )?;
 
         // Handle dynamic barcode/QR placeholder objects recursively (top-level + inside Groups/PowerClips)
-        let page_layer_objects: Vec<(LayerId, Vec<ObjectId>)> = out.pages[dst_page_idx]
+        let page_layer_objects: Vec<(LayerId, Vec<ObjectId>)> = out.pages()[dst_page_idx]
             .layers
             .iter()
             .map(|l| (l.id, l.objects.clone()))
@@ -362,6 +362,10 @@ pub fn apply_print_merge(
                     Some(rep.host_layer_id),
                 )?,
             };
+            // Clean relational references (`Connector`, `Blend`, `TextOnPath`, etc.) while
+            // `rep.old_id` is still attached to its parent container/layer so world-space
+            // fallback anchors preserve ancestor transforms.
+            out.cleanup_dangling_refs_for_object_ids(&[rep.old_id]);
             // Splice `new_id` cleanly into the exact parent container or layer slot of `old_id`
             match rep.parent {
                 BarcodeParent::Layer(lid) => {
@@ -379,20 +383,7 @@ pub fn apply_print_merge(
                     if let Some(layer) = out.find_layer_mut(rep.host_layer_id) {
                         layer.objects.retain(|&id| id != new_id);
                     }
-                    if let Some(parent_obj) = out.objects.get_mut(&parent_id) {
-                        let list = match &mut parent_obj.payload {
-                            NodePayload::Group(c) => Some(c),
-                            NodePayload::PowerClip { contents, .. } => Some(contents),
-                            _ => None,
-                        };
-                        if let Some(children) = list {
-                            if let Some(pos) = children.iter().position(|&id| id == rep.old_id) {
-                                children[pos] = new_id;
-                            } else {
-                                children.push(new_id);
-                            }
-                        }
-                    }
+                    let _ = out.replace_container_child(parent_id, rep.old_id, new_id);
                 }
             }
             let _ = out.remove_object(rep.old_id);
@@ -400,8 +391,10 @@ pub fn apply_print_merge(
 
         // Recursively substitute text/table placeholders on all remaining objects of this page
         for oid in top_ids {
-            if out.objects.contains_key(&oid) {
-                substitute_object_tree(&mut out, oid, &fields, 0);
+            if out.has_object(oid) {
+                out.substitute_object_text_and_table_placeholders(oid, |s| {
+                    substitute_placeholders(s, &fields)
+                });
             }
         }
     }
@@ -463,7 +456,7 @@ fn collect_barcode_replacements(
         });
         return;
     }
-    if let Some(obj) = doc.objects.get(&oid) {
+    if let Some(obj) = doc.object(oid) {
         let children: &[ObjectId] = match &obj.payload {
             NodePayload::Group(c) => c,
             NodePayload::PowerClip { contents, .. } => contents,
@@ -494,7 +487,7 @@ fn detect_barcode_directive(
     fields: &BTreeMap<String, String>,
     options: &PrintMergeOptions,
 ) -> Option<BarcodeDirective> {
-    let obj = doc.objects.get(&oid)?;
+    let obj = doc.object(oid)?;
     let name_trimmed = obj.name.trim();
 
     // Form 1: Object name starts with "Barcode:" (case-insensitive)
@@ -571,53 +564,6 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
         s.get(prefix.len()..)
     } else {
         None
-    }
-}
-
-fn substitute_object_tree(
-    doc: &mut Document,
-    id: ObjectId,
-    fields: &BTreeMap<String, String>,
-    depth: usize,
-) {
-    if depth > crate::scene_helpers::MAX_SCENE_DEPTH {
-        return;
-    }
-    let children: Vec<ObjectId> = match doc.objects.get_mut(&id) {
-        None => return,
-        Some(obj) => match &mut obj.payload {
-            NodePayload::ArtisticText(t) => {
-                substitute_runs(&mut t.runs, fields);
-                Vec::new()
-            }
-            NodePayload::ParagraphText(t) => {
-                substitute_runs(&mut t.runs, fields);
-                Vec::new()
-            }
-            NodePayload::TextOnPath(top) => {
-                substitute_runs(&mut top.text.runs, fields);
-                Vec::new()
-            }
-            NodePayload::Table(table) => {
-                for cell in &mut table.cells {
-                    cell.text = substitute_placeholders(&cell.text, fields);
-                }
-                Vec::new()
-            }
-            NodePayload::Group(c) | NodePayload::PowerClip { contents: c, .. } => c.clone(),
-            _ => Vec::new(),
-        },
-    };
-    for cid in children {
-        substitute_object_tree(doc, cid, fields, depth + 1);
-    }
-}
-
-fn substitute_runs(runs: &mut [TextRun], fields: &BTreeMap<String, String>) {
-    for run in runs {
-        if run.text.contains("<<") {
-            run.text = substitute_placeholders(&run.text, fields);
-        }
     }
 }
 
@@ -741,16 +687,16 @@ mod tests {
         };
 
         let merged = apply_print_merge(&tpl, &table, &opts).unwrap();
-        assert_eq!(merged.pages.len(), 3);
-        assert_eq!(merged.pages[0].name, "Badge 0001 - أحمد علي");
-        assert_eq!(merged.pages[1].name, "Badge 0002 - John, Doe");
-        assert_eq!(merged.pages[2].name, "Badge 0003 - فاطمة");
+        assert_eq!(merged.pages().len(), 3);
+        assert_eq!(merged.pages()[0].name, "Badge 0001 - أحمد علي");
+        assert_eq!(merged.pages()[1].name, "Badge 0002 - John, Doe");
+        assert_eq!(merged.pages()[2].name, "Badge 0003 - فاطمة");
 
         // Verify substituted Arabic + serial text on page 0 and generated vector barcode group!
-        let p0_objs: Vec<&SceneObject> = merged.pages[0].layers[0]
+        let p0_objs: Vec<&SceneObject> = merged.pages()[0].layers[0]
             .objects
             .iter()
-            .filter_map(|id| merged.objects.get(id))
+            .filter_map(|id| merged.object(*id))
             .collect();
         let text_obj = p0_objs
             .iter()

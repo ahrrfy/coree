@@ -303,7 +303,7 @@ pub fn print_document_via_os_spooler(
     cfg: &PrintJobConfig,
 ) -> Result<String, String> {
     cleanup_stale_print_pdfs();
-    let pages = parse_page_range_1based(&cfg.page_range, doc.pages.len())?;
+    let pages = parse_page_range_1based(&cfg.page_range, doc.pages().len())?;
 
     let spool_pdf = std::env::temp_dir().join(format!("coree-print-{}.pdf", Uuid::new_v4()));
     let pdf_opts = PdfExportOptions {

@@ -68,7 +68,7 @@ pub fn save_coree_with_preview(
     // Externalize heavy raster assets as standalone `assets/<uuid>.png` files so
     // `document.json` stays compact and fast to parse while preserving 100% lossless data.
     let mut light_doc = doc.clone();
-    let externalized_assets = std::mem::take(&mut light_doc.assets);
+    let externalized_assets = light_doc.take_assets();
 
     let mut asset_entries = Vec::with_capacity(externalized_assets.len());
     let mut encoded_assets: Vec<(String, Vec<u8>)> = Vec::with_capacity(externalized_assets.len());
@@ -96,11 +96,11 @@ pub fn save_coree_with_preview(
         format_version: COREE_FORMAT_VERSION,
         app: APP_NAME.to_owned(),
         app_version: VERSION.to_owned(),
-        document_id: doc.id,
-        title: doc.title.clone(),
-        created_at: doc.metadata.created_at,
-        modified_at: doc.metadata.modified_at,
-        page_count: doc.pages.len(),
+        document_id: doc.id(),
+        title: doc.title().to_owned(),
+        created_at: doc.metadata().created_at,
+        modified_at: doc.metadata().modified_at,
+        page_count: doc.pages().len(),
         asset_count: externalized_assets.len(),
         has_preview: preview_png.is_some(),
     };
@@ -217,7 +217,7 @@ pub fn load_coree_from_reader<R: Read + Seek>(
 
     // 3. Rehydrate externalized raster assets enforcing deduplication, path scoping,
     // and cumulative RGBA memory & pixel limits across all assets.
-    let mut restored_assets: BTreeMap<ImageAssetId, RasterAsset> = std::mem::take(&mut doc.assets);
+    let mut restored_assets: BTreeMap<ImageAssetId, RasterAsset> = doc.take_assets();
     let mut total_raster_pixels: u64 = 0;
     let mut total_rgba_bytes: u64 = 0;
     for asset in restored_assets.values() {
@@ -380,7 +380,7 @@ pub fn load_coree_from_reader<R: Read + Seek>(
         }
     }
 
-    doc.assets = restored_assets;
+    doc.restore_assets(restored_assets);
     Ok(doc)
 }
 
@@ -598,7 +598,7 @@ mod tests {
 
     fn build_rich_document() -> Document {
         let mut doc = Document::new_a4("Rich Native Container Test");
-        let page_id = doc.pages[0].id;
+        let page_id = doc.pages()[0].id;
         let master_layer = doc
             .add_layer(page_id, "Master Header", false, MasterLayerScope::AllPages)
             .unwrap();
@@ -699,7 +699,7 @@ mod tests {
         .unwrap();
 
         doc.add_guide(GuideOrientation::Horizontal(25.0), true);
-        doc.unknown_doc_chunks.push(UnknownCdrChunk {
+        doc.push_unknown_doc_chunk(UnknownCdrChunk {
             fourcc: *b"vrsn",
             version_hint: 2400,
             raw_bytes: vec![0xAA, 0xBB],

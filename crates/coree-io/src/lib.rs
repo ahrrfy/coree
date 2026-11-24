@@ -6,6 +6,7 @@
 
 pub mod atomic;
 pub mod cad_plot;
+pub mod clipboard_codec;
 pub mod eps;
 pub mod error;
 pub mod native;
@@ -26,6 +27,13 @@ pub use cad_plot::{
     export_plt, export_plt_to_string, export_plt_to_string_with_options, export_plt_with_options,
     import_dxf, import_dxf_bytes, import_plt, import_plt_bytes, DxfExportOptions, PltExportOptions,
     HPGL_UNITS_PER_MM,
+};
+pub use clipboard_codec::{
+    build_clipboard_document, decode_clipboard_auto, decode_clipboard_emf, decode_clipboard_pdf,
+    decode_clipboard_png, decode_clipboard_rgba, decode_clipboard_svg, encode_clipboard_emf,
+    encode_clipboard_payload, encode_clipboard_pdf, encode_clipboard_png_rgba,
+    encode_clipboard_svg, ClipboardDecodedFormat, ClipboardPayload, MIME_EMF, MIME_PDF, MIME_PNG,
+    MIME_SVG, MIME_TEXT_PLAIN,
 };
 pub use eps::{export_eps, export_eps_to_string, import_eps, import_eps_bytes};
 pub use error::{sanitize_zip_path, IoError, IoLimits, IoResult};

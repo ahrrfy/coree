@@ -43,6 +43,32 @@ jobs:
       - name: Run Clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Brand & MIME allowlist sweep (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python3 scripts/brand_sweep.py
+
+      - name: Brand & MIME allowlist sweep (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/brand_sweep.py
+          if ($LASTEXITCODE -ne 0) { throw "brand_sweep.py failed" }
+
+      - name: Verify repository invariants (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python3 scripts/verify_invariants.py
+
+      - name: Verify repository invariants (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/verify_invariants.py
+          if ($LASTEXITCODE -ne 0) { throw "verify_invariants.py failed" }
+
       - name: Build release binary
         run: cargo build --release --package coree-app --bins
 
@@ -51,8 +77,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./target/release/coree --diagnostics
-          ./target/release/coree-cli --diagnostics
+          EXPECTED_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          ./target/release/coree --diagnostics | tee /tmp/coree-diag.txt
+          grep -q "coree v${EXPECTED_VER}" /tmp/coree-diag.txt
+          ./target/release/coree-cli --diagnostics | tee /tmp/coree-cli-diag.txt
+          grep -q "coree v${EXPECTED_VER}" /tmp/coree-cli-diag.txt
           bash -n packaging/linux/install-linux.sh packaging/linux/build-deb.sh packaging/linux/build-appimage.sh
           python3 - <<'PY'
           import xml.etree.ElementTree as ET
@@ -74,8 +103,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $expectedVer = (Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           Copy-Item ".\target\release\coree-cli.exe" ".\target\release\coree.com" -Force
-          & .\target\release\coree.com --diagnostics
+          $cliOut = & .\target\release\coree.com --diagnostics
           if ($LASTEXITCODE -ne 0) { throw "coree.com --diagnostics failed with exit code $LASTEXITCODE" }
+          if (($cliOut -join "`n") -notmatch "coree v$([regex]::Escape($expectedVer))") { throw "coree.com --diagnostics missing coree v$expectedVer" }
           $guiProc = Start-Process -FilePath ".\target\release\coree.exe" -ArgumentList "--diagnostics" -NoNewWindow -Wait -PassThru
           if ($guiProc.ExitCode -ne 0) { throw "coree.exe GUI launcher exited with code $($guiProc.ExitCode)" }

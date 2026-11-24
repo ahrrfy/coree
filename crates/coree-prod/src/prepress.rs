@@ -133,6 +133,21 @@ pub fn compute_separations(
     page_index: usize,
     options: &SeparationOptions,
 ) -> ProdResult<SeparationResult> {
+    compute_separations_with_text_outliner(doc, page_index, options, |_, _| None)
+}
+
+/// Analyzes `doc.pages[page_index]` and generates CMYK + Spot color separation plates while
+/// converting live text objects (`ArtisticText`, `ParagraphText`, `TextOnPath`, and symbol text)
+/// via `text_outliner` into true vector glyph curves in each object's local coordinate space.
+pub fn compute_separations_with_text_outliner<F>(
+    doc: &Document,
+    page_index: usize,
+    options: &SeparationOptions,
+    mut text_outliner: F,
+) -> ProdResult<SeparationResult>
+where
+    F: FnMut(&SceneObject, &Document) -> Option<BezierPath>,
+{
     let page = get_page(doc, page_index)?;
     validate_positive("page.width_mm", page.width_mm)?;
     validate_positive("page.height_mm", page.height_mm)?;
@@ -183,6 +198,7 @@ pub fn compute_separations(
         scale_y,
         spot_index: &spot_index,
         buffers: &mut buffers,
+        text_outliner: &mut text_outliner,
     };
 
     for layer in &effective_layers {
@@ -273,7 +289,7 @@ fn collect_spots_recursive(
     if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
         return;
     }
-    if let Some(obj) = doc.objects.get(&id) {
+    if let Some(obj) = doc.object(id) {
         if obj.visible && obj.printable {
             for c in obj.fill.referenced_colors() {
                 register_spot_color(&c, spots);
@@ -307,6 +323,52 @@ fn collect_spots_recursive(
                         collect_spots_recursive(doc, cid, depth + 1, visiting, spots);
                     }
                 }
+                NodePayload::SymbolInstance(sym_id) => {
+                    if let Some(sym) = doc.symbol(*sym_id) {
+                        for sub in &sym.objects {
+                            if !sub.visible || !sub.printable {
+                                continue;
+                            }
+                            for c in sub.fill.referenced_colors() {
+                                register_spot_color(&c, spots);
+                            }
+                            if sub.outline.is_visible() {
+                                register_spot_color(&sub.outline.color, spots);
+                            }
+                            match &sub.payload {
+                                NodePayload::ArtisticText(t) => {
+                                    for run in &t.runs {
+                                        register_spot_color(&run.style.fill, spots);
+                                    }
+                                }
+                                NodePayload::ParagraphText(t) => {
+                                    for run in &t.runs {
+                                        register_spot_color(&run.style.fill, spots);
+                                    }
+                                }
+                                NodePayload::TextOnPath(top) => {
+                                    for run in &top.text.runs {
+                                        register_spot_color(&run.style.fill, spots);
+                                    }
+                                }
+                                NodePayload::Table(table) => {
+                                    if table.border_style.is_visible() {
+                                        register_spot_color(&table.border_style.color, spots);
+                                    }
+                                    for cell in &table.cells {
+                                        if !cell.is_covered() {
+                                            for c in cell.fill.referenced_colors() {
+                                                register_spot_color(&c, spots);
+                                            }
+                                            register_spot_color(&cell.text_style.fill, spots);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -335,6 +397,7 @@ struct SeparationRasterCtx<'a> {
     scale_y: f32,
     spot_index: &'a BTreeMap<String, usize>,
     buffers: &'a mut [Vec<f32>],
+    text_outliner: &'a mut dyn FnMut(&SceneObject, &Document) -> Option<BezierPath>,
 }
 
 fn rasterize_object_separation(
@@ -348,7 +411,7 @@ fn rasterize_object_separation(
     if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
         return;
     }
-    let Some(obj) = ctx.doc.objects.get(&id) else {
+    let Some(obj) = ctx.doc.object(id) else {
         visiting.remove(&id);
         return;
     };
@@ -414,15 +477,44 @@ fn rasterize_object_separation(
             return;
         }
         NodePayload::SymbolInstance(sym_id) => {
-            if let Some(sym) = ctx.doc.symbols.get(sym_id) {
+            if let Some(sym) = ctx.doc.symbol(*sym_id) {
                 for sub in &sym.objects {
-                    if !sub.visible || !sub.printable || sub.opacity <= 1e-6 {
+                    if !sub.visible
+                        || !sub.printable
+                        || !sub.opacity.is_finite()
+                        || sub.opacity <= 1e-6
+                    {
                         continue;
                     }
                     let sub_xf = world_xf.compose(&sub.transform);
+                    if !sub_xf.is_finite() {
+                        continue;
+                    }
                     let sub_path = match &sub.payload {
                         NodePayload::Path(p) => Some(p.transformed(&sub_xf)),
                         NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&sub_xf)),
+                        NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&sub_xf)),
+                        NodePayload::ArtisticText(t) => outline_text_path_for_separation(
+                            ctx,
+                            sub,
+                            &sub_xf,
+                            t.estimated_bounds(),
+                            !t.plain_text().trim().is_empty(),
+                        ),
+                        NodePayload::ParagraphText(t) => outline_text_path_for_separation(
+                            ctx,
+                            sub,
+                            &sub_xf,
+                            t.bounding_box(),
+                            !t.plain_text().trim().is_empty(),
+                        ),
+                        NodePayload::TextOnPath(top) => outline_text_path_for_separation(
+                            ctx,
+                            sub,
+                            &sub_xf,
+                            top.text.estimated_bounds(),
+                            !top.text.plain_text().trim().is_empty(),
+                        ),
                         _ => None,
                     };
                     if let Some(path) = sub_path {
@@ -440,15 +532,27 @@ fn rasterize_object_separation(
         NodePayload::Path(p) => Some(p.transformed(&world_xf)),
         NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
         NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
-        NodePayload::ArtisticText(t) => {
-            Some(BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf))
-        }
-        NodePayload::ParagraphText(t) => {
-            Some(BezierPath::from_rect(t.bounding_box()).transformed(&world_xf))
-        }
-        NodePayload::TextOnPath(top) => {
-            Some(BezierPath::from_rect(top.text.estimated_bounds()).transformed(&world_xf))
-        }
+        NodePayload::ArtisticText(t) => outline_text_path_for_separation(
+            ctx,
+            obj,
+            &world_xf,
+            t.estimated_bounds(),
+            !t.plain_text().trim().is_empty(),
+        ),
+        NodePayload::ParagraphText(t) => outline_text_path_for_separation(
+            ctx,
+            obj,
+            &world_xf,
+            t.bounding_box(),
+            !t.plain_text().trim().is_empty(),
+        ),
+        NodePayload::TextOnPath(top) => outline_text_path_for_separation(
+            ctx,
+            obj,
+            &world_xf,
+            top.text.estimated_bounds(),
+            !top.text.plain_text().trim().is_empty(),
+        ),
         NodePayload::Dimension(d) => {
             Some(BezierPath::from_rect(d.bounding_box()).transformed(&world_xf))
         }
@@ -466,6 +570,26 @@ fn rasterize_object_separation(
     }
 
     visiting.remove(&id);
+}
+
+fn outline_text_path_for_separation(
+    ctx: &mut SeparationRasterCtx<'_>,
+    obj: &SceneObject,
+    world_xf: &Affine2D,
+    fallback_rect: Rect2D,
+    has_non_whitespace: bool,
+) -> Option<BezierPath> {
+    if let Some(local_path) = (ctx.text_outliner)(obj, ctx.doc) {
+        if local_path.is_finite() {
+            if !local_path.is_empty() {
+                return Some(local_path.transformed(world_xf));
+            }
+            if !has_non_whitespace {
+                return None;
+            }
+        }
+    }
+    Some(BezierPath::from_rect(fallback_rect).transformed(world_xf))
 }
 
 fn paint_vector_object(
@@ -693,7 +817,7 @@ fn paint_raster_object(
     world_xf: &Affine2D,
     clip_mask: Option<&[f32]>,
 ) {
-    let Some(asset) = ctx.doc.assets.get(&raster.asset_id) else {
+    let Some(asset) = ctx.doc.asset(raster.asset_id) else {
         return;
     };
     if asset.width == 0 || asset.height == 0 || raster.width_mm <= 1e-6 || raster.height_mm <= 1e-6
@@ -1111,7 +1235,7 @@ pub fn booklet_signature_order(page_count: usize) -> Vec<(Option<usize>, Option<
 
 /// Imposes `doc` into a new press-ready [`Document`] according to `mode`.
 pub fn impose_document(doc: &Document, mode: &ImpositionMode) -> ProdResult<Document> {
-    if doc.pages.is_empty() {
+    if doc.pages().is_empty() {
         return Err(ProdError::EmptyDocument(
             "cannot impose a document with zero pages".into(),
         ));
@@ -1182,8 +1306,8 @@ fn impose_nup(
             "N-Up grid {cols}x{rows} ({per_sheet} slots) exceeds safety cap {MAX_IMPOSITION_SLOTS_PER_SHEET}"
         )));
     }
-    let src_w = doc.pages[0].width_mm;
-    let src_h = doc.pages[0].height_mm;
+    let src_w = doc.pages()[0].width_mm;
+    let src_h = doc.pages()[0].height_mm;
     validate_positive("source page width_mm", src_w)?;
     validate_positive("source page height_mm", src_h)?;
 
@@ -1193,10 +1317,10 @@ fn impose_nup(
     let origin_y = (sheet_h_mm - grid_h) * 0.5;
 
     // Step-and-repeat for 1-page designs; sequential flow for multi-page documents.
-    let slot_sources: Vec<usize> = if doc.pages.len() == 1 {
+    let slot_sources: Vec<usize> = if doc.pages().len() == 1 {
         vec![0; per_sheet]
     } else {
-        (0..doc.pages.len()).collect()
+        (0..doc.pages().len()).collect()
     };
 
     let sheet_count = slot_sources.len().div_ceil(per_sheet);
@@ -1205,7 +1329,7 @@ fn impose_nup(
             "N-Up imposition would produce {sheet_count} sheets (exceeds cap {MAX_IMPOSITION_PAGES})"
         )));
     }
-    let mut out = clone_document_shell(doc, format!("{} (N-Up {}x{})", doc.title, cols, rows));
+    let mut out = clone_document_shell(doc, format!("{} (N-Up {}x{})", doc.title(), cols, rows));
 
     for sheet_idx in 0..sheet_count {
         out.add_page(
@@ -1214,7 +1338,7 @@ fn impose_nup(
             sheet_h_mm,
             0.0,
         );
-        let dst_page_idx = out.pages.len() - 1;
+        let dst_page_idx = out.pages().len() - 1;
 
         for slot in 0..per_sheet {
             let global_slot = sheet_idx * per_sheet + slot;
@@ -1242,12 +1366,12 @@ fn impose_nup(
 fn impose_booklet(doc: &Document, sheet_w_mm: f64, sheet_h_mm: f64) -> ProdResult<Document> {
     validate_positive("sheet_w_mm", sheet_w_mm)?;
     validate_positive("sheet_h_mm", sheet_h_mm)?;
-    for p in &doc.pages {
+    for p in doc.pages() {
         validate_positive("page.width_mm", p.width_mm)?;
         validate_positive("page.height_mm", p.height_mm)?;
     }
 
-    let spreads = booklet_signature_order(doc.pages.len());
+    let spreads = booklet_signature_order(doc.pages().len());
     if spreads.len() > MAX_IMPOSITION_PAGES {
         return Err(ProdError::InvalidParameter(format!(
             "booklet imposition would produce {} spreads (exceeds cap {MAX_IMPOSITION_PAGES})",
@@ -1255,7 +1379,7 @@ fn impose_booklet(doc: &Document, sheet_w_mm: f64, sheet_h_mm: f64) -> ProdResul
         )));
     }
     let half_w = sheet_w_mm * 0.5;
-    let mut out = clone_document_shell(doc, format!("{} (Booklet)", doc.title));
+    let mut out = clone_document_shell(doc, format!("{} (Booklet)", doc.title()));
 
     for (spread_idx, (left_opt, right_opt)) in spreads.iter().enumerate() {
         let sheet_num = (spread_idx / 2) + 1;
@@ -1270,11 +1394,11 @@ fn impose_booklet(doc: &Document, sheet_w_mm: f64, sheet_h_mm: f64) -> ProdResul
             fmt_p(*right_opt)
         );
         out.add_page(page_name, sheet_w_mm, sheet_h_mm, 0.0);
-        let dst_page_idx = out.pages.len() - 1;
+        let dst_page_idx = out.pages().len() - 1;
 
         // Place left half flush against the center spine (x = half_w)
         if let Some(src_idx) = *left_opt {
-            let p = &doc.pages[src_idx];
+            let p = &doc.pages()[src_idx];
             let scale = (half_w / p.width_mm).min(sheet_h_mm / p.height_mm).min(1.0);
             let placed_w = p.width_mm * scale;
             let placed_h = p.height_mm * scale;
@@ -1286,7 +1410,7 @@ fn impose_booklet(doc: &Document, sheet_w_mm: f64, sheet_h_mm: f64) -> ProdResul
 
         // Place right half flush against the center spine (x = half_w)
         if let Some(src_idx) = *right_opt {
-            let p = &doc.pages[src_idx];
+            let p = &doc.pages()[src_idx];
             let scale = (half_w / p.width_mm).min(sheet_h_mm / p.height_mm).min(1.0);
             let placed_h = p.height_mm * scale;
             let tx = half_w;
@@ -1318,9 +1442,9 @@ fn impose_tiling(
     let step_y = tile_h_mm - overlap_mm;
 
     // Validate tile grid counts upfront before allocating any output pages
-    let mut page_grids: Vec<(usize, usize)> = Vec::with_capacity(doc.pages.len());
+    let mut page_grids: Vec<(usize, usize)> = Vec::with_capacity(doc.pages().len());
     let mut total_tiles = 0usize;
-    for src_page in &doc.pages {
+    for src_page in doc.pages() {
         validate_positive("page.width_mm", src_page.width_mm)?;
         validate_positive("page.height_mm", src_page.height_mm)?;
         let cols_f = if src_page.width_mm <= tile_w_mm + 1e-6 {
@@ -1358,9 +1482,9 @@ fn impose_tiling(
         page_grids.push((rows, cols));
     }
 
-    let mut out = clone_document_shell(doc, format!("{} (Tiled)", doc.title));
+    let mut out = clone_document_shell(doc, format!("{} (Tiled)", doc.title()));
 
-    for (src_idx, src_page) in doc.pages.iter().enumerate() {
+    for (src_idx, src_page) in doc.pages().iter().enumerate() {
         let (rows, cols) = page_grids[src_idx];
 
         for r in 0..rows {
@@ -1375,7 +1499,7 @@ fn impose_tiling(
                     tile_h_mm,
                     0.0,
                 );
-                let dst_page_idx = out.pages.len() - 1;
+                let dst_page_idx = out.pages().len() - 1;
                 clone_page_contents_into(
                     doc,
                     src_idx,
@@ -1620,10 +1744,10 @@ pub fn generate_print_marks(
     validate_positive("page.width_mm", w)?;
     validate_positive("page.height_mm", h)?;
     let page_name = page.name.clone();
-    let total_pages = doc.pages.len();
-    let doc_title = doc.title.clone();
-    let color_mode = doc.color_mode;
-    let dpi = doc.dpi;
+    let total_pages = doc.pages().len();
+    let doc_title = doc.title().to_owned();
+    let color_mode = doc.color_mode();
+    let dpi = doc.dpi();
 
     validate_positive("mark_length_mm", options.mark_length_mm)?;
     validate_non_negative("mark_offset_mm", options.mark_offset_mm)?;
@@ -1962,7 +2086,7 @@ mod tests {
         // CutContour Spot outline on cut layer
         let cut_layer = doc
             .add_layer(
-                doc.pages[0].id,
+                doc.pages()[0].id,
                 "CutContour",
                 true,
                 coree_core::MasterLayerScope::None,
@@ -2079,8 +2203,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(nup.pages.len(), 1);
-        assert_eq!(nup.objects.len(), 10);
+        assert_eq!(nup.pages().len(), 1);
+        assert_eq!(nup.object_count(), 10);
 
         // 2. Booklet Saddle-Stitch on 6-page A5 document -> 4 imposed A4 spreads
         let mut booklet_src = Document::new("Zine", 148.5, 210.0, ColorMode::Cmyk, 300.0);
@@ -2088,7 +2212,7 @@ mod tests {
             if p > 0 {
                 booklet_src.add_page(format!("Page {}", p + 1), 148.5, 210.0, 0.0);
             }
-            let lid = booklet_src.pages[p].layers[0].id;
+            let lid = booklet_src.pages()[p].layers[0].id;
             booklet_src
                 .add_object(
                     SceneObject::new(
@@ -2111,12 +2235,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(booklet.pages.len(), 4);
-        assert!(booklet.pages[0].name.contains("Blank | P1"));
-        assert!(booklet.pages[1].name.contains("P2 | Blank"));
-        assert!(booklet.pages[2].name.contains("P6 | P3"));
-        assert!(booklet.pages[3].name.contains("P4 | P5"));
-        assert_eq!(booklet.objects.len(), 6);
+        assert_eq!(booklet.pages().len(), 4);
+        assert!(booklet.pages()[0].name.contains("Blank | P1"));
+        assert!(booklet.pages()[1].name.contains("P2 | Blank"));
+        assert!(booklet.pages()[2].name.contains("P6 | P3"));
+        assert!(booklet.pages()[3].name.contains("P4 | P5"));
+        assert_eq!(booklet.object_count(), 6);
 
         // 3. Large-format Tiling: 1000x600 billboard into 400x350 tiles with 20mm overlap
         let mut banner = Document::new("Billboard", 1000.0, 600.0, ColorMode::Cmyk, 150.0);
@@ -2143,8 +2267,8 @@ mod tests {
         )
         .unwrap();
         // cols = 1 + ceil((1000 - 400) / 380) = 1 + 2 = 3; rows = 1 + ceil((600 - 350) / 330) = 2 => 6 tiles
-        assert_eq!(tiled.pages.len(), 6);
-        assert!(tiled.pages[0]
+        assert_eq!(tiled.pages().len(), 6);
+        assert!(tiled.pages()[0]
             .layers
             .iter()
             .any(|l| l.name == TILE_MARKS_LAYER_NAME && !l.objects.is_empty()));
@@ -2162,5 +2286,103 @@ mod tests {
         let layer = doc.find_layer(report.layer_id).unwrap();
         assert_eq!(layer.name, PRINT_MARKS_LAYER_NAME);
         assert_eq!(layer.objects.len(), report.total_objects());
+    }
+
+    #[test]
+    fn text_outliner_renders_glyph_contours_and_symbol_spot_text() {
+        let mut doc = Document::new("GlyphSep", 100.0, 100.0, ColorMode::Cmyk, 150.0);
+
+        // Live ArtisticText positioned at (20, 20)
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Letter O",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "O",
+                    TextStyle {
+                        font_size_pt: 72.0,
+                        fill: Color::KEY_BLACK,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_transform(Affine2D::translate(20.0, 20.0))
+            .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+
+        // Symbol containing Spot-ink ArtisticText
+        let sym_text = SceneObject::new(
+            ObjectId(1),
+            "SymText",
+            NodePayload::ArtisticText(ArtisticText::from_plain(
+                "I",
+                TextStyle {
+                    font_size_pt: 36.0,
+                    fill: Color::spot("SpotGold", 1.0, [0.0, 0.2, 0.9, 0.0]),
+                    ..TextStyle::default()
+                },
+            )),
+        )
+        .with_outline(OutlineStyle::none());
+        let sym = coree_core::SymbolDef::new("Badge", vec![sym_text]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BadgeInst",
+                NodePayload::SymbolInstance(sym_id),
+            )
+            .with_transform(Affine2D::translate(60.0, 20.0)),
+            None,
+        )
+        .unwrap();
+
+        let opts = SeparationOptions {
+            dpi: 25.4,
+            max_dimension_px: 256,
+            include_cut_layers: true,
+        };
+        let sep = compute_separations_with_text_outliner(&doc, 0, &opts, |obj, _| {
+            if matches!(obj.payload, NodePayload::ArtisticText(_)) {
+                // Hollow ring glyph in local coords (0..20 x 0..20) with inner hole (6..14 x 6..14)
+                let outer = coree_core::Subpath::from_points(
+                    [
+                        Point2D::new(0.0, 0.0),
+                        Point2D::new(20.0, 0.0),
+                        Point2D::new(20.0, 20.0),
+                        Point2D::new(0.0, 20.0),
+                    ],
+                    true,
+                );
+                let inner = coree_core::Subpath::from_points(
+                    [
+                        Point2D::new(6.0, 6.0),
+                        Point2D::new(6.0, 14.0),
+                        Point2D::new(14.0, 14.0),
+                        Point2D::new(14.0, 6.0),
+                    ],
+                    true,
+                );
+                Some(BezierPath {
+                    subpaths: vec![outer, inner],
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+        let k_plate = sep.plate(&SeparationChannel::Black).unwrap();
+        // Stroke of ring at (22, 22) has black ink
+        assert_eq!(k_plate.ink_map[22 * 100 + 22], 255);
+        // Inner counter hole at (30, 30) must be clear (0 ink, NOT filled bounding box!)
+        assert_eq!(k_plate.ink_map[30 * 100 + 30], 0);
+        // Spot ink inside symbol text was discovered and rasterized!
+        let spot_plate = sep.spot_plate("SpotGold").unwrap();
+        assert_eq!(spot_plate.ink_map[22 * 100 + 62], 255);
+        assert_eq!(spot_plate.ink_map[30 * 100 + 70], 0);
     }
 }

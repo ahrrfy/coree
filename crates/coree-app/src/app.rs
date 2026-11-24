@@ -3,7 +3,7 @@
 //! `eframe 0.37` desktop application shell wrapping [`StudioApp`].
 
 use crate::shortcuts::{poll_egui_shortcuts_custom, ShortcutAction};
-use crate::state::{CanvasDragState, StudioApp};
+use crate::state::StudioApp;
 use crate::theme::{apply_theme, configure_arabic_capable_fonts_for_language};
 use crate::ui::{
     canvas::show_canvas_and_status, command_palette::show_command_palette, dialogs::show_dialogs,
@@ -261,21 +261,7 @@ impl StudioApp {
         self.poll_system_printers_async();
         self.prune_toasts();
         self.tick_autosave();
-        let ipc_batches = self
-            .ipc_server
-            .as_ref()
-            .map(crate::ipc::IpcServer::try_recv_batches)
-            .unwrap_or_default();
-        if !ipc_batches.is_empty() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            for batch in ipc_batches {
-                for path in batch {
-                    if let Err(err) = self.open_file_path(&path) {
-                        self.push_toast(err, true);
-                    }
-                }
-            }
-        }
+        let _ = self.process_pending_ipc(Some(&ctx));
 
         // Keep repainting smoothly while background jobs or printer discovery run
         if !self.active_jobs.is_empty() || self.scanning_printers {
@@ -299,16 +285,9 @@ impl StudioApp {
 
         // Process global keyboard shortcuts (unless Command Palette is open and consuming keys)
         if !self.command_palette.open {
-            let is_transform_drag = self.active_tab().is_some_and(|t| {
-                matches!(
-                    t.drag_state,
-                    CanvasDragState::MovingSelection { .. }
-                        | CanvasDragState::ScalingSelection { .. }
-                        | CanvasDragState::RotatingSelection { .. }
-                        | CanvasDragState::SkewingSelection { .. }
-                        | CanvasDragState::FreeTransforming { .. }
-                )
-            });
+            let is_transform_drag = self
+                .active_tab()
+                .is_some_and(|t| t.tool_core.is_transform_dragging());
             let actions =
                 poll_egui_shortcuts_custom(&ctx, self.shortcut_profile, &self.custom_shortcuts);
             for act in actions {

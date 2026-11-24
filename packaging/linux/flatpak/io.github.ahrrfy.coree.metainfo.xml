@@ -74,6 +74,21 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.1" date="2026-11-22">
+      <description>
+        <p>
+          Deep atomic architecture, precision, security, and UI audit release (BUG-106 through
+          BUG-116): ICC v4 mAB/mBA CLUT &amp; cached SoftProofLut3D, Philip Schneider cubic
+          Bezier curve refitting for booleans and eraser, Master Odd/Even spatial indexing and
+          undo-safe asset GC, live text effects, 999-step multi-subpath Blends, C1 Catmull-Rom
+          Mesh Fill, 960px curve-refit SmartFill, shaped Kashida ForceJustifyKashida, outliner
+          prepress separations, clean-room CQL search, SFNT font name collection, gzipped
+          autosaves, Unix 0700/0600 IPC lockfile permissions, composed ancestor world transforms
+          and lock enforcement across all canvas tools, live Print Preview thumbnails, distinct
+          per-tool icons, and Arabic localized dockers.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-22">
       <description>
         <p>

@@ -9,10 +9,21 @@
 
 use crate::db::StorageDb;
 use crate::error::{StorageError, StorageResult};
-use coree_core::{apply_command, CommandOp, Document};
-use rusqlite::{params, OptionalExtension};
+use coree_core::{
+    apply_command, ColorMode, ColorPalette, ColorStyle, CommandHistory, CommandOp, Document,
+    DocumentMetadata, GridConfig, Guide, ImageAssetId, ObjectId, ObjectStyle, Page,
+    PerspectiveGridConfig, RasterAsset, SceneObject, SymbolDef, SymbolId, Unit,
+};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -68,7 +79,589 @@ pub struct JournalEntry {
     pub committed_at: String,
 }
 
+/// Incremental differential autosave payload containing only changed objects and optional
+/// structural fields (`pages`, `assets`, styles, symbols) relative to `base_snapshot_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DifferentialSnapshotPatch {
+    pub doc_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub source_path: Option<String>,
+    pub base_snapshot_id: String,
+    pub last_command_seq: u64,
+    pub upserted_objects: Vec<(ObjectId, SceneObject)>,
+    pub deleted_object_ids: Vec<ObjectId>,
+    pub upserted_assets: Vec<(ImageAssetId, RasterAsset)>,
+    pub deleted_asset_ids: Vec<ImageAssetId>,
+    pub full_assets: Option<BTreeMap<ImageAssetId, RasterAsset>>,
+    pub pages: Option<Vec<Page>>,
+    pub active_page_index: Option<usize>,
+    pub next_id: Option<u64>,
+    pub color_mode: Option<ColorMode>,
+    pub default_unit: Option<Unit>,
+    pub dpi: Option<f32>,
+    pub multipage_view: Option<bool>,
+    pub palettes: Option<Vec<ColorPalette>>,
+    pub document_palette: Option<ColorPalette>,
+    pub guides: Option<Vec<Guide>>,
+    pub grid: Option<GridConfig>,
+    pub perspective_grid: Option<PerspectiveGridConfig>,
+    pub color_styles: Option<Vec<ColorStyle>>,
+    pub object_styles: Option<Vec<ObjectStyle>>,
+    pub symbols: Option<BTreeMap<SymbolId, SymbolDef>>,
+    pub metadata: Option<DocumentMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DifferentialSnapshotEnvelope {
+    autosave_format: String,
+    patch: DifferentialSnapshotPatch,
+}
+
+enum AutosaveTask {
+    BaselineSnapshot {
+        snapshot_id: String,
+        doc_id: String,
+        session_id: String,
+        title: String,
+        source_path: Option<String>,
+        doc: Box<Document>,
+        last_command_seq: u64,
+    },
+    DifferentialDelta {
+        delta_id: String,
+        patch: Box<DifferentialSnapshotPatch>,
+    },
+    AppendCommand {
+        doc_id: String,
+        session_id: String,
+        snapshot_id: Option<String>,
+        seq: u64,
+        op: Box<CommandOp>,
+        inverse_json: String,
+        rhai_snippet: Option<String>,
+    },
+    Flush(SyncSender<()>),
+    Shutdown(SyncSender<()>),
+}
+
+enum CompletedMemoryRow {
+    Snapshot {
+        id: String,
+        doc_id: String,
+        session_id: String,
+        orig_path: Option<String>,
+        title: String,
+        blob_path: String,
+        sha256: String,
+        last_command_seq: i64,
+        byte_size: i64,
+    },
+    Command {
+        doc_id: String,
+        session_id: String,
+        snapshot_id: Option<String>,
+        seq: i64,
+        command_type: String,
+        payload_json: String,
+        inverse_json: String,
+        rhai_snippet: Option<String>,
+    },
+}
+
+/// Dedicated background FIFO thread handling JSON serialization, gzip compression,
+/// SHA-256 hashing, atomic blob writes, and SQLite WAL inserts off the UI thread.
+pub(crate) struct AsyncAutosaveHandle {
+    tx: Option<SyncSender<AutosaveTask>>,
+    pending_memory_rows: Arc<Mutex<Vec<CompletedMemoryRow>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AsyncAutosaveHandle {
+    pub(crate) fn spawn(db_path: Option<PathBuf>, autosave_dir: PathBuf) -> StorageResult<Self> {
+        let (tx, rx) = mpsc::sync_channel::<AutosaveTask>(512);
+        let pending_memory_rows = Arc::new(Mutex::new(Vec::new()));
+        let mem_clone = Arc::clone(&pending_memory_rows);
+
+        let handle = thread::Builder::new()
+            .name("coree-autosave-worker".to_owned())
+            .spawn(move || {
+                let worker_conn = db_path.as_ref().and_then(|p| {
+                    let conn = Connection::open(p).ok()?;
+                    let _ = conn.pragma_update(None, "foreign_keys", "ON");
+                    let _ = conn.pragma_update(None, "busy_timeout", 5000);
+                    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+                    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+                    Some(conn)
+                });
+
+                while let Ok(task) = rx.recv() {
+                    match task {
+                        AutosaveTask::BaselineSnapshot {
+                            snapshot_id,
+                            doc_id,
+                            session_id,
+                            title,
+                            source_path,
+                            doc,
+                            last_command_seq,
+                        } => {
+                            if let Ok((blob_path, sha256, byte_size)) =
+                                write_baseline_blob(&autosave_dir, &snapshot_id, &doc)
+                            {
+                                let blob_str = blob_path.to_string_lossy().into_owned();
+                                if let Some(ref conn) = worker_conn {
+                                    if insert_snapshot_row(
+                                        conn,
+                                        &snapshot_id,
+                                        &doc_id,
+                                        &session_id,
+                                        source_path.as_deref(),
+                                        &title,
+                                        &blob_str,
+                                        &sha256,
+                                        last_command_seq as i64,
+                                        byte_size as i64,
+                                    )
+                                    .is_err()
+                                    {
+                                        let _ = std::fs::remove_file(&blob_path);
+                                    }
+                                } else if let Ok(mut guard) = mem_clone.lock() {
+                                    guard.push(CompletedMemoryRow::Snapshot {
+                                        id: snapshot_id,
+                                        doc_id,
+                                        session_id,
+                                        orig_path: source_path,
+                                        title,
+                                        blob_path: blob_str,
+                                        sha256,
+                                        last_command_seq: last_command_seq as i64,
+                                        byte_size: byte_size as i64,
+                                    });
+                                }
+                            }
+                        }
+                        AutosaveTask::DifferentialDelta { delta_id, patch } => {
+                            let envelope = DifferentialSnapshotEnvelope {
+                                autosave_format: "differential_v1".to_owned(),
+                                patch: *patch,
+                            };
+                            if let Ok((blob_path, sha256, byte_size)) =
+                                write_differential_blob(&autosave_dir, &delta_id, &envelope)
+                            {
+                                let blob_str = blob_path.to_string_lossy().into_owned();
+                                let p = &envelope.patch;
+                                if let Some(ref conn) = worker_conn {
+                                    if insert_snapshot_row(
+                                        conn,
+                                        &delta_id,
+                                        &p.doc_id,
+                                        &p.session_id,
+                                        p.source_path.as_deref(),
+                                        &p.title,
+                                        &blob_str,
+                                        &sha256,
+                                        p.last_command_seq as i64,
+                                        byte_size as i64,
+                                    )
+                                    .is_err()
+                                    {
+                                        let _ = std::fs::remove_file(&blob_path);
+                                    }
+                                } else if let Ok(mut guard) = mem_clone.lock() {
+                                    guard.push(CompletedMemoryRow::Snapshot {
+                                        id: delta_id,
+                                        doc_id: p.doc_id.clone(),
+                                        session_id: p.session_id.clone(),
+                                        orig_path: p.source_path.clone(),
+                                        title: p.title.clone(),
+                                        blob_path: blob_str,
+                                        sha256,
+                                        last_command_seq: p.last_command_seq as i64,
+                                        byte_size: byte_size as i64,
+                                    });
+                                }
+                            }
+                        }
+                        AutosaveTask::AppendCommand {
+                            doc_id,
+                            session_id,
+                            snapshot_id,
+                            seq,
+                            op,
+                            inverse_json,
+                            rhai_snippet,
+                        } => {
+                            let command_type = command_op_type_name(&op).to_owned();
+                            if let Ok(payload_json) = serde_json::to_string(&*op) {
+                                if let Some(ref conn) = worker_conn {
+                                    let _ = insert_command_row(
+                                        conn,
+                                        &doc_id,
+                                        &session_id,
+                                        snapshot_id.as_deref(),
+                                        seq as i64,
+                                        &command_type,
+                                        &payload_json,
+                                        &inverse_json,
+                                        rhai_snippet.as_deref(),
+                                    );
+                                } else if let Ok(mut guard) = mem_clone.lock() {
+                                    guard.push(CompletedMemoryRow::Command {
+                                        doc_id,
+                                        session_id,
+                                        snapshot_id,
+                                        seq: seq as i64,
+                                        command_type,
+                                        payload_json,
+                                        inverse_json,
+                                        rhai_snippet,
+                                    });
+                                }
+                            }
+                        }
+                        AutosaveTask::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                        AutosaveTask::Shutdown(ack) => {
+                            let _ = ack.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| StorageError::ThreadPool(format!("autosave worker spawn: {e}")))?;
+
+        Ok(Self {
+            tx: Some(tx),
+            pending_memory_rows,
+            thread: Some(handle),
+        })
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            if tx.send(AutosaveTask::Shutdown(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn write_baseline_blob(
+    autosave_dir: &Path,
+    snapshot_id: &str,
+    doc: &Document,
+) -> StorageResult<(PathBuf, String, u64)> {
+    let blob_path = autosave_dir.join(format!("{snapshot_id}.snapshot.json.gz"));
+    let raw_json = serde_json::to_vec(doc)?;
+    write_compressed_blob(&blob_path, &raw_json)
+}
+
+fn write_differential_blob(
+    autosave_dir: &Path,
+    delta_id: &str,
+    envelope: &DifferentialSnapshotEnvelope,
+) -> StorageResult<(PathBuf, String, u64)> {
+    let blob_path = autosave_dir.join(format!("{delta_id}.delta.json.gz"));
+    let raw_json = serde_json::to_vec(envelope)?;
+    write_compressed_blob(&blob_path, &raw_json)
+}
+
+fn write_compressed_blob(
+    blob_path: &Path,
+    raw_json: &[u8],
+) -> StorageResult<(PathBuf, String, u64)> {
+    let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+    gz.write_all(raw_json)?;
+    let payload = gz.finish()?;
+    let byte_size = payload.len() as u64;
+    if byte_size > MAX_SNAPSHOT_BYTES || byte_size > i64::MAX as u64 {
+        return Err(StorageError::InvalidArgument(format!(
+            "snapshot size {byte_size}B exceeds limit {MAX_SNAPSHOT_BYTES}B"
+        )));
+    }
+    let sha256 = sha256_hex(&payload);
+    atomic_write_blob(blob_path, &payload)?;
+    Ok((blob_path.to_path_buf(), sha256, byte_size))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_snapshot_row(
+    conn: &Connection,
+    snapshot_id: &str,
+    doc_id: &str,
+    session_id: &str,
+    orig_path_str: Option<&str>,
+    title: &str,
+    blob_path_str: &str,
+    sha256: &str,
+    last_command_seq: i64,
+    byte_size: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO autosave_snapshots (
+             id, document_id, session_id, original_file_path, display_name,
+             snapshot_blob_path, snapshot_sha256, last_command_seq, byte_size, clean_shutdown
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+        params![
+            snapshot_id,
+            doc_id,
+            session_id,
+            orig_path_str,
+            title,
+            blob_path_str,
+            sha256,
+            last_command_seq,
+            byte_size,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_command_row(
+    conn: &Connection,
+    doc_id: &str,
+    session_id: &str,
+    snapshot_id: Option<&str>,
+    seq: i64,
+    command_type: &str,
+    payload_json: &str,
+    inverse_json: &str,
+    rhai_snippet: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO command_journal (
+             document_id, session_id, snapshot_id, seq_no,
+             command_type, payload_json, inverse_json, rhai_snippet, applied
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+        params![
+            doc_id,
+            session_id,
+            snapshot_id,
+            seq,
+            command_type,
+            payload_json,
+            inverse_json,
+            rhai_snippet,
+        ],
+    )?;
+    Ok(())
+}
+
 impl StorageDb {
+    /// Flushes all pending background autosave snapshots, differential deltas, and async
+    /// command journal rows to disk/SQLite within `timeout`.
+    pub fn flush_autosave(&self, timeout: Duration) -> StorageResult<()> {
+        let Some(ref worker) = self.autosave_worker else {
+            return Ok(());
+        };
+        if let Some(ref tx) = worker.tx {
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            if tx.send(AutosaveTask::Flush(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(timeout);
+            }
+        }
+        let rows: Vec<CompletedMemoryRow> = {
+            let mut guard = worker.pending_memory_rows.lock().map_err(|_| {
+                StorageError::RecoveryFailed("autosave memory lock poisoned".into())
+            })?;
+            std::mem::take(&mut *guard)
+        };
+        for row in rows {
+            match row {
+                CompletedMemoryRow::Snapshot {
+                    id,
+                    doc_id,
+                    session_id,
+                    orig_path,
+                    title,
+                    blob_path,
+                    sha256,
+                    last_command_seq,
+                    byte_size,
+                } => {
+                    insert_snapshot_row(
+                        &self.conn,
+                        &id,
+                        &doc_id,
+                        &session_id,
+                        orig_path.as_deref(),
+                        &title,
+                        &blob_path,
+                        &sha256,
+                        last_command_seq,
+                        byte_size,
+                    )?;
+                }
+                CompletedMemoryRow::Command {
+                    doc_id,
+                    session_id,
+                    snapshot_id,
+                    seq,
+                    command_type,
+                    payload_json,
+                    inverse_json,
+                    rhai_snippet,
+                } => {
+                    insert_command_row(
+                        &self.conn,
+                        &doc_id,
+                        &session_id,
+                        snapshot_id.as_deref(),
+                        seq,
+                        &command_type,
+                        &payload_json,
+                        &inverse_json,
+                        rhai_snippet.as_deref(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueues a baseline full snapshot onto the background autosave worker thread (`<= 2 ms`
+    /// non-blocking enqueue when channel capacity is available), returning the allocated snapshot ID.
+    pub fn enqueue_baseline_snapshot(
+        &self,
+        doc_id: &str,
+        session_id: &str,
+        title: &str,
+        source_path: Option<&Path>,
+        doc: Document,
+        last_command_seq: u64,
+    ) -> StorageResult<String> {
+        if doc_id.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(StorageError::InvalidArgument(
+                "doc_id and session_id must be non-empty".into(),
+            ));
+        }
+        if last_command_seq > i64::MAX as u64 {
+            return Err(StorageError::InvalidArgument(
+                "last_command_seq exceeds i64::MAX".into(),
+            ));
+        }
+        let snapshot_id = Uuid::new_v4().to_string();
+        let orig_path = source_path.map(|p| p.to_string_lossy().into_owned());
+        if let Some(tx) = self.autosave_worker.as_ref().and_then(|w| w.tx.as_ref()) {
+            let task = AutosaveTask::BaselineSnapshot {
+                snapshot_id: snapshot_id.clone(),
+                doc_id: doc_id.to_owned(),
+                session_id: session_id.to_owned(),
+                title: title.to_owned(),
+                source_path: orig_path,
+                doc: Box::new(doc),
+                last_command_seq,
+            };
+            tx.send(task)
+                .map_err(|e| StorageError::ThreadPool(format!("autosave queue closed: {e}")))?;
+            Ok(snapshot_id)
+        } else {
+            let info = self.save_snapshot_for_session(
+                doc_id,
+                session_id,
+                title,
+                source_path,
+                &doc,
+                last_command_seq,
+            )?;
+            Ok(info.id)
+        }
+    }
+
+    /// Enqueues a lightweight differential autosave delta (`O(changed_objects)`, `<= 2 ms` UI
+    /// thread enqueue) onto the background worker thread and returns the allocated delta ID.
+    pub fn enqueue_differential_autosave(
+        &self,
+        patch: DifferentialSnapshotPatch,
+    ) -> StorageResult<String> {
+        if patch.doc_id.trim().is_empty()
+            || patch.session_id.trim().is_empty()
+            || patch.base_snapshot_id.trim().is_empty()
+        {
+            return Err(StorageError::InvalidArgument(
+                "differential patch requires non-empty doc_id, session_id, and base_snapshot_id"
+                    .into(),
+            ));
+        }
+        if patch.last_command_seq > i64::MAX as u64 {
+            return Err(StorageError::InvalidArgument(
+                "last_command_seq exceeds i64::MAX".into(),
+            ));
+        }
+        let delta_id = Uuid::new_v4().to_string();
+        if let Some(tx) = self.autosave_worker.as_ref().and_then(|w| w.tx.as_ref()) {
+            tx.send(AutosaveTask::DifferentialDelta {
+                delta_id: delta_id.clone(),
+                patch: Box::new(patch),
+            })
+            .map_err(|e| StorageError::ThreadPool(format!("autosave queue closed: {e}")))?;
+            Ok(delta_id)
+        } else {
+            let autosave_dir = self.autosave_dir()?;
+            let differential = DifferentialSnapshotEnvelope {
+                autosave_format: "differential_v1".to_owned(),
+                patch,
+            };
+            let (blob_path, sha256, byte_size) =
+                write_differential_blob(&autosave_dir, &delta_id, &differential)?;
+            let p = &differential.patch;
+            insert_snapshot_row(
+                &self.conn,
+                &delta_id,
+                &p.doc_id,
+                &p.session_id,
+                p.source_path.as_deref(),
+                &p.title,
+                &blob_path.to_string_lossy(),
+                &sha256,
+                p.last_command_seq as i64,
+                byte_size as i64,
+            )?;
+            Ok(delta_id)
+        }
+    }
+
+    /// Enqueues a [`CommandOp`] journal append onto the background autosave worker thread so
+    /// UI-thread command execution never stalls on SQLite WAL writes.
+    pub fn enqueue_command_async(
+        &self,
+        doc_id: &str,
+        session_id: &str,
+        snapshot_id: Option<&str>,
+        seq: u64,
+        op: CommandOp,
+    ) -> StorageResult<()> {
+        if seq == 0 || seq > i64::MAX as u64 {
+            return Err(StorageError::InvalidArgument(
+                "command_journal seq_no must be in 1..=i64::MAX".into(),
+            ));
+        }
+        if let Some(tx) = self.autosave_worker.as_ref().and_then(|w| w.tx.as_ref()) {
+            tx.send(AutosaveTask::AppendCommand {
+                doc_id: doc_id.to_owned(),
+                session_id: session_id.to_owned(),
+                snapshot_id: snapshot_id.map(str::to_owned),
+                seq,
+                op: Box::new(op),
+                inverse_json: "{}".to_owned(),
+                rhai_snippet: None,
+            })
+            .map_err(|e| StorageError::ThreadPool(format!("autosave queue closed: {e}")))?;
+            Ok(())
+        } else {
+            self.append_command_for_session(doc_id, session_id, snapshot_id, seq, &op, "{}", None)?;
+            Ok(())
+        }
+    }
+
     /// Atomically saves a full JSON snapshot of `doc` to disk with SHA-256 verification
     /// and records it in `autosave_snapshots`.
     ///
@@ -83,6 +676,7 @@ impl StorageDb {
         source_path: Option<&Path>,
         doc: &Document,
     ) -> StorageResult<AutosaveSnapshotInfo> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let (session_id, _) = self.resolve_or_open_session(doc_id)?;
         let current_seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq_no), 0) FROM command_journal
@@ -123,9 +717,12 @@ impl StorageDb {
 
         let snapshot_id = Uuid::new_v4().to_string();
         let autosave_dir = self.autosave_dir()?;
-        let blob_path = autosave_dir.join(format!("{snapshot_id}.snapshot.json"));
+        let blob_path = autosave_dir.join(format!("{snapshot_id}.snapshot.json.gz"));
 
-        let payload = serde_json::to_vec(doc)?;
+        let raw_json = serde_json::to_vec(doc)?;
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        gz.write_all(&raw_json)?;
+        let payload = gz.finish()?;
         let byte_size = payload.len() as u64;
         if byte_size > MAX_SNAPSHOT_BYTES || byte_size > i64::MAX as u64 {
             return Err(StorageError::InvalidArgument(format!(
@@ -169,6 +766,7 @@ impl StorageDb {
     /// active unclean session for `doc_id` (allocating a fresh session if none is open yet,
     /// so reopening a document after [`Self::mark_clean_close`] never collides on sequence numbers).
     pub fn append_command(&self, doc_id: &str, seq: u64, op: &CommandOp) -> StorageResult<i64> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let (session_id, latest_snap_id) = self.resolve_or_open_session(doc_id)?;
         self.append_command_for_session(
             doc_id,
@@ -181,7 +779,50 @@ impl StorageDb {
         )
     }
 
-    fn resolve_or_open_session(&self, doc_id: &str) -> StorageResult<(String, Option<String>)> {
+    /// Drains any unreferenced asset IDs pruned by the latest [`CommandHistory::gc_after_commit`]
+    /// and appends a deterministic [`CommandOp::PruneAssets`] entry to `command_journal`
+    /// (incrementing `seq` when pruned IDs are present), returning the number of pruned IDs journaled.
+    pub fn sync_pruned_assets(
+        &self,
+        doc_id: &str,
+        seq: &mut u64,
+        history: &mut CommandHistory,
+    ) -> StorageResult<usize> {
+        let pruned = history.take_last_gc_pruned();
+        let count = pruned.len();
+        if count > 0 {
+            *seq = seq.saturating_add(1);
+            self.append_command(doc_id, *seq, &CommandOp::PruneAssets { ids: pruned })?;
+        }
+        Ok(count)
+    }
+
+    /// Executes `op` through `history` on `doc`, journals `op` (`seq += 1`), and automatically
+    /// journals any `max_history` eviction asset pruning (`CommandOp::PruneAssets`, `seq += 1`)
+    /// so `live_doc.assets()`, `CommandHistory::replay_log()`, and `recover_document`/`recover_session`
+    /// remain identical across `max_history` evictions.
+    pub fn execute_and_journal(
+        &self,
+        doc_id: &str,
+        seq: &mut u64,
+        history: &mut CommandHistory,
+        doc: &mut Document,
+        op: CommandOp,
+    ) -> StorageResult<()> {
+        history.execute(doc, op.clone())?;
+        let pruned = history.take_last_gc_pruned();
+        *seq = seq.saturating_add(1);
+        self.append_command(doc_id, *seq, &op)?;
+        if !pruned.is_empty() {
+            *seq = seq.saturating_add(1);
+            self.append_command(doc_id, *seq, &CommandOp::PruneAssets { ids: pruned })?;
+        }
+        Ok(())
+    }
+
+    /// Resolves an active unclean session (plus latest snapshot ID) or allocates a fresh one.
+    pub fn resolve_or_open_session(&self, doc_id: &str) -> StorageResult<(String, Option<String>)> {
+        self.flush_autosave(Duration::from_secs(5))?;
         if let Some((sess, snap_id)) = self.active_unclean_session(doc_id)? {
             return Ok((sess, Some(snap_id)));
         }
@@ -262,6 +903,7 @@ impl StorageDb {
 
     /// Marks all autosave snapshots for `doc_id` as cleanly closed (`clean_shutdown = 1`).
     pub fn mark_clean_close(&self, doc_id: &str) -> StorageResult<usize> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let updated = self.conn.execute(
             "UPDATE autosave_snapshots
              SET clean_shutdown = 1,
@@ -274,6 +916,7 @@ impl StorageDb {
 
     /// Marks all autosave snapshots for a specific `(doc_id, session_id)` as cleanly closed.
     pub fn mark_session_clean_close(&self, doc_id: &str, session_id: &str) -> StorageResult<usize> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let updated = self.conn.execute(
             "UPDATE autosave_snapshots
              SET clean_shutdown = 1,
@@ -287,6 +930,7 @@ impl StorageDb {
     /// Lists all documents/sessions that have unclean snapshots (`clean_shutdown = 0`),
     /// most recently updated first, along with the count of journaled ops after the latest snapshot.
     pub fn list_unclean_sessions(&self) -> StorageResult<Vec<UncleanSession>> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let mut stmt = self.conn.prepare(
             "SELECT s.document_id, s.session_id, s.display_name, s.original_file_path,
                     s.id, s.last_command_seq, s.updated_at,
@@ -333,6 +977,7 @@ impl StorageDb {
         session_id: Option<&str>,
         after_seq: u64,
     ) -> StorageResult<Vec<JournalEntry>> {
+        self.flush_autosave(Duration::from_secs(5))?;
         if after_seq > i64::MAX as u64 {
             return Err(StorageError::InvalidArgument(
                 "after_seq exceeds i64::MAX".into(),
@@ -393,6 +1038,7 @@ impl StorageDb {
     /// Recovers `doc_id` by loading its latest autosave snapshot (verifying SHA-256 integrity)
     /// and deterministically replaying every subsequent applied [`CommandOp`] from `command_journal`.
     pub fn recover_document(&self, doc_id: &str) -> StorageResult<Document> {
+        self.flush_autosave(Duration::from_secs(5))?;
         // Prefer latest unclean snapshot; fall back to latest snapshot overall.
         let snapshot: AutosaveSnapshotInfo = self
             .latest_snapshot_for_doc(doc_id, true)?
@@ -404,6 +1050,7 @@ impl StorageDb {
     /// Recovers a specific `(doc_id, session_id)` by loading its latest snapshot (verifying
     /// SHA-256 integrity) and replaying every subsequent applied command in that session.
     pub fn recover_session(&self, doc_id: &str, session_id: &str) -> StorageResult<Document> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let snapshot: AutosaveSnapshotInfo = self
             .conn
             .query_row(
@@ -424,26 +1071,38 @@ impl StorageDb {
     }
 
     fn recover_from_snapshot(&self, snapshot: &AutosaveSnapshotInfo) -> StorageResult<Document> {
-        let file = std::fs::File::open(&snapshot.snapshot_blob_path)?;
-        let mut blob = Vec::new();
-        file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
-            .read_to_end(&mut blob)?;
-        if (blob.len() as u64) > MAX_SNAPSHOT_BYTES {
-            return Err(StorageError::RecoveryFailed(format!(
-                "snapshot blob '{}' exceeds maximum allowed size of {} bytes",
-                snapshot.snapshot_blob_path, MAX_SNAPSHOT_BYTES
-            )));
+        const MAX_DELTA_CHAIN: usize = 512;
+        let mut patches: Vec<DifferentialSnapshotPatch> = Vec::new();
+        let mut visited_ids: HashSet<String> = HashSet::new();
+        let mut cursor = snapshot.clone();
+
+        let mut doc = loop {
+            if !visited_ids.insert(cursor.id.clone()) || patches.len() >= MAX_DELTA_CHAIN {
+                return Err(StorageError::RecoveryFailed(format!(
+                    "differential snapshot chain cycle or depth limit exceeded at {}",
+                    cursor.id
+                )));
+            }
+            let json_bytes = read_and_verify_snapshot_blob(&cursor)?;
+            if let Ok(differential) =
+                serde_json::from_slice::<DifferentialSnapshotEnvelope>(&json_bytes)
+            {
+                if differential.autosave_format == "differential_v1" {
+                    let base_id = differential.patch.base_snapshot_id.clone();
+                    patches.push(differential.patch);
+                    cursor = self.get_snapshot_by_id(&base_id)?.ok_or_else(|| {
+                        StorageError::NotFound(format!("base autosave snapshot {base_id}"))
+                    })?;
+                    continue;
+                }
+            }
+            break serde_json::from_slice::<Document>(&json_bytes)?;
+        };
+
+        for patch in patches.into_iter().rev() {
+            apply_differential_patch(&mut doc, &patch)?;
         }
 
-        let actual_sha = sha256_hex(&blob);
-        if actual_sha != snapshot.snapshot_sha256 {
-            return Err(StorageError::IntegrityMismatch {
-                expected: snapshot.snapshot_sha256.clone(),
-                actual: actual_sha,
-            });
-        }
-
-        let mut doc: Document = serde_json::from_slice(&blob)?;
         let pending = self.list_journal_entries(
             &snapshot.document_id,
             Some(&snapshot.session_id),
@@ -468,6 +1127,7 @@ impl StorageDb {
 
     /// Deletes all autosave snapshots (both SQLite metadata and blob files) and journal rows for `doc_id`.
     pub fn purge_document_autosaves(&self, doc_id: &str) -> StorageResult<()> {
+        self.flush_autosave(Duration::from_secs(5))?;
         let mut stmt = self
             .conn
             .prepare("SELECT snapshot_blob_path FROM autosave_snapshots WHERE document_id = ?1")?;
@@ -530,6 +1190,120 @@ impl StorageDb {
             .optional()
             .map_err(StorageError::from)
     }
+}
+
+fn read_and_verify_snapshot_blob(snapshot: &AutosaveSnapshotInfo) -> StorageResult<Vec<u8>> {
+    let file = std::fs::File::open(&snapshot.snapshot_blob_path)?;
+    let mut blob = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+        .read_to_end(&mut blob)?;
+    if (blob.len() as u64) > MAX_SNAPSHOT_BYTES {
+        return Err(StorageError::RecoveryFailed(format!(
+            "snapshot blob '{}' exceeds maximum allowed size of {} bytes",
+            snapshot.snapshot_blob_path, MAX_SNAPSHOT_BYTES
+        )));
+    }
+
+    let actual_sha = sha256_hex(&blob);
+    if actual_sha != snapshot.snapshot_sha256 {
+        return Err(StorageError::IntegrityMismatch {
+            expected: snapshot.snapshot_sha256.clone(),
+            actual: actual_sha,
+        });
+    }
+
+    if blob.starts_with(&[0x1F, 0x8B]) {
+        let mut decoded = Vec::new();
+        GzDecoder::new(&blob[..])
+            .take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+            .read_to_end(&mut decoded)?;
+        if (decoded.len() as u64) > MAX_SNAPSHOT_BYTES {
+            return Err(StorageError::RecoveryFailed(format!(
+                "decompressed snapshot '{}' exceeds maximum allowed size of {} bytes",
+                snapshot.snapshot_blob_path, MAX_SNAPSHOT_BYTES
+            )));
+        }
+        Ok(decoded)
+    } else {
+        Ok(blob)
+    }
+}
+
+fn apply_differential_patch(
+    doc: &mut Document,
+    patch: &DifferentialSnapshotPatch,
+) -> StorageResult<()> {
+    doc.set_title(patch.title.clone());
+    if let Some(cm) = patch.color_mode {
+        doc.set_color_mode(cm);
+    }
+    if let Some(unit) = patch.default_unit {
+        doc.set_default_unit(unit);
+    }
+    if let Some(dpi) = patch.dpi {
+        doc.set_dpi(dpi);
+    }
+    if let Some(mp) = patch.multipage_view {
+        doc.set_multipage_view(mp);
+    }
+    if let Some(ref pages) = patch.pages {
+        doc.clear_pages_for_load();
+        for p in pages {
+            doc.push_loaded_page(p.clone());
+        }
+    }
+    if let Some(idx) = patch.active_page_index {
+        if idx < doc.pages().len() {
+            doc.set_active_page_index(idx)?;
+        }
+    }
+    for &del_id in &patch.deleted_object_ids {
+        doc.remove_snapshot_object(del_id);
+    }
+    for (_, obj) in &patch.upserted_objects {
+        doc.upsert_snapshot_object(obj.clone());
+    }
+    if let Some(ref full_assets) = patch.full_assets {
+        doc.restore_assets(full_assets.clone());
+    } else {
+        for &del_aid in &patch.deleted_asset_ids {
+            doc.remove_asset(del_aid);
+        }
+        for (_, asset) in &patch.upserted_assets {
+            doc.replace_asset(asset.clone());
+        }
+    }
+    if let Some(ref palettes) = patch.palettes {
+        doc.replace_palettes(palettes.clone());
+    }
+    if let Some(ref doc_pal) = patch.document_palette {
+        doc.replace_document_palette(doc_pal.clone());
+    }
+    if let Some(ref guides) = patch.guides {
+        doc.replace_guides(guides.clone());
+    }
+    if let Some(grid) = patch.grid {
+        doc.set_grid(grid);
+    }
+    if let Some(ref pg) = patch.perspective_grid {
+        doc.set_perspective_grid(pg.clone());
+    }
+    if let Some(ref cs) = patch.color_styles {
+        doc.replace_color_styles(cs.clone());
+    }
+    if let Some(ref os) = patch.object_styles {
+        doc.replace_object_styles(os.clone());
+    }
+    if let Some(ref syms) = patch.symbols {
+        doc.replace_symbols(syms.clone());
+    }
+    if let Some(ref meta) = patch.metadata {
+        doc.set_metadata(meta.clone());
+    }
+    if let Some(nid) = patch.next_id {
+        doc.ensure_next_id_at_least(nid);
+    }
+    Ok(())
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutosaveSnapshotInfo> {
@@ -606,6 +1380,38 @@ const fn command_op_type_name(op: &CommandOp) -> &'static str {
         CommandOp::ConvertToCurves { .. } => "ConvertToCurves",
         CommandOp::ConvertOutlineToObject { .. } => "ConvertOutlineToObject",
         CommandOp::UpdateRaster { .. } => "UpdateRaster",
+        CommandOp::DuplicateObjects { .. } => "DuplicateObjects",
+        CommandOp::SetObjectVisibility { .. } => "SetObjectVisibility",
+        CommandOp::SetObjectLocked { .. } => "SetObjectLocked",
+        CommandOp::SetObjectPrintable { .. } => "SetObjectPrintable",
+        CommandOp::RenameObject { .. } => "RenameObject",
+        CommandOp::SetOpacity { .. } => "SetOpacity",
+        CommandOp::SetBlendMode { .. } => "SetBlendMode",
+        CommandOp::SetDocumentProperties { .. } => "SetDocumentProperties",
+        CommandOp::SetPageProperties { .. } => "SetPageProperties",
+        CommandOp::ReorderPages { .. } => "ReorderPages",
+        CommandOp::RenameLayer { .. } => "RenameLayer",
+        CommandOp::ReorderLayerObjects { .. } => "ReorderLayerObjects",
+        CommandOp::SetGridConfig { .. } => "SetGridConfig",
+        CommandOp::SetPerspectiveGrid { .. } => "SetPerspectiveGrid",
+        CommandOp::UpsertColorStyle { .. } => "UpsertColorStyle",
+        CommandOp::DeleteColorStyle { .. } => "DeleteColorStyle",
+        CommandOp::UpsertObjectStyle { .. } => "UpsertObjectStyle",
+        CommandOp::DeleteObjectStyle { .. } => "DeleteObjectStyle",
+        CommandOp::SetObjectStyleLink { .. } => "SetObjectStyleLink",
+        CommandOp::UpsertSymbol { .. } => "UpsertSymbol",
+        CommandOp::DeleteSymbol { .. } => "DeleteSymbol",
+        CommandOp::InstantiateSymbol { .. } => "InstantiateSymbol",
+        CommandOp::UnlinkSymbolInstance { .. } => "UnlinkSymbolInstance",
+        CommandOp::FitPowerClip { .. } => "FitPowerClip",
+        CommandOp::FindAndReplace { .. } => "FindAndReplace",
+        CommandOp::EditShape { .. } => "EditShape",
+        CommandOp::DeleteLayer { .. } => "DeleteLayer",
+        CommandOp::RegisterAsset { .. } => "RegisterAsset",
+        CommandOp::CreateDetachedObject { .. } => "CreateDetachedObject",
+        CommandOp::EditDimension { .. } => "EditDimension",
+        CommandOp::PruneAssets { .. } => "PruneAssets",
+        CommandOp::ReplaceObjectInParent { .. } => "ReplaceObjectInParent",
         CommandOp::Batch(_) => "Batch",
     }
 }
@@ -718,7 +1524,7 @@ mod tests {
     fn crash_recovery_loads_snapshot_and_replays_subsequent_commands_with_zero_lost_clicks() {
         let db = StorageDb::open_in_memory().unwrap();
         let mut live_doc = Document::new_a4("Poster Draft");
-        let doc_id = live_doc.id.to_string();
+        let doc_id = live_doc.id().to_string();
 
         // Initial object before snapshot
         let base_id = live_doc
@@ -739,7 +1545,7 @@ mod tests {
         let snap = db
             .save_snapshot(
                 &doc_id,
-                &live_doc.title,
+                live_doc.title(),
                 Some(Path::new("/work/poster.coree")),
                 &live_doc,
             )
@@ -759,7 +1565,7 @@ mod tests {
             .with_fill(Fill::Solid(Color::CYAN)),
             None,
         );
-        let expected_hero_id = ObjectId(live_doc.next_id);
+        let expected_hero_id = ObjectId(live_doc.next_id());
         apply_command(&mut live_doc, &op1).unwrap();
         db.append_command(&doc_id, 1, &op1).unwrap();
 
@@ -785,8 +1591,11 @@ mod tests {
 
         // 4. Recover document -> must match post-click state bit-for-bit (excluding timestamps)
         let recovered = db.recover_document(&doc_id).unwrap();
-        assert_eq!(recovered.objects.len(), 2);
-        assert_eq!(recovered.objects[&base_id].fill, Fill::Solid(Color::YELLOW));
+        assert_eq!(recovered.objects().len(), 2);
+        assert_eq!(
+            recovered.object(base_id).unwrap().fill,
+            Fill::Solid(Color::YELLOW)
+        );
         let bb = recovered.object_bounds(expected_hero_id).unwrap();
         assert!((bb.min_x - 35.0).abs() < 1e-6);
         assert!((bb.min_y - 25.0).abs() < 1e-6);
@@ -800,13 +1609,179 @@ mod tests {
     fn crash_recovery_detects_corrupted_snapshot_sha256() {
         let db = StorageDb::open_in_memory().unwrap();
         let doc = Document::new_a4("Tamper Test");
-        let doc_id = doc.id.to_string();
+        let doc_id = doc.id().to_string();
         let snap = db
             .save_snapshot(&doc_id, "Tamper Test", None, &doc)
             .unwrap();
 
         // Corrupt the snapshot blob on disk
         std::fs::write(&snap.snapshot_blob_path, b"corrupted").unwrap();
+        let err = db.recover_document(&doc_id).unwrap_err();
+        assert!(matches!(err, StorageError::IntegrityMismatch { .. }));
+    }
+
+    #[test]
+    fn async_differential_autosave_roundtrip_and_sub_2ms_ui_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("diff_autosave.db");
+        let db = StorageDb::open(&db_path).unwrap();
+
+        let mut doc = Document::new_a4("10k Differential Doc");
+        let doc_id = doc.id().to_string();
+        let layer_id = doc.page(0).unwrap().layers[0].id;
+        let mut obj_ids = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            let x = (i % 100) as f64 * 2.0;
+            let y = (i / 100) as f64 * 2.0;
+            let oid = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        format!("Obj{i}"),
+                        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(x, y, 1.5, 1.5))),
+                    )
+                    .with_fill(Fill::Solid(Color::CYAN)),
+                    Some(layer_id),
+                )
+                .unwrap();
+            obj_ids.push(oid);
+        }
+
+        let baseline = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+
+        // Mutate 5 objects and enqueue a differential patch on the calling thread
+        let mut upserted_objects = Vec::with_capacity(5);
+        for &oid in &obj_ids[0..5] {
+            let op = CommandOp::SetFill {
+                ids: vec![oid],
+                fill: Fill::Solid(Color::MAGENTA),
+            };
+            apply_command(&mut doc, &op).unwrap();
+            upserted_objects.push((oid, doc.object(oid).unwrap().clone()));
+        }
+
+        let patch = DifferentialSnapshotPatch {
+            doc_id: doc_id.clone(),
+            session_id: baseline.session_id.clone(),
+            title: doc.title().to_owned(),
+            source_path: None,
+            base_snapshot_id: baseline.id.clone(),
+            last_command_seq: 0,
+            upserted_objects,
+            deleted_object_ids: Vec::new(),
+            upserted_assets: Vec::new(),
+            deleted_asset_ids: Vec::new(),
+            full_assets: None,
+            pages: None,
+            active_page_index: None,
+            next_id: Some(doc.next_id()),
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            palettes: None,
+            document_palette: None,
+            guides: None,
+            grid: None,
+            perspective_grid: None,
+            color_styles: None,
+            object_styles: None,
+            symbols: None,
+            metadata: None,
+        };
+
+        let start = std::time::Instant::now();
+        let delta_id = db.enqueue_differential_autosave(patch).unwrap();
+        let enqueue_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            enqueue_ms < 2.0,
+            "UI-thread differential enqueue took {enqueue_ms:.3} ms (expected < 2.0 ms)"
+        );
+        assert!(!delta_id.is_empty());
+
+        db.flush_autosave(Duration::from_secs(5)).unwrap();
+        drop(db);
+
+        // Reopen and verify full 10,000-object + 5 mutated objects recovery
+        let db2 = StorageDb::open(&db_path).unwrap();
+        let recovered = db2.recover_document(&doc_id).unwrap();
+        assert_eq!(recovered.objects().len(), 10_000);
+        for &oid in &obj_ids[0..5] {
+            assert_eq!(
+                recovered.object(oid).unwrap().fill,
+                Fill::Solid(Color::MAGENTA)
+            );
+        }
+        assert_eq!(
+            recovered.object(obj_ids[5000]).unwrap().fill,
+            Fill::Solid(Color::CYAN)
+        );
+    }
+
+    #[test]
+    fn differential_autosave_detects_tampered_delta_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tamper_delta.db");
+        let db = StorageDb::open(&db_path).unwrap();
+
+        let mut doc = Document::new_a4("Tamper Delta");
+        let doc_id = doc.id().to_string();
+        let lid = doc.page(0).unwrap().layers[0].id;
+        let oid = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "R",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 10.0, 10.0,
+                    ))),
+                ),
+                Some(lid),
+            )
+            .unwrap();
+        let base = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+        let patch = DifferentialSnapshotPatch {
+            doc_id: doc_id.clone(),
+            session_id: base.session_id.clone(),
+            title: doc.title().to_owned(),
+            source_path: None,
+            base_snapshot_id: base.id.clone(),
+            last_command_seq: 0,
+            upserted_objects: vec![(oid, doc.object(oid).unwrap().clone())],
+            deleted_object_ids: Vec::new(),
+            upserted_assets: Vec::new(),
+            deleted_asset_ids: Vec::new(),
+            full_assets: None,
+            pages: None,
+            active_page_index: None,
+            next_id: None,
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            palettes: None,
+            document_palette: None,
+            guides: None,
+            grid: None,
+            perspective_grid: None,
+            color_styles: None,
+            object_styles: None,
+            symbols: None,
+            metadata: None,
+        };
+        let delta_id = db.enqueue_differential_autosave(patch).unwrap();
+        db.flush_autosave(Duration::from_secs(5)).unwrap();
+
+        let delta_path: String = db
+            .connection()
+            .query_row(
+                "SELECT snapshot_blob_path FROM autosave_snapshots WHERE id = ?1",
+                params![delta_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::fs::write(delta_path, b"corrupted-delta").unwrap();
+
         let err = db.recover_document(&doc_id).unwrap_err();
         assert!(matches!(err, StorageError::IntegrityMismatch { .. }));
     }

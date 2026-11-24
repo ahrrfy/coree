@@ -11,14 +11,17 @@ use crate::theme::{core_color_to_egui, StudioLanguage, StudioTheme};
 use coree_cdr::CdrWriteVersion;
 use coree_core::brand::BrandInfo;
 use coree_core::{
-    ArrowheadStyle, BuiltinIccProfile, Color, ColorMode, Document, Fill, GradientStop, LineCap,
-    LineJoin, OutlineStyle, Point2D, PostScriptFillPreset, RenderingIntent, Unit,
+    ArrowheadStyle, BuiltinIccProfile, Color, ColorMode, CommandOp, Document, Fill, GradientStop,
+    LineCap, LineJoin, OutlineStyle, Point2D, PostScriptFillPreset, RenderingIntent, Unit,
 };
 use coree_prod::{
     default_plugin_dirs, detect_executable, install_sample_plugin_template, GcodeDialect,
     PluginKind, PluginManifest, PluginRegistry,
 };
-use egui::{Color32, ComboBox, DragValue, Frame, Id, Margin, RichText, Stroke};
+use egui::{
+    pos2, vec2, Align2, Color32, ComboBox, CornerRadius, DragValue, FontId, Frame, Id, Margin,
+    Rect, RichText, Sense, Stroke, StrokeKind,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -286,10 +289,8 @@ fn show_new_document_dialog(ctx: &egui::Context, app: &mut StudioApp) {
     if create_now {
         let d = app.new_doc_dialog.clone();
         let mut doc = Document::new(&d.title, d.width_mm, d.height_mm, d.color_mode, d.dpi);
-        doc.default_unit = d.unit;
-        if let Some(p0) = doc.pages.first_mut() {
-            p0.bleed_mm = d.bleed_mm;
-        }
+        doc.set_default_unit(d.unit);
+        let _ = doc.set_page_bleed(0, d.bleed_mm);
         for i in 2..=d.pages {
             doc.add_page(format!("Page {i}"), d.width_mm, d.height_mm, d.bleed_mm);
         }
@@ -467,7 +468,9 @@ fn show_export_dialog(ctx: &egui::Context, app: &mut StudioApp) {
         } else {
             let path = PathBuf::from(trimmed);
             let mut opts = app.export_dialog.options.clone();
-            opts.page_index = app.active_tab().map_or(0, |t| t.document.active_page_index);
+            opts.page_index = app
+                .active_tab()
+                .map_or(0, |t| t.document.active_page_index());
             app.export_dialog.open = false;
             app.export_active_async(path, opts);
         }
@@ -586,28 +589,49 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                     "Large-Format Tiling",
                 );
             });
+            let lang = app.ui_language;
             ui.horizontal(|ui| {
-                ui.label("Sheet W:");
+                ui.label(lang.tr_ui("Sheet W:", "عرض اللوح:"));
                 ui.add(
                     DragValue::new(&mut app.production_state.sheet_w_mm)
                         .range(50.0..=5000.0)
                         .suffix(" mm"),
                 );
-                ui.label("H:");
+                ui.label(lang.tr_ui("H:", "الارتفاع:"));
                 ui.add(
                     DragValue::new(&mut app.production_state.sheet_h_mm)
                         .range(50.0..=5000.0)
                         .suffix(" mm"),
                 );
             });
+            ui.separator();
+            ui.label(
+                RichText::new(lang.tr_ui(
+                    "Live Sheet, Bleed, Margin & Imposition Preview",
+                    "معاينة حية للوح الطباعة والهوامش والتركيب",
+                ))
+                .strong(),
+            );
+            draw_print_preview_thumbnail(ui, app, &tokens);
             ui.horizontal(|ui| {
-                if ui.button("Generate Imposed Press Sheets").clicked() {
+                if ui
+                    .button(lang.tr_ui("Generate Imposed Press Sheets", "توليد ألواح المونتاج"))
+                    .clicked()
+                {
                     app.run_imposition_active();
                 }
-                if ui.button("Add Crop & Registration Marks").clicked() {
+                if ui
+                    .button(
+                        lang.tr_ui("Add Crop & Registration Marks", "إضافة علامات القص والتطابق"),
+                    )
+                    .clicked()
+                {
                     app.add_print_marks_active();
                 }
-                if ui.button("Compute Separations").clicked() {
+                if ui
+                    .button(lang.tr_ui("Compute Separations", "حساب فصل الألوان"))
+                    .clicked()
+                {
                     app.compute_separations_active();
                 }
             });
@@ -640,6 +664,260 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
         app.print_active_document_os();
     }
     app.show_print_preview_dialog = open;
+}
+
+fn draw_print_preview_thumbnail(
+    ui: &mut egui::Ui,
+    app: &StudioApp,
+    tokens: &crate::theme::ThemeTokens,
+) {
+    let sheet_w = app.production_state.sheet_w_mm.max(10.0) as f32;
+    let sheet_h = app.production_state.sheet_h_mm.max(10.0) as f32;
+    let (page_w, page_h, bleed_mm, doc_thumbs) = if let Some(tab) = app.active_tab() {
+        let p = tab.document.active_page();
+        let (pw, ph, bm) = p.map_or((210.0_f32, 297.0_f32, 3.0_f32), |pg| {
+            (
+                pg.width_mm.max(5.0) as f32,
+                pg.height_mm.max(5.0) as f32,
+                pg.bleed_mm.max(0.0) as f32,
+            )
+        });
+        let mut thumbs: Vec<((f32, f32, f32, f32), Color32)> = Vec::new();
+        if let Some(pg) = p {
+            for layer in &pg.layers {
+                if !layer.visible || !layer.printable {
+                    continue;
+                }
+                for &oid in &layer.objects {
+                    if thumbs.len() >= 48 {
+                        break;
+                    }
+                    if let (Some(obj), Some(bb)) =
+                        (tab.document.object(oid), tab.document.object_bounds(oid))
+                    {
+                        if !obj.visible || !obj.printable {
+                            continue;
+                        }
+                        let fill_c = obj
+                            .fill
+                            .referenced_colors()
+                            .first()
+                            .map(core_color_to_egui)
+                            .unwrap_or(core_color_to_egui(&obj.outline.color));
+                        let nx = (bb.min_x as f32 / pw).clamp(-0.1, 1.1);
+                        let ny = (bb.min_y as f32 / ph).clamp(-0.1, 1.1);
+                        let nw = ((bb.max_x - bb.min_x) as f32 / pw).clamp(0.01, 1.2);
+                        let nh = ((bb.max_y - bb.min_y) as f32 / ph).clamp(0.01, 1.2);
+                        thumbs.push(((nx, ny, nw, nh), fill_c.gamma_multiply(0.85)));
+                    }
+                }
+            }
+        }
+        (pw, ph, bm, thumbs)
+    } else {
+        (210.0, 297.0, 3.0, Vec::new())
+    };
+
+    let avail_w = ui.available_width().clamp(260.0, 480.0);
+    let (resp, painter) = ui.allocate_painter(vec2(avail_w, 190.0), Sense::hover());
+    painter.rect_filled(resp.rect, CornerRadius::same(4), tokens.canvas_well);
+    painter.rect_stroke(
+        resp.rect,
+        CornerRadius::same(4),
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+
+    let inner = resp.rect.shrink2(vec2(18.0, 14.0));
+    let scale = (inner.width() / sheet_w)
+        .min(inner.height() / sheet_h)
+        .max(1e-3);
+    let sheet_px_size = vec2(sheet_w * scale, sheet_h * scale);
+    let sheet_rect = Rect::from_center_size(inner.center(), sheet_px_size);
+
+    painter.rect_filled(
+        sheet_rect.translate(vec2(2.5, 2.5)),
+        CornerRadius::ZERO,
+        Color32::from_black_alpha(70),
+    );
+    painter.rect_filled(
+        sheet_rect,
+        CornerRadius::ZERO,
+        Color32::from_rgb(248, 249, 251),
+    );
+    painter.rect_stroke(
+        sheet_rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, Color32::from_rgb(130, 140, 155)),
+        StrokeKind::Outside,
+    );
+
+    let draw_slot_contents = |slot_rect: Rect| {
+        if bleed_mm > 0.01 && page_w > 0.0 && page_h > 0.0 {
+            let bx = (bleed_mm / page_w) * slot_rect.width();
+            let by = (bleed_mm / page_h) * slot_rect.height();
+            let bleed_rect = slot_rect.expand2(vec2(bx.min(8.0), by.min(8.0)));
+            painter.rect_stroke(
+                bleed_rect,
+                CornerRadius::ZERO,
+                Stroke::new(0.9, Color32::from_rgb(220, 65, 85)),
+                StrokeKind::Inside,
+            );
+        }
+        // Safe inner margin (5mm visual guide)
+        let safe_inset = ((5.0 / page_w.max(page_h)) * slot_rect.width().min(slot_rect.height()))
+            .clamp(1.5, 10.0);
+        if slot_rect.width() > 14.0 && slot_rect.height() > 14.0 {
+            painter.rect_stroke(
+                slot_rect.shrink(safe_inset),
+                CornerRadius::ZERO,
+                Stroke::new(0.7, Color32::from_rgba_unmultiplied(40, 130, 210, 140)),
+                StrokeKind::Inside,
+            );
+        }
+        // Artwork silhouettes scaled inside slot trim box
+        for &((nx, ny, nw, nh), col) in &doc_thumbs {
+            let r = Rect::from_min_size(
+                pos2(
+                    slot_rect.left() + nx * slot_rect.width(),
+                    slot_rect.top() + ny * slot_rect.height(),
+                ),
+                vec2(
+                    (nw * slot_rect.width()).max(1.5),
+                    (nh * slot_rect.height()).max(1.5),
+                ),
+            )
+            .intersect(slot_rect);
+            if r.width() > 0.5 && r.height() > 0.5 {
+                painter.rect_filled(r, CornerRadius::ZERO, col);
+            }
+        }
+        painter.rect_stroke(
+            slot_rect,
+            CornerRadius::ZERO,
+            Stroke::new(1.0, Color32::from_rgb(55, 65, 80)),
+            StrokeKind::Inside,
+        );
+        if app.print_job_config.crop_marks {
+            let tick = 5.0;
+            let gap = 1.5;
+            let mc = Stroke::new(1.0, Color32::from_rgb(15, 25, 40));
+            for (cx, cy, sx, sy) in [
+                (slot_rect.left(), slot_rect.top(), -1.0_f32, -1.0_f32),
+                (slot_rect.right(), slot_rect.top(), 1.0, -1.0),
+                (slot_rect.left(), slot_rect.bottom(), -1.0, 1.0),
+                (slot_rect.right(), slot_rect.bottom(), 1.0, 1.0),
+            ] {
+                let p = pos2(cx, cy);
+                painter.line_segment(
+                    [p + vec2(sx * gap, 0.0), p + vec2(sx * (gap + tick), 0.0)],
+                    mc,
+                );
+                painter.line_segment(
+                    [p + vec2(0.0, sy * gap), p + vec2(0.0, sy * (gap + tick))],
+                    mc,
+                );
+            }
+        }
+    };
+
+    match app.production_state.imposition_kind {
+        1 => {
+            // 2-Up Booklet spread
+            let margin_px = (6.0 * scale).clamp(3.0, 12.0);
+            let work = sheet_rect.shrink(margin_px);
+            let half_w = (work.width() * 0.5).max(4.0);
+            let s_scale = (half_w / page_w).min(work.height() / page_h).max(1e-3);
+            let pw_px = page_w * s_scale;
+            let ph_px = page_h * s_scale;
+            let top = work.center().y - ph_px * 0.5;
+            let left_slot =
+                Rect::from_min_size(pos2(work.center().x - pw_px, top), vec2(pw_px, ph_px));
+            let right_slot = Rect::from_min_size(pos2(work.center().x, top), vec2(pw_px, ph_px));
+            draw_slot_contents(left_slot);
+            draw_slot_contents(right_slot);
+            painter.line_segment(
+                [
+                    pos2(work.center().x, sheet_rect.top()),
+                    pos2(work.center().x, sheet_rect.bottom()),
+                ],
+                Stroke::new(1.2, Color32::from_rgb(200, 70, 50)),
+            );
+        }
+        2 => {
+            // Large-Format Tiling grid
+            let margin_px = (4.0 * scale).clamp(2.0, 10.0);
+            let work = sheet_rect.shrink(margin_px);
+            let p_scale = (work.width() / page_w)
+                .min(work.height() / page_h)
+                .max(1e-3);
+            let art_rect =
+                Rect::from_center_size(work.center(), vec2(page_w * p_scale, page_h * p_scale));
+            draw_slot_contents(art_rect);
+            let tw = (app.production_state.tile_w_mm.max(10.0) as f32) * p_scale;
+            let th = (app.production_state.tile_h_mm.max(10.0) as f32) * p_scale;
+            let ov = (app.production_state.tile_overlap_mm.max(0.0) as f32) * p_scale;
+            let step_x = (tw - ov).max(8.0);
+            let step_y = (th - ov).max(8.0);
+            let mut x = art_rect.left();
+            while x < art_rect.right() - 1.0 {
+                let mut y = art_rect.top();
+                while y < art_rect.bottom() - 1.0 {
+                    let tile = Rect::from_min_size(pos2(x, y), vec2(tw, th)).intersect(art_rect);
+                    painter.rect_stroke(
+                        tile,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.0, Color32::from_rgb(25, 130, 195)),
+                        StrokeKind::Inside,
+                    );
+                    y += step_y;
+                }
+                x += step_x;
+            }
+        }
+        _ => {
+            // N-Up Grid
+            let cols = app.production_state.nup_cols.clamp(1, 16) as usize;
+            let rows = app.production_state.nup_rows.clamp(1, 16) as usize;
+            let margin_px = (6.0 * scale).clamp(3.0, 12.0);
+            let work = sheet_rect.shrink(margin_px);
+            let cell_w = work.width() / cols as f32;
+            let cell_h = work.height() / rows as f32;
+            let fit_scale = ((cell_w - 4.0).max(2.0) / page_w)
+                .min((cell_h - 4.0).max(2.0) / page_h)
+                .max(1e-3);
+            let slot_size = vec2(page_w * fit_scale, page_h * fit_scale);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let cell = Rect::from_min_size(
+                        pos2(
+                            work.left() + c as f32 * cell_w,
+                            work.top() + r as f32 * cell_h,
+                        ),
+                        vec2(cell_w, cell_h),
+                    );
+                    let slot_rect = Rect::from_center_size(cell.center(), slot_size);
+                    draw_slot_contents(slot_rect);
+                }
+            }
+        }
+    }
+
+    let summary = format!(
+        "Sheet {sheet_w:.0}×{sheet_h:.0} mm · Trim {page_w:.0}×{page_h:.0} mm · Bleed {bleed_mm:.1} mm · {}",
+        if app.print_job_config.force_cmyk {
+            "CMYK Press"
+        } else {
+            "RGB Output"
+        }
+    );
+    painter.text(
+        pos2(resp.rect.center().x, resp.rect.bottom() - 4.0),
+        Align2::CENTER_BOTTOM,
+        summary,
+        FontId::proportional(10.0),
+        tokens.text_muted,
+    );
 }
 
 /// Classic tabbed Studio Options dialog (`Tools -> Options...`, `Ctrl+J`).
@@ -873,12 +1151,15 @@ fn show_options_general_nudge(
     tokens: &crate::theme::ThemeTokens,
 ) {
     ui.label(RichText::new("Units, Nudge & Duplicate Offsets").strong());
+    let mut pending_unit: Option<Unit> = None;
     if let Some(tab) = app.active_tab_mut() {
+        let cur_unit = tab.document.default_unit();
+        let mut next_unit = cur_unit;
         ui.horizontal(|ui| {
             ui.label("Active Document Units:");
             ComboBox::from_id_salt("opt_doc_units")
                 .width(120.0)
-                .selected_text(tab.document.default_unit.suffix())
+                .selected_text(cur_unit.suffix())
                 .show_ui(ui, |ui| {
                     for u in [
                         Unit::Millimeter,
@@ -888,10 +1169,13 @@ fn show_options_general_nudge(
                         Unit::Point,
                         Unit::Pixel,
                     ] {
-                        ui.selectable_value(&mut tab.document.default_unit, u, u.suffix());
+                        ui.selectable_value(&mut next_unit, u, u.suffix());
                     }
                 });
         });
+        if next_unit != cur_unit {
+            pending_unit = Some(next_unit);
+        }
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -945,6 +1229,19 @@ fn show_options_general_nudge(
             )
             .color(tokens.text_muted),
         );
+    }
+    if let Some(next_unit) = pending_unit {
+        let _ = app.execute_command(CommandOp::SetDocumentProperties {
+            title: None,
+            color_mode: None,
+            default_unit: Some(next_unit),
+            dpi: None,
+            multipage_view: None,
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+        });
     }
 
     ui.add_space(10.0);
@@ -1055,10 +1352,10 @@ fn show_options_color_management(
     ui.label(RichText::new("Document Embedded / Custom ICC Profile (.icc / .icm)").strong());
     let custom_desc = app
         .active_tab()
-        .and_then(|t| t.document.custom_icc_name.clone());
+        .and_then(|t| t.document.custom_icc_name().map(str::to_owned));
     let custom_len = app
         .active_tab()
-        .and_then(|t| t.document.custom_icc_profile.as_ref().map(Vec::len));
+        .and_then(|t| t.document.custom_icc_profile().map(<[u8]>::len));
     match (custom_desc, custom_len) {
         (Some(name), Some(bytes_len)) => {
             ui.label(
@@ -1099,27 +1396,35 @@ fn show_options_color_management(
                     });
                 match read_res {
                     Ok(bytes) => {
-                        let attached = app.active_tab_mut().map(|tab| {
-                            let res = tab.document.set_custom_icc_profile(bytes);
-                            if res.is_ok() {
-                                tab.dirty = true;
-                                tab.needs_rerender = true;
-                            }
-                            res
-                        });
-                        match attached {
-                            Some(Ok(prof)) => {
+                        match app.execute_command(CommandOp::SetDocumentProperties {
+                            title: None,
+                            color_mode: None,
+                            default_unit: None,
+                            dpi: None,
+                            multipage_view: None,
+                            active_page_index: None,
+                            metadata: None,
+                            custom_icc_profile: Some(bytes),
+                            clear_custom_icc: false,
+                        }) {
+                            Ok(()) => {
+                                let desc = app
+                                    .active_tab()
+                                    .and_then(|t| t.document.custom_icc_name().map(str::to_owned))
+                                    .unwrap_or_else(|| "Custom Profile".to_owned());
+                                if let Some(tab) = app.active_tab_mut() {
+                                    tab.needs_rerender = true;
+                                }
                                 app.soft_proof_cmyk = true;
                                 app.sync_proof_options_to_tabs();
                                 app.push_toast(
-                                    format!("Attached custom ICC profile: {}", prof.description),
+                                    format!("Attached custom ICC profile: {desc}"),
                                     false,
                                 );
                             }
-                            Some(Err(err)) => {
+                            Err(err) => {
                                 app.push_toast(format!("Invalid ICC profile: {err}"), true);
                             }
-                            None => app.push_toast("No active document", true),
                         }
                     }
                     Err(err) => app.push_toast(err, true),
@@ -1127,15 +1432,25 @@ fn show_options_color_management(
             }
         }
         if custom_len.is_some() && ui.button("Clear Custom ICC").clicked() {
-            if let Some(tab) = app.active_tab_mut() {
-                tab.document.custom_icc_profile = None;
-                tab.document.custom_icc_name = None;
-                tab.document.touch();
-                tab.dirty = true;
-                tab.needs_rerender = true;
+            if let Err(err) = app.execute_command(CommandOp::SetDocumentProperties {
+                title: None,
+                color_mode: None,
+                default_unit: None,
+                dpi: None,
+                multipage_view: None,
+                active_page_index: None,
+                metadata: None,
+                custom_icc_profile: None,
+                clear_custom_icc: true,
+            }) {
+                app.push_toast(format!("Clear ICC failed: {err}"), true);
+            } else {
+                if let Some(tab) = app.active_tab_mut() {
+                    tab.needs_rerender = true;
+                }
+                app.sync_proof_options_to_tabs();
+                app.push_toast("Cleared custom document ICC profile", false);
             }
-            app.sync_proof_options_to_tabs();
-            app.push_toast("Cleared custom document ICC profile", false);
         }
     });
 }

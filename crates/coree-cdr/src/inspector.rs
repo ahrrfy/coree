@@ -3,7 +3,7 @@
 //! Clean-room **CDR Structural Inspector** powering `coree inspect file.cdr`.
 //!
 //! Inspects RIFF CDR (v4–v13), ZIP/OPC CDR (X4–2025), CDT, CMX (16/32-bit),
-//! and CPT (PHOTO-PAINT) binaries and produces both structured reports and
+//! and CPT raster binaries and produces both structured reports and
 //! human-readable diagnostic summaries.
 
 use crate::cdr_riff::{is_cdr_form_type, is_cdt_form_type, parse_cdr_riff};
@@ -14,7 +14,7 @@ use crate::cpt::{detect_cpt_version, parse_cpt_bytes};
 use crate::error::{CdrError, CdrResult};
 use crate::limits::{read_file_bounded, CodecLimits};
 use crate::riff::{fourcc_to_string, RiffDocument, RiffNode};
-use crate::CorelFormat;
+use crate::CdrFormat;
 use coree_core::{Document, NodePayload};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -48,10 +48,10 @@ pub struct UnknownChunkSummary {
     pub scope: String,
 }
 
-/// Complete structural inspection report for any supported Corel binary file.
+/// Complete structural inspection report for any supported CDR/CDT/CMX/CPT binary file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CdrInspectionReport {
-    pub detected_format: CorelFormat,
+    pub detected_format: CdrFormat,
     pub format_era: String,
     pub file_size_bytes: u64,
     pub version_number: Option<u32>,
@@ -75,13 +75,13 @@ impl CdrInspectionReport {
     }
 }
 
-/// Inspects raw bytes of any supported Corel format using default [`CodecLimits`].
-pub fn inspect_corel_bytes(bytes: &[u8]) -> CdrResult<CdrInspectionReport> {
-    inspect_corel_bytes_with_limits(bytes, &CodecLimits::default())
+/// Inspects raw bytes of any supported CDR/CDT/CMX/CPT format using default [`CodecLimits`].
+pub fn inspect_cdr_bytes(bytes: &[u8]) -> CdrResult<CdrInspectionReport> {
+    inspect_cdr_bytes_with_limits(bytes, &CodecLimits::default())
 }
 
-/// Inspects raw bytes of any supported Corel format under explicit [`CodecLimits`].
-pub fn inspect_corel_bytes_with_limits(
+/// Inspects raw bytes of any supported CDR/CDT/CMX/CPT format under explicit [`CodecLimits`].
+pub fn inspect_cdr_bytes_with_limits(
     bytes: &[u8],
     limits: &CodecLimits,
 ) -> CdrResult<CdrInspectionReport> {
@@ -91,10 +91,10 @@ pub fn inspect_corel_bytes_with_limits(
     if is_zip_bytes(bytes) {
         let parsed = parse_cdr_zip(bytes, limits)?;
         let (detected_format, format_era) = match (parsed.era, parsed.is_template) {
-            (CdrZipEra::X4, false) => (CorelFormat::CdrZipX4, "CDR ZIP/OPC X4–X5".to_owned()),
-            (CdrZipEra::X6, false) => (CorelFormat::CdrZipX6, "CDR ZIP/OPC X6–2025".to_owned()),
-            (CdrZipEra::X4, true) => (CorelFormat::CdtZip, "CDT Template ZIP X4–X5".to_owned()),
-            (CdrZipEra::X6, true) => (CorelFormat::CdtZip, "CDT Template ZIP X6–2025".to_owned()),
+            (CdrZipEra::X4, false) => (CdrFormat::CdrZipX4, "CDR ZIP/OPC X4–X5".to_owned()),
+            (CdrZipEra::X6, false) => (CdrFormat::CdrZipX6, "CDR ZIP/OPC X6–2025".to_owned()),
+            (CdrZipEra::X4, true) => (CdrFormat::CdtZip, "CDT Template ZIP X4–X5".to_owned()),
+            (CdrZipEra::X6, true) => (CdrFormat::CdtZip, "CDT Template ZIP X6–2025".to_owned()),
         };
         let chunks = summarize_riff_tree(&parsed.riff_tree);
         let zip_entries = parsed
@@ -118,7 +118,7 @@ pub fn inspect_corel_bytes_with_limits(
         ));
     }
 
-    // 2. PHOTO-PAINT CPT (native CPT7/8/9 or RIFF CPT)
+    // 2. CPT raster container (native CPT7/8/9 or RIFF CPT)
     if detect_cpt_version(bytes).is_some() {
         let parsed = parse_cpt_bytes(bytes, limits)?;
         let chunks = parsed
@@ -133,7 +133,7 @@ pub fn inspect_corel_bytes_with_limits(
         );
         let mut report = build_report_from_doc(
             &parsed.document,
-            CorelFormat::Cpt {
+            CdrFormat::Cpt {
                 version: parsed.version,
             },
             era,
@@ -161,8 +161,8 @@ pub fn inspect_corel_bytes_with_limits(
         if is_cmx_form_type(&form) {
             let parsed = parse_cmx_bytes(bytes, limits)?;
             let (fmt, era) = match parsed.precision {
-                CmxPrecision::Bit16 => (CorelFormat::Cmx16, "CMX 16-bit Presentation Exchange"),
-                CmxPrecision::Bit32 => (CorelFormat::Cmx32, "CMX 32-bit Presentation Exchange"),
+                CmxPrecision::Bit16 => (CdrFormat::Cmx16, "CMX 16-bit Presentation Exchange"),
+                CmxPrecision::Bit32 => (CdrFormat::Cmx32, "CMX 32-bit Presentation Exchange"),
             };
             let chunks = summarize_riff_tree(&parsed.riff_tree);
             return Ok(build_report_from_doc(
@@ -180,14 +180,14 @@ pub fn inspect_corel_bytes_with_limits(
             let parsed = parse_cdr_riff(bytes, limits, &HashMap::new())?;
             let (fmt, era) = if parsed.is_template {
                 (
-                    CorelFormat::CdtRiff {
+                    CdrFormat::CdtRiff {
                         version: parsed.version,
                     },
                     format!("CDT RIFF Template v{}", parsed.version / 100),
                 )
             } else {
                 (
-                    CorelFormat::CdrRiff {
+                    CdrFormat::CdrRiff {
                         version: parsed.version,
                     },
                     format!(
@@ -217,18 +217,18 @@ pub fn inspect_corel_bytes_with_limits(
 }
 
 /// Reads and inspects a `.cdr`/`.cdt`/`.cmx`/`.cpt` file on disk using default [`CodecLimits`].
-pub fn inspect_corel_file(path: &Path) -> CdrResult<CdrInspectionReport> {
-    inspect_corel_file_with_limits(path, &CodecLimits::default())
+pub fn inspect_cdr_file(path: &Path) -> CdrResult<CdrInspectionReport> {
+    inspect_cdr_file_with_limits(path, &CodecLimits::default())
 }
 
 /// Reads and inspects a `.cdr`/`.cdt`/`.cmx`/`.cpt` file on disk under explicit [`CodecLimits`],
 /// enforcing bounded disk reads before parsing.
-pub fn inspect_corel_file_with_limits(
+pub fn inspect_cdr_file_with_limits(
     path: &Path,
     limits: &CodecLimits,
 ) -> CdrResult<CdrInspectionReport> {
     let bytes = read_file_bounded(path, limits)?;
-    inspect_corel_bytes_with_limits(&bytes, limits)
+    inspect_cdr_bytes_with_limits(&bytes, limits)
 }
 
 /// Formats a [`CdrInspectionReport`] into a structured, human-readable multi-line report.
@@ -324,7 +324,7 @@ pub fn format_report(report: &CdrInspectionReport) -> String {
 #[allow(clippy::too_many_arguments)]
 fn build_report_from_doc(
     doc: &Document,
-    detected_format: CorelFormat,
+    detected_format: CdrFormat,
     format_era: String,
     file_size_bytes: u64,
     version_number: Option<u32>,
@@ -332,16 +332,16 @@ fn build_report_from_doc(
     zip_entries: Vec<ZipEntrySummary>,
     warnings: Vec<String>,
 ) -> CdrInspectionReport {
-    let page_count = doc.pages.len();
-    let layer_count: usize = doc.pages.iter().map(|p| p.layers.len()).sum();
-    let object_count = doc.objects.len();
-    let bitmap_count = doc.assets.len();
+    let page_count = doc.pages().len();
+    let layer_count: usize = doc.pages().iter().map(|p| p.layers.len()).sum();
+    let object_count = doc.objects().len();
+    let bitmap_count = doc.assets().len();
 
     let mut fonts = BTreeSet::new();
     let mut color_models = BTreeSet::new();
     let mut unknown_chunks = Vec::new();
 
-    for unk in &doc.unknown_doc_chunks {
+    for unk in doc.unknown_doc_chunks() {
         unknown_chunks.push(UnknownChunkSummary {
             fourcc: unk.fourcc_str(),
             byte_len: unk.raw_bytes.len(),
@@ -350,7 +350,28 @@ fn build_report_from_doc(
         });
     }
 
-    for obj in doc.objects.values() {
+    for page in doc.pages() {
+        for unk in &page.unknown_chunks {
+            unknown_chunks.push(UnknownChunkSummary {
+                fourcc: unk.fourcc_str(),
+                byte_len: unk.raw_bytes.len(),
+                version_hint: unk.version_hint,
+                scope: format!("page:{}", page.name),
+            });
+        }
+        for layer in &page.layers {
+            for unk in &layer.unknown_chunks {
+                unknown_chunks.push(UnknownChunkSummary {
+                    fourcc: unk.fourcc_str(),
+                    byte_len: unk.raw_bytes.len(),
+                    version_hint: unk.version_hint,
+                    scope: format!("layer:{}", layer.name),
+                });
+            }
+        }
+    }
+
+    for obj in doc.objects().values() {
         for c in obj.fill.referenced_colors() {
             color_models.insert(color_model_name(&c).to_owned());
         }
@@ -388,7 +409,7 @@ fn build_report_from_doc(
         }
     }
 
-    for sw in &doc.document_palette.swatches {
+    for sw in &doc.document_palette().swatches {
         color_models.insert(color_model_name(&sw.color).to_owned());
     }
 

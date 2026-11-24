@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Dry-run release tag (e.g. v0.3.0)'
+        description: 'Dry-run release tag (e.g. v0.3.1)'
         required: false
-        default: 'v0.3.0'
+        default: 'v0.3.1'
 
 permissions:
   contents: write
@@ -49,6 +49,11 @@ jobs:
             exit 1
           fi
           SEMVER="${TAG#v}"
+          CARGO_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${SEMVER}" != "${CARGO_VER}" ]]; then
+            echo "Error: release tag semver (${SEMVER}) does not match Cargo.toml version (${CARGO_VER})" >&2
+            exit 1
+          fi
           printf 'tag=%s\n' "${TAG}" >> "${GITHUB_OUTPUT}"
           printf 'semver=%s\n' "${SEMVER}" >> "${GITHUB_OUTPUT}"
 
@@ -102,7 +107,13 @@ jobs:
               assert manifest["id"] == "io.github.ahrrfy.coree"
               assert "--share=network" not in manifest.get("finish-args", [])
           except ImportError:
-              pass
+              yml_text = open("packaging/linux/flatpak/io.github.ahrrfy.coree.yml", encoding="utf-8").read()
+              non_comment = [line.split("#", 1)[0].strip() for line in yml_text.splitlines()]
+              assert "id: io.github.ahrrfy.coree" in non_comment
+              assert not any(
+                  s in ("--share=network", "- --share=network", "- '--share=network'", '- "--share=network"')
+                  for s in non_comment
+              )
           print("MIME XML, AppStream Metainfo, and Flatpak manifest verified.")
           PY
           if command -v desktop-file-validate >/dev/null 2>&1; then
@@ -217,10 +228,14 @@ jobs:
             throw "Invalid release tag format: $tag"
           }
           $semver = $tag -replace '^v', ''
+          $cargoVer = (Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($semver -ne $cargoVer) {
+            throw "Release tag semver ($semver) does not match Cargo.toml version ($cargoVer)"
+          }
           # MSI Package Version requires numeric Major.Minor.Patch (no prerelease suffix)
           $msiVer = ($semver -split '-')[0]
           if ($msiVer -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
-            $msiVer = "0.3.0"
+            $msiVer = "0.3.1"
           }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "semver=$semver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

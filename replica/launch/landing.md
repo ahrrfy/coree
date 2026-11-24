@@ -9,7 +9,7 @@ Grounds every section in the positioning angle from [fixes.md](../fixes.md) and 
 - **Eyebrow:** `100% Offline · Native Linux & Windows · MIT OR Apache-2.0`
 - **Headline:** **Open `.cdr`, design in CMYK, and cut directly to PDF/X or laser — with zero subscriptions.**
 - **Subheadline:** Built in pure Rust for commercial print shops, sign makers, packaging converters, Arabic RTL studios, and laser workshops. Local-first desktop studio with lossless `.cdr` round-tripping, native Spot `CutContour` prepress, and instant crash recovery.
-- **Primary CTA:** `Download coree v0.3.0 (Linux & Windows)` -> `https://github.com/ahrrfy/coree/releases`
+- **Primary CTA:** `Download coree v0.3.1 (Linux & Windows)` -> `https://github.com/ahrrfy/coree/releases`
 - **Secondary Link:** `Inspect Source & CLI Docs` -> `https://github.com/ahrrfy/coree`
 - **Product Screenshots (100% deterministic `coree render` output):**
   - `docs/images/showcase_lenses_vectors.png` — Live optical lenses (`FishEye`, `Magnify`, `Invert`, `HeatMap`, `Wireframe`), multi-stop gradients, 4×4 Bézier Mesh Fill, Drop Shadow, and stepped Contour.
@@ -28,7 +28,7 @@ Grounds every section in the positioning angle from [fixes.md](../fixes.md) and 
 ## 3. How It Works
 
 1. **Open any production file directly (`File > Open` / CLI).** Load RIFF v4–v13, ZIP X4–X5, ZCF X6–2025 `.cdr`/`.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, PDF/AI, EPS, DXF, PLT, multi-layer PSD/PSB, or `.svg` natively — preserving unrecognized vendor chunks verbatim and recovering legacy Windows-1256 Arabic encodings automatically.
-2. **Design, trace, soften, and adjust with classic desktop precision.** Work across side-by-side multipage spreads with rearrangeable dockers, right-click palette fill/outline swatches, 65 interactive vector & raster tools (`F10` Shape, `F11` Edit Fill, `F12` Outline Pen, `Ctrl+K` Break Apart, 11 live Lenses, `PowerTRACE`, Healing/Dodge/Burn, Arabic RTL/Kashida), backed on every click by a crash-safe SQLite WAL command journal.
+2. **Design, trace, soften, and adjust with classic desktop precision.** Work across side-by-side multipage spreads with rearrangeable dockers, right-click palette fill/outline swatches, 65 interactive vector & raster tools (`F10` Shape, `F11` Edit Fill, `F12` Outline Pen, `Ctrl+K` Break Apart, 11 live Lenses, Vector Trace, Healing/Dodge/Burn, Arabic RTL/Kashida), backed on every click by a crash-safe SQLite WAL command journal.
 3. **Export press-ready CMYK PDF/X, separations, or direct laser/cutter toolpaths.** Generate one-click `CutContour` / `Crease` spots, N-Up/Booklet/Tiling imposition, Preflight audits, embedded ICC `/OutputIntents` PDFs with curved glyphs, or kerf-compensated GRBL/Marlin/Ruida G-Code and DXF R12 / HPGL `.plt` via 7 built-in laser bridges.
 
 ---
@@ -73,4 +73,4 @@ See full evidence & market comparison in [pricing.md](pricing.md):
 ## 7. Final Call to Action
 
 **Own your files, your OS, and your press workflow.**
-`Download coree v0.3.0` (`.deb`, `.AppImage`, `.msi`, portable `.zip`) -> `https://github.com/ahrrfy/coree/releases/tag/v0.3.0`
+`Download coree v0.3.1` (`.deb`, `.AppImage`, `.msi`, portable `.zip`) -> `https://github.com/ahrrfy/coree/releases/tag/v0.3.1`

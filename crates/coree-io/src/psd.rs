@@ -200,9 +200,9 @@ fn import_psd_reader<R: Read + Seek>(
         header.color_mode.doc_color_mode(),
         dpi,
     );
-    doc.metadata.source_format = Some(if header.is_psb { "psb" } else { "psd" }.to_owned());
-    let page_id = doc.pages[0].id;
-    let default_layer_id = doc.pages[0].layers[0].id;
+    doc.metadata_mut().source_format = Some(if header.is_psb { "psb" } else { "psd" }.to_owned());
+    let page_id = doc.pages()[0].id;
+    let default_layer_id = doc.pages()[0].layers[0].id;
 
     // -------------------------------------------------------------------------
     // Section 4: Layer & Mask Information
@@ -389,13 +389,13 @@ fn import_psd_reader<R: Read + Seek>(
     }
 
     // Remove the empty placeholder "Layer 1" when PSD layers were imported.
-    if imported_layers > 0 && doc.pages[0].layers.len() > 1 {
-        if let Some(pos) = doc.pages[0]
+    if imported_layers > 0 && doc.pages()[0].layers.len() > 1 {
+        if let Some(pos) = doc.pages()[0]
             .layers
             .iter()
             .position(|l| l.id == default_layer_id && l.objects.is_empty())
         {
-            doc.pages[0].layers.remove(pos);
+            doc.remove_page_layer(0, pos);
         }
     }
 
@@ -1789,21 +1789,21 @@ mod tests {
         let bytes = build_synthetic_psd(false, 4, 2, 3, 8, 3, Some(300.0), &[bg, fg], None);
         let doc = import_psd_bytes(&bytes, "Studio Poster").unwrap();
 
-        assert_eq!(doc.title, "Studio Poster");
-        assert_eq!(doc.color_mode, ColorMode::Rgb);
-        assert!((doc.dpi - 300.0).abs() < 0.01);
-        assert_eq!(doc.pages.len(), 1);
-        assert_eq!(doc.pages[0].layers.len(), 2);
+        assert_eq!(doc.title(), "Studio Poster");
+        assert_eq!(doc.color_mode(), ColorMode::Rgb);
+        assert!((doc.dpi() - 300.0).abs() < 0.01);
+        assert_eq!(doc.pages().len(), 1);
+        assert_eq!(doc.pages()[0].layers.len(), 2);
 
-        let l0 = &doc.pages[0].layers[0];
-        let l1 = &doc.pages[0].layers[1];
+        let l0 = &doc.pages()[0].layers[0];
+        let l1 = &doc.pages()[0].layers[1];
         assert_eq!(l0.name, "Background");
         assert!(l0.visible);
         assert_eq!(l1.name, "طبقة الشعار");
         assert!(!l1.visible);
 
-        let obj0 = &doc.objects[&l0.objects[0]];
-        let obj1 = &doc.objects[&l1.objects[0]];
+        let obj0 = &doc.objects()[&l0.objects[0]];
+        let obj1 = &doc.objects()[&l1.objects[0]];
         assert_eq!(obj0.blend_mode, BlendMode::Normal);
         assert_eq!(obj1.blend_mode, BlendMode::Multiply);
         assert!((obj1.opacity - (128.0 / 255.0)).abs() < 0.01);
@@ -1812,14 +1812,14 @@ mod tests {
         let NodePayload::Raster(r0) = &obj0.payload else {
             panic!("expected raster layer 0");
         };
-        let a0 = &doc.assets[&r0.asset_id];
+        let a0 = &doc.assets()[&r0.asset_id];
         assert_eq!((a0.width, a0.height), (4, 2));
         assert_eq!(&a0.rgba_bytes[0..4], &[10, 20, 240, 255]);
 
         let NodePayload::Raster(r1) = &obj1.payload else {
             panic!("expected raster layer 1");
         };
-        let a1 = &doc.assets[&r1.asset_id];
+        let a1 = &doc.assets()[&r1.asset_id];
         assert_eq!((a1.width, a1.height), (2, 2));
         assert_eq!(&a1.rgba_bytes[0..4], &[250, 30, 40, 200]);
     }
@@ -1849,16 +1849,16 @@ mod tests {
 
         let bytes = build_synthetic_psd(true, 2, 1, 4, 16, 4, Some(150.0), &[cyan_layer], None);
         let doc = import_psd_bytes(&bytes, "CMYK PSB").unwrap();
-        assert_eq!(doc.color_mode, ColorMode::Cmyk);
-        assert_eq!(doc.metadata.source_format.as_deref(), Some("psb"));
-        assert!((doc.dpi - 150.0).abs() < 0.01);
+        assert_eq!(doc.color_mode(), ColorMode::Cmyk);
+        assert_eq!(doc.metadata().source_format.as_deref(), Some("psb"));
+        assert!((doc.dpi() - 150.0).abs() < 0.01);
 
-        let obj = doc.objects.values().next().unwrap();
+        let obj = doc.objects().values().next().unwrap();
         assert_eq!(obj.blend_mode, BlendMode::Screen);
         let NodePayload::Raster(r) = &obj.payload else {
             panic!("expected raster");
         };
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         // Pure Cyan -> sRGB (0, 255, 255, 255)
         assert_eq!(&asset.rgba_bytes[0..4], &[0, 255, 255, 255]);
     }
@@ -1880,9 +1880,9 @@ mod tests {
             Some((1, vec![r, g, b])),
         );
         let doc = import_psd_bytes(&bytes, "Flat Photo").unwrap();
-        assert_eq!(doc.pages[0].layers.len(), 1);
-        assert_eq!(doc.pages[0].layers[0].name, "Composite");
-        let asset = doc.assets.values().next().unwrap();
+        assert_eq!(doc.pages()[0].layers.len(), 1);
+        assert_eq!(doc.pages()[0].layers[0].name, "Composite");
+        let asset = doc.assets().values().next().unwrap();
         assert_eq!((asset.width, asset.height), (3, 2));
         assert_eq!(&asset.rgba_bytes[0..4], &[120, 180, 60, 255]);
     }
@@ -1919,13 +1919,13 @@ mod tests {
         let bytes = build_synthetic_psd(false, 4096, 4, 1, 8, 1, Some(254.0), &[big], None);
         let doc = import_psd_bytes(&bytes, "Wide Banner").unwrap();
         // At 254 DPI, 4096 px = 409.6 mm, 4 px = 0.4 mm
-        let obj = doc.objects.values().next().unwrap();
+        let obj = doc.objects().values().next().unwrap();
         let NodePayload::Raster(r) = &obj.payload else {
             panic!("expected raster");
         };
         assert!((r.width_mm - 409.6).abs() < 0.05);
         assert!((r.height_mm - 0.4).abs() < 0.05);
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         assert!(asset.width <= MAX_LAYER_OUTPUT_DIM);
         assert!(asset.height <= MAX_LAYER_OUTPUT_DIM);
         assert_eq!(&asset.rgba_bytes[0..4], &[200, 200, 200, 255]);
@@ -1971,13 +1971,13 @@ mod tests {
         };
         let bytes = build_synthetic_psd(false, 2, 2, 3, 8, 3, Some(150.0), &[l0, l1], None);
         let doc = import_psd_bytes(&bytes, "Masked Multi").unwrap();
-        assert_eq!(doc.pages[0].layers.len(), 2);
+        assert_eq!(doc.pages()[0].layers.len(), 2);
 
-        let top_obj = &doc.objects[&doc.pages[0].layers[1].objects[0]];
+        let top_obj = &doc.objects()[&doc.pages()[0].layers[1].objects[0]];
         let NodePayload::Raster(r) = &top_obj.payload else {
             panic!("expected raster");
         };
-        let asset = &doc.assets[&r.asset_id];
+        let asset = &doc.assets()[&r.asset_id];
         assert_eq!(&asset.rgba_bytes[0..4], &[15, 230, 45, 255]);
     }
 

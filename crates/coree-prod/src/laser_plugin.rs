@@ -1439,7 +1439,7 @@ fn collect_laser_polylines_recursive(
         return;
     }
 
-    if let Some(obj) = doc.objects.get(&id) {
+    if let Some(obj) = doc.object(id) {
         if !obj.visible {
             visiting.remove(&id);
             return;
@@ -1514,7 +1514,7 @@ fn collect_laser_polylines_recursive(
             }
             NodePayload::SymbolInstance(sym_id) => {
                 if is_selected {
-                    if let Some(sym) = doc.symbols.get(sym_id) {
+                    if let Some(sym) = doc.symbol(*sym_id) {
                         for sub in &sym.objects {
                             if !sub.visible {
                                 continue;
@@ -2857,8 +2857,8 @@ mod tests {
     #[test]
     fn plan_laser_toolpath_orders_inner_before_outer_and_exports_all_formats() {
         let mut doc = Document::new_a4("Laser Bracket");
-        let page_id = doc.pages[0].id;
-        let visible_layer = doc.pages[0].layers[0].id;
+        let page_id = doc.pages()[0].id;
+        let visible_layer = doc.pages()[0].layers[0].id;
 
         // Hidden layer must be excluded from laser output!
         let hidden_layer = doc

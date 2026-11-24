@@ -149,6 +149,65 @@ impl Effect {
         out
     }
 
+    /// Extracts symmetry transforms if `effects` contains an [`Effect::Symmetry`], or `[IDENTITY]`.
+    #[must_use]
+    pub fn symmetry_transforms_for(effects: &[Effect]) -> Vec<Affine2D> {
+        for eff in effects {
+            if let Effect::Symmetry {
+                axes,
+                mirror,
+                origin,
+            } = eff
+            {
+                return Self::symmetry_transforms(*axes, *mirror, *origin);
+            }
+        }
+        vec![Affine2D::IDENTITY]
+    }
+
+    /// Computes extra world-mm padding needed around an object for effect overhangs
+    /// (`DropShadow`, `BlockShadow`, `Contour::Outside`, `Extrude25D`, `Distort`).
+    #[must_use]
+    pub fn effects_bounds_padding_mm(effects: &[Effect]) -> f64 {
+        let mut pad = 0.0_f64;
+        for eff in effects {
+            match eff {
+                Effect::DropShadow {
+                    dx_mm,
+                    dy_mm,
+                    blur_mm,
+                    ..
+                } => {
+                    pad = pad.max(dx_mm.abs() + blur_mm.abs() * 3.0);
+                    pad = pad.max(dy_mm.abs() + blur_mm.abs() * 3.0);
+                }
+                Effect::BlockShadow { dx_mm, dy_mm, .. } => {
+                    pad = pad.max(dx_mm.abs().max(dy_mm.abs()) + 2.0);
+                }
+                Effect::Contour {
+                    mode: ContourMode::Outside,
+                    steps,
+                    offset_mm,
+                    ..
+                } => {
+                    pad = pad.max(f64::from(*steps) * offset_mm.abs() + 2.0);
+                }
+                Effect::Extrude25D { depth, .. } => {
+                    pad = pad.max(depth.abs() * 2.0 + 10.0);
+                }
+                Effect::Distort { amplitude, .. } => {
+                    pad = pad.max(amplitude.abs() * 2.0 + 2.0);
+                }
+                _ => {}
+            }
+        }
+        if pad.is_finite() {
+            pad
+        } else {
+            0.0
+        }
+    }
+
     /// Evaluates a live [`Effect::Distort`] transformation onto a copy of `path`.
     #[must_use]
     pub fn apply_distort_to_path(

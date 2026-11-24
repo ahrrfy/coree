@@ -924,7 +924,7 @@ fn fit_png_bytes_to_max(png_bytes: &[u8], limit: u32) -> Result<Vec<u8>, String>
 
 fn render_page0_thumbnail_png(doc: &mut Document, limit: u32) -> Result<Vec<u8>, String> {
     let page = doc
-        .pages
+        .pages()
         .first()
         .ok_or_else(|| "document has no pages to thumbnail".to_owned())?;
     let w_mm = if page.width_mm.is_finite() && page.width_mm > 0.0 {
@@ -955,8 +955,8 @@ fn render_page0_thumbnail_png(doc: &mut Document, limit: u32) -> Result<Vec<u8>,
     let mut viewport = Viewport::for_export(target_w, target_h, clamped_dpi);
     viewport.zoom = zoom;
 
-    doc.active_page_index = 0;
-    doc.multipage_view = false;
+    let _ = doc.set_active_page_index(0);
+    doc.set_multipage_view(false);
 
     let mut renderer = SceneRenderer::new();
     renderer.render_document(
@@ -983,7 +983,7 @@ pub fn inspect_in_memory_document(doc: &Document) -> FileInspectionReport {
     build_report_from_doc(
         doc,
         ContainerFormat::NativeCoree,
-        doc.metadata
+        doc.metadata()
             .source_format
             .clone()
             .unwrap_or_else(|| "In-Memory Studio Document".to_owned()),
@@ -1032,16 +1032,16 @@ fn build_report_from_doc(
     zip_entries: Vec<ZipEntrySummary>,
     warnings: Vec<String>,
 ) -> FileInspectionReport {
-    let page_count = doc.pages.len();
-    let layer_count: usize = doc.pages.iter().map(|p| p.layers.len()).sum();
-    let object_count = doc.objects.len();
-    let bitmap_count = doc.assets.len();
+    let page_count = doc.pages().len();
+    let layer_count: usize = doc.pages().iter().map(|p| p.layers.len()).sum();
+    let object_count = doc.object_count();
+    let bitmap_count = doc.assets().len();
 
     let mut fonts = BTreeSet::new();
     let mut color_models = BTreeSet::new();
     let mut unknown_chunks = Vec::new();
 
-    for unk in &doc.unknown_doc_chunks {
+    for unk in doc.unknown_doc_chunks() {
         unknown_chunks.push(UnknownChunkSummary {
             fourcc: unk.fourcc_str(),
             byte_len: unk.raw_bytes.len(),
@@ -1050,7 +1050,28 @@ fn build_report_from_doc(
         });
     }
 
-    for obj in doc.objects.values() {
+    for page in doc.pages() {
+        for unk in &page.unknown_chunks {
+            unknown_chunks.push(UnknownChunkSummary {
+                fourcc: unk.fourcc_str(),
+                byte_len: unk.raw_bytes.len(),
+                version_hint: unk.version_hint,
+                scope: format!("page:{}", page.name),
+            });
+        }
+        for layer in &page.layers {
+            for unk in &layer.unknown_chunks {
+                unknown_chunks.push(UnknownChunkSummary {
+                    fourcc: unk.fourcc_str(),
+                    byte_len: unk.raw_bytes.len(),
+                    version_hint: unk.version_hint,
+                    scope: format!("layer:{}", layer.name),
+                });
+            }
+        }
+    }
+
+    for obj in doc.objects().values() {
         for c in obj.fill.referenced_colors() {
             color_models.insert(color_model_name(&c).to_owned());
         }
@@ -1088,7 +1109,7 @@ fn build_report_from_doc(
         }
     }
 
-    for sw in &doc.document_palette.swatches {
+    for sw in &doc.document_palette().swatches {
         color_models.insert(color_model_name(&sw.color).to_owned());
     }
 

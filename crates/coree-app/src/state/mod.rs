@@ -6,7 +6,8 @@
 
 use crate::cdr_bridge::{inspect_any_file, inspect_in_memory_document, FileInspectionReport};
 use crate::io_bridge::{
-    export_any_document, import_into_document, open_any_document, UniversalExportOptions,
+    build_import_document_ops_on_layer, export_any_document, open_any_document,
+    resolve_import_target_layer, UniversalExportOptions,
 };
 use crate::printing::{
     list_system_printers, print_document_via_os_spooler, PrintJobConfig, PrinterInfo,
@@ -21,37 +22,45 @@ use coree_core::{
     BasicShapeKind, BezierPath, BlendMode, BooleanOp, BuiltinIccProfile, Color, ColorMapMode,
     ColorMode, ColorPalette, ColorSwatch, CommandHistory, CommandOp, ConnectorObject,
     ConnectorStyle, ContourMode, CornerStyle, DimensionKind, DistortKind, DistributeOp, Document,
-    Effect, EllipseMode, EnvelopeMode, FeatherDirection, Fill, GuideOrientation, ImageAssetId,
-    ImpactStyle, LayerId, LensConfig, LensKind, MasterLayerScope, MeshNode, NodeKind, NodePayload,
-    NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape, PathNode, Point2D, RasterAsset,
-    RasterFilter, RasterLayerData, Rect2D, RenderingIntent, SceneObject, SelectionState, Subpath,
-    TextOnPath, TextStyle, TransparencyMode, Unit, Vec2D, VectorTable, ZOrderOp,
+    DocumentInvalidation, Effect, EllipseMode, EnvelopeMode, FeatherDirection, Fill,
+    GuideOrientation, ImageAssetId, ImpactStyle, LayerId, LensConfig, LensKind, MasterLayerScope,
+    MeshNode, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape,
+    PathNode, Point2D, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent,
+    SceneObject, SelectionState, SnapEngine, Subpath, SymbolId, TextOnPath, TextStyle,
+    TransparencyMode, Unit, Vec2D, VectorTable, ZOrderOp,
 };
 use coree_io::import_palette_file;
 use coree_prod::{
     add_barcode_to_document, add_qr_code_to_document, apply_print_merge, builtin_macros,
-    collect_for_output, compute_production_metrics, compute_separations, detect_executable,
-    export_for_plugin, find_and_replace, find_objects, generate_cut_contour, generate_dieline,
-    generate_print_marks, impose_document, launch_external_bridge, plan_laser_toolpath, run_macro,
-    run_preflight, run_recorded_macro, BarcodeOptions, BarcodeSymbology, CollectOptions,
-    DielineKind, FindQuery, FindReplaceReport, FindScope, ImpositionMode, LaserJobConfig,
-    LaserToolpathPlan, LensKindFilter, MacroSandboxConfig, ObjectKindFilter, PluginExportOutcome,
-    PluginKind, PluginRegistry, PreflightReport, PreflightRules, PrintMarksOptions,
-    PrintMergeOptions, PrintMergeTable, ProductionMetrics, QrCodeOptions, QrErrorCorrection,
-    ReplaceAction, SeparationOptions, SeparationResult, TextMatchMode,
+    collect_for_output, compute_production_metrics, compute_separations_with_text_outliner,
+    detect_executable, evaluate_cql_query, export_for_plugin, find_objects, generate_cut_contour,
+    generate_dieline, generate_print_marks, impose_document, launch_external_bridge,
+    plan_laser_toolpath, plan_macro_ops, plan_recorded_macro_ops, run_preflight, BarcodeOptions,
+    BarcodeSymbology, CollectOptions, DielineKind, FindQuery, FindReplaceReport, FindScope,
+    ImpositionMode, LaserJobConfig, LaserToolpathPlan, LensKindFilter, MacroSandboxConfig,
+    ObjectKindFilter, PluginExportOutcome, PluginKind, PluginRegistry, PreflightReport,
+    PreflightRules, PrintMarksOptions, PrintMergeOptions, PrintMergeTable, ProductionMetrics,
+    QrCodeOptions, QrErrorCorrection, ReplaceAction, SeparationOptions, SeparationResult,
+    TextMatchMode,
 };
 use coree_render::{
     apply_dodge_burn_stroke, apply_healing_stroke, clone_stamp_stroke, compute_page_layouts,
-    convert_object_to_bitmap, erase_stroke, hit_test_point, hit_test_powerclip_contents,
-    lower_effects_to_primitives, paint_brush_stroke, paint_brush_stroke_masked,
-    paragraph_to_curves, raster_flood_fill, resample, smudge_stroke, text_on_path_to_curves,
-    text_to_curves, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
-    GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer, SnapOptions,
-    ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
+    convert_object_to_bitmap_with_bounds, create_smart_fill_object, erase_stroke, hit_test_point,
+    hit_test_powerclip_contents, lower_effects_to_primitives, paint_brush_stroke,
+    paint_brush_stroke_masked, raster_flood_fill, resample, smudge_stroke, trace_raster_to_mm,
+    DirtyTileCache, DodgeBurnMode, DynamicGuideLine, GlyphBlockFilter, OutlinePreset, RasterMask,
+    RenderOptions, SceneRenderer, SnapOptions, TextEngine, ToneRange, TraceConfig, TraceMode,
+    ViewMode, Viewport,
 };
 use coree_storage::{
-    FontQuery, FontRecord, JobHandle, JobOutcome, JobPool, RecentDocumentRecord, StorageDb,
-    UncleanSession, WorkspaceLayoutRecord,
+    DifferentialSnapshotPatch, FontQuery, FontRecord, JobHandle, JobOutcome, JobPool,
+    RecentDocumentRecord, StorageDb, UncleanSession, WorkspaceLayoutRecord,
+};
+pub use coree_tools::{
+    ActiveDragState, CursorHint, HandleShape, KeyEvent, ModifiersState, NodeDragPart,
+    NodeSmoothness, OverlayHandle, OverlayPath, OverlayStrokeKind, ParametricHandleKind,
+    PointerButton, PointerEvent, RasterBrushOp, ScaleHandle, ToolActionRequest, ToolCore, ToolId,
+    ToolKey, ToolOutput, ToolReadContext, ToolSettingsSnapshot, TransientOverlay, TOOL_GROUPS,
 };
 use egui_dock::{DockState, NodeIndex, NodePath, SurfaceIndex};
 use serde::{Deserialize, Serialize};
@@ -62,7 +71,7 @@ use uuid::Uuid;
 
 mod canvas_tools;
 mod editing;
-mod helpers;
+pub(crate) mod helpers;
 mod production;
 mod tab;
 mod types;
@@ -76,8 +85,10 @@ pub use types::*;
 /// references, and raster assets cleanly without ID aliasing or data loss.
 #[derive(Debug, Clone)]
 pub struct ClipboardSnapshot {
+    pub source_doc_id: Uuid,
     pub roots: Vec<ObjectId>,
     pub document: Document,
+    pub text_on_path_fallbacks: HashMap<ObjectId, Affine2D>,
 }
 
 /// Complete desktop studio application state (`eframe::App` + headless test API).
@@ -139,8 +150,11 @@ pub struct StudioApp {
 
     // Repeat & Clipboard State
     pub last_executed_op: Option<CommandOp>,
+    pub(crate) last_world_transform: Option<Affine2D>,
     pub clipboard_objects: Vec<SceneObject>,
     pub clipboard_snapshot: Option<ClipboardSnapshot>,
+    pub(crate) clipboard_backend: Box<dyn crate::clipboard::ClipboardBackend>,
+    pub(crate) last_clipboard_hash: Option<u64>,
 
     // Offline local storage & async job pool
     pub storage: Option<StorageDb>,
@@ -194,27 +208,76 @@ impl StudioApp {
     #[must_use]
     pub fn new_headless() -> Self {
         let storage = StorageDb::open_in_memory().ok();
-        Self::from_storage(storage, Vec::new(), false)
+        Self::from_storage(
+            storage,
+            Vec::new(),
+            false,
+            Box::new(crate::clipboard::MemoryClipboardBackend::new()),
+        )
     }
 
     /// Creates a `StudioApp` attached to an explicit [`StorageDb`] instance.
     #[must_use]
     pub fn new_with_storage(storage: StorageDb) -> Self {
-        Self::from_storage(Some(storage), Vec::new(), false)
+        Self::from_storage(
+            Some(storage),
+            Vec::new(),
+            false,
+            Box::new(crate::clipboard::MemoryClipboardBackend::new()),
+        )
     }
 
     /// Creates the desktop `StudioApp` opening local SQLite persistence, scanning for
     /// crash-recovery sessions, loading preferences, and opening any CLI-supplied files.
     #[must_use]
     pub fn new_desktop(initial_files: Vec<PathBuf>) -> Self {
-        let storage = StorageDb::open_default().ok();
-        Self::from_storage(storage, initial_files, true)
+        let (storage, storage_err) = match StorageDb::open_default() {
+            Ok(db) => (Some(db), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        let quarantined_backup = storage
+            .as_ref()
+            .and_then(|db| db.last_quarantined_backup().map(Path::to_path_buf));
+        let mut app = Self::from_storage(
+            storage,
+            initial_files,
+            true,
+            Box::new(crate::clipboard::OsClipboardBackend::new()),
+        );
+        if let Some(bak) = quarantined_backup {
+            let msg = format!(
+                "Recovered from corrupt local database (quarantined to {})",
+                bak.display()
+            );
+            app.status_message = msg.clone();
+            app.push_toast(msg, true);
+        }
+        if let Some(err) = storage_err {
+            let msg = format!("Local database/autosave unavailable (running in-memory): {err}");
+            app.status_message = msg.clone();
+            app.push_toast(msg, true);
+        }
+        app
+    }
+
+    /// Replaces the active clipboard backend (useful for shared cross-instance tests).
+    pub fn set_clipboard_backend(&mut self, backend: Box<dyn crate::clipboard::ClipboardBackend>) {
+        self.clipboard_backend = backend;
+    }
+
+    /// Returns `true` if either the internal studio clipboard or the OS clipboard holds supported content.
+    #[must_use]
+    pub fn has_clipboard_content(&self) -> bool {
+        !self.clipboard_objects.is_empty()
+            || self.clipboard_snapshot.is_some()
+            || self.clipboard_backend.has_supported_content()
     }
 
     fn from_storage(
         storage: Option<StorageDb>,
         initial_files: Vec<PathBuf>,
         open_welcome_when_empty: bool,
+        clipboard_backend: Box<dyn crate::clipboard::ClipboardBackend>,
     ) -> Self {
         let mut group_active_tools = [ToolId::Pick; 15];
         for (i, group) in TOOL_GROUPS.iter().enumerate() {
@@ -329,8 +392,11 @@ impl StudioApp {
             glyph_block_filter: GlyphBlockFilter::default(),
             glyph_search: String::new(),
             last_executed_op: None,
+            last_world_transform: None,
             clipboard_objects: Vec::new(),
             clipboard_snapshot: None,
+            clipboard_backend,
+            last_clipboard_hash: None,
             storage,
             job_pool,
             ipc_server: None,
@@ -459,9 +525,9 @@ impl StudioApp {
     /// Opens any supported document file (`.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, raster).
     pub fn open_file_path(&mut self, path: &Path) -> Result<(), String> {
         let opened = open_any_document(path)?;
-        let title = opened.document.title.clone();
-        let page_count = opened.document.pages.len() as u32;
-        let color_mode = match opened.document.color_mode {
+        let title = opened.document.title().to_owned();
+        let page_count = opened.document.pages().len() as u32;
+        let color_mode = match opened.document.color_mode() {
             ColorMode::Cmyk => "cmyk",
             ColorMode::Rgb => "rgb",
         }
@@ -507,16 +573,49 @@ impl StudioApp {
 
     /// Imports an external vector/raster file into the active document page.
     pub fn import_file_path(&mut self, path: &Path) -> Result<usize, String> {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return Err("no active document".to_owned());
-        };
-        let ids = import_into_document(&mut tab.document, path)?;
-        let count = ids.len();
-        if !ids.is_empty() {
-            tab.selection.select_many(&tab.document, &ids);
+        let opened = open_any_document(path)?;
+        enum ImportPlan {
+            NoTab,
+            NoUnlockedLayer,
+            Ready(Vec<CommandOp>, Vec<ObjectId>),
         }
-        tab.mark_modified();
-        self.checkpoint_wal_snapshot_active();
+        let plan = match self.tabs.get(self.active_tab) {
+            None => ImportPlan::NoTab,
+            Some(tab) => {
+                if resolve_import_target_layer(&tab.document, tab.active_layer_id).is_none() {
+                    ImportPlan::NoUnlockedLayer
+                } else {
+                    let (ops, created_ids) = build_import_document_ops_on_layer(
+                        &tab.document,
+                        &opened.document,
+                        tab.active_layer_id,
+                    );
+                    ImportPlan::Ready(ops, created_ids)
+                }
+            }
+        };
+        let (ops, created_ids) = match plan {
+            ImportPlan::NoTab => return Err("no active document".to_owned()),
+            ImportPlan::NoUnlockedLayer => {
+                let msg = "Cannot import: active page has no visible unlocked layer".to_owned();
+                self.push_toast(msg.clone(), true);
+                return Err(msg);
+            }
+            ImportPlan::Ready(ops, created_ids) => (ops, created_ids),
+        };
+        let count = created_ids.len();
+        if !ops.is_empty() && count > 0 {
+            let cmd = if ops.len() == 1 {
+                ops.into_iter().next().expect("len == 1")
+            } else {
+                CommandOp::Batch(ops)
+            };
+            self.execute_command(cmd)?;
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.selection.select_many(&tab.document, &created_ids);
+            }
+            self.checkpoint_wal_snapshot_active();
+        }
         self.push_toast(
             format!("Imported {count} object(s) from {}", path.display()),
             false,
@@ -551,13 +650,13 @@ impl StudioApp {
             tab.source_path = Some(path.to_path_buf());
             tab.dirty = false;
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                tab.document.title = stem.to_owned();
+                tab.document.set_title(stem.to_owned());
             }
             (
-                tab.document.id.to_string(),
-                tab.document.title.clone(),
-                tab.document.pages.len() as u32,
-                match tab.document.color_mode {
+                tab.document.id().to_string(),
+                tab.document.title().to_owned(),
+                tab.document.pages().len() as u32,
+                match tab.document.color_mode() {
                     ColorMode::Cmyk => "cmyk",
                     ColorMode::Rgb => "rgb",
                 }
@@ -578,10 +677,16 @@ impl StudioApp {
         };
 
         if let Some(ref db) = self.storage {
+            let _ = db.flush_autosave(Duration::from_secs(5));
             let _ = db.mark_clean_close(&doc_id_str);
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.journal_seq = 0;
                 tab.wal_session_open = false;
+                tab.wal_session_id = None;
+                tab.wal_base_snapshot_id = None;
+                tab.autosave_dirty_objects.clear();
+                tab.autosave_dirty_structure = false;
+                tab.autosave_dirty_all = false;
             }
             let rec = RecentDocumentRecord {
                 id: Uuid::new_v4().to_string(),
@@ -649,7 +754,7 @@ impl StudioApp {
         if idx >= self.tabs.len() {
             return;
         }
-        let doc_id = self.tabs[idx].document.id.to_string();
+        let doc_id = self.tabs[idx].document.id().to_string();
         if let Some(ref db) = self.storage {
             let _ = db.mark_clean_close(&doc_id);
         }
@@ -681,7 +786,7 @@ impl StudioApp {
             serde_json::to_string(&self.custom_shortcuts).unwrap_or_else(|_| "{}".to_owned());
         if let Some(ref mut db) = self.storage {
             for tab in &self.tabs {
-                let _ = db.mark_clean_close(&tab.document.id.to_string());
+                let _ = db.mark_clean_close(&tab.document.id().to_string());
             }
             let _ = db.set_preference("ui.theme", "ui", &self.theme);
             let _ = db.set_preference("ui.language", "ui", &self.ui_language);
@@ -707,7 +812,8 @@ impl StudioApp {
     // Autosave, WAL Command Journal & Crash Recovery
     // -------------------------------------------------------------------------
 
-    /// Saves an atomic crash-recovery snapshot of the active tab into SQLite.
+    /// Saves an incremental differential (or baseline) crash-recovery snapshot of the active tab
+    /// asynchronously on the background autosave worker thread (`<= 2 ms` UI-thread enqueue).
     pub fn perform_autosave_active(&mut self) -> Result<(), String> {
         let Some(ref db) = self.storage else {
             return Ok(());
@@ -715,15 +821,89 @@ impl StudioApp {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return Ok(());
         };
-        let doc_id = tab.document.id.to_string();
-        db.save_snapshot(
-            &doc_id,
-            &tab.document.title,
-            tab.source_path.as_deref(),
-            &tab.document,
-        )
-        .map_err(|e| format!("autosave failed: {e}"))?;
+        let doc_id = tab.document.id().to_string();
+        if tab.wal_session_open && !tab.autosave_dirty_all {
+            if let (Some(session_id), Some(base_id)) =
+                (tab.wal_session_id.clone(), tab.wal_base_snapshot_id.clone())
+            {
+                let mut upserted_objects = Vec::with_capacity(tab.autosave_dirty_objects.len());
+                let mut deleted_object_ids = Vec::new();
+                for &oid in &tab.autosave_dirty_objects {
+                    if let Some(obj) = tab.document.object(oid) {
+                        upserted_objects.push((oid, obj.clone()));
+                    } else {
+                        deleted_object_ids.push(oid);
+                    }
+                }
+                let struct_dirty = tab.autosave_dirty_structure;
+                let patch = DifferentialSnapshotPatch {
+                    doc_id: doc_id.clone(),
+                    session_id,
+                    title: tab.document.title().to_owned(),
+                    source_path: tab
+                        .source_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    base_snapshot_id: base_id,
+                    last_command_seq: tab.journal_seq,
+                    upserted_objects,
+                    deleted_object_ids,
+                    upserted_assets: Vec::new(),
+                    deleted_asset_ids: Vec::new(),
+                    full_assets: struct_dirty.then(|| tab.document.assets().clone()),
+                    pages: struct_dirty.then(|| tab.document.pages().to_vec()),
+                    active_page_index: struct_dirty.then(|| tab.document.active_page_index()),
+                    next_id: Some(tab.document.next_id()),
+                    color_mode: struct_dirty.then(|| tab.document.color_mode()),
+                    default_unit: struct_dirty.then(|| tab.document.default_unit()),
+                    dpi: struct_dirty.then(|| tab.document.dpi()),
+                    multipage_view: struct_dirty.then(|| tab.document.multipage_view()),
+                    palettes: struct_dirty.then(|| tab.document.palettes().to_vec()),
+                    document_palette: struct_dirty.then(|| tab.document.document_palette().clone()),
+                    guides: struct_dirty.then(|| tab.document.guides().to_vec()),
+                    grid: struct_dirty.then(|| tab.document.grid()),
+                    perspective_grid: struct_dirty.then(|| tab.document.perspective_grid().clone()),
+                    color_styles: struct_dirty.then(|| tab.document.color_styles().to_vec()),
+                    object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
+                    symbols: struct_dirty.then(|| tab.document.symbols().clone()),
+                    metadata: struct_dirty.then(|| tab.document.metadata().clone()),
+                };
+                let delta_id = db
+                    .enqueue_differential_autosave(patch)
+                    .map_err(|e| format!("autosave failed: {e}"))?;
+                tab.wal_base_snapshot_id = Some(delta_id);
+                tab.autosave_dirty_objects.clear();
+                tab.autosave_dirty_structure = false;
+                tab.autosave_dirty_all = false;
+                tab.last_autosave_at = Instant::now();
+                return Ok(());
+            }
+        }
+
+        let session_id = match tab.wal_session_id.clone() {
+            Some(s) if tab.wal_session_open => s,
+            _ => {
+                db.resolve_or_open_session(&doc_id)
+                    .map_err(|e| format!("autosave session error: {e}"))?
+                    .0
+            }
+        };
+        let snap_id = db
+            .enqueue_baseline_snapshot(
+                &doc_id,
+                &session_id,
+                tab.document.title(),
+                tab.source_path.as_deref(),
+                tab.document.clone(),
+                tab.journal_seq,
+            )
+            .map_err(|e| format!("autosave failed: {e}"))?;
         tab.wal_session_open = true;
+        tab.wal_session_id = Some(session_id);
+        tab.wal_base_snapshot_id = Some(snap_id);
+        tab.autosave_dirty_objects.clear();
+        tab.autosave_dirty_structure = false;
+        tab.autosave_dirty_all = false;
         tab.last_autosave_at = Instant::now();
         Ok(())
     }
@@ -771,7 +951,7 @@ impl StudioApp {
             (recovered, orig)
         };
 
-        let title = doc.title.clone();
+        let title = doc.title().to_owned();
         let mut tab = DocumentTab::new(doc, orig_path, self.theme);
         tab.dirty = true;
         self.tabs.push(tab);
@@ -789,6 +969,179 @@ impl StudioApp {
             self.refresh_storage_lists();
         }
         self.push_toast("Discarded recovery snapshot", false);
+    }
+
+    /// Drains pending IPC file-open batches and bidirectional JSON-RPC `2.0` Scene-DOM /
+    /// `CommandHistory` automation calls, executing mutations through `CommandHistory` + WAL.
+    pub fn process_pending_ipc(&mut self, ctx: Option<&egui::Context>) -> usize {
+        use crate::ipc::{
+            dispatch_jsonrpc_on_session, JsonRpcResponse, JSONRPC_INVALID_PARAMS,
+            JSONRPC_INVALID_REQUEST, JSONRPC_SERVER_ERROR,
+        };
+
+        let mut handled = 0usize;
+        let ipc_batches = self
+            .ipc_server
+            .as_ref()
+            .map(crate::ipc::IpcServer::try_recv_batches)
+            .unwrap_or_default();
+        if !ipc_batches.is_empty() {
+            if let Some(c) = ctx {
+                c.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            for batch in ipc_batches {
+                handled += 1;
+                for path in batch {
+                    if let Err(err) = self.open_file_path(&path) {
+                        self.push_toast(err, true);
+                    }
+                }
+            }
+        }
+
+        let rpc_calls = self
+            .ipc_server
+            .as_ref()
+            .map(crate::ipc::IpcServer::try_recv_rpc)
+            .unwrap_or_default();
+        for call in rpc_calls {
+            handled += 1;
+            let req = call.request;
+            let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+            let resp = if req.jsonrpc != "2.0" {
+                JsonRpcResponse::err(id, JSONRPC_INVALID_REQUEST, "jsonrpc must be '2.0'")
+            } else {
+                match req.method.as_str() {
+                    "scene.execute_command" => {
+                        match req
+                            .params
+                            .get("op")
+                            .cloned()
+                            .ok_or_else(|| "missing params.op".to_owned())
+                            .and_then(|v| {
+                                serde_json::from_value::<CommandOp>(v)
+                                    .map_err(|e| format!("invalid CommandOp: {e}"))
+                            }) {
+                            Ok(op) => match self.execute_command(op) {
+                                Ok(()) => {
+                                    let (next_id, obj_count, undo_depth) =
+                                        self.active_tab().map_or((0, 0, 0), |t| {
+                                            (
+                                                t.document.next_id(),
+                                                t.document.objects().len(),
+                                                t.history.undo_labels().len(),
+                                            )
+                                        });
+                                    JsonRpcResponse::ok(
+                                        id,
+                                        serde_json::json!({
+                                            "applied": true,
+                                            "next_id": next_id,
+                                            "object_count": obj_count,
+                                            "undo_depth": undo_depth,
+                                        }),
+                                    )
+                                }
+                                Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                            },
+                            Err(e) => JsonRpcResponse::err(id, JSONRPC_INVALID_PARAMS, e),
+                        }
+                    }
+                    "scene.execute_batch" => {
+                        match req
+                            .params
+                            .get("ops")
+                            .cloned()
+                            .ok_or_else(|| "missing params.ops".to_owned())
+                            .and_then(|v| {
+                                serde_json::from_value::<Vec<CommandOp>>(v)
+                                    .map_err(|e| format!("invalid CommandOp array: {e}"))
+                            }) {
+                            Ok(ops) => match self.execute_command(CommandOp::Batch(ops)) {
+                                Ok(()) => {
+                                    let (next_id, obj_count, undo_depth) =
+                                        self.active_tab().map_or((0, 0, 0), |t| {
+                                            (
+                                                t.document.next_id(),
+                                                t.document.objects().len(),
+                                                t.history.undo_labels().len(),
+                                            )
+                                        });
+                                    JsonRpcResponse::ok(
+                                        id,
+                                        serde_json::json!({
+                                            "applied": true,
+                                            "next_id": next_id,
+                                            "object_count": obj_count,
+                                            "undo_depth": undo_depth,
+                                        }),
+                                    )
+                                }
+                                Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                            },
+                            Err(e) => JsonRpcResponse::err(id, JSONRPC_INVALID_PARAMS, e),
+                        }
+                    }
+                    "scene.undo" => match self.undo() {
+                        Ok(label) => {
+                            let (obj_count, undo_depth, redo_depth) =
+                                self.active_tab().map_or((0, 0, 0), |t| {
+                                    (
+                                        t.document.objects().len(),
+                                        t.history.undo_labels().len(),
+                                        t.history.redo_labels().len(),
+                                    )
+                                });
+                            JsonRpcResponse::ok(
+                                id,
+                                serde_json::json!({
+                                    "undone": true,
+                                    "label": label,
+                                    "object_count": obj_count,
+                                    "undo_depth": undo_depth,
+                                    "redo_depth": redo_depth,
+                                }),
+                            )
+                        }
+                        Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                    },
+                    "scene.redo" => match self.redo() {
+                        Ok(label) => {
+                            let (obj_count, undo_depth, redo_depth) =
+                                self.active_tab().map_or((0, 0, 0), |t| {
+                                    (
+                                        t.document.objects().len(),
+                                        t.history.undo_labels().len(),
+                                        t.history.redo_labels().len(),
+                                    )
+                                });
+                            JsonRpcResponse::ok(
+                                id,
+                                serde_json::json!({
+                                    "redone": true,
+                                    "label": label,
+                                    "object_count": obj_count,
+                                    "undo_depth": undo_depth,
+                                    "redo_depth": redo_depth,
+                                }),
+                            )
+                        }
+                        Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                    },
+                    _ => match self.tabs.get_mut(self.active_tab) {
+                        Some(tab) => {
+                            dispatch_jsonrpc_on_session(&req, &mut tab.document, &mut tab.history)
+                        }
+                        None => {
+                            JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, "no active document tab")
+                        }
+                    },
+                }
+            };
+            let _ = call.reply_tx.send(resp);
+        }
+
+        handled
     }
 
     /// Polls non-blocking background jobs and emits completion toasts.
@@ -819,28 +1172,96 @@ impl StudioApp {
     // Deterministic Command Execution & Undo/Redo
     // -------------------------------------------------------------------------
 
+    /// Checks whether the active creation target layer is writable (visible and unlocked),
+    /// returning `Ok(Option<LayerId>)` for `CommandOp::create_object` or an error message.
+    pub(crate) fn active_creation_layer_or_err(&self) -> Result<Option<LayerId>, String> {
+        let tab = self
+            .tabs
+            .get(self.active_tab)
+            .ok_or_else(|| "no active document".to_owned())?;
+        if let Some(lid) = tab.active_layer_id {
+            match tab.document.find_layer(lid) {
+                Some(l) if l.locked => Err(format!("Layer '{}' is locked", l.name)),
+                Some(l) if !l.visible => Err(format!("Layer '{}' is hidden", l.name)),
+                Some(_) => Ok(Some(lid)),
+                None => Err("Active layer no longer exists".to_owned()),
+            }
+        } else if let Some(page) = tab.document.active_page() {
+            if page.layers.iter().any(|l| l.visible && !l.locked) {
+                Ok(None)
+            } else if page.layers.iter().all(|l| l.locked) {
+                Err("All layers on active page are locked".to_owned())
+            } else {
+                Err("Active page has no visible unlocked layer".to_owned())
+            }
+        } else {
+            Err("No active page".to_owned())
+        }
+    }
+
+    /// Validates that the active creation target layer is visible and unlocked, pushing an
+    /// error toast and returning `None` if creation should be refused.
+    pub(crate) fn ensure_active_creation_layer(&mut self) -> Option<Option<LayerId>> {
+        match self.active_creation_layer_or_err() {
+            Ok(lid) => Some(lid),
+            Err(e) => {
+                self.push_toast(e, true);
+                None
+            }
+        }
+    }
+
+    /// Creates `obj` on the active writable layer via `CommandOp::create_object`, propagating
+    /// errors as error toasts and selecting the newly created object only on success.
+    pub(crate) fn create_object_on_active_layer(&mut self, obj: SceneObject) -> Option<ObjectId> {
+        let layer_id = self.ensure_active_creation_layer()?;
+        match self.execute_command(CommandOp::create_object(obj, layer_id)) {
+            Ok(()) => {
+                let created_id = self
+                    .active_tab()
+                    .and_then(|t| t.document.objects().keys().last().copied());
+                if let (Some(tab), Some(id)) = (self.active_tab_mut(), created_id) {
+                    tab.selection.select_single(&tab.document, id);
+                    tab.metrics_dirty = true;
+                    tab.needs_rerender = true;
+                }
+                created_id
+            }
+            Err(e) => {
+                self.push_toast(e, true);
+                None
+            }
+        }
+    }
+
     /// Executes `op` through the active tab's [`CommandHistory`] and appends it to SQLite WAL journal.
     pub fn execute_command(&mut self, op: CommandOp) -> Result<(), String> {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return Err("no active document".to_owned());
         };
-        let doc_id = tab.document.id.to_string();
+        let doc_id = tab.document.id().to_string();
 
         // Ensure an active unclean baseline snapshot exists before journaling commands
         // (including after `save_active_as` marks the previous session cleanly closed).
         if !tab.wal_session_open {
             if let Some(ref db) = self.storage {
-                if db
-                    .save_snapshot(
+                if let Ok((session_id, _)) = db.resolve_or_open_session(&doc_id) {
+                    if let Ok(base_id) = db.enqueue_baseline_snapshot(
                         &doc_id,
-                        &tab.document.title,
+                        &session_id,
+                        tab.document.title(),
                         tab.source_path.as_deref(),
-                        &tab.document,
-                    )
-                    .is_ok()
-                {
-                    tab.wal_session_open = true;
-                    tab.last_autosave_at = Instant::now();
+                        tab.document.clone(),
+                        tab.journal_seq,
+                    ) {
+                        tab.wal_session_open = true;
+                        tab.wal_session_id = Some(session_id);
+                        tab.wal_base_snapshot_id = Some(base_id);
+                        tab.autosave_dirty_objects.clear();
+                        tab.autosave_dirty_structure = false;
+                        tab.autosave_dirty_all = false;
+                        tab.last_autosave_at = Instant::now();
+                    }
                 }
             }
         }
@@ -848,9 +1269,14 @@ impl StudioApp {
         tab.history
             .execute(&mut tab.document, op.clone())
             .map_err(|e| e.to_string())?;
+        let pruned_assets = tab.history.take_last_gc_pruned();
+        let inv = tab.history.last_invalidation().clone();
         tab.journal_seq = tab.journal_seq.saturating_add(1);
         let seq = tab.journal_seq;
-        tab.mark_modified();
+        tab.mark_modified_with_invalidation(&inv);
+        if command_op_touches_structure(&op) {
+            tab.autosave_dirty_structure = true;
+        }
 
         match &op {
             CommandOp::TransformObjects { ids, affine } if !ids.is_empty() => {
@@ -862,17 +1288,80 @@ impl StudioApp {
                     }
                 }
             }
-            CommandOp::TransformObjects { ids, .. } if ids.is_empty() => {}
             _ => {
                 tab.last_duplicate_batch = None;
             }
         }
 
         if let Some(ref db) = self.storage {
-            let _ = db.append_command(&doc_id, seq, &op);
+            if let Some(ref sess_id) = tab.wal_session_id {
+                let base_id = tab.wal_base_snapshot_id.as_deref();
+                let _ = db.enqueue_command_async(&doc_id, sess_id, base_id, seq, op.clone());
+                if !pruned_assets.is_empty() {
+                    tab.journal_seq = tab.journal_seq.saturating_add(1);
+                    let prune_seq = tab.journal_seq;
+                    let _ = db.enqueue_command_async(
+                        &doc_id,
+                        sess_id,
+                        base_id,
+                        prune_seq,
+                        CommandOp::PruneAssets { ids: pruned_assets },
+                    );
+                }
+            } else {
+                let _ = db.append_command(&doc_id, seq, &op);
+                if !pruned_assets.is_empty() {
+                    tab.journal_seq = tab.journal_seq.saturating_add(1);
+                    let prune_seq = tab.journal_seq;
+                    let _ = db.append_command(
+                        &doc_id,
+                        prune_seq,
+                        &CommandOp::PruneAssets { ids: pruned_assets },
+                    );
+                }
+            }
         }
+        self.last_world_transform = match &op {
+            CommandOp::TransformObjects { ids, affine } if !ids.is_empty() => {
+                let doc = &self.tabs[self.active_tab].document;
+                Some(helpers::unconjugate_local_affine_to_world(
+                    doc, ids[0], *affine,
+                ))
+            }
+            CommandOp::Batch(ops)
+                if !ops.is_empty()
+                    && ops.iter().all(|inner| {
+                        matches!(inner, CommandOp::TransformObjects { ids, .. } if !ids.is_empty())
+                    }) =>
+            {
+                if let Some(CommandOp::TransformObjects { ids, affine }) = ops.first() {
+                    let doc = &self.tabs[self.active_tab].document;
+                    Some(helpers::unconjugate_local_affine_to_world(
+                        doc, ids[0], *affine,
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         self.last_executed_op = Some(op);
         Ok(())
+    }
+
+    /// Applies `world_affine` in world coordinates to `ids` via `build_world_transform_command`.
+    pub(crate) fn apply_world_transform_to_selection(
+        &mut self,
+        ids: &[ObjectId],
+        world_affine: Affine2D,
+    ) -> bool {
+        let Some(cmd) = self
+            .active_tab()
+            .and_then(|t| helpers::build_world_transform_command(&t.document, ids, world_affine))
+        else {
+            return false;
+        };
+        self.execute_command(cmd).is_ok()
     }
 
     /// Undoes the last command on the active tab and checkpoints the WAL snapshot
@@ -886,8 +1375,13 @@ impl StudioApp {
                 .history
                 .undo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
+            let inv = tab.history.last_invalidation().clone();
             tab.last_duplicate_batch = None;
-            tab.mark_modified();
+            tab.viewport.multipage_view = tab.document.multipage_view();
+            tab.snap_options.grid = tab.document.grid().snap;
+            tab.sync_active_layer();
+            tab.mark_modified_with_invalidation(&inv);
+            tab.autosave_dirty_all = true;
             label
         };
         self.checkpoint_wal_snapshot_active();
@@ -905,12 +1399,566 @@ impl StudioApp {
                 .history
                 .redo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
+            let inv = tab.history.last_invalidation().clone();
             tab.last_duplicate_batch = None;
-            tab.mark_modified();
+            tab.viewport.multipage_view = tab.document.multipage_view();
+            tab.snap_options.grid = tab.document.grid().snap;
+            tab.sync_active_layer();
+            tab.mark_modified_with_invalidation(&inv);
+            tab.autosave_dirty_all = true;
             label
         };
         self.checkpoint_wal_snapshot_active();
         self.push_toast(format!("Redo: {label}"), false);
         Ok(label)
+    }
+
+    /// Builds an immutable [`ToolSettingsSnapshot`] + active lens config for `ToolCore`.
+    #[must_use]
+    pub fn current_tool_snapshot(&self) -> (ToolSettingsSnapshot, LensConfig) {
+        (
+            self.tool_settings
+                .to_snapshot(&self.properties_state, &self.effects_state),
+            self.lens_state.build_config(),
+        )
+    }
+
+    /// Dispatches a pointer-down event to the active tab's [`ToolCore`] and applies its output.
+    pub fn run_tool_pointer_down(&mut self, event: &PointerEvent) {
+        let creation_layer_id = self.ensure_active_creation_layer().flatten();
+        let (settings, default_lens) = self.current_tool_snapshot();
+        let treat_all = self.treat_all_objects_as_filled;
+        let default_fill = self.default_fill.clone();
+        let default_outline = self.default_outline.clone();
+        let default_text_style = self.default_text_style.clone();
+        let active_tool = self.active_tool;
+
+        let out = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return;
+            };
+            if tab.tool_core.active_tool() != active_tool {
+                tab.tool_core.set_active_tool(active_tool);
+            }
+            tab.cursor_world_mm = event.world_pt_mm;
+            // Keep ToolCore's mirror of pending crop/raster/guide/mesh state synced if modified from toolbar.
+            tab.tool_core.pending_crop_rect = tab.pending_crop_rect;
+            tab.tool_core.raster_mask_rect_mm = tab.raster_mask_rect_mm;
+            tab.tool_core.selected_guide_id = tab.selected_guide_id;
+            tab.tool_core.selected_mesh_node = tab.selected_mesh_node;
+            let mut tool_core = std::mem::replace(&mut tab.tool_core, ToolCore::new(active_tool));
+            let ctx = ToolReadContext {
+                document: &tab.document,
+                selection: &tab.selection,
+                snap_engine: &SnapEngine,
+                viewport: &tab.viewport,
+                snap_options: &tab.snap_options,
+                active_layer_id: tab.active_layer_id,
+                creation_layer_id,
+                powerclip_edit_id: tab.powerclip_edit_id,
+                treat_all_objects_as_filled: treat_all,
+                default_fill: &default_fill,
+                default_outline: &default_outline,
+                default_text_style: &default_text_style,
+                default_lens: &default_lens,
+                settings: &settings,
+            };
+            let out = tool_core.on_pointer_down(&ctx, event);
+            tab.tool_core = tool_core;
+            out
+        };
+        self.apply_tool_output(out);
+    }
+
+    /// Dispatches a pointer-move/drag event to the active tab's [`ToolCore`] and applies its output.
+    pub fn run_tool_pointer_move(&mut self, event: &PointerEvent) {
+        let creation_layer_id = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.active_layer_id);
+        let (settings, default_lens) = self.current_tool_snapshot();
+        let treat_all = self.treat_all_objects_as_filled;
+        let default_fill = self.default_fill.clone();
+        let default_outline = self.default_outline.clone();
+        let default_text_style = self.default_text_style.clone();
+        let active_tool = self.active_tool;
+
+        let out = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return;
+            };
+            if tab.tool_core.active_tool() != active_tool {
+                tab.tool_core.set_active_tool(active_tool);
+            }
+            tab.cursor_world_mm = event.world_pt_mm;
+            tab.tool_core.pending_crop_rect = tab.pending_crop_rect;
+            tab.tool_core.raster_mask_rect_mm = tab.raster_mask_rect_mm;
+            tab.tool_core.selected_guide_id = tab.selected_guide_id;
+            tab.tool_core.selected_mesh_node = tab.selected_mesh_node;
+            let mut tool_core = std::mem::replace(&mut tab.tool_core, ToolCore::new(active_tool));
+            let ctx = ToolReadContext {
+                document: &tab.document,
+                selection: &tab.selection,
+                snap_engine: &SnapEngine,
+                viewport: &tab.viewport,
+                snap_options: &tab.snap_options,
+                active_layer_id: tab.active_layer_id,
+                creation_layer_id,
+                powerclip_edit_id: tab.powerclip_edit_id,
+                treat_all_objects_as_filled: treat_all,
+                default_fill: &default_fill,
+                default_outline: &default_outline,
+                default_text_style: &default_text_style,
+                default_lens: &default_lens,
+                settings: &settings,
+            };
+            let out = tool_core.on_pointer_move(&ctx, event);
+            tab.tool_core = tool_core;
+            out
+        };
+        self.apply_tool_output(out);
+    }
+
+    /// Dispatches a pointer-up event to the active tab's [`ToolCore`] and applies its output.
+    pub fn run_tool_pointer_up(&mut self, event: &PointerEvent) {
+        let creation_layer_id = self.ensure_active_creation_layer().flatten();
+        let (settings, default_lens) = self.current_tool_snapshot();
+        let treat_all = self.treat_all_objects_as_filled;
+        let default_fill = self.default_fill.clone();
+        let default_outline = self.default_outline.clone();
+        let default_text_style = self.default_text_style.clone();
+        let active_tool = self.active_tool;
+
+        let out = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return;
+            };
+            if tab.tool_core.active_tool() != active_tool {
+                tab.tool_core.set_active_tool(active_tool);
+            }
+            tab.cursor_world_mm = event.world_pt_mm;
+            tab.tool_core.pending_crop_rect = tab.pending_crop_rect;
+            tab.tool_core.raster_mask_rect_mm = tab.raster_mask_rect_mm;
+            tab.tool_core.selected_guide_id = tab.selected_guide_id;
+            tab.tool_core.selected_mesh_node = tab.selected_mesh_node;
+            let mut tool_core = std::mem::replace(&mut tab.tool_core, ToolCore::new(active_tool));
+            let ctx = ToolReadContext {
+                document: &tab.document,
+                selection: &tab.selection,
+                snap_engine: &SnapEngine,
+                viewport: &tab.viewport,
+                snap_options: &tab.snap_options,
+                active_layer_id: tab.active_layer_id,
+                creation_layer_id,
+                powerclip_edit_id: tab.powerclip_edit_id,
+                treat_all_objects_as_filled: treat_all,
+                default_fill: &default_fill,
+                default_outline: &default_outline,
+                default_text_style: &default_text_style,
+                default_lens: &default_lens,
+                settings: &settings,
+            };
+            let out = tool_core.on_pointer_up(&ctx, event);
+            tab.tool_core = tool_core;
+            out
+        };
+        self.apply_tool_output(out);
+    }
+
+    /// Dispatches a keyboard event to the active tab's [`ToolCore`] and applies its output.
+    pub fn run_tool_key_event(&mut self, event: &KeyEvent) {
+        let creation_layer_id = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.active_layer_id);
+        let (settings, default_lens) = self.current_tool_snapshot();
+        let treat_all = self.treat_all_objects_as_filled;
+        let default_fill = self.default_fill.clone();
+        let default_outline = self.default_outline.clone();
+        let default_text_style = self.default_text_style.clone();
+        let active_tool = self.active_tool;
+
+        let out = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return;
+            };
+            if tab.tool_core.active_tool() != active_tool {
+                tab.tool_core.set_active_tool(active_tool);
+            }
+            tab.tool_core.pending_crop_rect = tab.pending_crop_rect;
+            tab.tool_core.raster_mask_rect_mm = tab.raster_mask_rect_mm;
+            tab.tool_core.selected_guide_id = tab.selected_guide_id;
+            tab.tool_core.selected_mesh_node = tab.selected_mesh_node;
+            let mut tool_core = std::mem::replace(&mut tab.tool_core, ToolCore::new(active_tool));
+            let ctx = ToolReadContext {
+                document: &tab.document,
+                selection: &tab.selection,
+                snap_engine: &SnapEngine,
+                viewport: &tab.viewport,
+                snap_options: &tab.snap_options,
+                active_layer_id: tab.active_layer_id,
+                creation_layer_id,
+                powerclip_edit_id: tab.powerclip_edit_id,
+                treat_all_objects_as_filled: treat_all,
+                default_fill: &default_fill,
+                default_outline: &default_outline,
+                default_text_style: &default_text_style,
+                default_lens: &default_lens,
+                settings: &settings,
+            };
+            let out = tool_core.on_key(&ctx, event);
+            tab.tool_core = tool_core;
+            out
+        };
+        self.apply_tool_output(out);
+    }
+
+    /// Applies a [`ToolOutput`] returned by [`ToolCore`] to the active tab and studio shell.
+    pub fn apply_tool_output(&mut self, output: ToolOutput) {
+        match output {
+            ToolOutput::Continue { overlay } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.active_guides = overlay.active_guides.clone();
+                    tab.transient_overlay = overlay;
+                    tab.viewport.lod_dragging = tab.tool_core.is_transform_dragging();
+                }
+            }
+            ToolOutput::Cancel => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.transient_overlay = TransientOverlay::default();
+                    tab.active_guides.clear();
+                    tab.viewport.lod_dragging = false;
+                    tab.pending_crop_rect = tab.tool_core.pending_crop_rect;
+                    tab.raster_mask_rect_mm = tab.tool_core.raster_mask_rect_mm;
+                }
+            }
+            ToolOutput::Commit {
+                mut ops,
+                clear_overlay,
+                post_actions,
+            } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewport.lod_dragging = false;
+                    if clear_overlay {
+                        tab.transient_overlay = TransientOverlay::default();
+                        tab.active_guides.clear();
+                    }
+                    tab.pending_crop_rect = tab.tool_core.pending_crop_rect;
+                    tab.raster_mask_rect_mm = tab.tool_core.raster_mask_rect_mm;
+                    tab.selected_guide_id = tab.tool_core.selected_guide_id;
+                    tab.selected_mesh_node = tab.tool_core.selected_mesh_node;
+                }
+                if !ops.is_empty() {
+                    let has_create = ops
+                        .iter()
+                        .any(|op| matches!(op, CommandOp::CreateObject { .. }));
+                    let has_explicit_select = post_actions
+                        .iter()
+                        .any(|a| matches!(a, ToolActionRequest::SelectObjects { .. }));
+                    let cmd = if ops.len() == 1 {
+                        ops.remove(0)
+                    } else {
+                        CommandOp::Batch(ops)
+                    };
+                    if let Err(err) = self.execute_command(cmd) {
+                        self.push_toast(err, true);
+                        return;
+                    }
+                    if has_create && !has_explicit_select {
+                        if let Some(tab) = self.active_tab_mut() {
+                            if let Some(created_id) = tab.document.objects().keys().last().copied()
+                            {
+                                tab.selection.select_single(&tab.document, created_id);
+                                tab.metrics_dirty = true;
+                            }
+                        }
+                    }
+                }
+                for act in post_actions {
+                    self.handle_tool_action(act);
+                }
+            }
+            ToolOutput::Consumed { overlay, actions } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewport.lod_dragging = tab.tool_core.is_transform_dragging();
+                    if let Some(ov) = overlay {
+                        tab.active_guides = ov.active_guides.clone();
+                        tab.transient_overlay = ov;
+                    }
+                    tab.pending_crop_rect = tab.tool_core.pending_crop_rect;
+                    tab.raster_mask_rect_mm = tab.tool_core.raster_mask_rect_mm;
+                    tab.selected_guide_id = tab.tool_core.selected_guide_id;
+                    tab.selected_mesh_node = tab.tool_core.selected_mesh_node;
+                }
+                for act in actions {
+                    self.handle_tool_action(act);
+                }
+            }
+        }
+    }
+
+    /// Executes a single host-delegated [`ToolActionRequest`] emitted by [`ToolCore`].
+    pub fn handle_tool_action(&mut self, action: ToolActionRequest) {
+        match action {
+            ToolActionRequest::SelectObjects {
+                ids,
+                additive,
+                toggle,
+            } => {
+                let active_tool = self.active_tool;
+                if let Some(tab) = self.active_tab_mut() {
+                    if ids.is_empty() {
+                        if !additive && !toggle {
+                            tab.selection.clear();
+                        }
+                    } else if additive {
+                        for id in ids {
+                            if !tab.selection.contains(id) {
+                                tab.selection.toggle_object(&tab.document, id);
+                            }
+                        }
+                    } else if toggle {
+                        for id in ids {
+                            tab.selection.click_object(&tab.document, id, true);
+                        }
+                    } else if ids.len() == 1 {
+                        if active_tool == ToolId::Pick {
+                            tab.selection.click_object(&tab.document, ids[0], false);
+                        } else {
+                            tab.selection.select_single(&tab.document, ids[0]);
+                        }
+                    } else {
+                        tab.selection.select_many(&tab.document, &ids);
+                    }
+                    tab.metrics_dirty = true;
+                    tab.last_duplicate_batch = None;
+                }
+            }
+            ToolActionRequest::ClearSelection => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.clear();
+                    tab.metrics_dirty = true;
+                    tab.last_duplicate_batch = None;
+                }
+            }
+            ToolActionRequest::ToggleTransformMode => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.toggle_transform_mode();
+                    tab.metrics_dirty = true;
+                }
+            }
+            ToolActionRequest::SelectNodes { nodes, additive } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if !additive {
+                        tab.selection.node_selection.clear();
+                    }
+                    for n in nodes {
+                        if additive {
+                            tab.selection.node_selection.toggle(n);
+                        } else if !tab.selection.node_selection.contains(n) {
+                            tab.selection.node_selection.nodes.push(n);
+                        }
+                    }
+                }
+            }
+            ToolActionRequest::ClearNodeSelection => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.node_selection.clear();
+                }
+            }
+            ToolActionRequest::SetPivot { pivot_mm } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.set_pivot(pivot_mm);
+                }
+            }
+            ToolActionRequest::PanTo {
+                pan_mm,
+                lod_dragging,
+            } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewport.pan_mm = pan_mm;
+                    tab.viewport.lod_dragging = lod_dragging;
+                    tab.needs_rerender = true;
+                }
+            }
+            ToolActionRequest::ZoomFitRect {
+                rect_mm,
+                margin_px,
+                one_shot_complete,
+            } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewport.fit_rect(rect_mm, margin_px);
+                    tab.needs_rerender = true;
+                }
+                if one_shot_complete {
+                    self.complete_one_shot_zoom_if_active();
+                }
+            }
+            ToolActionRequest::ZoomAtScreen {
+                screen_px,
+                factor,
+                one_shot_complete,
+            } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewport.zoom_at_screen_point(screen_px, factor);
+                    tab.needs_rerender = true;
+                }
+                if one_shot_complete {
+                    self.complete_one_shot_zoom_if_active();
+                }
+            }
+            ToolActionRequest::SetPendingCropRect(rect) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.pending_crop_rect = rect;
+                    tab.tool_core.pending_crop_rect = rect;
+                }
+            }
+            ToolActionRequest::ApplyCropRect(rect) => {
+                self.apply_crop_rect(rect);
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.pending_crop_rect = None;
+                    tab.tool_core.pending_crop_rect = None;
+                    tab.transient_overlay = TransientOverlay::default();
+                }
+            }
+            ToolActionRequest::SetRasterMaskRect(rect) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.raster_mask_rect_mm = rect;
+                    tab.tool_core.raster_mask_rect_mm = rect;
+                }
+            }
+            ToolActionRequest::SetSelectedGuide(gid) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected_guide_id = gid;
+                    tab.tool_core.selected_guide_id = gid;
+                }
+            }
+            ToolActionRequest::SetSelectedMeshNode(node) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected_mesh_node = node;
+                    tab.tool_core.selected_mesh_node = node;
+                }
+            }
+            ToolActionRequest::EnterPowerClipEdit(oid) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.powerclip_edit_id = Some(oid);
+                }
+            }
+            ToolActionRequest::ExitPowerClipEdit => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.powerclip_edit_id = None;
+                }
+            }
+            ToolActionRequest::OpenInlineTextEdit {
+                object_id,
+                world_pos_mm,
+                is_paragraph,
+                box_size_mm,
+            } => {
+                self.begin_inline_text_edit(object_id, world_pos_mm, is_paragraph, box_size_mm);
+            }
+            ToolActionRequest::CommitInlineTextEdit => {
+                let _ = self.commit_inline_text_edit();
+            }
+            ToolActionRequest::SmartFillAt { pt_mm } => {
+                if let Some(lid) = self.ensure_active_creation_layer() {
+                    let created = self.active_tab().and_then(|tab| {
+                        create_smart_fill_object(
+                            &tab.document,
+                            tab.document.active_page_index(),
+                            pt_mm,
+                            self.default_fill.clone(),
+                            self.default_outline.clone(),
+                        )
+                    });
+                    if let Some(obj) = created {
+                        match self.execute_command(CommandOp::create_object(obj, lid)) {
+                            Ok(()) => {
+                                if let Some(tab) = self.active_tab_mut() {
+                                    if let Some(new_id) =
+                                        tab.document.objects().keys().last().copied()
+                                    {
+                                        tab.selection.select_single(&tab.document, new_id);
+                                        tab.metrics_dirty = true;
+                                    }
+                                }
+                                self.push_toast("Created Smart Fill region", false);
+                            }
+                            Err(e) => self.push_toast(e, true),
+                        }
+                    } else {
+                        self.push_toast("Click inside an enclosed boundary for Smart Fill", false);
+                    }
+                }
+            }
+            ToolActionRequest::ApplyEyedropper {
+                pt_mm,
+                attributes_mode,
+                force_sample,
+            } => {
+                self.eyedropper_click(pt_mm, attributes_mode, force_sample);
+            }
+            ToolActionRequest::ApplyRasterStroke { tool, points_mm } => {
+                let _ = self.apply_raster_tool_stroke(tool, &points_mm);
+            }
+            ToolActionRequest::SetCloneSource(pt) => {
+                self.tool_settings.clone_source_mm = Some(pt);
+                self.push_toast(
+                    format!("Set sample source at ({:.1}, {:.1}) mm", pt.x, pt.y),
+                    false,
+                );
+            }
+            ToolActionRequest::StampDuplicateDuringDrag { live_world_affine } => {
+                let _ = self.stamp_duplicate_with_affine(live_world_affine);
+            }
+            ToolActionRequest::ApplyLensToObject { object_id } => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.select_single(&tab.document, object_id);
+                }
+                let cfg = self.lens_state.build_config();
+                self.apply_lens_to_selection(Some(cfg));
+            }
+            ToolActionRequest::EnsureEnvelopeOnObject { object_id } => {
+                let _ = self.ensure_envelope_on_object(object_id);
+            }
+            ToolActionRequest::MeshFillInteract {
+                start_mm,
+                end_mm,
+                shift_recolor,
+            } => {
+                let recolor = if shift_recolor {
+                    self.default_fill.referenced_colors().into_iter().next()
+                } else {
+                    None
+                };
+                self.mesh_fill_interact(start_mm, end_mm, recolor);
+            }
+            ToolActionRequest::Toast { message, is_error } => {
+                self.push_toast(message, is_error);
+            }
+        }
+    }
+}
+
+fn command_op_touches_structure(op: &CommandOp) -> bool {
+    match op {
+        CommandOp::TransformObjects { .. }
+        | CommandOp::EditPath { .. }
+        | CommandOp::EditShape { .. }
+        | CommandOp::EditText { .. }
+        | CommandOp::EditTable { .. }
+        | CommandOp::EditDimension { .. }
+        | CommandOp::SetOpacity { .. }
+        | CommandOp::SetBlendMode { .. }
+        | CommandOp::SetLens { .. }
+        | CommandOp::AddEffect { .. }
+        | CommandOp::RemoveEffect { .. }
+        | CommandOp::SetObjectVisibility { .. }
+        | CommandOp::SetObjectLocked { .. }
+        | CommandOp::SetObjectPrintable { .. }
+        | CommandOp::RenameObject { .. }
+        | CommandOp::UpdateRaster { .. } => false,
+        CommandOp::Batch(ops) => ops.iter().any(command_op_touches_structure),
+        _ => true,
     }
 }
