@@ -1782,3 +1782,2105 @@ fn w2b_r5_pdf_cutcontour_artistic_media_under_inner_shadow() {
         assert_gs_cutcontour_tiffsep(&pdf_bytes, &format!("artistic_media_{scale_with_object}"));
     }
 }
+
+#[test]
+fn w2_exit_r2_group_and_symbol_instance_export_effects_cutcontour_and_perspective() {
+    use coree_core::{
+        apply_command, Affine2D, BevelStyle, CommandOp, Effect, ExtrudeLight, FeatherDirection,
+        Perspective3x3, SymbolDef,
+    };
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(10.0, 10.0, 30.0, 30.0),
+        &[
+            Point2D::new(16.0, 12.0),
+            Point2D::new(38.0, 15.0),
+            Point2D::new(35.0, 42.0),
+            Point2D::new(12.0, 39.0),
+        ],
+    )
+    .expect("valid perspective quad");
+
+    for is_symbol in [false, true] {
+        let kind = if is_symbol { "SymbolInstance" } else { "Group" };
+        let build_doc = |eff: Option<Effect>, p: Option<Perspective3x3>| {
+            let mut doc = Document::new("ContainerExport", 120.0, 120.0, ColorMode::Cmyk, 300.0);
+            let child = SceneObject::new(
+                ObjectId(0),
+                "ChildBox",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 30.0,
+                    height: 30.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_transform(Affine2D::translate(10.0, 10.0))
+            .with_fill(Fill::Solid(Color::rgba8(50, 140, 220, 255)))
+            .with_outline(OutlineStyle {
+                color: Color::cut_contour_spot(),
+                width_mm: 0.8,
+                scale_with_object: true,
+                ..OutlineStyle::default()
+            });
+
+            let target_id = if is_symbol {
+                let sym = SymbolDef::new("CutSym", vec![child]);
+                let sid = sym.id;
+                doc.insert_symbol(sym);
+                doc.add_object(
+                    SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid)),
+                    None,
+                )
+                .unwrap()
+            } else {
+                let cid = doc.add_object(child, None).unwrap();
+                doc.group_objects(&[cid], "CutGrp").unwrap()
+            };
+            if let Some(e) = eff {
+                apply_command(
+                    &mut doc,
+                    &CommandOp::AddEffect {
+                        id: target_id,
+                        effect: e,
+                    },
+                )
+                .unwrap();
+            }
+            if p.is_some() {
+                apply_command(
+                    &mut doc,
+                    &CommandOp::SetObjectPerspective {
+                        ids: vec![target_id],
+                        perspective: p,
+                    },
+                )
+                .unwrap();
+            }
+            doc
+        };
+
+        // 1. Raster-effect containers (InnerShadow, Bevel, Extrude3D) -> PDF (/DynIm + /Separation /CutContour), SVG (<image>), EPS (image)
+        for (fx_name, eff) in [
+            (
+                "InnerShadow",
+                Effect::InnerShadow {
+                    dx_mm: 2.0,
+                    dy_mm: 2.0,
+                    blur_mm: 2.0,
+                    opacity: 0.8,
+                    color: Color::BLACK,
+                    feather_direction: FeatherDirection::Inside,
+                },
+            ),
+            (
+                "Bevel",
+                Effect::Bevel {
+                    style: BevelStyle::SoftEdge,
+                    distance_mm: 2.5,
+                    softness_mm: 0.6,
+                    light_angle_deg: 135.0,
+                    altitude_deg: 45.0,
+                    highlight_color: Color::WHITE,
+                    shadow_color: Color::BLACK,
+                    intensity: 0.85,
+                },
+            ),
+            (
+                "Extrude3D",
+                Effect::Extrude3D {
+                    vanishing_point: Point2D::new(70.0, 10.0),
+                    depth: 10.0,
+                    bevel_depth: 0.8,
+                    shade_color: Color::rgba8(20, 25, 50, 255),
+                    rotation_3d: [15.0, -20.0, 0.0],
+                    lights: vec![ExtrudeLight {
+                        dir: [0.4, -0.6, 0.7],
+                        intensity: 1.0,
+                    }],
+                },
+            ),
+        ] {
+            let doc = build_doc(Some(eff), None);
+            let pdf_opts = PdfExportOptions {
+                color_space: PdfColorSpace::DeviceCmyk,
+                compress_streams: false,
+                ..PdfExportOptions::default()
+            };
+            let pdf_bytes = export_pdf_to_bytes(&doc, &pdf_opts).expect("PDF export");
+            let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+            assert!(
+                pdf_text.contains("/DynIm1 Do"),
+                "{kind} + {fx_name} PDF must emit raster composite /DynIm1 Do"
+            );
+            assert!(
+                pdf_text.contains("/Separation /CutContour /DeviceCMYK")
+                    && pdf_text.contains("/Sep1 CS 1.0000 SCN"),
+                "{kind} + {fx_name} PDF must preserve vector CutContour spot overlay"
+            );
+            assert_gs_cutcontour_tiffsep(&pdf_bytes, &format!("{kind}_{fx_name}"));
+
+            let svg_str = export_svg_to_string(&doc, 0).expect("SVG export");
+            assert!(
+                svg_str.contains("<image ") && svg_str.contains("data:image/png;base64,"),
+                "{kind} + {fx_name} SVG must emit raster composite <image>: {svg_str}"
+            );
+
+            let eps_str = export_eps_to_string(&doc, 0).expect("EPS export");
+            assert!(
+                eps_str.contains(">> image"),
+                "{kind} + {fx_name} EPS must emit raster composite image"
+            );
+        }
+
+        // 2. Non-raster Perspective3x3 on Group / SymbolInstance -> PDF/SVG/EPS vector warp
+        let doc_plain = build_doc(None, None);
+        let doc_persp = build_doc(None, Some(persp));
+
+        let pdf_opts = PdfExportOptions {
+            color_space: PdfColorSpace::DeviceCmyk,
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        };
+        let pdf_plain =
+            String::from_utf8_lossy(&export_pdf_to_bytes(&doc_plain, &pdf_opts).unwrap())
+                .into_owned();
+        let pdf_persp =
+            String::from_utf8_lossy(&export_pdf_to_bytes(&doc_persp, &pdf_opts).unwrap())
+                .into_owned();
+        assert_ne!(pdf_plain, pdf_persp, "{kind} Perspective3x3 must alter PDF");
+        let pt = 72.0 / 25.4;
+        let bleed = 3.0;
+        let px16 = format!("{:.4}", (16.0 + bleed) * pt);
+        let py12 = format!("{:.4}", (120.0 + bleed - 12.0) * pt);
+        assert!(
+            pdf_persp.contains(&format!("{px16} {py12}")),
+            "{kind} Perspective3x3 PDF must emit warped corner ({px16} {py12})"
+        );
+
+        let svg_plain = export_svg_to_string(&doc_plain, 0).unwrap();
+        let svg_persp = export_svg_to_string(&doc_persp, 0).unwrap();
+        assert_ne!(svg_plain, svg_persp, "{kind} Perspective3x3 must alter SVG");
+        assert!(
+            svg_persp.contains("16.0000 12.0000")
+                && svg_persp.contains("38.0000 15.0000")
+                && svg_persp.contains("35.0000 42.0000")
+                && svg_persp.contains("12.0000 39.0000"),
+            "{kind} Perspective3x3 SVG must emit warped corners: {svg_persp}"
+        );
+
+        let eps_plain = export_eps_to_string(&doc_plain, 0).unwrap();
+        let eps_persp = export_eps_to_string(&doc_persp, 0).unwrap();
+        assert_ne!(eps_plain, eps_persp, "{kind} Perspective3x3 must alter EPS");
+    }
+}
+
+#[test]
+fn w2_exit_r3_svg_powerclip_and_nested_group_perspective_ctm_and_dimension_label() {
+    use coree_core::{apply_command, Affine2D, CommandOp, Perspective3x3};
+    use coree_io::export_svg_to_string;
+
+    // 1. Translated PowerClip with Perspective3x3 in SVG: clipPath, fill, stroke, and contents must all align.
+    let mut doc = Document::new("SvgPowerClipPersp", 160.0, 160.0, ColorMode::Rgb, 300.0);
+    let inner = SceneObject::new(
+        ObjectId(0),
+        "ClippedRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            52.0, 42.0, 20.0, 20.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN));
+    let inner_id = doc.add_object(inner, None).unwrap();
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 24.0, 24.0),
+        &[
+            Point2D::new(2.0, 1.0),
+            Point2D::new(23.0, 3.0),
+            Point2D::new(21.0, 24.0),
+            Point2D::new(0.0, 22.0),
+        ],
+    )
+    .unwrap();
+    let pc = SceneObject::new(
+        ObjectId(0),
+        "PerspClip",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 24.0, 24.0,
+        ))),
+    )
+    .with_transform(Affine2D::translate(50.0, 40.0))
+    .with_fill(Fill::Solid(Color::YELLOW))
+    .with_outline(OutlineStyle::solid(Color::BLACK, 0.5));
+    let pc_id = doc.add_object(pc, None).unwrap();
+    apply_command(
+        &mut doc,
+        &CommandOp::CreatePowerClip {
+            container_id: pc_id,
+            content_ids: vec![inner_id],
+        },
+    )
+    .unwrap();
+    apply_command(
+        &mut doc,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![pc_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+
+    let svg = export_svg_to_string(&doc, 0).expect("SVG export");
+    // Expected translated+warped container corners: (52,41), (73,43), (71,64), (50,62)
+    let clip_line = svg
+        .lines()
+        .find(|l| l.contains("<clipPath id=\"clip-1\">"))
+        .expect("PowerClip clipPath");
+    for corner in [
+        "52.0000 41.0000",
+        "73.0000 43.0000",
+        "71.0000 64.0000",
+        "50.0000 62.0000",
+    ] {
+        assert!(
+            clip_line.contains(corner),
+            "Translated PowerClip + Perspective3x3 clipPath missing corner {corner}: {clip_line}"
+        );
+    }
+    let fill_line = svg
+        .lines()
+        .find(|l| l.contains("fill=\"#ffff00\" stroke=\"none\""))
+        .expect("PowerClip fill path");
+    for corner in [
+        "52.0000 41.0000",
+        "73.0000 43.0000",
+        "71.0000 64.0000",
+        "50.0000 62.0000",
+    ] {
+        assert!(
+            fill_line.contains(corner),
+            "Translated PowerClip + Perspective3x3 fill missing corner {corner}: {fill_line}"
+        );
+    }
+    let stroke_line = svg
+        .lines()
+        .find(|l| l.contains("fill=\"none\" stroke=\"#000000\""))
+        .expect("PowerClip stroke path");
+    for corner in [
+        "52.0000 41.0000",
+        "73.0000 43.0000",
+        "71.0000 64.0000",
+        "50.0000 62.0000",
+    ] {
+        assert!(
+            stroke_line.contains(corner),
+            "Translated PowerClip + Perspective3x3 stroke missing corner {corner}: {stroke_line}"
+        );
+    }
+    assert!(
+        svg.contains("53.5833 42.9167") && !svg.contains("M 2.0000 1.0000"),
+        "PowerClip contents and container must both be translated away from origin: {svg}"
+    );
+
+    // 2. Nested OuterGroup(translate(50,30)) -> InnerGroup(translate(10,10), Perspective3x3) + Dimension child
+    let mut doc2 = Document::new("NestedSvgPersp", 200.0, 200.0, ColorMode::Rgb, 300.0);
+    let leaf = SceneObject::new(
+        ObjectId(0),
+        "LeafRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 24.0, 24.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::MAGENTA));
+    let leaf_id = doc2.add_object(leaf, None).unwrap();
+
+    let dim_obj = SceneObject::new(
+        ObjectId(0),
+        "DimInsidePersp",
+        NodePayload::Dimension(DimensionObject::linear(
+            DimensionKind::Horizontal,
+            Point2D::new(2.0, 12.0),
+            Point2D::new(22.0, 12.0),
+            4.0,
+        )),
+    )
+    .with_outline(OutlineStyle::solid(Color::BLACK, 0.3));
+    let dim_id = doc2.add_object(dim_obj, None).unwrap();
+
+    let inner_grp_id = doc2
+        .group_objects(&[leaf_id, dim_id], "InnerPerspGrp")
+        .unwrap();
+    apply_command(
+        &mut doc2,
+        &CommandOp::TransformObjects {
+            ids: vec![inner_grp_id],
+            affine: Affine2D::translate(10.0, 10.0),
+        },
+    )
+    .unwrap();
+    apply_command(
+        &mut doc2,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![inner_grp_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+    let outer_grp_id = doc2.group_objects(&[inner_grp_id], "OuterGrp").unwrap();
+    apply_command(
+        &mut doc2,
+        &CommandOp::TransformObjects {
+            ids: vec![outer_grp_id],
+            affine: Affine2D::translate(50.0, 30.0),
+        },
+    )
+    .unwrap();
+
+    let svg2 = export_svg_to_string(&doc2, 0).expect("SVG export");
+    // OuterGroup emits transform="matrix(1 0 0 1 50.0000 30.0000)"; InnerGroup's leaf must be at T_inner + warped = (12, 11), NOT (62, 41)!
+    assert!(
+        svg2.contains("matrix(1.000000 0.000000 0.000000 1.000000 50.0000 30.0000)"),
+        "OuterGroup must emit SVG transform matrix(1 0 0 1 50 30): {svg2}"
+    );
+    let leaf_line = svg2
+        .lines()
+        .find(|l| l.contains(&format!("id=\"obj-{}\"", leaf_id.0)))
+        .expect("InnerGroup leaf path");
+    for corner in [
+        "12.0000 11.0000",
+        "33.0000 13.0000",
+        "31.0000 34.0000",
+        "10.0000 32.0000",
+    ] {
+        assert!(
+            leaf_line.contains(corner),
+            "InnerGroup path inside OuterGroup missing {corner} (must NOT double-apply OuterGroup's (50,30) transform): {leaf_line}"
+        );
+    }
+    assert!(
+        !svg2.contains("62.0000 41.0000"),
+        "Double-applied OuterGroup transform (62,41) must not appear inside <g transform=\"... 50 30\">: {svg2}"
+    );
+    // Dimension inside parent_persp must emit both its dimension line <path> AND outlined label glyph <path>s
+    let dim_tag = format!("<g id=\"obj-{}\">", dim_id.0);
+    let dim_start = svg2.find(&dim_tag).expect("Dimension group in SVG");
+    let dim_end = svg2[dim_start..].find("</g>").unwrap() + dim_start;
+    let dim_slice = &svg2[dim_start..dim_end];
+    let path_count = dim_slice.matches("<path ").count();
+    assert!(
+        path_count >= 2,
+        "Dimension under parent_persp in SVG must emit both line and outlined label paths (found {path_count}): {dim_slice}"
+    );
+}
+
+#[test]
+fn w2_exit_r3_text_on_path_and_connector_inside_translated_perspective_group() {
+    use coree_core::{apply_command, Affine2D, CommandOp, Perspective3x3};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 50.0, 50.0),
+        &[
+            Point2D::new(4.0, 2.0),
+            Point2D::new(48.0, 5.0),
+            Point2D::new(45.0, 47.0),
+            Point2D::new(2.0, 44.0),
+        ],
+    )
+    .unwrap();
+
+    // 1. TextOnPath inside translated Group(40, 35) with Perspective3x3 across PDF / SVG / EPS
+    let mut doc_top = Document::new("TopPersp", 160.0, 160.0, ColorMode::Rgb, 300.0);
+    let host = SceneObject::new(
+        ObjectId(0),
+        "HostLine",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(5.0, 20.0),
+            Point2D::new(45.0, 20.0),
+        )),
+    )
+    .with_outline(OutlineStyle::solid(Color::BLACK, 0.3));
+    let host_id = doc_top.add_object(host, None).unwrap();
+
+    let top_obj = SceneObject::new(
+        ObjectId(0),
+        "TopObj",
+        NodePayload::TextOnPath(coree_core::TextOnPath {
+            path_id: host_id,
+            text: ArtisticText::from_plain(
+                "AB",
+                TextStyle {
+                    font_size_pt: 18.0,
+                    fill: Color::rgba8(200, 20, 20, 255),
+                    ..TextStyle::default()
+                },
+            ),
+            distance_mm: 0.0,
+            offset_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    );
+    let top_id = doc_top.add_object(top_obj, None).unwrap();
+    let grp_id = doc_top.group_objects(&[host_id, top_id], "TopGrp").unwrap();
+    apply_command(
+        &mut doc_top,
+        &CommandOp::TransformObjects {
+            ids: vec![grp_id],
+            affine: Affine2D::translate(40.0, 35.0),
+        },
+    )
+    .unwrap();
+    apply_command(
+        &mut doc_top,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![grp_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+
+    // SVG: glyph paths must stay inside translated+warped group bbox [38..92, 33..85]
+    let svg_top = export_svg_to_string(&doc_top, 0).expect("SVG TextOnPath");
+    let top_marker = format!("id=\"obj-{}-g0\"", top_id.0);
+    assert!(
+        svg_top.contains(&top_marker),
+        "SVG must outline TextOnPath under Perspective3x3: {svg_top}"
+    );
+    for line in svg_top
+        .lines()
+        .filter(|l| l.contains(&format!("id=\"obj-{}-g", top_id.0)))
+    {
+        let d_start = line.find(" d=\"").unwrap() + 4;
+        let d_end = line[d_start..].find('"').unwrap() + d_start;
+        let nums: Vec<f64> = line[d_start..d_end]
+            .split_whitespace()
+            .filter_map(|tok| tok.parse::<f64>().ok())
+            .collect();
+        assert!(!nums.is_empty(), "glyph path must have coords: {line}");
+        for pair in nums.as_chunks::<2>().0 {
+            assert!(
+                (38.0..=92.0).contains(&pair[0]) && (33.0..=85.0).contains(&pair[1]),
+                "SVG TextOnPath glyph coord ({:.2}, {:.2}) out of expected group range [38..92, 33..85] (double parent_xf?): {line}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    // PDF & EPS: verify TextOnPath doesn't double-apply (40, 35)
+    let pdf_opts = PdfExportOptions {
+        color_space: PdfColorSpace::DeviceRgb,
+        compress_streams: false,
+        ..PdfExportOptions::default()
+    };
+    let pdf_top =
+        String::from_utf8_lossy(&export_pdf_to_bytes(&doc_top, &pdf_opts).unwrap()).into_owned();
+    let pt_per_mm = 72.0 / 25.4;
+    let bleed_mm = 3.0;
+    let mut pdf_checked_pts = 0usize;
+    for line in pdf_top.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() >= 3 && matches!(toks.last().copied(), Some("m" | "l")) {
+            if let (Ok(x_pt), Ok(y_pt)) = (toks[0].parse::<f64>(), toks[1].parse::<f64>()) {
+                let x_mm = x_pt / pt_per_mm - bleed_mm;
+                let y_mm = 160.0 + bleed_mm - y_pt / pt_per_mm;
+                if x_mm > 10.0 && y_mm > 10.0 {
+                    assert!(
+                        (38.0..=92.0).contains(&x_mm) && (33.0..=85.0).contains(&y_mm),
+                        "PDF TextOnPath/Host coord ({x_mm:.2}, {y_mm:.2}) out of expected group range [38..92, 33..85]: {line}"
+                    );
+                    pdf_checked_pts += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        pdf_checked_pts >= 4,
+        "expected PDF path coords for TextOnPath"
+    );
+
+    let eps_top = export_eps_to_string(&doc_top, 0).unwrap();
+    let mut eps_checked_pts = 0usize;
+    for line in eps_top.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() == 3 && matches!(toks[2], "moveto" | "lineto") {
+            if let (Ok(x_pt), Ok(y_pt)) = (toks[0].parse::<f64>(), toks[1].parse::<f64>()) {
+                let x_mm = x_pt / pt_per_mm;
+                let y_mm = 160.0 - y_pt / pt_per_mm;
+                assert!(
+                    (38.0..=92.0).contains(&x_mm) && (33.0..=85.0).contains(&y_mm),
+                    "EPS TextOnPath/Host coord ({x_mm:.2}, {y_mm:.2}) out of expected group range [38..92, 33..85]: {line}"
+                );
+                eps_checked_pts += 1;
+            }
+        }
+    }
+    assert!(
+        eps_checked_pts >= 4,
+        "expected EPS path coords for TextOnPath"
+    );
+
+    // 2. Connector inside translated Group(40, 40) with Perspective3x3 across PDF / SVG / EPS
+    let mut doc_conn = Document::new("ConnPersp", 160.0, 160.0, ColorMode::Rgb, 300.0);
+    let box_a = SceneObject::new(
+        ObjectId(0),
+        "BoxA",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 10.0,
+            height: 10.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_transform(Affine2D::translate(5.0, 5.0))
+    .with_fill(Fill::Solid(Color::CYAN));
+    let box_b = SceneObject::new(
+        ObjectId(0),
+        "BoxB",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 10.0,
+            height: 10.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_transform(Affine2D::translate(30.0, 30.0))
+    .with_fill(Fill::Solid(Color::YELLOW));
+    let id_a = doc_conn.add_object(box_a, None).unwrap();
+    let id_b = doc_conn.add_object(box_b, None).unwrap();
+    let conn = SceneObject::new(
+        ObjectId(0),
+        "LinkAB",
+        NodePayload::Connector(ConnectorObject::between_objects(
+            id_a,
+            AnchorPoint::Center,
+            id_b,
+            AnchorPoint::Center,
+            ConnectorStyle::Straight,
+        )),
+    )
+    .with_outline(OutlineStyle::solid(Color::rgba8(255, 0, 0, 255), 1.0));
+    let conn_id = doc_conn.add_object(conn, None).unwrap();
+    let cgrp_id = doc_conn
+        .group_objects(&[id_a, id_b, conn_id], "ConnPerspGrp")
+        .unwrap();
+    apply_command(
+        &mut doc_conn,
+        &CommandOp::TransformObjects {
+            ids: vec![cgrp_id],
+            affine: Affine2D::translate(40.0, 40.0),
+        },
+    )
+    .unwrap();
+    apply_command(
+        &mut doc_conn,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![cgrp_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+
+    let svg_conn = export_svg_to_string(&doc_conn, 0).expect("SVG Connector");
+    let conn_line = svg_conn
+        .lines()
+        .find(|l| l.contains(&format!("id=\"obj-{}\"", conn_id.0)))
+        .expect("SVG Connector path");
+    let d_start = conn_line.find(" d=\"").unwrap() + 4;
+    let d_end = conn_line[d_start..].find('"').unwrap() + d_start;
+    let svg_conn_nums: Vec<f64> = conn_line[d_start..d_end]
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<f64>().ok())
+        .collect();
+    assert!(svg_conn_nums.len() >= 4);
+    for pair in svg_conn_nums.as_chunks::<2>().0 {
+        assert!(
+            (42.0..=88.0).contains(&pair[0]) && (42.0..=88.0).contains(&pair[1]),
+            "SVG Connector coord ({:.2}, {:.2}) out of [42..88]: {conn_line}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    let pdf_conn =
+        String::from_utf8_lossy(&export_pdf_to_bytes(&doc_conn, &pdf_opts).unwrap()).into_owned();
+    let mut red_conn_pts = 0usize;
+    let mut in_red_conn = false;
+    for line in pdf_conn.lines() {
+        if line.contains("1.0000 0.0000 0.0000 RG") {
+            in_red_conn = true;
+            continue;
+        }
+        if in_red_conn {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() == 3 && matches!(toks[2], "m" | "l") {
+                let x_mm = toks[0].parse::<f64>().unwrap() / pt_per_mm - bleed_mm;
+                let y_mm = 160.0 + bleed_mm - toks[1].parse::<f64>().unwrap() / pt_per_mm;
+                assert!(
+                    (42.0..=88.0).contains(&x_mm) && (42.0..=88.0).contains(&y_mm),
+                    "PDF Connector coord ({x_mm:.2}, {y_mm:.2}) escaped warped group [42..88]: {line}"
+                );
+                red_conn_pts += 1;
+            } else if line.trim() == "S" {
+                in_red_conn = false;
+            }
+        }
+    }
+    assert!(red_conn_pts >= 2, "must check PDF red Connector endpoints");
+
+    let eps_conn = export_eps_to_string(&doc_conn, 0).unwrap();
+    let mut eps_red_pts = 0usize;
+    let mut in_eps_red = false;
+    for line in eps_conn.lines() {
+        if line.contains("1.0000 0.0000 0.0000 setrgbcolor") {
+            in_eps_red = true;
+            continue;
+        }
+        if in_eps_red {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() == 3 && matches!(toks[2], "moveto" | "lineto") {
+                let x_mm = toks[0].parse::<f64>().unwrap() / pt_per_mm;
+                let y_mm = 160.0 - toks[1].parse::<f64>().unwrap() / pt_per_mm;
+                assert!(
+                    (42.0..=88.0).contains(&x_mm) && (42.0..=88.0).contains(&y_mm),
+                    "EPS Connector coord ({x_mm:.2}, {y_mm:.2}) escaped warped group [42..88]: {line}"
+                );
+                eps_red_pts += 1;
+            } else if line.trim() == "stroke" {
+                in_eps_red = false;
+            }
+        }
+    }
+    assert!(eps_red_pts >= 2, "must check EPS red Connector endpoints");
+}
+
+#[test]
+fn w2_exit_r3_recursive_raster_composite_for_persp_group_and_symbol_child_effects() {
+    use coree_core::{apply_command, Affine2D, CommandOp, Perspective3x3, SymbolDef};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(10.0, 10.0, 30.0, 30.0),
+        &[
+            Point2D::new(14.0, 11.0),
+            Point2D::new(39.0, 14.0),
+            Point2D::new(36.0, 41.0),
+            Point2D::new(11.0, 38.0),
+        ],
+    )
+    .unwrap();
+
+    for case in ["PerspGroup_ChildDropShadow", "SymbolDef_ChildDropShadow"] {
+        let mut doc = Document::new(case, 120.0, 120.0, ColorMode::Cmyk, 300.0);
+        let mut child = SceneObject::new(
+            ObjectId(0),
+            "ShadowChild",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 30.0,
+                height: 30.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_transform(Affine2D::translate(10.0, 10.0))
+        .with_fill(Fill::Solid(Color::rgba8(60, 130, 210, 255)))
+        .with_outline(OutlineStyle {
+            color: Color::cut_contour_spot(),
+            width_mm: 0.8,
+            scale_with_object: true,
+            ..OutlineStyle::default()
+        });
+        child.effects.push(Effect::DropShadow {
+            dx_mm: 3.0,
+            dy_mm: 3.0,
+            blur_mm: 2.0,
+            opacity: 0.75,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Outside,
+        });
+
+        if case == "SymbolDef_ChildDropShadow" {
+            let sym = SymbolDef::new("ShadowSym", vec![child]);
+            let sid = sym.id;
+            doc.insert_symbol(sym);
+            doc.add_object(
+                SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid)),
+                None,
+            )
+            .unwrap();
+        } else {
+            let cid = doc.add_object(child, None).unwrap();
+            let gid = doc.group_objects(&[cid], "PerspGrp").unwrap();
+            apply_command(
+                &mut doc,
+                &CommandOp::SetObjectPerspective {
+                    ids: vec![gid],
+                    perspective: Some(persp),
+                },
+            )
+            .unwrap();
+        }
+
+        let pdf_opts = PdfExportOptions {
+            color_space: PdfColorSpace::DeviceCmyk,
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        };
+        let pdf_bytes = export_pdf_to_bytes(&doc, &pdf_opts).expect("PDF export");
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(
+            pdf_text.contains("/DynIm1 Do"),
+            "{case} PDF must emit /DynIm1 Do raster composite for child DropShadow"
+        );
+        assert!(
+            pdf_text.contains("/Separation /CutContour /DeviceCMYK")
+                && pdf_text.contains("/Sep1 CS 1.0000 SCN"),
+            "{case} PDF must preserve /CutContour spot overlay"
+        );
+        assert_gs_cutcontour_tiffsep(&pdf_bytes, case);
+
+        let svg = export_svg_to_string(&doc, 0).expect("SVG export");
+        assert!(
+            svg.contains("<image ") && svg.contains("data:image/png;base64,"),
+            "{case} SVG must emit <image raster composite for child DropShadow"
+        );
+
+        let eps = export_eps_to_string(&doc, 0).expect("EPS export");
+        assert!(
+            eps.contains(">> image"),
+            "{case} EPS must emit >> image raster composite for child DropShadow"
+        );
+    }
+}
+
+#[test]
+fn w2_exit_r4_powerclip_perspective_pixel_parity_with_and_without_dropshadow() {
+    use coree_core::{apply_command, Affine2D, CommandOp, Perspective3x3};
+    use coree_io::export_eps_to_string;
+    use coree_io::export_svg_to_string;
+    use coree_render::{render_page_to_rgba, render_svg_to_rgba, ViewMode};
+
+    let red_bbox = |rgba: &[u8], w: u32, h: u32| -> (usize, (f64, f64, f64, f64)) {
+        let px_per_mm = 150.0 / 25.4;
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let [r, g, b, a] = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+                if a > 128 && r > 170 && g < 90 && b < 90 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(count > 0, "expected non-empty red pixels");
+        (
+            count,
+            (
+                f64::from(min_x) / px_per_mm,
+                f64::from(min_y) / px_per_mm,
+                f64::from(max_x + 1) / px_per_mm,
+                f64::from(max_y + 1) / px_per_mm,
+            ),
+        )
+    };
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 24.0, 24.0),
+        &[
+            Point2D::new(8.0, 0.0),
+            Point2D::new(16.0, 0.0),
+            Point2D::new(24.0, 24.0),
+            Point2D::new(0.0, 24.0),
+        ],
+    )
+    .unwrap();
+
+    for with_shadow in [false, true] {
+        let mut doc = Document::new("PCPerspIO", 160.0, 160.0, ColorMode::Rgb, 150.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let inner = SceneObject::new(
+            ObjectId(0),
+            "RedInner",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                52.0, 42.0, 20.0, 8.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(220, 20, 20, 255)));
+        let inner_id = doc.add_object(inner, Some(lid)).unwrap();
+        let pc = SceneObject::new(
+            ObjectId(0),
+            "TrapezoidPC",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 24.0, 24.0,
+            ))),
+        )
+        .with_transform(Affine2D::translate(50.0, 40.0))
+        .with_fill(Fill::Solid(Color::rgba8(245, 220, 40, 255)));
+        let pc_id = doc.add_object(pc, Some(lid)).unwrap();
+        doc.create_powerclip(pc_id, &[inner_id]).unwrap();
+        apply_command(
+            &mut doc,
+            &CommandOp::SetObjectPerspective {
+                ids: vec![pc_id],
+                perspective: Some(persp),
+            },
+        )
+        .unwrap();
+        if with_shadow {
+            apply_command(
+                &mut doc,
+                &CommandOp::AddEffect {
+                    id: pc_id,
+                    effect: Effect::DropShadow {
+                        dx_mm: 3.0,
+                        dy_mm: 3.0,
+                        blur_mm: 2.0,
+                        opacity: 0.6,
+                        color: Color::BLACK,
+                        feather_direction: FeatherDirection::Outside,
+                    },
+                },
+            )
+            .unwrap();
+        }
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (r_cnt, r_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        let svg_buf = render_svg_to_rgba(svg.as_bytes(), render_img.width, render_img.height)
+            .expect("resvg render");
+        let (s_cnt, s_bb) = red_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+        assert!(
+            (r_cnt as isize - s_cnt as isize).abs() < 120
+                && (r_bb.0 - s_bb.0).abs() < 0.8
+                && (r_bb.1 - s_bb.1).abs() < 0.8
+                && (r_bb.2 - s_bb.2).abs() < 0.8
+                && (r_bb.3 - s_bb.3).abs() < 0.8,
+            "with_shadow={with_shadow}: Render ({r_cnt} px, {r_bb:?}) vs SVG ({s_cnt} px, {s_bb:?})"
+        );
+
+        let pdf_bytes = export_pdf_to_bytes(
+            &doc,
+            &PdfExportOptions {
+                color_space: PdfColorSpace::DeviceRgb,
+                include_bleed: false,
+                ..PdfExportOptions::default()
+            },
+        )
+        .unwrap();
+        if std::path::Path::new("/usr/bin/pdftoppm").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_path = dir.path().join("pc.pdf");
+            let png_prefix = dir.path().join("pc_page");
+            std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/pdftoppm")
+                .args([
+                    "-png",
+                    "-r",
+                    "150",
+                    "-cropbox",
+                    "-singlefile",
+                    &pdf_path.display().to_string(),
+                    &png_prefix.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(dir.path().join("pc_page.png"))
+                .unwrap()
+                .to_rgba8();
+            let (p_cnt, p_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert!(
+                (r_cnt as isize - p_cnt as isize).abs() < 120
+                    && (r_bb.0 - p_bb.0).abs() < 0.8
+                    && (r_bb.1 - p_bb.1).abs() < 0.8
+                    && (r_bb.2 - p_bb.2).abs() < 0.8
+                    && (r_bb.3 - p_bb.3).abs() < 0.8,
+                "with_shadow={with_shadow}: Render ({r_cnt} px, {r_bb:?}) vs PDF ({p_cnt} px, {p_bb:?})"
+            );
+        }
+
+        let eps = export_eps_to_string(&doc, 0).unwrap();
+        if std::path::Path::new("/usr/bin/gs").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let eps_path = dir.path().join("pc.eps");
+            let png_path = dir.path().join("pc_eps.png");
+            std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+            let st = std::process::Command::new("/usr/bin/gs")
+                .args([
+                    "-q",
+                    "-dNOPAUSE",
+                    "-dBATCH",
+                    "-dEPSCrop",
+                    "-sDEVICE=png16m",
+                    "-r150",
+                    &format!("-sOutputFile={}", png_path.display()),
+                    &eps_path.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(&png_path).unwrap().to_rgba8();
+            let (e_cnt, e_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert!(
+                (r_cnt as isize - e_cnt as isize).abs() < 150
+                    && (r_bb.0 - e_bb.0).abs() < 0.8
+                    && (r_bb.1 - e_bb.1).abs() < 0.8
+                    && (r_bb.2 - e_bb.2).abs() < 0.8
+                    && (r_bb.3 - e_bb.3).abs() < 0.8,
+                "with_shadow={with_shadow}: Render ({r_cnt} px, {r_bb:?}) vs EPS ({e_cnt} px, {e_bb:?})"
+            );
+        }
+    }
+
+    // Nested Group(Perspective3x3) -> PowerClip(Perspective3x3) across Render & SVG
+    let mut nested_doc = Document::new("NestedPCIO", 160.0, 160.0, ColorMode::Rgb, 150.0);
+    let lid = nested_doc.pages()[0].layers[0].id;
+    let inner = SceneObject::new(
+        ObjectId(0),
+        "RedInner",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            2.0, 2.0, 20.0, 8.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 20, 20, 255)));
+    let inner_id = nested_doc.add_object(inner, Some(lid)).unwrap();
+    let pc = SceneObject::new(
+        ObjectId(0),
+        "NestedPC",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 24.0, 24.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(245, 220, 40, 255)));
+    let pc_id = nested_doc.add_object(pc, Some(lid)).unwrap();
+    nested_doc.create_powerclip(pc_id, &[inner_id]).unwrap();
+    apply_command(
+        &mut nested_doc,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![pc_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+    let gid = nested_doc.group_objects(&[pc_id], "OuterGrp").unwrap();
+    apply_command(
+        &mut nested_doc,
+        &CommandOp::TransformObjects {
+            ids: vec![gid],
+            affine: Affine2D::translate(50.0, 40.0),
+        },
+    )
+    .unwrap();
+    let grp_persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 24.0, 24.0),
+        &[
+            Point2D::new(2.0, 2.0),
+            Point2D::new(22.0, 2.0),
+            Point2D::new(24.0, 24.0),
+            Point2D::new(0.0, 24.0),
+        ],
+    )
+    .unwrap();
+    apply_command(
+        &mut nested_doc,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![gid],
+            perspective: Some(grp_persp),
+        },
+    )
+    .unwrap();
+
+    let n_render = render_page_to_rgba(&nested_doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+    let (nr_cnt, nr_bb) = red_bbox(&n_render.rgba, n_render.width, n_render.height);
+    let n_svg = export_svg_to_string(&nested_doc, 0).unwrap();
+    let n_svg_buf = render_svg_to_rgba(n_svg.as_bytes(), n_render.width, n_render.height).unwrap();
+    let (ns_cnt, ns_bb) = red_bbox(&n_svg_buf.rgba, n_svg_buf.width, n_svg_buf.height);
+    assert!(
+        (nr_cnt as isize - ns_cnt as isize).abs() < 120
+            && (nr_bb.0 - ns_bb.0).abs() < 0.8
+            && (nr_bb.1 - ns_bb.1).abs() < 0.8
+            && (nr_bb.2 - ns_bb.2).abs() < 0.8
+            && (nr_bb.3 - ns_bb.3).abs() < 0.8,
+        "Nested Group(Persp)->PowerClip(Persp): Render ({nr_cnt} px, {nr_bb:?}) vs SVG ({ns_cnt} px, {ns_bb:?})"
+    );
+}
+
+#[test]
+fn w2_exit_r4_symbol_def_text_on_path_and_connector_svg_pdf_eps_parity() {
+    use coree_core::{Affine2D, Perspective3x3, TextOnPath};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+    use coree_render::{render_page_to_rgba, render_svg_to_rgba, ViewMode};
+
+    let green_bbox = |rgba: &[u8], w: u32, h: u32| -> (usize, (f64, f64, f64, f64)) {
+        let px_per_mm = 150.0 / 25.4;
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let [r, g, b, a] = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+                if a > 128 && g > 140 && r < 80 && b < 80 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(count > 0, "expected green connector pixels");
+        (
+            count,
+            (
+                f64::from(min_x) / px_per_mm,
+                f64::from(min_y) / px_per_mm,
+                f64::from(max_x + 1) / px_per_mm,
+                f64::from(max_y + 1) / px_per_mm,
+            ),
+        )
+    };
+
+    let red_bbox = |rgba: &[u8], w: u32, h: u32| -> (usize, (f64, f64, f64, f64)) {
+        let px_per_mm = 150.0 / 25.4;
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let [r, g, b, a] = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+                if a > 128 && r > 160 && g < 80 && b < 80 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(count > 0, "expected red TextOnPath pixels");
+        (
+            count,
+            (
+                f64::from(min_x) / px_per_mm,
+                f64::from(min_y) / px_per_mm,
+                f64::from(max_x + 1) / px_per_mm,
+                f64::from(max_y + 1) / px_per_mm,
+            ),
+        )
+    };
+
+    for with_persp in [false, true] {
+        let mut doc = Document::new("SymTOPConn", 180.0, 180.0, ColorMode::Rgb, 150.0);
+        let sym_host = SceneObject::new(
+            ObjectId(10),
+            "SymHost",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(5.0, 20.0),
+                Point2D::new(45.0, 20.0),
+            )),
+        )
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.5));
+        let top_style = TextStyle {
+            fill: Color::rgba8(220, 20, 20, 255),
+            font_size_pt: 14.0,
+            ..Default::default()
+        };
+        let sym_top = SceneObject::new(
+            ObjectId(11),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("SYM", top_style),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        let sym_a = SceneObject::new(
+            ObjectId(12),
+            "SymA",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                5.0, 35.0, 10.0, 10.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(40, 100, 220, 255)));
+        let sym_b = SceneObject::new(
+            ObjectId(13),
+            "SymB",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                35.0, 35.0, 10.0, 10.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(40, 100, 220, 255)));
+        let sym_conn = SceneObject::new(
+            ObjectId(14),
+            "SymConn",
+            NodePayload::Connector(ConnectorObject::between_objects(
+                ObjectId(12),
+                AnchorPoint::Center,
+                ObjectId(13),
+                AnchorPoint::Center,
+                ConnectorStyle::Straight,
+            )),
+        )
+        .with_outline(OutlineStyle::solid(Color::rgba8(20, 180, 40, 255), 1.2));
+        // Wrap SymTOP and SymConn in a nested Group inside SymbolDef to verify sym_root_xf preservation!
+        let sym_grp = SceneObject::new(
+            ObjectId(15),
+            "SymInnerGrp",
+            NodePayload::Group(vec![ObjectId(11), ObjectId(14)]),
+        )
+        .with_transform(Affine2D::translate(2.0, 0.0));
+
+        let sym = SymbolDef::new(
+            "WidgetSym",
+            vec![sym_host, sym_a, sym_b, sym_grp, sym_top, sym_conn],
+        );
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+
+        let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(50.0, 40.0));
+        if with_persp {
+            inst.perspective = Some(
+                Perspective3x3::from_rect_to_quad(
+                    Rect2D::from_xywh(0.0, 0.0, 50.0, 50.0),
+                    &[
+                        Point2D::new(4.0, 2.0),
+                        Point2D::new(46.0, 4.0),
+                        Point2D::new(48.0, 48.0),
+                        Point2D::new(2.0, 46.0),
+                    ],
+                )
+                .unwrap(),
+            );
+        }
+        doc.add_object(inst, None).unwrap();
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (_, r_green_bb) = green_bbox(&render_img.rgba, render_img.width, render_img.height);
+        let (_, r_red_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+        // Connector must live inside symbol around x=58..92, y=75..85 (NEVER at page origin 0..20!)
+        assert!(
+            r_green_bb.0 > 50.0 && r_green_bb.1 > 70.0,
+            "with_persp={with_persp}: SceneRenderer green connector bbox {r_green_bb:?}"
+        );
+        assert!(
+            r_red_bb.0 > 50.0 && r_red_bb.1 > 50.0,
+            "with_persp={with_persp}: SceneRenderer red TOP bbox {r_red_bb:?}"
+        );
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(
+            !svg.contains("M -50.0000 -40.0000"),
+            "with_persp={with_persp}: SVG Connector must NOT teleport to page origin: {svg}"
+        );
+        if !with_persp {
+            assert!(
+                svg.contains("<textPath href=\"#textpath-")
+                    && svg.contains("d=\"M 5.0000 20.0000 L 45.0000 20.0000\""),
+                "SVG TextOnPath inside SymbolDef must emit <textPath> along SymHost (5..45, 20): {svg}"
+            );
+        }
+        let svg_buf =
+            render_svg_to_rgba(svg.as_bytes(), render_img.width, render_img.height).expect("resvg");
+        let (_, s_green_bb) = green_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+        assert!(
+            (r_green_bb.0 - s_green_bb.0).abs() < 1.5
+                && (r_green_bb.1 - s_green_bb.1).abs() < 1.5
+                && (r_green_bb.2 - s_green_bb.2).abs() < 1.5
+                && (r_green_bb.3 - s_green_bb.3).abs() < 1.5,
+            "with_persp={with_persp}: Connector Render {r_green_bb:?} vs SVG {s_green_bb:?}"
+        );
+        if with_persp {
+            let (_, s_red_bb) = red_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+            assert!(
+                s_red_bb.0 > 50.0 && s_red_bb.1 > 50.0 && (r_red_bb.1 - s_red_bb.1).abs() < 2.5,
+                "with_persp={with_persp}: TOP Render {r_red_bb:?} vs SVG {s_red_bb:?}"
+            );
+        }
+
+        let pdf_bytes = export_pdf_to_bytes(
+            &doc,
+            &PdfExportOptions {
+                color_space: PdfColorSpace::DeviceRgb,
+                include_bleed: false,
+                ..PdfExportOptions::default()
+            },
+        )
+        .unwrap();
+        if std::path::Path::new("/usr/bin/pdftoppm").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_path = dir.path().join("sym.pdf");
+            let png_prefix = dir.path().join("sym_page");
+            std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/pdftoppm")
+                .args([
+                    "-png",
+                    "-r",
+                    "150",
+                    "-cropbox",
+                    "-singlefile",
+                    &pdf_path.display().to_string(),
+                    &png_prefix.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(dir.path().join("sym_page.png"))
+                .unwrap()
+                .to_rgba8();
+            let (_, p_green_bb) = green_bbox(img.as_raw(), img.width(), img.height());
+            let (_, p_red_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert!(
+                (r_green_bb.0 - p_green_bb.0).abs() < 1.5
+                    && (r_green_bb.1 - p_green_bb.1).abs() < 1.5
+                    && (r_green_bb.2 - p_green_bb.2).abs() < 1.5
+                    && (r_green_bb.3 - p_green_bb.3).abs() < 1.5,
+                "with_persp={with_persp}: Connector Render {r_green_bb:?} vs PDF {p_green_bb:?}"
+            );
+            assert!(
+                p_red_bb.0 > 50.0 && p_red_bb.1 > 50.0 && (r_red_bb.1 - p_red_bb.1).abs() < 2.5,
+                "with_persp={with_persp}: TOP Render {r_red_bb:?} vs PDF {p_red_bb:?}"
+            );
+        }
+
+        let eps = export_eps_to_string(&doc, 0).unwrap();
+        if std::path::Path::new("/usr/bin/gs").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let eps_path = dir.path().join("sym.eps");
+            let png_path = dir.path().join("sym_eps.png");
+            std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+            let st = std::process::Command::new("/usr/bin/gs")
+                .args([
+                    "-q",
+                    "-dNOPAUSE",
+                    "-dBATCH",
+                    "-dEPSCrop",
+                    "-sDEVICE=png16m",
+                    "-r150",
+                    &format!("-sOutputFile={}", png_path.display()),
+                    &eps_path.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(&png_path).unwrap().to_rgba8();
+            let (_, e_green_bb) = green_bbox(img.as_raw(), img.width(), img.height());
+            let (_, e_red_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert!(
+                (r_green_bb.0 - e_green_bb.0).abs() < 1.5
+                    && (r_green_bb.1 - e_green_bb.1).abs() < 1.5
+                    && (r_green_bb.2 - e_green_bb.2).abs() < 1.5
+                    && (r_green_bb.3 - e_green_bb.3).abs() < 1.5,
+                "with_persp={with_persp}: Connector Render {r_green_bb:?} vs EPS {e_green_bb:?}"
+            );
+            assert!(
+                e_red_bb.0 > 50.0 && e_red_bb.1 > 50.0 && (r_red_bb.1 - e_red_bb.1).abs() < 2.5,
+                "with_persp={with_persp}: TOP Render {r_red_bb:?} vs EPS {e_red_bb:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r5_symbol_text_on_path_bspline_media_clone_persp_and_unattached_cross_oracle() {
+    use coree_core::{Affine2D, ArtisticMediaStyle, BSplineCurve, Perspective3x3, TextOnPath};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+    use coree_render::{render_page_to_rgba, render_svg_to_rgba, ViewMode};
+
+    let red_bbox = |rgba: &[u8], w: u32, h: u32| -> (usize, (f64, f64, f64, f64)) {
+        let px_per_mm = 150.0 / 25.4;
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let [r, g, b, a] = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+                if a > 128 && r > 160 && g < 80 && b < 80 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(count > 0, "expected red TextOnPath pixels");
+        (
+            count,
+            (
+                f64::from(min_x) / px_per_mm,
+                f64::from(min_y) / px_per_mm,
+                f64::from(max_x + 1) / px_per_mm,
+                f64::from(max_y + 1) / px_per_mm,
+            ),
+        )
+    };
+
+    let assert_bbox_parity = |label: &str, a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        let diff = (a.0 - b.0)
+            .abs()
+            .max((a.1 - b.1).abs())
+            .max((a.2 - b.2).abs())
+            .max((a.3 - b.3).abs());
+        assert!(
+            diff <= 1.5,
+            "{label}: bbox mismatch {a:?} vs {b:?} (max_diff={diff:.3} mm > 1.5 mm)"
+        );
+    };
+
+    let render_pdf_bb = |doc: &Document| -> Option<(f64, f64, f64, f64)> {
+        if !std::path::Path::new("/usr/bin/pdftoppm").exists() {
+            return None;
+        }
+        let pdf_bytes = export_pdf_to_bytes(
+            doc,
+            &PdfExportOptions {
+                color_space: PdfColorSpace::DeviceRgb,
+                include_bleed: false,
+                ..PdfExportOptions::default()
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("t.pdf");
+        let png_prefix = dir.path().join("p");
+        std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+        let st = std::process::Command::new("/usr/bin/pdftoppm")
+            .args([
+                "-png",
+                "-r",
+                "150",
+                "-cropbox",
+                "-singlefile",
+                &pdf_path.display().to_string(),
+                &png_prefix.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let img = image::open(dir.path().join("p.png")).unwrap().to_rgba8();
+        Some(red_bbox(img.as_raw(), img.width(), img.height()).1)
+    };
+
+    let render_eps_bb = |doc: &Document| -> Option<(f64, f64, f64, f64)> {
+        if !std::path::Path::new("/usr/bin/gs").exists() {
+            return None;
+        }
+        let eps = export_eps_to_string(doc, 0).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let eps_path = dir.path().join("t.eps");
+        let png_path = dir.path().join("e.png");
+        std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+        let st = std::process::Command::new("/usr/bin/gs")
+            .args([
+                "-q",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dEPSCrop",
+                "-sDEVICE=png16m",
+                "-r150",
+                &format!("-sOutputFile={}", png_path.display()),
+                &eps_path.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let img = image::open(&png_path).unwrap().to_rgba8();
+        Some(red_bbox(img.as_raw(), img.width(), img.height()).1)
+    };
+
+    let top_style = TextStyle {
+        fill: Color::rgba8(220, 20, 20, 255),
+        font_size_pt: 14.0,
+        ..Default::default()
+    };
+
+    // Part A: SymbolDef containing TextOnPath attached to BSpline, ArtisticMedia, Clone, and Perspective3x3 Path
+    for kind in ["BSpline", "ArtisticMedia", "Clone", "PerspectivePath"] {
+        let mut doc = Document::new(kind, 180.0, 180.0, ColorMode::Rgb, 150.0);
+        let master_id = if kind == "Clone" {
+            let mut master = SceneObject::new(
+                ObjectId(0),
+                "MasterLine",
+                NodePayload::BSpline(BSplineCurve::from_control_points(
+                    vec![
+                        Point2D::new(5.0, 20.0),
+                        Point2D::new(20.0, 18.0),
+                        Point2D::new(35.0, 22.0),
+                        Point2D::new(50.0, 20.0),
+                    ],
+                    3,
+                    false,
+                )),
+            )
+            .with_outline(OutlineStyle::none())
+            .with_fill(Fill::None);
+            master.visible = false;
+            Some(doc.add_object(master, None).unwrap())
+        } else {
+            None
+        };
+
+        let mut sym_host = match kind {
+            "BSpline" => SceneObject::new(
+                ObjectId(10),
+                "SymBSpline",
+                NodePayload::BSpline(BSplineCurve::from_control_points(
+                    vec![
+                        Point2D::new(5.0, 20.0),
+                        Point2D::new(20.0, 20.0),
+                        Point2D::new(35.0, 20.0),
+                        Point2D::new(50.0, 20.0),
+                    ],
+                    3,
+                    false,
+                )),
+            ),
+            "ArtisticMedia" => SceneObject::new(
+                ObjectId(10),
+                "SymMedia",
+                NodePayload::ArtisticMedia {
+                    spine: BezierPath::from_line(Point2D::new(5.0, 20.0), Point2D::new(50.0, 20.0)),
+                    style: ArtisticMediaStyle::Calligraphic {
+                        width_mm: 2.0,
+                        angle_deg: 45.0,
+                    },
+                },
+            ),
+            "Clone" => SceneObject::new(
+                ObjectId(10),
+                "SymClone",
+                NodePayload::Clone {
+                    master_id: master_id.unwrap(),
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            ),
+            "PerspectivePath" => {
+                let mut host = SceneObject::new(
+                    ObjectId(10),
+                    "SymPerspHost",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 40.0, 20.0,
+                    ))),
+                );
+                host.perspective = Some(
+                    Perspective3x3::from_rect_to_quad(
+                        Rect2D::from_xywh(0.0, 0.0, 40.0, 20.0),
+                        &[
+                            Point2D::new(0.0, 10.0),
+                            Point2D::new(40.0, 0.0),
+                            Point2D::new(40.0, 20.0),
+                            Point2D::new(0.0, 20.0),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                host
+            }
+            _ => unreachable!(),
+        };
+        sym_host = sym_host
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none());
+
+        let sym_top = SceneObject::new(
+            ObjectId(11),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("HOST", top_style.clone()),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        )
+        .with_outline(OutlineStyle::none());
+
+        let sym = SymbolDef::new(format!("Sym_{kind}"), vec![sym_host, sym_top]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(50.0, 60.0));
+        doc.add_object(inst, None).unwrap();
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (_, r_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+        assert!(
+            r_bb.0 >= 47.0 && r_bb.1 >= 62.0,
+            "{kind}: SceneRenderer must NOT fall back to (50,60) origin: {r_bb:?}"
+        );
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(
+            svg.contains("<textPath href=\"#textpath-"),
+            "{kind}: SVG must emit <textPath> for attached SymbolDef host: {svg}"
+        );
+
+        if let Some(p_bb) = render_pdf_bb(&doc) {
+            assert_bbox_parity(&format!("{kind} Render vs PDF"), r_bb, p_bb);
+        }
+        if let Some(e_bb) = render_eps_bb(&doc) {
+            assert_bbox_parity(&format!("{kind} Render vs EPS"), r_bb, e_bb);
+        }
+    }
+
+    // Part B: SymbolDef containing unattached TextOnPath inside SymbolInstance(Translate + Perspective3x3)
+    {
+        let mut doc = Document::new("SymUnattachedPerspTOP", 180.0, 180.0, ColorMode::Rgb, 150.0);
+        let sym_top = SceneObject::new(
+            ObjectId(11),
+            "SymUnattachedTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain(
+                    "FALLBACK",
+                    TextStyle {
+                        fill: Color::rgba8(220, 20, 20, 255),
+                        font_size_pt: 18.0,
+                        ..Default::default()
+                    },
+                ),
+                path_id: ObjectId(9999),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        )
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(5.0, 10.0));
+        let sym = SymbolDef::new("UnattachedSym", vec![sym_top]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+
+        let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(50.0, 40.0));
+        inst.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 45.0, 25.0),
+                &[
+                    Point2D::new(4.0, 2.0),
+                    Point2D::new(42.0, 6.0),
+                    Point2D::new(44.0, 24.0),
+                    Point2D::new(2.0, 22.0),
+                ],
+            )
+            .unwrap(),
+        );
+        doc.add_object(inst, None).unwrap();
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (_, r_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+        assert!(
+            r_bb.0 > 50.0 && r_bb.1 > 48.0,
+            "Unattached TOP inside SymInst(Persp) render bbox unexpected: {r_bb:?}"
+        );
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(
+            !svg.contains("<text "),
+            "Unattached TOP inside SymInst(Persp) must outline warped glyph paths, not emit untransformed <text>: {svg}"
+        );
+        let svg_buf =
+            render_svg_to_rgba(svg.as_bytes(), render_img.width, render_img.height).expect("resvg");
+        let (_, s_bb) = red_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+        assert_bbox_parity("Unattached TOP Sym(Persp) Render vs SVG", r_bb, s_bb);
+
+        if let Some(p_bb) = render_pdf_bb(&doc) {
+            assert_bbox_parity("Unattached TOP Sym(Persp) Render vs PDF", r_bb, p_bb);
+        }
+        if let Some(e_bb) = render_eps_bb(&doc) {
+            assert_bbox_parity("Unattached TOP Sym(Persp) Render vs EPS", r_bb, e_bb);
+        }
+    }
+
+    // Part C: Standalone unattached TextOnPath with own obj.perspective
+    {
+        let mut doc = Document::new("OwnPerspUnattachedTOP", 180.0, 180.0, ColorMode::Rgb, 150.0);
+        let mut top_obj = SceneObject::new(
+            ObjectId(0),
+            "OwnPerspTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain(
+                    "WARP",
+                    TextStyle {
+                        fill: Color::rgba8(220, 20, 20, 255),
+                        font_size_pt: 20.0,
+                        ..Default::default()
+                    },
+                ),
+                path_id: ObjectId(9999),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        )
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(40.0, 30.0));
+        top_obj.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+                &[
+                    Point2D::new(2.0, 4.0),
+                    Point2D::new(28.0, 0.0),
+                    Point2D::new(30.0, 14.0),
+                    Point2D::new(0.0, 10.0),
+                ],
+            )
+            .unwrap(),
+        );
+        doc.add_object(top_obj, None).unwrap();
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (_, r_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(
+            !svg.contains("<text "),
+            "Own-perspective unattached TOP must outline warped glyphs in SVG: {svg}"
+        );
+        let svg_buf =
+            render_svg_to_rgba(svg.as_bytes(), render_img.width, render_img.height).expect("resvg");
+        let (_, s_bb) = red_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+        assert_bbox_parity("OwnPersp Unattached TOP Render vs SVG", r_bb, s_bb);
+
+        if let Some(p_bb) = render_pdf_bb(&doc) {
+            assert_bbox_parity("OwnPersp Unattached TOP Render vs PDF", r_bb, p_bb);
+        }
+        if let Some(e_bb) = render_eps_bb(&doc) {
+            assert_bbox_parity("OwnPersp Unattached TOP Render vs EPS", r_bb, e_bb);
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r6_symbol_persp_attached_text_on_path_with_symmetry_cross_oracle() {
+    use coree_core::{Affine2D, Perspective3x3, TextOnPath};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+    use coree_render::{render_page_to_rgba, render_svg_to_rgba, ViewMode};
+
+    let red_bbox = |rgba: &[u8], w: u32, h: u32| -> (usize, (f64, f64, f64, f64)) {
+        let px_per_mm = 150.0 / 25.4;
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let [r, g, b, a] = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+                if a > 128 && r > 160 && g < 80 && b < 80 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(count > 0, "expected red TextOnPath pixels");
+        (
+            count,
+            (
+                f64::from(min_x) / px_per_mm,
+                f64::from(min_y) / px_per_mm,
+                f64::from(max_x + 1) / px_per_mm,
+                f64::from(max_y + 1) / px_per_mm,
+            ),
+        )
+    };
+
+    let assert_bbox_parity = |label: &str, a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        let diff = (a.0 - b.0)
+            .abs()
+            .max((a.1 - b.1).abs())
+            .max((a.2 - b.2).abs())
+            .max((a.3 - b.3).abs());
+        assert!(
+            diff <= 1.5,
+            "{label}: bbox mismatch {a:?} vs {b:?} (max_diff={diff:.3} mm > 1.5 mm)"
+        );
+    };
+
+    // C3: SymbolInstance(Translate + Perspective3x3) containing attached TextOnPath with Effect::Symmetry
+    for nested_group in [false, true] {
+        let mut doc = Document::new(
+            if nested_group {
+                "C3_nested"
+            } else {
+                "C3_direct"
+            },
+            180.0,
+            180.0,
+            ColorMode::Rgb,
+            150.0,
+        );
+        let sym_host = SceneObject::new(
+            ObjectId(10),
+            "SymHost",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(5.0, 15.0),
+                Point2D::new(40.0, 15.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+
+        let mut sym_top = SceneObject::new(
+            ObjectId(11),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain(
+                    "SYM",
+                    TextStyle {
+                        fill: Color::rgba8(220, 20, 20, 255),
+                        font_size_pt: 14.0,
+                        ..Default::default()
+                    },
+                ),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        )
+        .with_outline(OutlineStyle::none());
+        sym_top.effects.push(Effect::Symmetry {
+            axes: 2,
+            origin: Point2D::new(25.0, 35.0),
+            mirror: false,
+        });
+
+        let sym_objects = if nested_group {
+            let grp = SceneObject::new(
+                ObjectId(12),
+                "InnerGrp",
+                NodePayload::Group(vec![ObjectId(10), ObjectId(11)]),
+            )
+            .with_transform(Affine2D::translate(3.0, 4.0));
+            vec![sym_host, sym_top, grp]
+        } else {
+            vec![sym_host, sym_top]
+        };
+        let sym = SymbolDef::new("C3Sym", sym_objects);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+
+        let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(30.0, 30.0));
+        inst.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 50.0, 70.0),
+                &[
+                    Point2D::new(5.0, 5.0),
+                    Point2D::new(48.0, 0.0),
+                    Point2D::new(60.0, 75.0),
+                    Point2D::new(0.0, 65.0),
+                ],
+            )
+            .unwrap(),
+        );
+        doc.add_object(inst, None).unwrap();
+
+        let render_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (r_cnt, r_bb) = red_bbox(&render_img.rgba, render_img.width, render_img.height);
+        assert!(
+            (r_bb.3 - r_bb.1) > 25.0 && r_cnt > 400,
+            "nested={nested_group}: SceneRenderer must render BOTH symmetry branches, got cnt={r_cnt}, bb={r_bb:?}"
+        );
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        let svg_buf =
+            render_svg_to_rgba(svg.as_bytes(), render_img.width, render_img.height).expect("resvg");
+        let (_, s_bb) = red_bbox(&svg_buf.rgba, svg_buf.width, svg_buf.height);
+        assert_bbox_parity(
+            &format!("C3 (nested={nested_group}) Render vs SVG"),
+            r_bb,
+            s_bb,
+        );
+
+        if std::path::Path::new("/usr/bin/pdftoppm").exists() {
+            let pdf_bytes = export_pdf_to_bytes(
+                &doc,
+                &PdfExportOptions {
+                    color_space: PdfColorSpace::DeviceRgb,
+                    include_bleed: false,
+                    ..PdfExportOptions::default()
+                },
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_path = dir.path().join("c3.pdf");
+            let png_prefix = dir.path().join("c3");
+            std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/pdftoppm")
+                .args([
+                    "-png",
+                    "-r",
+                    "150",
+                    "-cropbox",
+                    "-singlefile",
+                    &pdf_path.display().to_string(),
+                    &png_prefix.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(dir.path().join("c3.png")).unwrap().to_rgba8();
+            let (_, p_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert_bbox_parity(
+                &format!("C3 (nested={nested_group}) Render vs PDF"),
+                r_bb,
+                p_bb,
+            );
+        }
+
+        if std::path::Path::new("/usr/bin/gs").exists() {
+            let eps = export_eps_to_string(&doc, 0).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let eps_path = dir.path().join("c3.eps");
+            let png_path = dir.path().join("c3_eps.png");
+            std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+            let st = std::process::Command::new("/usr/bin/gs")
+                .args([
+                    "-q",
+                    "-dNOPAUSE",
+                    "-dBATCH",
+                    "-dEPSCrop",
+                    "-sDEVICE=png16m",
+                    "-r150",
+                    &format!("-sOutputFile={}", png_path.display()),
+                    &eps_path.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(&png_path).unwrap().to_rgba8();
+            let (_, e_bb) = red_bbox(img.as_raw(), img.width(), img.height());
+            assert_bbox_parity(
+                &format!("C3 (nested={nested_group}) Render vs EPS"),
+                r_bb,
+                e_bb,
+            );
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r8_symbol_zero_id_persp_group_text_on_path_svg_pdf_eps_parity() {
+    use coree_core::{Affine2D, ArtisticText, Perspective3x3, SymbolDef, TextOnPath, TextStyle};
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+
+    let mut doc = Document::new("W2ExitR8_P5_IO", 240.0, 240.0, ColorMode::Rgb, 150.0);
+    let host = SceneObject::new(
+        ObjectId(20),
+        "Host20",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(0.0, 5.0),
+            Point2D::new(30.0, 5.0),
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    let mut top = SceneObject::new(
+        ObjectId(21),
+        "Top21",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain(
+                "ZERO",
+                TextStyle {
+                    fill: Color::rgba8(220, 20, 20, 255),
+                    font_size_pt: 14.0,
+                    ..Default::default()
+                },
+            ),
+            path_id: ObjectId(20),
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    )
+    .with_outline(OutlineStyle::none());
+    top.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+            &[
+                Point2D::new(20.0, 20.0),
+                Point2D::new(60.0, 20.0),
+                Point2D::new(60.0, 40.0),
+                Point2D::new(20.0, 40.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let mut zero_grp = SceneObject::new(
+        ObjectId(0),
+        "ZeroGrp",
+        NodePayload::Group(vec![ObjectId(20), ObjectId(21)]),
+    )
+    .with_transform(Affine2D::translate(10.0, 10.0));
+    zero_grp.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(20.0, 20.0, 40.0, 20.0),
+            &[
+                Point2D::new(100.0, 100.0),
+                Point2D::new(180.0, 100.0),
+                Point2D::new(180.0, 140.0),
+                Point2D::new(100.0, 140.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let sym = SymbolDef::new("P5IOSym", vec![zero_grp, host, top]);
+    let sid = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "P5Inst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(20.0, 20.0)),
+        None,
+    )
+    .unwrap();
+
+    // SVG: SymbolInstance emits outer translate(20, 20) group, so inner warped glyph coords sit in (108..192, 108..135)
+    // which compose with translate(20, 20) to (128..212, 128..155) matching PDF/EPS!
+    let svg = export_svg_to_string(&doc, 0).expect("SVG export");
+    assert!(
+        svg.contains("transform=\"matrix(1.000000 0.000000 0.000000 1.000000 20.0000 20.0000)\""),
+        "SVG must emit SymbolInstance translate(20, 20) group: {svg}"
+    );
+    let mut svg_pts = 0usize;
+    for line in svg.lines().filter(|l| l.contains("id=\"obj-21-g")) {
+        let d_start = line.find(" d=\"").unwrap() + 4;
+        let d_end = line[d_start..].find('"').unwrap() + d_start;
+        let nums: Vec<f64> = line[d_start..d_end]
+            .split_whitespace()
+            .filter_map(|t| t.parse::<f64>().ok())
+            .collect();
+        for pair in nums.as_chunks::<2>().0 {
+            let world_x = pair[0] + 20.0;
+            let world_y = pair[1] + 20.0;
+            assert!(
+                (128.0..=212.0).contains(&world_x) && (128.0..=155.0).contains(&world_y),
+                "SVG glyph world coord ({world_x:.2}, {world_y:.2}) out of expected ObjectId(0) Group range [128..212, 128..155]"
+            );
+            svg_pts += 1;
+        }
+    }
+    assert!(svg_pts >= 4, "expected SVG glyph coords for Top21");
+
+    // PDF + pdftoppm oracle
+    let pdf_bytes = export_pdf_to_bytes(
+        &doc,
+        &PdfExportOptions {
+            color_space: PdfColorSpace::DeviceRgb,
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        },
+    )
+    .unwrap();
+    if std::path::Path::new("/usr/bin/pdftoppm").exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("p5.pdf");
+        let png_prefix = dir.path().join("p5");
+        std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+        let st = std::process::Command::new("/usr/bin/pdftoppm")
+            .args([
+                "-png",
+                "-r",
+                "150",
+                "-cropbox",
+                "-singlefile",
+                &pdf_path.display().to_string(),
+                &png_prefix.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let img = image::open(dir.path().join("p5.png")).unwrap().to_rgba8();
+        let px_per_mm = 150.0 / 25.4;
+        let bleed_mm = 3.0;
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        for (idx, px) in img.pixels().enumerate() {
+            if px[3] > 128 && px[0] > 150 && px[1] < 90 && px[2] < 90 {
+                let x = (idx as u32) % img.width();
+                let y = (idx as u32) / img.width();
+                min_x = min_x.min(f64::from(x) / px_per_mm - bleed_mm);
+                min_y = min_y.min(f64::from(y) / px_per_mm - bleed_mm);
+            }
+        }
+        assert!(
+            min_x >= 128.0 && min_y >= 128.0,
+            "PDF pdftoppm red glyph min=({min_x:.2}, {min_y:.2}) must not drop ObjectId(0) Group transform"
+        );
+    }
+
+    // EPS + gs oracle
+    let eps = export_eps_to_string(&doc, 0).unwrap();
+    if std::path::Path::new("/usr/bin/gs").exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let eps_path = dir.path().join("p5.eps");
+        let png_path = dir.path().join("p5_eps.png");
+        std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+        let st = std::process::Command::new("/usr/bin/gs")
+            .args([
+                "-q",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dEPSCrop",
+                "-sDEVICE=png16m",
+                "-r150",
+                &format!("-sOutputFile={}", png_path.display()),
+                &eps_path.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let img = image::open(&png_path).unwrap().to_rgba8();
+        let px_per_mm = 150.0 / 25.4;
+        let mut min_x = f64::INFINITY;
+        for (idx, px) in img.pixels().enumerate() {
+            if px[3] > 128 && px[0] > 150 && px[1] < 90 && px[2] < 90 {
+                let x = (idx as u32) % img.width();
+                min_x = min_x.min(f64::from(x) / px_per_mm);
+            }
+        }
+        assert!(
+            min_x >= 128.0,
+            "EPS gs red glyph min_x={min_x:.2} must include ObjectId(0) Group transform"
+        );
+    }
+}

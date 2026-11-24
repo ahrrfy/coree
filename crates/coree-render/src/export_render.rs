@@ -197,14 +197,15 @@ pub(crate) fn collect_underlying_until(
                     subtree_contains_object(doc, cid, target_id, depth + 1, &mut sub_v)
                 });
                 if contains {
-                    let has_deform = obj.effects.iter().any(|e| {
-                        matches!(
-                            e,
-                            coree_core::Effect::Distort { .. }
-                                | coree_core::Effect::Envelope { .. }
-                                | coree_core::Effect::Perspective { .. }
-                        )
-                    });
+                    let has_deform = obj.perspective.is_some()
+                        || obj.effects.iter().any(|e| {
+                            matches!(
+                                e,
+                                coree_core::Effect::Distort { .. }
+                                    | coree_core::Effect::Envelope { .. }
+                                    | coree_core::Effect::Perspective { .. }
+                            )
+                        });
                     if has_deform {
                         out.push(BackdropItem::EnterDeformedGroup {
                             group_id: oid,
@@ -226,7 +227,11 @@ pub(crate) fn collect_underlying_until(
                     out.push(BackdropItem::Object(oid));
                 }
             }
-            coree_core::NodePayload::PowerClip { contents, .. } => {
+            coree_core::NodePayload::PowerClip {
+                container,
+                contents,
+                ..
+            } => {
                 let contains = contents.iter().any(|&cid| {
                     let mut sub_v = visiting.clone();
                     subtree_contains_object(doc, cid, target_id, depth + 1, &mut sub_v)
@@ -236,11 +241,38 @@ pub(crate) fn collect_underlying_until(
                         pc_id: oid,
                         sym_root_idx: None,
                     });
+                    let has_deform = obj.perspective.is_some()
+                        || obj.effects.iter().any(|e| {
+                            matches!(
+                                e,
+                                coree_core::Effect::Distort { .. }
+                                    | coree_core::Effect::Envelope { .. }
+                                    | coree_core::Effect::Perspective { .. }
+                            )
+                        });
+                    if has_deform {
+                        let pc_local_bb = obj
+                            .perspective
+                            .map_or_else(
+                                || (**container).clone(),
+                                |p| p.transform_bezier_path(container),
+                            )
+                            .bounding_box();
+                        out.push(BackdropItem::EnterDeformedGroup {
+                            group_id: oid,
+                            group_sym_root_idx: None,
+                            group_local_bb: pc_local_bb,
+                            group_world_xf: None,
+                        });
+                    }
                     for &cid in contents {
                         if collect_underlying_until(doc, cid, target_id, out, depth + 1, visiting) {
                             found = true;
                             break;
                         }
+                    }
+                    if has_deform && !found {
+                        out.push(BackdropItem::ExitDeformedGroup);
                     }
                 } else {
                     out.push(BackdropItem::Object(oid));

@@ -1169,13 +1169,32 @@ impl StudioApp {
                 .copied()
                 .map(|id| {
                     if let Some(obj) = tab.document.object(id) {
-                        if let Some(path) =
-                            outline_text_object_with_engine(&mut text_engine, obj, &tab.document)
-                        {
+                        let (resolved_tmp, eff_fill) =
+                            if matches!(obj.payload, NodePayload::Clone { .. }) {
+                                if let Some((eff_payload, eff_fill, _)) =
+                                    tab.document.resolve_clone_payload_and_style(obj)
+                                {
+                                    let mut tmp = obj.clone();
+                                    tmp.payload = eff_payload;
+                                    (Some(tmp), Some(eff_fill))
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            };
+                        let target_obj = resolved_tmp.as_ref().unwrap_or(obj);
+                        if let Some(path) = outline_text_object_with_engine(
+                            &mut text_engine,
+                            target_obj,
+                            &tab.document,
+                        ) {
                             if !path.is_empty() && path.is_finite() {
                                 let mut batch = Vec::new();
-                                if !obj.fill.is_visible() {
-                                    let run_fill = match &obj.payload {
+                                let has_visible_fill = obj.fill.is_visible()
+                                    || eff_fill.as_ref().is_some_and(Fill::is_visible);
+                                if !has_visible_fill {
+                                    let run_fill = match &target_obj.payload {
                                         NodePayload::ArtisticText(t) => t
                                             .runs
                                             .iter()

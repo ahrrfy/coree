@@ -70,8 +70,9 @@ pub use geometry::{
     Subpath,
 };
 pub use hit_test::{
-    hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_powerclip_contents_rect,
-    hit_test_rect, DynamicGuideKind, DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
+    hit_test_node, hit_test_object_warped_world_bounds, hit_test_object_warped_world_path,
+    hit_test_point, hit_test_powerclip_contents, hit_test_powerclip_contents_rect, hit_test_rect,
+    DynamicGuideKind, DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use icc::{
     apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile, convert_cmyk_to_rgb_icc,

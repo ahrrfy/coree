@@ -19,7 +19,7 @@ use crate::viewport::ViewMode;
 use coree_core::math::sanitize_f32;
 use coree_core::{
     Affine2D, BezierPath, Color, Document, Effect, Fill, LensConfig, LensKind, NodePayload,
-    ObjectId, Page, Point2D, Rect2D, SceneObject, SymbolDef, SymbolId,
+    ObjectId, Page, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolDef, SymbolId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -178,6 +178,7 @@ fn resolve_sym_parent_world(oid: ObjectId, sf: &ActiveSymbolFrame<'_>) -> Affine
 #[derive(Clone, Copy)]
 struct ActiveDeformGroup<'a> {
     group_ref: SymParentRef,
+    pre_perspective: Option<Perspective3x3>,
     group_local_bb: Option<Rect2D>,
     group_effects: &'a [Effect],
     group_world_xf: Affine2D,
@@ -215,6 +216,7 @@ fn push_deformed_group_frame<'a>(
     let group_to_sub = local_page_xf.compose(&eff_world);
     stack.push(Some(ActiveDeformGroup {
         group_ref,
+        pre_perspective: gobj.perspective,
         group_local_bb,
         group_effects: &gobj.effects,
         group_world_xf: eff_world,
@@ -405,6 +407,7 @@ fn build_deform_frames<'a>(
                 })
         };
         frames.push(DeformFrame {
+            pre_perspective: g.pre_perspective,
             group_local_bb: g.group_local_bb,
             group_effects: g.group_effects,
             rel_to_outer,
@@ -1195,7 +1198,8 @@ fn obtain_sample_backdrop(
                 deform_stack.pop();
             }
             BackdropItem::Object(oid) => {
-                let sym_ctx = active_sym.map(|sf| (&sf.sym_map, sf.sym_world_xf));
+                let sym_ctx = active_sym
+                    .map(|sf| (&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                 if let Some((active, frames)) =
                     build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                 {
@@ -1269,7 +1273,8 @@ fn obtain_sample_backdrop(
                         } else {
                             None
                         };
-                        let sym_ctx = Some((&sf.sym_map, sf.sym_world_xf));
+                        let sym_ctx =
+                            Some((&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                         if let Some((active, frames)) =
                             build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                         {
@@ -1342,6 +1347,10 @@ fn obtain_sample_backdrop(
                     continue;
                 }
                 if let NodePayload::PowerClip { container, .. } = &pc_obj.payload {
+                    let persp_container = pc_obj.perspective.map_or_else(
+                        || (**container).clone(),
+                        |p| p.transform_bezier_path(container),
+                    );
                     let (deformed_container, pc_local_xf, pc_parent_to_sub, pc_obj_to_sub) =
                         if let Some((active, frames)) =
                             build_deform_frames(doc, &deform_stack, parent_override, active_sym)
@@ -1359,7 +1368,7 @@ fn obtain_sample_backdrop(
                                     active_sym,
                                 ));
                             let def = apply_deform_chain_in_bounds(
-                                &apply_geometry_effects(container, &pc_obj.effects),
+                                &apply_geometry_effects(&persp_container, &pc_obj.effects),
                                 pc_rel_xf,
                                 &frames,
                             );
@@ -1379,7 +1388,7 @@ fn obtain_sample_backdrop(
                                     parent_override,
                                     active_sym,
                                 );
-                            let def = apply_geometry_effects(container, &pc_obj.effects);
+                            let def = apply_geometry_effects(&persp_container, &pc_obj.effects);
                             (def, pc_local_xf, pc_parent_to_sub, pc_obj_to_sub)
                         };
                     if !pc_obj.effects.is_empty() {
@@ -1736,7 +1745,8 @@ fn render_wireframe_lens(
                 deform_stack.pop();
             }
             BackdropItem::Object(oid) => {
-                let sym_ctx = active_sym.map(|sf| (&sf.sym_map, sf.sym_world_xf));
+                let sym_ctx = active_sym
+                    .map(|sf| (&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                 if let Some((active, frames)) =
                     build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                 {
@@ -1804,7 +1814,8 @@ fn render_wireframe_lens(
             BackdropItem::SymObjectIndex(sym_idx) => {
                 if let Some(sf) = active_sym {
                     if let Some(sub_obj) = sf.sym_def.objects.get(sym_idx) {
-                        let sym_ctx = Some((&sf.sym_map, sf.sym_world_xf));
+                        let sym_ctx =
+                            Some((&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                         if let Some((active, frames)) =
                             build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                         {
@@ -1876,6 +1887,10 @@ fn render_wireframe_lens(
                     continue;
                 }
                 if let NodePayload::PowerClip { container, .. } = &pc_obj.payload {
+                    let persp_container = pc_obj.perspective.map_or_else(
+                        || (**container).clone(),
+                        |p| p.transform_bezier_path(container),
+                    );
                     let (deformed_container, pc_obj_to_sub) = if let Some((active, frames)) =
                         build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                     {
@@ -1892,7 +1907,7 @@ fn render_wireframe_lens(
                                 active_sym,
                             ));
                         let def = apply_deform_chain_in_bounds(
-                            &apply_geometry_effects(container, &pc_obj.effects),
+                            &apply_geometry_effects(&persp_container, &pc_obj.effects),
                             pc_rel_xf,
                             &frames,
                         );
@@ -1911,7 +1926,7 @@ fn render_wireframe_lens(
                             active_sym,
                         );
                         (
-                            apply_geometry_effects(container, &pc_obj.effects),
+                            apply_geometry_effects(&persp_container, &pc_obj.effects),
                             pc_obj_to_sub,
                         )
                     };
@@ -2004,7 +2019,8 @@ fn rasterize_backdrop_coverage(
                 deform_stack.pop();
             }
             BackdropItem::Object(oid) => {
-                let sym_ctx = active_sym.map(|sf| (&sf.sym_map, sf.sym_world_xf));
+                let sym_ctx = active_sym
+                    .map(|sf| (&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                 let target_obj = active_sym
                     .and_then(|sf| sf.sym_map.get(&oid).copied())
                     .or_else(|| doc.object(oid));
@@ -2085,7 +2101,8 @@ fn rasterize_backdrop_coverage(
                         if !target_obj.visible || target_opacity <= 1e-6 {
                             continue;
                         }
-                        let sym_ctx = Some((&sf.sym_map, sf.sym_world_xf));
+                        let sym_ctx =
+                            Some((&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf));
                         if let Some((active, frames)) =
                             build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                         {
@@ -2163,6 +2180,10 @@ fn rasterize_backdrop_coverage(
                     continue;
                 }
                 if let NodePayload::PowerClip { container, .. } = &pc_obj.payload {
+                    let persp_container = pc_obj.perspective.map_or_else(
+                        || (**container).clone(),
+                        |p| p.transform_bezier_path(container),
+                    );
                     let (deformed_container, pc_obj_to_sub) = if let Some((active, frames)) =
                         build_deform_frames(doc, &deform_stack, parent_override, active_sym)
                     {
@@ -2179,7 +2200,7 @@ fn rasterize_backdrop_coverage(
                                 active_sym,
                             ));
                         let def = apply_deform_chain_in_bounds(
-                            &apply_geometry_effects(container, &pc_obj.effects),
+                            &apply_geometry_effects(&persp_container, &pc_obj.effects),
                             pc_rel_xf,
                             &frames,
                         );
@@ -2198,7 +2219,7 @@ fn rasterize_backdrop_coverage(
                             active_sym,
                         );
                         (
-                            apply_geometry_effects(container, &pc_obj.effects),
+                            apply_geometry_effects(&persp_container, &pc_obj.effects),
                             pc_obj_to_sub,
                         )
                     };
@@ -2329,7 +2350,7 @@ fn rasterize_silhouette_payload(
     obj_world_xf: Affine2D,
     deform_frames: &[DeformFrame<'_>],
     outer_to_sub: Affine2D,
-    sym_ctx: Option<(&HashMap<ObjectId, &SceneObject>, Affine2D)>,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
     paint: &BackendPaint,
     backend: &mut dyn CanvasBackend,
     depth: usize,
@@ -2408,7 +2429,7 @@ fn rasterize_silhouette_payload(
                     backend.push_clip(&deformed, FillRule::Winding, outer_to_sub);
                 }
                 for &cid in contents {
-                    if let Some((map, _)) = sym_ctx {
+                    if let Some((map, _, _)) = sym_ctx {
                         if let Some(sub) = map.get(&cid).copied() {
                             let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
                             if sub.visible && sub_opacity > 1e-6 {
@@ -2501,14 +2522,17 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::Group(children) => {
-            let group_has_deform = obj.effects.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
-                )
-            });
+            let group_has_deform = obj.perspective.is_some()
+                || obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                });
             if group_has_deform {
-                let group_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
+                let raw_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
                     doc.local_object_bounds(obj.id)
                 } else {
                     let mut v = HashSet::new();
@@ -2522,6 +2546,11 @@ fn rasterize_silhouette_payload(
                         &mut v,
                     )
                 };
+                let group_local_bb = if let Some(persp) = obj.perspective {
+                    raw_local_bb.and_then(|lb| persp.try_transform_rect(lb))
+                } else {
+                    raw_local_bb
+                };
                 let (next_outer_to_sub, rel_to_outer) = if deform_frames.is_empty() {
                     (world_xf, Affine2D::IDENTITY)
                 } else {
@@ -2530,12 +2559,13 @@ fn rasterize_silhouette_payload(
                 let mut extended = Vec::with_capacity(deform_frames.len() + 1);
                 extended.extend_from_slice(deform_frames);
                 extended.push(DeformFrame {
+                    pre_perspective: obj.perspective,
                     group_local_bb,
                     group_effects: &obj.effects,
                     rel_to_outer,
                 });
                 for &cid in children {
-                    if let Some((map, _)) = sym_ctx {
+                    if let Some((map, _, _)) = sym_ctx {
                         if let Some(sub) = map.get(&cid).copied() {
                             let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
                             if sub.visible && sub_opacity > 1e-6 {
@@ -2574,7 +2604,7 @@ fn rasterize_silhouette_payload(
                 }
             } else {
                 for &cid in children {
-                    if let Some((map, _)) = sym_ctx {
+                    if let Some((map, _, _)) = sym_ctx {
                         if let Some(sub) = map.get(&cid).copied() {
                             let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
                             if sub.visible && sub_opacity > 1e-6 {
@@ -2647,7 +2677,7 @@ fn rasterize_silhouette_payload(
                             child_world,
                             deform_frames,
                             outer_to_sub,
-                            Some((&child_map, obj_world_xf)),
+                            Some((&child_map, sym.objects.as_slice(), obj_world_xf)),
                             paint,
                             backend,
                             depth + 1,

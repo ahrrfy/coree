@@ -9143,3 +9143,584 @@ fn w1b_r28_remove_face_ignores_invisible_and_zero_opacity_artwork() {
     assert_eq!(pixel_at_mm(&img, 22.0, 60.0), [0, 255, 255, 255]);
     assert_eq!(pixel_at_mm(&img, 77.0, 60.0), [0, 255, 255, 255]);
 }
+
+#[test]
+fn w2_exit_r2_group_and_symbol_instance_effects_and_perspective_render() {
+    use coree_core::{BevelStyle, ExtrudeLight, FeatherDirection, Perspective3x3, SymbolDef};
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(20.0, 20.0, 40.0, 40.0),
+        &[
+            Point2D::new(26.0, 22.0),
+            Point2D::new(56.0, 26.0),
+            Point2D::new(62.0, 58.0),
+            Point2D::new(16.0, 56.0),
+        ],
+    )
+    .expect("valid perspective quad");
+
+    let effects_to_test: Vec<(&str, Option<Effect>, Option<Perspective3x3>)> = vec![
+        (
+            "InnerShadow",
+            Some(Effect::InnerShadow {
+                dx_mm: 3.0,
+                dy_mm: 3.0,
+                blur_mm: 2.0,
+                opacity: 0.85,
+                color: Color::BLACK,
+                feather_direction: FeatherDirection::Inside,
+            }),
+            None,
+        ),
+        (
+            "Bevel",
+            Some(Effect::Bevel {
+                style: BevelStyle::SoftEdge,
+                distance_mm: 3.0,
+                softness_mm: 0.8,
+                light_angle_deg: 135.0,
+                altitude_deg: 45.0,
+                highlight_color: Color::WHITE,
+                shadow_color: Color::BLACK,
+                intensity: 0.9,
+            }),
+            None,
+        ),
+        (
+            "Extrude3D",
+            Some(Effect::Extrude3D {
+                vanishing_point: Point2D::new(90.0, 10.0),
+                depth: 14.0,
+                bevel_depth: 1.0,
+                shade_color: Color::rgba8(20, 30, 60, 255),
+                rotation_3d: [18.0, -22.0, 0.0],
+                lights: vec![ExtrudeLight {
+                    dir: [0.4, -0.6, 0.7],
+                    intensity: 1.0,
+                }],
+            }),
+            None,
+        ),
+        (
+            "DropShadow",
+            Some(Effect::DropShadow {
+                dx_mm: 5.0,
+                dy_mm: 5.0,
+                blur_mm: 2.0,
+                opacity: 0.75,
+                color: Color::BLACK,
+                feather_direction: FeatherDirection::Middle,
+            }),
+            None,
+        ),
+        ("Perspective3x3", None, Some(persp)),
+    ];
+
+    for is_symbol in [false, true] {
+        let make_base = |eff: Option<Effect>, p: Option<Perspective3x3>| {
+            let mut doc = Document::new("ContainerFx", 120.0, 120.0, ColorMode::Rgb, 96.0);
+            let lid = doc.pages()[0].layers[0].id;
+            let child_fill = Fill::Solid(Color::rgba8(40, 130, 220, 255));
+            let target_id = if is_symbol {
+                let sym =
+                    SymbolDef::new("Badge", vec![rect_obj(20.0, 20.0, 40.0, 40.0, child_fill)]);
+                let sid = sym.id;
+                doc.insert_symbol(sym);
+                let inst = SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sid));
+                doc.add_object(inst, Some(lid)).unwrap()
+            } else {
+                let c = doc
+                    .add_object(rect_obj(20.0, 20.0, 40.0, 40.0, child_fill), Some(lid))
+                    .unwrap();
+                doc.group_objects(&[c], "Grp").unwrap()
+            };
+            if let Some(e) = eff {
+                coree_core::apply_command(
+                    &mut doc,
+                    &coree_core::CommandOp::AddEffect {
+                        id: target_id,
+                        effect: e,
+                    },
+                )
+                .unwrap();
+            }
+            if p.is_some() {
+                coree_core::apply_command(
+                    &mut doc,
+                    &coree_core::CommandOp::SetObjectPerspective {
+                        ids: vec![target_id],
+                        perspective: p,
+                    },
+                )
+                .unwrap();
+            }
+            (doc, target_id)
+        };
+
+        let (plain_doc, plain_id) = make_base(None, None);
+        let plain_page = render_page_to_rgba(&plain_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+        let (_, plain_iso) = coree_render::render_isolated_object_to_rgba(
+            &plain_doc,
+            0,
+            plain_id,
+            Affine2D::IDENTITY,
+            96.0,
+        )
+        .unwrap()
+        .expect("plain isolated");
+
+        for (label, eff, p) in &effects_to_test {
+            let (fx_doc, fx_id) = make_base(eff.clone(), *p);
+            let fx_page = render_page_to_rgba(&fx_doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+            let page_diff = plain_page
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(fx_page.rgba.as_chunks::<4>().0.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                page_diff > 50,
+                "{} with {label} must visually differ from plain in render_page_to_rgba (diff={page_diff})",
+                if is_symbol { "SymbolInstance" } else { "Group" }
+            );
+
+            let (_, fx_iso) = coree_render::render_isolated_object_to_rgba(
+                &fx_doc,
+                0,
+                fx_id,
+                Affine2D::IDENTITY,
+                96.0,
+            )
+            .unwrap()
+            .expect("fx isolated");
+            assert_ne!(
+                fx_iso.rgba,
+                plain_iso.rgba,
+                "{} with {label} must differ in render_isolated_object_to_rgba",
+                if is_symbol { "SymbolInstance" } else { "Group" }
+            );
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r4_powerclip_perspective_and_effects_deform_contents() {
+    use coree_core::Perspective3x3;
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 24.0, 24.0),
+        &[
+            Point2D::new(8.0, 0.0),
+            Point2D::new(16.0, 0.0),
+            Point2D::new(24.0, 24.0),
+            Point2D::new(0.0, 24.0),
+        ],
+    )
+    .expect("valid trapezoid homography");
+
+    let red_bbox_px = |rgba: &[u8], w: u32, h: u32| -> (usize, Option<(u32, u32, u32, u32)>) {
+        let mut count = 0usize;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                let r = rgba[idx];
+                let g = rgba[idx + 1];
+                let b = rgba[idx + 2];
+                let a = rgba[idx + 3];
+                if a > 128 && r > 180 && g < 80 && b < 80 {
+                    count += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let bb = (count > 0).then_some((min_x, min_y, max_x, max_y));
+        (count, bb)
+    };
+
+    for with_shadow in [false, true] {
+        let mut doc = Document::new("PCPerspRender", 160.0, 160.0, ColorMode::Rgb, 150.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let inner = SceneObject::new(
+            ObjectId(0),
+            "RedInner",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                52.0, 42.0, 20.0, 8.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(220, 20, 20, 255)));
+        let inner_id = doc.add_object(inner, Some(lid)).unwrap();
+        let container_obj = SceneObject::new(
+            ObjectId(0),
+            "TrapezoidPC",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 24.0, 24.0,
+            ))),
+        )
+        .with_transform(Affine2D::translate(50.0, 40.0))
+        .with_fill(Fill::Solid(Color::rgba8(245, 220, 40, 255)));
+        let pc_id = doc.add_object(container_obj, Some(lid)).unwrap();
+        doc.create_powerclip(pc_id, &[inner_id]).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::SetObjectPerspective {
+                ids: vec![pc_id],
+                perspective: Some(persp),
+            },
+        )
+        .unwrap();
+        if with_shadow {
+            coree_core::apply_command(
+                &mut doc,
+                &coree_core::CommandOp::AddEffect {
+                    id: pc_id,
+                    effect: Effect::DropShadow {
+                        dx_mm: 3.0,
+                        dy_mm: 3.0,
+                        blur_mm: 2.0,
+                        opacity: 0.6,
+                        color: Color::BLACK,
+                        feather_direction: FeatherDirection::Outside,
+                    },
+                },
+            )
+            .unwrap();
+        }
+
+        let page_img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+        let (page_red_count, page_red_bb) =
+            red_bbox_px(&page_img.rgba, page_img.width, page_img.height);
+        let (min_x, min_y, max_x, max_y) = page_red_bb.expect("red warped inner slice");
+        let px_per_mm = 150.0 / 25.4;
+        let min_x_mm = f64::from(min_x) / px_per_mm;
+        let min_y_mm = f64::from(min_y) / px_per_mm;
+        let max_x_mm = f64::from(max_x + 1) / px_per_mm;
+        let max_y_mm = f64::from(max_y + 1) / px_per_mm;
+
+        // Warped red rect corners: (58.47, 40.71)..(65.53, 40.71) at top, (57.38, 44.62)..(66.62, 44.62) at bottom.
+        // Unwarped would span x=55..69, y=42..50 (~3015 px).
+        assert!(
+            page_red_count > 600 && page_red_count < 1400,
+            "with_shadow={with_shadow}: expected warped trapezoid slice (~960 px), got {page_red_count}"
+        );
+        assert!(
+            min_x_mm >= 56.5 && max_x_mm <= 67.5 && min_y_mm >= 40.0 && max_y_mm <= 45.5,
+            "with_shadow={with_shadow}: red bbox ({min_x_mm:.2}, {min_y_mm:.2})..({max_x_mm:.2}, {max_y_mm:.2}) mm did not warp!"
+        );
+
+        let (iso_rect, iso_buf) =
+            coree_render::render_isolated_object_to_rgba(&doc, 0, pc_id, Affine2D::IDENTITY, 150.0)
+                .unwrap()
+                .expect("isolated PowerClip");
+        let (iso_red_count, iso_red_bb) = red_bbox_px(&iso_buf.rgba, iso_buf.width, iso_buf.height);
+        let (ix0, iy0, ix1, iy1) = iso_red_bb.expect("isolated red warped slice");
+        let iso_min_x_mm = iso_rect.min_x + f64::from(ix0) / px_per_mm;
+        let iso_min_y_mm = iso_rect.min_y + f64::from(iy0) / px_per_mm;
+        let iso_max_x_mm = iso_rect.min_x + f64::from(ix1 + 1) / px_per_mm;
+        let iso_max_y_mm = iso_rect.min_y + f64::from(iy1 + 1) / px_per_mm;
+        assert!(
+            (iso_red_count as isize - page_red_count as isize).abs() <= 80,
+            "with_shadow={with_shadow}: isolated red px {iso_red_count} vs page {page_red_count}"
+        );
+        assert!(
+            (iso_min_x_mm - min_x_mm).abs() < 0.5
+                && (iso_max_x_mm - max_x_mm).abs() < 0.5
+                && (iso_min_y_mm - min_y_mm).abs() < 0.5
+                && (iso_max_y_mm - max_y_mm).abs() < 0.5,
+            "with_shadow={with_shadow}: isolated bbox ({iso_min_x_mm:.2},{iso_min_y_mm:.2})..({iso_max_x_mm:.2},{iso_max_y_mm:.2}) != page ({min_x_mm:.2},{min_y_mm:.2})..({max_x_mm:.2},{max_y_mm:.2})"
+        );
+    }
+
+    // Nested PowerClip(Perspective3x3) inside translated Group(Perspective3x3)
+    let mut nested_doc = Document::new("NestedPCPersp", 160.0, 160.0, ColorMode::Rgb, 150.0);
+    let lid = nested_doc.pages()[0].layers[0].id;
+    let inner = SceneObject::new(
+        ObjectId(0),
+        "RedInner",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            2.0, 2.0, 20.0, 8.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 20, 20, 255)));
+    let inner_id = nested_doc.add_object(inner, Some(lid)).unwrap();
+    let pc = SceneObject::new(
+        ObjectId(0),
+        "NestedPC",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 24.0, 24.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(245, 220, 40, 255)));
+    let pc_id = nested_doc.add_object(pc, Some(lid)).unwrap();
+    nested_doc.create_powerclip(pc_id, &[inner_id]).unwrap();
+    coree_core::apply_command(
+        &mut nested_doc,
+        &coree_core::CommandOp::SetObjectPerspective {
+            ids: vec![pc_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+    let gid = nested_doc.group_objects(&[pc_id], "OuterGrp").unwrap();
+    coree_core::apply_command(
+        &mut nested_doc,
+        &coree_core::CommandOp::TransformObjects {
+            ids: vec![gid],
+            affine: Affine2D::translate(50.0, 40.0),
+        },
+    )
+    .unwrap();
+    let grp_persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 24.0, 24.0),
+        &[
+            Point2D::new(2.0, 2.0),
+            Point2D::new(22.0, 2.0),
+            Point2D::new(24.0, 24.0),
+            Point2D::new(0.0, 24.0),
+        ],
+    )
+    .unwrap();
+    coree_core::apply_command(
+        &mut nested_doc,
+        &coree_core::CommandOp::SetObjectPerspective {
+            ids: vec![gid],
+            perspective: Some(grp_persp),
+        },
+    )
+    .unwrap();
+
+    let nested_img = render_page_to_rgba(&nested_doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+    let (nested_red, nested_bb) =
+        red_bbox_px(&nested_img.rgba, nested_img.width, nested_img.height);
+    let (_, _, _, max_y) = nested_bb.expect("nested warped red slice");
+    let max_y_mm = f64::from(max_y + 1) / (150.0 / 25.4);
+    assert!(
+        nested_red > 400 && nested_red < 1200 && max_y_mm < 47.0,
+        "nested Group(Persp)->PowerClip(Persp) must warp contents cleanly (red={nested_red}, max_y_mm={max_y_mm:.2})"
+    );
+}
+
+#[test]
+fn w2_exit_r5_symbol_text_on_path_bspline_and_own_persp_text_render() {
+    use coree_core::{ArtisticText, BSplineCurve, Perspective3x3, TextOnPath, TextStyle};
+
+    let mut doc = Document::new("W2ExitR5Render", 160.0, 160.0, ColorMode::Rgb, 150.0);
+    let bs_host = SceneObject::new(
+        ObjectId(10),
+        "SymBSpline",
+        NodePayload::BSpline(BSplineCurve::from_control_points(
+            vec![
+                Point2D::new(5.0, 20.0),
+                Point2D::new(20.0, 20.0),
+                Point2D::new(35.0, 20.0),
+                Point2D::new(50.0, 20.0),
+            ],
+            3,
+            false,
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    let sym_top = SceneObject::new(
+        ObjectId(11),
+        "SymTOP",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain(
+                "BSPL",
+                TextStyle {
+                    fill: Color::rgba8(220, 20, 20, 255),
+                    font_size_pt: 14.0,
+                    ..Default::default()
+                },
+            ),
+            path_id: ObjectId(10),
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    );
+    let sym = SymbolDef::new("BSplineTOPSym", vec![bs_host, sym_top]);
+    let sid = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(50.0, 60.0)),
+        None,
+    )
+    .unwrap();
+
+    // Also add standalone ArtisticText with own Perspective3x3 shifted right into x=30..70, y=10..25
+    let mut art = SceneObject::new(
+        ObjectId(0),
+        "OwnPerspArt",
+        NodePayload::ArtisticText(ArtisticText::from_plain(
+            "ART",
+            TextStyle {
+                fill: Color::rgba8(20, 180, 40, 255),
+                font_size_pt: 16.0,
+                ..Default::default()
+            },
+        )),
+    )
+    .with_transform(Affine2D::translate(10.0, 10.0));
+    art.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 20.0, 10.0),
+            &[
+                Point2D::new(20.0, 5.0),
+                Point2D::new(50.0, 5.0),
+                Point2D::new(50.0, 18.0),
+                Point2D::new(20.0, 18.0),
+            ],
+        )
+        .unwrap(),
+    );
+    doc.add_object(art, None).unwrap();
+
+    let img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+    let px_per_mm = 150.0 / 25.4;
+    let mut red_min_y = f64::INFINITY;
+    let mut green_min_x = f64::INFINITY;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let idx = ((y * img.width + x) * 4) as usize;
+            let [r, g, b, a] = [
+                img.rgba[idx],
+                img.rgba[idx + 1],
+                img.rgba[idx + 2],
+                img.rgba[idx + 3],
+            ];
+            if a > 128 && r > 160 && g < 80 && b < 80 {
+                red_min_y = red_min_y.min(f64::from(y) / px_per_mm);
+            }
+            if a > 128 && g > 140 && r < 80 && b < 80 {
+                green_min_x = green_min_x.min(f64::from(x) / px_per_mm);
+            }
+        }
+    }
+    assert!(
+        red_min_y.is_finite() && red_min_y > 70.0,
+        "BSpline TextOnPath inside SymbolDef must render along y~80mm, got red_min_y={red_min_y:.2}"
+    );
+    assert!(
+        green_min_x.is_finite() && green_min_x >= 28.0,
+        "Own-perspective ArtisticText must warp horizontally to x>=30mm, got green_min_x={green_min_x:.2}"
+    );
+}
+
+#[test]
+fn w2_exit_r8_symbol_zero_id_persp_group_text_on_path_pixel_parity() {
+    use coree_core::{ArtisticText, Perspective3x3, TextOnPath, TextStyle};
+
+    let mut doc = Document::new("W2ExitR8_P5_Render", 240.0, 240.0, ColorMode::Rgb, 150.0);
+    let host = SceneObject::new(
+        ObjectId(20),
+        "Host20",
+        NodePayload::Path(BezierPath::from_line(
+            Point2D::new(0.0, 5.0),
+            Point2D::new(30.0, 5.0),
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    let mut top = SceneObject::new(
+        ObjectId(21),
+        "Top21",
+        NodePayload::TextOnPath(TextOnPath {
+            text: ArtisticText::from_plain(
+                "ZERO",
+                TextStyle {
+                    fill: Color::rgba8(220, 20, 20, 255),
+                    font_size_pt: 14.0,
+                    ..Default::default()
+                },
+            ),
+            path_id: ObjectId(20),
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        }),
+    )
+    .with_outline(OutlineStyle::none());
+    top.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+            &[
+                Point2D::new(20.0, 20.0),
+                Point2D::new(60.0, 20.0),
+                Point2D::new(60.0, 40.0),
+                Point2D::new(20.0, 40.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let mut zero_grp = SceneObject::new(
+        ObjectId(0),
+        "ZeroGrp",
+        NodePayload::Group(vec![ObjectId(20), ObjectId(21)]),
+    )
+    .with_transform(Affine2D::translate(10.0, 10.0));
+    zero_grp.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(20.0, 20.0, 40.0, 20.0),
+            &[
+                Point2D::new(100.0, 100.0),
+                Point2D::new(180.0, 100.0),
+                Point2D::new(180.0, 140.0),
+                Point2D::new(100.0, 140.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let sym = SymbolDef::new("P5RenderSym", vec![zero_grp, host, top]);
+    let sid = sym.id;
+    doc.insert_symbol(sym);
+    let inst_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "P5Inst", NodePayload::SymbolInstance(sid))
+                .with_transform(Affine2D::translate(20.0, 20.0)),
+            None,
+        )
+        .unwrap();
+
+    let wb = doc.world_object_bounds(inst_id).unwrap();
+    let img = render_page_to_rgba(&doc, 0, 150.0, ViewMode::Enhanced).unwrap();
+    let px_per_mm = 150.0 / 25.4;
+    let mut red_min_x = f64::INFINITY;
+    let mut red_max_x = f64::NEG_INFINITY;
+    let mut red_min_y = f64::INFINITY;
+    let mut red_max_y = f64::NEG_INFINITY;
+    let mut red_px = 0usize;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let idx = ((y * img.width + x) * 4) as usize;
+            let [r, g, b, a] = [
+                img.rgba[idx],
+                img.rgba[idx + 1],
+                img.rgba[idx + 2],
+                img.rgba[idx + 3],
+            ];
+            if a > 128 && r > 150 && g < 90 && b < 90 {
+                red_px += 1;
+                red_min_x = red_min_x.min(f64::from(x) / px_per_mm);
+                red_max_x = red_max_x.max(f64::from(x) / px_per_mm);
+                red_min_y = red_min_y.min(f64::from(y) / px_per_mm);
+                red_max_y = red_max_y.max(f64::from(y) / px_per_mm);
+            }
+        }
+    }
+    assert!(red_px > 40, "must render visible red glyph pixels");
+    assert!(
+        red_min_x >= 128.0 && red_max_x <= 212.0 && red_min_y >= 130.0 && red_max_y <= 155.0,
+        "ObjectId(0) Group(translate, persp) + TextOnPath(sub.persp) must render inside (128..212, 130..155) matching bounds {wb:?}, got ({red_min_x:.2}..{red_max_x:.2}, {red_min_y:.2}..{red_max_y:.2})"
+    );
+}

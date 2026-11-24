@@ -14,10 +14,13 @@
 //!   mm-scaled SVG, and EPSF-3.0 PostScript.
 
 use crate::error::{ProdError, ProdResult};
-use crate::scene_helpers::{collect_effective_layers, get_page, MAX_SCENE_DEPTH};
+use crate::scene_helpers::{
+    collect_effective_layers, get_page, sym_world_transform_of, world_bounds_with_sym_xf,
+    SymBoundsCtx, SymParentRef, MAX_SCENE_DEPTH,
+};
 use coree_core::{
-    Affine2D, BezierPath, Color, Document, Fill, Layer, NodePayload, ObjectId, Point2D, Rect2D,
-    SceneObject, Vec2D,
+    Affine2D, ArtisticMedia, BezierPath, Color, Document, Effect, Fill, Layer, NodePayload,
+    ObjectId, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId, Vec2D,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1198,16 +1201,20 @@ pub fn plan_laser_toolpath(
             continue;
         }
         let mut visiting = HashSet::new();
+        let mut visiting_syms = HashSet::new();
         for &oid in &layer.objects {
             collect_laser_polylines_recursive(
                 doc,
                 layer,
                 oid,
                 Affine2D::IDENTITY,
+                None,
+                None,
                 sel_set.as_ref(),
                 false,
                 0,
                 &mut visiting,
+                &mut visiting_syms,
                 &config.rules,
                 &mut rule_buckets,
                 &mut fallback_cut_bucket,
@@ -1419,16 +1426,110 @@ fn origin_home_in_page_coords(
     }
 }
 
+fn apply_obj_perspective_to_local_path(local: BezierPath, obj: &SceneObject) -> BezierPath {
+    let mut cur = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local)
+    } else {
+        local
+    };
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(bb) = cur.bounding_box() {
+                if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                    cur = h.transform_bezier_path(&cur);
+                }
+            }
+        }
+    }
+    cur
+}
+
+#[inline]
+fn warp_local_to_world(
+    local: &BezierPath,
+    world_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    if let Some(pp) = parent_persp {
+        pp.compose(&Perspective3x3::from_affine(*obj_xf))
+            .transform_bezier_path(local)
+    } else {
+        local.transformed(world_xf)
+    }
+}
+
+#[inline]
+fn compose_laser_parent_persp(
+    parent_persp: Option<Perspective3x3>,
+    parent_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    own_persp: Option<Perspective3x3>,
+) -> Option<Perspective3x3> {
+    match (parent_persp, own_persp) {
+        (Some(pp), Some(op)) => Some(
+            pp.compose(&Perspective3x3::from_affine(*obj_xf))
+                .compose(&op),
+        ),
+        (Some(pp), None) => Some(pp.compose(&Perspective3x3::from_affine(*obj_xf))),
+        (None, Some(op)) => {
+            let world_xf = parent_xf.compose(obj_xf);
+            Some(Perspective3x3::from_affine(world_xf).compose(&op))
+        }
+        (None, None) => None,
+    }
+}
+
+fn container_own_persp(doc: &Document, obj: &SceneObject) -> Option<Perspective3x3> {
+    let mut own = obj.perspective;
+    let has_eff_persp = obj
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::Perspective { .. }));
+    if has_eff_persp {
+        let raw_bb = match &obj.payload {
+            NodePayload::SymbolInstance(sym_id) => {
+                doc.symbol_bounds_with_xf_and_space(*sym_id, &Affine2D::IDENTITY, None)
+            }
+            NodePayload::PowerClip { container, .. } => container.bounding_box(),
+            _ if obj.id.0 != 0 => doc.local_object_bounds(obj.id),
+            _ => None,
+        };
+        let mut cur_bb = match (own, raw_bb) {
+            (Some(p), Some(bb)) => p.try_transform_rect(bb),
+            (None, Some(bb)) => Some(bb),
+            (_, None) => None,
+        };
+        for eff in &obj.effects {
+            if let Effect::Perspective { quad } = eff {
+                if let Some(bb) = cur_bb {
+                    if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                        own = Some(match own {
+                            Some(prev) => h.compose(&prev),
+                            None => h,
+                        });
+                        cur_bb = h.try_transform_rect(bb);
+                    }
+                }
+            }
+        }
+    }
+    own
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_laser_polylines_recursive(
     doc: &Document,
     layer: &Layer,
     id: ObjectId,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
     sel_set: Option<&HashSet<ObjectId>>,
     ancestor_selected: bool,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
     rules: &[LaserLayerRule],
     rule_buckets: &mut [Vec<ExtractedPolyline>],
     fallback_cut: &mut Vec<ExtractedPolyline>,
@@ -1439,134 +1540,84 @@ fn collect_laser_polylines_recursive(
         return;
     }
 
-    if let Some(obj) = doc.object(id) {
-        if !obj.visible {
-            visiting.remove(&id);
-            return;
-        }
-        let world_xf = parent_xf.compose(&obj.transform);
-        if !world_xf.is_finite() {
-            visiting.remove(&id);
-            return;
-        }
-
+    let obj_opt = if let Some(ctx) = sym_ctx {
+        ctx.sym_map.get(&id).copied()
+    } else {
+        doc.object(id)
+    };
+    if let Some(obj) = obj_opt {
         let is_selected = ancestor_selected || sel_set.is_none_or(|set| set.contains(&id));
+        collect_laser_scene_object_polylines(
+            doc,
+            layer,
+            obj,
+            parent_xf,
+            parent_persp,
+            sym_ctx,
+            sel_set,
+            is_selected,
+            depth,
+            visiting,
+            visiting_syms,
+            rules,
+            rule_buckets,
+            fallback_cut,
+            fallback_engrave,
+            total_extracted,
+        );
+    }
 
-        match &obj.payload {
-            NodePayload::Group(children) => {
-                for &cid in children {
-                    collect_laser_polylines_recursive(
-                        doc,
-                        layer,
-                        cid,
-                        world_xf,
-                        sel_set,
-                        is_selected,
-                        depth + 1,
-                        visiting,
-                        rules,
-                        rule_buckets,
-                        fallback_cut,
-                        fallback_engrave,
-                        total_extracted,
-                    );
-                }
-                visiting.remove(&id);
-                return;
-            }
-            NodePayload::PowerClip {
-                container,
-                contents,
-                ..
-            } => {
-                if is_selected {
-                    let world_path = container.transformed(&world_xf);
-                    classify_and_push_path(
-                        layer,
-                        obj,
-                        &world_path,
-                        rules,
-                        rule_buckets,
-                        fallback_cut,
-                        fallback_engrave,
-                        total_extracted,
-                    );
-                }
-                for &cid in contents {
-                    collect_laser_polylines_recursive(
-                        doc,
-                        layer,
-                        cid,
-                        world_xf,
-                        sel_set,
-                        is_selected,
-                        depth + 1,
-                        visiting,
-                        rules,
-                        rule_buckets,
-                        fallback_cut,
-                        fallback_engrave,
-                        total_extracted,
-                    );
-                }
-                visiting.remove(&id);
-                return;
-            }
-            NodePayload::SymbolInstance(sym_id) => {
-                if is_selected {
-                    if let Some(sym) = doc.symbol(*sym_id) {
-                        for sub in &sym.objects {
-                            if !sub.visible {
-                                continue;
-                            }
-                            let sub_xf = world_xf.compose(&sub.transform);
-                            if !sub_xf.is_finite() {
-                                continue;
-                            }
-                            let sub_path = match &sub.payload {
-                                NodePayload::Path(p) => Some(p.transformed(&sub_xf)),
-                                NodePayload::Shape(s) => {
-                                    Some(s.to_bezier_path().transformed(&sub_xf))
-                                }
-                                _ => None,
-                            };
-                            if let Some(path) = sub_path {
-                                classify_and_push_path(
-                                    layer,
-                                    sub,
-                                    &path,
-                                    rules,
-                                    rule_buckets,
-                                    fallback_cut,
-                                    fallback_engrave,
-                                    total_extracted,
-                                );
-                            }
-                        }
-                    }
-                }
-                visiting.remove(&id);
-                return;
-            }
-            _ => {}
-        }
+    visiting.remove(&id);
+}
 
-        if is_selected {
-            let world_path = match &obj.payload {
-                NodePayload::Path(p) => Some(p.transformed(&world_xf)),
-                NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
-                NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
-                NodePayload::Connector(c) => {
-                    let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
-                    Some(c.route_path(a, b))
-                }
-                _ => None,
-            };
-            if let Some(path) = world_path {
-                classify_and_push_path(
+#[allow(clippy::too_many_arguments)]
+fn collect_laser_scene_object_polylines(
+    doc: &Document,
+    layer: &Layer,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    sel_set: Option<&HashSet<ObjectId>>,
+    is_selected: bool,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    rules: &[LaserLayerRule],
+    rule_buckets: &mut [Vec<ExtractedPolyline>],
+    fallback_cut: &mut Vec<ExtractedPolyline>,
+    fallback_engrave: &mut Vec<ExtractedPolyline>,
+    total_extracted: &mut usize,
+) {
+    if depth > MAX_SCENE_DEPTH || *total_extracted >= MAX_PLAN_POLYLINES || !obj.visible {
+        return;
+    }
+    let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        return;
+    }
+
+    match &obj.payload {
+        NodePayload::Clone { .. } => {
+            if let Some((eff_payload, eff_fill, eff_outline)) =
+                doc.resolve_clone_payload_and_style(obj)
+            {
+                let mut tmp = obj.clone();
+                tmp.payload = eff_payload;
+                tmp.fill = eff_fill;
+                tmp.outline = eff_outline;
+                collect_laser_scene_object_polylines(
+                    doc,
                     layer,
-                    obj,
-                    &path,
+                    &tmp,
+                    parent_xf,
+                    parent_persp,
+                    sym_ctx,
+                    sel_set,
+                    is_selected,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
                     rules,
                     rule_buckets,
                     fallback_cut,
@@ -1574,10 +1625,263 @@ fn collect_laser_polylines_recursive(
                     total_extracted,
                 );
             }
+            return;
         }
+        NodePayload::Group(children) => {
+            let own_persp = container_own_persp(doc, obj);
+            let child_persp =
+                compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
+            for &cid in children {
+                collect_laser_polylines_recursive(
+                    doc,
+                    layer,
+                    cid,
+                    world_xf,
+                    child_persp,
+                    sym_ctx,
+                    sel_set,
+                    is_selected,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    rules,
+                    rule_buckets,
+                    fallback_cut,
+                    fallback_engrave,
+                    total_extracted,
+                );
+            }
+            return;
+        }
+        NodePayload::PowerClip {
+            container,
+            contents,
+            ..
+        } => {
+            if is_selected {
+                let local = apply_obj_perspective_to_local_path((**container).clone(), obj);
+                let world_path =
+                    warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                classify_and_push_path(
+                    layer,
+                    obj,
+                    &world_path,
+                    rules,
+                    rule_buckets,
+                    fallback_cut,
+                    fallback_engrave,
+                    total_extracted,
+                );
+            }
+            let own_persp = container_own_persp(doc, obj);
+            let child_persp =
+                compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
+            for &cid in contents {
+                collect_laser_polylines_recursive(
+                    doc,
+                    layer,
+                    cid,
+                    world_xf,
+                    child_persp,
+                    sym_ctx,
+                    sel_set,
+                    is_selected,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    rules,
+                    rule_buckets,
+                    fallback_cut,
+                    fallback_engrave,
+                    total_extracted,
+                );
+            }
+            return;
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if is_selected && visiting_syms.insert(*sym_id) {
+                let own_persp = container_own_persp(doc, obj);
+                let child_persp =
+                    compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
+                if let Some(sym) = doc.symbol(*sym_id) {
+                    let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                    let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                    let mut referenced_children: HashSet<ObjectId> = HashSet::new();
+                    for (idx, sub) in sym.objects.iter().enumerate() {
+                        if sub.id.0 != 0 {
+                            local_map.insert(sub.id, sub);
+                        }
+                        let parent_ref = if sub.id.0 != 0 {
+                            SymParentRef::Id(sub.id)
+                        } else {
+                            SymParentRef::RootIndex(idx)
+                        };
+                        match &sub.payload {
+                            NodePayload::Group(c) => {
+                                for &cid in c {
+                                    referenced_children.insert(cid);
+                                    if cid.0 != 0 {
+                                        sym_parent_map.entry(cid).or_insert(parent_ref);
+                                    }
+                                }
+                            }
+                            NodePayload::PowerClip { contents, .. } => {
+                                for &cid in contents {
+                                    referenced_children.insert(cid);
+                                    if cid.0 != 0 {
+                                        sym_parent_map.entry(cid).or_insert(parent_ref);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut sym_visited = HashSet::new();
+                    let ctx = SymBoundsCtx {
+                        root_xf: &world_xf,
+                        sym_objects: &sym.objects,
+                        sym_map: &local_map,
+                        sym_parent_map: &sym_parent_map,
+                    };
+                    for sub in &sym.objects {
+                        if sub.id.0 != 0
+                            && (referenced_children.contains(&sub.id)
+                                || !sym_visited.insert(sub.id))
+                        {
+                            continue;
+                        }
+                        collect_laser_scene_object_polylines(
+                            doc,
+                            layer,
+                            sub,
+                            world_xf,
+                            child_persp,
+                            Some(&ctx),
+                            None,
+                            true,
+                            depth + 1,
+                            &mut sym_visited,
+                            visiting_syms,
+                            rules,
+                            rule_buckets,
+                            fallback_cut,
+                            fallback_engrave,
+                            total_extracted,
+                        );
+                    }
+                }
+                visiting_syms.remove(sym_id);
+            }
+            return;
+        }
+        _ => {}
     }
 
-    visiting.remove(&id);
+    if is_selected {
+        let world_path = match &obj.payload {
+            NodePayload::Path(p) => {
+                let local = apply_obj_perspective_to_local_path(p.clone(), obj);
+                Some(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ))
+            }
+            NodePayload::Shape(s) => {
+                let local = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
+                Some(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ))
+            }
+            NodePayload::BSpline(bs) => {
+                let local = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
+                Some(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ))
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let expanded = ArtisticMedia::expand_stroke(spine, style);
+                let local = apply_obj_perspective_to_local_path(expanded, obj);
+                Some(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ))
+            }
+            NodePayload::Table(t) => {
+                let local = apply_obj_perspective_to_local_path(t.to_grid_paths(), obj);
+                Some(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ))
+            }
+            NodePayload::Connector(c) => {
+                let route = if let Some(ctx) = sym_ctx {
+                    let resolve_ep = |oid_opt: Option<ObjectId>,
+                                      anchor: &coree_core::AnchorPoint,
+                                      fallback: Point2D| {
+                        oid_opt
+                            .and_then(|oid| {
+                                if let Some(sub) = ctx.sym_map.get(&oid).copied() {
+                                    let p_xf = sym_world_transform_of(
+                                        oid,
+                                        ctx.root_xf,
+                                        ctx.sym_objects,
+                                        ctx.sym_map,
+                                        ctx.sym_parent_map,
+                                    )?;
+                                    world_bounds_with_sym_xf(doc, oid, sub, &p_xf, Some(ctx))
+                                } else {
+                                    doc.world_object_bounds(oid)
+                                }
+                            })
+                            .map_or_else(
+                                || world_xf.transform_point(fallback),
+                                |bb| anchor.resolve(bb),
+                            )
+                    };
+                    let a = resolve_ep(c.from_obj, &c.from_anchor, c.from_fallback);
+                    let b = resolve_ep(c.to_obj, &c.to_anchor, c.to_fallback);
+                    c.route_path(a, b)
+                } else {
+                    let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
+                    c.route_path(a, b)
+                };
+                let warped = if let Some(pp) = parent_persp {
+                    let local_route = parent_xf
+                        .inverse()
+                        .map_or(route.clone(), |inv| route.transformed(&inv));
+                    pp.transform_bezier_path(&local_route)
+                } else {
+                    route
+                };
+                Some(warped)
+            }
+            _ => None,
+        };
+        if let Some(path) = world_path {
+            classify_and_push_path(
+                layer,
+                obj,
+                &path,
+                rules,
+                rule_buckets,
+                fallback_cut,
+                fallback_engrave,
+                total_extracted,
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

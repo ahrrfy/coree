@@ -20,6 +20,130 @@ pub mod svg;
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-io";
 
+pub(crate) type ExportSymCtx<'a> = (
+    &'a std::collections::HashMap<coree_core::ObjectId, &'a coree_core::SceneObject>,
+    &'a [coree_core::SceneObject],
+    coree_core::Affine2D,
+);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ExportSymParentRef {
+    Id(coree_core::ObjectId),
+    RootIndex(usize),
+}
+
+fn sym_object_world_xf(
+    id: coree_core::ObjectId,
+    sym_root_xf: &coree_core::Affine2D,
+    sym_map: &std::collections::HashMap<coree_core::ObjectId, &coree_core::SceneObject>,
+    sym_objects: &[coree_core::SceneObject],
+) -> Option<coree_core::Affine2D> {
+    let mut chain = Vec::new();
+    let mut cur = ExportSymParentRef::Id(id);
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(cur) {
+        let obj = match cur {
+            ExportSymParentRef::Id(oid) => sym_map.get(&oid).copied()?,
+            ExportSymParentRef::RootIndex(idx) => sym_objects.get(idx)?,
+        };
+        chain.push(obj.transform);
+        match cur {
+            ExportSymParentRef::Id(oid) => {
+                let parent = sym_objects.iter().enumerate().find_map(|(idx, po)| {
+                    let contains = match &po.payload {
+                        coree_core::NodePayload::Group(c) => c.contains(&oid),
+                        coree_core::NodePayload::PowerClip { contents, .. } => {
+                            contents.contains(&oid)
+                        }
+                        _ => false,
+                    };
+                    contains.then_some(if po.id.0 != 0 {
+                        ExportSymParentRef::Id(po.id)
+                    } else {
+                        ExportSymParentRef::RootIndex(idx)
+                    })
+                });
+                match parent {
+                    Some(pid) => cur = pid,
+                    None => break,
+                }
+            }
+            ExportSymParentRef::RootIndex(_) => break,
+        }
+    }
+    let mut xf = *sym_root_xf;
+    for local in chain.into_iter().rev() {
+        xf = xf.compose(&local);
+    }
+    xf.is_finite().then_some(xf)
+}
+
+pub(crate) fn resolve_export_world_path(
+    doc: &coree_core::Document,
+    path_id: coree_core::ObjectId,
+    sym_ctx: Option<ExportSymCtx<'_>>,
+) -> Option<coree_core::BezierPath> {
+    if let Some((sym_map, sym_objects, sym_root_xf)) = sym_ctx {
+        if let Some(sub) = sym_map.get(&path_id).copied() {
+            let p_xf = sym_object_world_xf(path_id, &sym_root_xf, sym_map, sym_objects)?;
+            let local = match &sub.payload {
+                coree_core::NodePayload::Path(p) => Some(p.clone()),
+                coree_core::NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                coree_core::NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                coree_core::NodePayload::ArtisticMedia { spine, style } => {
+                    Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                }
+                coree_core::NodePayload::Clone { .. } => doc
+                    .resolve_clone_payload_and_style(sub)
+                    .and_then(|(eff_p, _, _)| match eff_p {
+                        coree_core::NodePayload::Path(p) => Some(p),
+                        coree_core::NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        coree_core::NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        coree_core::NodePayload::ArtisticMedia { spine, style } => {
+                            Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
+                        }
+                        coree_core::NodePayload::PowerClip { container, .. } => Some(*container),
+                        _ => None,
+                    }),
+                coree_core::NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+                _ => None,
+            }?;
+            let warped = if let Some(persp) = sub.perspective {
+                persp.transform_bezier_path(&local)
+            } else {
+                local
+            };
+            return Some(warped.transformed(&p_xf));
+        }
+    }
+    doc.world_path_of(path_id)
+}
+
+pub(crate) fn resolve_export_connector_endpoints(
+    doc: &coree_core::Document,
+    conn: &coree_core::ConnectorObject,
+    base_world_xf: &coree_core::Affine2D,
+    sym_ctx: Option<ExportSymCtx<'_>>,
+) -> (coree_core::Point2D, coree_core::Point2D) {
+    let Some((sym_map, _, sym_root_xf)) = sym_ctx else {
+        return doc.resolve_connector_endpoints(conn);
+    };
+    let mut visiting = std::collections::HashMap::new();
+    let mut visited_syms = std::collections::HashSet::new();
+    let mut cache = std::collections::HashMap::new();
+    coree_core::hit_test::resolve_connector_endpoints_with_sym(
+        doc,
+        conn,
+        base_world_xf,
+        Some((sym_map, sym_root_xf)),
+        &mut visiting,
+        &mut visited_syms,
+        &mut cache,
+        0,
+    )
+    .0
+}
+
 // Ergonomic top-level re-exports
 pub use atomic::{atomic_write_bytes, atomic_write_with};
 pub use cad_plot::{

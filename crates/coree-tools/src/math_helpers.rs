@@ -5,10 +5,11 @@
 
 use crate::types::{NodeDragPart, ParametricHandleKind, ScaleHandle};
 use coree_core::{
-    hit_test_point, hit_test_powerclip_contents, Affine2D, AnchorPoint, BezierPath, Color,
-    CommandOp, Document, Effect, EllipseMode, Fill, GradientStop, GuideOrientation, LayerId,
-    MeshNode, NodeKind, NodePayload, NodeRef, ObjectId, ParametricShape, PathNode, Point2D, Rect2D,
-    SceneObject, Subpath, Viewport,
+    hit_test_object_warped_world_bounds, hit_test_object_warped_world_path, hit_test_point,
+    hit_test_powerclip_contents, Affine2D, AnchorPoint, BezierPath, Color, CommandOp, Document,
+    Effect, EllipseMode, Fill, GradientStop, GuideOrientation, LayerId, MeshNode, NodeKind,
+    NodePayload, NodeRef, ObjectId, ParametricShape, PathNode, Point2D, Rect2D, SceneObject,
+    Subpath, Viewport,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -818,11 +819,12 @@ pub fn hit_test_powerclip_edit_point(
                 if !obj.visible || obj.locked {
                     continue;
                 }
-                if let Some(wp) = doc.world_path_of(cid) {
+                if let Some(wp) = hit_test_object_warped_world_path(doc, cid, Some(pc_id)) {
                     if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
                         return Some(cid);
                     }
-                } else if let Some(bb) = doc.world_object_bounds(cid) {
+                } else if let Some(bb) = hit_test_object_warped_world_bounds(doc, cid, Some(pc_id))
+                {
                     if bb.contains_point(world_pt) {
                         return Some(cid);
                     }
@@ -865,11 +867,11 @@ pub fn hit_test_canvas_point_in_doc(
                 if !obj.visible || obj.locked {
                     continue;
                 }
-                if let Some(wp) = doc.world_path_of(oid) {
+                if let Some(wp) = hit_test_object_warped_world_path(doc, oid, None) {
                     if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
                         return Some(oid);
                     }
-                } else if let Some(bb) = doc.world_object_bounds(oid) {
+                } else if let Some(bb) = hit_test_object_warped_world_bounds(doc, oid, None) {
                     if bb.contains_point(world_pt) {
                         return Some(oid);
                     }
@@ -1223,6 +1225,10 @@ pub fn object_preview_world_path(
     match &obj.payload {
         NodePayload::Path(p) => Some(p.transformed(&world_xf)),
         NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
+        NodePayload::BSpline(bs) => Some(bs.to_bezier_path().transformed(&world_xf)),
+        NodePayload::ArtisticMedia { spine, style } => {
+            Some(coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf))
+        }
         NodePayload::PowerClip { container, .. } => Some(container.transformed(&world_xf)),
         _ => doc
             .local_object_bounds(id)

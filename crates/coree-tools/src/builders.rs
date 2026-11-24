@@ -11,13 +11,13 @@ use crate::math_helpers::{
 use crate::output::{ToolActionRequest, ToolOutput};
 use crate::types::ToolId;
 use coree_core::{
-    closed_subpaths_contain_even_odd, hit_test_powerclip_contents_rect, hit_test_rect,
-    segment_min_dist_to_point, Affine2D, AnchorPoint, ArtisticMediaStyle, ArtisticText,
-    BSplineCurve, BezierPath, Color, CommandOp, ConnectorObject, ConnectorStyle, ContourMode,
-    DimensionKind, DimensionObject, Document, Effect, EllipseMode, FeatherDirection, Fill,
-    GradientStop, LayerId, LiveSketch, NodeKind, NodePayload, ObjectId, OutlineStyle,
-    ParagraphText, ParametricShape, PathNode, Perspective3x3, Point2D, Rect2D, SceneObject,
-    SmartDrawing, Subpath, TransparencyMode, Vec2D, VectorTable,
+    closed_subpaths_contain_even_odd, hit_test_object_warped_world_bounds,
+    hit_test_powerclip_contents_rect, hit_test_rect, segment_min_dist_to_point, Affine2D,
+    AnchorPoint, ArtisticMediaStyle, ArtisticText, BSplineCurve, BezierPath, Color, CommandOp,
+    ConnectorObject, ConnectorStyle, ContourMode, DimensionKind, DimensionObject, Document, Effect,
+    EllipseMode, FeatherDirection, Fill, GradientStop, LayerId, LiveSketch, NodeKind, NodePayload,
+    ObjectId, OutlineStyle, ParagraphText, ParametricShape, PathNode, Perspective3x3, Point2D,
+    Rect2D, SceneObject, SmartDrawing, Subpath, TransparencyMode, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -79,7 +79,7 @@ pub fn compute_lasso_hits_scoped(
     };
     let mut hits = Vec::new();
     for oid in candidates {
-        let Some(bb) = doc.world_object_bounds(oid) else {
+        let Some(bb) = hit_test_object_warped_world_bounds(doc, oid, powerclip_edit_id) else {
             continue;
         };
         let test_pts = [
@@ -310,7 +310,7 @@ pub fn build_knife_cut_op(
             return;
         };
         match &obj.payload {
-            NodePayload::Path(_) | NodePayload::Shape(_) => {
+            NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_) => {
                 if doc
                     .world_object_bounds(id)
                     .is_some_and(|wb| wb.intersects(cut_bb))
@@ -430,9 +430,12 @@ pub fn build_knife_cut_op(
 
 fn is_editable_vector_object(doc: &Document, oid: ObjectId) -> bool {
     is_object_editable_in_doc(doc, oid)
-        && doc
-            .object(oid)
-            .is_some_and(|o| matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_)))
+        && doc.object(oid).is_some_and(|o| {
+            matches!(
+                o.payload,
+                NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_)
+            )
+        })
 }
 
 fn path_hits_point_within_tol(path: &BezierPath, pt: Point2D, tol: f64) -> bool {
@@ -479,7 +482,7 @@ fn find_vector_hit_in_subtree(
         return None;
     }
     match &obj.payload {
-        NodePayload::Path(_) | NodePayload::Shape(_) => {
+        NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_) => {
             if !is_object_editable_in_doc(doc, id) {
                 return None;
             }
@@ -527,7 +530,7 @@ fn collect_visible_vsd_cutter_ids(ctx: &ToolReadContext<'_>) -> Vec<ObjectId> {
             return;
         }
         match &obj.payload {
-            NodePayload::Path(_) | NodePayload::Shape(_) => {
+            NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_) => {
                 out.push(oid);
             }
             NodePayload::Group(children) => {
@@ -743,6 +746,7 @@ pub fn build_virtual_segment_delete_stroke_ops(
         let orig_local = match ctx.document.object(oid).map(|o| &o.payload) {
             Some(NodePayload::Path(p)) => p.clone(),
             Some(NodePayload::Shape(s)) => s.to_bezier_path(),
+            Some(NodePayload::BSpline(bs)) => bs.to_bezier_path(),
             _ => continue,
         };
         if updated_local == orig_local {
@@ -1099,6 +1103,8 @@ pub fn is_fillable_leaf_payload(payload: &NodePayload) -> bool {
         payload,
         NodePayload::Path(_)
             | NodePayload::Shape(_)
+            | NodePayload::BSpline(_)
+            | NodePayload::ArtisticMedia { .. }
             | NodePayload::ArtisticText(_)
             | NodePayload::ParagraphText(_)
             | NodePayload::TextOnPath(_)
@@ -2402,6 +2408,7 @@ pub fn build_sculpt_stroke_output(
     let orig_path = match &obj.payload {
         NodePayload::Path(p) => p.clone(),
         NodePayload::Shape(s) => s.to_bezier_path(),
+        NodePayload::BSpline(bs) => bs.to_bezier_path(),
         _ => return ToolOutput::noop(),
     };
     let mut path = orig_path.clone();

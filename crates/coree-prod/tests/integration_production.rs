@@ -2668,3 +2668,266 @@ fn w1b_r28_cql_table_border_style_fill_type_and_trimmed_font() {
         vec![art_id]
     );
 }
+
+#[test]
+fn w2_exit_r6_metrics_and_laser_include_bspline_artistic_media_clone_persp_and_symbol() {
+    use coree_core::{ArtisticMediaStyle, BSplineCurve, Perspective3x3};
+    use coree_prod::{plan_laser_toolpath, LaserJobConfig};
+
+    let mut doc = Document::new_a4("W2 Prod BSpline Media Clone");
+    let lid = doc.pages()[0].layers[0].id;
+
+    // 1. Shape 20x20 mm = 80 mm CutContour
+    let shape_id = doc
+        .add_object(
+            make_rect(
+                10.0,
+                10.0,
+                20.0,
+                20.0,
+                Fill::None,
+                OutlineStyle::cut_contour(),
+            ),
+            Some(lid),
+        )
+        .unwrap();
+
+    // 2. Closed BSpline CutContour
+    let bs = BSplineCurve::from_control_points(
+        vec![
+            Point2D::new(40.0, 10.0),
+            Point2D::new(70.0, 10.0),
+            Point2D::new(70.0, 40.0),
+            Point2D::new(40.0, 40.0),
+        ],
+        2,
+        true,
+    );
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "BS_Cut", NodePayload::BSpline(bs))
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::cut_contour()),
+        Some(lid),
+    )
+    .unwrap();
+
+    // 3. ArtisticMedia CutContour
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "AM_Cut",
+            NodePayload::ArtisticMedia {
+                spine: BezierPath::from_line(Point2D::new(10.0, 50.0), Point2D::new(50.0, 50.0)),
+                style: ArtisticMediaStyle::Calligraphic {
+                    width_mm: 2.0,
+                    angle_deg: 45.0,
+                },
+            },
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::cut_contour()),
+        Some(lid),
+    )
+    .unwrap();
+
+    // 4. Clone of Shape with link_outline=true (own outline=none, inheriting CutContour) + Perspective3x3
+    let mut clone_obj = SceneObject::new(
+        ObjectId(0),
+        "Clone_Cut",
+        NodePayload::Clone {
+            master_id: shape_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(80.0, 10.0));
+    clone_obj.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+            &[
+                Point2D::new(0.0, 0.0),
+                Point2D::new(30.0, 0.0),
+                Point2D::new(30.0, 30.0),
+                Point2D::new(0.0, 30.0),
+            ],
+        )
+        .unwrap(),
+    );
+    doc.add_object(clone_obj, Some(lid)).unwrap();
+
+    // 5. SymbolInstance containing BSpline, ArtisticMedia, and Clone (all CutContour)
+    let sym_bs = SceneObject::new(
+        ObjectId(101),
+        "SymBS",
+        NodePayload::BSpline(BSplineCurve::from_control_points(
+            vec![
+                Point2D::new(0.0, 0.0),
+                Point2D::new(15.0, 0.0),
+                Point2D::new(15.0, 15.0),
+                Point2D::new(0.0, 15.0),
+            ],
+            2,
+            true,
+        )),
+    )
+    .with_outline(OutlineStyle::cut_contour());
+    let sym_am = SceneObject::new(
+        ObjectId(102),
+        "SymAM",
+        NodePayload::ArtisticMedia {
+            spine: BezierPath::from_line(Point2D::new(20.0, 0.0), Point2D::new(40.0, 0.0)),
+            style: ArtisticMediaStyle::Calligraphic {
+                width_mm: 2.0,
+                angle_deg: 0.0,
+            },
+        },
+    )
+    .with_outline(OutlineStyle::cut_contour());
+    let sym_cl = SceneObject::new(
+        ObjectId(103),
+        "SymClone",
+        NodePayload::Clone {
+            master_id: shape_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(45.0, 0.0));
+    let sym = SymbolDef::new("LaserSymW2", vec![sym_bs, sym_am, sym_cl]);
+    let sid = sym.id;
+    doc.insert_symbol(sym);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(10.0, 80.0)),
+        Some(lid),
+    )
+    .unwrap();
+
+    let metrics = compute_production_metrics(&doc, None);
+    // Shape(80) + BSpline(>70) + ArtisticMedia(>80) + PerspectiveClone(120) + SymbolInstance(BS+AM+Clone > 120)
+    assert!(
+        metrics.cut_length_mm > 400.0,
+        "expected cut_length_mm > 400 mm across Shape+BSpline+ArtisticMedia+Clone(Persp)+SymbolInstance, got {}",
+        metrics.cut_length_mm
+    );
+    assert!(metrics.object_count >= 7);
+
+    let plan = plan_laser_toolpath(&doc, 0, None, &LaserJobConfig::default()).unwrap();
+    assert!(
+        plan.cut_count >= 7,
+        "expected >= 7 Cut segments (4 top-level + 3 inside SymbolInstance), got {}",
+        plan.cut_count
+    );
+    assert!(
+        plan.total_cut_mm > 400.0,
+        "expected total_cut_mm > 400 mm, got {}",
+        plan.total_cut_mm
+    );
+}
+
+#[test]
+fn w2_exit_r8_generate_cut_contour_applies_perspective3x3_and_effect_perspective() {
+    use coree_core::{Effect, Perspective3x3};
+    use coree_prod::{plan_laser_toolpath, LaserJobConfig};
+
+    // 1. Direct Perspective3x3 on 20x20 shape mapped to (100..140, 100..140)
+    {
+        let mut doc = Document::new_a4("CutContourPersp3x3");
+        let lid = doc.pages()[0].layers[0].id;
+        let mut rect = make_rect(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Fill::Solid(Color::CYAN),
+            OutlineStyle::cut_contour(),
+        );
+        rect.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+                &[
+                    Point2D::new(100.0, 100.0),
+                    Point2D::new(140.0, 100.0),
+                    Point2D::new(140.0, 140.0),
+                    Point2D::new(100.0, 140.0),
+                ],
+            )
+            .unwrap(),
+        );
+        let oid = doc.add_object(rect, Some(lid)).unwrap();
+
+        let metrics = compute_production_metrics(&doc, None);
+        let plan = plan_laser_toolpath(&doc, 0, None, &LaserJobConfig::default()).unwrap();
+        let cut = generate_cut_contour(&mut doc, &[oid], 0.0, "CutContour").unwrap();
+        let cut_bb = doc.world_object_bounds(cut.object_id).unwrap();
+
+        assert!(
+            (cut_bb.min_x - 100.0).abs() < 0.2
+                && (cut_bb.min_y - 100.0).abs() < 0.2
+                && (cut_bb.max_x - 140.0).abs() < 0.2
+                && (cut_bb.max_y - 140.0).abs() < 0.2,
+            "CutContour bounds {cut_bb:?} must match warped (100..140, 100..140)"
+        );
+        assert!(
+            (cut.cut_length_mm - 160.0).abs() < 0.5
+                && (cut.cut_length_mm - plan.total_cut_mm).abs() < 0.5
+                && (cut.cut_length_mm - metrics.cut_length_mm).abs() < 0.5,
+            "CutContour length {:.2} must match laser {:.2} and metrics {:.2}",
+            cut.cut_length_mm,
+            plan.total_cut_mm,
+            metrics.cut_length_mm
+        );
+    }
+
+    // 2. Group with Effect::Perspective wrapping child shape
+    {
+        let mut doc = Document::new_a4("CutContourGroupEffPersp");
+        let lid = doc.pages()[0].layers[0].id;
+        let child = make_rect(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Fill::Solid(Color::MAGENTA),
+            OutlineStyle::none(),
+        );
+        let cid = doc.add_object(child, Some(lid)).unwrap();
+        let gid = doc.group_objects(&[cid], "EffGrp").unwrap();
+        let mut hist = CommandHistory::default();
+        hist.execute(
+            &mut doc,
+            CommandOp::AddEffect {
+                id: gid,
+                effect: Effect::Perspective {
+                    quad: [
+                        Point2D::new(100.0, 100.0),
+                        Point2D::new(140.0, 100.0),
+                        Point2D::new(140.0, 140.0),
+                        Point2D::new(100.0, 140.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        let cut = generate_cut_contour(&mut doc, &[cid], 0.0, "CutContour").unwrap();
+        let cut_bb = doc.world_object_bounds(cut.object_id).unwrap();
+        assert!(
+            (cut_bb.min_x - 100.0).abs() < 0.2
+                && (cut_bb.min_y - 100.0).abs() < 0.2
+                && (cut_bb.max_x - 140.0).abs() < 0.2
+                && (cut_bb.max_y - 140.0).abs() < 0.2,
+            "CutContour on child inside Group(Effect::Perspective) must be warped (100..140), got {cut_bb:?}"
+        );
+        assert!(
+            (cut.cut_length_mm - 160.0).abs() < 0.5,
+            "expected cut_length_mm ~ 160.0, got {}",
+            cut.cut_length_mm
+        );
+    }
+}

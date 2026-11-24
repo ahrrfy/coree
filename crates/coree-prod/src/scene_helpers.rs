@@ -5,8 +5,8 @@
 
 use crate::error::{ProdError, ProdResult};
 use coree_core::{
-    Affine2D, BezierPath, Document, Layer, LayerId, MasterLayerScope, NodePayload, ObjectId, Page,
-    PageId, Rect2D, SceneObject, SymbolId,
+    Affine2D, BezierPath, Document, Effect, Layer, LayerId, MasterLayerScope, NodePayload,
+    ObjectId, Page, PageId, Perspective3x3, Rect2D, SceneObject, SymbolId,
 };
 use kurbo::PathEl;
 use std::collections::{HashMap, HashSet};
@@ -736,12 +736,163 @@ pub(crate) fn bezier_to_skia_path(
     pb.finish()
 }
 
+pub(crate) fn apply_obj_perspective_to_local_path(
+    local: BezierPath,
+    obj: &SceneObject,
+) -> BezierPath {
+    let mut cur = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local)
+    } else {
+        local
+    };
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(bb) = cur.bounding_box() {
+                if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                    cur = h.transform_bezier_path(&cur);
+                }
+            }
+        }
+    }
+    cur
+}
+
+#[inline]
+pub(crate) fn warp_local_to_world(
+    local: &BezierPath,
+    world_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    if let Some(pp) = parent_persp {
+        pp.compose(&Perspective3x3::from_affine(*obj_xf))
+            .transform_bezier_path(local)
+    } else {
+        local.transformed(world_xf)
+    }
+}
+
+#[inline]
+pub(crate) fn compose_prod_parent_persp(
+    parent_persp: Option<Perspective3x3>,
+    parent_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    own_persp: Option<Perspective3x3>,
+) -> Option<Perspective3x3> {
+    match (parent_persp, own_persp) {
+        (Some(pp), Some(op)) => Some(
+            pp.compose(&Perspective3x3::from_affine(*obj_xf))
+                .compose(&op),
+        ),
+        (Some(pp), None) => Some(pp.compose(&Perspective3x3::from_affine(*obj_xf))),
+        (None, Some(op)) => {
+            let world_xf = parent_xf.compose(obj_xf);
+            Some(Perspective3x3::from_affine(world_xf).compose(&op))
+        }
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn container_own_persp(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+) -> Option<Perspective3x3> {
+    let mut own = obj.perspective;
+    let has_eff_persp = obj
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::Perspective { .. }));
+    if has_eff_persp {
+        let raw_bb = match &obj.payload {
+            NodePayload::SymbolInstance(sym_id) => {
+                let space_world = (sym_ctx.is_none() && obj.id.0 != 0)
+                    .then(|| doc.world_transform_of(obj.id))
+                    .flatten();
+                doc.symbol_bounds_with_xf_and_space(
+                    *sym_id,
+                    &Affine2D::IDENTITY,
+                    space_world.as_ref(),
+                )
+            }
+            NodePayload::PowerClip { container, .. } => container.bounding_box(),
+            NodePayload::Group(children) if sym_ctx.is_some() => {
+                let mut acc: Option<Rect2D> = None;
+                if let Some(ctx) = sym_ctx {
+                    for &cid in children {
+                        if let Some(child) = ctx.sym_map.get(&cid).copied() {
+                            if let Some(cb) = world_bounds_with_sym_xf(
+                                doc,
+                                cid,
+                                child,
+                                &child.transform,
+                                Some(ctx),
+                            ) {
+                                acc = Some(acc.map_or(cb, |prev| prev.union(cb)));
+                            }
+                        }
+                    }
+                }
+                acc
+            }
+            _ if sym_ctx.is_none() && obj.id.0 != 0 => doc.local_object_bounds(obj.id),
+            _ => None,
+        };
+        let mut cur_bb = match (own, raw_bb) {
+            (Some(p), Some(bb)) => p.try_transform_rect(bb),
+            (None, Some(bb)) => Some(bb),
+            (_, None) => None,
+        };
+        for eff in &obj.effects {
+            if let Effect::Perspective { quad } = eff {
+                if let Some(bb) = cur_bb {
+                    if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                        own = Some(match own {
+                            Some(prev) => h.compose(&prev),
+                            None => h,
+                        });
+                        cur_bb = h.try_transform_rect(bb);
+                    }
+                }
+            }
+        }
+    }
+    own
+}
+
+pub(crate) fn ancestor_world_persp(
+    doc: &Document,
+    top_container_id: ObjectId,
+) -> Option<Perspective3x3> {
+    let mut chain = Vec::new();
+    let mut cur = Some(top_container_id);
+    let mut seen = HashSet::new();
+    while let Some(oid) = cur {
+        if !seen.insert(oid) {
+            break;
+        }
+        chain.push(oid);
+        cur = doc.parent_container_of(oid);
+    }
+    let mut persp: Option<Perspective3x3> = None;
+    let mut parent_xf = Affine2D::IDENTITY;
+    for oid in chain.into_iter().rev() {
+        let obj = doc.object(oid)?;
+        let own = container_own_persp(doc, obj, None);
+        persp = compose_prod_parent_persp(persp, &parent_xf, &obj.transform, own);
+        parent_xf = parent_xf.compose(&obj.transform);
+    }
+    persp
+}
+
 /// Extracts world-space closed/open vector silhouette paths for `id` (expanding groups and
-/// symbol definitions hierarchically, falling back to bounding-box rects for text/raster/table objects).
+/// symbol definitions hierarchically, applying perspective homographies, and falling back to
+/// bounding-box rects for text/raster/table objects).
 pub(crate) fn collect_silhouette_paths(
     doc: &Document,
     id: ObjectId,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
     out: &mut Vec<BezierPath>,
@@ -751,6 +902,7 @@ pub(crate) fn collect_silhouette_paths(
         doc,
         id,
         parent_xf,
+        parent_persp,
         None,
         depth,
         visiting,
@@ -764,6 +916,7 @@ fn collect_silhouette_paths_by_id(
     doc: &Document,
     id: ObjectId,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<&SymBoundsCtx<'_>>,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
@@ -782,6 +935,7 @@ fn collect_silhouette_paths_by_id(
             id,
             obj,
             parent_xf,
+            parent_persp,
             sym_ctx,
             depth,
             visiting,
@@ -798,6 +952,7 @@ fn collect_silhouette_paths_obj(
     id: ObjectId,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<&SymBoundsCtx<'_>>,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
@@ -814,23 +969,31 @@ fn collect_silhouette_paths_obj(
     match &obj.payload {
         NodePayload::Path(p) => {
             if !p.is_empty() {
-                out.push(p.transformed(&world_xf));
+                let local = apply_obj_perspective_to_local_path(p.clone(), obj);
+                let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                if !wp.is_empty() {
+                    out.push(wp);
+                }
             }
         }
         NodePayload::Shape(s) => {
-            let p = s.to_bezier_path().transformed(&world_xf);
+            let local = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
         }
         NodePayload::BSpline(bs) => {
-            let p = bs.to_bezier_path().transformed(&world_xf);
+            let local = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
         }
         NodePayload::ArtisticMedia { spine, style } => {
-            let p = coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf);
+            let expanded = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            let local = apply_obj_perspective_to_local_path(expanded, obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
@@ -846,6 +1009,7 @@ fn collect_silhouette_paths_obj(
                     tmp.id,
                     &tmp,
                     parent_xf,
+                    parent_persp,
                     sym_ctx,
                     depth + 1,
                     visiting,
@@ -855,19 +1019,26 @@ fn collect_silhouette_paths_obj(
             }
         }
         NodePayload::PowerClip { container, .. } => {
-            let p = container.transformed(&world_xf);
+            let local = apply_obj_perspective_to_local_path((**container).clone(), obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
         }
         NodePayload::ArtisticText(t) => {
-            let p = BezierPath::from_rect(t.estimated_bounds()).transformed(&world_xf);
+            let local = apply_obj_perspective_to_local_path(
+                BezierPath::from_rect(t.estimated_bounds()),
+                obj,
+            );
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
         }
         NodePayload::ParagraphText(t) => {
-            let p = BezierPath::from_rect(t.bounding_box()).transformed(&world_xf);
+            let local =
+                apply_obj_perspective_to_local_path(BezierPath::from_rect(t.bounding_box()), obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
@@ -886,21 +1057,33 @@ fn collect_silhouette_paths_obj(
                 None => None,
             };
             if let Some(rc) = rect {
-                out.push(BezierPath::from_rect(rc).transformed(&world_xf));
+                let local = apply_obj_perspective_to_local_path(BezierPath::from_rect(rc), obj);
+                let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                if !p.is_empty() {
+                    out.push(p);
+                }
             }
         }
         NodePayload::Table(t) => {
-            let p = BezierPath::from_rect(t.to_bounding_box()).transformed(&world_xf);
+            let local = apply_obj_perspective_to_local_path(
+                BezierPath::from_rect(t.to_bounding_box()),
+                obj,
+            );
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             if !p.is_empty() {
                 out.push(p);
             }
         }
         NodePayload::Group(children) => {
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in children {
                 collect_silhouette_paths_by_id(
                     doc,
                     cid,
                     world_xf,
+                    child_persp,
                     sym_ctx,
                     depth + 1,
                     visiting,
@@ -913,6 +1096,9 @@ fn collect_silhouette_paths_obj(
             if !visiting_syms.insert(*sym_id) {
                 return;
             }
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             if let Some(sym) = doc.symbol(*sym_id) {
                 let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
                 let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
@@ -965,6 +1151,7 @@ fn collect_silhouette_paths_obj(
                         sub.id,
                         sub,
                         world_xf,
+                        child_persp,
                         Some(&ctx),
                         depth + 1,
                         &mut sym_visiting,
@@ -979,9 +1166,8 @@ fn collect_silhouette_paths_obj(
             visiting_syms.remove(sym_id);
         }
         NodePayload::TextOnPath(top) => {
-            if let Some(ctx) = sym_ctx {
-                let sym_bb = ctx
-                    .sym_map
+            let host_path = if let Some(ctx) = sym_ctx {
+                ctx.sym_map
                     .get(&top.path_id)
                     .copied()
                     .and_then(|path_obj| {
@@ -992,42 +1178,106 @@ fn collect_silhouette_paths_obj(
                             ctx.sym_map,
                             ctx.sym_parent_map,
                         )?;
-                        match &path_obj.payload {
-                            NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
-                            NodePayload::Shape(s) => {
-                                s.to_bezier_path().transformed(&p_xf).bounding_box()
+                        let local_opt = match &path_obj.payload {
+                            NodePayload::Path(p) => Some(p.clone()),
+                            NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                            NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                            NodePayload::ArtisticMedia { spine, style } => {
+                                Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
                             }
-                            _ => {
-                                if !visiting.insert(top.path_id) {
-                                    return None;
-                                }
-                                let r = world_bounds_with_xf_inner(
-                                    doc,
-                                    top.path_id,
-                                    path_obj,
-                                    &p_xf,
-                                    Some(ctx),
-                                    depth + 1,
-                                    visiting,
-                                    visiting_syms,
-                                );
-                                visiting.remove(&top.path_id);
-                                r
+                            NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+                            _ => None,
+                        };
+                        if let Some(local) = local_opt {
+                            Some(
+                                apply_obj_perspective_to_local_path(local, path_obj)
+                                    .transformed(&p_xf),
+                            )
+                        } else {
+                            if !visiting.insert(top.path_id) {
+                                return None;
                             }
+                            let r = world_bounds_with_xf_inner(
+                                doc,
+                                top.path_id,
+                                path_obj,
+                                &p_xf,
+                                Some(ctx),
+                                depth + 1,
+                                visiting,
+                                visiting_syms,
+                            );
+                            visiting.remove(&top.path_id);
+                            r.map(BezierPath::from_rect)
                         }
                     })
-                    .or_else(|| doc.world_object_bounds(top.path_id));
-                if let Some(bb) = sym_bb {
-                    out.push(BezierPath::from_rect(bb));
-                } else {
-                    out.push(
-                        BezierPath::from_rect(top.text.estimated_bounds()).transformed(&world_xf),
-                    );
-                }
-            } else if let Some(bb) = doc.world_object_bounds(id) {
-                out.push(BezierPath::from_rect(bb));
+                    .or_else(|| doc.world_path_of(top.path_id))
+                    .or_else(|| {
+                        doc.world_object_bounds(top.path_id)
+                            .map(BezierPath::from_rect)
+                    })
             } else {
-                out.push(BezierPath::from_rect(top.text.estimated_bounds()).transformed(&world_xf));
+                doc.world_path_of(top.path_id).or_else(|| {
+                    doc.world_object_bounds(top.path_id)
+                        .map(BezierPath::from_rect)
+                })
+            };
+            if let Some(hp) = host_path {
+                let has_own_persp = obj.perspective.is_some()
+                    || obj
+                        .effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::Perspective { .. }));
+                let warped = if parent_persp.is_some() || has_own_persp {
+                    let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let local_host = hp.transformed(&inv_parent);
+                    let warped_local = apply_obj_perspective_to_local_path(local_host, obj);
+                    if let Some(pp) = parent_persp {
+                        pp.transform_bezier_path(&warped_local)
+                    } else {
+                        warped_local.transformed(&parent_xf)
+                    }
+                } else {
+                    hp
+                };
+                if let Some(bb) = warped.bounding_box() {
+                    out.push(BezierPath::from_rect(bb));
+                }
+            } else if sym_ctx.is_none() {
+                if let Some(bb) = doc.world_object_bounds(id) {
+                    let local_rect = parent_xf
+                        .inverse()
+                        .and_then(|inv| inv.try_transform_rect(bb))
+                        .unwrap_or(bb);
+                    let local =
+                        apply_obj_perspective_to_local_path(BezierPath::from_rect(local_rect), obj);
+                    let p = if let Some(pp) = parent_persp {
+                        pp.transform_bezier_path(&local)
+                    } else {
+                        local.transformed(&parent_xf)
+                    };
+                    if !p.is_empty() {
+                        out.push(p);
+                    }
+                } else {
+                    let local = apply_obj_perspective_to_local_path(
+                        BezierPath::from_rect(top.text.estimated_bounds()),
+                        obj,
+                    );
+                    let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                    if !p.is_empty() {
+                        out.push(p);
+                    }
+                }
+            } else {
+                let local = apply_obj_perspective_to_local_path(
+                    BezierPath::from_rect(top.text.estimated_bounds()),
+                    obj,
+                );
+                let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                if !p.is_empty() {
+                    out.push(p);
+                }
             }
         }
         NodePayload::Dimension(_) | NodePayload::Connector(_) => {}

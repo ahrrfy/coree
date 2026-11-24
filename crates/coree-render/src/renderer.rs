@@ -25,19 +25,24 @@ use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
     Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, BuiltinIccProfile, Color,
     DimensionKind, DimensionObject, Document, Effect, Fill, GuideOrientation, IccProfile, Layer,
-    MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page, PerspectiveGridMode,
-    Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject, SoftProofLut3D,
-    SpatialIndex, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
+    MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page, Perspective3x3,
+    PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject,
+    SoftProofLut3D, SpatialIndex, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
 /// Maximum scene recursion depth matching `coree-core`.
 const MAX_RENDER_DEPTH: usize = 64;
 
-pub(crate) type SymRenderCtx<'a> = (&'a HashMap<ObjectId, &'a SceneObject>, Affine2D);
+pub(crate) type SymRenderCtx<'a> = (
+    &'a HashMap<ObjectId, &'a SceneObject>,
+    &'a [SceneObject],
+    Affine2D,
+);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeformFrame<'a> {
+    pub(crate) pre_perspective: Option<Perspective3x3>,
     pub(crate) group_local_bb: Option<Rect2D>,
     pub(crate) group_effects: &'a [Effect],
     pub(crate) rel_to_outer: Affine2D,
@@ -51,6 +56,9 @@ pub(crate) fn apply_deform_chain_in_bounds(
 ) -> BezierPath {
     let mut cur = path.transformed(&c_xf);
     for frame in frames.iter().rev() {
+        if let Some(persp) = frame.pre_perspective {
+            cur = persp.transform_bezier_path(&cur);
+        }
         cur = apply_geometry_effects_in_bounds(&cur, frame.group_local_bb, frame.group_effects);
         if frame.rel_to_outer != Affine2D::IDENTITY {
             cur = cur.transformed(&frame.rel_to_outer);
@@ -59,32 +67,54 @@ pub(crate) fn apply_deform_chain_in_bounds(
     cur
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RenderSymParentRef {
+    Id(ObjectId),
+    RootIndex(usize),
+}
+
 fn sym_object_world_xf(
     id: ObjectId,
     sym_root_xf: &Affine2D,
     sym_map: &HashMap<ObjectId, &SceneObject>,
+    sym_objects: &[SceneObject],
 ) -> Option<Affine2D> {
     let mut chain = Vec::new();
-    let mut cur = id;
+    let mut cur = RenderSymParentRef::Id(id);
     let mut seen = HashSet::new();
     while seen.insert(cur) {
-        let obj = sym_map.get(&cur).copied()?;
+        let obj = match cur {
+            RenderSymParentRef::Id(oid) => sym_map.get(&oid).copied()?,
+            RenderSymParentRef::RootIndex(idx) => sym_objects.get(idx)?,
+        };
         chain.push(obj.transform);
-        let parent = sym_map.iter().find_map(|(&pid, po)| match &po.payload {
-            NodePayload::Group(c) if c.contains(&cur) => Some(pid),
-            NodePayload::PowerClip { contents, .. } if contents.contains(&cur) => Some(pid),
-            _ => None,
-        });
-        match parent {
-            Some(pid) => cur = pid,
-            None => break,
+        match cur {
+            RenderSymParentRef::Id(oid) => {
+                let parent = sym_objects.iter().enumerate().find_map(|(idx, po)| {
+                    let contains = match &po.payload {
+                        NodePayload::Group(c) => c.contains(&oid),
+                        NodePayload::PowerClip { contents, .. } => contents.contains(&oid),
+                        _ => false,
+                    };
+                    contains.then_some(if po.id.0 != 0 {
+                        RenderSymParentRef::Id(po.id)
+                    } else {
+                        RenderSymParentRef::RootIndex(idx)
+                    })
+                });
+                match parent {
+                    Some(pid) => cur = pid,
+                    None => break,
+                }
+            }
+            RenderSymParentRef::RootIndex(_) => break,
         }
     }
     let mut xf = *sym_root_xf;
     for local in chain.into_iter().rev() {
         xf = xf.compose(&local);
     }
-    Some(xf)
+    xf.is_finite().then_some(xf)
 }
 
 fn resolve_sym_world_path(
@@ -92,15 +122,38 @@ fn resolve_sym_world_path(
     path_id: ObjectId,
     sym_ctx: Option<SymRenderCtx<'_>>,
 ) -> Option<BezierPath> {
-    if let Some((sym_map, sym_root_xf)) = sym_ctx {
+    if let Some((sym_map, sym_objects, sym_root_xf)) = sym_ctx {
         if let Some(sub) = sym_map.get(&path_id).copied() {
-            let p_xf = sym_object_world_xf(path_id, &sym_root_xf, sym_map)?;
-            return match &sub.payload {
-                NodePayload::Path(p) => Some(p.transformed(&p_xf)),
-                NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&p_xf)),
-                NodePayload::PowerClip { container, .. } => Some(container.transformed(&p_xf)),
+            let p_xf = sym_object_world_xf(path_id, &sym_root_xf, sym_map, sym_objects)?;
+            let local = match &sub.payload {
+                NodePayload::Path(p) => Some(p.clone()),
+                NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                NodePayload::ArtisticMedia { spine, style } => {
+                    Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                }
+                NodePayload::Clone { .. } => {
+                    doc.resolve_clone_payload_and_style(sub)
+                        .and_then(|(eff_p, _, _)| match eff_p {
+                            NodePayload::Path(p) => Some(p),
+                            NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                            NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                            NodePayload::ArtisticMedia { spine, style } => {
+                                Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
+                            }
+                            NodePayload::PowerClip { container, .. } => Some(*container),
+                            _ => None,
+                        })
+                }
+                NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
+            }?;
+            let warped = if let Some(persp) = sub.perspective {
+                persp.transform_bezier_path(&local)
+            } else {
+                local
             };
+            return Some(warped.transformed(&p_xf));
         }
     }
     doc.world_path_of(path_id)
@@ -928,7 +981,7 @@ impl SceneRenderer {
             return;
         }
         let Some(obj) = sym_ctx
-            .and_then(|(m, _)| m.get(&id).copied())
+            .and_then(|(m, _, _)| m.get(&id).copied())
             .or_else(|| doc.object(id))
         else {
             return;
@@ -1275,21 +1328,31 @@ impl SceneRenderer {
                     .bounding_box()
             }
             NodePayload::ArtisticText(t) => {
-                let mut sb = obj_to_screen.try_transform_rect(t.estimated_bounds())?;
+                let local_bb = if let Some(persp) = obj.perspective {
+                    persp.try_transform_rect(t.estimated_bounds())?
+                } else {
+                    t.estimated_bounds()
+                };
+                let mut sb = obj_to_screen.try_transform_rect(local_bb)?;
                 Self::expand_screen_bounds_for_deforms(
                     &obj.effects,
                     &obj_to_screen,
-                    Some(t.estimated_bounds().height()),
+                    Some(local_bb.height()),
                     &mut sb,
                 );
                 Some(sb)
             }
             NodePayload::ParagraphText(t) => {
-                let mut sb = obj_to_screen.try_transform_rect(t.bounding_box())?;
+                let local_bb = if let Some(persp) = obj.perspective {
+                    persp.try_transform_rect(t.bounding_box())?
+                } else {
+                    t.bounding_box()
+                };
+                let mut sb = obj_to_screen.try_transform_rect(local_bb)?;
                 Self::expand_screen_bounds_for_deforms(
                     &obj.effects,
                     &obj_to_screen,
-                    Some(t.bounding_box().height()),
+                    Some(local_bb.height()),
                     &mut sb,
                 );
                 Some(sb)
@@ -1371,11 +1434,16 @@ impl SceneRenderer {
                     );
                     Some(sb)
                 } else {
-                    let mut sb = obj_to_screen.try_transform_rect(top.text.estimated_bounds())?;
+                    let local_bb = if let Some(persp) = obj.perspective {
+                        persp.try_transform_rect(top.text.estimated_bounds())?
+                    } else {
+                        top.text.estimated_bounds()
+                    };
+                    let mut sb = obj_to_screen.try_transform_rect(local_bb)?;
                     Self::expand_screen_bounds_for_deforms(
                         &obj.effects,
                         &obj_to_screen,
-                        Some(top.text.estimated_bounds().height()),
+                        Some(local_bb.height()),
                         &mut sb,
                     );
                     Some(sb)
@@ -1393,7 +1461,7 @@ impl SceneRenderer {
                     doc,
                     conn,
                     &base_world_xf,
-                    sym_ctx,
+                    sym_ctx.map(|(m, _, xf)| (m, xf)),
                     &mut sym_visiting,
                     visited_syms,
                     &mut sym_cache,
@@ -1410,63 +1478,75 @@ impl SceneRenderer {
                 }
             }
             NodePayload::Group(children) => {
-                let mut acc: Option<Rect2D> = None;
-                for &cid in children {
-                    let from_sym = sym_ctx.and_then(|(m, _)| m.get(&cid).copied());
-                    let child_obj = if from_sym.is_some() {
-                        from_sym
-                    } else {
-                        if !visited_doc.insert(cid) {
-                            continue;
+                let raw_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
+                    doc.local_object_bounds(obj.id)
+                } else {
+                    let mut visit = HashSet::new();
+                    Self::compute_children_local_bounds(
+                        doc,
+                        children,
+                        sym_ctx,
+                        Affine2D::IDENTITY,
+                        obj_to_world,
+                        depth + 1,
+                        &mut visit,
+                    )
+                };
+                let mut acc: Option<Rect2D> = if let Some(persp) = obj.perspective {
+                    raw_local_bb
+                        .and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| obj_to_screen.try_transform_rect(wb))
+                } else {
+                    let mut acc: Option<Rect2D> = None;
+                    for &cid in children {
+                        let from_sym = sym_ctx.and_then(|(m, _, _)| m.get(&cid).copied());
+                        let child_obj = if from_sym.is_some() {
+                            from_sym
+                        } else {
+                            if !visited_doc.insert(cid) {
+                                continue;
+                            }
+                            doc.object(cid)
+                        };
+                        if let Some(cobj) = child_obj {
+                            if let Some(cb) = Self::compute_object_screen_bounds(
+                                doc,
+                                cobj,
+                                page_to_surface,
+                                obj_to_screen,
+                                sym_ctx,
+                                active_world_sym,
+                                true,
+                                visited_doc,
+                                visited_syms,
+                                depth + 1,
+                            ) {
+                                acc = Some(match acc {
+                                    Some(prev) => prev.union(cb),
+                                    None => cb,
+                                });
+                            }
                         }
-                        doc.object(cid)
-                    };
-                    if let Some(cobj) = child_obj {
-                        if let Some(cb) = Self::compute_object_screen_bounds(
-                            doc,
-                            cobj,
-                            page_to_surface,
-                            obj_to_screen,
-                            sym_ctx,
-                            active_world_sym,
-                            true,
-                            visited_doc,
-                            visited_syms,
-                            depth + 1,
-                        ) {
-                            acc = Some(match acc {
-                                Some(prev) => prev.union(cb),
-                                None => cb,
-                            });
+                        if from_sym.is_none() {
+                            visited_doc.remove(&cid);
                         }
                     }
-                    if from_sym.is_none() {
-                        visited_doc.remove(&cid);
-                    }
-                }
-                if let Some(mut sb) = acc {
-                    let local_h = if sym_ctx.is_none() && obj.id.0 != 0 {
-                        doc.local_object_bounds(obj.id).map(|b| b.height())
+                    acc
+                };
+                if let Some(ref mut sb) = acc {
+                    let local_h = if let Some(persp) = obj.perspective {
+                        raw_local_bb
+                            .and_then(|lb| persp.try_transform_rect(lb))
+                            .map(|b| b.height())
                     } else {
-                        let mut visit = HashSet::new();
-                        Self::compute_children_local_bounds(
-                            doc,
-                            children,
-                            sym_ctx,
-                            Affine2D::IDENTITY,
-                            obj_to_world,
-                            depth + 1,
-                            &mut visit,
-                        )
-                        .map(|b| b.height())
+                        raw_local_bb.map(|b| b.height())
                     };
                     Self::expand_screen_bounds_for_deforms(
                         &obj.effects,
                         &obj_to_screen,
                         local_h,
-                        &mut sb,
+                        sb,
                     );
-                    acc = Some(sb);
                 }
                 acc
             }
@@ -1474,48 +1554,74 @@ impl SceneRenderer {
                 if !visited_syms.insert(*sym_id) {
                     None
                 } else {
-                    let res = doc.symbol(*sym_id).and_then(|sym| {
-                        let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
-                        let mut referenced: HashSet<ObjectId> = HashSet::new();
-                        for sub in &sym.objects {
-                            if sub.id.0 != 0 {
-                                child_map.insert(sub.id, sub);
-                            }
-                            match &sub.payload {
-                                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
-                                NodePayload::PowerClip { contents, .. } => {
-                                    referenced.extend(contents.iter().copied());
+                    let raw_local_bb = doc.symbol_bounds_with_xf_and_space(
+                        *sym_id,
+                        &Affine2D::IDENTITY,
+                        Some(&obj_to_world),
+                    );
+                    let mut acc: Option<Rect2D> = if let Some(persp) = obj.perspective {
+                        raw_local_bb
+                            .and_then(|lb| persp.try_transform_rect(lb))
+                            .and_then(|wb| obj_to_screen.try_transform_rect(wb))
+                    } else {
+                        doc.symbol(*sym_id).and_then(|sym| {
+                            let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                            let mut referenced: HashSet<ObjectId> = HashSet::new();
+                            for sub in &sym.objects {
+                                if sub.id.0 != 0 {
+                                    child_map.insert(sub.id, sub);
                                 }
-                                _ => {}
+                                match &sub.payload {
+                                    NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                    NodePayload::PowerClip { contents, .. } => {
+                                        referenced.extend(contents.iter().copied());
+                                    }
+                                    _ => {}
+                                }
                             }
-                        }
-                        let mut acc: Option<Rect2D> = None;
-                        for sub in &sym.objects {
-                            if sub.id.0 != 0 && referenced.contains(&sub.id) {
-                                continue;
+                            let mut acc: Option<Rect2D> = None;
+                            for sub in &sym.objects {
+                                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                                    continue;
+                                }
+                                if let Some(sb) = Self::compute_object_screen_bounds(
+                                    doc,
+                                    sub,
+                                    page_to_surface,
+                                    obj_to_screen,
+                                    Some((&child_map, &sym.objects, obj_to_world)),
+                                    Affine2D::IDENTITY,
+                                    true,
+                                    visited_doc,
+                                    visited_syms,
+                                    depth + 1,
+                                ) {
+                                    acc = Some(match acc {
+                                        Some(prev) => prev.union(sb),
+                                        None => sb,
+                                    });
+                                }
                             }
-                            if let Some(sb) = Self::compute_object_screen_bounds(
-                                doc,
-                                sub,
-                                page_to_surface,
-                                obj_to_screen,
-                                Some((&child_map, obj_to_world)),
-                                Affine2D::IDENTITY,
-                                true,
-                                visited_doc,
-                                visited_syms,
-                                depth + 1,
-                            ) {
-                                acc = Some(match acc {
-                                    Some(prev) => prev.union(sb),
-                                    None => sb,
-                                });
-                            }
-                        }
-                        acc
-                    });
+                            acc
+                        })
+                    };
+                    if let Some(ref mut sb) = acc {
+                        let local_h = if let Some(persp) = obj.perspective {
+                            raw_local_bb
+                                .and_then(|lb| persp.try_transform_rect(lb))
+                                .map(|b| b.height())
+                        } else {
+                            raw_local_bb.map(|b| b.height())
+                        };
+                        Self::expand_screen_bounds_for_deforms(
+                            &obj.effects,
+                            &obj_to_screen,
+                            local_h,
+                            sb,
+                        );
+                    }
                     visited_syms.remove(sym_id);
-                    res
+                    acc
                 }
             }
         };
@@ -1587,7 +1693,7 @@ impl SceneRenderer {
                 && self.subtree_has_unwarmed_frozen_lens_in_branch(
                     doc,
                     obj,
-                    sym_ctx.map(|(m, _)| m),
+                    sym_ctx.map(|(m, _, _)| m),
                     false,
                 )
             {
@@ -1621,7 +1727,7 @@ impl SceneRenderer {
             crate::export_render::object_or_subtree_has_lens_with_sym(
                 doc,
                 obj,
-                sym_ctx.map(|(m, _)| m),
+                sym_ctx.map(|(m, _, _)| m),
                 0,
                 &mut v,
                 &mut vs,
@@ -1883,7 +1989,9 @@ impl SceneRenderer {
                 }
             }
             NodePayload::ArtisticText(text) => {
-                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                if (obj.effects.is_empty() && obj.perspective.is_none())
+                    || view_mode == ViewMode::Wireframe
+                {
                     self.text_engine.render_artistic_text(
                         backend,
                         text,
@@ -1895,7 +2003,7 @@ impl SceneRenderer {
                         px_per_mm,
                     );
                 } else {
-                    let pieces = self.text_engine.layout_artistic_pieces(text);
+                    let mut pieces = self.text_engine.layout_artistic_pieces(text);
                     if pieces.is_empty() && !text.plain_text().trim().is_empty() {
                         self.text_engine.render_artistic_text(
                             backend,
@@ -1908,23 +2016,43 @@ impl SceneRenderer {
                             px_per_mm,
                         );
                     } else {
-                        self.render_text_pieces_with_effects(
-                            doc,
-                            obj,
-                            &pieces,
-                            None,
-                            obj.transform,
-                            page_to_surface,
-                            parent_to_screen,
-                            px_per_mm,
-                            view_mode,
-                            backend,
-                        );
+                        if let Some(persp) = obj.perspective {
+                            for piece in &mut pieces {
+                                piece.path = persp.transform_bezier_path(&piece.path);
+                            }
+                        }
+                        if obj.effects.is_empty() {
+                            draw_text_pieces(
+                                backend,
+                                &pieces,
+                                obj_to_screen,
+                                &obj.outline,
+                                obj.opacity,
+                                obj.blend_mode,
+                                view_mode,
+                                px_per_mm,
+                            );
+                        } else {
+                            self.render_text_pieces_with_effects(
+                                doc,
+                                obj,
+                                &pieces,
+                                None,
+                                obj.transform,
+                                page_to_surface,
+                                parent_to_screen,
+                                px_per_mm,
+                                view_mode,
+                                backend,
+                            );
+                        }
                     }
                 }
             }
             NodePayload::ParagraphText(para) => {
-                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                if (obj.effects.is_empty() && obj.perspective.is_none())
+                    || view_mode == ViewMode::Wireframe
+                {
                     self.text_engine.render_paragraph_text(
                         backend,
                         para,
@@ -1936,19 +2064,41 @@ impl SceneRenderer {
                         px_per_mm,
                     );
                 } else {
-                    let pieces = self.text_engine.layout_paragraph_pieces(para);
-                    self.render_text_pieces_with_effects(
-                        doc,
-                        obj,
-                        &pieces,
-                        Some(para.bounding_box()),
-                        obj.transform,
-                        page_to_surface,
-                        parent_to_screen,
-                        px_per_mm,
-                        view_mode,
-                        backend,
-                    );
+                    let mut pieces = self.text_engine.layout_paragraph_pieces(para);
+                    if let Some(persp) = obj.perspective {
+                        for piece in &mut pieces {
+                            piece.path = persp.transform_bezier_path(&piece.path);
+                        }
+                    }
+                    if obj.effects.is_empty() {
+                        draw_text_pieces(
+                            backend,
+                            &pieces,
+                            obj_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            view_mode,
+                            px_per_mm,
+                        );
+                    } else {
+                        self.render_text_pieces_with_effects(
+                            doc,
+                            obj,
+                            &pieces,
+                            if obj.perspective.is_some() {
+                                None
+                            } else {
+                                Some(para.bounding_box())
+                            },
+                            obj.transform,
+                            page_to_surface,
+                            parent_to_screen,
+                            px_per_mm,
+                            view_mode,
+                            backend,
+                        );
+                    }
                 }
             }
             NodePayload::TextOnPath(top) => {
@@ -1968,7 +2118,9 @@ impl SceneRenderer {
                     actual_parent_world
                         .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY))
                 };
-                if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
+                if (obj.effects.is_empty() && obj.perspective.is_none())
+                    || view_mode == ViewMode::Wireframe
+                {
                     if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
                         let text_surface_xf = page_to_surface.compose(&delta_xf);
                         self.text_engine.render_text_on_path(
@@ -1995,33 +2147,89 @@ impl SceneRenderer {
                         );
                     }
                 } else if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
-                    let pieces = self.text_engine.layout_text_on_path_pieces(top, &host_path);
-                    self.render_text_pieces_with_effects(
-                        doc,
-                        obj,
-                        &pieces,
-                        None,
-                        delta_xf,
-                        page_to_surface,
-                        page_to_surface,
-                        px_per_mm,
-                        view_mode,
-                        backend,
-                    );
+                    let mut pieces = self.text_engine.layout_text_on_path_pieces(top, &host_path);
+                    if let Some(persp) = obj.perspective {
+                        let text_surface_xf = page_to_surface.compose(&delta_xf);
+                        let inv_parent = parent_to_screen
+                            .inverse()
+                            .map(|inv| inv.compose(&text_surface_xf))
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(Affine2D::IDENTITY);
+                        for piece in &mut pieces {
+                            let local_piece = piece.path.transformed(&inv_parent);
+                            piece.path = persp.transform_bezier_path(&local_piece);
+                        }
+                        if obj.effects.is_empty() {
+                            draw_text_pieces(
+                                backend,
+                                &pieces,
+                                parent_to_screen,
+                                &obj.outline,
+                                obj.opacity,
+                                obj.blend_mode,
+                                view_mode,
+                                px_per_mm,
+                            );
+                        } else {
+                            self.render_text_pieces_with_effects(
+                                doc,
+                                obj,
+                                &pieces,
+                                None,
+                                Affine2D::IDENTITY,
+                                page_to_surface,
+                                parent_to_screen,
+                                px_per_mm,
+                                view_mode,
+                                backend,
+                            );
+                        }
+                    } else {
+                        self.render_text_pieces_with_effects(
+                            doc,
+                            obj,
+                            &pieces,
+                            None,
+                            delta_xf,
+                            page_to_surface,
+                            page_to_surface,
+                            px_per_mm,
+                            view_mode,
+                            backend,
+                        );
+                    }
                 } else {
-                    let pieces = self.text_engine.layout_artistic_pieces(&top.text);
-                    self.render_text_pieces_with_effects(
-                        doc,
-                        obj,
-                        &pieces,
-                        None,
-                        obj.transform,
-                        page_to_surface,
-                        parent_to_screen,
-                        px_per_mm,
-                        view_mode,
-                        backend,
-                    );
+                    let mut pieces = self.text_engine.layout_artistic_pieces(&top.text);
+                    if let Some(persp) = obj.perspective {
+                        for piece in &mut pieces {
+                            piece.path = persp.transform_bezier_path(&piece.path);
+                        }
+                    }
+                    if obj.effects.is_empty() {
+                        draw_text_pieces(
+                            backend,
+                            &pieces,
+                            obj_to_screen,
+                            &obj.outline,
+                            obj.opacity,
+                            obj.blend_mode,
+                            view_mode,
+                            px_per_mm,
+                        );
+                    } else {
+                        self.render_text_pieces_with_effects(
+                            doc,
+                            obj,
+                            &pieces,
+                            None,
+                            obj.transform,
+                            page_to_surface,
+                            parent_to_screen,
+                            px_per_mm,
+                            view_mode,
+                            backend,
+                        );
+                    }
                 }
             }
             NodePayload::Raster(raster) => {
@@ -2079,7 +2287,7 @@ impl SceneRenderer {
                     doc,
                     conn,
                     &base_world_xf,
-                    sym_ctx,
+                    sym_ctx.map(|(m, _, xf)| (m, xf)),
                     &mut sym_visiting,
                     &mut sym_visited_syms,
                     &mut sym_cache,
@@ -2149,7 +2357,7 @@ impl SceneRenderer {
                 }
             }
             NodePayload::Group(children) => {
-                let sym_map = sym_ctx.map(|(m, _)| m);
+                let sym_map = sym_ctx.map(|(m, _, _)| m);
                 let track_child_lens = children.iter().any(|&cid| {
                     sym_map
                         .and_then(|m| m.get(&cid).copied())
@@ -2189,7 +2397,7 @@ impl SceneRenderer {
                                 && self.subtree_has_unwarmed_frozen_lens_in_branch(
                                     doc,
                                     obj,
-                                    sym_ctx.map(|(m, _)| m),
+                                    sym_ctx.map(|(m, _, _)| m),
                                     false,
                                 )
                             {
@@ -2337,12 +2545,25 @@ impl SceneRenderer {
                 contents,
                 ..
             } => {
+                let pc_has_deform = obj.perspective.is_some()
+                    || obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Distort { .. }
+                                | Effect::Envelope { .. }
+                                | Effect::Perspective { .. }
+                        )
+                    });
                 let persp_container = if let Some(persp) = obj.perspective {
                     persp.transform_bezier_path(container)
                 } else {
                     (**container).clone()
                 };
-                let deformed_container = apply_geometry_effects(&persp_container, &obj.effects);
+                let pc_local_bb = pc_has_deform
+                    .then(|| persp_container.bounding_box())
+                    .flatten();
+                let deformed_container =
+                    apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects);
                 if view_mode == ViewMode::Wireframe {
                     stroke_wireframe(
                         &deformed_container,
@@ -2351,21 +2572,50 @@ impl SceneRenderer {
                         options,
                         backend,
                     );
-                    for &cid in contents {
-                        self.render_object_by_id_with_sym(
+                    if pc_has_deform {
+                        let frames = [DeformFrame {
+                            pre_perspective: obj.perspective,
+                            group_local_bb: pc_local_bb,
+                            group_effects: &obj.effects,
+                            rel_to_outer: Affine2D::IDENTITY,
+                        }];
+                        let mut visit = HashSet::new();
+                        self.render_group_deformed_subtree(
                             doc,
                             page,
-                            cid,
+                            contents,
+                            obj.id,
+                            &frames,
                             page_to_surface,
                             obj_to_screen,
+                            Affine2D::IDENTITY,
                             sym_ctx,
-                            world_sym_xf,
+                            px_per_mm,
                             view_mode,
                             options,
                             backend,
                             underlying,
+                            false,
                             depth + 1,
+                            &mut visit,
                         );
+                    } else {
+                        for &cid in contents {
+                            self.render_object_by_id_with_sym(
+                                doc,
+                                page,
+                                cid,
+                                page_to_surface,
+                                obj_to_screen,
+                                sym_ctx,
+                                world_sym_xf,
+                                view_mode,
+                                options,
+                                backend,
+                                underlying,
+                                depth + 1,
+                            );
+                        }
                     }
                     return;
                 }
@@ -2417,7 +2667,7 @@ impl SceneRenderer {
 
                 // Clip contents strictly to container contour!
                 backend.push_clip(&deformed_container, FillRule::Winding, obj_to_screen);
-                let sym_map = sym_ctx.map(|(m, _)| m);
+                let sym_map = sym_ctx.map(|(m, _, _)| m);
                 let track_pc_lens = contents.iter().any(|&cid| {
                     sym_map
                         .and_then(|m| m.get(&cid).copied())
@@ -2436,32 +2686,78 @@ impl SceneRenderer {
                     None
                 };
                 let saved_sym_root_idx = self.current_sym_root_idx.take();
+                let pc_world_xf = page_to_surface
+                    .inverse()
+                    .map(|inv| inv.compose(&obj_to_screen))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(obj.transform);
                 let mut pc_underlying = track_pc_lens.then(|| {
                     let mut v = underlying.to_vec();
                     v.push(BackdropItem::EnterPowerClip {
                         pc_id: obj.id,
                         sym_root_idx: pc_sym_root_idx,
                     });
+                    if pc_has_deform {
+                        v.push(BackdropItem::EnterDeformedGroup {
+                            group_id: obj.id,
+                            group_sym_root_idx: pc_sym_root_idx,
+                            group_local_bb: pc_local_bb,
+                            group_world_xf: Some(pc_world_xf),
+                        });
+                    }
                     v
                 });
-                for &cid in contents {
-                    let child_u = pc_underlying.as_deref().unwrap_or(underlying);
-                    self.render_object_by_id_with_sym(
+                if pc_has_deform {
+                    let frames = [DeformFrame {
+                        pre_perspective: obj.perspective,
+                        group_local_bb: pc_local_bb,
+                        group_effects: &obj.effects,
+                        rel_to_outer: Affine2D::IDENTITY,
+                    }];
+                    let u_ref = pc_underlying.as_deref().unwrap_or(underlying);
+                    let mut visit = HashSet::new();
+                    self.render_group_deformed_subtree(
                         doc,
                         page,
-                        cid,
+                        contents,
+                        obj.id,
+                        &frames,
                         page_to_surface,
                         obj_to_screen,
+                        Affine2D::IDENTITY,
                         sym_ctx,
-                        world_sym_xf,
+                        px_per_mm,
                         view_mode,
                         options,
                         backend,
-                        child_u,
+                        u_ref,
+                        track_pc_lens,
                         depth + 1,
+                        &mut visit,
                     );
-                    if let Some(ref mut u) = pc_underlying {
-                        u.push(BackdropItem::Object(cid));
+                    if let Some(ref mut v) = pc_underlying {
+                        v.push(BackdropItem::ExitDeformedGroup);
+                    }
+                } else {
+                    for &cid in contents {
+                        let child_u = pc_underlying.as_deref().unwrap_or(underlying);
+                        self.render_object_by_id_with_sym(
+                            doc,
+                            page,
+                            cid,
+                            page_to_surface,
+                            obj_to_screen,
+                            sym_ctx,
+                            world_sym_xf,
+                            view_mode,
+                            options,
+                            backend,
+                            child_u,
+                            depth + 1,
+                        );
+                        if let Some(ref mut u) = pc_underlying {
+                            u.push(BackdropItem::Object(cid));
+                        }
                     }
                 }
                 self.current_sym_root_idx = saved_sym_root_idx;
@@ -2555,50 +2851,31 @@ impl SceneRenderer {
                     let render_roots =
                         |renderer: &mut Self,
                          target_page_to_surface: Affine2D,
+                         target_parent_to_screen: Affine2D,
                          target_obj_to_screen: Affine2D,
+                         target_px_per_mm: f64,
                          target_backend: &mut dyn CanvasBackend| {
-                            let mut sym_underlying = sym_has_lens.then(|| {
-                                let mut v = underlying.to_vec();
-                                v.push(BackdropItem::EnterSymbolInstance {
-                                    sym_id: *sym_id,
-                                    sym_world_xf: sym_root_world_xf,
-                                    inst_id: obj.id,
-                                    inst_sym_root_idx: parent_sym_root_idx,
-                                });
-                                v
-                            });
-                            for (idx, sub) in sym.objects.iter().enumerate() {
-                                if sub.id.0 != 0 && referenced.contains(&sub.id) {
-                                    continue;
-                                }
-                                renderer.current_sym_root_idx =
-                                    if sub.id.0 == 0 { Some(idx) } else { None };
-                                let sub_u = sym_underlying.as_deref().unwrap_or(underlying);
-                                renderer.render_scene_object_with_sym(
-                                    doc,
-                                    page,
-                                    sub,
-                                    target_page_to_surface,
-                                    target_obj_to_screen,
-                                    Some((&child_map, sym_root_world_xf)),
-                                    Affine2D::IDENTITY,
-                                    view_mode,
-                                    options,
-                                    target_backend,
-                                    sub_u,
-                                    depth + 1,
-                                );
-                                if let Some(ref mut u) = sym_underlying {
-                                    if sub.id.0 != 0 {
-                                        u.push(BackdropItem::Object(sub.id));
-                                    } else {
-                                        u.push(BackdropItem::SymObjectIndex(idx));
-                                    }
-                                }
-                            }
-                            if let Some(ref mut u) = sym_underlying {
-                                u.push(BackdropItem::ExitSymbolInstance);
-                            }
+                            renderer.render_symbol_instance_contents(
+                                doc,
+                                page,
+                                obj,
+                                *sym_id,
+                                sym,
+                                &child_map,
+                                &referenced,
+                                sym_root_world_xf,
+                                sym_has_lens,
+                                parent_sym_root_idx,
+                                target_page_to_surface,
+                                target_parent_to_screen,
+                                target_obj_to_screen,
+                                target_px_per_mm,
+                                view_mode,
+                                options,
+                                target_backend,
+                                underlying,
+                                depth,
+                            );
                         };
 
                     if needs_isolation {
@@ -2631,12 +2908,15 @@ impl SceneRenderer {
                                         -f64::from(clamped.y),
                                     );
                                     let sub_page = shift.compose(&page_to_surface);
+                                    let sub_parent = shift.compose(&parent_to_screen);
                                     let sub_obj = shift.compose(&obj_to_screen);
                                     let prev_force = self.force_offscreen_lens_backdrop;
                                     if sym_has_lens {
                                         self.force_offscreen_lens_backdrop = true;
                                     }
-                                    render_roots(self, sub_page, sub_obj, &mut sub);
+                                    render_roots(
+                                        self, sub_page, sub_parent, sub_obj, px_per_mm, &mut sub,
+                                    );
                                     self.force_offscreen_lens_backdrop = prev_force;
                                     let buf = sub.into_rgba();
                                     backend.composite_region(
@@ -2669,12 +2949,21 @@ impl SceneRenderer {
                                                 -f64::from(clamped.y),
                                             ));
                                         let sub_page = shift.compose(&page_to_surface);
+                                        let sub_parent = shift.compose(&parent_to_screen);
                                         let sub_obj = shift.compose(&obj_to_screen);
+                                        let sub_px_per_mm = estimate_scale(&sub_parent);
                                         let prev_force = self.force_offscreen_lens_backdrop;
                                         if sym_has_lens {
                                             self.force_offscreen_lens_backdrop = true;
                                         }
-                                        render_roots(self, sub_page, sub_obj, &mut sub);
+                                        render_roots(
+                                            self,
+                                            sub_page,
+                                            sub_parent,
+                                            sub_obj,
+                                            sub_px_per_mm,
+                                            &mut sub,
+                                        );
                                         self.force_offscreen_lens_backdrop = prev_force;
                                         let buf = sub.into_rgba();
                                         let draw_xf = Affine2D::translate(
@@ -2695,20 +2984,34 @@ impl SceneRenderer {
                                 && self.subtree_has_unwarmed_frozen_lens_in_branch(
                                     doc,
                                     obj,
-                                    sym_ctx.map(|(m, _)| m),
+                                    sym_ctx.map(|(m, _, _)| m),
                                     true,
                                 )
                             {
                                 if let Ok(mut dummy) = TinySkiaBackend::new(1, 1) {
                                     let prev_force = self.force_offscreen_lens_backdrop;
                                     self.force_offscreen_lens_backdrop = true;
-                                    render_roots(self, page_to_surface, obj_to_screen, &mut dummy);
+                                    render_roots(
+                                        self,
+                                        page_to_surface,
+                                        parent_to_screen,
+                                        obj_to_screen,
+                                        px_per_mm,
+                                        &mut dummy,
+                                    );
                                     self.force_offscreen_lens_backdrop = prev_force;
                                 }
                             }
                         }
                     } else {
-                        render_roots(self, page_to_surface, obj_to_screen, backend);
+                        render_roots(
+                            self,
+                            page_to_surface,
+                            parent_to_screen,
+                            obj_to_screen,
+                            px_per_mm,
+                            backend,
+                        );
                     }
 
                     self.frozen_scope_stack.truncate(scope_prev_len);
@@ -2957,12 +3260,13 @@ impl SceneRenderer {
         depth: usize,
     ) {
         let anti_alias = view_mode != ViewMode::Pixels;
-        let group_has_deform = obj.effects.iter().any(|e| {
-            matches!(
-                e,
-                Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
-            )
-        });
+        let group_has_deform = obj.perspective.is_some()
+            || obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+                )
+            });
         let group_has_underlay = view_mode != ViewMode::Wireframe
             && obj.effects.iter().any(|e| {
                 matches!(
@@ -2974,6 +3278,7 @@ impl SceneRenderer {
                             ..
                         }
                         | Effect::Extrude25D { .. }
+                        | Effect::Extrude3D { .. }
                         | Effect::Blend { .. }
                 )
             });
@@ -2985,6 +3290,9 @@ impl SceneRenderer {
                         mode: coree_core::ContourMode::Inside | coree_core::ContourMode::ToCenter,
                         ..
                     } | Effect::Extrude25D { .. }
+                        | Effect::Extrude3D { .. }
+                        | Effect::InnerShadow { .. }
+                        | Effect::Bevel { .. }
                 )
             });
 
@@ -3020,7 +3328,7 @@ impl SceneRenderer {
             .map(|inv| inv.compose(&obj_to_screen))
             .filter(|m| m.is_finite())
             .unwrap_or(obj.transform);
-        let group_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
+        let raw_group_local_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
             doc.local_object_bounds(obj.id)
         } else {
             let mut visit = HashSet::new();
@@ -3034,12 +3342,17 @@ impl SceneRenderer {
                 &mut visit,
             )
         };
+        let group_local_bb = if let Some(persp) = obj.perspective {
+            raw_group_local_bb.and_then(|lb| persp.try_transform_rect(lb))
+        } else {
+            raw_group_local_bb
+        };
 
         let mut proxy_holder: Option<SceneObject> = None;
         let mut deformed_sil_holder: Option<BezierPath> = None;
         if group_has_underlay || group_has_overlay {
             let mut visit = HashSet::new();
-            let sil = self.collect_group_local_silhouette(
+            let mut sil = self.collect_group_local_silhouette(
                 doc,
                 children,
                 sym_ctx,
@@ -3047,6 +3360,9 @@ impl SceneRenderer {
                 depth + 1,
                 &mut visit,
             );
+            if let Some(persp) = obj.perspective {
+                sil = persp.transform_bezier_path(&sil);
+            }
             let deformed_sil = apply_geometry_effects_in_bounds(&sil, group_local_bb, &obj.effects);
             let mut proxy = obj.clone();
             if !proxy.fill.is_visible() {
@@ -3092,6 +3408,7 @@ impl SceneRenderer {
             });
             let u_ref = group_underlying.as_deref().unwrap_or(underlying);
             let frames = [DeformFrame {
+                pre_perspective: obj.perspective,
                 group_local_bb,
                 group_effects: &obj.effects,
                 rel_to_outer: Affine2D::IDENTITY,
@@ -3159,6 +3476,266 @@ impl SceneRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_symbol_instance_contents(
+        &mut self,
+        doc: &Document,
+        page: Option<&Page>,
+        obj: &SceneObject,
+        sym_id: SymbolId,
+        sym: &SymbolDef,
+        child_map: &HashMap<ObjectId, &SceneObject>,
+        referenced: &HashSet<ObjectId>,
+        sym_root_world_xf: Affine2D,
+        sym_has_lens: bool,
+        parent_sym_root_idx: Option<usize>,
+        page_to_surface: Affine2D,
+        parent_to_screen: Affine2D,
+        obj_to_screen: Affine2D,
+        px_per_mm: f64,
+        view_mode: ViewMode,
+        options: &RenderOptions,
+        backend: &mut dyn CanvasBackend,
+        underlying: &[BackdropItem],
+        depth: usize,
+    ) {
+        let anti_alias = view_mode != ViewMode::Pixels;
+        let sym_has_deform = obj.perspective.is_some()
+            || obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+                )
+            });
+        let sym_has_underlay = view_mode != ViewMode::Wireframe
+            && obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::DropShadow { .. }
+                        | Effect::BlockShadow { .. }
+                        | Effect::Contour {
+                            mode: coree_core::ContourMode::Outside,
+                            ..
+                        }
+                        | Effect::Extrude25D { .. }
+                        | Effect::Extrude3D { .. }
+                        | Effect::Blend { .. }
+                )
+            });
+        let sym_has_overlay = view_mode != ViewMode::Wireframe
+            && obj.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Contour {
+                        mode: coree_core::ContourMode::Inside | coree_core::ContourMode::ToCenter,
+                        ..
+                    } | Effect::Extrude25D { .. }
+                        | Effect::Extrude3D { .. }
+                        | Effect::InnerShadow { .. }
+                        | Effect::Bevel { .. }
+                )
+            });
+
+        let raw_sym_local_bb = if sym_has_deform || sym_has_underlay || sym_has_overlay {
+            doc.symbol_bounds_with_xf_and_space(
+                sym_id,
+                &Affine2D::IDENTITY,
+                Some(&sym_root_world_xf),
+            )
+        } else {
+            None
+        };
+        let sym_local_bb = if let Some(persp) = obj.perspective {
+            raw_sym_local_bb.and_then(|lb| persp.try_transform_rect(lb))
+        } else {
+            raw_sym_local_bb
+        };
+
+        let mut proxy_holder: Option<SceneObject> = None;
+        let mut deformed_sil_holder: Option<BezierPath> = None;
+        if sym_has_underlay || sym_has_overlay {
+            let mut sil = self.collect_symbol_local_silhouette(
+                doc,
+                sym,
+                (child_map, &sym.objects, sym_root_world_xf),
+                referenced,
+                Affine2D::IDENTITY,
+                depth + 1,
+            );
+            if let Some(persp) = obj.perspective {
+                sil = persp.transform_bezier_path(&sil);
+            }
+            let deformed_sil = apply_geometry_effects_in_bounds(&sil, sym_local_bb, &obj.effects);
+            let mut proxy = obj.clone();
+            if !proxy.fill.is_visible() {
+                proxy.fill = Self::first_visible_symbol_fill(doc, sym, child_map, referenced)
+                    .unwrap_or(Fill::Solid(Color::BLACK));
+            }
+            deformed_sil_holder = Some(deformed_sil);
+            proxy_holder = Some(proxy);
+        }
+
+        if sym_has_underlay {
+            if let (Some(proxy), Some(deformed_sil)) = (&proxy_holder, &deformed_sil_holder) {
+                render_underlay_effects(
+                    doc,
+                    proxy,
+                    deformed_sil,
+                    obj.transform,
+                    parent_to_screen,
+                    page_to_surface,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        }
+
+        let mut sym_underlying = sym_has_lens.then(|| {
+            let mut v = underlying.to_vec();
+            v.push(BackdropItem::EnterSymbolInstance {
+                sym_id,
+                sym_world_xf: sym_root_world_xf,
+                inst_id: obj.id,
+                inst_sym_root_idx: parent_sym_root_idx,
+            });
+            v
+        });
+
+        if sym_has_deform {
+            let frames = [DeformFrame {
+                pre_perspective: obj.perspective,
+                group_local_bb: sym_local_bb,
+                group_effects: &obj.effects,
+                rel_to_outer: Affine2D::IDENTITY,
+            }];
+            let mut sym_visit = HashSet::new();
+            for (idx, sub) in sym.objects.iter().enumerate() {
+                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                    continue;
+                }
+                if sub.id.0 != 0 && !sym_visit.insert(sub.id) {
+                    if let Some(ref mut u) = sym_underlying {
+                        u.push(BackdropItem::Object(sub.id));
+                    }
+                    continue;
+                }
+                self.current_sym_root_idx = if sub.id.0 == 0 { Some(idx) } else { None };
+                let sub_u = sym_underlying.as_deref().unwrap_or(underlying);
+                self.render_deformed_scene_object(
+                    doc,
+                    page,
+                    sub,
+                    &frames,
+                    page_to_surface,
+                    obj_to_screen,
+                    Affine2D::IDENTITY,
+                    Some((child_map, &sym.objects, sym_root_world_xf)),
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    sub_u,
+                    sym_has_lens,
+                    depth + 1,
+                    &mut sym_visit,
+                );
+                if sub.id.0 != 0 {
+                    sym_visit.remove(&sub.id);
+                }
+                if let Some(ref mut u) = sym_underlying {
+                    if sub.id.0 != 0 {
+                        u.push(BackdropItem::Object(sub.id));
+                    } else {
+                        u.push(BackdropItem::SymObjectIndex(idx));
+                    }
+                }
+            }
+        } else {
+            for (idx, sub) in sym.objects.iter().enumerate() {
+                if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                    continue;
+                }
+                self.current_sym_root_idx = if sub.id.0 == 0 { Some(idx) } else { None };
+                let sub_u = sym_underlying.as_deref().unwrap_or(underlying);
+                self.render_scene_object_with_sym(
+                    doc,
+                    page,
+                    sub,
+                    page_to_surface,
+                    obj_to_screen,
+                    Some((child_map, &sym.objects, sym_root_world_xf)),
+                    Affine2D::IDENTITY,
+                    view_mode,
+                    options,
+                    backend,
+                    sub_u,
+                    depth + 1,
+                );
+                if let Some(ref mut u) = sym_underlying {
+                    if sub.id.0 != 0 {
+                        u.push(BackdropItem::Object(sub.id));
+                    } else {
+                        u.push(BackdropItem::SymObjectIndex(idx));
+                    }
+                }
+            }
+        }
+        if let Some(ref mut u) = sym_underlying {
+            u.push(BackdropItem::ExitSymbolInstance);
+        }
+
+        if sym_has_overlay {
+            if let (Some(proxy), Some(deformed_sil)) = (&proxy_holder, &deformed_sil_holder) {
+                render_overlay_effects(
+                    proxy,
+                    deformed_sil,
+                    obj.transform,
+                    parent_to_screen,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
+            }
+        }
+    }
+
+    fn first_visible_symbol_fill(
+        doc: &Document,
+        sym: &SymbolDef,
+        child_map: &HashMap<ObjectId, &SceneObject>,
+        referenced: &HashSet<ObjectId>,
+    ) -> Option<Fill> {
+        for sub in &sym.objects {
+            if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                continue;
+            }
+            if !sub.visible {
+                continue;
+            }
+            if sub.fill.is_visible() {
+                return Some(sub.fill.clone());
+            }
+            let ctx = Some((child_map, sym.objects.as_slice(), Affine2D::IDENTITY));
+            match &sub.payload {
+                NodePayload::Group(c) => {
+                    if let Some(f) = Self::first_visible_child_fill(doc, c, ctx) {
+                        return Some(f);
+                    }
+                }
+                NodePayload::Clone { .. } => {
+                    if let Some((_, f, _)) = doc.resolve_clone_payload_and_style(sub) {
+                        if f.is_visible() {
+                            return Some(f);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn first_visible_child_fill(
         doc: &Document,
         children: &[ObjectId],
@@ -3166,7 +3743,7 @@ impl SceneRenderer {
     ) -> Option<Fill> {
         for &cid in children {
             let cobj = sym_ctx
-                .and_then(|(m, _)| m.get(&cid).copied())
+                .and_then(|(m, _, _)| m.get(&cid).copied())
                 .or_else(|| doc.object(cid))?;
             if !cobj.visible {
                 continue;
@@ -3174,10 +3751,43 @@ impl SceneRenderer {
             if cobj.fill.is_visible() {
                 return Some(cobj.fill.clone());
             }
-            if let NodePayload::Group(sub) = &cobj.payload {
-                if let Some(f) = Self::first_visible_child_fill(doc, sub, sym_ctx) {
-                    return Some(f);
+            match &cobj.payload {
+                NodePayload::Group(sub) => {
+                    if let Some(f) = Self::first_visible_child_fill(doc, sub, sym_ctx) {
+                        return Some(f);
+                    }
                 }
+                NodePayload::Clone { .. } => {
+                    if let Some((_, f, _)) = doc.resolve_clone_payload_and_style(cobj) {
+                        if f.is_visible() {
+                            return Some(f);
+                        }
+                    }
+                }
+                NodePayload::SymbolInstance(sym_id) => {
+                    if let Some(sym) = doc.symbol(*sym_id) {
+                        let mut child_map = HashMap::new();
+                        let mut referenced = HashSet::new();
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 {
+                                child_map.insert(sub.id, sub);
+                            }
+                            match &sub.payload {
+                                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                NodePayload::PowerClip { contents, .. } => {
+                                    referenced.extend(contents.iter().copied());
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(f) =
+                            Self::first_visible_symbol_fill(doc, sym, &child_map, &referenced)
+                        {
+                            return Some(f);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         None
@@ -3202,97 +3812,338 @@ impl SceneRenderer {
                 continue;
             }
             let cobj = sym_ctx
-                .and_then(|(m, _)| m.get(&cid).copied())
+                .and_then(|(m, _, _)| m.get(&cid).copied())
                 .or_else(|| doc.object(cid));
             if let Some(obj) = cobj {
-                let c_xf = rel_xf.compose(&obj.transform);
-                let cb = match &obj.payload {
-                    NodePayload::Path(p) => p.transformed(&c_xf).bounding_box(),
-                    NodePayload::Shape(s) => s.to_bezier_path().transformed(&c_xf).bounding_box(),
-                    NodePayload::PowerClip { container, .. } => {
-                        container.transformed(&c_xf).bounding_box()
+                let apply_obj_persp = |bp: BezierPath| {
+                    if let Some(persp) = obj.perspective {
+                        persp.transform_bezier_path(&bp)
+                    } else {
+                        bp
                     }
-                    NodePayload::ArtisticText(t) => c_xf.try_transform_rect(t.estimated_bounds()),
-                    NodePayload::ParagraphText(t) => c_xf.try_transform_rect(t.bounding_box()),
-                    NodePayload::Table(t) => c_xf.try_transform_rect(t.to_bounding_box()),
-                    NodePayload::Dimension(d) => c_xf.try_transform_rect(d.bounding_box()),
-                    NodePayload::Raster(r) => {
-                        let rc = match r.crop_rect {
-                            Some(cr) if cr.is_finite() => Some(cr),
-                            Some(_) => None,
-                            None if r.width_mm.is_finite() && r.height_mm.is_finite() => {
-                                Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
-                            }
-                            None => None,
-                        };
-                        rc.and_then(|rect| c_xf.try_transform_rect(rect))
-                    }
-                    NodePayload::TextOnPath(top) => {
-                        resolve_sym_world_path(doc, top.path_id, sym_ctx)
-                            .and_then(|wp| {
-                                let inv = inv_target_world?;
-                                wp.transformed(&inv).bounding_box()
-                            })
-                            .or_else(|| c_xf.try_transform_rect(top.text.estimated_bounds()))
-                    }
-                    NodePayload::Connector(conn) => {
-                        let obj_world_xf = target_world_xf.compose(&c_xf);
-                        let mut sym_visiting = HashMap::new();
-                        let mut sym_visited_syms = HashSet::new();
-                        let mut sym_cache = HashMap::new();
-                        let ((a, b), _) = resolve_connector_endpoints_with_sym(
-                            doc,
-                            conn,
-                            &obj_world_xf,
-                            sym_ctx,
-                            &mut sym_visiting,
-                            &mut sym_visited_syms,
-                            &mut sym_cache,
-                            depth + 1,
-                        );
-                        inv_target_world
-                            .and_then(|inv| conn.route_path(a, b).transformed(&inv).bounding_box())
-                    }
-                    NodePayload::SymbolInstance(sym_id) => {
-                        doc.symbol_bounds_with_xf_and_space(*sym_id, &c_xf, Some(&target_world_xf))
-                    }
-                    NodePayload::Group(sub) => Self::compute_children_local_bounds(
-                        doc,
-                        sub,
-                        sym_ctx,
-                        c_xf,
-                        target_world_xf,
-                        depth + 1,
-                        visiting,
-                    ),
-                    NodePayload::BSpline(bs) => {
-                        inv_target_world.and_then(|_| c_xf.try_transform_rect(bs.bounding_box()?))
-                    }
-                    NodePayload::ArtisticMedia { spine, style } => {
-                        coree_core::ArtisticMedia::expand_stroke(spine, style)
-                            .transformed(&c_xf)
-                            .bounding_box()
-                    }
-                    NodePayload::Clone { .. } => cobj.and_then(|co| {
-                        doc.resolve_clone_payload_and_style(co)
-                            .and_then(|(p, _, _)| {
-                                let mut tmp = co.clone();
-                                tmp.payload = p;
-                                crate::effects_render::extract_local_geometry_path(&tmp)
-                                    .and_then(|path| path.transformed(&c_xf).bounding_box())
-                            })
-                    }),
                 };
-                if let Some(r) = cb {
-                    acc = Some(match acc {
-                        Some(prev) => prev.union(r),
-                        None => r,
-                    });
+                for sxf in symmetry_effect_transforms(&obj.effects) {
+                    let c_xf = rel_xf.compose(&sxf).compose(&obj.transform);
+                    let cb = match &obj.payload {
+                        NodePayload::Path(p) => {
+                            apply_obj_persp(p.clone()).transformed(&c_xf).bounding_box()
+                        }
+                        NodePayload::Shape(s) => apply_obj_persp(s.to_bezier_path())
+                            .transformed(&c_xf)
+                            .bounding_box(),
+                        NodePayload::PowerClip { container, .. } => {
+                            apply_obj_persp((**container).clone())
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::ArtisticText(t) => {
+                            apply_obj_persp(BezierPath::from_rect(t.estimated_bounds()))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::ParagraphText(t) => {
+                            apply_obj_persp(BezierPath::from_rect(t.bounding_box()))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::Table(t) => {
+                            apply_obj_persp(BezierPath::from_rect(t.to_bounding_box()))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::Dimension(d) => {
+                            apply_obj_persp(BezierPath::from_rect(d.bounding_box()))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::Raster(r) => {
+                            let rc = match r.crop_rect {
+                                Some(cr) if cr.is_finite() => Some(cr),
+                                Some(_) => None,
+                                None if r.width_mm.is_finite() && r.height_mm.is_finite() => {
+                                    Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+                                }
+                                None => None,
+                            };
+                            rc.and_then(|rect| {
+                                apply_obj_persp(BezierPath::from_rect(rect))
+                                    .transformed(&c_xf)
+                                    .bounding_box()
+                            })
+                        }
+                        NodePayload::TextOnPath(top) => {
+                            resolve_sym_world_path(doc, top.path_id, sym_ctx)
+                                .and_then(|wp| {
+                                    let inv = target_world_xf
+                                        .compose(&rel_xf)
+                                        .inverse()
+                                        .or(inv_target_world)?;
+                                    let sym_local = rel_xf.compose(&sxf);
+                                    apply_obj_persp(wp.transformed(&inv))
+                                        .transformed(&sym_local)
+                                        .bounding_box()
+                                })
+                                .or_else(|| {
+                                    apply_obj_persp(BezierPath::from_rect(
+                                        top.text.estimated_bounds(),
+                                    ))
+                                    .transformed(&c_xf)
+                                    .bounding_box()
+                                })
+                        }
+                        NodePayload::Connector(conn) => {
+                            let obj_world_xf = target_world_xf.compose(&c_xf);
+                            let mut sym_visiting = HashMap::new();
+                            let mut sym_visited_syms = HashSet::new();
+                            let mut sym_cache = HashMap::new();
+                            let ((a, b), _) = resolve_connector_endpoints_with_sym(
+                                doc,
+                                conn,
+                                &obj_world_xf,
+                                sym_ctx.map(|(m, _, xf)| (m, xf)),
+                                &mut sym_visiting,
+                                &mut sym_visited_syms,
+                                &mut sym_cache,
+                                depth + 1,
+                            );
+                            inv_target_world.and_then(|inv| {
+                                conn.route_path(a, b).transformed(&inv).bounding_box()
+                            })
+                        }
+                        NodePayload::SymbolInstance(sym_id) => doc.symbol_bounds_with_xf_and_space(
+                            *sym_id,
+                            &c_xf,
+                            Some(&target_world_xf),
+                        ),
+                        NodePayload::Group(sub) => Self::compute_children_local_bounds(
+                            doc,
+                            sub,
+                            sym_ctx,
+                            c_xf,
+                            target_world_xf,
+                            depth + 1,
+                            visiting,
+                        ),
+                        NodePayload::BSpline(bs) => inv_target_world.and_then(|_| {
+                            apply_obj_persp(bs.to_bezier_path())
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            apply_obj_persp(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::Clone { .. } => cobj.and_then(|co| {
+                            doc.resolve_clone_payload_and_style(co)
+                                .and_then(|(p, _, _)| {
+                                    let mut tmp = co.clone();
+                                    tmp.payload = p;
+                                    crate::effects_render::extract_local_geometry_path(&tmp)
+                                        .and_then(|path| path.transformed(&c_xf).bounding_box())
+                                })
+                        }),
+                    };
+                    if let Some(r) = cb {
+                        acc = Some(match acc {
+                            Some(prev) => prev.union(r),
+                            None => r,
+                        });
+                    }
                 }
             }
             visiting.remove(&cid);
         }
         acc
+    }
+
+    fn collect_single_object_local_silhouette(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+        rel_xf: Affine2D,
+        depth: usize,
+        visiting: &mut HashSet<ObjectId>,
+    ) -> BezierPath {
+        let mut out = BezierPath::default();
+        if depth > MAX_RENDER_DEPTH || !obj.visible || !rel_xf.is_finite() {
+            return out;
+        }
+        let apply_own_persp = |bp: BezierPath| -> BezierPath {
+            if let Some(persp) = obj.perspective {
+                persp.transform_bezier_path(&bp)
+            } else {
+                bp
+            }
+        };
+        for sym_xf in symmetry_effect_transforms(&obj.effects) {
+            let c_xf = rel_xf.compose(&sym_xf).compose(&obj.transform);
+            match &obj.payload {
+                NodePayload::Path(p) => {
+                    let def = apply_geometry_effects(&apply_own_persp(p.clone()), &obj.effects)
+                        .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::Shape(s) => {
+                    let def =
+                        apply_geometry_effects(&apply_own_persp(s.to_bezier_path()), &obj.effects)
+                            .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::BSpline(bs) => {
+                    let def =
+                        apply_geometry_effects(&apply_own_persp(bs.to_bezier_path()), &obj.effects)
+                            .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::ArtisticMedia { spine, style } => {
+                    let def = apply_geometry_effects(
+                        &apply_own_persp(coree_core::ArtisticMedia::expand_stroke(spine, style)),
+                        &obj.effects,
+                    )
+                    .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::Clone { .. } => {
+                    if let Some((p, _, _)) = doc.resolve_clone_payload_and_style(obj) {
+                        let mut tmp = obj.clone();
+                        tmp.payload = p;
+                        if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp)
+                        {
+                            let def =
+                                apply_geometry_effects(&geom, &obj.effects).transformed(&c_xf);
+                            out.subpaths.extend(def.subpaths);
+                        }
+                    }
+                }
+                NodePayload::PowerClip { container, .. } => {
+                    let def = apply_geometry_effects(
+                        &apply_own_persp((**container).clone()),
+                        &obj.effects,
+                    )
+                    .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::ArtisticText(t) => {
+                    let p = self.text_engine.artistic_text_to_curves(t);
+                    let def = apply_geometry_effects(&apply_own_persp(p), &obj.effects)
+                        .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::ParagraphText(t) => {
+                    let p = self.text_engine.paragraph_text_to_curves(t);
+                    let def = apply_geometry_effects(&apply_own_persp(p), &obj.effects)
+                        .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::Table(t) => {
+                    let p = apply_own_persp(BezierPath::from_rect(t.to_bounding_box()));
+                    let def = apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::Dimension(d) => {
+                    let p = apply_own_persp(BezierPath::from_rect(d.bounding_box()));
+                    let def = apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::Raster(r) => {
+                    let rc = r
+                        .crop_rect
+                        .filter(|cr| cr.is_finite())
+                        .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm));
+                    let p = apply_own_persp(BezierPath::from_rect(rc)).transformed(&c_xf);
+                    out.subpaths.extend(p.subpaths);
+                }
+                NodePayload::Group(sub) => {
+                    let mut sub_sil = self.collect_group_local_silhouette(
+                        doc,
+                        sub,
+                        sym_ctx,
+                        Affine2D::IDENTITY,
+                        depth + 1,
+                        visiting,
+                    );
+                    sub_sil = apply_own_persp(sub_sil);
+                    let sub_bb = sub_sil.bounding_box();
+                    let def = apply_geometry_effects_in_bounds(&sub_sil, sub_bb, &obj.effects)
+                        .transformed(&c_xf);
+                    out.subpaths.extend(def.subpaths);
+                }
+                NodePayload::SymbolInstance(sym_id) if self.active_symbols.insert(*sym_id) => {
+                    if let Some(sym) = doc.symbol(*sym_id) {
+                        let mut child_map = HashMap::new();
+                        let mut referenced = HashSet::new();
+                        for sub in &sym.objects {
+                            if sub.id.0 != 0 {
+                                child_map.insert(sub.id, sub);
+                            }
+                            match &sub.payload {
+                                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                                NodePayload::PowerClip { contents, .. } => {
+                                    referenced.extend(contents.iter().copied());
+                                }
+                                _ => {}
+                            }
+                        }
+                        let world_sym = sym_ctx.map_or(Affine2D::IDENTITY, |(_, _, w)| w);
+                        let mut sym_sil = self.collect_symbol_local_silhouette(
+                            doc,
+                            sym,
+                            (&child_map, &sym.objects, world_sym),
+                            &referenced,
+                            Affine2D::IDENTITY,
+                            depth + 1,
+                        );
+                        sym_sil = apply_own_persp(sym_sil);
+                        let sym_bb = sym_sil.bounding_box();
+                        let def = apply_geometry_effects_in_bounds(&sym_sil, sym_bb, &obj.effects)
+                            .transformed(&c_xf);
+                        out.subpaths.extend(def.subpaths);
+                    }
+                    self.active_symbols.remove(sym_id);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn collect_symbol_local_silhouette(
+        &mut self,
+        doc: &Document,
+        sym: &SymbolDef,
+        sym_ctx: SymRenderCtx<'_>,
+        referenced: &HashSet<ObjectId>,
+        rel_xf: Affine2D,
+        depth: usize,
+    ) -> BezierPath {
+        let mut out = BezierPath::default();
+        if depth > MAX_RENDER_DEPTH || !rel_xf.is_finite() {
+            return out;
+        }
+        let mut sym_visit = HashSet::new();
+        for sub in &sym.objects {
+            if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                continue;
+            }
+            if sub.id.0 != 0 && !sym_visit.insert(sub.id) {
+                continue;
+            }
+            let sil = self.collect_single_object_local_silhouette(
+                doc,
+                sub,
+                Some(sym_ctx),
+                rel_xf,
+                depth + 1,
+                &mut sym_visit,
+            );
+            out.subpaths.extend(sil.subpaths);
+            if sub.id.0 != 0 {
+                sym_visit.remove(&sub.id);
+            }
+        }
+        out
     }
 
     fn collect_group_local_silhouette(
@@ -3313,60 +4164,18 @@ impl SceneRenderer {
                 continue;
             }
             let cobj = sym_ctx
-                .and_then(|(m, _)| m.get(&cid).copied())
+                .and_then(|(m, _, _)| m.get(&cid).copied())
                 .or_else(|| doc.object(cid));
             if let Some(obj) = cobj {
-                if obj.visible {
-                    for sym_xf in symmetry_effect_transforms(&obj.effects) {
-                        let c_xf = rel_xf.compose(&sym_xf).compose(&obj.transform);
-                        match &obj.payload {
-                            NodePayload::Path(p) => {
-                                let def =
-                                    apply_geometry_effects(p, &obj.effects).transformed(&c_xf);
-                                out.subpaths.extend(def.subpaths);
-                            }
-                            NodePayload::Shape(s) => {
-                                let def = apply_geometry_effects(&s.to_bezier_path(), &obj.effects)
-                                    .transformed(&c_xf);
-                                out.subpaths.extend(def.subpaths);
-                            }
-                            NodePayload::PowerClip { container, .. } => {
-                                let def = apply_geometry_effects(container, &obj.effects)
-                                    .transformed(&c_xf);
-                                out.subpaths.extend(def.subpaths);
-                            }
-                            NodePayload::ArtisticText(t) => {
-                                let p = self.text_engine.artistic_text_to_curves(t);
-                                let def =
-                                    apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
-                                out.subpaths.extend(def.subpaths);
-                            }
-                            NodePayload::ParagraphText(t) => {
-                                let p = self.text_engine.paragraph_text_to_curves(t);
-                                let def =
-                                    apply_geometry_effects(&p, &obj.effects).transformed(&c_xf);
-                                out.subpaths.extend(def.subpaths);
-                            }
-                            NodePayload::Table(t) => {
-                                let p =
-                                    BezierPath::from_rect(t.to_bounding_box()).transformed(&c_xf);
-                                out.subpaths.extend(p.subpaths);
-                            }
-                            NodePayload::Group(sub) => {
-                                let sub_sil = self.collect_group_local_silhouette(
-                                    doc,
-                                    sub,
-                                    sym_ctx,
-                                    c_xf,
-                                    depth + 1,
-                                    visiting,
-                                );
-                                out.subpaths.extend(sub_sil.subpaths);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                let sil = self.collect_single_object_local_silhouette(
+                    doc,
+                    obj,
+                    sym_ctx,
+                    rel_xf,
+                    depth + 1,
+                    visiting,
+                );
+                out.subpaths.extend(sil.subpaths);
             }
             visiting.remove(&cid);
         }
@@ -3477,6 +4286,8 @@ impl SceneRenderer {
                             deform_frames,
                             page_to_surface,
                             group_to_screen,
+                            rel_xf,
+                            sym_xf,
                             c_xf,
                             sym_ctx,
                             depth,
@@ -3504,7 +4315,7 @@ impl SceneRenderer {
                             crate::export_render::object_or_subtree_has_lens_with_sym(
                                 doc,
                                 obj,
-                                sym_ctx.map(|(m, _)| m),
+                                sym_ctx.map(|(m, _, _)| m),
                                 0,
                                 &mut v,
                                 &mut vs,
@@ -3627,7 +4438,7 @@ impl SceneRenderer {
                         && self.subtree_has_unwarmed_frozen_lens_in_branch(
                             doc,
                             obj,
-                            sym_ctx.map(|(m, _)| m),
+                            sym_ctx.map(|(m, _, _)| m),
                             false,
                         )
                     {
@@ -3720,7 +4531,7 @@ impl SceneRenderer {
                 continue;
             }
             let cobj = sym_ctx
-                .and_then(|(m, _)| m.get(&cid).copied())
+                .and_then(|(m, _, _)| m.get(&cid).copied())
                 .or_else(|| doc.object(cid));
             if let Some(obj) = cobj {
                 let child_u = child_underlying.as_deref().unwrap_or(underlying);
@@ -3758,6 +4569,8 @@ impl SceneRenderer {
         deform_frames: &[DeformFrame<'_>],
         page_to_surface: Affine2D,
         group_to_screen: Affine2D,
+        rel_xf: Affine2D,
+        sym_xf: Affine2D,
         c_xf: Affine2D,
         sym_ctx: Option<SymRenderCtx<'_>>,
         depth: usize,
@@ -3770,6 +4583,8 @@ impl SceneRenderer {
             deform_frames,
             page_to_surface,
             group_to_screen,
+            rel_xf,
+            sym_xf,
             c_xf,
             sym_ctx,
             depth,
@@ -3786,6 +4601,8 @@ impl SceneRenderer {
         deform_frames: &[DeformFrame<'_>],
         page_to_surface: Affine2D,
         group_to_screen: Affine2D,
+        rel_xf: Affine2D,
+        sym_xf: Affine2D,
         c_xf: Affine2D,
         sym_ctx: Option<SymRenderCtx<'_>>,
         depth: usize,
@@ -3808,14 +4625,19 @@ impl SceneRenderer {
             .filter(|m| m.is_finite())
             .unwrap_or(Affine2D::IDENTITY);
         let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
-        let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-        let world_sym_xf = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
         let mut extra_top_pad = 0.0_f64;
 
+        let apply_own_persp = |p: &BezierPath| -> BezierPath {
+            if let Some(persp) = obj.perspective {
+                persp.transform_bezier_path(p)
+            } else {
+                p.clone()
+            }
+        };
         let mut base_sb: Option<Rect2D> = match &obj.payload {
             NodePayload::Path(p) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(p, &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(p), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -3823,7 +4645,7 @@ impl SceneRenderer {
             }
             NodePayload::Shape(s) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&s.to_bezier_path(), &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(&s.to_bezier_path()), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -3831,7 +4653,7 @@ impl SceneRenderer {
             }
             NodePayload::BSpline(bs) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&bs.to_bezier_path(), &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(&bs.to_bezier_path()), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -3840,7 +4662,7 @@ impl SceneRenderer {
             NodePayload::ArtisticMedia { spine, style } => {
                 let deformed = apply_deform_chain_in_bounds(
                     &apply_geometry_effects(
-                        &coree_core::ArtisticMedia::expand_stroke(spine, style),
+                        &apply_own_persp(&coree_core::ArtisticMedia::expand_stroke(spine, style)),
                         &obj.effects,
                     ),
                     c_xf,
@@ -3864,7 +4686,7 @@ impl SceneRenderer {
             }
             NodePayload::PowerClip { container, .. } => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(container, &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(container), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -3872,7 +4694,7 @@ impl SceneRenderer {
             }
             NodePayload::ArtisticText(t) => {
                 let mut bb = apply_deform_chain_in_bounds(
-                    &BezierPath::from_rect(t.estimated_bounds()),
+                    &apply_own_persp(&BezierPath::from_rect(t.estimated_bounds())),
                     c_xf,
                     deform_frames,
                 )
@@ -3889,7 +4711,7 @@ impl SceneRenderer {
             }
             NodePayload::ParagraphText(t) => {
                 let mut bb = apply_deform_chain_in_bounds(
-                    &BezierPath::from_rect(t.bounding_box()),
+                    &apply_own_persp(&BezierPath::from_rect(t.bounding_box())),
                     c_xf,
                     deform_frames,
                 )
@@ -3906,11 +4728,14 @@ impl SceneRenderer {
             }
             NodePayload::Table(t) => {
                 let r = t.to_bounding_box();
-                let mut bb =
-                    apply_deform_chain_in_bounds(&BezierPath::from_rect(r), c_xf, deform_frames)
-                        .transformed(&group_to_screen)
-                        .bounding_box()
-                        .or_else(|| obj_to_screen.try_transform_rect(r))?;
+                let mut bb = apply_deform_chain_in_bounds(
+                    &apply_own_persp(&BezierPath::from_rect(r)),
+                    c_xf,
+                    deform_frames,
+                )
+                .transformed(&group_to_screen)
+                .bounding_box()
+                .or_else(|| obj_to_screen.try_transform_rect(r))?;
                 Self::expand_screen_bounds_for_deforms(
                     &obj.effects,
                     &obj_to_screen,
@@ -3921,11 +4746,14 @@ impl SceneRenderer {
             }
             NodePayload::Dimension(d) => {
                 let r = d.bounding_box();
-                let mut bb =
-                    apply_deform_chain_in_bounds(&BezierPath::from_rect(r), c_xf, deform_frames)
-                        .transformed(&group_to_screen)
-                        .bounding_box()
-                        .or_else(|| obj_to_screen.try_transform_rect(r))?;
+                let mut bb = apply_deform_chain_in_bounds(
+                    &apply_own_persp(&BezierPath::from_rect(r)),
+                    c_xf,
+                    deform_frames,
+                )
+                .transformed(&group_to_screen)
+                .bounding_box()
+                .or_else(|| obj_to_screen.try_transform_rect(r))?;
                 Self::expand_screen_bounds_for_deforms(
                     &obj.effects,
                     &obj_to_screen,
@@ -3943,10 +4771,14 @@ impl SceneRenderer {
                     }
                     None => None,
                 }?;
-                apply_deform_chain_in_bounds(&BezierPath::from_rect(rc), c_xf, deform_frames)
-                    .transformed(&group_to_screen)
-                    .bounding_box()
-                    .or_else(|| obj_to_screen.try_transform_rect(rc))
+                apply_deform_chain_in_bounds(
+                    &apply_own_persp(&BezierPath::from_rect(rc)),
+                    c_xf,
+                    deform_frames,
+                )
+                .transformed(&group_to_screen)
+                .bounding_box()
+                .or_else(|| obj_to_screen.try_transform_rect(rc))
             }
             NodePayload::TextOnPath(top) => {
                 let dist = sanitize_f64(top.distance_mm, 0.0).abs();
@@ -3959,18 +4791,26 @@ impl SceneRenderer {
                     .fold(4.0_f64, f64::max);
                 extra_top_pad = dist + max_font * 1.5;
                 if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
-                    let to_inner = inv_inner_world.compose(&world_sym_xf);
-                    let path_in_inner = host_path.transformed(&to_inner);
+                    let top_parent_world_xf = inner_world_xf.compose(&rel_xf);
+                    let inv_top_parent_world =
+                        top_parent_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let path_in_parent =
+                        apply_own_persp(&host_path.transformed(&inv_top_parent_world));
+                    let sym_local_xf = rel_xf.compose(&sym_xf);
                     let deformed = apply_deform_chain_in_bounds(
-                        &apply_geometry_effects(&path_in_inner, &obj.effects),
-                        Affine2D::IDENTITY,
+                        &apply_geometry_effects(&path_in_parent, &obj.effects),
+                        if sym_local_xf.is_finite() {
+                            sym_local_xf
+                        } else {
+                            sym_xf
+                        },
                         deform_frames,
                     );
                     deformed.transformed(&group_to_screen).bounding_box()
                 } else {
                     let est = top.text.estimated_bounds();
                     let mut bb = apply_deform_chain_in_bounds(
-                        &BezierPath::from_rect(est),
+                        &apply_own_persp(&BezierPath::from_rect(est)),
                         c_xf,
                         deform_frames,
                     )
@@ -3987,29 +4827,22 @@ impl SceneRenderer {
                 }
             }
             NodePayload::Connector(conn) => {
+                let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
                 let obj_world_xf = inner_world_xf.compose(&c_xf);
-                let base_world_xf = world_sym_xf
-                    .inverse()
-                    .map(|inv| inv.compose(&obj_world_xf))
-                    .filter(|m| m.is_finite())
-                    .unwrap_or(obj_world_xf);
                 let mut sym_visiting = HashMap::new();
                 let mut sym_visited_syms = HashSet::new();
                 let mut sym_cache = HashMap::new();
                 let ((a, b), _) = resolve_connector_endpoints_with_sym(
                     doc,
                     conn,
-                    &base_world_xf,
-                    sym_ctx,
+                    &obj_world_xf,
+                    sym_ctx.map(|(m, _, xf)| (m, xf)),
                     &mut sym_visiting,
                     &mut sym_visited_syms,
                     &mut sym_cache,
                     depth + 1,
                 );
-                let route_in_inner = conn
-                    .route_path(a, b)
-                    .transformed(&world_sym_xf)
-                    .transformed(&inv_inner_world);
+                let route_in_inner = conn.route_path(a, b).transformed(&inv_inner_world);
                 let deformed = apply_deform_chain_in_bounds(
                     &apply_geometry_effects(&route_in_inner, &obj.effects),
                     Affine2D::IDENTITY,
@@ -4018,16 +4851,17 @@ impl SceneRenderer {
                 deformed.transformed(&group_to_screen).bounding_box()
             }
             NodePayload::Group(sub) => {
-                let sub_has_deform = obj.effects.iter().any(|e| {
-                    matches!(
-                        e,
-                        Effect::Distort { .. }
-                            | Effect::Envelope { .. }
-                            | Effect::Perspective { .. }
-                    )
-                });
+                let sub_has_deform = obj.perspective.is_some()
+                    || obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Distort { .. }
+                                | Effect::Envelope { .. }
+                                | Effect::Perspective { .. }
+                        )
+                    });
                 let sub_local_bb = if sub_has_deform {
-                    if sym_ctx.is_none() && obj.id.0 != 0 {
+                    let raw_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
                         doc.local_object_bounds(obj.id)
                     } else {
                         let mut v = HashSet::new();
@@ -4040,6 +4874,11 @@ impl SceneRenderer {
                             depth + 1,
                             &mut v,
                         )
+                    };
+                    if let Some(persp) = obj.perspective {
+                        raw_bb.and_then(|lb| persp.try_transform_rect(lb))
+                    } else {
+                        raw_bb
                     }
                 } else {
                     None
@@ -4048,6 +4887,7 @@ impl SceneRenderer {
                 let (active_frames, child_rel_xf) = if sub_has_deform {
                     extended_frames.extend_from_slice(deform_frames);
                     extended_frames.push(DeformFrame {
+                        pre_perspective: obj.perspective,
                         group_local_bb: sub_local_bb,
                         group_effects: &obj.effects,
                         rel_to_outer: c_xf,
@@ -4062,7 +4902,7 @@ impl SceneRenderer {
                         continue;
                     }
                     let cobj = sym_ctx
-                        .and_then(|(m, _)| m.get(&cid).copied())
+                        .and_then(|(m, _, _)| m.get(&cid).copied())
                         .or_else(|| doc.object(cid));
                     if let Some(child) = cobj {
                         if child.visible && child.transform.is_finite() {
@@ -4075,6 +4915,8 @@ impl SceneRenderer {
                                     active_frames,
                                     page_to_surface,
                                     group_to_screen,
+                                    child_rel_xf,
+                                    sxf,
                                     child_c_xf,
                                     sym_ctx,
                                     depth + 1,
@@ -4097,8 +4939,44 @@ impl SceneRenderer {
                 if !visiting_syms.insert(*sym_id) {
                     None
                 } else {
+                    let sym_root_world_xf = inner_world_xf.compose(&c_xf);
+                    let sub_has_deform = obj.perspective.is_some()
+                        || obj.effects.iter().any(|e| {
+                            matches!(
+                                e,
+                                Effect::Distort { .. }
+                                    | Effect::Envelope { .. }
+                                    | Effect::Perspective { .. }
+                            )
+                        });
+                    let sub_local_bb = if sub_has_deform {
+                        let raw_bb = doc.symbol_bounds_with_xf_and_space(
+                            *sym_id,
+                            &Affine2D::IDENTITY,
+                            Some(&sym_root_world_xf),
+                        );
+                        if let Some(persp) = obj.perspective {
+                            raw_bb.and_then(|lb| persp.try_transform_rect(lb))
+                        } else {
+                            raw_bb
+                        }
+                    } else {
+                        None
+                    };
+                    let mut extended_frames: Vec<DeformFrame<'_>> = Vec::new();
+                    let (active_frames, child_rel_xf) = if sub_has_deform {
+                        extended_frames.extend_from_slice(deform_frames);
+                        extended_frames.push(DeformFrame {
+                            pre_perspective: obj.perspective,
+                            group_local_bb: sub_local_bb,
+                            group_effects: &obj.effects,
+                            rel_to_outer: c_xf,
+                        });
+                        (extended_frames.as_slice(), Affine2D::IDENTITY)
+                    } else {
+                        (deform_frames, c_xf)
+                    };
                     let res = doc.symbol(*sym_id).and_then(|sym| {
-                        let sym_root_world_xf = inner_world_xf.compose(&c_xf);
                         let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
                         let mut referenced: HashSet<ObjectId> = HashSet::new();
                         for sub in &sym.objects {
@@ -4122,15 +5000,17 @@ impl SceneRenderer {
                                 continue;
                             }
                             for sxf in symmetry_effect_transforms(&sub.effects) {
-                                let sub_c_xf = c_xf.compose(&sxf).compose(&sub.transform);
+                                let sub_c_xf = child_rel_xf.compose(&sxf).compose(&sub.transform);
                                 if let Some(sb) = self.compute_deformed_child_screen_bounds_inner(
                                     doc,
                                     sub,
-                                    deform_frames,
+                                    active_frames,
                                     page_to_surface,
                                     group_to_screen,
+                                    child_rel_xf,
+                                    sxf,
                                     sub_c_xf,
-                                    Some((&child_map, sym_root_world_xf)),
+                                    Some((&child_map, &sym.objects, sym_root_world_xf)),
                                     depth + 1,
                                     visiting_bounds,
                                     visiting_syms,
@@ -4224,16 +5104,27 @@ impl SceneRenderer {
             .skip(1)
             .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
 
+        let apply_own_persp = |p: &BezierPath| -> BezierPath {
+            if let Some(persp) = obj.perspective {
+                persp.transform_bezier_path(p)
+            } else {
+                p.clone()
+            }
+        };
         if view_mode != ViewMode::Wireframe {
             if let Some(lens_cfg) = &obj.lens {
                 if let Some(local_path) = match &obj.payload {
                     NodePayload::Path(p) => Some(p.clone()),
                     NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                    }
                     NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                     _ => None,
                 } {
                     let deformed = apply_deform_chain_in_bounds(
-                        &apply_geometry_effects(&local_path, &obj.effects),
+                        &apply_geometry_effects(&apply_own_persp(&local_path), &obj.effects),
                         c_xf,
                         deform_frames,
                     );
@@ -4294,10 +5185,17 @@ impl SceneRenderer {
             }
         }
 
+        let apply_own_persp = |p: &BezierPath| -> BezierPath {
+            if let Some(persp) = obj.perspective {
+                persp.transform_bezier_path(p)
+            } else {
+                p.clone()
+            }
+        };
         match &obj.payload {
             NodePayload::Path(p) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(p, &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(p), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -4317,7 +5215,7 @@ impl SceneRenderer {
             }
             NodePayload::Shape(s) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&s.to_bezier_path(), &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(&s.to_bezier_path()), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -4337,7 +5235,7 @@ impl SceneRenderer {
             }
             NodePayload::BSpline(bs) => {
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&bs.to_bezier_path(), &obj.effects),
+                    &apply_geometry_effects(&apply_own_persp(&bs.to_bezier_path()), &obj.effects),
                     c_xf,
                     deform_frames,
                 );
@@ -4358,7 +5256,7 @@ impl SceneRenderer {
             NodePayload::ArtisticMedia { spine, style } => {
                 let deformed = apply_deform_chain_in_bounds(
                     &apply_geometry_effects(
-                        &coree_core::ArtisticMedia::expand_stroke(spine, style),
+                        &apply_own_persp(&coree_core::ArtisticMedia::expand_stroke(spine, style)),
                         &obj.effects,
                     ),
                     c_xf,
@@ -4407,7 +5305,12 @@ impl SceneRenderer {
                 }
             }
             NodePayload::ArtisticText(text) => {
-                let pieces = self.text_engine.layout_artistic_pieces(text);
+                let mut pieces = self.text_engine.layout_artistic_pieces(text);
+                if let Some(persp) = obj.perspective {
+                    for piece in &mut pieces {
+                        piece.path = persp.transform_bezier_path(&piece.path);
+                    }
+                }
                 self.render_deformed_text_pieces(
                     doc,
                     obj,
@@ -4425,7 +5328,12 @@ impl SceneRenderer {
                 );
             }
             NodePayload::ParagraphText(para) => {
-                let pieces = self.text_engine.layout_paragraph_pieces(para);
+                let mut pieces = self.text_engine.layout_paragraph_pieces(para);
+                if let Some(persp) = obj.perspective {
+                    for piece in &mut pieces {
+                        piece.path = persp.transform_bezier_path(&piece.path);
+                    }
+                }
                 self.render_deformed_text_pieces(
                     doc,
                     obj,
@@ -4450,19 +5358,29 @@ impl SceneRenderer {
                         .filter(|m| m.is_finite())
                         .unwrap_or(Affine2D::IDENTITY);
                     let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
-                    let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-                    let world_sym = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
-                    let to_grp = inv_inner_world.compose(&world_sym);
+                    let top_parent_world_xf = inner_world_xf.compose(&rel_xf);
+                    let inv_top_parent_world =
+                        top_parent_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
                     let mut pieces = self.text_engine.layout_text_on_path_pieces(top, &host_path);
                     for piece in &mut pieces {
-                        piece.path = piece.path.transformed(&to_grp);
+                        let local_piece = piece.path.transformed(&inv_top_parent_world);
+                        piece.path = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&local_piece)
+                        } else {
+                            local_piece
+                        };
                     }
+                    let sym_local_xf = rel_xf.compose(&sym_xf);
                     self.render_deformed_text_pieces(
                         doc,
                         obj,
                         &pieces,
                         deform_frames,
-                        Affine2D::IDENTITY,
+                        if sym_local_xf.is_finite() {
+                            sym_local_xf
+                        } else {
+                            sym_xf
+                        },
                         page_to_surface,
                         group_to_screen,
                         px_per_mm,
@@ -4473,7 +5391,12 @@ impl SceneRenderer {
                         depth,
                     );
                 } else {
-                    let pieces = self.text_engine.layout_artistic_pieces(&top.text);
+                    let mut pieces = self.text_engine.layout_artistic_pieces(&top.text);
+                    if let Some(persp) = obj.perspective {
+                        for piece in &mut pieces {
+                            piece.path = persp.transform_bezier_path(&piece.path);
+                        }
+                    }
                     self.render_deformed_text_pieces(
                         doc,
                         obj,
@@ -4800,29 +5723,21 @@ impl SceneRenderer {
                 let inner_world_xf = group_world_xf.compose(&inner_to_outer_rel);
                 let inv_inner_world = inner_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
                 let obj_world_xf = inner_world_xf.compose(&c_xf);
-                let world_sym_xf = sym_ctx.map_or(Affine2D::IDENTITY, |(_, w)| w);
-                let base_world_xf = world_sym_xf
-                    .inverse()
-                    .map(|inv| inv.compose(&obj_world_xf))
-                    .filter(|m| m.is_finite())
-                    .unwrap_or(obj_world_xf);
                 let mut sym_visiting = HashMap::new();
                 let mut sym_visited_syms = HashSet::new();
                 let mut sym_cache = HashMap::new();
                 let ((a, b), _) = resolve_connector_endpoints_with_sym(
                     doc,
                     conn,
-                    &base_world_xf,
-                    sym_ctx,
+                    &obj_world_xf,
+                    sym_ctx.map(|(m, _, xf)| (m, xf)),
                     &mut sym_visiting,
                     &mut sym_visited_syms,
                     &mut sym_cache,
                     depth + 1,
                 );
                 let route = conn.route_path(a, b);
-                let route_in_inner = route
-                    .transformed(&world_sym_xf)
-                    .transformed(&inv_inner_world);
+                let route_in_inner = route.transformed(&inv_inner_world);
                 let deformed = apply_deform_chain_in_bounds(
                     &apply_geometry_effects(&route_in_inner, &obj.effects),
                     Affine2D::IDENTITY,
@@ -4871,14 +5786,15 @@ impl SceneRenderer {
                 }
             }
             NodePayload::Group(sub) => {
-                let sub_has_deform = obj.effects.iter().any(|e| {
-                    matches!(
-                        e,
-                        Effect::Distort { .. }
-                            | Effect::Envelope { .. }
-                            | Effect::Perspective { .. }
-                    )
-                });
+                let sub_has_deform = obj.perspective.is_some()
+                    || obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Distort { .. }
+                                | Effect::Envelope { .. }
+                                | Effect::Perspective { .. }
+                        )
+                    });
                 let outer_world_xf = page_to_surface
                     .inverse()
                     .map(|inv| inv.compose(&group_to_screen))
@@ -4886,7 +5802,7 @@ impl SceneRenderer {
                     .unwrap_or(Affine2D::IDENTITY);
                 let sub_world_xf = outer_world_xf.compose(&inner_to_outer_rel).compose(&c_xf);
                 let sub_local_bb = if sub_has_deform {
-                    if sym_ctx.is_none() && obj.id.0 != 0 {
+                    let raw_bb = if sym_ctx.is_none() && obj.id.0 != 0 {
                         doc.local_object_bounds(obj.id)
                     } else {
                         let mut v = HashSet::new();
@@ -4899,6 +5815,11 @@ impl SceneRenderer {
                             depth + 1,
                             &mut v,
                         )
+                    };
+                    if let Some(persp) = obj.perspective {
+                        raw_bb.and_then(|lb| persp.try_transform_rect(lb))
+                    } else {
+                        raw_bb
                     }
                 } else {
                     None
@@ -4907,6 +5828,7 @@ impl SceneRenderer {
                 let (next_frames, next_rel_xf) = if sub_has_deform {
                     extended_frames.extend_from_slice(deform_frames);
                     extended_frames.push(DeformFrame {
+                        pre_perspective: obj.perspective,
                         group_local_bb: sub_local_bb,
                         group_effects: &obj.effects,
                         rel_to_outer: c_xf,
@@ -4926,6 +5848,7 @@ impl SceneRenderer {
                                     ..
                                 }
                                 | Effect::Extrude25D { .. }
+                                | Effect::Extrude3D { .. }
                                 | Effect::Blend { .. }
                         )
                     });
@@ -4938,6 +5861,9 @@ impl SceneRenderer {
                                     | coree_core::ContourMode::ToCenter,
                                 ..
                             } | Effect::Extrude25D { .. }
+                                | Effect::Extrude3D { .. }
+                                | Effect::InnerShadow { .. }
+                                | Effect::Bevel { .. }
                         )
                     });
                 let mut child_proxy: Option<SceneObject> = None;
@@ -5035,12 +5961,38 @@ impl SceneRenderer {
                 contents,
                 ..
             } => {
+                let pc_has_deform = obj.perspective.is_some()
+                    || obj.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Distort { .. }
+                                | Effect::Envelope { .. }
+                                | Effect::Perspective { .. }
+                        )
+                    });
+                let persp_container = apply_own_persp(container);
+                let pc_local_bb = pc_has_deform
+                    .then(|| persp_container.bounding_box())
+                    .flatten();
                 let deformed_container = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(container, &obj.effects),
+                    &apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects),
                     c_xf,
                     deform_frames,
                 );
-                let sym_map = sym_ctx.map(|(m, _)| m);
+                let mut extended_frames: Vec<DeformFrame<'_>> = Vec::new();
+                let (next_frames, next_rel_xf) = if pc_has_deform {
+                    extended_frames.extend_from_slice(deform_frames);
+                    extended_frames.push(DeformFrame {
+                        pre_perspective: obj.perspective,
+                        group_local_bb: pc_local_bb,
+                        group_effects: &obj.effects,
+                        rel_to_outer: c_xf,
+                    });
+                    (extended_frames.as_slice(), Affine2D::IDENTITY)
+                } else {
+                    (deform_frames, c_xf)
+                };
+                let sym_map = sym_ctx.map(|(m, _, _)| m);
                 let track_pc_lens = track_child_lens
                     && contents.iter().any(|&cid| {
                         sym_map
@@ -5060,12 +6012,26 @@ impl SceneRenderer {
                     None
                 };
                 let saved_sym_root_idx = self.current_sym_root_idx.take();
-                let pc_underlying = track_pc_lens.then(|| {
+                let outer_world_xf = page_to_surface
+                    .inverse()
+                    .map(|inv| inv.compose(&group_to_screen))
+                    .filter(|m| m.is_finite())
+                    .unwrap_or(Affine2D::IDENTITY);
+                let pc_world_xf = outer_world_xf.compose(&inner_to_outer_rel).compose(&c_xf);
+                let mut pc_underlying = track_pc_lens.then(|| {
                     let mut v = child_u.to_vec();
                     v.push(BackdropItem::EnterPowerClip {
                         pc_id: obj.id,
                         sym_root_idx: pc_sym_root_idx,
                     });
+                    if pc_has_deform {
+                        v.push(BackdropItem::EnterDeformedGroup {
+                            group_id: obj.id,
+                            group_sym_root_idx: pc_sym_root_idx,
+                            group_local_bb: pc_local_bb,
+                            group_world_xf: Some(pc_world_xf),
+                        });
+                    }
                     v
                 });
                 let pc_u = pc_underlying.as_deref().unwrap_or(child_u);
@@ -5082,10 +6048,10 @@ impl SceneRenderer {
                         page,
                         contents,
                         obj.id,
-                        deform_frames,
+                        next_frames,
                         page_to_surface,
                         group_to_screen,
-                        c_xf,
+                        next_rel_xf,
                         sym_ctx,
                         px_per_mm,
                         view_mode,
@@ -5143,10 +6109,10 @@ impl SceneRenderer {
                         page,
                         contents,
                         obj.id,
-                        deform_frames,
+                        next_frames,
                         page_to_surface,
                         group_to_screen,
-                        c_xf,
+                        next_rel_xf,
                         sym_ctx,
                         px_per_mm,
                         view_mode,
@@ -5158,6 +6124,11 @@ impl SceneRenderer {
                         visiting,
                     );
                     self.current_sym_root_idx = saved_sym_root_idx;
+                    if let Some(ref mut v) = pc_underlying {
+                        if pc_has_deform {
+                            v.push(BackdropItem::ExitDeformedGroup);
+                        }
+                    }
                     backend.pop_clip();
                     if !obj.effects.is_empty() {
                         render_overlay_effects(
@@ -5211,6 +6182,112 @@ impl SceneRenderer {
                                     referenced.extend(contents.iter().copied());
                                 }
                                 _ => {}
+                            }
+                        }
+                        let sub_has_deform = obj.perspective.is_some()
+                            || obj.effects.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    Effect::Distort { .. }
+                                        | Effect::Envelope { .. }
+                                        | Effect::Perspective { .. }
+                                )
+                            });
+                        let sub_local_bb = if sub_has_deform {
+                            let raw_bb = doc.symbol_bounds_with_xf_and_space(
+                                *sym_id,
+                                &Affine2D::IDENTITY,
+                                Some(&sym_root_world_xf),
+                            );
+                            if let Some(persp) = obj.perspective {
+                                raw_bb.and_then(|lb| persp.try_transform_rect(lb))
+                            } else {
+                                raw_bb
+                            }
+                        } else {
+                            None
+                        };
+                        let mut extended_frames: Vec<DeformFrame<'_>> = Vec::new();
+                        let (next_frames, next_rel_xf) = if sub_has_deform {
+                            extended_frames.extend_from_slice(deform_frames);
+                            extended_frames.push(DeformFrame {
+                                pre_perspective: obj.perspective,
+                                group_local_bb: sub_local_bb,
+                                group_effects: &obj.effects,
+                                rel_to_outer: c_xf,
+                            });
+                            (extended_frames.as_slice(), Affine2D::IDENTITY)
+                        } else {
+                            (deform_frames, c_xf)
+                        };
+                        let child_has_underlay = view_mode != ViewMode::Wireframe
+                            && obj.effects.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    Effect::DropShadow { .. }
+                                        | Effect::BlockShadow { .. }
+                                        | Effect::Contour {
+                                            mode: coree_core::ContourMode::Outside,
+                                            ..
+                                        }
+                                        | Effect::Extrude25D { .. }
+                                        | Effect::Extrude3D { .. }
+                                        | Effect::Blend { .. }
+                                )
+                            });
+                        let child_has_overlay = view_mode != ViewMode::Wireframe
+                            && obj.effects.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    Effect::Contour {
+                                        mode: coree_core::ContourMode::Inside
+                                            | coree_core::ContourMode::ToCenter,
+                                        ..
+                                    } | Effect::Extrude25D { .. }
+                                        | Effect::Extrude3D { .. }
+                                        | Effect::InnerShadow { .. }
+                                        | Effect::Bevel { .. }
+                                )
+                            });
+                        let mut child_proxy: Option<SceneObject> = None;
+                        let mut child_sil: Option<BezierPath> = None;
+                        if child_has_underlay || child_has_overlay {
+                            let sil = self.collect_symbol_local_silhouette(
+                                doc,
+                                sym,
+                                (&child_map, &sym.objects, sym_root_world_xf),
+                                &referenced,
+                                Affine2D::IDENTITY,
+                                depth + 1,
+                            );
+                            let def_sil =
+                                apply_deform_chain_in_bounds(&sil, next_rel_xf, next_frames);
+                            let mut proxy = obj.clone();
+                            if !proxy.fill.is_visible() {
+                                proxy.fill = Self::first_visible_symbol_fill(
+                                    doc,
+                                    sym,
+                                    &child_map,
+                                    &referenced,
+                                )
+                                .unwrap_or(Fill::Solid(Color::BLACK));
+                            }
+                            child_sil = Some(def_sil);
+                            child_proxy = Some(proxy);
+                        }
+                        if child_has_underlay {
+                            if let (Some(proxy), Some(def_sil)) = (&child_proxy, &child_sil) {
+                                render_underlay_effects(
+                                    doc,
+                                    proxy,
+                                    def_sil,
+                                    Affine2D::IDENTITY,
+                                    group_to_screen,
+                                    page_to_surface,
+                                    px_per_mm,
+                                    anti_alias,
+                                    backend,
+                                );
                             }
                         }
                         let sym_has_lens = track_child_lens
@@ -5271,11 +6348,11 @@ impl SceneRenderer {
                                 doc,
                                 page,
                                 sub,
-                                deform_frames,
+                                next_frames,
                                 page_to_surface,
                                 group_to_screen,
-                                c_xf,
-                                Some((&child_map, sym_root_world_xf)),
+                                next_rel_xf,
+                                Some((&child_map, &sym.objects, sym_root_world_xf)),
                                 px_per_mm,
                                 view_mode,
                                 options,
@@ -5301,6 +6378,19 @@ impl SceneRenderer {
                         }
                         self.frozen_scope_stack.truncate(scope_prev_len);
                         self.current_sym_root_idx = parent_sym_root_idx;
+                        if child_has_overlay {
+                            if let (Some(proxy), Some(def_sil)) = (&child_proxy, &child_sil) {
+                                render_overlay_effects(
+                                    proxy,
+                                    def_sil,
+                                    Affine2D::IDENTITY,
+                                    group_to_screen,
+                                    px_per_mm,
+                                    anti_alias,
+                                    backend,
+                                );
+                            }
+                        }
                     }
                     self.active_symbols.remove(sym_id);
                 }

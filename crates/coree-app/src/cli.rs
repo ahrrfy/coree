@@ -769,10 +769,10 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             let mut doc = open_any_document(input_path)?.document;
             let mut ids: Vec<ObjectId> = doc.objects().keys().copied().collect();
             ids.sort_by_key(|id| {
-                let is_top = doc
-                    .object(*id)
-                    .is_some_and(|o| matches!(o.payload, NodePayload::TextOnPath(_)));
-                (!is_top, id.0)
+                let obj = doc.object(*id);
+                let is_clone = obj.is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }));
+                let is_top = obj.is_some_and(|o| matches!(o.payload, NodePayload::TextOnPath(_)));
+                (is_clone, !is_top, id.0)
             });
             let mut text_engine = coree_render::TextEngine::new();
             let mut converted = 0usize;
@@ -1239,5 +1239,58 @@ mod tests {
             .objects()
             .values()
             .any(|o| o.name == "Txt" && o.fill.is_visible()));
+
+        // REM-02: Clone added BEFORE text masters (ObjectId(clone) < ObjectId(master)) must still convert
+        let rev_in = dir.path().join("rev_clone.coree");
+        let rev_out = dir.path().join("rev_clone_curves.coree");
+        let mut rev_doc = Document::new_a4("RevCloneText");
+        let master_id = rev_doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(10),
+                    "MasterLate",
+                    NodePayload::ArtisticText(coree_core::ArtisticText::from_plain(
+                        "HI",
+                        Default::default(),
+                    )),
+                )
+                .with_fill(Fill::None),
+                None,
+            )
+            .unwrap();
+        let clone_id = rev_doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(5),
+                    "CloneEarly",
+                    NodePayload::Clone {
+                        master_id,
+                        link_fill: true,
+                        link_outline: true,
+                        link_shape: true,
+                    },
+                )
+                .with_fill(Fill::None)
+                .with_transform(coree_core::Affine2D::translate(10.0, 40.0)),
+                None,
+            )
+            .unwrap();
+        assert!(clone_id.0 < master_id.0);
+        coree_io::save_coree_with_preview(&rev_doc, None, &rev_in).unwrap();
+
+        let parsed_rev = Cli::try_parse_from([
+            "coree",
+            "convert-to-curves",
+            rev_in.to_str().unwrap(),
+            rev_out.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(execute_cli(&parsed_rev).is_ok());
+        let rev_loaded = open_any_document(&rev_out).unwrap().document;
+        assert!(rev_loaded
+            .objects()
+            .values()
+            .all(|o| matches!(o.payload, NodePayload::Path(_))));
+        assert!(rev_loaded.objects().values().all(|o| o.fill.is_visible()));
     }
 }

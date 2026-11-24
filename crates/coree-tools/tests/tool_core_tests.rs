@@ -4664,3 +4664,467 @@ fn w2b_r3_powerclip_edit_mode_pick_marquee_and_empty_clicks_ignore_container_and
         other => panic!("Expected Consumed ExitPowerClipEdit, got {other:?}"),
     }
 }
+
+#[test]
+fn w2_exit_r4_bspline_and_artistic_media_toolcore_coverage() {
+    use coree_core::{ArtisticMediaStyle, BSplineCurve};
+
+    let make_closed_bspline = || {
+        BSplineCurve::from_control_points(
+            vec![
+                Point2D::new(20.0, 20.0),
+                Point2D::new(80.0, 20.0),
+                Point2D::new(80.0, 80.0),
+                Point2D::new(20.0, 80.0),
+            ],
+            3,
+            true,
+        )
+    };
+
+    // 1. Knife on NodePayload::BSpline + Undo/Redo
+    {
+        let mut h = Harness::new();
+        let lid = h.layer_id();
+        let bs_obj = SceneObject::new(
+            ObjectId(0),
+            "BSpline",
+            NodePayload::BSpline(make_closed_bspline()),
+        )
+        .with_fill(Fill::Solid(Color::CYAN))
+        .with_outline(OutlineStyle::default());
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(bs_obj, Some(lid)))
+            .unwrap();
+        let bs_id = *h.doc.objects().keys().max().unwrap();
+
+        let mut knife = ToolCore::new(ToolId::Knife);
+        let _ = knife.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(10.0, 50.0), [0.0, 0.0]),
+        );
+        let _ = knife.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(90.0, 50.0), [0.0, 0.0]),
+        );
+        let out = knife.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(90.0, 50.0), [0.0, 0.0]),
+        );
+        match out {
+            ToolOutput::Commit { ops, .. } => {
+                assert_eq!(ops.len(), 1);
+                h.history
+                    .execute(&mut h.doc, ops.into_iter().next().unwrap())
+                    .unwrap();
+            }
+            other => panic!("Knife on BSpline must commit slice op, got {other:?}"),
+        }
+        assert!(h.doc.object(bs_id).is_none());
+        assert_eq!(h.doc.active_page().unwrap().layers[0].objects.len(), 2);
+        h.history.undo(&mut h.doc).unwrap();
+        assert!(matches!(
+            h.doc.object(bs_id).map(|o| &o.payload),
+            Some(NodePayload::BSpline(_))
+        ));
+        h.history.redo(&mut h.doc).unwrap();
+        assert_eq!(h.doc.active_page().unwrap().layers[0].objects.len(), 2);
+    }
+
+    // 2. VirtualSegmentDelete on intersecting NodePayload::BSpline + Line + Undo/Redo
+    {
+        let mut h = Harness::new();
+        let lid = h.layer_id();
+        let bs_obj = SceneObject::new(
+            ObjectId(0),
+            "BSpline",
+            NodePayload::BSpline(make_closed_bspline()),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::default());
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(bs_obj, Some(lid)))
+            .unwrap();
+        let bs_id = *h.doc.objects().keys().max().unwrap();
+        let cutter = SceneObject::new(
+            ObjectId(0),
+            "Cutter",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(10.0, 50.0),
+                Point2D::new(90.0, 50.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::default());
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(cutter, Some(lid)))
+            .unwrap();
+        let wp = h.doc.world_path_of(bs_id).unwrap();
+        let top_pt = wp.subpaths[0]
+            .nodes
+            .iter()
+            .min_by(|a, b| a.pos.y.partial_cmp(&b.pos.y).unwrap())
+            .unwrap()
+            .pos;
+        let top_y = top_pt.y;
+        let vsd_ops = coree_tools::build_virtual_segment_delete_stroke_ops(
+            &h.ctx(),
+            &[
+                Point2D::new(top_pt.x, top_pt.y - 2.0),
+                Point2D::new(top_pt.x, top_pt.y + 2.0),
+            ],
+        );
+        assert!(
+            !vsd_ops.is_empty(),
+            "VSD across BSpline boundary at {top_pt:?} must emit ops"
+        );
+        h.history
+            .execute(&mut h.doc, CommandOp::Batch(vsd_ops))
+            .unwrap();
+        let edited_wp = h.doc.world_path_of(bs_id).unwrap();
+        assert!(
+            edited_wp != wp,
+            "VSD must modify BSpline path after deleting segment at {top_pt:?}"
+        );
+        let _ = top_y;
+        h.history.undo(&mut h.doc).unwrap();
+        assert!(matches!(
+            h.doc.object(bs_id).map(|o| &o.payload),
+            Some(NodePayload::BSpline(_))
+        ));
+    }
+
+    // 3. Smooth sculpt, InteractiveFill, MeshFill, and Pick drag TransientOverlay curve preview on BSpline + ArtisticMedia
+    {
+        let mut h = Harness::new();
+        let lid = h.layer_id();
+        let bs_curve = make_closed_bspline();
+        let expected_curve_path = bs_curve.to_bezier_path();
+        let bs_obj = SceneObject::new(ObjectId(0), "BSpline", NodePayload::BSpline(bs_curve))
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::default());
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(bs_obj, Some(lid)))
+            .unwrap();
+        let bs_id = *h.doc.objects().keys().max().unwrap();
+        h.selection.select_single(&h.doc, bs_id);
+
+        // Pick drag TransientOverlay must emit curved BSpline preview (not 4-node AABB rect)
+        let mut pick = ToolCore::new(ToolId::Pick);
+        let _ = pick.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(50.0, 50.0), [0.0, 0.0]),
+        );
+        let mv = pick.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(60.0, 55.0), [0.0, 0.0]),
+        );
+        match mv {
+            ToolOutput::Continue { overlay } => {
+                assert!(
+                    !overlay.preview_paths.is_empty(),
+                    "Pick drag on BSpline must emit curve preview path"
+                );
+                let preview = &overlay.preview_paths[0].path;
+                assert!(
+                    preview.subpaths[0].nodes.len() == expected_curve_path.subpaths[0].nodes.len()
+                        && preview.subpaths[0].nodes.len() > 4,
+                    "Pick drag BSpline preview must use curved BSpline path, not 4-node AABB rect (got {} nodes)",
+                    preview.subpaths[0].nodes.len()
+                );
+            }
+            other => panic!("Expected Continue overlay during Pick drag on BSpline, got {other:?}"),
+        }
+        let _ = pick.on_key(
+            &h.ctx(),
+            &KeyEvent {
+                key: ToolKey::Escape,
+                modifiers: ModifiersState::default(),
+            },
+        );
+
+        // InteractiveFill on BSpline + Undo/Redo
+        let mut ifill = ToolCore::new(ToolId::InteractiveFill);
+        let _ = ifill.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(35.0, 50.0), [0.0, 0.0]),
+        );
+        let _ = ifill.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(65.0, 50.0), [0.0, 0.0]),
+        );
+        let fill_out = ifill.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(65.0, 50.0), [0.0, 0.0]),
+        );
+        match fill_out {
+            ToolOutput::Commit { ops, .. } => {
+                h.history
+                    .execute(&mut h.doc, ops.into_iter().next().unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.fill),
+                    Some(Fill::LinearGradient { .. })
+                ));
+                h.history.undo(&mut h.doc).unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.fill),
+                    Some(Fill::Solid(_))
+                ));
+                h.history.redo(&mut h.doc).unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.fill),
+                    Some(Fill::LinearGradient { .. })
+                ));
+            }
+            other => panic!("InteractiveFill on BSpline must commit, got {other:?}"),
+        }
+
+        // MeshFill on BSpline + Undo/Redo
+        let mut mfill = ToolCore::new(ToolId::MeshFill);
+        let _ = mfill.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(50.0, 50.0), [0.0, 0.0]),
+        );
+        let _ = mfill.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(55.0, 55.0), [0.0, 0.0]),
+        );
+        let mesh_out = mfill.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(55.0, 55.0), [0.0, 0.0]),
+        );
+        match mesh_out {
+            ToolOutput::Commit { ops, .. } => {
+                h.history
+                    .execute(&mut h.doc, ops.into_iter().next().unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.fill),
+                    Some(Fill::MeshFill { .. })
+                ));
+                h.history.undo(&mut h.doc).unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.fill),
+                    Some(Fill::LinearGradient { .. })
+                ));
+            }
+            other => panic!("MeshFill on BSpline must commit, got {other:?}"),
+        }
+
+        // Smooth sculpt on BSpline boundary node
+        let node_pt = expected_curve_path.subpaths[0].nodes[0].pos;
+        let mut smooth = ToolCore::new(ToolId::Smooth);
+        let _ = smooth.on_pointer_down(&h.ctx(), &PointerEvent::primary(node_pt, [0.0, 0.0]));
+        let _ = smooth.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(node_pt.x + 2.0, node_pt.y + 2.0), [0.0, 0.0]),
+        );
+        let smooth_out = smooth.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(node_pt.x + 4.0, node_pt.y + 2.0), [0.0, 0.0]),
+        );
+        match smooth_out {
+            ToolOutput::Commit { ops, .. } => {
+                h.history
+                    .execute(&mut h.doc, ops.into_iter().next().unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.payload),
+                    Some(NodePayload::Path(_))
+                ));
+                h.history.undo(&mut h.doc).unwrap();
+                assert!(matches!(
+                    h.doc.object(bs_id).map(|o| &o.payload),
+                    Some(NodePayload::BSpline(_))
+                ));
+            }
+            other => panic!("Smooth on BSpline must commit, got {other:?}"),
+        }
+
+        // InteractiveFill on NodePayload::ArtisticMedia + Undo/Redo
+        let am_obj = SceneObject::new(
+            ObjectId(0),
+            "MediaStroke",
+            NodePayload::ArtisticMedia {
+                spine: BezierPath::from_line(Point2D::new(100.0, 20.0), Point2D::new(160.0, 20.0)),
+                style: ArtisticMediaStyle::Preset {
+                    max_width_mm: 6.0,
+                    profile: coree_core::ArtisticWidthProfile::TaperBoth,
+                },
+            },
+        )
+        .with_fill(Fill::Solid(Color::MAGENTA));
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(am_obj, Some(lid)))
+            .unwrap();
+        let am_id = *h.doc.objects().keys().max().unwrap();
+        h.selection.select_single(&h.doc, am_id);
+        let mut am_ifill = ToolCore::new(ToolId::InteractiveFill);
+        let _ = am_ifill.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(110.0, 20.0), [0.0, 0.0]),
+        );
+        let _ = am_ifill.on_pointer_move(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(150.0, 20.0), [0.0, 0.0]),
+        );
+        let am_out = am_ifill.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(150.0, 20.0), [0.0, 0.0]),
+        );
+        match am_out {
+            ToolOutput::Commit { ops, .. } => {
+                h.history
+                    .execute(&mut h.doc, ops.into_iter().next().unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    h.doc.object(am_id).map(|o| &o.fill),
+                    Some(Fill::LinearGradient { .. })
+                ));
+                h.history.undo(&mut h.doc).unwrap();
+                assert!(matches!(
+                    h.doc.object(am_id).map(|o| &o.fill),
+                    Some(Fill::Solid(_))
+                ));
+            }
+            other => panic!("InteractiveFill on ArtisticMedia must commit, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r8_freehand_pick_lasso_powerclip_persp_edit_and_group_effect_persp() {
+    use coree_core::{Perspective3x3, Rect2D};
+
+    // 1. PowerClip(Perspective3x3) edit mode + ToolId::FreehandPick lasso
+    {
+        let mut h = Harness::new();
+        let pc_cont = h.add_rect("PCCont", 0.0, 0.0, 40.0, 40.0);
+        let child = h.add_rect("PCChild", 10.0, 10.0, 20.0, 20.0);
+        h.history
+            .execute(
+                &mut h.doc,
+                CommandOp::CreatePowerClip {
+                    container_id: pc_cont,
+                    content_ids: vec![child],
+                },
+            )
+            .unwrap();
+        let persp = Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 40.0, 40.0),
+            &[
+                Point2D::new(100.0, 100.0),
+                Point2D::new(140.0, 100.0),
+                Point2D::new(140.0, 140.0),
+                Point2D::new(100.0, 140.0),
+            ],
+        )
+        .unwrap();
+        h.history
+            .execute(
+                &mut h.doc,
+                CommandOp::SetObjectPerspective {
+                    ids: vec![pc_cont],
+                    perspective: Some(persp),
+                },
+            )
+            .unwrap();
+
+        let mut tc = ToolCore::new(ToolId::FreehandPick);
+        let mut ctx = h.ctx();
+        ctx.powerclip_edit_id = Some(pc_cont);
+
+        let lasso_warped = [
+            Point2D::new(98.0, 98.0),
+            Point2D::new(142.0, 98.0),
+            Point2D::new(142.0, 142.0),
+            Point2D::new(98.0, 142.0),
+        ];
+        let _ = tc.on_pointer_down(&ctx, &PointerEvent::primary(lasso_warped[0], [0.0, 0.0]));
+        for &p in &lasso_warped[1..] {
+            let _ = tc.on_pointer_move(&ctx, &PointerEvent::primary(p, [0.0, 0.0]));
+        }
+        let out = tc.on_pointer_up(&ctx, &PointerEvent::primary(lasso_warped[0], [0.0, 0.0]));
+        assert!(
+            matches!(
+                out,
+                ToolOutput::Consumed { ref actions, .. }
+                    if matches!(
+                        actions.as_slice(),
+                        [ToolActionRequest::SelectObjects { ids, .. }] if ids == &[child]
+                    )
+            ),
+            "FreehandPick lasso inside PowerClip(Perspective3x3) edit mode must select child, got {out:?}"
+        );
+
+        let lasso_unwarped = [
+            Point2D::new(5.0, 5.0),
+            Point2D::new(35.0, 5.0),
+            Point2D::new(35.0, 35.0),
+            Point2D::new(5.0, 35.0),
+        ];
+        let _ = tc.on_pointer_down(&ctx, &PointerEvent::primary(lasso_unwarped[0], [0.0, 0.0]));
+        for &p in &lasso_unwarped[1..] {
+            let _ = tc.on_pointer_move(&ctx, &PointerEvent::primary(p, [0.0, 0.0]));
+        }
+        let out_unwarped =
+            tc.on_pointer_up(&ctx, &PointerEvent::primary(lasso_unwarped[0], [0.0, 0.0]));
+        assert!(
+            matches!(
+                out_unwarped,
+                ToolOutput::Consumed { ref actions, .. }
+                    if actions.iter().all(|a| !matches!(a, ToolActionRequest::SelectObjects { ids, .. } if !ids.is_empty()))
+            ),
+            "FreehandPick lasso at unwarped coords must NOT ghost-select PowerClip child, got {out_unwarped:?}"
+        );
+    }
+
+    // 2. Group(Effect::Perspective) + ToolId::FreehandPick lasso
+    {
+        let mut h = Harness::new();
+        let r = h.add_rect("GrpChild", 10.0, 10.0, 20.0, 20.0);
+        let gid = h.doc.group_objects(&[r], "EffPerspGrp").unwrap();
+        h.history
+            .execute(
+                &mut h.doc,
+                CommandOp::AddEffect {
+                    id: gid,
+                    effect: Effect::Perspective {
+                        quad: [
+                            Point2D::new(110.0, 110.0),
+                            Point2D::new(130.0, 110.0),
+                            Point2D::new(130.0, 130.0),
+                            Point2D::new(110.0, 130.0),
+                        ],
+                    },
+                },
+            )
+            .unwrap();
+
+        let mut tc = ToolCore::new(ToolId::FreehandPick);
+        let ctx = h.ctx();
+        let lasso_warped = [
+            Point2D::new(105.0, 105.0),
+            Point2D::new(135.0, 105.0),
+            Point2D::new(135.0, 135.0),
+            Point2D::new(105.0, 135.0),
+        ];
+        let _ = tc.on_pointer_down(&ctx, &PointerEvent::primary(lasso_warped[0], [0.0, 0.0]));
+        for &p in &lasso_warped[1..] {
+            let _ = tc.on_pointer_move(&ctx, &PointerEvent::primary(p, [0.0, 0.0]));
+        }
+        let out = tc.on_pointer_up(&ctx, &PointerEvent::primary(lasso_warped[0], [0.0, 0.0]));
+        assert!(
+            matches!(
+                out,
+                ToolOutput::Consumed { ref actions, .. }
+                    if matches!(
+                        actions.as_slice(),
+                        [ToolActionRequest::SelectObjects { ids, .. }] if ids == &[gid]
+                    )
+            ),
+            "FreehandPick lasso on Group(Effect::Perspective) must select gid, got {out:?}"
+        );
+    }
+}

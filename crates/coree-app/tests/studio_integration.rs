@@ -8782,3 +8782,98 @@ fn w2b_r2_artistic_media_property_bar_edit_and_undo_redo() {
         other => panic!("expected ArtisticMedia after redo, got {other:?}"),
     }
 }
+
+#[test]
+fn w2_exit_r6_studio_convert_selection_to_curves_on_clone_of_text() {
+    let mut app = StudioApp::new_headless();
+    let lid = Some(app.active_tab().unwrap().document.pages()[0].layers[0].id);
+
+    let art = SceneObject::new(
+        ObjectId(0),
+        "MasterArt",
+        NodePayload::ArtisticText(ArtisticText::from_plain(
+            "CLONE",
+            TextStyle {
+                fill: Color::rgba8(220, 20, 20, 255),
+                font_size_pt: 16.0,
+                ..Default::default()
+            },
+        )),
+    )
+    .with_fill(Fill::None)
+    .with_transform(Affine2D::translate(20.0, 30.0));
+    app.execute_command(CommandOp::create_object(art, lid))
+        .unwrap();
+    let master_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[0];
+
+    let clone_obj = SceneObject::new(
+        ObjectId(0),
+        "CloneArt",
+        NodePayload::Clone {
+            master_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_fill(Fill::None)
+    .with_transform(Affine2D::translate(20.0, 60.0));
+    app.execute_command(CommandOp::create_object(clone_obj, lid))
+        .unwrap();
+    let clone_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[1];
+
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, clone_id);
+    }
+    app.convert_selection_to_curves();
+
+    let converted = app.active_tab().unwrap().document.object(clone_id).unwrap();
+    match &converted.payload {
+        NodePayload::Path(p) => {
+            assert!(
+                p.subpaths.len() >= 3,
+                "expected real glyph curve subpaths for 'CLONE', got {}",
+                p.subpaths.len()
+            );
+        }
+        other => {
+            panic!("expected NodePayload::Path after convert_selection_to_curves, got {other:?}")
+        }
+    }
+    assert!(
+        converted.fill.is_visible(),
+        "converted Clone of ArtisticText must have visible fill"
+    );
+
+    // Master must remain live ArtisticText, and Undo/Redo must work cleanly
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(master_id)
+            .unwrap()
+            .payload,
+        NodePayload::ArtisticText(_)
+    ));
+    app.undo().unwrap();
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Clone { .. }
+    ));
+    app.redo().unwrap();
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Path(_)
+    ));
+}

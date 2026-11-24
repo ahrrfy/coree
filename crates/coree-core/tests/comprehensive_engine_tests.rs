@@ -10996,3 +10996,1267 @@ fn w1c_r7_connector_before_bounds_with_drop_shadow_and_nested_group() {
     hist.redo(&mut doc).unwrap();
     assert_grp_cov(hist.last_invalidation(), "nested group delete redo");
 }
+
+#[test]
+fn w2_exit_r2_perspective_grid_one_point_and_isometric_planes() {
+    use coree_core::{PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, SymbolDef};
+
+    let vp = Point2D::new(105.0, 80.0);
+    let rect_right = Rect2D::from_xywh(120.0, 100.0, 30.0, 30.0);
+    let rect_left = Rect2D::from_xywh(40.0, 100.0, 30.0, 30.0);
+
+    // 1. OnePoint mode: single VP governs all receding planes regardless of rect side.
+    for rect in [rect_right, rect_left] {
+        // Top plane
+        let pg_top = PerspectiveGridConfig {
+            enabled: true,
+            mode: PerspectiveGridMode::OnePoint,
+            horizon_y_mm: 80.0,
+            vanishing_points: vec![vp],
+            density: 12,
+            opacity: 0.35,
+            active_plane: PerspectivePlane::Top,
+        };
+        let q_top = pg_top.plane_quad_for_rect(rect).expect("OnePoint Top quad");
+        assert!(
+            q_top[1].x - q_top[0].x < rect.width(),
+            "OnePoint Top back width must shrink toward VP: {q_top:?}"
+        );
+        let c_left = (q_top[0] - q_top[3]).cross(vp - q_top[3]);
+        let c_right = (q_top[1] - q_top[2]).cross(vp - q_top[2]);
+        assert!(
+            c_left.abs() < 1e-6 && c_right.abs() < 1e-6,
+            "OnePoint Top receding edges must be collinear with VP: c_left={c_left}, c_right={c_right}"
+        );
+        assert!(pg_top.plane_homography_for_rect(rect).is_some());
+
+        // Left & Right planes
+        for plane in [PerspectivePlane::Left, PerspectivePlane::Right] {
+            let pg_side = PerspectiveGridConfig {
+                active_plane: plane,
+                ..pg_top.clone()
+            };
+            let q_side = pg_side
+                .plane_quad_for_rect(rect)
+                .expect("OnePoint side quad");
+            assert!(
+                q_side[0].x < q_side[1].x && q_side[3].x < q_side[2].x,
+                "OnePoint {plane:?} must not mirror horizontally: {q_side:?}"
+            );
+            assert!(
+                q_side[0].y < q_side[3].y && q_side[1].y < q_side[2].y,
+                "OnePoint {plane:?} must not invert vertically: {q_side:?}"
+            );
+            // Receding top & bottom edges must point toward `vp`.
+            if rect.min_x > vp.x {
+                assert!((q_side[0] - q_side[1]).cross(vp - q_side[1]).abs() < 1e-6);
+                assert!((q_side[3] - q_side[2]).cross(vp - q_side[2]).abs() < 1e-6);
+            } else {
+                assert!((q_side[1] - q_side[0]).cross(vp - q_side[0]).abs() < 1e-6);
+                assert!((q_side[2] - q_side[3]).cross(vp - q_side[3]).abs() < 1e-6);
+            }
+            assert!(pg_side.plane_homography_for_rect(rect).is_some());
+        }
+
+        // Front plane is orthogonal [tl, tr, br, bl]
+        let pg_front = PerspectiveGridConfig {
+            active_plane: PerspectivePlane::Front,
+            ..pg_top
+        };
+        let q_front = pg_front
+            .plane_quad_for_rect(rect)
+            .expect("OnePoint Front quad");
+        assert_eq!(q_front, rect.corners());
+    }
+
+    // 2. Isometric mode: parallel 30° / 150° / 90° edges, independent of horizon/VPs.
+    for plane in [
+        PerspectivePlane::Left,
+        PerspectivePlane::Right,
+        PerspectivePlane::Top,
+    ] {
+        let iso_a = PerspectiveGridConfig {
+            enabled: true,
+            mode: PerspectiveGridMode::Isometric,
+            horizon_y_mm: 10.0,
+            vanishing_points: Vec::new(),
+            density: 12,
+            opacity: 0.35,
+            active_plane: plane,
+        };
+        let iso_b = PerspectiveGridConfig {
+            horizon_y_mm: 240.0,
+            vanishing_points: vec![Point2D::new(-50.0, 240.0), Point2D::new(300.0, 240.0)],
+            ..iso_a.clone()
+        };
+        let q_a = iso_a
+            .plane_quad_for_rect(rect_left)
+            .expect("Isometric quad A");
+        let q_b = iso_b
+            .plane_quad_for_rect(rect_left)
+            .expect("Isometric quad B");
+        assert_eq!(
+            q_a, q_b,
+            "Isometric quad must be independent of horizon_y_mm / vanishing_points"
+        );
+        let top_edge = q_a[1] - q_a[0];
+        let bot_edge = q_a[2] - q_a[3];
+        let left_edge = q_a[3] - q_a[0];
+        let right_edge = q_a[2] - q_a[1];
+        assert!(
+            top_edge.cross(bot_edge).abs() < 1e-9,
+            "Isometric {plane:?} top/bottom edges must be parallel: {q_a:?}"
+        );
+        assert!(
+            left_edge.cross(right_edge).abs() < 1e-9,
+            "Isometric {plane:?} left/right edges must be parallel: {q_a:?}"
+        );
+        let expected_top_deg = match plane {
+            PerspectivePlane::Left => 30.0_f64,
+            PerspectivePlane::Right | PerspectivePlane::Top => -30.0_f64,
+            _ => unreachable!(),
+        };
+        assert!(
+            (top_edge.angle_rad().to_degrees() - expected_top_deg).abs() < 1e-6,
+            "Isometric {plane:?} top edge angle mismatch: got {}",
+            top_edge.angle_rad().to_degrees()
+        );
+        let h = iso_a
+            .plane_homography_for_rect(rect_left)
+            .expect("Isometric homography");
+        assert!(
+            h.m[6].abs() < 1e-9 && h.m[7].abs() < 1e-9,
+            "Isometric homography must be affine: {:?}",
+            h.m
+        );
+    }
+    let iso_front = PerspectiveGridConfig {
+        enabled: true,
+        mode: PerspectiveGridMode::Isometric,
+        horizon_y_mm: 10.0,
+        vanishing_points: Vec::new(),
+        density: 12,
+        opacity: 0.35,
+        active_plane: PerspectivePlane::Front,
+    };
+    assert_eq!(
+        iso_front.plane_quad_for_rect(rect_left),
+        Some(rect_left.corners())
+    );
+
+    // 3. visual_world_bounds on Group and SymbolInstance with Perspective3x3
+    let mut doc = Document::new("VwbPersp", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let lid = doc.pages()[0].layers[0].id;
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+        &[
+            Point2D::new(40.0, 40.0),
+            Point2D::new(90.0, 50.0),
+            Point2D::new(85.0, 100.0),
+            Point2D::new(35.0, 95.0),
+        ],
+    )
+    .unwrap();
+    let child = SceneObject::new(ObjectId(0), "C", rect_shape(20.0, 20.0));
+    let cid = doc.add_object(child, Some(lid)).unwrap();
+    let grp_id = doc.group_objects(&[cid], "PerspGrp").unwrap();
+    apply_command(
+        &mut doc,
+        &CommandOp::SetObjectPerspective {
+            ids: vec![grp_id],
+            perspective: Some(persp),
+        },
+    )
+    .unwrap();
+    let grp_vwb = doc.visual_world_bounds(grp_id).unwrap();
+    assert!(
+        grp_vwb.max_x >= 89.0 && grp_vwb.max_y >= 99.0 && grp_vwb.min_x >= 34.0,
+        "Group visual_world_bounds must include Perspective3x3: {grp_vwb:?}"
+    );
+
+    let sym = SymbolDef::new(
+        "PerspSym",
+        vec![SceneObject::new(ObjectId(0), "SC", rect_shape(20.0, 20.0))],
+    );
+    let sid = sym.id;
+    doc.insert_symbol(sym);
+    let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid));
+    inst.perspective = Some(persp);
+    let inst_id = doc.add_object(inst, Some(lid)).unwrap();
+    let inst_vwb = doc.visual_world_bounds(inst_id).unwrap();
+    assert!(
+        inst_vwb.max_x >= 89.0 && inst_vwb.max_y >= 99.0 && inst_vwb.min_x >= 34.0,
+        "SymbolInstance visual_world_bounds must include Perspective3x3: {inst_vwb:?}"
+    );
+}
+
+#[test]
+fn w2_exit_r5_hit_test_symbol_text_on_path_hosts_and_persp_connector_bounds() {
+    use coree_core::hit_test::{
+        hit_test_point, hit_test_rect, resolve_connector_endpoints_with_sym,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    for kind in ["BSpline", "ArtisticMedia", "Clone", "PerspectivePath"] {
+        let mut doc = Document::new(kind, 200.0, 200.0, ColorMode::Rgb, 96.0);
+        let lid = doc.pages()[0].layers[0].id;
+        let master_id = if kind == "Clone" {
+            let mut master = SceneObject::new(
+                ObjectId(0),
+                "MasterCurve",
+                NodePayload::BSpline(BSplineCurve::from_control_points(
+                    vec![
+                        Point2D::new(5.0, 20.0),
+                        Point2D::new(20.0, 20.0),
+                        Point2D::new(35.0, 20.0),
+                        Point2D::new(50.0, 20.0),
+                    ],
+                    3,
+                    false,
+                )),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none());
+            master.visible = false;
+            Some(doc.add_object(master, Some(lid)).unwrap())
+        } else {
+            None
+        };
+
+        let mut sym_host = match kind {
+            "BSpline" => SceneObject::new(
+                ObjectId(10),
+                "SymBSpline",
+                NodePayload::BSpline(BSplineCurve::from_control_points(
+                    vec![
+                        Point2D::new(5.0, 20.0),
+                        Point2D::new(20.0, 20.0),
+                        Point2D::new(35.0, 20.0),
+                        Point2D::new(50.0, 20.0),
+                    ],
+                    3,
+                    false,
+                )),
+            ),
+            "ArtisticMedia" => SceneObject::new(
+                ObjectId(10),
+                "SymMedia",
+                NodePayload::ArtisticMedia {
+                    spine: BezierPath::from_line(Point2D::new(5.0, 20.0), Point2D::new(50.0, 20.0)),
+                    style: ArtisticMediaStyle::Calligraphic {
+                        width_mm: 2.0,
+                        angle_deg: 45.0,
+                    },
+                },
+            ),
+            "Clone" => SceneObject::new(
+                ObjectId(10),
+                "SymClone",
+                NodePayload::Clone {
+                    master_id: master_id.unwrap(),
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            ),
+            "PerspectivePath" => {
+                let mut host = SceneObject::new(
+                    ObjectId(10),
+                    "SymPerspHost",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 40.0, 20.0,
+                    ))),
+                );
+                host.perspective = Some(
+                    Perspective3x3::from_rect_to_quad(
+                        Rect2D::from_xywh(0.0, 0.0, 40.0, 20.0),
+                        &[
+                            Point2D::new(0.0, 25.0),
+                            Point2D::new(40.0, 25.0),
+                            Point2D::new(40.0, 35.0),
+                            Point2D::new(0.0, 35.0),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                host
+            }
+            _ => unreachable!(),
+        };
+        sym_host = sym_host
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none());
+
+        let sym_top = SceneObject::new(
+            ObjectId(11),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain(
+                    "HIT",
+                    TextStyle {
+                        font_size_pt: 12.0,
+                        ..Default::default()
+                    },
+                ),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        let sym = SymbolDef::new(format!("HitSym_{kind}"), vec![sym_host, sym_top]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+                    .with_transform(Affine2D::translate(50.0, 60.0)),
+                Some(lid),
+            )
+            .unwrap();
+
+        let probe_pt = if kind == "PerspectivePath" {
+            Point2D::new(70.0, 86.0)
+        } else {
+            Point2D::new(75.0, 80.0)
+        };
+        let hit = hit_test_point(&doc, 0, probe_pt, 1.0);
+        assert_eq!(
+            hit,
+            Some(inst_id),
+            "{kind}: hit_test_point must hit SymbolInstance TextOnPath at {probe_pt:?}"
+        );
+        let origin_miss = hit_test_point(&doc, 0, Point2D::new(51.0, 61.0), 0.5);
+        assert_eq!(
+            origin_miss, None,
+            "{kind}: hit_test_point must NOT hit unwarped/origin fallback near (51,61)"
+        );
+        let rect_hits = hit_test_rect(
+            &doc,
+            0,
+            Rect2D::from_xywh(probe_pt.x - 1.0, probe_pt.y - 1.0, 2.0, 2.0),
+            false,
+        );
+        assert!(
+            rect_hits.contains(&inst_id),
+            "{kind}: hit_test_rect must match TextOnPath along {kind} host"
+        );
+    }
+
+    // Connector endpoint inside SymbolDef targeting a Perspective3x3-warped Path
+    let mut doc = Document::new("SymPerspConn", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    let mut target_a = SceneObject::new(
+        ObjectId(20),
+        "PerspTarget",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 10.0, 10.0,
+        ))),
+    );
+    target_a.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 10.0, 10.0),
+            &[
+                Point2D::new(30.0, 40.0),
+                Point2D::new(50.0, 40.0),
+                Point2D::new(50.0, 60.0),
+                Point2D::new(30.0, 60.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let conn = ConnectorObject::between_objects(
+        ObjectId(20),
+        AnchorPoint::Center,
+        ObjectId(20),
+        AnchorPoint::Right,
+        ConnectorStyle::Straight,
+    );
+    let mut sym_map = HashMap::new();
+    sym_map.insert(ObjectId(20), &target_a);
+    let mut visiting = HashMap::new();
+    let mut visited_syms = HashSet::new();
+    let mut cache = HashMap::new();
+    let ((a, b), _) = resolve_connector_endpoints_with_sym(
+        &doc,
+        &conn,
+        &Affine2D::translate(10.0, 20.0),
+        Some((&sym_map, Affine2D::translate(10.0, 20.0))),
+        &mut visiting,
+        &mut visited_syms,
+        &mut cache,
+        0,
+    );
+    assert!(
+        (a.x - 50.0).abs() < 1e-6 && (a.y - 70.0).abs() < 1e-6,
+        "expected warped Center (50, 70), got {a:?}"
+    );
+    assert!(
+        (b.x - 60.0).abs() < 1e-6 && (b.y - 70.0).abs() < 1e-6,
+        "expected warped Right (60, 70), got {b:?}"
+    );
+    let _ = &mut doc;
+}
+
+#[test]
+fn w2_exit_r6_hit_test_persp_text_and_persp_containers_and_clone_text_convert() {
+    // 1. C4: own obj.perspective on ArtisticText, ParagraphText, Unattached & Attached TextOnPath
+    let persp_0_30_to_90_140 = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+        &[
+            Point2D::new(90.0, 90.0),
+            Point2D::new(140.0, 90.0),
+            Point2D::new(140.0, 120.0),
+            Point2D::new(90.0, 120.0),
+        ],
+    )
+    .unwrap();
+    let warped_pt = Point2D::new(115.0, 105.0);
+    let unwarped_pt = Point2D::new(15.0, 5.0);
+    let warped_rect = Rect2D::from_xywh(95.0, 95.0, 40.0, 20.0);
+    let unwarped_rect = Rect2D::from_xywh(5.0, 2.0, 10.0, 5.0);
+
+    for kind in [
+        "ArtisticText",
+        "ParagraphText",
+        "UnattachedTOP",
+        "AttachedTOP",
+    ] {
+        let mut doc = Document::new(kind, 200.0, 200.0, ColorMode::Rgb, 150.0);
+        let style = TextStyle {
+            font_size_pt: 16.0,
+            fill: Color::rgba8(220, 20, 20, 255),
+            ..Default::default()
+        };
+        let mut obj = match kind {
+            "ArtisticText" => SceneObject::new(
+                ObjectId(0),
+                "Art",
+                NodePayload::ArtisticText(ArtisticText::from_plain("WARPED", style)),
+            ),
+            "ParagraphText" => SceneObject::new(
+                ObjectId(0),
+                "Para",
+                NodePayload::ParagraphText(ParagraphText::new(
+                    "WARPED",
+                    Vec2D::new(30.0, 10.0),
+                    style,
+                )),
+            ),
+            "UnattachedTOP" => SceneObject::new(
+                ObjectId(0),
+                "UnTOP",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("WARPED", style),
+                    path_id: ObjectId(9999),
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            "AttachedTOP" => {
+                let mut host = SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(0.0, 5.0),
+                        Point2D::new(30.0, 5.0),
+                    )),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none());
+                host.visible = false;
+                let hid = doc.add_object(host, None).unwrap();
+                SceneObject::new(
+                    ObjectId(0),
+                    "AttTOP",
+                    NodePayload::TextOnPath(TextOnPath {
+                        text: ArtisticText::from_plain("WARPED", style),
+                        path_id: hid,
+                        offset_mm: 0.0,
+                        distance_mm: 0.0,
+                        flip_vertical: false,
+                        flip_horizontal: false,
+                    }),
+                )
+            }
+            _ => unreachable!(),
+        };
+        obj.perspective = Some(persp_0_30_to_90_140);
+        let oid = doc.add_object(obj, None).unwrap();
+
+        assert_eq!(
+            hit_test_point(&doc, 0, warped_pt, 2.0),
+            Some(oid),
+            "{kind}: hit_test_point must hit warped coords"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, unwarped_pt, 1.0),
+            None,
+            "{kind}: hit_test_point must NOT ghost-hit unwarped coords"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, warped_rect, false).contains(&oid),
+            "{kind}: hit_test_rect must intersect warped coords"
+        );
+        assert!(
+            !hit_test_rect(&doc, 0, unwarped_rect, false).contains(&oid),
+            "{kind}: hit_test_rect must NOT ghost-hit unwarped coords"
+        );
+    }
+
+    // 2. C1: SymbolInstance(Translate(30, 30) + Perspective3x3) containing attached TextOnPath
+    {
+        let mut doc = Document::new("C1_SymPersp", 200.0, 200.0, ColorMode::Rgb, 150.0);
+        let host = SceneObject::new(
+            ObjectId(10),
+            "Host",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 20.0),
+                Point2D::new(40.0, 20.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        let top = SceneObject::new(
+            ObjectId(11),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("SYM", TextStyle::default()),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        let sym = SymbolDef::new("C1Sym", vec![host, top]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid))
+            .with_transform(Affine2D::translate(30.0, 30.0));
+        inst.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 40.0, 30.0),
+                &[
+                    Point2D::new(50.0, 60.0),
+                    Point2D::new(110.0, 60.0),
+                    Point2D::new(110.0, 90.0),
+                    Point2D::new(50.0, 90.0),
+                ],
+            )
+            .unwrap(),
+        );
+        let inst_id = doc.add_object(inst, None).unwrap();
+
+        // Line y=20 in (0..40, 0..30) warps to y=80 in local (50..110, 60..90), + (30,30) = (80..140, 110)
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(110.0, 110.0), 2.0),
+            Some(inst_id),
+            "C1: must hit warped SymbolInstance TextOnPath"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(50.0, 50.0), 2.0),
+            None,
+            "C1: must NOT ghost-hit unwarped SymbolInstance coords"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(100.0, 105.0, 20.0, 10.0), false)
+                .contains(&inst_id)
+        );
+        assert!(
+            !hit_test_rect(&doc, 0, Rect2D::from_xywh(45.0, 48.0, 10.0, 4.0), false)
+                .contains(&inst_id)
+        );
+    }
+
+    // 3. A3: Group(Perspective3x3) & PowerClip(Perspective3x3) edit mode
+    {
+        let mut doc = Document::new("A3_GroupPersp", 200.0, 200.0, ColorMode::Rgb, 150.0);
+        let rect = SceneObject::new(ObjectId(0), "ChildRect", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::rgba8(0, 0, 255, 255)));
+        let rid = doc.add_object(rect, None).unwrap();
+        let gid = doc.group_objects(&[rid], "PerspGrp").unwrap();
+        let grp_persp = Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+            &[
+                Point2D::new(80.0, 80.0),
+                Point2D::new(120.0, 80.0),
+                Point2D::new(120.0, 120.0),
+                Point2D::new(80.0, 120.0),
+            ],
+        )
+        .unwrap();
+        let mut hist = CommandHistory::default();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetObjectPerspective {
+                ids: vec![gid],
+                perspective: Some(grp_persp),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(100.0, 100.0), 1.0),
+            Some(gid),
+            "A3: hit_test_point must hit Perspective3x3 Group at warped center"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(10.0, 10.0), 1.0),
+            None,
+            "A3: hit_test_point must NOT ghost-hit unwarped Group coords"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(90.0, 90.0, 20.0, 20.0), false).contains(&gid)
+        );
+        assert!(
+            !hit_test_rect(&doc, 0, Rect2D::from_xywh(5.0, 5.0, 10.0, 10.0), false).contains(&gid)
+        );
+
+        // PowerClip with Perspective3x3 edit-mode content hit_test
+        let pc_child = SceneObject::new(ObjectId(0), "PCChild", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::rgba8(0, 200, 0, 255)));
+        let pc_cid = doc.add_object(pc_child, None).unwrap();
+        let pc_container = SceneObject::new(ObjectId(0), "PCCont", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::WHITE));
+        let pc_cont_id = doc.add_object(pc_container, None).unwrap();
+        let pc_id = doc.create_powerclip(pc_cont_id, &[pc_cid]).unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetObjectPerspective {
+                ids: vec![pc_id],
+                perspective: Some(grp_persp),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hit_test_powerclip_contents(&doc, pc_id, Point2D::new(100.0, 100.0), 1.0),
+            Some(pc_cid)
+        );
+        assert_eq!(
+            hit_test_powerclip_contents(&doc, pc_id, Point2D::new(10.0, 10.0), 1.0),
+            None
+        );
+        assert!(hit_test_powerclip_contents_rect(
+            &doc,
+            pc_id,
+            Rect2D::from_xywh(90.0, 90.0, 20.0, 20.0),
+            false
+        )
+        .contains(&pc_cid));
+    }
+
+    // 4. REM-02: Document::convert_to_curves_with_outliner on Clone of ArtisticText/ParagraphText/TextOnPath
+    {
+        let mut doc = Document::new_a4("CloneTextCurves");
+        let style = TextStyle {
+            fill: Color::rgba8(220, 20, 20, 255),
+            font_size_pt: 14.0,
+            ..Default::default()
+        };
+        let art_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "MasterArt",
+                    NodePayload::ArtisticText(ArtisticText::from_plain("ABC", style.clone())),
+                )
+                .with_fill(Fill::None),
+                None,
+            )
+            .unwrap();
+        let para_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "MasterPara",
+                    NodePayload::ParagraphText(ParagraphText::new(
+                        "DEF",
+                        Vec2D::new(40.0, 20.0),
+                        style.clone(),
+                    )),
+                )
+                .with_fill(Fill::None),
+                None,
+            )
+            .unwrap();
+        let host_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(0.0, 0.0),
+                        Point2D::new(40.0, 0.0),
+                    )),
+                ),
+                None,
+            )
+            .unwrap();
+        let top_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "MasterTOP",
+                    NodePayload::TextOnPath(TextOnPath {
+                        text: ArtisticText::from_plain("GHI", style),
+                        path_id: host_id,
+                        offset_mm: 0.0,
+                        distance_mm: 0.0,
+                        flip_vertical: false,
+                        flip_horizontal: false,
+                    }),
+                )
+                .with_fill(Fill::None),
+                None,
+            )
+            .unwrap();
+
+        for (name, mid) in [
+            ("CloneArt", art_id),
+            ("ClonePara", para_id),
+            ("CloneTOP", top_id),
+        ] {
+            let cid = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        name,
+                        NodePayload::Clone {
+                            master_id: mid,
+                            link_fill: true,
+                            link_outline: true,
+                            link_shape: true,
+                        },
+                    )
+                    .with_fill(Fill::None),
+                    None,
+                )
+                .unwrap();
+            let mut outliner_called = false;
+            doc.convert_to_curves_with_outliner(cid, |synth, _| {
+                outliner_called = true;
+                assert!(!matches!(synth.payload, NodePayload::Clone { .. }));
+                Some(BezierPath::from_rect(Rect2D::from_xywh(
+                    1.0, 1.0, 12.0, 5.0,
+                )))
+            })
+            .unwrap();
+            assert!(outliner_called, "{name}: text_outliner must be invoked");
+            let converted = doc.object(cid).unwrap();
+            assert!(
+                matches!(converted.payload, NodePayload::Path(_)),
+                "{name}: must convert to Path"
+            );
+            assert!(
+                converted.fill.is_visible(),
+                "{name}: run fill must propagate when converting Clone of text"
+            );
+        }
+    }
+}
+
+#[test]
+fn w2_exit_r7_powerclip_enclosed_symbol_member_persp_and_grouped_text_on_path_bounds() {
+    let mut hist = CommandHistory::default();
+
+    // 1. challenger_w2exit_r6_1-r6-1: hit_test_powerclip_contents_rect(..., fully_enclosed = true)
+    //    under PowerClip(Perspective3x3) & hit_test_rect(..., true) on Perspective3x3/Effect::Perspective containers
+    {
+        let mut doc = Document::new("R7_PowerClipEnclosed", 200.0, 200.0, ColorMode::Rgb, 150.0);
+        let child = SceneObject::new(ObjectId(0), "PCChild", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::rgba8(0, 180, 0, 255)));
+        let cid = doc.add_object(child, None).unwrap();
+        let container = SceneObject::new(ObjectId(0), "PCCont", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::WHITE));
+        let cont_id = doc.add_object(container, None).unwrap();
+        let pc_id = doc.create_powerclip(cont_id, &[cid]).unwrap();
+
+        let pc_persp = Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+            &[
+                Point2D::new(80.0, 80.0),
+                Point2D::new(120.0, 80.0),
+                Point2D::new(120.0, 120.0),
+                Point2D::new(80.0, 120.0),
+            ],
+        )
+        .unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetObjectPerspective {
+                ids: vec![pc_id],
+                perspective: Some(pc_persp),
+            },
+        )
+        .unwrap();
+
+        let warped_enclosing_rect = Rect2D::from_xywh(75.0, 75.0, 50.0, 50.0);
+        let unwarped_enclosing_rect = Rect2D::from_xywh(-5.0, -5.0, 30.0, 30.0);
+        assert_eq!(
+            hit_test_powerclip_contents_rect(&doc, pc_id, warped_enclosing_rect, true),
+            vec![cid],
+            "r6-1: fully_enclosed hit_test_powerclip_contents_rect must hit warped child"
+        );
+        assert!(
+            hit_test_powerclip_contents_rect(&doc, pc_id, unwarped_enclosing_rect, true).is_empty(),
+            "r6-1: fully_enclosed hit_test_powerclip_contents_rect must NOT ghost-hit unwarped coords"
+        );
+        assert_eq!(
+            hit_test_rect(&doc, 0, warped_enclosing_rect, true),
+            vec![pc_id],
+            "r6-1: fully_enclosed hit_test_rect must hit warped PowerClip"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, unwarped_enclosing_rect, true).is_empty(),
+            "r6-1: fully_enclosed hit_test_rect must NOT ghost-hit unwarped PowerClip coords"
+        );
+    }
+
+    // 2. challenger_w2exit_r6_1-r6-2: SymbolDef member with sub.perspective (both named & ObjectId(0) + Group)
+    {
+        let mut doc = Document::new("R7_SymMemberPersp", 200.0, 200.0, ColorMode::Rgb, 150.0);
+        let member_persp = Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0),
+            &[
+                Point2D::new(80.0, 80.0),
+                Point2D::new(120.0, 80.0),
+                Point2D::new(120.0, 120.0),
+                Point2D::new(80.0, 120.0),
+            ],
+        )
+        .unwrap();
+        let mut sub_rect = SceneObject::new(ObjectId(10), "SubRect", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::rgba8(20, 40, 220, 255)));
+        sub_rect.perspective = Some(member_persp);
+
+        let sym = SymbolDef::new("MemberPerspSym", vec![sub_rect]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sid));
+        let inst_id = doc.add_object(inst, None).unwrap();
+
+        let wb = doc.world_object_bounds(inst_id).unwrap();
+        assert!(
+            (wb.min_x - 80.0).abs() < 1e-6
+                && (wb.min_y - 80.0).abs() < 1e-6
+                && (wb.max_x - 120.0).abs() < 1e-6
+                && (wb.max_y - 120.0).abs() < 1e-6,
+            "r6-2: world_object_bounds must reflect sub.perspective (80..120), got {wb:?}"
+        );
+        let vwb = doc.visual_world_bounds(inst_id).unwrap();
+        assert!(
+            vwb.min_x >= 79.0 && vwb.min_y >= 79.0 && vwb.max_x <= 121.0 && vwb.max_y <= 121.0,
+            "r6-2: visual_world_bounds must reflect sub.perspective (80..120) without origin leak, got {vwb:?}"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(100.0, 100.0), 1.0),
+            Some(inst_id),
+            "r6-2: hit_test_point must hit SymbolInstance at warped center (100,100)"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(10.0, 10.0), 1.0),
+            None,
+            "r6-2: hit_test_point must NOT ghost-hit unwarped center (10,10)"
+        );
+        assert_eq!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(75.0, 75.0, 50.0, 50.0), true),
+            vec![inst_id],
+            "r6-2: fully_enclosed hit_test_rect must hit warped SymbolInstance"
+        );
+
+        // Also verify ObjectId(0) anonymous Group member inside SymbolDef with sub.perspective
+        let child_zero = SceneObject::new(ObjectId(50), "InnerZero", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::CYAN));
+        let mut zero_grp = SceneObject::new(
+            ObjectId(0),
+            "ZeroGrp",
+            NodePayload::Group(vec![ObjectId(50)]),
+        );
+        zero_grp.perspective = Some(member_persp);
+        let sym2 = SymbolDef::new("ZeroGrpPerspSym", vec![child_zero, zero_grp]);
+        let sid2 = sym2.id;
+        doc.insert_symbol(sym2);
+        let inst2 = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "SymInst2", NodePayload::SymbolInstance(sid2))
+                    .with_transform(Affine2D::translate(10.0, 10.0)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(110.0, 110.0), 1.0),
+            Some(inst2),
+            "r6-2: ObjectId(0) Group with sub.perspective in SymbolDef must be clickable"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(20.0, 20.0), 1.0),
+            None,
+            "r6-2: ObjectId(0) Group with sub.perspective must NOT ghost-hit unwarped coords"
+        );
+    }
+
+    // 3. challenger_w2exit_r6_1-r6-3: grouped attached TextOnPath with obj.perspective (no double transform)
+    {
+        let mut doc = Document::new("R7_GroupedTOPPersp", 300.0, 300.0, ColorMode::Rgb, 150.0);
+        let mut host = SceneObject::new(
+            ObjectId(0),
+            "HostPath",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 5.0),
+                Point2D::new(30.0, 5.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        host.visible = false;
+        let host_id = doc.add_object(host, None).unwrap();
+
+        let top_persp = Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+            &[
+                Point2D::new(80.0, 80.0),
+                Point2D::new(120.0, 80.0),
+                Point2D::new(120.0, 100.0),
+                Point2D::new(80.0, 100.0),
+            ],
+        )
+        .unwrap();
+        let mut top = SceneObject::new(
+            ObjectId(0),
+            "GroupedTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("TEST", TextStyle::default()),
+                path_id: host_id,
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        top.perspective = Some(top_persp);
+        let top_id = doc.add_object(top, None).unwrap();
+
+        let gid = doc.group_objects(&[top_id], "TOPGroup").unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::TransformObjects {
+                ids: vec![gid, host_id],
+                affine: Affine2D::translate(40.0, 40.0),
+            },
+        )
+        .unwrap();
+
+        // Local host (0,5)-(30,5) -> top_persp -> (80,90)-(120,90) -> Group translate(40,40) -> (120,130)-(160,130)
+        let wb = doc.world_object_bounds(gid).unwrap();
+        assert!(
+            (wb.min_x - 120.0).abs() < 1e-6
+                && (wb.max_x - 160.0).abs() < 1e-6
+                && (wb.min_y - 130.0).abs() < 1e-6
+                && (wb.max_y - 130.0).abs() < 1e-6,
+            "r6-3: world_object_bounds(gid) must be (120,130)-(160,130) without double-transform, got {wb:?}"
+        );
+        let tight_rendered_enclosing_rect = Rect2D::from_xywh(115.0, 117.0, 50.0, 20.0);
+        assert_eq!(
+            hit_test_rect(&doc, 0, tight_rendered_enclosing_rect, true),
+            vec![gid],
+            "r6-3: hit_test_rect(..., true) must enclose grouped TextOnPath(Perspective3x3)"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(170.0, 200.0, 50.0, 20.0), true).is_empty(),
+            "r6-3: must NOT hit double-transformed coords (173..213, 210)"
+        );
+    }
+
+    // 4. Sibling checks: Effect::Perspective on Group with hit_test_rect(..., true) and
+    //    SymbolDef TextOnPath with sub.perspective
+    {
+        let mut doc = Document::new("R7_SiblingPersp", 300.0, 300.0, ColorMode::Rgb, 150.0);
+        let r = SceneObject::new(ObjectId(0), "EffRect", rect_shape(20.0, 20.0))
+            .with_fill(Fill::Solid(Color::CYAN));
+        let rid = doc.add_object(r, None).unwrap();
+        let gid = doc.group_objects(&[rid], "EffPerspGrp").unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::AddEffect {
+                id: gid,
+                effect: Effect::Perspective {
+                    quad: [
+                        Point2D::new(90.0, 90.0),
+                        Point2D::new(130.0, 90.0),
+                        Point2D::new(130.0, 130.0),
+                        Point2D::new(90.0, 130.0),
+                    ],
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(85.0, 85.0, 50.0, 50.0), true),
+            vec![gid],
+            "sibling: fully_enclosed hit_test_rect must hit Group with Effect::Perspective"
+        );
+        assert!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(-5.0, -5.0, 30.0, 30.0), true).is_empty(),
+            "sibling: must NOT ghost-hit unwarped Effect::Perspective Group"
+        );
+
+        let sym_host = SceneObject::new(
+            ObjectId(20),
+            "SymHost",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 5.0),
+                Point2D::new(30.0, 5.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        let mut sym_top = SceneObject::new(
+            ObjectId(21),
+            "SymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("SYMTOP", TextStyle::default()),
+                path_id: ObjectId(20),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        sym_top.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+                &[
+                    Point2D::new(80.0, 80.0),
+                    Point2D::new(120.0, 80.0),
+                    Point2D::new(120.0, 100.0),
+                    Point2D::new(80.0, 100.0),
+                ],
+            )
+            .unwrap(),
+        );
+        let sym_top_only = SymbolDef::new("SymTOPPersp", vec![sym_host, sym_top]);
+        let stid = sym_top_only.id;
+        doc.insert_symbol(sym_top_only);
+        let inst = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "SymTOPInst", NodePayload::SymbolInstance(stid))
+                    .with_transform(Affine2D::translate(40.0, 40.0)),
+                None,
+            )
+            .unwrap();
+        let sym_wb = doc.world_object_bounds(inst).unwrap();
+        assert!(
+            (sym_wb.max_x - 160.0).abs() < 1e-6 && (sym_wb.max_y - 130.0).abs() < 1e-6,
+            "sibling: SymbolDef TextOnPath with sub.perspective must not double-transform: {sym_wb:?}"
+        );
+    }
+}
+
+#[test]
+fn w2_exit_r8_symbol_group_top_persp_connector_and_zero_id_group_ancestors() {
+    use coree_core::hit_test::{hit_test_point, hit_test_rect, sym_sub_world_bounds};
+    use coree_core::{
+        AnchorPoint, ArtisticText, ConnectorObject, ConnectorStyle, SymbolDef, TextOnPath,
+        TextStyle,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    // (a) Probe P2: SymbolDef Group(translate(40,40)) + TextOnPath(sub.perspective) + Connector
+    {
+        let mut doc = Document::new("W2ExitR8_P2", 300.0, 300.0, ColorMode::Rgb, 150.0);
+        let host = SceneObject::new(
+            ObjectId(10),
+            "Host",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 5.0),
+                Point2D::new(30.0, 5.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        let mut top = SceneObject::new(
+            ObjectId(11),
+            "GroupedSymTOP",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("WARP", TextStyle::default()),
+                path_id: ObjectId(10),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        top.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+                &[
+                    Point2D::new(80.0, 80.0),
+                    Point2D::new(120.0, 80.0),
+                    Point2D::new(120.0, 100.0),
+                    Point2D::new(80.0, 100.0),
+                ],
+            )
+            .unwrap(),
+        );
+        let grp = SceneObject::new(
+            ObjectId(12),
+            "SymGrp",
+            NodePayload::Group(vec![ObjectId(10), ObjectId(11)]),
+        )
+        .with_transform(Affine2D::translate(40.0, 40.0));
+        let conn = SceneObject::new(
+            ObjectId(13),
+            "SymConn",
+            NodePayload::Connector(ConnectorObject::between_objects(
+                ObjectId(11),
+                AnchorPoint::Center,
+                ObjectId(999),
+                AnchorPoint::Center,
+                ConnectorStyle::Straight,
+            )),
+        )
+        .with_outline(OutlineStyle::solid(Color::BLACK, 1.0));
+        let mut conn_fixed = conn;
+        if let NodePayload::Connector(ref mut c) = conn_fixed.payload {
+            c.to_obj = None;
+            c.to_fallback = Point2D::new(140.0, 180.0);
+        }
+
+        let sym = SymbolDef::new("P2Sym", vec![host, top, grp, conn_fixed]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "P2Inst", NodePayload::SymbolInstance(sid)),
+                None,
+            )
+            .unwrap();
+
+        let sym_ref = doc.symbol(sid).unwrap();
+        let sym_map: HashMap<ObjectId, &SceneObject> = sym_ref
+            .objects
+            .iter()
+            .filter(|s| s.id.0 != 0)
+            .map(|s| (s.id, s))
+            .collect();
+        let mut visiting = HashMap::new();
+        let mut visited_syms = HashSet::new();
+        let mut cache = HashMap::new();
+        let (top_bb, _) = sym_sub_world_bounds(
+            &doc,
+            ObjectId(11),
+            &sym_map,
+            Affine2D::IDENTITY,
+            &mut visiting,
+            &mut visited_syms,
+            &mut cache,
+            0,
+        );
+        let top_bb = top_bb.expect("sym_sub_world_bounds for grouped TextOnPath");
+        assert!(
+            (top_bb.center().x - 140.0).abs() < 1e-4 && (top_bb.center().y - 130.0).abs() < 1e-4,
+            "expected grouped TextOnPath center (140, 130), got {:?}",
+            top_bb.center()
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(140.0, 155.0), 1.0),
+            Some(inst_id),
+            "Connector midpoint from grouped TextOnPath(sub.perspective) must hit at (140, 155)"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(140.0, 130.0), 1.0),
+            Some(inst_id),
+            "Grouped TextOnPath(sub.perspective) must hit at (140, 130)"
+        );
+    }
+
+    // (b) Probe P5: SymbolDef ObjectId(0) Group(translate(10,10), perspective) + TextOnPath(sub.perspective)
+    {
+        let mut doc = Document::new("W2ExitR8_P5", 300.0, 300.0, ColorMode::Rgb, 150.0);
+        let mut host = SceneObject::new(
+            ObjectId(20),
+            "Host20",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 5.0),
+                Point2D::new(30.0, 5.0),
+            )),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        host.visible = false;
+        let mut top = SceneObject::new(
+            ObjectId(21),
+            "Top21",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("ZERO", TextStyle::default()),
+                path_id: ObjectId(20),
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+        top.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(0.0, 0.0, 30.0, 10.0),
+                &[
+                    Point2D::new(20.0, 20.0),
+                    Point2D::new(60.0, 20.0),
+                    Point2D::new(60.0, 40.0),
+                    Point2D::new(20.0, 40.0),
+                ],
+            )
+            .unwrap(),
+        );
+        let mut zero_grp = SceneObject::new(
+            ObjectId(0),
+            "ZeroGrp",
+            NodePayload::Group(vec![ObjectId(20), ObjectId(21)]),
+        )
+        .with_transform(Affine2D::translate(10.0, 10.0));
+        zero_grp.perspective = Some(
+            Perspective3x3::from_rect_to_quad(
+                Rect2D::from_xywh(20.0, 20.0, 40.0, 20.0),
+                &[
+                    Point2D::new(100.0, 100.0),
+                    Point2D::new(180.0, 100.0),
+                    Point2D::new(180.0, 140.0),
+                    Point2D::new(100.0, 140.0),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let sym = SymbolDef::new("P5Sym", vec![zero_grp, host, top]);
+        let sid = sym.id;
+        doc.insert_symbol(sym);
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "P5Inst", NodePayload::SymbolInstance(sid))
+                    .with_transform(Affine2D::translate(20.0, 20.0)),
+                None,
+            )
+            .unwrap();
+
+        // Host (0,5)-(30,5) -> top.persp -> (20,30)-(60,30) -> zero_grp.persp -> (100,120)-(180,120)
+        // -> zero_grp.translate(10,10) + inst.translate(20,20) => (130, 150)-(210, 150)
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(150.0, 150.0), 5.0),
+            Some(inst_id),
+            "ObjectId(0) Group(translate, persp) + TextOnPath(sub.persp) must hit at (150, 150)"
+        );
+        assert_eq!(
+            hit_test_point(&doc, 0, Point2D::new(120.0, 100.0), 5.0),
+            None,
+            "Must NOT ghost-hit shifted coords missing ObjectId(0) Group transform"
+        );
+        assert_eq!(
+            hit_test_rect(&doc, 0, Rect2D::from_xywh(125.0, 135.0, 90.0, 30.0), true),
+            vec![inst_id],
+            "hit_test_rect(..., true) must enclose ObjectId(0) Group + TextOnPath at (125..215, 135..165)"
+        );
+    }
+}

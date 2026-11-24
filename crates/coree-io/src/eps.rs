@@ -5,10 +5,11 @@
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
+use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
     Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Effect, Fill, GradientStop,
-    LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Point2D,
-    SceneObject, TextDirection, TextStyle,
+    LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, Perspective3x3,
+    Point2D, SceneObject, SymbolDef, TextDirection, TextStyle,
 };
 use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
 use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba, TextEngine};
@@ -112,6 +113,8 @@ pub fn export_eps_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
                     page_index,
                     obj,
                     Affine2D::IDENTITY,
+                    None,
+                    None,
                     use_cmyk,
                     &mut text_engine,
                     &mut out,
@@ -134,11 +137,36 @@ pub fn export_eps(doc: &Document, page_index: usize, path: &Path) -> IoResult<()
     atomic_write_bytes(path, eps.as_bytes())
 }
 
-fn eps_requires_raster_composite(obj: &SceneObject) -> bool {
-    if obj.lens.is_some() {
-        return true;
+fn eps_requires_raster_composite(doc: &Document, obj: &SceneObject) -> bool {
+    let mut visited_objs = HashSet::new();
+    let mut visited_syms = HashSet::new();
+    eps_requires_raster_composite_inner(
+        doc,
+        obj,
+        None,
+        false,
+        &mut visited_objs,
+        &mut visited_syms,
+        0,
+    )
+}
+
+fn eps_requires_raster_composite_inner(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+    in_forced_vector_ancestor: bool,
+    visited_objs: &mut HashSet<ObjectId>,
+    visited_syms: &mut HashSet<coree_core::SymbolId>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_EPS_DEPTH
+        || (depth > 0 && (!obj.visible || !obj.printable))
+        || (obj.id.0 != 0 && !visited_objs.insert(obj.id))
+    {
+        return false;
     }
-    if obj.effects.iter().any(|e| {
+    let has_raster_fx = obj.effects.iter().any(|e| {
         matches!(
             e,
             Effect::DropShadow { .. }
@@ -151,19 +179,100 @@ fn eps_requires_raster_composite(obj: &SceneObject) -> bool {
                 | Effect::Bevel { .. }
                 | Effect::Extrude3D { .. }
         )
-    }) {
-        return true;
+    });
+    let result = if obj.lens.is_some() || has_raster_fx {
+        true
+    } else {
+        match &obj.payload {
+            NodePayload::Group(children) => {
+                eps_has_geometry_effect(&obj.effects)
+                    || ((in_forced_vector_ancestor || obj.perspective.is_some())
+                        && children.iter().any(|cid| {
+                            sym_map
+                                .and_then(|m| m.get(cid).copied())
+                                .or_else(|| doc.object(*cid))
+                                .is_some_and(|child| {
+                                    eps_requires_raster_composite_inner(
+                                        doc,
+                                        child,
+                                        sym_map,
+                                        true,
+                                        visited_objs,
+                                        visited_syms,
+                                        depth + 1,
+                                    )
+                                })
+                        }))
+            }
+            NodePayload::SymbolInstance(sym_id) => {
+                eps_has_geometry_effect(&obj.effects)
+                    || (visited_syms.insert(*sym_id) && {
+                        let hit = doc.symbol(*sym_id).is_some_and(|sym| {
+                            let (child_map, referenced) = build_eps_symbol_maps(sym);
+                            let mut sym_visited = HashSet::new();
+                            sym.objects.iter().any(|sub| {
+                                !(sub.id.0 != 0 && referenced.contains(&sub.id))
+                                    && eps_requires_raster_composite_inner(
+                                        doc,
+                                        sub,
+                                        Some(&child_map),
+                                        true,
+                                        &mut sym_visited,
+                                        visited_syms,
+                                        depth + 1,
+                                    )
+                            })
+                        });
+                        visited_syms.remove(sym_id);
+                        hit
+                    })
+            }
+            NodePayload::PowerClip { contents, .. } => {
+                let own_fill = matches!(
+                    obj.fill,
+                    Fill::ConicalGradient { .. }
+                        | Fill::SquareGradient { .. }
+                        | Fill::MeshFill { .. }
+                        | Fill::TwoColorPattern { .. }
+                        | Fill::VectorPattern { .. }
+                        | Fill::BitmapPattern { .. }
+                        | Fill::TextureFill { .. }
+                );
+                own_fill
+                    || ((in_forced_vector_ancestor || obj.perspective.is_some())
+                        && contents.iter().any(|cid| {
+                            sym_map
+                                .and_then(|m| m.get(cid).copied())
+                                .or_else(|| doc.object(*cid))
+                                .is_some_and(|child| {
+                                    eps_requires_raster_composite_inner(
+                                        doc,
+                                        child,
+                                        sym_map,
+                                        true,
+                                        visited_objs,
+                                        visited_syms,
+                                        depth + 1,
+                                    )
+                                })
+                        }))
+            }
+            _ => matches!(
+                obj.fill,
+                Fill::ConicalGradient { .. }
+                    | Fill::SquareGradient { .. }
+                    | Fill::MeshFill { .. }
+                    | Fill::TwoColorPattern { .. }
+                    | Fill::VectorPattern { .. }
+                    | Fill::BitmapPattern { .. }
+                    | Fill::TextureFill { .. }
+            ),
+        }
+    };
+    if obj.id.0 != 0 {
+        visited_objs.remove(&obj.id);
     }
-    matches!(
-        obj.fill,
-        Fill::ConicalGradient { .. }
-            | Fill::SquareGradient { .. }
-            | Fill::MeshFill { .. }
-            | Fill::TwoColorPattern { .. }
-            | Fill::VectorPattern { .. }
-            | Fill::BitmapPattern { .. }
-            | Fill::TextureFill { .. }
-    )
+    result
 }
 
 fn eps_has_geometry_effect(effects: &[Effect]) -> bool {
@@ -173,6 +282,53 @@ fn eps_has_geometry_effect(effects: &[Effect]) -> bool {
             Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
         )
     })
+}
+
+fn compose_eps_parent_persp(
+    parent_persp: Option<Perspective3x3>,
+    local_xf: Affine2D,
+    world_xf: Affine2D,
+    own_persp: Option<Perspective3x3>,
+) -> Option<Perspective3x3> {
+    match (parent_persp, own_persp) {
+        (Some(pp), Some(op)) => Some(
+            pp.compose(&Perspective3x3::from_affine(local_xf))
+                .compose(&op),
+        ),
+        (Some(pp), None) => Some(pp.compose(&Perspective3x3::from_affine(local_xf))),
+        (None, Some(op)) => Some(Perspective3x3::from_affine(world_xf).compose(&op)),
+        (None, None) => None,
+    }
+}
+
+fn transform_eps_local_path(
+    local_deformed: &BezierPath,
+    local_xf: Affine2D,
+    world_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    if let Some(pp) = parent_persp {
+        pp.compose(&Perspective3x3::from_affine(local_xf))
+            .transform_bezier_path(local_deformed)
+    } else {
+        local_deformed.transformed(&world_xf)
+    }
+}
+
+fn build_eps_symbol_maps(sym: &SymbolDef) -> (HashMap<ObjectId, &SceneObject>, HashSet<ObjectId>) {
+    let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+    let mut referenced: HashSet<ObjectId> = HashSet::new();
+    for sub in &sym.objects {
+        if sub.id.0 != 0 {
+            child_map.insert(sub.id, sub);
+        }
+        match &sub.payload {
+            NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+            NodePayload::PowerClip { contents, .. } => referenced.extend(contents.iter().copied()),
+            _ => {}
+        }
+    }
+    (child_map, referenced)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,25 +425,32 @@ fn emit_eps_object(
     page_index: usize,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+    sym_ctx: Option<ExportSymCtx<'_>>,
     use_cmyk: bool,
     text_engine: &mut TextEngine,
     out: &mut String,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
 ) {
-    if depth > MAX_EPS_DEPTH || !obj.visible || !obj.printable || !visited.insert(obj.id) {
+    if depth > MAX_EPS_DEPTH
+        || !obj.visible
+        || !obj.printable
+        || (obj.id.0 != 0 && !visited.insert(obj.id))
+    {
         return;
     }
     if !parent_xf.is_finite() || !obj.transform.is_finite() {
-        visited.remove(&obj.id);
+        if obj.id.0 != 0 {
+            visited.remove(&obj.id);
+        }
         return;
     }
 
-    if eps_requires_raster_composite(obj)
-        && !matches!(
-            obj.payload,
-            NodePayload::Group(_) | NodePayload::SymbolInstance(_)
-        )
+    if eps_requires_raster_composite(doc, obj)
+        && sym_ctx.is_none()
+        && obj.id.0 != 0
+        && parent_persp.is_none()
     {
         if let Ok(Some((rect_mm, rgba_buf))) =
             render_isolated_object_to_rgba(doc, page_index, obj.id, parent_xf, 300.0)
@@ -310,6 +473,7 @@ fn emit_eps_object(
 
     let sym_transforms = symmetry_effect_transforms(&obj.effects);
     for sym_xf in sym_transforms {
+        let local_xf = sym_xf.compose(&obj.transform);
         let effective_parent = parent_xf.compose(&sym_xf);
         let world_xf = effective_parent.compose(&obj.transform);
         if !world_xf.is_finite() {
@@ -324,9 +488,11 @@ fn emit_eps_object(
                     path.clone()
                 };
                 let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let out_path =
+                    transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
                 emit_eps_styled_path(
                     page,
-                    &deformed.transformed(&world_xf),
+                    &out_path,
                     &obj.fill,
                     &obj.outline,
                     world_xf,
@@ -341,9 +507,11 @@ fn emit_eps_object(
                     shape.to_bezier_path()
                 };
                 let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let out_path =
+                    transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
                 emit_eps_styled_path(
                     page,
-                    &deformed.transformed(&world_xf),
+                    &out_path,
                     &obj.fill,
                     &obj.outline,
                     world_xf,
@@ -358,9 +526,11 @@ fn emit_eps_object(
                     bs.to_bezier_path()
                 };
                 let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let out_path =
+                    transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
                 emit_eps_styled_path(
                     page,
-                    &deformed.transformed(&world_xf),
+                    &out_path,
                     &obj.fill,
                     &obj.outline,
                     world_xf,
@@ -376,9 +546,11 @@ fn emit_eps_object(
                     raw
                 };
                 let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let out_path =
+                    transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
                 emit_eps_styled_path(
                     page,
-                    &deformed.transformed(&world_xf),
+                    &out_path,
                     &obj.fill,
                     &obj.outline,
                     world_xf,
@@ -404,54 +576,146 @@ fn emit_eps_object(
                             raw
                         };
                         let deformed = apply_geometry_effects(&wp, &obj.effects);
+                        let out_path =
+                            transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
+                        emit_eps_styled_path(page, &out_path, &f, &o, world_xf, use_cmyk, out);
+                    }
+                }
+            }
+            NodePayload::ArtisticText(text) => {
+                if parent_persp.is_some() || obj.perspective.is_some() {
+                    let pieces = text_engine.layout_artistic_pieces(text);
+                    for piece in &pieces {
+                        let bp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&piece.path)
+                        } else {
+                            piece.path.clone()
+                        };
+                        let deformed = apply_geometry_effects(&bp, &obj.effects);
+                        let out_path =
+                            transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
                         emit_eps_styled_path(
                             page,
-                            &deformed.transformed(&world_xf),
-                            &f,
-                            &o,
+                            &out_path,
+                            &Fill::Solid(piece.fill.clone()),
+                            &obj.outline,
                             world_xf,
                             use_cmyk,
                             out,
                         );
                     }
+                } else {
+                    emit_eps_artistic_text(
+                        page,
+                        text,
+                        &obj.outline,
+                        &obj.effects,
+                        world_xf,
+                        use_cmyk,
+                        text_engine,
+                        out,
+                    );
                 }
-            }
-            NodePayload::ArtisticText(text) => {
-                emit_eps_artistic_text(
-                    page,
-                    text,
-                    &obj.outline,
-                    &obj.effects,
-                    world_xf,
-                    use_cmyk,
-                    text_engine,
-                    out,
-                );
             }
             NodePayload::ParagraphText(para) => {
                 let pieces = text_engine.layout_paragraph_pieces(para);
-                emit_eps_shaped_pieces(
-                    page,
-                    &pieces,
-                    &obj.outline,
-                    &obj.effects,
-                    world_xf,
-                    use_cmyk,
-                    out,
-                );
-            }
-            NodePayload::TextOnPath(top) => {
-                if let Some(host_path) = doc.world_path_of(top.path_id) {
-                    let pieces = text_engine.layout_text_on_path_pieces(top, &host_path);
+                if parent_persp.is_some() || obj.perspective.is_some() {
+                    for piece in &pieces {
+                        let bp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&piece.path)
+                        } else {
+                            piece.path.clone()
+                        };
+                        let deformed = apply_geometry_effects(&bp, &obj.effects);
+                        let out_path =
+                            transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
+                        emit_eps_styled_path(
+                            page,
+                            &out_path,
+                            &Fill::Solid(piece.fill.clone()),
+                            &obj.outline,
+                            world_xf,
+                            use_cmyk,
+                            out,
+                        );
+                    }
+                } else {
                     emit_eps_shaped_pieces(
                         page,
                         &pieces,
                         &obj.outline,
                         &obj.effects,
-                        effective_parent,
+                        world_xf,
                         use_cmyk,
                         out,
                     );
+                }
+            }
+            NodePayload::TextOnPath(top) => {
+                if let Some(host_path) = resolve_export_world_path(doc, top.path_id, sym_ctx) {
+                    let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                    let mut pieces = text_engine.layout_text_on_path_pieces(top, &host_path);
+                    if inv_parent != Affine2D::IDENTITY {
+                        for piece in &mut pieces {
+                            piece.path = piece.path.transformed(&inv_parent);
+                        }
+                    }
+                    if parent_persp.is_some() || obj.perspective.is_some() {
+                        for piece in &pieces {
+                            let bp = if let Some(persp) = obj.perspective {
+                                persp.transform_bezier_path(&piece.path)
+                            } else {
+                                piece.path.clone()
+                            };
+                            let deformed = apply_geometry_effects(&bp, &obj.effects);
+                            let out_path = transform_eps_local_path(
+                                &deformed,
+                                sym_xf,
+                                effective_parent,
+                                parent_persp,
+                            );
+                            emit_eps_styled_path(
+                                page,
+                                &out_path,
+                                &Fill::Solid(piece.fill.clone()),
+                                &obj.outline,
+                                effective_parent,
+                                use_cmyk,
+                                out,
+                            );
+                        }
+                    } else {
+                        emit_eps_shaped_pieces(
+                            page,
+                            &pieces,
+                            &obj.outline,
+                            &obj.effects,
+                            effective_parent,
+                            use_cmyk,
+                            out,
+                        );
+                    }
+                } else if parent_persp.is_some() || obj.perspective.is_some() {
+                    let pieces = text_engine.layout_artistic_pieces(&top.text);
+                    for piece in &pieces {
+                        let bp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&piece.path)
+                        } else {
+                            piece.path.clone()
+                        };
+                        let deformed = apply_geometry_effects(&bp, &obj.effects);
+                        let out_path =
+                            transform_eps_local_path(&deformed, local_xf, world_xf, parent_persp);
+                        emit_eps_styled_path(
+                            page,
+                            &out_path,
+                            &Fill::Solid(piece.fill.clone()),
+                            &obj.outline,
+                            world_xf,
+                            use_cmyk,
+                            out,
+                        );
+                    }
                 } else {
                     emit_eps_artistic_text(
                         page,
@@ -470,9 +734,15 @@ fn emit_eps_object(
                     for c in 0..table.cols {
                         if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c))
                         {
+                            let cell_path = transform_eps_local_path(
+                                &BezierPath::from_rect(rect),
+                                local_xf,
+                                world_xf,
+                                parent_persp,
+                            );
                             emit_eps_styled_path(
                                 page,
-                                &BezierPath::from_rect(rect).transformed(&world_xf),
+                                &cell_path,
                                 &cell.fill,
                                 &table.border_style,
                                 world_xf,
@@ -488,27 +758,51 @@ fn emit_eps_object(
                                     cell.text.clone(),
                                     cell.text_style.clone(),
                                 );
-                                emit_eps_artistic_text(
-                                    page,
-                                    &at,
-                                    &OutlineStyle::none(),
-                                    &[],
-                                    world_xf.compose(&tx),
-                                    use_cmyk,
-                                    text_engine,
-                                    out,
-                                );
+                                if parent_persp.is_some() {
+                                    for piece in text_engine.layout_artistic_pieces(&at) {
+                                        let p = transform_eps_local_path(
+                                            &piece.path,
+                                            local_xf.compose(&tx),
+                                            world_xf.compose(&tx),
+                                            parent_persp,
+                                        );
+                                        emit_eps_styled_path(
+                                            page,
+                                            &p,
+                                            &Fill::Solid(piece.fill),
+                                            &OutlineStyle::none(),
+                                            world_xf.compose(&tx),
+                                            use_cmyk,
+                                            out,
+                                        );
+                                    }
+                                } else {
+                                    emit_eps_artistic_text(
+                                        page,
+                                        &at,
+                                        &OutlineStyle::none(),
+                                        &[],
+                                        world_xf.compose(&tx),
+                                        use_cmyk,
+                                        text_engine,
+                                        out,
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
             NodePayload::Dimension(dim) => {
-                let line = BezierPath::from_line(
-                    Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
-                    Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
-                )
-                .transformed(&world_xf);
+                let line = transform_eps_local_path(
+                    &BezierPath::from_line(
+                        Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
+                        Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
+                    ),
+                    local_xf,
+                    world_xf,
+                    parent_persp,
+                );
                 emit_eps_styled_path(
                     page,
                     &line,
@@ -522,23 +816,52 @@ fn emit_eps_object(
                     dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
                 let mid = dim.p1.midpoint(dim.p2);
                 let at = ArtisticText::from_plain(label, dim.text_style.clone());
-                emit_eps_artistic_text(
-                    page,
-                    &at,
-                    &OutlineStyle::none(),
-                    &[],
-                    world_xf.compose(&Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0)),
-                    use_cmyk,
-                    text_engine,
-                    out,
-                );
+                let tx = Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0);
+                if parent_persp.is_some() {
+                    for piece in text_engine.layout_artistic_pieces(&at) {
+                        let p = transform_eps_local_path(
+                            &piece.path,
+                            local_xf.compose(&tx),
+                            world_xf.compose(&tx),
+                            parent_persp,
+                        );
+                        emit_eps_styled_path(
+                            page,
+                            &p,
+                            &Fill::Solid(piece.fill),
+                            &OutlineStyle::none(),
+                            world_xf.compose(&tx),
+                            use_cmyk,
+                            out,
+                        );
+                    }
+                } else {
+                    emit_eps_artistic_text(
+                        page,
+                        &at,
+                        &OutlineStyle::none(),
+                        &[],
+                        world_xf.compose(&tx),
+                        use_cmyk,
+                        text_engine,
+                        out,
+                    );
+                }
             }
             NodePayload::Connector(conn) => {
-                let (a, b) = doc.resolve_connector_endpoints(conn);
+                let (a, b) = resolve_export_connector_endpoints(doc, conn, &world_xf, sym_ctx);
                 let path = conn.route_path(a, b);
+                let out_path = if let Some(pp) = parent_persp {
+                    let local_path = parent_xf
+                        .inverse()
+                        .map_or_else(|| path.clone(), |inv| path.transformed(&inv));
+                    pp.transform_bezier_path(&local_path)
+                } else {
+                    path
+                };
                 emit_eps_styled_path(
                     page,
-                    &path,
+                    &out_path,
                     &Fill::None,
                     &obj.outline,
                     world_xf,
@@ -547,14 +870,21 @@ fn emit_eps_object(
                 );
             }
             NodePayload::Group(children) => {
+                let child_persp =
+                    compose_eps_parent_persp(parent_persp, local_xf, world_xf, obj.perspective);
                 for &cid in children {
-                    if let Some(child) = doc.object(cid) {
+                    let child_opt = sym_ctx
+                        .and_then(|(m, _, _)| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid));
+                    if let Some(child) = child_opt {
                         emit_eps_object(
                             doc,
                             page,
                             page_index,
                             child,
                             world_xf,
+                            child_persp,
+                            sym_ctx,
                             use_cmyk,
                             text_engine,
                             out,
@@ -574,8 +904,14 @@ fn emit_eps_object(
                 } else {
                     (**container).clone()
                 };
-                let clip_path =
-                    apply_geometry_effects(&container_bp, &obj.effects).transformed(&world_xf);
+                let clip_path = transform_eps_local_path(
+                    &apply_geometry_effects(&container_bp, &obj.effects),
+                    local_xf,
+                    world_xf,
+                    parent_persp,
+                );
+                let child_persp =
+                    compose_eps_parent_persp(parent_persp, local_xf, world_xf, obj.perspective);
                 if obj.fill.is_visible() {
                     emit_eps_styled_path(
                         page,
@@ -591,13 +927,18 @@ fn emit_eps_object(
                 emit_eps_path_ops(page, &clip_path, out);
                 out.push_str("clip newpath\n");
                 for &cid in contents {
-                    if let Some(child) = doc.object(cid) {
+                    let child_opt = sym_ctx
+                        .and_then(|(m, _, _)| m.get(&cid).copied())
+                        .or_else(|| doc.object(cid));
+                    if let Some(child) = child_opt {
                         emit_eps_object(
                             doc,
                             page,
                             page_index,
                             child,
                             world_xf,
+                            child_persp,
+                            sym_ctx,
                             use_cmyk,
                             text_engine,
                             out,
@@ -621,14 +962,22 @@ fn emit_eps_object(
             }
             NodePayload::SymbolInstance(sym_id) => {
                 if let Some(sym) = doc.symbol(*sym_id) {
+                    let (child_map, referenced) = build_eps_symbol_maps(sym);
+                    let child_persp =
+                        compose_eps_parent_persp(parent_persp, local_xf, world_xf, obj.perspective);
+                    let mut sym_visited = HashSet::new();
                     for sub in &sym.objects {
-                        let mut sym_visited = HashSet::new();
+                        if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                            continue;
+                        }
                         emit_eps_object(
                             doc,
                             page,
                             page_index,
                             sub,
                             world_xf,
+                            child_persp,
+                            Some((&child_map, &sym.objects, world_xf)),
                             use_cmyk,
                             text_engine,
                             out,

@@ -8,13 +8,14 @@
 
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{
-    collect_silhouette_paths, find_or_create_layer, get_page, sym_world_transform_of,
-    visit_layer_objects, world_bounds_with_sym_xf, SymBoundsCtx, SymParentRef,
+    ancestor_world_persp, collect_silhouette_paths, find_or_create_layer, get_page,
+    sym_world_transform_of, visit_layer_objects, world_bounds_with_sym_xf, SymBoundsCtx,
+    SymParentRef,
 };
 use coree_core::{
-    apply_boolean_many, offset_polygon, Affine2D, BezierPath, BooleanOp, Color, CornerStyle,
-    Document, EllipseMode, Fill, Layer, LayerId, NodePayload, ObjectId, OutlineStyle,
-    ParametricShape, Point2D, Rect2D, SceneObject, SymbolId,
+    apply_boolean_many, offset_polygon, Affine2D, ArtisticMedia, BezierPath, BooleanOp, Color,
+    CornerStyle, Document, Effect, EllipseMode, Fill, Layer, LayerId, NodePayload, ObjectId,
+    OutlineStyle, ParametricShape, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -68,12 +69,21 @@ pub fn generate_cut_contour(
         if !doc.has_object(oid) {
             return Err(ProdError::Core(coree_core::CoreError::ObjectNotFound(oid)));
         }
-        let parent_xf = doc
-            .parent_container_of(oid)
+        let parent_id = doc.parent_container_of(oid);
+        let parent_xf = parent_id
             .and_then(|pid| doc.world_transform_of(pid))
             .filter(|m| m.is_finite())
             .unwrap_or(Affine2D::IDENTITY);
-        collect_silhouette_paths(doc, oid, parent_xf, 0, &mut visiting, &mut silhouettes);
+        let parent_persp = parent_id.and_then(|pid| ancestor_world_persp(doc, pid));
+        collect_silhouette_paths(
+            doc,
+            oid,
+            parent_xf,
+            parent_persp,
+            0,
+            &mut visiting,
+            &mut silhouettes,
+        );
     }
 
     if silhouettes.is_empty() {
@@ -864,11 +874,15 @@ pub fn compute_production_metrics(
                     .and_then(|pid| doc.world_transform_of(pid))
                     .filter(|m| m.is_finite())
                     .unwrap_or(Affine2D::IDENTITY);
+                let parent_persp = doc
+                    .parent_container_of(oid)
+                    .and_then(|pid| ancestor_world_persp(doc, pid));
                 accumulate_object_metrics(
                     doc,
                     oid,
                     layer,
                     parent_xf,
+                    parent_persp,
                     None,
                     0,
                     None,
@@ -893,6 +907,7 @@ pub fn compute_production_metrics(
                             oid,
                             Some(layer),
                             Affine2D::IDENTITY,
+                            None,
                             None,
                             0,
                             None,
@@ -1009,12 +1024,71 @@ fn classify_path_role(layer: Option<&Layer>, obj: &SceneObject) -> PathRole {
     }
 }
 
+fn apply_obj_perspective_to_local_path(local: BezierPath, obj: &SceneObject) -> BezierPath {
+    let mut cur = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local)
+    } else {
+        local
+    };
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(bb) = cur.bounding_box() {
+                if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                    cur = h.transform_bezier_path(&cur);
+                }
+            }
+        }
+    }
+    cur
+}
+
+#[inline]
+fn warp_local_to_world(
+    local: &BezierPath,
+    world_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    if let Some(pp) = parent_persp {
+        pp.compose(&Perspective3x3::from_affine(*obj_xf))
+            .transform_bezier_path(local)
+    } else {
+        local.transformed(world_xf)
+    }
+}
+
+#[inline]
+fn compose_prod_parent_persp(
+    parent_persp: Option<Perspective3x3>,
+    parent_xf: &Affine2D,
+    obj_xf: &Affine2D,
+    own_persp: Option<Perspective3x3>,
+) -> Option<Perspective3x3> {
+    match (parent_persp, own_persp) {
+        (Some(pp), Some(op)) => Some(
+            pp.compose(&Perspective3x3::from_affine(*obj_xf))
+                .compose(&op),
+        ),
+        (Some(pp), None) => Some(pp.compose(&Perspective3x3::from_affine(*obj_xf))),
+        (None, Some(op)) => {
+            let world_xf = parent_xf.compose(obj_xf);
+            Some(Perspective3x3::from_affine(world_xf).compose(&op))
+        }
+        (None, None) => None,
+    }
+}
+
+fn container_own_persp(doc: &Document, obj: &SceneObject) -> Option<Perspective3x3> {
+    crate::scene_helpers::container_own_persp(doc, obj, None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn accumulate_object_metrics(
     doc: &Document,
     id: ObjectId,
     layer: Option<&Layer>,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     clip_bounds: Option<Rect2D>,
     depth: usize,
     sym_ctx: Option<&SymBoundsCtx<'_>>,
@@ -1040,6 +1114,7 @@ fn accumulate_object_metrics(
         obj,
         layer,
         parent_xf,
+        parent_persp,
         clip_bounds,
         depth,
         sym_ctx,
@@ -1057,6 +1132,7 @@ fn accumulate_scene_object_metrics(
     obj: &SceneObject,
     layer: Option<&Layer>,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     clip_bounds: Option<Rect2D>,
     depth: usize,
     sym_ctx: Option<&SymBoundsCtx<'_>>,
@@ -1074,13 +1150,43 @@ fn accumulate_scene_object_metrics(
     }
 
     match &obj.payload {
+        NodePayload::Clone { .. } => {
+            if let Some((eff_payload, eff_fill, eff_outline)) =
+                doc.resolve_clone_payload_and_style(obj)
+            {
+                let mut tmp = obj.clone();
+                tmp.payload = eff_payload;
+                tmp.fill = eff_fill;
+                tmp.outline = eff_outline;
+                accumulate_scene_object_metrics(
+                    doc,
+                    id,
+                    &tmp,
+                    layer,
+                    parent_xf,
+                    parent_persp,
+                    clip_bounds,
+                    depth + 1,
+                    sym_ctx,
+                    visited,
+                    visiting_syms,
+                    metrics,
+                    cut_subpaths,
+                );
+            }
+            return;
+        }
         NodePayload::Group(children) => {
+            let own_persp = container_own_persp(doc, obj);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in children {
                 accumulate_object_metrics(
                     doc,
                     cid,
                     layer,
                     world_xf,
+                    child_persp,
                     clip_bounds,
                     depth + 1,
                     sym_ctx,
@@ -1097,7 +1203,9 @@ fn accumulate_scene_object_metrics(
             contents,
             ..
         } => {
-            let path = container.transformed(&world_xf);
+            let local_container = apply_obj_perspective_to_local_path((**container).clone(), obj);
+            let path =
+                warp_local_to_world(&local_container, &world_xf, &obj.transform, parent_persp);
             let container_bb = path.bounding_box();
             let child_clip = match (clip_bounds, container_bb) {
                 (Some(a), Some(b)) => a.intersection(b),
@@ -1106,12 +1214,16 @@ fn accumulate_scene_object_metrics(
                 (None, None) => None,
             };
             record_path_metrics(obj, layer, &path, clip_bounds, metrics, cut_subpaths);
+            let own_persp = container_own_persp(doc, obj);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in contents {
                 accumulate_object_metrics(
                     doc,
                     cid,
                     layer,
                     world_xf,
+                    child_persp,
                     child_clip,
                     depth + 1,
                     sym_ctx,
@@ -1127,6 +1239,9 @@ fn accumulate_scene_object_metrics(
             if !visiting_syms.insert(*sym_id) {
                 return;
             }
+            let own_persp = container_own_persp(doc, obj);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             if let Some(sym) = doc.symbol(*sym_id) {
                 let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
                 let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
@@ -1179,6 +1294,7 @@ fn accumulate_scene_object_metrics(
                         sub,
                         layer,
                         world_xf,
+                        child_persp,
                         clip_bounds,
                         depth + 1,
                         Some(&ctx),
@@ -1196,11 +1312,54 @@ fn accumulate_scene_object_metrics(
     }
 
     let world_path = match &obj.payload {
-        NodePayload::Path(p) => Some(p.transformed(&world_xf)),
-        NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
-        NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
+        NodePayload::Path(p) => {
+            let local = apply_obj_perspective_to_local_path(p.clone(), obj);
+            Some(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ))
+        }
+        NodePayload::Shape(s) => {
+            let local = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
+            Some(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ))
+        }
+        NodePayload::BSpline(bs) => {
+            let local = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
+            Some(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ))
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = ArtisticMedia::expand_stroke(spine, style);
+            let local = apply_obj_perspective_to_local_path(expanded, obj);
+            Some(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ))
+        }
+        NodePayload::Table(t) => {
+            let local = apply_obj_perspective_to_local_path(t.to_grid_paths(), obj);
+            Some(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ))
+        }
         NodePayload::Connector(c) => {
-            if let Some(ctx) = sym_ctx {
+            let route = if let Some(ctx) = sym_ctx {
                 let resolve_ep = |oid_opt: Option<ObjectId>,
                                   anchor: &coree_core::AnchorPoint,
                                   fallback: Point2D| {
@@ -1226,11 +1385,20 @@ fn accumulate_scene_object_metrics(
                 };
                 let a = resolve_ep(c.from_obj, &c.from_anchor, c.from_fallback);
                 let b = resolve_ep(c.to_obj, &c.to_anchor, c.to_fallback);
-                Some(c.route_path(a, b))
+                c.route_path(a, b)
             } else {
                 let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
-                Some(c.route_path(a, b))
-            }
+                c.route_path(a, b)
+            };
+            let warped = if let Some(pp) = parent_persp {
+                let local_route = parent_xf
+                    .inverse()
+                    .map_or(route.clone(), |inv| route.transformed(&inv));
+                pp.transform_bezier_path(&local_route)
+            } else {
+                route
+            };
+            Some(warped)
         }
         _ => None,
     };

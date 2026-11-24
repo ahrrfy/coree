@@ -1177,6 +1177,7 @@ impl ToolCore {
                         let (was_shape, draft_path) = match &obj.payload {
                             NodePayload::Path(p) => (false, p.clone()),
                             NodePayload::Shape(s) => (true, s.to_bezier_path()),
+                            NodePayload::BSpline(bs) => (true, bs.to_bezier_path()),
                             _ => return ToolOutput::noop(),
                         };
                         if !is_object_in_or_descendant_of_selection(
@@ -2557,6 +2558,7 @@ impl ToolCore {
                 let unchanged = match &obj.payload {
                     NodePayload::Path(orig) => *orig == draft_path,
                     NodePayload::Shape(s) => s.to_bezier_path() == draft_path,
+                    NodePayload::BSpline(bs) => bs.to_bezier_path() == draft_path,
                     _ => return ToolOutput::noop(),
                 };
                 if unchanged {

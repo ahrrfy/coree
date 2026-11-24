@@ -616,66 +616,148 @@ impl PerspectiveGridConfig {
         let tr = Point2D::new(src_rect.max_x, src_rect.min_y);
         let br = Point2D::new(src_rect.max_x, src_rect.max_y);
         let bl = Point2D::new(src_rect.min_x, src_rect.max_y);
-        let vp_left = self
-            .vanishing_points
-            .first()
-            .copied()
-            .filter(|p| p.is_finite())
-            .unwrap_or(Point2D::new(src_rect.min_x - 100.0, self.horizon_y_mm));
-        let vp_right = self
-            .vanishing_points
-            .get(1)
-            .copied()
-            .filter(|p| p.is_finite())
-            .unwrap_or(Point2D::new(src_rect.max_x + 100.0, self.horizon_y_mm));
-        let vp_vert = self
-            .vanishing_points
-            .get(2)
-            .copied()
-            .filter(|p| p.is_finite())
-            .unwrap_or(Point2D::new(src_rect.center().x, self.horizon_y_mm + 260.0));
-
         let lerp_toward = |p: Point2D, vp: Point2D, t: f64| {
             Point2D::new(p.x + (vp.x - p.x) * t, p.y + (vp.y - p.y) * t)
         };
 
-        let quad = match self.active_plane {
-            PerspectivePlane::Orthographic => [tl, tr, br, bl],
-            PerspectivePlane::Left => [
-                lerp_toward(tl, vp_left, 0.28),
-                tr,
-                br,
-                lerp_toward(bl, vp_left, 0.28),
-            ],
-            PerspectivePlane::Right => [
-                tl,
-                lerp_toward(tr, vp_right, 0.28),
-                lerp_toward(br, vp_right, 0.28),
-                bl,
-            ],
-            PerspectivePlane::Top => [
-                lerp_toward(tl, vp_left, 0.18),
-                lerp_toward(tr, vp_right, 0.18),
-                br,
-                bl,
-            ],
-            PerspectivePlane::Front => {
-                if self.mode == PerspectiveGridMode::ThreePoint {
-                    [
-                        tl,
+        let quad = match self.mode {
+            PerspectiveGridMode::OnePoint => {
+                let vp = self
+                    .vanishing_points
+                    .first()
+                    .copied()
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(Point2D::new(src_rect.center().x, self.horizon_y_mm));
+                match self.active_plane {
+                    PerspectivePlane::Orthographic | PerspectivePlane::Front => [tl, tr, br, bl],
+                    PerspectivePlane::Top => {
+                        if vp.y <= src_rect.center().y {
+                            let t = if vp.y < tl.y {
+                                (src_rect.height() / (bl.y - vp.y)).clamp(0.18, 0.72)
+                            } else {
+                                0.35
+                            };
+                            [lerp_toward(bl, vp, t), lerp_toward(br, vp, t), br, bl]
+                        } else {
+                            let t = if vp.y > bl.y {
+                                (src_rect.height() / (vp.y - tl.y)).clamp(0.18, 0.72)
+                            } else {
+                                0.35
+                            };
+                            [tl, tr, lerp_toward(tr, vp, t), lerp_toward(tl, vp, t)]
+                        }
+                    }
+                    PerspectivePlane::Left | PerspectivePlane::Right => {
+                        let recede_left_edge = match self.active_plane {
+                            PerspectivePlane::Left => vp.x < tr.x,
+                            PerspectivePlane::Right => vp.x <= tl.x,
+                            _ => false,
+                        };
+                        if recede_left_edge {
+                            let t = if vp.x < tl.x {
+                                (src_rect.width() / (tr.x - vp.x)).clamp(0.22, 0.72)
+                            } else {
+                                0.35
+                            };
+                            [lerp_toward(tr, vp, t), tr, br, lerp_toward(br, vp, t)]
+                        } else {
+                            let t = if vp.x > tr.x {
+                                (src_rect.width() / (vp.x - tl.x)).clamp(0.22, 0.72)
+                            } else {
+                                0.35
+                            };
+                            [tl, lerp_toward(tl, vp, t), lerp_toward(bl, vp, t), bl]
+                        }
+                    }
+                }
+            }
+            PerspectiveGridMode::Isometric => {
+                // Parallel 30° / 150° / 90° isometric axes matching `render_perspective_grid`,
+                // independent of `horizon_y_mm` and `vanishing_points`.
+                let u_30 = Vec2D::from_angle(30.0_f64.to_radians());
+                let u_neg30 = -Vec2D::from_angle(150.0_f64.to_radians());
+                let u_90 = Vec2D::new(0.0, 1.0);
+                let c = src_rect.center();
+                let hw = 0.5 * src_rect.width();
+                let hh = 0.5 * src_rect.height();
+                match self.active_plane {
+                    PerspectivePlane::Orthographic | PerspectivePlane::Front => [tl, tr, br, bl],
+                    PerspectivePlane::Left => {
+                        let hu = u_30 * hw;
+                        let hv = u_90 * hh;
+                        [c - hu - hv, c + hu - hv, c + hu + hv, c - hu + hv]
+                    }
+                    PerspectivePlane::Right => {
+                        let hu = u_neg30 * hw;
+                        let hv = u_90 * hh;
+                        [c - hu - hv, c + hu - hv, c + hu + hv, c - hu + hv]
+                    }
+                    PerspectivePlane::Top => {
+                        let hu = u_neg30 * hw;
+                        let hv = u_30 * hh;
+                        [c - hu - hv, c + hu - hv, c + hu + hv, c - hu + hv]
+                    }
+                }
+            }
+            PerspectiveGridMode::TwoPoint | PerspectiveGridMode::ThreePoint => {
+                let vp_left = self
+                    .vanishing_points
+                    .first()
+                    .copied()
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(Point2D::new(src_rect.min_x - 100.0, self.horizon_y_mm));
+                let vp_right = self
+                    .vanishing_points
+                    .get(1)
+                    .copied()
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(Point2D::new(src_rect.max_x + 100.0, self.horizon_y_mm));
+                let vp_vert = self
+                    .vanishing_points
+                    .get(2)
+                    .copied()
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(Point2D::new(src_rect.center().x, self.horizon_y_mm + 260.0));
+
+                match self.active_plane {
+                    PerspectivePlane::Orthographic => [tl, tr, br, bl],
+                    PerspectivePlane::Left => [
+                        lerp_toward(tl, vp_left, 0.28),
                         tr,
-                        lerp_toward(br, vp_vert, 0.18),
-                        lerp_toward(bl, vp_vert, 0.18),
-                    ]
-                } else {
-                    let c = src_rect.center();
-                    let inset = src_rect.width() * 0.12;
-                    [
-                        Point2D::new(tl.x + inset, tl.y),
-                        Point2D::new(tr.x - inset, tr.y),
-                        Point2D::new(br.x, br.y.max(c.y)),
-                        Point2D::new(bl.x, bl.y.max(c.y)),
-                    ]
+                        br,
+                        lerp_toward(bl, vp_left, 0.28),
+                    ],
+                    PerspectivePlane::Right => [
+                        tl,
+                        lerp_toward(tr, vp_right, 0.28),
+                        lerp_toward(br, vp_right, 0.28),
+                        bl,
+                    ],
+                    PerspectivePlane::Top => [
+                        lerp_toward(tl, vp_left, 0.18),
+                        lerp_toward(tr, vp_right, 0.18),
+                        br,
+                        bl,
+                    ],
+                    PerspectivePlane::Front => {
+                        if self.mode == PerspectiveGridMode::ThreePoint {
+                            [
+                                tl,
+                                tr,
+                                lerp_toward(br, vp_vert, 0.18),
+                                lerp_toward(bl, vp_vert, 0.18),
+                            ]
+                        } else {
+                            let c = src_rect.center();
+                            let inset = src_rect.width() * 0.12;
+                            [
+                                Point2D::new(tl.x + inset, tl.y),
+                                Point2D::new(tr.x - inset, tr.y),
+                                Point2D::new(br.x, br.y.max(c.y)),
+                                Point2D::new(bl.x, bl.y.max(c.y)),
+                            ]
+                        }
+                    }
                 }
             }
         };
@@ -923,6 +1005,7 @@ struct SymBoundsCtx<'a, 'b> {
     sym_objects: &'a [SceneObject],
     sym_map: &'a HashMap<ObjectId, &'a SceneObject>,
     sym_parent_map: &'a HashMap<ObjectId, SymParentRef>,
+    sym_space_inv: Option<Affine2D>,
     visiting_sym_depth: &'b mut HashMap<ObjectId, usize>,
     sym_bounds_cache: &'b mut HashMap<(ObjectId, [u64; 6]), Option<Rect2D>>,
 }
@@ -4195,6 +4278,58 @@ impl Document {
                     }
                     NodePayload::Table(t) => t.to_grid_paths(),
                     NodePayload::PowerClip { container, .. } => *container,
+                    NodePayload::ArtisticText(ref t) => {
+                        if !obj.fill.is_visible() && propagated_fill.is_none() {
+                            if let Some(run) = t
+                                .runs
+                                .iter()
+                                .find(|r| !r.text.is_empty())
+                                .or_else(|| t.runs.first())
+                            {
+                                propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                            }
+                        }
+                        let mut synthetic = obj.clone();
+                        synthetic.payload = eff_payload.clone();
+                        text_outliner(&synthetic, self)
+                            .filter(|p| !p.is_empty() && p.is_finite())
+                            .unwrap_or_else(|| BezierPath::from_rect(t.estimated_bounds()))
+                    }
+                    NodePayload::ParagraphText(ref t) => {
+                        if !obj.fill.is_visible() && propagated_fill.is_none() {
+                            if let Some(run) = t
+                                .runs
+                                .iter()
+                                .find(|r| !r.text.is_empty())
+                                .or_else(|| t.runs.first())
+                            {
+                                propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                            }
+                        }
+                        let mut synthetic = obj.clone();
+                        synthetic.payload = eff_payload.clone();
+                        text_outliner(&synthetic, self)
+                            .filter(|p| !p.is_empty() && p.is_finite())
+                            .unwrap_or_else(|| BezierPath::from_rect(t.bounding_box()))
+                    }
+                    NodePayload::TextOnPath(ref top) => {
+                        if !obj.fill.is_visible() && propagated_fill.is_none() {
+                            if let Some(run) = top
+                                .text
+                                .runs
+                                .iter()
+                                .find(|r| !r.text.is_empty())
+                                .or_else(|| top.text.runs.first())
+                            {
+                                propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                            }
+                        }
+                        let mut synthetic = obj.clone();
+                        synthetic.payload = eff_payload.clone();
+                        text_outliner(&synthetic, self)
+                            .filter(|p| !p.is_empty() && p.is_finite())
+                            .unwrap_or_else(|| BezierPath::from_rect(top.text.estimated_bounds()))
+                    }
                     _ => {
                         return Err(CoreError::InvalidGeometry(format!(
                             "clone object {id} master payload cannot be converted to curves"
@@ -5151,11 +5286,16 @@ impl Document {
         }
         let base_bb = match &obj.payload {
             NodePayload::Group(children) => {
+                let eval_xf = if obj.perspective.is_some() {
+                    &Affine2D::IDENTITY
+                } else {
+                    &obj_world_xf
+                };
                 let mut acc: Option<Rect2D> = None;
                 for &cid in children {
                     if let Some(cb) = self.visual_world_bounds_inner(
                         cid,
-                        &obj_world_xf,
+                        eval_xf,
                         depth + 1,
                         visiting,
                         visiting_syms,
@@ -5167,24 +5307,60 @@ impl Document {
                         });
                     }
                 }
-                acc
+                if let Some(persp) = obj.perspective {
+                    acc.and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| obj_world_xf.try_transform_rect(wb))
+                } else {
+                    acc
+                }
             }
-            NodePayload::SymbolInstance(sym_id) => self.symbol_visual_bounds_inner(
-                *sym_id,
-                &obj_world_xf,
-                depth + 1,
-                visiting,
-                visiting_syms,
-                bounds_ctx,
-            ),
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(persp) = obj.perspective {
+                    self.symbol_visual_bounds_inner(
+                        *sym_id,
+                        &Affine2D::IDENTITY,
+                        depth + 1,
+                        visiting,
+                        visiting_syms,
+                        bounds_ctx,
+                    )
+                    .and_then(|lb| persp.try_transform_rect(lb))
+                    .and_then(|wb| obj_world_xf.try_transform_rect(wb))
+                } else {
+                    self.symbol_visual_bounds_inner(
+                        *sym_id,
+                        &obj_world_xf,
+                        depth + 1,
+                        visiting,
+                        visiting_syms,
+                        bounds_ctx,
+                    )
+                }
+            }
             NodePayload::TextOnPath(top) => {
                 let doc_parent_world = self.cached_parent_world_xf(id, bounds_ctx);
                 if *parent_world_xf != doc_parent_world {
-                    let delta_xf = parent_world_xf
-                        .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY));
-                    self.world_path_of(top.path_id)
-                        .and_then(|wp| wp.transformed(&delta_xf).bounding_box())
-                        .or_else(|| obj_world_xf.try_transform_rect(top.text.estimated_bounds()))
+                    if let Some(persp) = obj.perspective {
+                        if let Some(wp) = self.world_path_of(top.path_id) {
+                            doc_parent_world
+                                .inverse()
+                                .and_then(|inv| wp.transformed(&inv).bounding_box())
+                                .and_then(|lb| persp.try_transform_rect(lb))
+                                .and_then(|wb| parent_world_xf.try_transform_rect(wb))
+                        } else {
+                            persp
+                                .try_transform_rect(top.text.estimated_bounds())
+                                .and_then(|wb| obj_world_xf.try_transform_rect(wb))
+                        }
+                    } else {
+                        let delta_xf = parent_world_xf
+                            .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY));
+                        self.world_path_of(top.path_id)
+                            .and_then(|wp| wp.transformed(&delta_xf).bounding_box())
+                            .or_else(|| {
+                                obj_world_xf.try_transform_rect(top.text.estimated_bounds())
+                            })
+                    }
                 } else {
                     self.object_bounds_inner_with_space(
                         id,
@@ -5335,6 +5511,7 @@ impl Document {
                 sym_objects: &sym.objects,
                 sym_map: &sym_map,
                 sym_parent_map: &sym_parent_map,
+                sym_space_inv: None,
                 visiting_sym_depth: &mut visiting_sym_depth,
                 sym_bounds_cache: &mut sym_bounds_cache,
             };
@@ -5393,12 +5570,21 @@ impl Document {
         }
         let base_bb = match &sub.payload {
             NodePayload::Group(children) => {
+                let (eval_xf, prev_inv) = if sub.perspective.is_some() {
+                    let prev_inv = ctx.sym_space_inv;
+                    if let Some(si) = sub_xf.inverse() {
+                        ctx.sym_space_inv = Some(prev_inv.map_or(si, |pi| si.compose(&pi)));
+                    }
+                    (&Affine2D::IDENTITY, Some(prev_inv))
+                } else {
+                    (&sub_xf, None)
+                };
                 let mut acc: Option<Rect2D> = None;
                 for &cid in children {
                     if let Some(child) = ctx.sym_map.get(&cid).copied() {
                         if let Some(r) = self.sym_visual_object_bounds(
                             child,
-                            &sub_xf,
+                            eval_xf,
                             depth + 1,
                             ctx,
                             visiting_sym_visual,
@@ -5413,16 +5599,39 @@ impl Document {
                         }
                     }
                 }
-                acc
+                if let Some(prev) = prev_inv {
+                    ctx.sym_space_inv = prev;
+                }
+                if let Some(persp) = sub.perspective {
+                    acc.and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| sub_xf.try_transform_rect(wb))
+                } else {
+                    acc
+                }
             }
-            NodePayload::SymbolInstance(sym_id) => self.symbol_visual_bounds_inner(
-                *sym_id,
-                &sub_xf,
-                depth + 1,
-                visiting_doc,
-                visiting_syms,
-                bounds_ctx,
-            ),
+            NodePayload::SymbolInstance(sym_id) => {
+                if let Some(persp) = sub.perspective {
+                    self.symbol_visual_bounds_inner(
+                        *sym_id,
+                        &Affine2D::IDENTITY,
+                        depth + 1,
+                        visiting_doc,
+                        visiting_syms,
+                        bounds_ctx,
+                    )
+                    .and_then(|lb| persp.try_transform_rect(lb))
+                    .and_then(|wb| sub_xf.try_transform_rect(wb))
+                } else {
+                    self.symbol_visual_bounds_inner(
+                        *sym_id,
+                        &sub_xf,
+                        depth + 1,
+                        visiting_doc,
+                        visiting_syms,
+                        bounds_ctx,
+                    )
+                }
+            }
             _ if sub.id.0 != 0 => {
                 self.sym_object_bounds_with_xf(
                     sub.id,
@@ -5436,13 +5645,13 @@ impl Document {
                 .0
             }
             _ => {
-                self.payload_bounds_with_ctx(
-                    &sub.payload,
+                self.sym_obj_bounds_with_xf(
+                    sub,
                     &sub_xf,
                     depth,
+                    ctx,
                     bounds_ctx,
                     visiting_syms,
-                    Some(ctx),
                     None,
                 )
                 .0
@@ -5866,19 +6075,52 @@ impl Document {
         let my_depth = ctx.visiting_depth.len();
         ctx.visiting_depth.insert(id, my_depth);
         let (raw_bounds, min_backedge) = if let Some(persp) = obj.perspective {
-            let (local_b, back) = self.payload_bounds_with_ctx(
-                &obj.payload,
-                &Affine2D::IDENTITY,
-                depth,
-                ctx,
-                visiting_syms,
-                None,
-                None,
-            );
-            let warped = local_b
-                .and_then(|lb| persp.try_transform_rect(lb))
-                .and_then(|wb| world_xf.try_transform_rect(wb));
-            (warped, back)
+            let full_parent_world = match pc_space {
+                Some((pc_w, _)) => pc_w.compose(parent_xf),
+                None => *parent_xf,
+            };
+            let full_obj_world = full_parent_world.compose(&obj.transform);
+            let inv_obj_world = full_obj_world.inverse();
+            let local_space = inv_obj_world.as_ref().map(|inv| (&full_obj_world, inv));
+            if let NodePayload::TextOnPath(top) = &obj.payload {
+                if let Some(wp) = self.world_path_of(top.path_id) {
+                    let local_b = full_parent_world
+                        .inverse()
+                        .and_then(|inv| wp.transformed(&inv).bounding_box());
+                    let warped = local_b
+                        .and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| parent_xf.try_transform_rect(wb));
+                    (warped, usize::MAX)
+                } else {
+                    let (local_b, back) = self.payload_bounds_with_ctx(
+                        &obj.payload,
+                        &Affine2D::IDENTITY,
+                        depth,
+                        ctx,
+                        visiting_syms,
+                        None,
+                        local_space,
+                    );
+                    let warped = local_b
+                        .and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| world_xf.try_transform_rect(wb));
+                    (warped, back)
+                }
+            } else {
+                let (local_b, back) = self.payload_bounds_with_ctx(
+                    &obj.payload,
+                    &Affine2D::IDENTITY,
+                    depth,
+                    ctx,
+                    visiting_syms,
+                    None,
+                    local_space,
+                );
+                let warped = local_b
+                    .and_then(|lb| persp.try_transform_rect(lb))
+                    .and_then(|wb| world_xf.try_transform_rect(wb));
+                (warped, back)
+            }
         } else {
             self.payload_bounds_with_ctx(
                 &obj.payload,
@@ -5964,6 +6206,7 @@ impl Document {
                 sym_objects: &sym.objects,
                 sym_map: &sym_map,
                 sym_parent_map: &sym_parent_map,
+                sym_space_inv: None,
                 visiting_sym_depth: &mut visiting_sym_depth,
                 sym_bounds_cache: &mut sym_bounds_cache,
             };
@@ -5987,13 +6230,13 @@ impl Document {
                         pc_space,
                     )
                 } else {
-                    self.payload_bounds_with_ctx(
-                        &sub.payload,
+                    self.sym_obj_bounds_with_xf(
+                        sub,
                         &sub_xf,
                         depth + 1,
+                        &mut ctx,
                         bounds_ctx,
                         visiting_syms,
-                        Some(&mut ctx),
                         pc_space,
                     )
                 };
@@ -6011,6 +6254,107 @@ impl Document {
         });
         visiting_syms.remove(&sym_id);
         (res, overall_backedge)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sym_obj_bounds_with_xf(
+        &self,
+        sub: &SceneObject,
+        sub_xf: &Affine2D,
+        depth: usize,
+        ctx: &mut SymBoundsCtx<'_, '_>,
+        bounds_ctx: &mut DocBoundsCtx,
+        visiting_syms: &mut HashSet<SymbolId>,
+        pc_space: Option<(&Affine2D, &Affine2D)>,
+    ) -> (Option<Rect2D>, usize) {
+        if let Some(persp) = sub.perspective {
+            let sub_parent_xf = sub
+                .transform
+                .inverse()
+                .map_or(*sub_xf, |inv| sub_xf.compose(&inv));
+            let full_parent_world = match pc_space {
+                Some((pc_w, _)) => pc_w.compose(&sub_parent_xf),
+                None => sub_parent_xf,
+            };
+            let full_sub_world = match pc_space {
+                Some((pc_w, _)) => pc_w.compose(sub_xf),
+                None => *sub_xf,
+            };
+            let inv_sub_world = full_sub_world.inverse();
+            let local_space = inv_sub_world.as_ref().map(|inv| (&full_sub_world, inv));
+            if let NodePayload::TextOnPath(top) = &sub.payload {
+                if ctx.sym_map.contains_key(&top.path_id) {
+                    if let Some(p_xf) = Self::sym_world_transform_of(
+                        top.path_id,
+                        ctx.root_xf,
+                        ctx.sym_objects,
+                        ctx.sym_map,
+                        ctx.sym_parent_map,
+                    ) {
+                        let adj_p_xf = ctx.sym_space_inv.map_or(p_xf, |inv| inv.compose(&p_xf));
+                        let local_p_xf = sub_parent_xf
+                            .inverse()
+                            .map_or(adj_p_xf, |inv| inv.compose(&adj_p_xf));
+                        let (path_b, back) = self.sym_object_bounds_with_xf(
+                            top.path_id,
+                            &local_p_xf,
+                            depth + 1,
+                            ctx,
+                            bounds_ctx,
+                            visiting_syms,
+                            local_space,
+                        );
+                        let warped = path_b
+                            .and_then(|lb| persp.try_transform_rect(lb))
+                            .and_then(|wb| sub_parent_xf.try_transform_rect(wb))
+                            .or_else(|| {
+                                persp
+                                    .try_transform_rect(top.text.estimated_bounds())
+                                    .and_then(|wb| sub_xf.try_transform_rect(wb))
+                            });
+                        return (warped, back);
+                    }
+                } else if let Some(wp) = self.world_path_of(top.path_id) {
+                    let local_b = full_parent_world
+                        .inverse()
+                        .and_then(|inv| wp.transformed(&inv).bounding_box());
+                    let warped = local_b
+                        .and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(|wb| sub_parent_xf.try_transform_rect(wb));
+                    return (warped, usize::MAX);
+                }
+            }
+            let prev_inv = ctx.sym_space_inv;
+            if matches!(sub.payload, NodePayload::Group(_)) {
+                if let Some(si) = sub_xf.inverse() {
+                    ctx.sym_space_inv = Some(prev_inv.map_or(si, |pi| si.compose(&pi)));
+                }
+            }
+            let (local_b, back) = self.payload_bounds_with_ctx(
+                &sub.payload,
+                &Affine2D::IDENTITY,
+                depth,
+                bounds_ctx,
+                visiting_syms,
+                Some(ctx),
+                local_space,
+            );
+            ctx.sym_space_inv = prev_inv;
+            let warped = local_b
+                .and_then(|lb| persp.try_transform_rect(lb))
+                .and_then(|wb| sub_xf.try_transform_rect(wb));
+            (warped, back)
+        } else {
+            self.payload_bounds_with_ctx(
+                &sub.payload,
+                sub_xf,
+                depth,
+                bounds_ctx,
+                visiting_syms,
+                Some(ctx),
+                pc_space,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6033,7 +6377,8 @@ impl Document {
         if let Some(&active_depth) = ctx.visiting_sym_depth.get(&id) {
             return (None, active_depth);
         }
-        let cache_key = pc_space.is_none().then(|| (id, affine_cache_key(sub_xf)));
+        let cache_key = (pc_space.is_none() && ctx.sym_space_inv.is_none())
+            .then(|| (id, affine_cache_key(sub_xf)));
         if let Some(key) = cache_key {
             if let Some(&cached) = ctx.sym_bounds_cache.get(&key) {
                 return (cached, usize::MAX);
@@ -6045,13 +6390,13 @@ impl Document {
         };
         let my_depth = ctx.visiting_sym_depth.len();
         ctx.visiting_sym_depth.insert(id, my_depth);
-        let (raw_bounds, min_backedge) = self.payload_bounds_with_ctx(
-            &sub.payload,
+        let (raw_bounds, min_backedge) = self.sym_obj_bounds_with_xf(
+            sub,
             sub_xf,
             depth,
+            ctx,
             bounds_ctx,
             visiting_syms,
-            Some(ctx),
             pc_space,
         );
         ctx.visiting_sym_depth.remove(&id);
@@ -6187,7 +6532,7 @@ impl Document {
             NodePayload::ParagraphText(t) => world_xf.try_transform_rect(t.bounding_box()),
             NodePayload::TextOnPath(top) => {
                 if let Some(ctx) = sym_ctx {
-                    if let Some(path_obj) = ctx.sym_map.get(&top.path_id).copied() {
+                    if ctx.sym_map.contains_key(&top.path_id) {
                         Self::sym_world_transform_of(
                             top.path_id,
                             ctx.root_xf,
@@ -6195,24 +6540,19 @@ impl Document {
                             ctx.sym_map,
                             ctx.sym_parent_map,
                         )
-                        .and_then(|p_xf| match &path_obj.payload {
-                            NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
-                            NodePayload::Shape(s) => {
-                                s.to_bezier_path().transformed(&p_xf).bounding_box()
-                            }
-                            _ => {
-                                let (bb, backedge) = self.sym_object_bounds_with_xf(
-                                    top.path_id,
-                                    &p_xf,
-                                    depth + 1,
-                                    ctx,
-                                    bounds_ctx,
-                                    visiting_syms,
-                                    pc_space,
-                                );
-                                min_backedge = min_backedge.min(backedge);
-                                bb
-                            }
+                        .and_then(|p_xf| {
+                            let adj_p_xf = ctx.sym_space_inv.map_or(p_xf, |inv| inv.compose(&p_xf));
+                            let (bb, backedge) = self.sym_object_bounds_with_xf(
+                                top.path_id,
+                                &adj_p_xf,
+                                depth + 1,
+                                ctx,
+                                bounds_ctx,
+                                visiting_syms,
+                                pc_space,
+                            );
+                            min_backedge = min_backedge.min(backedge);
+                            bb
                         })
                         .or_else(|| world_xf.try_transform_rect(top.text.estimated_bounds()))
                     } else if let Some((_, inv_pc)) = pc_space {
@@ -6301,9 +6641,12 @@ impl Document {
                                             ctx.sym_map,
                                             ctx.sym_parent_map,
                                         ) {
+                                            let adj_p_xf = ctx
+                                                .sym_space_inv
+                                                .map_or(p_xf, |inv| inv.compose(&p_xf));
                                             let (bb, backedge) = self.sym_object_bounds_with_xf(
                                                 oid,
-                                                &p_xf,
+                                                &adj_p_xf,
                                                 depth + 1,
                                                 ctx,
                                                 bounds_ctx,
@@ -6341,9 +6684,12 @@ impl Document {
                                                 ctx.sym_map,
                                                 ctx.sym_parent_map,
                                             )?;
+                                            let adj_p_xf = ctx
+                                                .sym_space_inv
+                                                .map_or(p_xf, |inv| inv.compose(&p_xf));
                                             let (bb, backedge) = self.sym_object_bounds_with_xf(
                                                 oid,
-                                                &p_xf,
+                                                &adj_p_xf,
                                                 depth + 1,
                                                 ctx,
                                                 bounds_ctx,
@@ -6649,6 +6995,7 @@ impl Document {
                         sym_objects,
                         sym_map,
                         sym_parent_map,
+                        sym_space_inv: None,
                         visiting_sym_depth: &mut visiting_sym_depth,
                         sym_bounds_cache: &mut sym_bounds_cache,
                     };
