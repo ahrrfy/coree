@@ -338,6 +338,13 @@ pub enum Commands {
         /// Output document path after running the macro.
         output_path: PathBuf,
     },
+    /// Convert all live shapes, text, B-Splines, artistic media, and clones in a document to vector curves.
+    ConvertToCurves {
+        /// Input document path (`.coree`, `.cdr`, `.svg`, etc.).
+        input_path: PathBuf,
+        /// Output document path (format inferred from extension).
+        output_path: PathBuf,
+    },
 }
 
 /// Outcome returned by [`execute_cli`].
@@ -755,6 +762,36 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             }
             Ok(CliOutcome::Printed(out))
         }
+        Commands::ConvertToCurves {
+            input_path,
+            output_path,
+        } => {
+            let mut doc = open_any_document(input_path)?.document;
+            let mut ids: Vec<ObjectId> = doc.objects().keys().copied().collect();
+            ids.sort_by_key(|id| {
+                let is_top = doc
+                    .object(*id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::TextOnPath(_)));
+                (!is_top, id.0)
+            });
+            let mut text_engine = coree_render::TextEngine::new();
+            let mut converted = 0usize;
+            for id in ids {
+                let mut outliner = |obj: &SceneObject, d: &Document| {
+                    crate::state::outline_text_object_with_engine(&mut text_engine, obj, d)
+                };
+                if doc
+                    .convert_to_curves_with_outliner(id, &mut outliner)
+                    .is_ok()
+                {
+                    converted += 1;
+                }
+            }
+            let msg = export_any_document(&doc, output_path, &UniversalExportOptions::default())?;
+            Ok(CliOutcome::Printed(format!(
+                "Converted {converted} object(s) to curves. {msg}"
+            )))
+        }
     }
 }
 
@@ -1141,5 +1178,66 @@ mod tests {
                 ..
             }) if (kerf + 0.15).abs() < 1e-9 && (hatch_angle + 45.0).abs() < 1e-9
         ));
+    }
+
+    #[test]
+    fn cli_convert_to_curves_outlines_text_bspline_artistic_and_empty_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_in = dir.path().join("empty.coree");
+        let empty_out = dir.path().join("empty_curves.coree");
+        let empty_doc = Document::new_a4("Empty");
+        coree_io::save_coree_with_preview(&empty_doc, None, &empty_in).unwrap();
+        let parsed_empty = Cli::try_parse_from([
+            "coree",
+            "convert-to-curves",
+            empty_in.to_str().unwrap(),
+            empty_out.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(execute_cli(&parsed_empty).is_ok());
+
+        let rich_in = dir.path().join("rich.coree");
+        let rich_out = dir.path().join("rich_curves.coree");
+        let mut doc = Document::new_a4("Rich");
+        let txt = coree_core::ArtisticText::from_plain("Hi", Default::default());
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Txt", NodePayload::ArtisticText(txt))
+                .with_fill(Fill::None),
+            None,
+        )
+        .unwrap();
+        let bs = coree_core::BSplineCurve::from_control_points(
+            vec![
+                coree_core::Point2D::new(10.0, 10.0),
+                coree_core::Point2D::new(30.0, 40.0),
+                coree_core::Point2D::new(60.0, 10.0),
+            ],
+            2,
+            false,
+        );
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "BS", NodePayload::BSpline(bs)),
+            None,
+        )
+        .unwrap();
+        coree_io::save_coree_with_preview(&doc, None, &rich_in).unwrap();
+
+        let parsed_rich = Cli::try_parse_from([
+            "coree",
+            "convert-to-curves",
+            rich_in.to_str().unwrap(),
+            rich_out.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(execute_cli(&parsed_rich).is_ok());
+        let loaded = open_any_document(&rich_out).unwrap().document;
+        assert!(loaded
+            .objects()
+            .values()
+            .all(|o| matches!(o.payload, NodePayload::Path(_))));
+        assert!(loaded
+            .objects()
+            .values()
+            .any(|o| o.name == "Txt" && o.fill.is_visible()));
     }
 }

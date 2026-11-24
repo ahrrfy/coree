@@ -50,7 +50,7 @@ pub use renderer::{
     arrowhead_geometry, compute_page_layouts, outline_arrowhead_geometries, PageLayout,
     RenderOptions, SceneRenderer,
 };
-pub use smart_fill::{compute_smart_fill, create_smart_fill_object};
+pub use smart_fill::{compute_smart_fill, create_smart_fill_object, dcel_smart_fill, PlanarDcel};
 pub use text_layout::{
     apply_kashida_elongation, contains_arabic, list_glyphs_for_block, paragraph_to_curves,
     text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, ShapedGlyphDraw,

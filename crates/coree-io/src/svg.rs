@@ -1188,6 +1188,9 @@ fn svg_requires_raster_composite(obj: &SceneObject) -> bool {
                 | Effect::Extrude25D { .. }
                 | Effect::Blend { .. }
                 | Effect::Transparency { .. }
+                | Effect::InnerShadow { .. }
+                | Effect::Bevel { .. }
+                | Effect::Extrude3D { .. }
         )
     }) {
         return true;
@@ -1315,7 +1318,12 @@ fn write_svg_object(
 
         match &obj.payload {
             NodePayload::Path(path) => {
-                let deformed = apply_geometry_effects(path, &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(path)
+                } else {
+                    path.clone()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 let paint_attrs = format_svg_paint_attrs_with_doc(
                     doc,
                     &obj.fill,
@@ -1340,7 +1348,12 @@ fn write_svg_object(
                 );
             }
             NodePayload::Shape(shape) => {
-                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&shape.to_bezier_path())
+                } else {
+                    shape.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 let paint_attrs = format_svg_paint_attrs_with_doc(
                     doc,
                     &obj.fill,
@@ -1363,6 +1376,95 @@ fn write_svg_object(
                     body,
                     &pad,
                 );
+            }
+            NodePayload::BSpline(bs) => {
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&bs.to_bezier_path())
+                } else {
+                    bs.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let paint_attrs = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &obj.fill,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let d = bezier_to_svg_d(&deformed);
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                );
+                write_svg_arrowheads(
+                    &deformed,
+                    &obj.outline,
+                    &xf_attr,
+                    &op_attr,
+                    &blend_attr,
+                    vis_attr,
+                    body,
+                    &pad,
+                );
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let raw = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&raw)
+                } else {
+                    raw
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let paint_attrs = format_svg_paint_attrs_with_doc(
+                    doc,
+                    &obj.fill,
+                    &obj.outline,
+                    defs,
+                    def_counter,
+                );
+                let d = bezier_to_svg_d(&deformed);
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                );
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                    let bp_opt = match &p {
+                        NodePayload::Path(path) => Some(path.clone()),
+                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                        }
+                        _ => None,
+                    };
+                    if let Some(raw) = bp_opt {
+                        let bp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&raw)
+                        } else {
+                            raw
+                        };
+                        let deformed = apply_geometry_effects(&bp, &obj.effects);
+                        let paint_attrs =
+                            format_svg_paint_attrs_with_doc(doc, &f, &o, defs, def_counter);
+                        let d = bezier_to_svg_d(&deformed);
+                        let _ = writeln!(
+                            body,
+                            "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                        );
+                        write_svg_arrowheads(
+                            &deformed,
+                            &o,
+                            &xf_attr,
+                            &op_attr,
+                            &blend_attr,
+                            vis_attr,
+                            body,
+                            &pad,
+                        );
+                    }
+                }
             }
             NodePayload::ArtisticText(text) => {
                 write_svg_artistic_text(
@@ -1597,7 +1699,12 @@ fn write_svg_object(
             } => {
                 *def_counter += 1;
                 let clip_id = format!("clip-{}", *def_counter);
-                let deformed_container = apply_geometry_effects(container, &obj.effects);
+                let container_bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(container)
+                } else {
+                    (**container).clone()
+                };
+                let deformed_container = apply_geometry_effects(&container_bp, &obj.effects);
                 let container_d = bezier_to_svg_d(&deformed_container);
                 let _ = writeln!(
                     defs,

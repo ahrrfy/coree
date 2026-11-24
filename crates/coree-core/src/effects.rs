@@ -47,6 +47,21 @@ pub enum EnvelopeMode {
     Unconstrained,
 }
 
+/// Bevel edge profile style for [`Effect::Bevel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum BevelStyle {
+    #[default]
+    SoftEdge,
+    Emboss,
+}
+
+/// Directional light source for [`Effect::Extrude3D`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExtrudeLight {
+    pub dir: [f32; 3],
+    pub intensity: f32,
+}
+
 /// Transparency alpha distribution across an object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransparencyMode {
@@ -126,6 +141,32 @@ pub enum Effect {
         mirror: bool,
         origin: Point2D,
     },
+    InnerShadow {
+        dx_mm: f64,
+        dy_mm: f64,
+        blur_mm: f64,
+        opacity: f32,
+        color: Color,
+        feather_direction: FeatherDirection,
+    },
+    Bevel {
+        style: BevelStyle,
+        distance_mm: f64,
+        softness_mm: f64,
+        light_angle_deg: f64,
+        altitude_deg: f64,
+        highlight_color: Color,
+        shadow_color: Color,
+        intensity: f32,
+    },
+    Extrude3D {
+        vanishing_point: Point2D,
+        depth: f64,
+        bevel_depth: f64,
+        shade_color: Color,
+        rotation_3d: [f64; 3],
+        lights: Vec<ExtrudeLight>,
+    },
 }
 
 impl Effect {
@@ -192,7 +233,7 @@ impl Effect {
                 } => {
                     pad = pad.max(f64::from(*steps) * offset_mm.abs() + 2.0);
                 }
-                Effect::Extrude25D { depth, .. } => {
+                Effect::Extrude25D { depth, .. } | Effect::Extrude3D { depth, .. } => {
                     pad = pad.max(depth.abs() * 2.0 + 10.0);
                 }
                 Effect::Distort { amplitude, .. } => {

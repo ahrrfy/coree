@@ -31,7 +31,8 @@ pub const CRATE_NAME: &str = "coree-core";
 
 // Ergonomic top-level re-exports for downstream crates
 pub use boolean::{
-    apply_boolean, apply_boolean_many, offset_polygon, stroke_to_closed_path, BooleanOp,
+    apply_boolean, apply_boolean_many, arrowhead_geometry, offset_polygon, stroke_to_closed_path,
+    BooleanOp,
 };
 pub use brand::{
     BrandInfo, APP_NAME, DISPLAY_NAME, LICENSE, NATIVE_EXT, REPO_URL, TRADEMARK_NOTICE,
@@ -48,12 +49,12 @@ pub use dimension::{AnchorPoint, ConnectorObject, ConnectorStyle, DimensionKind,
 pub use document::{
     decode_base64, encode_base64, AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig,
     Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload, Page, PathMetrics,
-    PerspectiveGridConfig, PerspectiveGridMode, PowerClipFitMode, RasterAsset, RasterLayerData,
-    SceneObject, SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
+    PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, PowerClipFitMode, RasterAsset,
+    RasterLayerData, SceneObject, SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
 };
 pub use effects::{
-    ContourMode, DistortKind, Effect, EnvelopeMode, FeatherDirection, RasterFilter,
-    TransparencyMode,
+    BevelStyle, ContourMode, DistortKind, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
+    RasterFilter, TransparencyMode,
 };
 pub use error::{CoreError, CoreResult};
 pub use find_replace::{
@@ -62,14 +63,15 @@ pub use find_replace::{
     LensKindFilter, ObjectKindFilter, ReplaceAction, TextMatchMode,
 };
 pub use geometry::{
-    erase_circle, fit_cubic_bezier_subpath, knife_cut, virtual_segment_delete, ArtisticMedia,
-    ArtisticMediaStyle, ArtisticWidthProfile, BasicShapeKind, BezierPath, CornerStyle, EllipseMode,
+    closed_subpaths_contain_even_odd, erase_circle, fit_cubic_bezier_subpath, knife_cut,
+    segment_min_dist_to_point, virtual_segment_delete, ArtisticMedia, ArtisticMediaStyle,
+    ArtisticWidthProfile, BSplineCurve, BasicShapeKind, BezierPath, CornerStyle, EllipseMode,
     ImpactStyle, LiveSketch, NodeKind, ParametricShape, PathNode, RecognizedShape, SmartDrawing,
     Subpath,
 };
 pub use hit_test::{
-    hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
-    DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
+    hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_powerclip_contents_rect,
+    hit_test_rect, DynamicGuideKind, DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use icc::{
     apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile, convert_cmyk_to_rgb_icc,
@@ -81,7 +83,7 @@ pub use icc::{
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
-pub use math::{Affine2D, AffineDecomposed, Point2D, Rect2D, Unit, Vec2D};
+pub use math::{Affine2D, AffineDecomposed, Perspective3x3, Point2D, Rect2D, Unit, Vec2D};
 pub use selection::{NodeRef, NodeSelection, SelectionState, TransformMode};
 pub use style::{
     ArrowheadStyle, BlendMode, Fill, GradientStop, LineCap, LineJoin, MeshNode, ObjectStyle,

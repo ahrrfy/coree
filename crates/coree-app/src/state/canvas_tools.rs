@@ -505,65 +505,13 @@ impl StudioApp {
     #[must_use]
     pub fn hit_test_canvas_point(&self, world_pt: Point2D, tol_mm: f64) -> Option<ObjectId> {
         let tab = self.active_tab()?;
-        if let Some(pc_id) = tab.powerclip_edit_id {
-            if let Some(cid) = hit_test_powerclip_contents(&tab.document, pc_id, world_pt, tol_mm) {
-                return Some(cid);
-            }
-            if self.treat_all_objects_as_filled {
-                if let Some(NodePayload::PowerClip { contents, .. }) =
-                    tab.document.object(pc_id).map(|o| &o.payload)
-                {
-                    for &cid in contents.iter().rev() {
-                        let Some(obj) = tab.document.object(cid) else {
-                            continue;
-                        };
-                        if !obj.visible || obj.locked {
-                            continue;
-                        }
-                        if let Some(wp) = tab.document.world_path_of(cid) {
-                            if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt)
-                            {
-                                return Some(cid);
-                            }
-                        } else if let Some(bb) = tab.document.world_object_bounds(cid) {
-                            if bb.contains_point(world_pt) {
-                                return Some(cid);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let page_idx = tab.document.active_page_index();
-        if let Some(hit) = hit_test_point(&tab.document, page_idx, world_pt, tol_mm) {
-            return Some(hit);
-        }
-        if self.treat_all_objects_as_filled {
-            let page = tab.document.page(page_idx)?;
-            for layer in page.layers.iter().rev() {
-                if !layer.visible || layer.locked {
-                    continue;
-                }
-                for &oid in layer.objects.iter().rev() {
-                    let Some(obj) = tab.document.object(oid) else {
-                        continue;
-                    };
-                    if !obj.visible || obj.locked {
-                        continue;
-                    }
-                    if let Some(wp) = tab.document.world_path_of(oid) {
-                        if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
-                            return Some(oid);
-                        }
-                    } else if let Some(bb) = tab.document.object_bounds(oid) {
-                        if bb.contains_point(world_pt) {
-                            return Some(oid);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        coree_tools::hit_test_canvas_point_in_doc(
+            &tab.document,
+            tab.powerclip_edit_id,
+            self.treat_all_objects_as_filled,
+            world_pt,
+            tol_mm,
+        )
     }
 
     /// Selects all visible unlocked objects on the active page intersecting the freehand `polygon` lasso.
@@ -574,33 +522,8 @@ impl StudioApp {
         let Some(tab) = self.active_tab_mut() else {
             return Vec::new();
         };
-        let Some(poly_bb) = Rect2D::from_iter_points(polygon.iter().copied()) else {
-            return Vec::new();
-        };
-        let candidates = coree_render::hit_test_rect(
-            &tab.document,
-            tab.document.active_page_index(),
-            poly_bb,
-            false,
-        );
-        let mut hits = Vec::new();
-        for oid in candidates {
-            let Some(bb) = tab.document.object_bounds(oid) else {
-                continue;
-            };
-            let test_pts = [
-                bb.center(),
-                bb.min(),
-                Point2D::new(bb.max_x, bb.min_y),
-                bb.max(),
-                Point2D::new(bb.min_x, bb.max_y),
-            ];
-            let inside = test_pts.iter().any(|&p| point_in_polygon(p, polygon))
-                || polygon.iter().any(|&p| bb.contains_point(p));
-            if inside {
-                hits.push(oid);
-            }
-        }
+        let hits =
+            coree_tools::compute_lasso_hits_scoped(&tab.document, tab.powerclip_edit_id, polygon);
         if additive {
             let mut combined = tab.selection.objects.clone();
             for id in &hits {
@@ -1616,7 +1539,7 @@ impl StudioApp {
                     }
                     let intersects = tab
                         .document
-                        .object_bounds(oid)
+                        .world_object_bounds(oid)
                         .is_none_or(|bb| bb.intersects(crop));
                     if intersects {
                         inside_ids.push(oid);
@@ -2301,29 +2224,7 @@ impl StudioApp {
         pt: Point2D,
         tol_mm: f64,
     ) -> Option<(ObjectId, AnchorPoint, Point2D)> {
-        let search_tol = tol_mm.max(6.0);
-        let oid = hit_test_point(doc, page_index, pt, search_tol)?;
-        let obj = doc.object(oid)?;
-        if matches!(obj.payload, NodePayload::Connector(_)) {
-            return None;
-        }
-        let bb = doc.object_bounds(oid)?;
-        let c = bb.center();
-        let candidates = [
-            (AnchorPoint::Top, Point2D::new(c.x, bb.min_y)),
-            (AnchorPoint::Bottom, Point2D::new(c.x, bb.max_y)),
-            (AnchorPoint::Left, Point2D::new(bb.min_x, c.y)),
-            (AnchorPoint::Right, Point2D::new(bb.max_x, c.y)),
-            (AnchorPoint::Center, c),
-        ];
-        candidates
-            .into_iter()
-            .min_by(|a, b| {
-                a.1.distance_to(pt)
-                    .partial_cmp(&b.1.distance_to(pt))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(anc, pos)| (oid, anc, pos))
+        coree_tools::find_nearest_object_anchor(doc, page_index, pt, tol_mm)
     }
 
     /// Creates a live-snapped Straight or Right-Angle connector from `start_mm` to `end_mm`.
@@ -2554,7 +2455,7 @@ impl StudioApp {
                                 .iter()
                                 .position(|e| matches!(e, Effect::Contour { .. }))
                         });
-                        (i, t.document.object_bounds(oid))
+                        (i, t.document.world_object_bounds(oid))
                     })
                     .unwrap_or((None, None));
                 let (mode, offset_mm) = if let Some(bb) = wb {
@@ -3410,13 +3311,42 @@ impl StudioApp {
                     Point2D::new(local_bb.min_x, local_bb.max_y),
                 ],
             },
-            _ => Effect::Symmetry {
+            9 => Effect::Symmetry {
                 axes: es.symmetry_axes.clamp(2, 24),
                 mirror: es.symmetry_mirror,
                 origin: self
                     .active_tab()
                     .and_then(|t| t.selection.bounding_box(&t.document))
                     .map_or(Point2D::new(105.0, 148.0), |b| b.center()),
+            },
+            10 => Effect::InnerShadow {
+                dx_mm: es.dx_mm,
+                dy_mm: es.dy_mm,
+                blur_mm: es.blur_mm.max(0.0),
+                opacity: es.opacity.clamp(0.0, 1.0),
+                color: es.color.clone(),
+                feather_direction: es.inner_shadow_feather,
+            },
+            11 => Effect::Bevel {
+                style: es.bevel_style,
+                distance_mm: es.bevel_distance_mm.max(0.2),
+                softness_mm: es.bevel_softness_mm.max(0.0),
+                light_angle_deg: es.bevel_light_angle_deg,
+                altitude_deg: es.bevel_altitude_deg,
+                highlight_color: es.bevel_highlight_color.clone(),
+                shadow_color: es.bevel_shadow_color.clone(),
+                intensity: es.bevel_intensity.clamp(0.0, 1.0),
+            },
+            _ => Effect::Extrude3D {
+                vanishing_point: Point2D::new(140.0, 40.0),
+                depth: es.extrude_depth.max(1.0),
+                bevel_depth: es.bevel_distance_mm.max(0.0),
+                shade_color: es.color.clone(),
+                rotation_3d: es.extrude3d_rotation,
+                lights: vec![coree_core::ExtrudeLight {
+                    dir: es.extrude3d_light_dir,
+                    intensity: es.extrude3d_light_intensity.clamp(0.0, 3.0),
+                }],
             },
         }
     }

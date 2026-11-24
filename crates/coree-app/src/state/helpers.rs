@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) use coree_tools::{
     bspline_to_bezier_path, build_world_transform_command, compute_free_transform_affine,
-    enclosing_layer_of_object, is_object_editable_in_doc, point_in_polygon, three_point_arc_path,
+    enclosing_layer_of_object, is_object_editable_in_doc, three_point_arc_path,
     unconjugate_local_affine_to_world, world_inverse_transform_of, world_transform_of_or_local,
 };
 

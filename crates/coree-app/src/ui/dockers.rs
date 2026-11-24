@@ -22,8 +22,7 @@ use coree_core::{
     Affine2D, AlignOp, ArrowheadStyle, BlendMode, BooleanOp, Color, ColorMapMode, CommandOp,
     ContourMode, DistortKind, DistributeOp, EnvelopeMode, Fill, GradientStop, LineCap, LineJoin,
     MasterLayerScope, NodePayload, ObjectId, ObjectStyle, OutlineStyle, Point2D,
-    PostScriptFillPreset, Rect2D, SceneObject, SymbolDef, TextAlign, TextDirection, Vec2D,
-    ZOrderOp,
+    PostScriptFillPreset, Rect2D, SymbolDef, TextAlign, TextDirection, Vec2D, ZOrderOp,
 };
 use coree_prod::{
     builtin_macros, default_laser_layer_rules, export_laser_dxf_r12, export_laser_gcode,
@@ -1278,7 +1277,7 @@ fn ui_lens_docker(ui: &mut Ui, app: &mut StudioApp) {
 // =============================================================================
 
 fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
-    const EFFECT_NAMES: [&str; 10] = [
+    const EFFECT_NAMES: [&str; 13] = [
         "Drop Shadow",
         "Block Shadow",
         "Contour",
@@ -1289,11 +1288,14 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
         "Transparency",
         "Perspective",
         "Symmetry",
+        "Inner Shadow",
+        "Bevel",
+        "Extrude 3D",
     ];
 
     ComboBox::from_id_salt("effects_kind_combo")
         .width(200.0)
-        .selected_text(EFFECT_NAMES[app.effects_state.selected_effect_kind])
+        .selected_text(EFFECT_NAMES[app.effects_state.selected_effect_kind.min(12)])
         .show_ui(ui, |ui| {
             for (i, n) in EFFECT_NAMES.iter().enumerate() {
                 ui.selectable_value(&mut app.effects_state.selected_effect_kind, i, *n);
@@ -1350,6 +1352,36 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
             ui.add(egui::Slider::new(&mut es.symmetry_axes, 2..=16).text("Axes"));
             ui.checkbox(&mut es.symmetry_mirror, "Mirror Reflection");
         }
+        10 => {
+            ui.add(egui::Slider::new(&mut es.dx_mm, -30.0..=30.0).text("Offset X (mm)"));
+            ui.add(egui::Slider::new(&mut es.dy_mm, -30.0..=30.0).text("Offset Y (mm)"));
+            ui.add(egui::Slider::new(&mut es.blur_mm, 0.0..=20.0).text("Blur (mm)"));
+            ui.add(egui::Slider::new(&mut es.opacity, 0.0..=1.0).text("Opacity"));
+        }
+        11 => {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut es.bevel_style,
+                    coree_core::BevelStyle::SoftEdge,
+                    "Soft Edge",
+                );
+                ui.selectable_value(
+                    &mut es.bevel_style,
+                    coree_core::BevelStyle::Emboss,
+                    "Emboss",
+                );
+            });
+            ui.add(egui::Slider::new(&mut es.bevel_distance_mm, 0.5..=20.0).text("Distance (mm)"));
+            ui.add(egui::Slider::new(&mut es.bevel_softness_mm, 0.0..=10.0).text("Softness (mm)"));
+            ui.add(egui::Slider::new(&mut es.bevel_light_angle_deg, 0.0..=360.0).text("Angle"));
+            ui.add(egui::Slider::new(&mut es.bevel_intensity, 0.0..=1.0).text("Intensity"));
+        }
+        12 => {
+            ui.add(egui::Slider::new(&mut es.extrude_depth, 2.0..=60.0).text("Depth (mm)"));
+            ui.add(egui::Slider::new(&mut es.extrude3d_rotation[0], -85.0..=85.0).text("Rot X"));
+            ui.add(egui::Slider::new(&mut es.extrude3d_rotation[1], -85.0..=85.0).text("Rot Y"));
+            ui.add(egui::Slider::new(&mut es.extrude3d_light_intensity, 0.0..=2.0).text("Light"));
+        }
         _ => {}
     }
 
@@ -1394,10 +1426,35 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
         if ui.button("Extract Contents").clicked() {
             app.extract_selected_powerclip();
         }
+        if ui.button("Fit Contents").clicked() {
+            app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
+        }
+        if ui.button("Center Contents").clicked() {
+            app.fit_powerclip_selection(coree_core::PowerClipFitMode::CenterContents);
+        }
+        if ui.button("Stretch to Fill").clicked() {
+            app.fit_powerclip_selection(coree_core::PowerClipFitMode::StretchToFill);
+        }
         if ui.button("Move to Desktop Layer").clicked() {
             app.move_selection_to_desktop_layer();
         }
     });
+    ui.separator();
+    ui.label(RichText::new("Drawing Modes (Symmetry & Perspective)").strong());
+    ui.checkbox(
+        &mut app.tool_settings.symmetry_enabled,
+        "Live Symmetry Drawing",
+    );
+    if app.tool_settings.symmetry_enabled {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut app.tool_settings.symmetry_folds, 2..=16).text("Folds"));
+            ui.checkbox(&mut app.tool_settings.symmetry_mirror, "Mirror");
+        });
+    }
+    ui.checkbox(
+        &mut app.tool_settings.draw_in_perspective,
+        "Draw in Perspective",
+    );
     let selected_pc_lock = app.active_tab().and_then(|t| {
         t.selection.objects.iter().find_map(|id| {
             let obj = t.document.object(*id)?;
@@ -2231,14 +2288,22 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
 
 fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
     ui.label(RichText::new("Reusable Symbols").strong());
-    if ui.button("+ Create Symbol from Selection").clicked() {
+    let editing_sym_name = app
+        .active_tab()
+        .and_then(|t| t.editing_symbol.as_ref().map(|s| s.symbol_name.clone()));
+    if let Some(sname) = editing_sym_name {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Editing '{sname}'")).strong());
+            if ui.button("Finish Editing").clicked() {
+                app.finish_edit_symbol(true);
+            }
+            if ui.button("Cancel").clicked() {
+                app.finish_edit_symbol(false);
+            }
+        });
+    } else if ui.button("+ Create Symbol from Selection").clicked() {
         let new_sym = app.active_tab().and_then(|tab| {
-            let objs: Vec<SceneObject> = tab
-                .selection
-                .objects
-                .iter()
-                .filter_map(|id| tab.document.object(*id).cloned())
-                .collect();
+            let objs = tab.document.collect_subtree_objects(&tab.selection.objects);
             if objs.is_empty() {
                 None
             } else {
@@ -2276,6 +2341,112 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
                     }
                 }
             }
+            if ui.small_button("Edit").clicked() {
+                app.begin_edit_symbol(sid);
+            }
+            if ui.small_button("Del").clicked() {
+                if let Err(e) = app.execute_command(CommandOp::DeleteSymbol { id: sid }) {
+                    app.push_toast(e, true);
+                }
+            }
+        });
+    }
+    let selected_sym_inst = app.active_tab().and_then(|t| {
+        t.selection.objects.iter().copied().find(|&id| {
+            t.document
+                .object(id)
+                .is_some_and(|o| matches!(o.payload, NodePayload::SymbolInstance(_)))
+        })
+    });
+    if let Some(inst_id) = selected_sym_inst {
+        if ui.button("Unlink Selected Symbol Instance").clicked() {
+            if let Err(e) = app.execute_command(CommandOp::UnlinkSymbolInstance { id: inst_id }) {
+                app.push_toast(e, true);
+            }
+        }
+    }
+    let (has_sel_for_clone, has_selected_clone) = app
+        .active_tab()
+        .map(|t| {
+            (
+                !t.selection.objects.is_empty(),
+                t.selection.objects.iter().any(|id| {
+                    t.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }))
+                }),
+            )
+        })
+        .unwrap_or((false, false));
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(has_sel_for_clone, egui::Button::new("Clone Selected"))
+            .clicked()
+        {
+            let _ = app.clone_selection();
+        }
+        if ui
+            .add_enabled(has_selected_clone, egui::Button::new("Unlink Clone"))
+            .clicked()
+        {
+            app.unlink_clone_selection();
+        }
+    });
+
+    ui.separator();
+    ui.label(RichText::new("Color Styles & Harmonies").strong());
+    if ui.button("+ Color Style from Selection").clicked() {
+        let new_cs = app.active_tab().and_then(|t| {
+            let obj = t
+                .selection
+                .objects
+                .first()
+                .and_then(|id| t.document.object(*id))?;
+            let col = obj
+                .fill
+                .referenced_colors()
+                .into_iter()
+                .next()
+                .unwrap_or(Color::CYAN);
+            let n = t.document.color_styles().len() + 1;
+            Some(coree_core::ColorStyle::new(
+                format!("Color {n}"),
+                col,
+                Some(coree_core::ColorHarmony::Complementary),
+            ))
+        });
+        if let Some(style) = new_cs {
+            let _ = app.execute_command(CommandOp::UpsertColorStyle { style });
+        }
+    }
+    let color_styles: Vec<_> = app
+        .active_tab()
+        .map(|t| t.document.color_styles().to_vec())
+        .unwrap_or_default();
+    for mut cs in color_styles {
+        ui.horizontal(|ui| {
+            ui.label(&cs.name);
+            let mut rgb = cs.base_color.to_rgba8();
+            if ui.color_edit_button_srgba_unmultiplied(&mut rgb).changed() {
+                cs.set_base_color(Color::rgba8(rgb[0], rgb[1], rgb[2], rgb[3]));
+                let _ = app.execute_command(CommandOp::UpsertColorStyle { style: cs.clone() });
+            }
+            if ui.small_button("Link").clicked() {
+                let ids = app
+                    .active_tab()
+                    .map(|t| t.selection.objects.clone())
+                    .unwrap_or_default();
+                if !ids.is_empty() {
+                    let _ = app.execute_command(CommandOp::SetObjectColorStyleLink {
+                        ids,
+                        color_style_id: Some(cs.id),
+                        slot: None,
+                    });
+                }
+            }
+            if ui.small_button("Del").clicked() {
+                let _ = app.execute_command(CommandOp::DeleteColorStyle { id: cs.id });
+            }
         });
     }
 
@@ -2294,10 +2465,24 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
             st.outline = Some(obj.outline.clone());
             st.blend_mode = Some(obj.blend_mode);
             st.opacity = Some(obj.opacity);
+            st.color_style_id = obj.color_style_id;
+            st.color_style_slot = obj.color_style_slot;
             Some(st)
         });
         if let Some(style) = new_style {
             let _ = app.execute_command(CommandOp::UpsertObjectStyle { style });
+        }
+    }
+    if ui.small_button("Unlink Style from Selection").clicked() {
+        let ids = app
+            .active_tab()
+            .map(|t| t.selection.objects.clone())
+            .unwrap_or_default();
+        if !ids.is_empty() {
+            let _ = app.execute_command(CommandOp::SetObjectStyleLink {
+                ids,
+                style_id: None,
+            });
         }
     }
     let styles: Vec<_> = app
@@ -2320,6 +2505,9 @@ fn ui_symbols_styles_docker(ui: &mut Ui, app: &mut StudioApp) {
                 }) {
                     app.push_toast(format!("Apply Object Style failed: {err}"), true);
                 }
+            }
+            if ui.small_button("Del").clicked() {
+                let _ = app.execute_command(CommandOp::DeleteObjectStyle { id: st.id });
             }
         });
     }

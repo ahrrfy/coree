@@ -749,6 +749,48 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
             // Floating PowerClip Content-Edit Mode pill at top-center of canvas
             let mut pc_bar_clicked_finish = false;
             let mut pc_bar_occludes_pointer = false;
+            if app.active_tab().is_some_and(|t| t.editing_symbol.is_some()) {
+                let pill_anchor = pos2(canvas_rect.center().x - 165.0, canvas_rect.top() + 10.0);
+                let sym_name = app
+                    .active_tab()
+                    .and_then(|t| t.editing_symbol.as_ref().map(|s| s.symbol_name.clone()))
+                    .unwrap_or_default();
+                let area_resp = egui::Area::new(ui.scope_id().with("coree_symbol_edit_bar"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pill_anchor)
+                    .show(ui.ctx(), |ui| {
+                        Frame::NONE
+                            .fill(tokens.surface_elevated.gamma_multiply(0.95))
+                            .stroke(Stroke::new(1.2, tokens.accent))
+                            .corner_radius(CornerRadius::same(12))
+                            .inner_margin(Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("Editing Symbol: {sym_name}"))
+                                            .size(11.5)
+                                            .strong()
+                                            .color(tokens.accent),
+                                    );
+                                    if ui.small_button("Finish Editing").clicked() {
+                                        app.finish_edit_symbol(true);
+                                        pc_bar_clicked_finish = true;
+                                    }
+                                    if ui.small_button("Cancel").clicked() {
+                                        app.finish_edit_symbol(false);
+                                        pc_bar_clicked_finish = true;
+                                    }
+                                });
+                            });
+                    });
+                let ptr_pos =
+                    ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
+                pc_bar_occludes_pointer = pc_bar_occludes_pointer
+                    || area_resp.response.hovered()
+                    || area_resp.response.contains_pointer()
+                    || area_resp.response.container_contains_pointer()
+                    || ptr_pos.is_some_and(|p| area_resp.response.rect.contains(p));
+            }
             if app
                 .active_tab()
                 .is_some_and(|t| t.powerclip_edit_id.is_some())
@@ -1192,6 +1234,13 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
     canvas_resp.context_menu(|ui| {
         let has_sel = app.active_tab().is_some_and(|t| !t.selection.is_empty());
         let has_multi = app.active_tab().is_some_and(|t| t.selection.len() >= 2);
+        let has_clone = app.active_tab().is_some_and(|t| {
+            t.selection.objects.iter().any(|id| {
+                t.document
+                    .object(*id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }))
+            })
+        });
         let has_clip = app.has_clipboard_content();
 
         if ui
@@ -1220,6 +1269,17 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             .clicked()
         {
             let _ = app.duplicate_selection();
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_sel, egui::Button::new("Clone"))
+            .clicked()
+        {
+            let _ = app.clone_selection();
+            ui.close();
+        }
+        if has_clone && ui.button("Unlink Clone").clicked() {
+            app.unlink_clone_selection();
             ui.close();
         }
         if ui
@@ -1313,6 +1373,18 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
         if let Some(pc_id) = selected_pc {
             if ui.button("Edit PowerClip Contents (Ctrl+Click)").clicked() {
                 app.enter_powerclip_edit(pc_id);
+                ui.close();
+            }
+            if ui.button("Fit PowerClip Contents").clicked() {
+                app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
+                ui.close();
+            }
+            if ui.button("Center PowerClip Contents").clicked() {
+                app.fit_powerclip_selection(coree_core::PowerClipFitMode::CenterContents);
+                ui.close();
+            }
+            if ui.button("Stretch PowerClip to Fill").clicked() {
+                app.fit_powerclip_selection(coree_core::PowerClipFitMode::StretchToFill);
                 ui.close();
             }
         }

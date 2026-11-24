@@ -199,6 +199,30 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         let _ = app.duplicate_selection_with_offset(coree_core::Vec2D::ZERO);
                         ui.close();
                     }
+                    let has_sel = app
+                        .active_tab()
+                        .is_some_and(|t| !t.selection.objects.is_empty());
+                    let has_clone = app.active_tab().is_some_and(|t| {
+                        t.selection.objects.iter().any(|id| {
+                            t.document.object(*id).is_some_and(|o| {
+                                matches!(o.payload, coree_core::NodePayload::Clone { .. })
+                            })
+                        })
+                    });
+                    if ui
+                        .add_enabled(has_sel, egui::Button::new("Clone"))
+                        .clicked()
+                    {
+                        let _ = app.clone_selection();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_clone, egui::Button::new("Unlink Clone"))
+                        .clicked()
+                    {
+                        app.unlink_clone_selection();
+                        ui.close();
+                    }
                     if menu_item(
                         ui,
                         "Delete",
@@ -284,6 +308,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                     let mut pending_multipage: Option<bool> = None;
                     let mut pending_grid: Option<coree_core::GridConfig> = None;
                     let mut pending_pgrid: Option<coree_core::PerspectiveGridConfig> = None;
+                    let mut pending_draw_persp: Option<bool> = None;
                     if let Some(tab) = app.active_tab_mut() {
                         let mut multipage = tab.document.multipage_view();
                         if ui.checkbox(&mut multipage, "Multipage View").changed() {
@@ -316,9 +341,36 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             .checkbox(&mut pgrid.enabled, "Perspective Drawing Grid")
                             .changed()
                         {
-                            pending_pgrid = Some(pgrid);
+                            pending_pgrid = Some(pgrid.clone());
                             tab.needs_rerender = true;
                         }
+                        ui.menu_button("Perspective Plane", |ui| {
+                            for (plane, label) in [
+                                (
+                                    coree_core::PerspectivePlane::Orthographic,
+                                    "Orthographic (Off)",
+                                ),
+                                (coree_core::PerspectivePlane::Top, "Top Plane"),
+                                (coree_core::PerspectivePlane::Left, "Left Plane"),
+                                (coree_core::PerspectivePlane::Right, "Right Plane"),
+                                (coree_core::PerspectivePlane::Front, "Front Plane"),
+                            ] {
+                                if ui
+                                    .selectable_label(pgrid.active_plane == plane, label)
+                                    .clicked()
+                                {
+                                    let mut next = pgrid.clone();
+                                    next.active_plane = plane;
+                                    if plane != coree_core::PerspectivePlane::Orthographic {
+                                        next.enabled = true;
+                                        pending_draw_persp = Some(true);
+                                    }
+                                    pending_pgrid = Some(next);
+                                    tab.needs_rerender = true;
+                                    ui.close();
+                                }
+                            }
+                        });
                         if ui
                             .checkbox(&mut tab.overprint_preview, "Simulate Overprints")
                             .changed()
@@ -356,6 +408,9 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                     }
                     if let Some(config) = pending_pgrid {
                         let _ = app.execute_command(CommandOp::SetPerspectiveGrid { config });
+                    }
+                    if let Some(dp) = pending_draw_persp {
+                        app.tool_settings.draw_in_perspective = dp;
                     }
                     if menu_item(ui, "Compute CMYK/Spot Separations Preview", "") {
                         app.compute_separations_active();
@@ -690,6 +745,22 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             app.extract_selected_powerclip();
                             ui.close();
                         }
+                        if ui.button("Fit Contents Proportionally").clicked() {
+                            app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
+                            ui.close();
+                        }
+                        if ui.button("Center Contents").clicked() {
+                            app.fit_powerclip_selection(
+                                coree_core::PowerClipFitMode::CenterContents,
+                            );
+                            ui.close();
+                        }
+                        if ui.button("Stretch to Fill").clicked() {
+                            app.fit_powerclip_selection(
+                                coree_core::PowerClipFitMode::StretchToFill,
+                            );
+                            ui.close();
+                        }
                         if menu_item(
                             ui,
                             "Lock / Unlock Contents to PowerClip",
@@ -774,6 +845,9 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         "Transparency",
                         "Perspective",
                         "Symmetry",
+                        "Inner Shadow",
+                        "Bevel",
+                        "Extrude 3D",
                     ]
                     .iter()
                     .enumerate()

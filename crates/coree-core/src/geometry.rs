@@ -11,8 +11,6 @@
 use crate::error::{CoreError, CoreResult};
 use crate::math::{sanitize_f64, Affine2D, Point2D, Rect2D, Vec2D};
 use i_overlay::core::fill_rule::FillRule;
-use i_overlay::core::overlay_rule::OverlayRule;
-use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::float::slice::FloatSlice;
 use kurbo::{
     BezPath, CubicBez, Line, ParamCurve, ParamCurveArclen, ParamCurveDeriv, PathEl, PathSeg, Shape,
@@ -130,7 +128,11 @@ impl PathNode {
                 if let (Some(h_in), Some(h_out)) = (self.handle_in, self.handle_out) {
                     let v_in = h_in - self.pos;
                     let v_out = h_out - self.pos;
-                    if let Some(dir) = (v_out - v_in).normalized() {
+                    let dir = (v_out - v_in)
+                        .normalized()
+                        .or_else(|| v_in.normalized().map(|d| -d))
+                        .or_else(|| v_out.normalized());
+                    if let Some(dir) = dir {
                         let len_in = v_in.length();
                         let len_out = v_out.length();
                         self.handle_in = Some(self.pos - dir * len_in);
@@ -143,7 +145,11 @@ impl PathNode {
                     let v_in = h_in - self.pos;
                     let v_out = h_out - self.pos;
                     let avg_len = 0.5 * (v_in.length() + v_out.length());
-                    if let Some(dir) = (v_out - v_in).normalized() {
+                    let dir = (v_out - v_in)
+                        .normalized()
+                        .or_else(|| v_in.normalized().map(|d| -d))
+                        .or_else(|| v_out.normalized());
+                    if let Some(dir) = dir {
                         self.handle_in = Some(self.pos - dir * avg_len);
                         self.handle_out = Some(self.pos + dir * avg_len);
                     }
@@ -153,6 +159,44 @@ impl PathNode {
                 } else if let Some(h_out) = self.handle_out {
                     let v = h_out - self.pos;
                     self.handle_in = Some(self.pos - v);
+                }
+            }
+        }
+    }
+
+    /// Enforces `self.kind` continuity while keeping the actively dragged handle
+    /// (`handle_in` when `active_is_in` is `true`, `handle_out` otherwise) fixed in place.
+    pub fn enforce_continuity_for_handle(&mut self, active_is_in: bool) {
+        match self.kind {
+            NodeKind::Cusp => {}
+            NodeKind::Smooth => {
+                if active_is_in {
+                    if let (Some(h_in), Some(h_out)) = (self.handle_in, self.handle_out) {
+                        if let Some(dir) = (h_in - self.pos).normalized() {
+                            let len_out = (h_out - self.pos).length();
+                            self.handle_out = Some(self.pos - dir * len_out);
+                        }
+                    }
+                } else if let (Some(h_out), Some(h_in)) = (self.handle_out, self.handle_in) {
+                    if let Some(dir) = (h_out - self.pos).normalized() {
+                        let len_in = (h_in - self.pos).length();
+                        self.handle_in = Some(self.pos - dir * len_in);
+                    }
+                }
+            }
+            NodeKind::Symmetrical => {
+                if active_is_in {
+                    if let Some(h_in) = self.handle_in {
+                        let v = h_in - self.pos;
+                        if v.length() > 1e-12 {
+                            self.handle_out = Some(self.pos - v);
+                        }
+                    }
+                } else if let Some(h_out) = self.handle_out {
+                    let v = h_out - self.pos;
+                    if v.length() > 1e-12 {
+                        self.handle_in = Some(self.pos - v);
+                    }
                 }
             }
         }
@@ -1277,7 +1321,7 @@ pub fn knife_cut(
     let all_closed = path.subpaths.iter().all(|sp| sp.closed);
     if auto_close && all_closed {
         let contours: Vec<Vec<[f64; 2]>> = path
-            .flatten(0.05)
+            .flatten(0.02)
             .into_iter()
             .filter_map(|poly| {
                 if !poly.iter().all(|&p| point_in_overlay_range(p)) {
@@ -1301,10 +1345,9 @@ pub fn knife_cut(
                             .into_iter()
                             .filter(|c| c.len() >= 3)
                             .map(|c| {
-                                Subpath::from_points(
-                                    c.into_iter().map(|[x, y]| Point2D::new(x, y)),
-                                    true,
-                                )
+                                let pts: Vec<Point2D> =
+                                    c.into_iter().map(|[x, y]| Point2D::new(x, y)).collect();
+                                fit_cubic_bezier_subpath(&pts, true, 0.025)
                             })
                             .collect();
                         BezierPath { subpaths }
@@ -1446,7 +1489,7 @@ pub fn virtual_segment_delete(
     // Collect cutter polylines as linear segments
     let mut cutter_edges: Vec<(Point2D, Point2D)> = Vec::new();
     for cutter in cutters {
-        for poly in cutter.flatten(0.05) {
+        for poly in cutter.flatten(0.02) {
             for win in poly.windows(2) {
                 if win[0].distance_to(win[1]) > 1e-6 {
                     cutter_edges.push((win[0], win[1]));
@@ -1462,7 +1505,7 @@ pub fn virtual_segment_delete(
         .enumerate()
         .filter_map(|(orig_idx, sp)| {
             let mut poly = BezierPath::from_subpath(sp.clone())
-                .flatten(0.05)
+                .flatten(0.02)
                 .into_iter()
                 .next()?;
             if poly.len() < 2 {
@@ -1577,13 +1620,13 @@ pub fn virtual_segment_delete(
             if prev_cut > 1e-4 {
                 let left = extract_polyline_range(poly, 0.0, prev_cut);
                 if left.len() >= 2 {
-                    out_subpaths.push(Subpath::from_points(left, false));
+                    out_subpaths.push(fit_cubic_bezier_subpath(&left, false, 0.025));
                 }
             }
             if total_len - next_cut > 1e-4 {
                 let right = extract_polyline_range(poly, next_cut, total_len);
                 if right.len() >= 2 {
-                    out_subpaths.push(Subpath::from_points(right, false));
+                    out_subpaths.push(fit_cubic_bezier_subpath(&right, false, 0.025));
                 }
             }
         } else if cut_arcs.len() >= 2 {
@@ -1615,7 +1658,7 @@ pub fn virtual_segment_delete(
                 }
             }
             if kept.len() >= 2 {
-                out_subpaths.push(Subpath::from_points(kept, false));
+                out_subpaths.push(fit_cubic_bezier_subpath(&kept, false, 0.025));
             }
         }
         // If closed with < 2 intersections, deleting the clicked virtual segment removes the loop
@@ -1626,9 +1669,252 @@ pub fn virtual_segment_delete(
     }
 }
 
+/// Exact Euclidean minimum distance from `pt` to a `kurbo::PathSeg` (line, quad, or cubic Bézier).
+#[must_use]
+pub fn segment_min_dist_to_point(seg: PathSeg, pt: Point2D) -> f64 {
+    if !pt.is_finite() {
+        return f64::INFINITY;
+    }
+    match seg {
+        PathSeg::Line(l) => {
+            point_to_segment_distance(pt, Point2D::from_kurbo(l.p0), Point2D::from_kurbo(l.p1))
+        }
+        PathSeg::Quad(_) | PathSeg::Cubic(_) => {
+            const SAMPLES: usize = 32;
+            let mut best_t = 0.0_f64;
+            let mut best_d2 = f64::INFINITY;
+            for i in 0..=SAMPLES {
+                let t = (i as f64) / (SAMPLES as f64);
+                let p = Point2D::from_kurbo(seg.eval(t));
+                let d2 = p.distance_sq(pt);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_t = t;
+                }
+            }
+            // Golden-section / ternary refinement around best sample
+            let step = 1.0 / (SAMPLES as f64);
+            let mut lo = (best_t - step).max(0.0);
+            let mut hi = (best_t + step).min(1.0);
+            for _ in 0..24 {
+                let m1 = lo + (hi - lo) / 3.0;
+                let m2 = hi - (hi - lo) / 3.0;
+                let d1 = Point2D::from_kurbo(seg.eval(m1)).distance_sq(pt);
+                let d2 = Point2D::from_kurbo(seg.eval(m2)).distance_sq(pt);
+                if d1 < d2 {
+                    hi = m2;
+                } else {
+                    lo = m1;
+                }
+            }
+            let mid = 0.5 * (lo + hi);
+            let refined = Point2D::from_kurbo(seg.eval(mid)).distance_sq(pt);
+            best_d2.min(refined).sqrt()
+        }
+    }
+}
+
+/// Returns `true` if `pt` lies inside the compound region defined by `closed_subpaths`
+/// under the `EvenOdd` fill rule (evaluated analytically over exact Bézier segments).
+#[must_use]
+pub fn closed_subpaths_contain_even_odd(closed_subpaths: &[Subpath], pt: Point2D) -> bool {
+    if !pt.is_finite() {
+        return false;
+    }
+    let mut kb = BezPath::new();
+    let mut any = false;
+    for sp in closed_subpaths {
+        if sp.closed && sp.nodes.len() >= 2 {
+            push_subpath_to_kurbo(sp, &mut kb);
+            any = true;
+        }
+    }
+    if !any || kb.is_empty() {
+        return false;
+    }
+    kb.winding(pt.to_kurbo()).rem_euclid(2) != 0
+}
+
+fn segment_kurbo_circle_intersections(seg: PathSeg, center: Point2D, radius: f64) -> Vec<f64> {
+    match seg {
+        PathSeg::Line(l) => segment_circle_intersections(
+            Point2D::from_kurbo(l.p0),
+            Point2D::from_kurbo(l.p1),
+            center,
+            radius,
+        ),
+        PathSeg::Quad(_) | PathSeg::Cubic(_) => {
+            const SAMPLES: usize = 32;
+            let r2 = radius * radius;
+            let f = |t: f64| -> f64 {
+                let p = Point2D::from_kurbo(seg.eval(t));
+                p.distance_sq(center) - r2
+            };
+            let mut roots: Vec<f64> = Vec::new();
+            let mut ts = [0.0_f64; SAMPLES + 1];
+            let mut fs = [0.0_f64; SAMPLES + 1];
+            for i in 0..=SAMPLES {
+                let t = (i as f64) / (SAMPLES as f64);
+                ts[i] = t;
+                fs[i] = f(t);
+            }
+            let refine_bisect = |mut a: f64, mut b: f64, mut fa: f64, mut fb: f64| -> f64 {
+                for _ in 0..42 {
+                    let mid = 0.5 * (a + b);
+                    let fm = f(mid);
+                    if fm.abs() <= 1e-12 || (b - a) <= 1e-11 {
+                        return mid;
+                    }
+                    if (fa <= 0.0 && fm <= 0.0) || (fa >= 0.0 && fm >= 0.0) {
+                        a = mid;
+                        fa = fm;
+                    } else {
+                        b = mid;
+                        fb = fm;
+                    }
+                    let _ = fb;
+                }
+                0.5 * (a + b)
+            };
+            for i in 0..SAMPLES {
+                let a = ts[i];
+                let b = ts[i + 1];
+                let fa = fs[i];
+                let fb = fs[i + 1];
+                if fa.abs() <= 1e-10 {
+                    roots.push(a);
+                } else if (fa < 0.0 && fb > 0.0) || (fa > 0.0 && fb < 0.0) {
+                    roots.push(refine_bisect(a, b, fa, fb));
+                } else if fa > 0.0 && fb > 0.0 {
+                    // Check for interior grazing tangency where f dips <= 0 inside [a, b]
+                    let mut lo = a;
+                    let mut hi = b;
+                    for _ in 0..24 {
+                        let m1 = lo + (hi - lo) / 3.0;
+                        let m2 = hi - (hi - lo) / 3.0;
+                        if f(m1) < f(m2) {
+                            hi = m2;
+                        } else {
+                            lo = m1;
+                        }
+                    }
+                    let t_min = 0.5 * (lo + hi);
+                    let f_min = f(t_min);
+                    if f_min <= 1e-7 {
+                        if f_min >= -1e-7 {
+                            roots.push(t_min);
+                        } else {
+                            roots.push(refine_bisect(a, t_min, fa, f_min));
+                            roots.push(refine_bisect(t_min, b, f_min, fb));
+                        }
+                    }
+                }
+            }
+            if fs[SAMPLES].abs() <= 1e-10 {
+                roots.push(1.0);
+            }
+            roots.retain(|t| *t > 1e-6 && *t < 1.0 - 1e-6);
+            roots.sort_by(|a, b| a.total_cmp(b));
+            roots.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+            roots
+        }
+    }
+}
+
+fn seg_reverse(seg: PathSeg) -> PathSeg {
+    match seg {
+        PathSeg::Line(l) => PathSeg::Line(Line::new(l.p1, l.p0)),
+        PathSeg::Quad(q) => PathSeg::Quad(kurbo::QuadBez::new(q.p2, q.p1, q.p0)),
+        PathSeg::Cubic(c) => PathSeg::Cubic(CubicBez::new(c.p3, c.p2, c.p1, c.p0)),
+    }
+}
+
+fn circle_arc_to_cubic_segs(
+    center: Point2D,
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+) -> Vec<PathSeg> {
+    let sweep = end_angle - start_angle;
+    if sweep.abs() <= 1e-8 {
+        return Vec::new();
+    }
+    let count = ((sweep.abs() / FRAC_PI_2).ceil() as usize).clamp(1, 8);
+    let step = sweep / (count as f64);
+    let alpha = (4.0 / 3.0) * (step * 0.25).tan();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let a0 = start_angle + (i as f64) * step;
+        let a1 = a0 + step;
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        let p0 = kurbo::Point::new(center.x + radius * c0, center.y + radius * s0);
+        let p3 = kurbo::Point::new(center.x + radius * c1, center.y + radius * s1);
+        let p1 = kurbo::Point::new(p0.x - alpha * radius * s0, p0.y + alpha * radius * c0);
+        let p2 = kurbo::Point::new(p3.x + alpha * radius * s1, p3.y - alpha * radius * c1);
+        out.push(PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3)));
+    }
+    out
+}
+
+fn segs_to_bezier_subpath(segs: &[PathSeg], closed: bool) -> Option<Subpath> {
+    if segs.is_empty() {
+        return None;
+    }
+    let mut kb = BezPath::new();
+    kb.move_to(segs[0].start());
+    for seg in segs {
+        kb.push(seg.as_path_el());
+    }
+    if closed {
+        kb.close_path();
+    }
+    let mut bp = BezierPath::from_kurbo(&kb);
+    bp.subpaths.pop().filter(|sp| sp.nodes.len() >= 2)
+}
+
+fn exact_circle_subpath(center: Point2D, radius: f64, reverse_winding: bool) -> Subpath {
+    let k = radius * CIRCLE_KAPPA;
+    let nodes = vec![
+        PathNode::new(
+            Point2D::new(center.x + radius, center.y),
+            Some(Point2D::new(center.x + radius, center.y - k)),
+            Some(Point2D::new(center.x + radius, center.y + k)),
+            NodeKind::Symmetrical,
+        ),
+        PathNode::new(
+            Point2D::new(center.x, center.y + radius),
+            Some(Point2D::new(center.x + k, center.y + radius)),
+            Some(Point2D::new(center.x - k, center.y + radius)),
+            NodeKind::Symmetrical,
+        ),
+        PathNode::new(
+            Point2D::new(center.x - radius, center.y),
+            Some(Point2D::new(center.x - radius, center.y + k)),
+            Some(Point2D::new(center.x - radius, center.y - k)),
+            NodeKind::Symmetrical,
+        ),
+        PathNode::new(
+            Point2D::new(center.x, center.y - radius),
+            Some(Point2D::new(center.x - k, center.y - radius)),
+            Some(Point2D::new(center.x + k, center.y - radius)),
+            NodeKind::Symmetrical,
+        ),
+    ];
+    let mut sp = Subpath {
+        nodes,
+        closed: true,
+    };
+    if reverse_winding {
+        sp.reverse();
+    }
+    sp
+}
+
 /// Erases all geometry of `path` falling inside the disk `(center, radius)`.
 ///
-/// Closed shapes are subtracted via `i_overlay`; open curves are trimmed outside the circle.
+/// Uses analytical `PathSeg` vs. circle intersections and exact circular cubic Bézier arcs
+/// (`CIRCLE_KAPPA` / `4/3 * tan(dtheta/4)`) with zero polygon approximation.
 #[must_use]
 pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<BezierPath> {
     if path.is_empty()
@@ -1644,105 +1930,238 @@ pub fn erase_circle(path: &BezierPath, center: Point2D, radius: f64) -> Vec<Bezi
         };
     }
 
-    // Build a smooth 96-gon circular cutter and re-fit output arcs back to cubic Béziers
-    const SEGMENTS: usize = 96;
-    let circle_ring: Vec<[f64; 2]> = (0..SEGMENTS)
-        .map(|i| {
-            let theta = TAU * (i as f64) / (SEGMENTS as f64);
-            [
-                center.x + radius * theta.cos(),
-                center.y + radius * theta.sin(),
-            ]
-        })
-        .collect();
-
     let mut results = Vec::new();
-    let mut closed_contours: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut closed_subpaths: Vec<Subpath> = Vec::new();
 
     for sp in &path.subpaths {
         if sp.closed {
-            for poly in BezierPath::from_subpath(sp.clone()).flatten(0.05) {
-                if !poly.iter().all(|&p| point_in_overlay_range(p)) {
-                    continue;
-                }
-                let mut ring: Vec<[f64; 2]> = poly.into_iter().map(|p| [p.x, p.y]).collect();
-                if ring.len() > 1 && ring.first() == ring.last() {
-                    ring.pop();
-                }
-                if ring.len() >= 3 {
-                    closed_contours.push(ring);
-                }
+            if sp.nodes.len() >= 3 && sp.nodes.iter().all(|n| point_in_overlay_range(n.pos)) {
+                closed_subpaths.push(sp.clone());
             }
         } else {
-            // Trim open polyline against disk
-            for poly in BezierPath::from_subpath(sp.clone()).flatten(0.05) {
-                let mut piece: Vec<Point2D> = Vec::new();
-                for win in poly.windows(2) {
-                    let a = win[0];
-                    let b = win[1];
-                    let mut ts = vec![0.0, 1.0];
-                    for t in segment_circle_intersections(a, b, center, radius) {
-                        ts.push(t);
-                    }
-                    ts.sort_by(|x, y| x.total_cmp(y));
-                    for pair in ts.windows(2) {
-                        let t0 = pair[0];
-                        let t1 = pair[1];
-                        if t1 - t0 < 1e-6 {
-                            continue;
-                        }
-                        let mid = a.lerp(b, 0.5 * (t0 + t1));
-                        if mid.distance_to(center) > radius + 1e-6 {
-                            let p0 = a.lerp(b, t0);
-                            let p1 = a.lerp(b, t1);
-                            if piece.last().is_none_or(|last| last.distance_to(p0) > 1e-5) {
-                                if piece.len() >= 2 {
-                                    results.push(BezierPath::from_subpath(
-                                        fit_cubic_bezier_subpath(&piece, false, 0.025),
-                                    ));
-                                }
-                                piece.clear();
-                                piece.push(p0);
-                            }
-                            piece.push(p1);
-                        } else {
-                            if piece.len() >= 2 {
-                                results.push(BezierPath::from_subpath(fit_cubic_bezier_subpath(
-                                    &piece, false, 0.025,
-                                )));
-                            }
-                            piece.clear();
-                        }
-                    }
+            // Exact open-curve trimming against disk `(center, radius)`
+            let seg_count = sp.segment_count();
+            let mut active_segs: Vec<PathSeg> = Vec::new();
+            let flush_open = |segs: &mut Vec<PathSeg>, out: &mut Vec<BezierPath>| {
+                if let Some(sub) = segs_to_bezier_subpath(segs, false) {
+                    out.push(BezierPath::from_subpath(sub));
                 }
-                if piece.len() >= 2 {
-                    results.push(BezierPath::from_subpath(fit_cubic_bezier_subpath(
-                        &piece, false, 0.025,
-                    )));
+                segs.clear();
+            };
+
+            for s in 0..seg_count {
+                let Some(seg) = sp.segment_to_kurbo(s) else {
+                    continue;
+                };
+                let mut ts = vec![0.0, 1.0];
+                ts.extend(segment_kurbo_circle_intersections(seg, center, radius));
+                ts.sort_by(|x, y| x.total_cmp(y));
+                ts.dedup_by(|x, y| (*x - *y).abs() < 1e-6);
+
+                for pair in ts.windows(2) {
+                    let t0 = pair[0];
+                    let t1 = pair[1];
+                    if t1 - t0 < 1e-7 {
+                        continue;
+                    }
+                    let piece = seg.subsegment(t0..t1);
+                    let mid = Point2D::from_kurbo(piece.eval(0.5));
+                    if mid.distance_to(center) > radius + 1e-6 {
+                        let piece_start = Point2D::from_kurbo(piece.start());
+                        if let Some(prev) = active_segs.last() {
+                            let prev_end = Point2D::from_kurbo(prev.end());
+                            if prev_end.distance_to(piece_start) > 1e-4 {
+                                flush_open(&mut active_segs, &mut results);
+                            }
+                        }
+                        active_segs.push(piece);
+                    } else {
+                        flush_open(&mut active_segs, &mut results);
+                    }
                 }
             }
+            flush_open(&mut active_segs, &mut results);
         }
     }
 
-    if !closed_contours.is_empty() {
-        let diff = closed_contours.overlay_as::<i64>(
-            &circle_ring,
-            OverlayRule::Difference,
-            FillRule::EvenOdd,
-        );
-        for shape in diff {
-            let subpaths: Vec<Subpath> = shape
-                .into_iter()
-                .filter(|c| c.len() >= 3)
-                .map(|c| {
-                    let pts: Vec<Point2D> =
-                        c.into_iter().map(|[x, y]| Point2D::new(x, y)).collect();
-                    fit_cubic_bezier_subpath(&pts, true, 0.025)
-                })
-                .collect();
-            if !subpaths.is_empty() {
-                results.push(BezierPath { subpaths });
+    if !closed_subpaths.is_empty() {
+        let mut untouched_outside: Vec<Subpath> = Vec::new();
+        let mut boundary_segs: Vec<PathSeg> = Vec::new();
+        let mut hit_angles: Vec<f64> = Vec::new();
+
+        for sp in &closed_subpaths {
+            let seg_count = sp.segment_count();
+            let mut sp_has_hit = false;
+            let mut sp_all_inside = true;
+            let mut sp_kept: Vec<PathSeg> = Vec::new();
+
+            for s in 0..seg_count {
+                let Some(seg) = sp.segment_to_kurbo(s) else {
+                    continue;
+                };
+                let min_d = segment_min_dist_to_point(seg, center);
+                let mut ts = vec![0.0, 1.0];
+                let hits = segment_kurbo_circle_intersections(seg, center, radius);
+                if !hits.is_empty() || min_d <= radius + 1e-5 {
+                    sp_has_hit = true;
+                }
+                for &t in &hits {
+                    let hp = Point2D::from_kurbo(seg.eval(t));
+                    hit_angles.push((hp.y - center.y).atan2(hp.x - center.x));
+                }
+                ts.extend(hits);
+                ts.sort_by(|x, y| x.total_cmp(y));
+                ts.dedup_by(|x, y| (*x - *y).abs() < 1e-6);
+
+                for pair in ts.windows(2) {
+                    let t0 = pair[0];
+                    let t1 = pair[1];
+                    if t1 - t0 < 1e-7 {
+                        continue;
+                    }
+                    let piece = seg.subsegment(t0..t1);
+                    let mid = Point2D::from_kurbo(piece.eval(0.5));
+                    if mid.distance_to(center) > radius + 1e-6 {
+                        sp_all_inside = false;
+                        let ps = Point2D::from_kurbo(piece.start());
+                        let pe = Point2D::from_kurbo(piece.end());
+                        if (ps.distance_to(center) - radius).abs() <= 1e-4 {
+                            hit_angles.push((ps.y - center.y).atan2(ps.x - center.x));
+                        }
+                        if (pe.distance_to(center) - radius).abs() <= 1e-4 {
+                            hit_angles.push((pe.y - center.y).atan2(pe.x - center.x));
+                        }
+                        sp_kept.push(piece);
+                    }
+                }
             }
+
+            if !sp_has_hit {
+                if !sp_all_inside {
+                    untouched_outside.push(sp.clone());
+                }
+            } else if !sp_all_inside {
+                boundary_segs.extend(sp_kept);
+            }
+        }
+
+        // Normalize and deduplicate angular intersection points on circle
+        for a in &mut hit_angles {
+            *a = a.rem_euclid(TAU);
+        }
+        hit_angles.sort_by(|a, b| a.total_cmp(b));
+        hit_angles.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        if hit_angles.len() >= 2
+            && (hit_angles[0] + TAU - hit_angles[hit_angles.len() - 1]).abs() < 1e-4
+        {
+            hit_angles.pop();
+        }
+
+        let mut arc_segs: Vec<PathSeg> = Vec::new();
+        if hit_angles.len() >= 2 {
+            let k = hit_angles.len();
+            for i in 0..k {
+                let a0 = hit_angles[i];
+                let a1 = if i + 1 < k {
+                    hit_angles[i + 1]
+                } else {
+                    hit_angles[0] + TAU
+                };
+                if a1 - a0 <= 1e-5 {
+                    continue;
+                }
+                let mid_a = 0.5 * (a0 + a1);
+                let mid_pt = Point2D::new(
+                    center.x + radius * mid_a.cos(),
+                    center.y + radius * mid_a.sin(),
+                );
+                if closed_subpaths_contain_even_odd(&closed_subpaths, mid_pt) {
+                    arc_segs.extend(circle_arc_to_cubic_segs(center, radius, a0, a1));
+                }
+            }
+        }
+
+        let mut out_closed: Vec<Subpath> = untouched_outside;
+
+        // Stitch kept boundary segments and circular arcs into exact closed subpaths
+        let mut pool: Vec<PathSeg> = Vec::with_capacity(boundary_segs.len() + arc_segs.len());
+        pool.extend(boundary_segs);
+        pool.extend(arc_segs);
+        let mut used = vec![false; pool.len()];
+        let stitch_tol = 0.05;
+
+        for start_idx in 0..pool.len() {
+            if used[start_idx] {
+                continue;
+            }
+            used[start_idx] = true;
+            let first = pool[start_idx];
+            let loop_start = Point2D::from_kurbo(first.start());
+            let mut cur_end = Point2D::from_kurbo(first.end());
+            let mut chain = vec![first];
+
+            loop {
+                if chain.len() >= 2 && cur_end.distance_to(loop_start) <= 1e-3 {
+                    break;
+                }
+                let mut best: Option<(usize, bool, f64)> = None;
+                for (j, seg) in pool.iter().enumerate() {
+                    if used[j] {
+                        continue;
+                    }
+                    let d_fwd = cur_end.distance_to(Point2D::from_kurbo(seg.start()));
+                    if d_fwd <= stitch_tol && best.is_none_or(|(_, _, bd)| d_fwd < bd) {
+                        best = Some((j, false, d_fwd));
+                    }
+                    let d_rev = cur_end.distance_to(Point2D::from_kurbo(seg.end()));
+                    if d_rev <= stitch_tol && best.is_none_or(|(_, _, bd)| d_rev < bd) {
+                        best = Some((j, true, d_rev));
+                    }
+                }
+                if let Some((j, rev, d_next)) = best {
+                    let d_close = cur_end.distance_to(loop_start);
+                    if chain.len() >= 2 && d_close < d_next && d_close <= stitch_tol {
+                        break;
+                    }
+                    used[j] = true;
+                    let next_seg = if rev { seg_reverse(pool[j]) } else { pool[j] };
+                    cur_end = Point2D::from_kurbo(next_seg.end());
+                    chain.push(next_seg);
+                } else {
+                    break;
+                }
+            }
+
+            if cur_end.distance_to(loop_start) <= stitch_tol {
+                if let Some(sub) = segs_to_bezier_subpath(&chain, true) {
+                    if BezierPath::from_subpath(sub.clone()).area_mm2() > 1e-6 {
+                        out_closed.push(sub);
+                    }
+                }
+            }
+        }
+
+        // If the circle punched strictly inside the remaining shape without cutting boundaries
+        if hit_angles.len() < 2
+            && !out_closed.is_empty()
+            && closed_subpaths_contain_even_odd(&out_closed, center)
+        {
+            let outer_sign: f64 = out_closed
+                .iter()
+                .map(|sp| BezierPath::from_subpath(sp.clone()).signed_area_mm2())
+                .sum();
+            let mut hole = exact_circle_subpath(center, radius, false);
+            let hole_sign = BezierPath::from_subpath(hole.clone()).signed_area_mm2();
+            if (outer_sign >= 0.0) == (hole_sign >= 0.0) {
+                hole.reverse();
+            }
+            out_closed.push(hole);
+        }
+
+        if !out_closed.is_empty() {
+            results.push(BezierPath {
+                subpaths: out_closed,
+            });
         }
     }
 
@@ -1798,7 +2217,7 @@ pub fn fit_cubic_bezier_subpath(points: &[Point2D], closed: bool, max_error_mm: 
         }
         let cos_a = (d0.dot(d1) / (l0 * l1)).clamp(-1.0, 1.0);
         // Treat crisp geometric turns (> ~26 deg) or flat-sided polygon corners (longer chords) as sharp cusps.
-        if cos_a < 0.90 || (cos_a < 0.996 && l0.min(l1) > 1.5) {
+        if cos_a < 0.90 || (cos_a < 0.996 && l0.min(l1) > 4.0) {
             is_corner[i] = true;
         }
     }
@@ -3451,6 +3870,204 @@ fn build_basic_shape_path(kind: BasicShapeKind, width: f64, height: f64) -> Bezi
     }
 }
 
+/// Native non-uniform B-spline curve evaluated via de Boor's algorithm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BSplineCurve {
+    pub control_points: Vec<Point2D>,
+    pub degree: u32,
+    pub knots: Vec<f64>,
+    pub closed: bool,
+}
+
+impl BSplineCurve {
+    /// Builds a clamped uniform B-spline from `control_points`.
+    #[must_use]
+    pub fn from_control_points(control_points: Vec<Point2D>, degree: u32, closed: bool) -> Self {
+        let n = control_points.len();
+        let p = if n <= 1 {
+            0
+        } else {
+            (degree as usize).clamp(1, (n - 1).min(7))
+        };
+        let knots = Self::default_clamped_knots(n, p);
+        Self {
+            control_points,
+            degree: p as u32,
+            knots,
+            closed,
+        }
+    }
+
+    /// Generates a clamped uniform knot vector of length `n + p + 1` in `[0.0, 1.0]`.
+    #[must_use]
+    pub fn default_clamped_knots(n: usize, p: usize) -> Vec<f64> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let m = n + p + 1;
+        let mut knots = Vec::with_capacity(m);
+        let interior = n.saturating_sub(p);
+        for i in 0..m {
+            if i <= p {
+                knots.push(0.0);
+            } else if i >= n {
+                knots.push(1.0);
+            } else if interior > 0 {
+                knots.push((i - p) as f64 / (interior as f64));
+            } else {
+                knots.push(1.0);
+            }
+        }
+        knots
+    }
+
+    /// Returns `true` if every control point and knot value is finite.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        self.control_points.iter().all(|p| p.is_finite())
+            && self.knots.iter().all(|k| k.is_finite())
+    }
+
+    /// Transforms all control points in place by `affine`.
+    pub fn transform(&mut self, affine: &Affine2D) {
+        if !affine.is_finite() {
+            return;
+        }
+        for pt in &mut self.control_points {
+            *pt = affine.transform_point(*pt);
+        }
+    }
+
+    /// Returns a transformed copy of this B-spline.
+    #[must_use]
+    pub fn transformed(&self, affine: &Affine2D) -> Self {
+        let mut out = self.clone();
+        out.transform(affine);
+        out
+    }
+
+    /// Resolves a valid non-decreasing knot vector and effective degree without panicking on
+    /// degenerate or malformed inputs (`degree == 0`, 1 point, short/non-monotonic knots).
+    fn resolved_knots_and_degree(&self) -> Option<(usize, Vec<f64>)> {
+        let n = self.control_points.len();
+        if n < 2 || self.degree == 0 || !self.is_finite() {
+            return None;
+        }
+        let p = (self.degree as usize).min(n - 1).clamp(1, 7);
+        let expected_len = n + p + 1;
+        let valid_knots = self.knots.len() == expected_len
+            && self.knots.windows(2).all(|w| w[0] <= w[1])
+            && self.knots[n] > self.knots[p];
+        let knots = if valid_knots {
+            self.knots.clone()
+        } else {
+            Self::default_clamped_knots(n, p)
+        };
+        if knots.len() != expected_len || knots[n] <= knots[p] {
+            return None;
+        }
+        Some((p, knots))
+    }
+
+    /// Evaluates the B-spline curve at parameter `u` (clamped to `[knots[p], knots[n]]`)
+    /// using de Boor's algorithm.
+    #[must_use]
+    pub fn evaluate(&self, u: f64) -> Option<Point2D> {
+        let valid_pts: Vec<Point2D> = self
+            .control_points
+            .iter()
+            .copied()
+            .filter(|p| p.is_finite())
+            .collect();
+        if valid_pts.is_empty() || !u.is_finite() {
+            return None;
+        }
+        if valid_pts.len() == 1 || self.degree == 0 {
+            return Some(valid_pts[0]);
+        }
+        let n = valid_pts.len();
+        let (p, knots) = self.resolved_knots_and_degree()?;
+        let u_min = knots[p];
+        let u_max = knots[n];
+        let t = u.clamp(u_min, u_max);
+
+        // Locate knot span `k` such that knots[k] <= t < knots[k + 1] (or last non-empty span at u_max)
+        let mut k = p;
+        if (t - u_max).abs() <= 1e-12 {
+            k = n - 1;
+            while k > p && (knots[k + 1] - knots[k]).abs() <= 1e-12 {
+                k -= 1;
+            }
+        } else {
+            for idx in p..n {
+                if t >= knots[idx] && t < knots[idx + 1] {
+                    k = idx;
+                    break;
+                }
+            }
+        }
+
+        let mut d: Vec<Point2D> = (0..=p)
+            .map(|j| valid_pts[(k + j).saturating_sub(p).min(n - 1)])
+            .collect();
+        for r in 1..=p {
+            for j in (r..=p).rev() {
+                let i = k + j - p;
+                let denom = knots[i + p + 1 - r] - knots[i];
+                let alpha = if denom.abs() > 1e-12 {
+                    ((t - knots[i]) / denom).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                d[j] = d[j - 1].lerp(d[j], alpha);
+            }
+        }
+        Some(d[p])
+    }
+
+    /// Evaluates this B-spline into a smooth editable cubic [`BezierPath`].
+    #[must_use]
+    pub fn to_bezier_path(&self) -> BezierPath {
+        let clean: Vec<Point2D> = self
+            .control_points
+            .iter()
+            .copied()
+            .filter(|p| p.is_finite())
+            .collect();
+        if clean.len() < 2 {
+            return BezierPath::new();
+        }
+        if self.degree == 0 {
+            return BezierPath::from_polygon(clean, self.closed);
+        }
+        let Some((p, knots)) = self.resolved_knots_and_degree() else {
+            return BezierPath::from_polygon(clean, self.closed);
+        };
+        let n = clean.len();
+        let u_min = knots[p];
+        let u_max = knots[n];
+        let samples = (n * 16).clamp(24, 256);
+        let mut pts = Vec::with_capacity(samples + 1);
+        for i in 0..=samples {
+            let frac = (i as f64) / (samples as f64);
+            let u = u_min + (u_max - u_min) * frac;
+            if let Some(pt) = self.evaluate(u) {
+                pts.push(pt);
+            }
+        }
+        if pts.len() < 2 {
+            return BezierPath::new();
+        }
+        BezierPath::from_subpath(fit_cubic_bezier_subpath(&pts, self.closed, 0.015))
+    }
+
+    /// Tight bounding box of the evaluated B-spline curve.
+    #[must_use]
+    pub fn bounding_box(&self) -> Option<Rect2D> {
+        self.to_bezier_path().bounding_box()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3717,5 +4334,269 @@ mod tests {
             lock_corners: false,
         };
         assert!(deg.to_bezier_path().is_empty());
+    }
+
+    #[test]
+    fn geometry_analytical_erase_circle_grazing_and_open_curve() {
+        // Grazing disk at distance 0.9997 * r from square edge must still intersect analytically
+        let square = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0));
+        let radius = 10.0;
+        let grazing_center = Point2D::new(10.0, -radius * 0.9997);
+        let grazed = erase_circle(&square, grazing_center, radius);
+        assert_eq!(grazed.len(), 1);
+        assert!(
+            grazed[0].area_mm2() < 400.0 - 1e-4,
+            "analytical erase_circle must detect 0.9997*r grazing (area={})",
+            grazed[0].area_mm2()
+        );
+
+        // Open cubic curve trimmed by disk preserves curved handles on surviving pieces
+        let curve = BezierPath::from_subpath(Subpath {
+            nodes: vec![
+                PathNode::new(
+                    Point2D::new(0.0, 10.0),
+                    None,
+                    Some(Point2D::new(10.0, 0.0)),
+                    NodeKind::Smooth,
+                ),
+                PathNode::new(
+                    Point2D::new(40.0, 10.0),
+                    Some(Point2D::new(30.0, 20.0)),
+                    None,
+                    NodeKind::Smooth,
+                ),
+            ],
+            closed: false,
+        });
+        let trimmed = erase_circle(&curve, Point2D::new(20.0, 10.0), 6.0);
+        assert_eq!(trimmed.len(), 2);
+        assert!(trimmed.iter().all(|p| p.subpaths[0]
+            .nodes
+            .iter()
+            .any(|n| n.handle_in.is_some() || n.handle_out.is_some())));
+    }
+
+    #[test]
+    fn geometry_knife_and_vsd_refit_cubic_curves() {
+        let circle = ParametricShape::Ellipse {
+            rx: 20.0,
+            ry: 20.0,
+            mode: EllipseMode::Full,
+            start_deg: 0.0,
+            end_deg: 360.0,
+        }
+        .to_bezier_path()
+        .transformed(&Affine2D::translate(30.0, 30.0));
+        let halves = knife_cut(
+            &circle,
+            Point2D::new(30.0, 0.0),
+            Point2D::new(30.0, 60.0),
+            true,
+        );
+        assert_eq!(halves.len(), 2);
+        for h in &halves {
+            assert!(
+                h.node_count() <= 12,
+                "knife refit bloated to {} nodes",
+                h.node_count()
+            );
+            assert!(h.subpaths[0]
+                .nodes
+                .iter()
+                .any(|n| n.handle_in.is_some() || n.handle_out.is_some()));
+        }
+
+        // Virtual segment delete on an open cubic curve refits curved geometry
+        let arc = ParametricShape::Ellipse {
+            rx: 20.0,
+            ry: 20.0,
+            mode: EllipseMode::Arc,
+            start_deg: 0.0,
+            end_deg: 180.0,
+        }
+        .to_bezier_path();
+        let cutter = BezierPath::from_line(Point2D::new(0.0, -5.0), Point2D::new(0.0, 25.0));
+        let vsd = virtual_segment_delete(&arc, &[cutter], Point2D::new(-14.14, 14.14), 3.0);
+        assert!(!vsd.is_empty());
+        assert!(vsd.node_count() <= 10);
+        assert!(vsd.subpaths[0]
+            .nodes
+            .iter()
+            .any(|n| n.handle_in.is_some() || n.handle_out.is_some()));
+    }
+
+    #[test]
+    fn geometry_bspline_evaluation_and_bva_safety() {
+        let bs = BSplineCurve {
+            control_points: vec![
+                Point2D::new(30.0, 140.0),
+                Point2D::new(60.0, 110.0),
+                Point2D::new(100.0, 115.0),
+                Point2D::new(125.0, 145.0),
+                Point2D::new(80.0, 165.0),
+            ],
+            degree: 3,
+            knots: vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+            closed: true,
+        };
+        let path = bs.to_bezier_path();
+        assert!(!path.is_empty());
+        assert!(path.area_mm2() > 500.0);
+
+        // Degenerate inputs must not panic
+        let deg = BSplineCurve {
+            control_points: vec![Point2D::new(10.0, 10.0)],
+            degree: 0,
+            knots: vec![0.0],
+            closed: false,
+        };
+        assert!(deg.to_bezier_path().is_empty());
+        assert_eq!(deg.evaluate(0.5), Some(Point2D::new(10.0, 10.0)));
+    }
+
+    #[test]
+    fn continuity_enforce_preserves_dragged_handle_and_handles_cusp_and_folded() {
+        let mut smooth = PathNode::new(
+            Point2D::new(50.0, 50.0),
+            Some(Point2D::new(30.0, 50.0)),
+            Some(Point2D::new(60.0, 40.0)),
+            NodeKind::Smooth,
+        );
+        smooth.enforce_continuity_for_handle(true);
+        assert_eq!(smooth.handle_in, Some(Point2D::new(30.0, 50.0)));
+        let out_vec = smooth.handle_out.unwrap() - smooth.pos;
+        assert!((out_vec.y).abs() < 1e-9 && out_vec.x > 0.0);
+        assert!((out_vec.length() - 10.0_f64.hypot(10.0)).abs() < 1e-6);
+
+        let mut sym = PathNode::new(
+            Point2D::new(10.0, 10.0),
+            Some(Point2D::new(0.0, 10.0)),
+            Some(Point2D::new(10.0, 25.0)),
+            NodeKind::Symmetrical,
+        );
+        sym.enforce_continuity_for_handle(false);
+        assert_eq!(sym.handle_out, Some(Point2D::new(10.0, 25.0)));
+        assert_eq!(sym.handle_in, Some(Point2D::new(10.0, -5.0)));
+
+        // Folded handles (identical side) still align via enforce_continuity
+        let mut folded = PathNode::new(
+            Point2D::new(0.0, 0.0),
+            Some(Point2D::new(10.0, 0.0)),
+            Some(Point2D::new(10.0, 0.0)),
+            NodeKind::Symmetrical,
+        );
+        folded.enforce_continuity();
+        assert_eq!(folded.handle_in, Some(Point2D::new(10.0, 0.0)));
+        assert_eq!(folded.handle_out, Some(Point2D::new(-10.0, 0.0)));
+
+        // Cusp remains independent
+        let mut cusp = PathNode::new(
+            Point2D::new(0.0, 0.0),
+            Some(Point2D::new(-5.0, 0.0)),
+            Some(Point2D::new(0.0, 8.0)),
+            NodeKind::Cusp,
+        );
+        cusp.enforce_continuity_for_handle(true);
+        assert_eq!(cusp.handle_out, Some(Point2D::new(0.0, 8.0)));
+    }
+
+    #[test]
+    fn smart_drawing_triangle_rectangle_and_freehand_modes() {
+        let rect_pts = vec![
+            Point2D::new(0.0, 0.0),
+            Point2D::new(40.0, 0.0),
+            Point2D::new(40.0, 20.0),
+            Point2D::new(0.0, 20.0),
+            Point2D::new(0.0, 0.0),
+        ];
+        assert!(matches!(
+            SmartDrawing::recognize_rough_stroke(&rect_pts),
+            RecognizedShape::Rectangle { .. }
+        ));
+
+        let tri_pts = vec![
+            Point2D::new(0.0, 0.0),
+            Point2D::new(30.0, 0.0),
+            Point2D::new(15.0, 25.0),
+            Point2D::new(0.0, 0.0),
+        ];
+        assert!(matches!(
+            SmartDrawing::recognize_rough_stroke(&tri_pts),
+            RecognizedShape::Triangle { .. }
+        ));
+    }
+
+    #[test]
+    fn smart_drawing_freehand_handles_degenerate_input() {
+        let single = [Point2D::new(5.0, 5.0)];
+        let res = SmartDrawing::recognize_rough_stroke(&single);
+        assert!(matches!(res, RecognizedShape::Freehand(_)));
+        let nan_pts = [
+            Point2D::new(f64::NAN, 0.0),
+            Point2D::new(0.0, f64::INFINITY),
+        ];
+        assert!(SmartDrawing::recognize_rough_stroke(&nan_pts)
+            .to_bezier_path()
+            .is_empty());
+    }
+
+    #[test]
+    fn artistic_media_preset_brush_expression_and_sprayer() {
+        let spine = BezierPath::from_line(Point2D::new(0.0, 0.0), Point2D::new(60.0, 0.0));
+        let preset = ArtisticMedia::expand_stroke(
+            &spine,
+            &ArtisticMediaStyle::Preset {
+                max_width_mm: 8.0,
+                profile: ArtisticWidthProfile::TaperBoth,
+            },
+        );
+        assert!(preset.area_mm2() > 150.0);
+
+        let sprayer = ArtisticMedia::expand_stroke(
+            &spine,
+            &ArtisticMediaStyle::Sprayer {
+                spacing_mm: 10.0,
+                size_mm: 4.0,
+                scatter_mm: 1.0,
+                seed: 7,
+            },
+        );
+        assert!(sprayer.subpaths.len() >= 5);
+    }
+
+    #[test]
+    fn artistic_media_handles_degenerate_zero_length_spine() {
+        let single = BezierPath::from_polygon([Point2D::new(10.0, 10.0)], false);
+        let out = ArtisticMedia::expand_stroke(
+            &single,
+            &ArtisticMediaStyle::Calligraphic {
+                width_mm: 0.0,
+                angle_deg: 45.0,
+            },
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn erase_circle_engulfing_compound_donut_hole_preserves_eraser_hole() {
+        let outer = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let mut hole = BezierPath::from_rect(Rect2D::from_xywh(40.0, 40.0, 20.0, 20.0));
+        if (outer.signed_area_mm2() >= 0.0) == (hole.signed_area_mm2() >= 0.0) {
+            hole.subpaths[0].reverse();
+        }
+        let donut = BezierPath {
+            subpaths: vec![outer.subpaths[0].clone(), hole.subpaths[0].clone()],
+        };
+        assert!((donut.area_mm2() - 9600.0).abs() < 1.0);
+
+        let erased = erase_circle(&donut, Point2D::new(50.0, 50.0), 15.0);
+        assert_eq!(erased.len(), 1);
+        assert_eq!(erased[0].subpaths.len(), 2);
+        let expected_area = 10000.0 - std::f64::consts::PI * 225.0;
+        assert!(
+            (erased[0].area_mm2() - expected_area).abs() < 1.0,
+            "expected ~{expected_area:.2}, got {:.2}",
+            erased[0].area_mm2()
+        );
     }
 }

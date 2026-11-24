@@ -6,6 +6,17 @@ use super::*;
 // Multi-Document Tab Model
 // =============================================================================
 
+/// Isolated symbol-editing session stored on [`DocumentTab`] while editing a [`SymbolDef`].
+pub struct SymbolEditSession {
+    pub symbol_id: SymbolId,
+    pub symbol_name: String,
+    pub backup_document: Document,
+    pub backup_history: CommandHistory,
+    pub backup_selection: Vec<ObjectId>,
+    pub backup_active_layer_id: Option<LayerId>,
+    pub root_id_map: HashMap<ObjectId, ObjectId>,
+}
+
 /// Independent document session tab holding scene graph, history, viewport, and render cache.
 pub struct DocumentTab {
     pub id: Uuid,
@@ -46,6 +57,7 @@ pub struct DocumentTab {
     pub separations_preview: Option<SeparationResult>,
     pub active_separation_channel: Option<usize>,
     pub powerclip_edit_id: Option<ObjectId>,
+    pub editing_symbol: Option<SymbolEditSession>,
     pub last_metrics: ProductionMetrics,
     pub metrics_dirty: bool,
     pub preflight_report: Option<PreflightReport>,
@@ -111,6 +123,7 @@ impl DocumentTab {
             separations_preview: None,
             active_separation_channel: None,
             powerclip_edit_id: None,
+            editing_symbol: None,
             last_metrics: metrics,
             metrics_dirty: false,
             preflight_report: None,

@@ -236,6 +236,43 @@ fn emit_dxf_object_entities(
                 out,
             );
         }
+        NodePayload::BSpline(bs) => {
+            emit_dxf_path(
+                page,
+                &bs.to_bezier_path().transformed(&world_xf),
+                layer_name,
+                opts,
+                out,
+            );
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            emit_dxf_path(
+                page,
+                &coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf),
+                layer_name,
+                opts,
+                out,
+            );
+        }
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut resolved = obj.clone();
+                resolved.payload = p;
+                resolved.fill = f;
+                resolved.outline = o;
+                emit_dxf_object_entities(
+                    doc,
+                    page,
+                    &resolved,
+                    parent_xf,
+                    layer_name,
+                    opts,
+                    out,
+                    depth + 1,
+                    visited,
+                );
+            }
+        }
         NodePayload::Table(t) => {
             emit_dxf_path(
                 page,
@@ -700,6 +737,19 @@ fn collect_vector_paths(
     match &obj.payload {
         NodePayload::Path(p) => out.push(p.transformed(&world_xf)),
         NodePayload::Shape(s) => out.push(s.to_bezier_path().transformed(&world_xf)),
+        NodePayload::BSpline(bs) => out.push(bs.to_bezier_path().transformed(&world_xf)),
+        NodePayload::ArtisticMedia { spine, style } => {
+            out.push(coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf))
+        }
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut resolved = obj.clone();
+                resolved.payload = p;
+                resolved.fill = f;
+                resolved.outline = o;
+                collect_vector_paths(doc, &resolved, parent_xf, out, depth + 1, visited);
+            }
+        }
         NodePayload::Table(t) => out.push(t.to_grid_paths().transformed(&world_xf)),
         NodePayload::Connector(c) => {
             let (a, b) = doc.resolve_connector_endpoints(c);

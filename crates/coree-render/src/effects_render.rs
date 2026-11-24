@@ -13,9 +13,9 @@ use crate::backend::{
 use crate::raster_engine::gaussian_blur_rgba;
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
-    offset_polygon, Affine2D, BezierPath, BlendMode, Color, ContourMode, Document, Effect,
-    EnvelopeMode, FeatherDirection, Fill, NodePayload, OutlineStyle, PathNode, Point2D,
-    SceneObject, Subpath, TransparencyMode, Vec2D,
+    offset_polygon, Affine2D, ArtisticMedia, BevelStyle, BezierPath, BlendMode, Color, ContourMode,
+    Document, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection, Fill, NodePayload,
+    OutlineStyle, PathNode, Perspective3x3, Point2D, SceneObject, Subpath, TransparencyMode, Vec2D,
 };
 
 /// Applies all path-deforming live effects (`Distort`, `Envelope`, `Perspective`)
@@ -220,6 +220,27 @@ pub fn render_underlay_effects(
                     backend,
                 );
             }
+            Effect::Extrude3D {
+                vanishing_point,
+                depth,
+                bevel_depth: _,
+                shade_color,
+                rotation_3d,
+                lights,
+            } => {
+                render_extrude_3d(
+                    &page_world_path,
+                    shade_color,
+                    *vanishing_point,
+                    *depth,
+                    *rotation_3d,
+                    lights,
+                    page_to_surface,
+                    obj.opacity,
+                    anti_alias,
+                    backend,
+                );
+            }
             _ => {}
         }
     }
@@ -268,7 +289,7 @@ pub fn render_overlay_effects(
                     );
                 }
             }
-            Effect::Extrude25D { bevel_depth, .. } => {
+            Effect::Extrude25D { bevel_depth, .. } | Effect::Extrude3D { bevel_depth, .. } => {
                 let bevel = sanitize_f64(*bevel_depth, 0.0).max(0.0);
                 if bevel > 0.05 && !world_path.is_empty() {
                     if let Ok(inner) = offset_polygon(&world_path, -bevel.min(4.0)) {
@@ -285,6 +306,53 @@ pub fn render_overlay_effects(
                         }
                     }
                 }
+            }
+            Effect::InnerShadow {
+                dx_mm,
+                dy_mm,
+                blur_mm,
+                opacity,
+                color,
+                feather_direction,
+            } => {
+                render_inner_shadow(
+                    &world_path,
+                    page_to_screen,
+                    *dx_mm,
+                    *dy_mm,
+                    *blur_mm,
+                    *opacity * obj.opacity,
+                    color,
+                    *feather_direction,
+                    px_per_mm,
+                    backend,
+                );
+            }
+            Effect::Bevel {
+                style,
+                distance_mm,
+                softness_mm,
+                light_angle_deg,
+                altitude_deg,
+                highlight_color,
+                shadow_color,
+                intensity,
+            } => {
+                render_bevel_effect(
+                    &world_path,
+                    *style,
+                    *distance_mm,
+                    *softness_mm,
+                    *light_angle_deg,
+                    *altitude_deg,
+                    highlight_color,
+                    shadow_color,
+                    *intensity * obj.opacity,
+                    page_to_screen,
+                    px_per_mm,
+                    anti_alias,
+                    backend,
+                );
             }
             _ => {}
         }
@@ -794,6 +862,429 @@ fn render_extrude_25d(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_inner_shadow(
+    world_path: &BezierPath,
+    page_to_screen: Affine2D,
+    dx_mm: f64,
+    dy_mm: f64,
+    blur_mm: f64,
+    opacity: f32,
+    color: &Color,
+    feather: FeatherDirection,
+    px_per_mm: f64,
+    backend: &mut dyn CanvasBackend,
+) {
+    let op = sanitize_f32(opacity, 0.5).clamp(0.0, 1.0);
+    if op <= 1e-5 || world_path.is_empty() {
+        return;
+    }
+    let Some(wb) = world_path.bounding_box() else {
+        return;
+    };
+    let blur_px = (sanitize_f64(blur_mm, 0.0).max(0.0) * px_per_mm).min(128.0) as f32;
+    let pad_px = ((blur_px.ceil() as i32) * 3 + 2).min(256);
+    let sb = page_to_screen.transform_rect(wb);
+    let Some(clamped) = PixelRect::from_f64_rect_clamped(sb, 2, backend.width(), backend.height())
+    else {
+        return;
+    };
+
+    let full_x0 = (sb.min_x.floor() - f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_y0 = (sb.min_y.floor() - f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_x1 = (sb.max_x.ceil() + f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_y1 = (sb.max_y.ceil() + f64::from(pad_px)).clamp(-1e9, 1e9) as i64;
+    let full_w_i64 = full_x1.saturating_sub(full_x0);
+    let full_h_i64 = full_y1.saturating_sub(full_y0);
+    let (work_x, work_y, work_w, work_h, crop_x, crop_y) = if full_w_i64 > 0
+        && full_h_i64 > 0
+        && full_w_i64 <= 4096
+        && full_h_i64 <= 4096
+        && validate_surface_dimensions(full_w_i64 as u32, full_h_i64 as u32).is_ok()
+    {
+        (
+            full_x0,
+            full_y0,
+            full_w_i64 as u32,
+            full_h_i64 as u32,
+            (i64::from(clamped.x) - full_x0).max(0) as usize,
+            (i64::from(clamped.y) - full_y0).max(0) as usize,
+        )
+    } else {
+        (
+            i64::from(clamped.x),
+            i64::from(clamped.y),
+            clamped.width,
+            clamped.height,
+            0usize,
+            0usize,
+        )
+    };
+
+    let Ok(mut mask_sub) = TinySkiaBackend::new(work_w, work_h) else {
+        return;
+    };
+    let Ok(mut cast_sub) = TinySkiaBackend::new(work_w, work_h) else {
+        return;
+    };
+    mask_sub.clear(Color::TRANSPARENT);
+    cast_sub.clear(Color::TRANSPARENT);
+
+    let local_xf = Affine2D::translate(-(work_x as f64), -(work_y as f64)).compose(&page_to_screen);
+    let white = BackendPaint::solid(Color::WHITE);
+    mask_sub.fill_path(world_path, &white, FillRule::EvenOdd, local_xf);
+
+    let shifted_world = world_path.transformed(&Affine2D::translate(
+        sanitize_f64(dx_mm, 0.0),
+        sanitize_f64(dy_mm, 0.0),
+    ));
+    cast_sub.fill_path(&shifted_world, &white, FillRule::EvenOdd, local_xf);
+
+    let mask_buf = mask_sub.into_rgba();
+    let cast_buf = cast_sub.into_rgba();
+    let blurred_cast = if blur_px > 0.2 {
+        gaussian_blur_rgba(&cast_buf.rgba, cast_buf.width, cast_buf.height, blur_px)
+    } else {
+        cast_buf.rgba.clone()
+    };
+
+    let [cr, cg, cb, ca] = color.to_rgba8();
+    let eff_alpha_scale = (f32::from(ca) / 255.0) * op;
+    let cw = clamped.width as usize;
+    let ch = clamped.height as usize;
+    let ww = work_w as usize;
+    let wh = work_h as usize;
+    let mut final_rgba = Vec::with_capacity(cw * ch * 4);
+    for ly in 0..ch {
+        let sy = ly + crop_y;
+        for lx in 0..cw {
+            let sx = lx + crop_x;
+            if sx < ww && sy < wh {
+                let pidx = (sy * ww + sx) * 4;
+                let inside_a = f32::from(mask_buf.rgba[pidx + 3]) / 255.0;
+                let raw_inv = 255_u8.saturating_sub(cast_buf.rgba[pidx + 3]);
+                let blur_inv = 255_u8.saturating_sub(blurred_cast[pidx + 3]);
+                let shaped = match feather {
+                    FeatherDirection::Middle | FeatherDirection::Average => blur_inv,
+                    FeatherDirection::Inside => blur_inv.max(raw_inv),
+                    FeatherDirection::Outside => blur_inv.min(raw_inv),
+                };
+                let out_a = (inside_a * f32::from(shaped) * eff_alpha_scale)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                final_rgba.extend_from_slice(&[cr, cg, cb, out_a]);
+            } else {
+                final_rgba.extend_from_slice(&[cr, cg, cb, 0]);
+            }
+        }
+    }
+    backend.composite_region(
+        clamped,
+        &RgbaBuffer {
+            width: clamped.width,
+            height: clamped.height,
+            rgba: final_rgba,
+        },
+        1.0,
+        BlendMode::Normal,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_bevel_effect(
+    world_path: &BezierPath,
+    style: BevelStyle,
+    distance_mm: f64,
+    softness_mm: f64,
+    light_angle_deg: f64,
+    altitude_deg: f64,
+    highlight_color: &Color,
+    shadow_color: &Color,
+    intensity: f32,
+    page_to_screen: Affine2D,
+    px_per_mm: f64,
+    anti_alias: bool,
+    backend: &mut dyn CanvasBackend,
+) {
+    let inten = sanitize_f32(intensity, 0.75).clamp(0.0, 1.0);
+    if inten <= 1e-5 || world_path.is_empty() {
+        return;
+    }
+    let dist = sanitize_f64(distance_mm, 2.5).clamp(0.15, 25.0);
+    let Some(wb) = world_path.bounding_box() else {
+        return;
+    };
+    let ang = sanitize_f64(light_angle_deg, 135.0).to_radians();
+    let alt = sanitize_f64(altitude_deg, 45.0)
+        .clamp(5.0, 89.0)
+        .to_radians();
+    let light_dir = Vec2D::new(ang.cos(), ang.sin());
+    let alt_boost = alt.cos().clamp(0.25, 1.0);
+    let soft_px = (sanitize_f64(softness_mm, 0.5).max(0.0) * px_per_mm).min(24.0) as f32;
+    let expand_mm = match style {
+        BevelStyle::Emboss => dist + 1.0,
+        BevelStyle::SoftEdge => 1.0,
+    };
+    let sb = page_to_screen.transform_rect(wb.expand(expand_mm));
+    let pad_px = ((soft_px.ceil() as i32) * 2 + 2).min(64);
+    let Some(clamped) =
+        PixelRect::from_f64_rect_clamped(sb, pad_px, backend.width(), backend.height())
+    else {
+        return;
+    };
+    let Ok(mut bevel_sub) = TinySkiaBackend::new(clamped.width, clamped.height) else {
+        return;
+    };
+    bevel_sub.clear(Color::TRANSPARENT);
+    let local_xf =
+        Affine2D::translate(-f64::from(clamped.x), -f64::from(clamped.y)).compose(&page_to_screen);
+
+    let clip_inside = matches!(style, BevelStyle::SoftEdge);
+    if clip_inside {
+        bevel_sub.push_clip(world_path, FillRule::EvenOdd, local_xf);
+    }
+
+    let c_center = wb.center();
+    for poly in world_path.flatten(0.15) {
+        if poly.len() < 3 {
+            continue;
+        }
+        let n = poly.len();
+        for i in 0..(n - 1) {
+            let p0 = poly[i];
+            let p1 = poly[i + 1];
+            let seg = p1 - p0;
+            if seg.length() <= 1e-5 {
+                continue;
+            }
+            let dir = seg / seg.length();
+            let cand_n = Vec2D::new(-dir.y, dir.x);
+            let mid = p0.lerp(p1, 0.5);
+            let inward = if (c_center - mid).dot(cand_n) >= 0.0 {
+                cand_n
+            } else {
+                cand_n * -1.0
+            };
+            let outward = inward * -1.0;
+            let raw_dot = outward.dot(light_dir) * alt_boost;
+            let (is_hi, strength) = (raw_dot >= 0.0, raw_dot.abs());
+            let col = if is_hi {
+                highlight_color.clone()
+            } else {
+                shadow_color.clone()
+            };
+            let edge_alpha = (strength as f32 * inten * 0.85).clamp(0.05, 0.95);
+            let (q0, q1, q2, q3) = match style {
+                BevelStyle::Emboss => (
+                    p0 - inward * (dist * 0.5),
+                    p1 - inward * (dist * 0.5),
+                    p1 + inward * (dist * 0.5),
+                    p0 + inward * (dist * 0.5),
+                ),
+                BevelStyle::SoftEdge => (p0, p1, p1 + inward * dist, p0 + inward * dist),
+            };
+            let quad = BezierPath::from_polygon([q0, q1, q2, q3], true);
+            let paint = BackendPaint {
+                shader: crate::backend::PaintShader::Solid(col),
+                opacity: edge_alpha,
+                blend_mode: BlendMode::Normal,
+                anti_alias,
+            };
+            bevel_sub.fill_path(&quad, &paint, FillRule::Winding, local_xf);
+        }
+    }
+    if clip_inside {
+        bevel_sub.pop_clip();
+    }
+
+    let mut buf = bevel_sub.into_rgba();
+    if soft_px > 0.25 {
+        buf.rgba = gaussian_blur_rgba(&buf.rgba, buf.width, buf.height, soft_px);
+    }
+    backend.composite_region(clamped, &buf, 1.0, BlendMode::Normal);
+}
+
+fn rotate_pt_3d(p: [f64; 3], rot_deg: [f64; 3]) -> [f64; 3] {
+    let rx = sanitize_f64(rot_deg[0], 0.0).to_radians();
+    let ry = sanitize_f64(rot_deg[1], 0.0).to_radians();
+    let rz = sanitize_f64(rot_deg[2], 0.0).to_radians();
+
+    let (sx, cx) = rx.sin_cos();
+    let (sy, cy) = ry.sin_cos();
+    let (sz, cz) = rz.sin_cos();
+
+    let (x0, y0, z0) = (p[0], p[1], p[2]);
+    // Rx
+    let y1 = y0 * cx - z0 * sx;
+    let z1 = y0 * sx + z0 * cx;
+    let x1 = x0;
+    // Ry
+    let x2 = x1 * cy + z1 * sy;
+    let z2 = -x1 * sy + z1 * cy;
+    let y2 = y1;
+    // Rz
+    let x3 = x2 * cz - y2 * sz;
+    let y3 = x2 * sz + y2 * cz;
+    [x3, y3, z2]
+}
+
+fn shade_color_by_lights(base: &Color, normal: [f64; 3], lights: &[ExtrudeLight]) -> Color {
+    let [br, bg, bb, ba] = base.to_rgba8();
+    let mut r_acc = f64::from(br) / 255.0 * 0.22;
+    let mut g_acc = f64::from(bg) / 255.0 * 0.22;
+    let mut b_acc = f64::from(bb) / 255.0 * 0.22;
+    let default_lights = [ExtrudeLight {
+        dir: [0.45, -0.6, 0.65],
+        intensity: 0.9,
+    }];
+    let used = if lights.is_empty() {
+        &default_lights[..]
+    } else {
+        lights
+    };
+    let n_len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+        .sqrt()
+        .max(1e-9);
+    let n = [normal[0] / n_len, normal[1] / n_len, normal[2] / n_len];
+    for l in used {
+        let ld = [
+            f64::from(l.dir[0]),
+            f64::from(l.dir[1]),
+            f64::from(l.dir[2]),
+        ];
+        let l_len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
+            .sqrt()
+            .max(1e-9);
+        let dot = ((n[0] * ld[0] + n[1] * ld[1] + n[2] * ld[2]) / l_len).max(0.0);
+        let inten = f64::from(sanitize_f32(l.intensity, 0.8).clamp(0.0, 3.0));
+        r_acc += (f64::from(br) / 255.0) * dot * inten;
+        g_acc += (f64::from(bg) / 255.0) * dot * inten;
+        b_acc += (f64::from(bb) / 255.0) * dot * inten;
+    }
+    Color::rgba(
+        r_acc.clamp(0.0, 1.0) as f32,
+        g_acc.clamp(0.0, 1.0) as f32,
+        b_acc.clamp(0.0, 1.0) as f32,
+        f32::from(ba) / 255.0,
+    )
+}
+
+fn compute_extrude_3d_faces(
+    world_path: &BezierPath,
+    base_color: &Color,
+    vanishing_point: Point2D,
+    depth: f64,
+    rotation_3d: [f64; 3],
+    lights: &[ExtrudeLight],
+) -> Vec<(Vec<Point2D>, Color)> {
+    let mut out = Vec::new();
+    let Some(wb) = world_path.bounding_box() else {
+        return out;
+    };
+    let d = sanitize_f64(depth, 15.0).clamp(0.5, 500.0);
+    let center = wb.center();
+    let focal = 250.0;
+    let project_3d = |p3: [f64; 3]| -> Point2D {
+        let z_eff = (p3[2] + d * 0.5).clamp(-focal * 0.85, focal * 2.0);
+        let persp_scale = focal / (focal - z_eff * 0.45);
+        let raw_2d = Point2D::new(
+            center.x + p3[0] * persp_scale,
+            center.y + p3[1] * persp_scale,
+        );
+        let back_t = ((-p3[2]) / d).clamp(0.0, 1.0) * 0.35;
+        if vanishing_point.is_finite() {
+            raw_2d.lerp(vanishing_point, back_t)
+        } else {
+            raw_2d
+        }
+    };
+
+    let mut tagged: Vec<(f64, Vec<Point2D>, Color)> = Vec::new();
+    for poly in world_path.flatten(0.2) {
+        if poly.len() < 3 {
+            continue;
+        }
+        let front3: Vec<[f64; 3]> = poly
+            .iter()
+            .map(|p| {
+                let r = rotate_pt_3d([p.x - center.x, p.y - center.y, d * 0.5], rotation_3d);
+                [r[0], r[1], r[2] - d * 0.5]
+            })
+            .collect();
+        let back3: Vec<[f64; 3]> = poly
+            .iter()
+            .map(|p| {
+                let r = rotate_pt_3d([p.x - center.x, p.y - center.y, -d * 0.5], rotation_3d);
+                [r[0], r[1], r[2] - d * 0.5]
+            })
+            .collect();
+        let back2: Vec<Point2D> = back3.iter().map(|&p| project_3d(p)).collect();
+        let back_avg_z = back3.iter().map(|p| p[2]).sum::<f64>() / back3.len() as f64;
+        let back_col = shade_color_by_lights(base_color, [0.0, 0.0, -1.0], lights);
+        tagged.push((back_avg_z, back2, back_col));
+
+        for i in 0..(poly.len() - 1) {
+            let f0 = front3[i];
+            let f1 = front3[i + 1];
+            let b1 = back3[i + 1];
+            let b0 = back3[i];
+            let u = [f1[0] - f0[0], f1[1] - f0[1], f1[2] - f0[2]];
+            let v = [b0[0] - f0[0], b0[1] - f0[1], b0[2] - f0[2]];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let avg_z = (f0[2] + f1[2] + b1[2] + b0[2]) * 0.25;
+            let quad = vec![
+                project_3d(f0),
+                project_3d(f1),
+                project_3d(b1),
+                project_3d(b0),
+            ];
+            let shade = shade_color_by_lights(base_color, n, lights);
+            tagged.push((avg_z, quad, shade));
+        }
+    }
+    tagged.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, quad, shade) in tagged {
+        out.push((quad, shade));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_extrude_3d(
+    world_path: &BezierPath,
+    base_color: &Color,
+    vanishing_point: Point2D,
+    depth: f64,
+    rotation_3d: [f64; 3],
+    lights: &[ExtrudeLight],
+    page_to_screen: Affine2D,
+    opacity: f32,
+    anti_alias: bool,
+    backend: &mut dyn CanvasBackend,
+) {
+    for (quad, color) in compute_extrude_3d_faces(
+        world_path,
+        base_color,
+        vanishing_point,
+        depth,
+        rotation_3d,
+        lights,
+    ) {
+        let quad_path = BezierPath::from_polygon(quad, true);
+        let paint = BackendPaint {
+            shader: crate::backend::PaintShader::Solid(color),
+            opacity,
+            blend_mode: BlendMode::Normal,
+            anti_alias,
+        };
+        backend.fill_path(&quad_path, &paint, FillRule::Winding, page_to_screen);
+    }
+}
+
 struct ComputedBlendStep {
     path: BezierPath,
     fill: Color,
@@ -1077,51 +1568,21 @@ fn apply_perspective_to_path_in_bounds(
 
 /// Solves the exact 2D projective homography mapping `[0,1]²` -> `quad[TL, TR, BR, BL]`.
 fn solve_unit_square_homography(q: &[Point2D; 4]) -> Option<[f64; 8]> {
-    // Source corners: (0,0)->q0, (1,0)->q1, (1,1)->q2, (0,1)->q3
-    let src = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-    let mut a = [[0.0_f64; 9]; 8];
-    for i in 0..4 {
-        let (u, v) = src[i];
-        let (x, y) = (q[i].x, q[i].y);
-        a[2 * i] = [u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v, x];
-        a[2 * i + 1] = [0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v, y];
+    let h = Perspective3x3::from_unit_square_to_quad(q)?;
+    let d = h.m[8];
+    if d.abs() <= 1e-10 {
+        return None;
     }
-    // Gaussian elimination with partial pivoting
-    for col in 0..8 {
-        let mut pivot_row = col;
-        let mut max_val = a[col][col].abs();
-        for (r, row) in a.iter().enumerate().skip(col + 1) {
-            if row[col].abs() > max_val {
-                max_val = row[col].abs();
-                pivot_row = r;
-            }
-        }
-        if max_val < 1e-10 {
-            return None;
-        }
-        a.swap(col, pivot_row);
-        let div = a[col][col];
-        for cell in a[col].iter_mut().skip(col) {
-            *cell /= div;
-        }
-        for r in 0..8 {
-            if r == col {
-                continue;
-            }
-            let factor = a[r][col];
-            for c in col..9 {
-                a[r][c] -= factor * a[col][c];
-            }
-        }
-    }
-    let mut res = [0.0_f64; 8];
-    for i in 0..8 {
-        if !a[i][8].is_finite() {
-            return None;
-        }
-        res[i] = a[i][8];
-    }
-    Some(res)
+    Some([
+        h.m[0] / d,
+        h.m[1] / d,
+        h.m[2] / d,
+        h.m[3] / d,
+        h.m[4] / d,
+        h.m[5] / d,
+        h.m[6] / d,
+        h.m[7] / d,
+    ])
 }
 
 fn eval_quad(p0: Point2D, p1: Point2D, p2: Point2D, t: f64) -> Point2D {
@@ -1205,12 +1666,21 @@ fn centroid(pts: &[Point2D]) -> Point2D {
 /// Helper to build a single world-space `BezierPath` from an object's base geometry (if any).
 #[must_use]
 pub fn extract_local_geometry_path(obj: &SceneObject) -> Option<BezierPath> {
-    match &obj.payload {
+    let base = match &obj.payload {
         NodePayload::Path(p) => Some(p.clone()),
         NodePayload::Shape(s) => Some(s.to_bezier_path()),
+        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+        NodePayload::ArtisticMedia { spine, style } => {
+            Some(ArtisticMedia::expand_stroke(spine, style))
+        }
         NodePayload::PowerClip { container, .. } => Some((**container).clone()),
         _ => None,
-    }
+    }?;
+    Some(if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&base)
+    } else {
+        base
+    })
 }
 
 /// Ensures every node in `path` is valid & finite (guard against NaN effect parameters).
@@ -1356,6 +1826,33 @@ pub fn lower_effects_to_primitives(
                         &mut out,
                     );
                 }
+                Effect::Extrude3D {
+                    vanishing_point,
+                    depth,
+                    bevel_depth: _,
+                    shade_color,
+                    rotation_3d,
+                    lights,
+                } => {
+                    for (quad, shade) in compute_extrude_3d_faces(
+                        &world_path,
+                        shade_color,
+                        *vanishing_point,
+                        *depth,
+                        *rotation_3d,
+                        lights,
+                    ) {
+                        let mut face = SceneObject::new(
+                            alloc_id(),
+                            format!("{} Extrude3D{suffix}", obj.name),
+                            NodePayload::Path(BezierPath::from_polygon(quad, true)),
+                        );
+                        face.fill = Fill::Solid(shade);
+                        face.outline = OutlineStyle::none();
+                        face.opacity = obj.opacity;
+                        out.push(face);
+                    }
+                }
                 Effect::Blend {
                     target_id,
                     steps,
@@ -1419,7 +1916,7 @@ pub fn lower_effects_to_primitives(
                         &mut out,
                     );
                 }
-                Effect::Extrude25D { bevel_depth, .. } => {
+                Effect::Extrude25D { bevel_depth, .. } | Effect::Extrude3D { bevel_depth, .. } => {
                     let bevel = sanitize_f64(*bevel_depth, 0.0).max(0.0);
                     if bevel > 0.05 && !world_path.is_empty() {
                         if let Ok(inner) = offset_polygon(&world_path, -bevel.min(4.0)) {
@@ -1433,6 +1930,30 @@ pub fn lower_effects_to_primitives(
                                 bv.fill = Fill::Solid(base_color.lerp(&Color::WHITE, 0.35));
                                 bv.outline = OutlineStyle::none();
                                 bv.opacity = obj.opacity * 0.75;
+                                out.push(bv);
+                            }
+                        }
+                    }
+                }
+                Effect::Bevel {
+                    distance_mm,
+                    highlight_color,
+                    intensity,
+                    ..
+                } => {
+                    let bevel = sanitize_f64(*distance_mm, 0.0).max(0.0);
+                    if bevel > 0.05 && !world_path.is_empty() {
+                        if let Ok(inner) = offset_polygon(&world_path, -bevel.min(6.0)) {
+                            if !inner.is_empty() {
+                                let mut bv = SceneObject::new(
+                                    alloc_id(),
+                                    format!("{} Bevel{suffix}", obj.name),
+                                    NodePayload::Path(inner),
+                                );
+                                bv.fill = Fill::Solid(highlight_color.clone());
+                                bv.outline = OutlineStyle::none();
+                                bv.opacity =
+                                    (obj.opacity * sanitize_f32(*intensity, 0.5)).clamp(0.05, 1.0);
                                 out.push(bv);
                             }
                         }
@@ -1629,5 +2150,82 @@ mod tests {
             .iter()
             .any(|p| p.name.contains("DropShadow") && matches!(p.payload, NodePayload::Path(_))));
         assert!(pieces.iter().any(|p| p.name.contains("Contour")));
+    }
+
+    #[test]
+    fn add01_inner_shadow_bevel_and_extrude3d_render_cleanly() {
+        let mut backend = TinySkiaBackend::new(160, 160).unwrap();
+        backend.clear(Color::WHITE);
+        let rect_path =
+            BezierPath::from_rect(coree_core::Rect2D::from_xywh(10.0, 10.0, 60.0, 60.0));
+        let mut obj = SceneObject::new(
+            ObjectId(1),
+            "ADD-01 Test",
+            NodePayload::Path(rect_path.clone()),
+        );
+        obj.fill = Fill::Solid(Color::CYAN);
+        obj.effects.push(Effect::Extrude3D {
+            vanishing_point: Point2D::new(90.0, 10.0),
+            depth: 12.0,
+            bevel_depth: 1.0,
+            shade_color: Color::rgb(0.2, 0.5, 0.9),
+            rotation_3d: [12.0, -18.0, 0.0],
+            lights: vec![ExtrudeLight {
+                dir: [0.5, -0.5, 0.7],
+                intensity: 1.0,
+            }],
+        });
+        obj.effects.push(Effect::InnerShadow {
+            dx_mm: 4.0,
+            dy_mm: 4.0,
+            blur_mm: 2.0,
+            opacity: 0.7,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Inside,
+        });
+        obj.effects.push(Effect::Bevel {
+            style: BevelStyle::SoftEdge,
+            distance_mm: 4.0,
+            softness_mm: 1.0,
+            light_angle_deg: 135.0,
+            altitude_deg: 45.0,
+            highlight_color: Color::WHITE,
+            shadow_color: Color::BLACK,
+            intensity: 0.85,
+        });
+
+        let xf = Affine2D::scale(2.0, 2.0);
+        render_underlay_effects(
+            &Document::new_a4("E"),
+            &obj,
+            &rect_path,
+            Affine2D::IDENTITY,
+            xf,
+            xf,
+            2.0,
+            true,
+            &mut backend,
+        );
+        backend.fill_path(
+            &rect_path,
+            &BackendPaint::solid(Color::CYAN),
+            FillRule::EvenOdd,
+            xf,
+        );
+        render_overlay_effects(
+            &obj,
+            &rect_path,
+            Affine2D::IDENTITY,
+            xf,
+            2.0,
+            true,
+            &mut backend,
+        );
+        let rgba = backend.into_rgba().rgba;
+        assert!(rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[0] < 240 && px[3] > 200));
     }
 }

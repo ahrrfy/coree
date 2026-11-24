@@ -46,11 +46,10 @@ use coree_prod::{
 use coree_render::{
     apply_dodge_burn_stroke, apply_healing_stroke, clone_stamp_stroke, compute_page_layouts,
     convert_object_to_bitmap_with_bounds, create_smart_fill_object, erase_stroke, hit_test_point,
-    hit_test_powerclip_contents, lower_effects_to_primitives, paint_brush_stroke,
-    paint_brush_stroke_masked, raster_flood_fill, resample, smudge_stroke, trace_raster_to_mm,
-    DirtyTileCache, DodgeBurnMode, DynamicGuideLine, GlyphBlockFilter, OutlinePreset, RasterMask,
-    RenderOptions, SceneRenderer, SnapOptions, TextEngine, ToneRange, TraceConfig, TraceMode,
-    ViewMode, Viewport,
+    lower_effects_to_primitives, paint_brush_stroke, paint_brush_stroke_masked, raster_flood_fill,
+    resample, smudge_stroke, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
+    GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer, SnapOptions,
+    TextEngine, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
 };
 use coree_storage::{
     DifferentialSnapshotPatch, FontQuery, FontRecord, JobHandle, JobOutcome, JobPool,
@@ -1945,12 +1944,16 @@ fn command_op_touches_structure(op: &CommandOp) -> bool {
         CommandOp::TransformObjects { .. }
         | CommandOp::EditPath { .. }
         | CommandOp::EditShape { .. }
+        | CommandOp::EditBSpline { .. }
+        | CommandOp::EditArtisticMedia { .. }
         | CommandOp::EditText { .. }
         | CommandOp::EditTable { .. }
         | CommandOp::EditDimension { .. }
         | CommandOp::SetOpacity { .. }
         | CommandOp::SetBlendMode { .. }
         | CommandOp::SetLens { .. }
+        | CommandOp::SetObjectPerspective { .. }
+        | CommandOp::SetObjectColorStyleLink { .. }
         | CommandOp::AddEffect { .. }
         | CommandOp::RemoveEffect { .. }
         | CommandOp::SetObjectVisibility { .. }

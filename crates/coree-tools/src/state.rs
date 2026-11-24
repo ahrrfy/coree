@@ -7,8 +7,9 @@ use crate::builders::{
     build_interactive_effect_output, build_interactive_fill_op, build_knife_cut_op,
     build_mesh_fill_output, build_replace_effect_op, build_three_point_curve_op,
     build_three_point_shape_op, build_vector_eraser_ops, build_virtual_segment_delete_stroke_ops,
-    collect_editable_fillable_targets, collect_nodes_in_rect, compute_lasso_hits,
-    hit_test_canvas_point_opt, is_object_in_or_descendant_of_selection,
+    collect_editable_fillable_targets, collect_nodes_in_rect, compute_lasso_hits_scoped,
+    hit_test_canvas_point_opt, hit_test_canvas_point_scoped_opt,
+    hit_test_canvas_point_scoped_opt_tol, is_object_in_or_descendant_of_selection,
     order_selection_frontmost_first, resolve_sculpt_target_at, resolve_sculpt_target_in_selection,
     resolve_selected_object_at_or_first,
 };
@@ -31,7 +32,8 @@ use crate::overlay::{
 };
 use crate::types::{NodeDragPart, ParametricHandleKind, RasterBrushOp, ScaleHandle, ToolId};
 use coree_core::{
-    hit_test_node, hit_test_rect, Affine2D, BezierPath, CommandOp, DynamicGuideLine, Effect, Fill,
+    hit_test_node, hit_test_powerclip_contents_rect, hit_test_rect, Affine2D, ArtisticMedia,
+    ArtisticMediaStyle, BSplineCurve, BezierPath, CommandOp, DynamicGuideLine, Effect, Fill,
     GuideOrientation, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, ParametricShape,
     PathNode, Point2D, Rect2D, SceneObject, SnapEngine, Subpath, TransformMode, TransparencyMode,
     Vec2D,
@@ -127,6 +129,21 @@ pub enum ActiveDragState {
         handle: ParametricHandleKind,
         orig_shape: ParametricShape,
         draft_shape: ParametricShape,
+    },
+    DraggingBSplineControlPoint {
+        object_id: ObjectId,
+        cp_index: usize,
+        orig_bspline: BSplineCurve,
+        draft_bspline: BSplineCurve,
+    },
+    DraggingArtisticMediaNode {
+        object_id: ObjectId,
+        subpath_index: usize,
+        node_index: usize,
+        handle_part: NodeDragPart,
+        orig_spine: BezierPath,
+        draft_spine: BezierPath,
+        style: ArtisticMediaStyle,
     },
     Sculpting {
         object_id: ObjectId,
@@ -227,6 +244,11 @@ pub struct ToolCore {
     pub three_point_curve_chord: Option<(Point2D, Point2D)>,
     pub three_point_shape_chord: Option<(ToolId, Point2D, Point2D)>,
     pub live_sketch_strokes: Vec<Vec<Point2D>>,
+    pub live_sketch_object_id: Option<ObjectId>,
+    pub symmetry_enabled: bool,
+    pub symmetry_folds: u32,
+    pub symmetry_mirror: bool,
+    pub symmetry_origin_mm: Option<Point2D>,
     pub pending_crop_rect: Option<Rect2D>,
     pub raster_mask_rect_mm: Option<Rect2D>,
     pub selected_mesh_node: Option<(ObjectId, usize)>,
@@ -254,6 +276,11 @@ impl ToolCore {
             three_point_curve_chord: None,
             three_point_shape_chord: None,
             live_sketch_strokes: Vec::new(),
+            live_sketch_object_id: None,
+            symmetry_enabled: false,
+            symmetry_folds: 4,
+            symmetry_mirror: true,
+            symmetry_origin_mm: None,
             pending_crop_rect: None,
             raster_mask_rect_mm: None,
             selected_mesh_node: None,
@@ -291,6 +318,7 @@ impl ToolCore {
         self.three_point_curve_chord = None;
         self.three_point_shape_chord = None;
         self.live_sketch_strokes.clear();
+        self.live_sketch_object_id = None;
     }
 
     /// Pops the last point from an active Bezier/Pen/B-Spline/Polyline draft.
@@ -853,7 +881,11 @@ impl ToolCore {
                 }
 
                 // 2. Hit object -> MoveSelection (or PowerClip enter/exit on Ctrl+Click)
-                let hit = hit_test_canvas_point_opt(ctx, pt);
+                let hit = if ctrl {
+                    hit_test_canvas_point_opt(ctx, pt)
+                } else {
+                    hit_test_canvas_point_scoped_opt(ctx, pt)
+                };
                 if ctrl {
                     let hit_is_pc = hit.filter(|&hid| {
                         matches!(
@@ -952,6 +984,76 @@ impl ToolCore {
                 }
             }
             ToolId::ShapeNode => {
+                let bspline_tol = ctx.hit_tol_mm(8.0, 1.5);
+                for &oid in &ctx.selection.objects {
+                    if !is_object_editable_in_doc(ctx.document, oid) {
+                        continue;
+                    }
+                    let Some(obj) = ctx.document.object(oid) else {
+                        continue;
+                    };
+                    if let NodePayload::BSpline(ref bs) = obj.payload {
+                        let xf = world_transform_of_or_local(ctx.document, oid);
+                        if let Some((cp_idx, _)) = bs
+                            .control_points
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &cp)| (i, xf.transform_point(cp).distance_to(pt)))
+                            .filter(|(_, d)| *d <= bspline_tol)
+                            .min_by(|a, b| a.1.total_cmp(&b.1))
+                        {
+                            self.drag_state = ActiveDragState::DraggingBSplineControlPoint {
+                                object_id: oid,
+                                cp_index: cp_idx,
+                                orig_bspline: bs.clone(),
+                                draft_bspline: bs.clone(),
+                            };
+                            let overlay = self.finalize_overlay(self.build_overlay(ctx));
+                            return ToolOutput::Continue { overlay };
+                        }
+                    } else if let NodePayload::ArtisticMedia {
+                        ref spine,
+                        ref style,
+                    } = obj.payload
+                    {
+                        let xf = world_transform_of_or_local(ctx.document, oid);
+                        let mut best_hit: Option<(usize, usize, NodeDragPart, f64)> = None;
+                        for (sp_idx, sp) in spine.subpaths.iter().enumerate() {
+                            for (n_idx, node) in sp.nodes.iter().enumerate() {
+                                if let Some(h_in) = node.handle_in {
+                                    let d = xf.transform_point(h_in).distance_to(pt);
+                                    if d <= bspline_tol && best_hit.is_none_or(|b| d < b.3) {
+                                        best_hit = Some((sp_idx, n_idx, NodeDragPart::HandleIn, d));
+                                    }
+                                }
+                                if let Some(h_out) = node.handle_out {
+                                    let d = xf.transform_point(h_out).distance_to(pt);
+                                    if d <= bspline_tol && best_hit.is_none_or(|b| d < b.3) {
+                                        best_hit =
+                                            Some((sp_idx, n_idx, NodeDragPart::HandleOut, d));
+                                    }
+                                }
+                                let d = xf.transform_point(node.pos).distance_to(pt);
+                                if d <= bspline_tol && best_hit.is_none_or(|b| d < b.3) {
+                                    best_hit = Some((sp_idx, n_idx, NodeDragPart::Anchor, d));
+                                }
+                            }
+                        }
+                        if let Some((sp_idx, n_idx, handle_part, _)) = best_hit {
+                            self.drag_state = ActiveDragState::DraggingArtisticMediaNode {
+                                object_id: oid,
+                                subpath_index: sp_idx,
+                                node_index: n_idx,
+                                handle_part,
+                                orig_spine: spine.clone(),
+                                draft_spine: spine.clone(),
+                                style: style.clone(),
+                            };
+                            let overlay = self.finalize_overlay(self.build_overlay(ctx));
+                            return ToolOutput::Continue { overlay };
+                        }
+                    }
+                }
                 if let Some((oid, handle, orig_shape)) = hit_parametric_shape_handle_world(
                     ctx.document,
                     &ctx.selection.objects,
@@ -1689,10 +1791,11 @@ impl ToolCore {
                                     if let Some(pnode) = sp.nodes.get_mut(node.node_index) {
                                         if *handle_part == NodeDragPart::HandleIn {
                                             pnode.handle_in = Some(local_pt);
+                                            pnode.enforce_continuity_for_handle(true);
                                         } else {
                                             pnode.handle_out = Some(local_pt);
+                                            pnode.enforce_continuity_for_handle(false);
                                         }
-                                        pnode.enforce_continuity();
                                     }
                                 }
                             }
@@ -1721,8 +1824,55 @@ impl ToolCore {
                             if let Some(h0) = sp.nodes[i0].handle_out.as_mut() {
                                 *h0 = *h0 + delta * w0;
                             }
+                            sp.nodes[i0].enforce_continuity_for_handle(false);
                             if let Some(h1) = sp.nodes[i1].handle_in.as_mut() {
                                 *h1 = *h1 + delta * w1;
+                            }
+                            sp.nodes[i1].enforce_continuity_for_handle(true);
+                        }
+                    }
+                }
+            }
+            ActiveDragState::DraggingBSplineControlPoint {
+                object_id,
+                cp_index,
+                draft_bspline,
+                ..
+            } => {
+                if is_object_editable_in_doc(ctx.document, *object_id) {
+                    let inv = world_inverse_transform_of(ctx.document, *object_id);
+                    let lp = inv.transform_point(pt);
+                    if let Some(cp) = draft_bspline.control_points.get_mut(*cp_index) {
+                        *cp = lp;
+                    }
+                }
+            }
+            ActiveDragState::DraggingArtisticMediaNode {
+                object_id,
+                subpath_index,
+                node_index,
+                handle_part,
+                draft_spine,
+                ..
+            } => {
+                if is_object_editable_in_doc(ctx.document, *object_id) {
+                    let inv = world_inverse_transform_of(ctx.document, *object_id);
+                    let local_pt = inv.transform_point(pt);
+                    if let Some(sp) = draft_spine.subpaths.get_mut(*subpath_index) {
+                        if let Some(pnode) = sp.nodes.get_mut(*node_index) {
+                            match *handle_part {
+                                NodeDragPart::Anchor => {
+                                    let delta = local_pt - pnode.pos;
+                                    pnode.translate(delta);
+                                }
+                                NodeDragPart::HandleIn => {
+                                    pnode.handle_in = Some(local_pt);
+                                    pnode.enforce_continuity_for_handle(true);
+                                }
+                                NodeDragPart::HandleOut => {
+                                    pnode.handle_out = Some(local_pt);
+                                    pnode.enforce_continuity_for_handle(false);
+                                }
                             }
                         }
                     }
@@ -2097,13 +2247,7 @@ impl ToolCore {
                 let rect = Rect2D::from_points(start_mm, current_mm);
                 if rect.width() < 0.5 && rect.height() < 0.5 {
                     let tol = ctx.hit_tol_mm(6.0, 0.8);
-                    let hit = crate::math_helpers::hit_test_canvas_point_in_doc(
-                        ctx.document,
-                        ctx.powerclip_edit_id,
-                        ctx.treat_all_objects_as_filled,
-                        pt,
-                        tol,
-                    );
+                    let hit = hit_test_canvas_point_scoped_opt_tol(ctx, pt, tol);
                     if let Some(hid) = hit {
                         ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                             ids: vec![hid],
@@ -2116,8 +2260,11 @@ impl ToolCore {
                         ToolOutput::noop()
                     }
                 } else {
-                    let hits =
-                        hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false);
+                    let hits = if let Some(pc_id) = ctx.powerclip_edit_id {
+                        hit_test_powerclip_contents_rect(ctx.document, pc_id, rect, false)
+                    } else {
+                        hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false)
+                    };
                     ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                         ids: hits,
                         additive: shift,
@@ -2127,7 +2274,7 @@ impl ToolCore {
             }
             ActiveDragState::LassoSelect { points_mm } => {
                 if points_mm.len() < 3 {
-                    if let Some(hid) = hit_test_canvas_point_opt(ctx, pt) {
+                    if let Some(hid) = hit_test_canvas_point_scoped_opt(ctx, pt) {
                         ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                             ids: vec![hid],
                             additive: false,
@@ -2139,7 +2286,8 @@ impl ToolCore {
                         ToolOutput::noop()
                     }
                 } else {
-                    let hits = compute_lasso_hits(ctx.document, &points_mm);
+                    let hits =
+                        compute_lasso_hits_scoped(ctx.document, ctx.powerclip_edit_id, &points_mm);
                     ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                         ids: hits,
                         additive: shift,
@@ -2160,7 +2308,7 @@ impl ToolCore {
                             additive: shift,
                         }]);
                     }
-                    if let Some(oid) = hit_test_canvas_point_opt(ctx, pt) {
+                    if let Some(oid) = hit_test_canvas_point_scoped_opt(ctx, pt) {
                         return ToolOutput::actions(vec![
                             ToolActionRequest::SelectObjects {
                                 ids: vec![oid],
@@ -2172,8 +2320,11 @@ impl ToolCore {
                     }
                     ToolOutput::noop()
                 } else if ctx.selection.is_empty() {
-                    let hits =
-                        hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false);
+                    let hits = if let Some(pc_id) = ctx.powerclip_edit_id {
+                        hit_test_powerclip_contents_rect(ctx.document, pc_id, rect, false)
+                    } else {
+                        hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false)
+                    };
                     ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                         ids: hits,
                         additive: false,
@@ -2332,6 +2483,49 @@ impl ToolCore {
                         ops: vec![CommandOp::EditShape {
                             id: object_id,
                             shape: draft_shape,
+                        }],
+                        clear_overlay: true,
+                        post_actions: Vec::new(),
+                    }
+                }
+            }
+            ActiveDragState::DraggingBSplineControlPoint {
+                object_id,
+                orig_bspline,
+                draft_bspline,
+                ..
+            } => {
+                if orig_bspline == draft_bspline
+                    || !is_object_editable_in_doc(ctx.document, object_id)
+                {
+                    ToolOutput::noop()
+                } else {
+                    ToolOutput::Commit {
+                        ops: vec![CommandOp::EditBSpline {
+                            id: object_id,
+                            bspline: draft_bspline,
+                        }],
+                        clear_overlay: true,
+                        post_actions: Vec::new(),
+                    }
+                }
+            }
+            ActiveDragState::DraggingArtisticMediaNode {
+                object_id,
+                orig_spine,
+                draft_spine,
+                style,
+                ..
+            } => {
+                if orig_spine == draft_spine || !is_object_editable_in_doc(ctx.document, object_id)
+                {
+                    ToolOutput::noop()
+                } else {
+                    ToolOutput::Commit {
+                        ops: vec![CommandOp::EditArtisticMedia {
+                            id: object_id,
+                            spine: draft_spine,
+                            style,
                         }],
                         clear_overlay: true,
                         post_actions: Vec::new(),
@@ -2865,10 +3059,82 @@ impl ToolCore {
                 };
                 self.live_sketch_strokes.push(points);
                 let path = coree_core::LiveSketch::average_strokes(&self.live_sketch_strokes, 32);
-                let obj =
+                let existing_id = self
+                    .live_sketch_object_id
+                    .filter(|&id| {
+                        ctx.document
+                            .object(id)
+                            .is_some_and(|o| matches!(o.payload, NodePayload::Path(_)))
+                    })
+                    .or_else(|| {
+                        if self.live_sketch_strokes.len() <= 1 {
+                            return None;
+                        }
+                        ctx.selection
+                            .objects
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|&id| {
+                                ctx.document.object(id).is_some_and(|o| {
+                                    o.name == "LiveSketch Curve"
+                                        && matches!(o.payload, NodePayload::Path(_))
+                                })
+                            })
+                            .or_else(|| {
+                                ctx.document
+                                    .find_layer(layer_id)
+                                    .and_then(|l| l.objects.last().copied())
+                                    .filter(|&id| {
+                                        ctx.document.object(id).is_some_and(|o| {
+                                            o.name == "LiveSketch Curve"
+                                                && matches!(o.payload, NodePayload::Path(_))
+                                        })
+                                    })
+                            })
+                    });
+                if let Some(oid) = existing_id {
+                    self.live_sketch_object_id = Some(oid);
+                    let inv = world_inverse_transform_of(ctx.document, oid);
+                    return ToolOutput::Commit {
+                        ops: vec![CommandOp::EditPath {
+                            id: oid,
+                            path: path.transformed(&inv),
+                        }],
+                        clear_overlay: true,
+                        post_actions: Vec::new(),
+                    };
+                }
+                let mut obj =
                     SceneObject::new(ObjectId(0), "LiveSketch Curve", NodePayload::Path(path))
                         .with_fill(Fill::None)
                         .with_outline(ctx.default_outline.clone());
+                if ctx.settings.symmetry_enabled || self.symmetry_enabled {
+                    let folds = if self.symmetry_enabled {
+                        self.symmetry_folds
+                    } else {
+                        ctx.settings.symmetry_folds
+                    }
+                    .max(2);
+                    let mirror = if self.symmetry_enabled {
+                        self.symmetry_mirror
+                    } else {
+                        ctx.settings.symmetry_mirror
+                    };
+                    let origin = self
+                        .symmetry_origin_mm
+                        .or(ctx.settings.symmetry_center_mm)
+                        .unwrap_or_else(|| {
+                            ctx.document.active_page().map_or(Point2D::ZERO, |p| {
+                                Point2D::new(p.width_mm * 0.5, p.height_mm * 0.5)
+                            })
+                        });
+                    obj.effects.push(Effect::Symmetry {
+                        axes: folds,
+                        mirror,
+                        origin,
+                    });
+                }
                 ToolOutput::Commit {
                     ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                     clear_overlay: true,
@@ -2880,17 +3146,46 @@ impl ToolCore {
                     return ToolOutput::noop();
                 };
                 let centerline = BezierPath::from_polygon(points, false);
-                let expanded = coree_core::ArtisticMedia::expand_stroke(
-                    &centerline,
-                    &coree_core::ArtisticMediaStyle::Preset {
-                        max_width_mm: ctx.settings.artistic_media_width_mm,
-                        profile: ctx.settings.artistic_media_profile.clone(),
+                let style = ArtisticMediaStyle::Preset {
+                    max_width_mm: ctx.settings.artistic_media_width_mm,
+                    profile: ctx.settings.artistic_media_profile.clone(),
+                };
+                let mut obj = SceneObject::new(
+                    ObjectId(0),
+                    "Artistic Media",
+                    NodePayload::ArtisticMedia {
+                        spine: centerline,
+                        style,
                     },
-                );
-                let obj =
-                    SceneObject::new(ObjectId(0), "Artistic Media", NodePayload::Path(expanded))
-                        .with_fill(ctx.default_fill.clone())
-                        .with_outline(OutlineStyle::none());
+                )
+                .with_fill(ctx.default_fill.clone())
+                .with_outline(OutlineStyle::none());
+                if ctx.settings.symmetry_enabled || self.symmetry_enabled {
+                    let folds = if self.symmetry_enabled {
+                        self.symmetry_folds
+                    } else {
+                        ctx.settings.symmetry_folds
+                    }
+                    .max(2);
+                    let mirror = if self.symmetry_enabled {
+                        self.symmetry_mirror
+                    } else {
+                        ctx.settings.symmetry_mirror
+                    };
+                    let origin = self
+                        .symmetry_origin_mm
+                        .or(ctx.settings.symmetry_center_mm)
+                        .unwrap_or_else(|| {
+                            ctx.document.active_page().map_or(Point2D::ZERO, |p| {
+                                Point2D::new(p.width_mm * 0.5, p.height_mm * 0.5)
+                            })
+                        });
+                    obj.effects.push(Effect::Symmetry {
+                        axes: folds,
+                        mirror,
+                        origin,
+                    });
+                }
                 ToolOutput::Commit {
                     ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                     clear_overlay: true,
@@ -3117,6 +3412,86 @@ impl ToolCore {
                 ));
                 for (_, wpt) in parametric_shape_handles(draft_shape, &xf) {
                     preview_handles.push(OverlayHandle::new(wpt, HandleShape::Diamond));
+                }
+            }
+            ActiveDragState::DraggingBSplineControlPoint {
+                object_id,
+                cp_index,
+                draft_bspline,
+                ..
+            } => {
+                let xf = world_transform_of_or_local(ctx.document, *object_id);
+                preview_paths.push(OverlayPath::stroke(
+                    draft_bspline.to_bezier_path().transformed(&xf),
+                    OverlayStrokeKind::Accent,
+                ));
+                let wpts: Vec<Point2D> = draft_bspline
+                    .control_points
+                    .iter()
+                    .map(|&p| xf.transform_point(p))
+                    .collect();
+                if wpts.len() >= 2 {
+                    preview_paths.push(OverlayPath::stroke(
+                        BezierPath::from_polygon(wpts.clone(), draft_bspline.closed),
+                        OverlayStrokeKind::Secondary,
+                    ));
+                }
+                for (idx, wpt) in wpts.into_iter().enumerate() {
+                    preview_handles.push(OverlayHandle {
+                        pos_mm: wpt,
+                        shape: HandleShape::Diamond,
+                        selected: idx == *cp_index,
+                        color_hint: None,
+                    });
+                }
+            }
+            ActiveDragState::DraggingArtisticMediaNode {
+                object_id,
+                subpath_index,
+                node_index,
+                handle_part,
+                draft_spine,
+                style,
+                ..
+            } => {
+                let xf = world_transform_of_or_local(ctx.document, *object_id);
+                let expanded = ArtisticMedia::expand_stroke(draft_spine, style);
+                if !expanded.is_empty() {
+                    preview_paths.push(OverlayPath::stroke(
+                        expanded.transformed(&xf),
+                        OverlayStrokeKind::Accent,
+                    ));
+                }
+                preview_paths.push(OverlayPath::stroke(
+                    draft_spine.transformed(&xf),
+                    OverlayStrokeKind::Secondary,
+                ));
+                for (sp_idx, sp) in draft_spine.subpaths.iter().enumerate() {
+                    for (n_idx, node) in sp.nodes.iter().enumerate() {
+                        let is_node = sp_idx == *subpath_index && n_idx == *node_index;
+                        preview_handles.push(OverlayHandle {
+                            pos_mm: xf.transform_point(node.pos),
+                            shape: HandleShape::Square,
+                            selected: is_node && *handle_part == NodeDragPart::Anchor,
+                            color_hint: None,
+                        });
+                        if let Some(h_in) = node.handle_in {
+                            preview_handles.push(OverlayHandle {
+                                pos_mm: xf.transform_point(h_in),
+                                shape: HandleShape::Circle,
+                                selected: is_node && *handle_part == NodeDragPart::HandleIn,
+                                color_hint: None,
+                            });
+                        }
+                        if let Some(h_out) = node.handle_out {
+                            preview_handles.push(OverlayHandle {
+                                pos_mm: xf.transform_point(h_out),
+                                shape: HandleShape::Circle,
+                                selected: is_node && *handle_part == NodeDragPart::HandleOut,
+                                color_hint: None,
+                            });
+                        }
+                    }
                 }
             }
             ActiveDragState::DraggingGradientHandle {
@@ -3372,12 +3747,54 @@ impl ToolCore {
                     preview_handles.push(OverlayHandle::new(*current_mm, HandleShape::Circle));
                 } else {
                     let box_mm = compute_constrained_box(*start_mm, *current_mm, *ctrl, *shift);
-                    let p = if matches!(self.active_tool, ToolId::Ellipse | ToolId::LensTool) {
-                        ellipse_rect_to_bezier_path(box_mm)
+                    if self.active_tool == ToolId::Table {
+                        preview_paths.push(OverlayPath::stroke(
+                            rect_to_bezier_path(box_mm),
+                            OverlayStrokeKind::Accent,
+                        ));
+                        let rows = ctx.settings.table_rows.clamp(1, 30);
+                        let cols = ctx.settings.table_cols.clamp(1, 30);
+                        for r in 1..rows {
+                            let y = box_mm.min_y + box_mm.height() * (r as f64 / rows as f64);
+                            preview_paths.push(OverlayPath::stroke(
+                                BezierPath::from_line(
+                                    Point2D::new(box_mm.min_x, y),
+                                    Point2D::new(box_mm.max_x, y),
+                                ),
+                                OverlayStrokeKind::Secondary,
+                            ));
+                        }
+                        for c in 1..cols {
+                            let x = box_mm.min_x + box_mm.width() * (c as f64 / cols as f64);
+                            preview_paths.push(OverlayPath::stroke(
+                                BezierPath::from_line(
+                                    Point2D::new(x, box_mm.min_y),
+                                    Point2D::new(x, box_mm.max_y),
+                                ),
+                                OverlayStrokeKind::Secondary,
+                            ));
+                        }
                     } else {
-                        rect_to_bezier_path(box_mm)
-                    };
-                    preview_paths.push(OverlayPath::stroke(p, OverlayStrokeKind::Accent));
+                        let p = if matches!(self.active_tool, ToolId::Ellipse | ToolId::LensTool) {
+                            ellipse_rect_to_bezier_path(box_mm)
+                        } else {
+                            rect_to_bezier_path(box_mm)
+                        };
+                        let p = if ctx.settings.draw_in_perspective {
+                            if let Some(hm) = ctx
+                                .document
+                                .perspective_grid()
+                                .plane_homography_for_rect(box_mm)
+                            {
+                                hm.transform_bezier_path(&p)
+                            } else {
+                                p
+                            }
+                        } else {
+                            p
+                        };
+                        preview_paths.push(OverlayPath::stroke(p, OverlayStrokeKind::Accent));
+                    }
                 }
             }
             ActiveDragState::DrawingStroke { points_mm } => {
@@ -3489,6 +3906,81 @@ impl ToolCore {
         if let Some(crop) = self.pending_crop_rect {
             for (_, pos) in selection_handle_world_positions(crop) {
                 preview_handles.push(OverlayHandle::new(pos, HandleShape::Square));
+            }
+        }
+
+        // 7. Symmetry axis guides (when symmetry mode is active)
+        if ctx.settings.symmetry_enabled || self.symmetry_enabled {
+            let folds = if self.symmetry_enabled {
+                self.symmetry_folds
+            } else {
+                ctx.settings.symmetry_folds
+            }
+            .max(2);
+            let origin = self
+                .symmetry_origin_mm
+                .or(ctx.settings.symmetry_center_mm)
+                .unwrap_or_else(|| {
+                    ctx.document.active_page().map_or(Point2D::ZERO, |p| {
+                        Point2D::new(p.width_mm * 0.5, p.height_mm * 0.5)
+                    })
+                });
+            let vis = ctx.viewport.visible_world_rect();
+            let radius = vis.width().hypot(vis.height()).max(500.0);
+            for k in 0..folds {
+                let ang = std::f64::consts::TAU * (k as f64) / (folds as f64);
+                let dir = Vec2D::new(ang.cos(), ang.sin()) * radius;
+                preview_paths.push(OverlayPath::stroke(
+                    BezierPath::from_line(origin, origin + dir),
+                    OverlayStrokeKind::Guide,
+                ));
+            }
+            preview_handles.push(OverlayHandle::new(origin, HandleShape::Crosshair));
+        }
+
+        // 8. Selected BSpline control polygon + handles in ShapeNode idle mode
+        if self.active_tool == ToolId::ShapeNode && matches!(self.drag_state, ActiveDragState::Idle)
+        {
+            for &oid in &ctx.selection.objects {
+                if let Some(obj) = ctx.document.object(oid) {
+                    if let NodePayload::BSpline(ref bs) = obj.payload {
+                        let xf = world_transform_of_or_local(ctx.document, oid);
+                        let wpts: Vec<Point2D> = bs
+                            .control_points
+                            .iter()
+                            .map(|&p| xf.transform_point(p))
+                            .collect();
+                        if wpts.len() >= 2 {
+                            preview_paths.push(OverlayPath::stroke(
+                                BezierPath::from_polygon(wpts.clone(), bs.closed),
+                                OverlayStrokeKind::Secondary,
+                            ));
+                        }
+                        for wpt in wpts {
+                            preview_handles.push(OverlayHandle::new(wpt, HandleShape::Diamond));
+                        }
+                    } else if let NodePayload::ArtisticMedia { ref spine, .. } = obj.payload {
+                        let xf = world_transform_of_or_local(ctx.document, oid);
+                        preview_paths.push(OverlayPath::stroke(
+                            spine.transformed(&xf),
+                            OverlayStrokeKind::Secondary,
+                        ));
+                        for sp in &spine.subpaths {
+                            for node in &sp.nodes {
+                                preview_handles.push(OverlayHandle::new(
+                                    xf.transform_point(node.pos),
+                                    HandleShape::Square,
+                                ));
+                                for h in [node.handle_in, node.handle_out].into_iter().flatten() {
+                                    preview_handles.push(OverlayHandle::new(
+                                        xf.transform_point(h),
+                                        HandleShape::Circle,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

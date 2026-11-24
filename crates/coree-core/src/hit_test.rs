@@ -4,11 +4,12 @@
 //! `hit_test_node`) and intelligent multi-target [`SnapEngine`] emitting
 //! [`DynamicGuideLine`] alignment overlays.
 
-use crate::geometry::point_to_segment_distance;
-use crate::math::sanitize_f64;
+use crate::geometry::{point_to_segment_distance, ArtisticMedia};
+use crate::math::{sanitize_f64, Perspective3x3};
 use crate::{
-    Affine2D, ArtisticText, BezierPath, DimensionKind, DimensionObject, Document, GuideOrientation,
-    NodePayload, NodeRef, ObjectId, Point2D, Rect2D, SceneObject, SymbolId, Vec2D,
+    Affine2D, ArtisticText, BezierPath, DimensionKind, DimensionObject, Document, Effect,
+    GuideOrientation, NodePayload, NodeRef, ObjectId, Point2D, Rect2D, SceneObject, SymbolId,
+    Vec2D,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -85,6 +86,51 @@ pub fn hit_test_powerclip_contents(
         }
     }
     None
+}
+
+/// Returns all visible, unlocked child objects inside `PowerClip` container `pc_id`
+/// intersecting (or fully enclosed by) `rect_mm` (in page/world mm), ordered frontmost-first.
+#[must_use]
+pub fn hit_test_powerclip_contents_rect(
+    doc: &Document,
+    pc_id: ObjectId,
+    rect_mm: Rect2D,
+    fully_enclosed: bool,
+) -> Vec<ObjectId> {
+    if rect_mm.is_empty() {
+        return Vec::new();
+    }
+    let Some(pc_obj) = doc.object(pc_id) else {
+        return Vec::new();
+    };
+    let NodePayload::PowerClip { contents, .. } = &pc_obj.payload else {
+        return Vec::new();
+    };
+    let Some(pc_xf) = doc.world_transform_of(pc_id) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for &cid in contents.iter().rev() {
+        let Some(child) = doc.object(cid) else {
+            continue;
+        };
+        if !child.visible || child.locked {
+            continue;
+        }
+        if fully_enclosed {
+            if let Some(bb) = doc.world_object_bounds(cid) {
+                if rect_mm.contains_rect(bb) {
+                    hits.push(cid);
+                }
+            }
+        } else {
+            let mut visited_syms = HashSet::new();
+            if object_intersects_rect(doc, child, &pc_xf, rect_mm, None, &mut visited_syms, 0) {
+                hits.push(cid);
+            }
+        }
+    }
+    hits
 }
 
 /// Returns all visible, unlocked objects on `page_index` intersecting (or fully enclosed by)
@@ -276,6 +322,30 @@ pub fn sym_sub_world_bounds(
         match &sub.payload {
             NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
             NodePayload::Shape(s) => s.to_bezier_path().transformed(&p_xf).bounding_box(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path().transformed(&p_xf).bounding_box(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+                    .transformed(&p_xf)
+                    .bounding_box()
+            }
+            NodePayload::Clone { .. } => {
+                doc.resolve_clone_payload_and_style(sub)
+                    .and_then(|(eff_p, _, _)| match eff_p {
+                        NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
+                        NodePayload::Shape(s) => {
+                            s.to_bezier_path().transformed(&p_xf).bounding_box()
+                        }
+                        NodePayload::BSpline(bs) => {
+                            bs.to_bezier_path().transformed(&p_xf).bounding_box()
+                        }
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            ArtisticMedia::expand_stroke(&spine, &style)
+                                .transformed(&p_xf)
+                                .bounding_box()
+                        }
+                        _ => None,
+                    })
+            }
             NodePayload::PowerClip { container, .. } => container.transformed(&p_xf).bounding_box(),
             NodePayload::ArtisticText(t) => p_xf.try_transform_rect(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => p_xf.try_transform_rect(t.bounding_box()),
@@ -445,6 +515,10 @@ fn resolve_sym_world_path(
             return match &sub.payload {
                 NodePayload::Path(p) => Some(p.transformed(&p_xf)),
                 NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&p_xf)),
+                NodePayload::BSpline(bs) => Some(bs.to_bezier_path().transformed(&p_xf)),
+                NodePayload::ArtisticMedia { spine, style } => {
+                    Some(ArtisticMedia::expand_stroke(spine, style).transformed(&p_xf))
+                }
                 NodePayload::PowerClip { container, .. } => Some(container.transformed(&p_xf)),
                 _ => None,
             };
@@ -564,6 +638,24 @@ fn raster_local_rect(r: &crate::RasterLayerData) -> Rect2D {
         .unwrap_or(full_rect)
 }
 
+fn apply_obj_perspective_to_local_path(local: BezierPath, obj: &SceneObject) -> BezierPath {
+    let mut cur = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local)
+    } else {
+        local
+    };
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(bb) = cur.bounding_box() {
+                if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                    cur = h.transform_bezier_path(&cur);
+                }
+            }
+        }
+    }
+    cur
+}
+
 #[allow(clippy::too_many_arguments)]
 fn object_ref_hits_point(
     doc: &Document,
@@ -586,7 +678,7 @@ fn object_ref_hits_point(
 
     match &obj.payload {
         NodePayload::Path(p) => {
-            let wp = p.transformed(&world_xf);
+            let wp = apply_obj_perspective_to_local_path(p.clone(), obj).transformed(&world_xf);
             path_hits_point(
                 &wp,
                 obj.fill.is_visible() || obj.lens.is_some(),
@@ -595,7 +687,8 @@ fn object_ref_hits_point(
             )
         }
         NodePayload::Shape(s) => {
-            let wp = s.to_bezier_path().transformed(&world_xf);
+            let wp =
+                apply_obj_perspective_to_local_path(s.to_bezier_path(), obj).transformed(&world_xf);
             path_hits_point(
                 &wp,
                 obj.fill.is_visible() || obj.lens.is_some(),
@@ -603,8 +696,49 @@ fn object_ref_hits_point(
                 stroke_tol,
             )
         }
+        NodePayload::BSpline(bs) => {
+            let wp = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj)
+                .transformed(&world_xf);
+            path_hits_point(
+                &wp,
+                obj.fill.is_visible() || obj.lens.is_some(),
+                pt_mm,
+                stroke_tol,
+            )
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = ArtisticMedia::expand_stroke(spine, style);
+            let wp = apply_obj_perspective_to_local_path(expanded, obj).transformed(&world_xf);
+            path_hits_point(
+                &wp,
+                obj.fill.is_visible() || obj.lens.is_some(),
+                pt_mm,
+                stroke_tol,
+            )
+        }
+        NodePayload::Clone { .. } => {
+            let Some((eff_p, eff_fill, eff_outline)) = doc.resolve_clone_payload_and_style(obj)
+            else {
+                return false;
+            };
+            let mut tmp = obj.clone();
+            tmp.payload = eff_p;
+            tmp.fill = eff_fill;
+            tmp.outline = eff_outline;
+            object_ref_hits_point(
+                doc,
+                &tmp,
+                parent_xf,
+                pt_mm,
+                tol_mm,
+                sym_ctx,
+                visited_syms,
+                depth + 1,
+            )
+        }
         NodePayload::PowerClip { container, .. } => {
-            let wp = container.transformed(&world_xf);
+            let wp = apply_obj_perspective_to_local_path((**container).clone(), obj)
+                .transformed(&world_xf);
             path_hits_point(&wp, true, pt_mm, stroke_tol)
         }
         NodePayload::Connector(c) => {
@@ -748,15 +882,46 @@ fn object_intersects_rect(
 
     match &obj.payload {
         NodePayload::Path(p) => {
-            let wp = p.transformed(&world_xf);
+            let wp = apply_obj_perspective_to_local_path(p.clone(), obj).transformed(&world_xf);
             path_intersects_rect(&wp, obj.fill.is_visible() || obj.lens.is_some(), rect_mm)
         }
         NodePayload::Shape(s) => {
-            let wp = s.to_bezier_path().transformed(&world_xf);
+            let wp =
+                apply_obj_perspective_to_local_path(s.to_bezier_path(), obj).transformed(&world_xf);
             path_intersects_rect(&wp, obj.fill.is_visible() || obj.lens.is_some(), rect_mm)
         }
+        NodePayload::BSpline(bs) => {
+            let wp = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj)
+                .transformed(&world_xf);
+            path_intersects_rect(&wp, obj.fill.is_visible() || obj.lens.is_some(), rect_mm)
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = ArtisticMedia::expand_stroke(spine, style);
+            let wp = apply_obj_perspective_to_local_path(expanded, obj).transformed(&world_xf);
+            path_intersects_rect(&wp, obj.fill.is_visible() || obj.lens.is_some(), rect_mm)
+        }
+        NodePayload::Clone { .. } => {
+            let Some((eff_p, eff_fill, eff_outline)) = doc.resolve_clone_payload_and_style(obj)
+            else {
+                return false;
+            };
+            let mut tmp = obj.clone();
+            tmp.payload = eff_p;
+            tmp.fill = eff_fill;
+            tmp.outline = eff_outline;
+            object_intersects_rect(
+                doc,
+                &tmp,
+                parent_xf,
+                rect_mm,
+                sym_ctx,
+                visited_syms,
+                depth + 1,
+            )
+        }
         NodePayload::PowerClip { container, .. } => {
-            let wp = container.transformed(&world_xf);
+            let wp = apply_obj_perspective_to_local_path((**container).clone(), obj)
+                .transformed(&world_xf);
             path_intersects_rect(&wp, true, rect_mm)
         }
         NodePayload::Connector(c) => {

@@ -268,6 +268,9 @@ impl DirtyTileCache {
                         dependents.entry(next_id).or_default().push(oid);
                     }
                 }
+                NodePayload::Clone { master_id, .. } => {
+                    dependents.entry(*master_id).or_default().push(oid);
+                }
                 NodePayload::SymbolInstance(sym_id) => {
                     if let Some(sym) = doc.symbol(*sym_id) {
                         for sub in &sym.objects {

@@ -2338,18 +2338,38 @@ fn rasterize_silhouette_payload(
     if depth > 64 || !obj.visible || obj_opacity <= 1e-6 || !world_xf.is_finite() {
         return;
     }
+    let resolved_clone;
+    let obj_eff = if matches!(obj.payload, NodePayload::Clone { .. }) {
+        if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            let mut c = obj.clone();
+            c.payload = p;
+            c.fill = f;
+            c.outline = o;
+            resolved_clone = c;
+            &resolved_clone
+        } else {
+            obj
+        }
+    } else {
+        obj
+    };
     let mut fill_geom = |base_path: &BezierPath| {
-        let local_geom = apply_geometry_effects(base_path, &obj.effects);
+        let persp_geom = if let Some(persp) = obj_eff.perspective {
+            persp.transform_bezier_path(base_path)
+        } else {
+            base_path.clone()
+        };
+        let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
         if deform_frames.is_empty() {
-            backend.fill_path(&local_geom, paint, FillRule::Winding, world_xf);
+            backend.fill_path(&local_geom, paint, FillRule::EvenOdd, world_xf);
         } else {
             let deformed = apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
-            backend.fill_path(&deformed, paint, FillRule::Winding, outer_to_sub);
+            backend.fill_path(&deformed, paint, FillRule::EvenOdd, outer_to_sub);
         }
     };
     let own_fill_or_outline =
-        fill_is_visible(&obj.fill) || obj.outline.is_visible() || obj.lens.is_some();
-    match &obj.payload {
+        fill_is_visible(&obj_eff.fill) || obj_eff.outline.is_visible() || obj_eff.lens.is_some();
+    match &obj_eff.payload {
         NodePayload::Path(p) => {
             if own_fill_or_outline {
                 fill_geom(p);
@@ -2360,6 +2380,17 @@ fn rasterize_silhouette_payload(
                 fill_geom(&s.to_bezier_path());
             }
         }
+        NodePayload::BSpline(bs) => {
+            if own_fill_or_outline {
+                fill_geom(&bs.to_bezier_path());
+            }
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            if own_fill_or_outline {
+                fill_geom(&coree_core::ArtisticMedia::expand_stroke(spine, style));
+            }
+        }
+        NodePayload::Clone { .. } => {}
         NodePayload::PowerClip {
             container,
             contents,

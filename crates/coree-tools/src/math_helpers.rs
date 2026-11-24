@@ -179,51 +179,10 @@ pub fn point_in_polygon(pt: Point2D, poly: &[Point2D]) -> bool {
     inside
 }
 
-/// Converts a sequence of B-Spline / Catmull-Rom control points into a smooth cubic [`BezierPath`].
+/// Converts a sequence of B-Spline control points into a smooth cubic [`BezierPath`].
 #[must_use]
 pub fn bspline_to_bezier_path(pts: &[Point2D], closed: bool) -> BezierPath {
-    if pts.len() < 2 {
-        return BezierPath::new();
-    }
-    if pts.len() == 2 {
-        return BezierPath::from_line(pts[0], pts[1]);
-    }
-    let n = pts.len();
-    let mut nodes = Vec::with_capacity(n);
-    for i in 0..n {
-        let p_prev = if i == 0 {
-            if closed {
-                pts[n - 1]
-            } else {
-                pts[0]
-            }
-        } else {
-            pts[i - 1]
-        };
-        let p_curr = pts[i];
-        let p_next = if i + 1 == n {
-            if closed {
-                pts[0]
-            } else {
-                pts[n - 1]
-            }
-        } else {
-            pts[i + 1]
-        };
-        let tang = (p_next - p_prev) * (1.0 / 6.0);
-        let h_in = if !closed && i == 0 {
-            None
-        } else {
-            Some(p_curr - tang)
-        };
-        let h_out = if !closed && i + 1 == n {
-            None
-        } else {
-            Some(p_curr + tang)
-        };
-        nodes.push(PathNode::new(p_curr, h_in, h_out, NodeKind::Smooth));
-    }
-    BezierPath::from_subpath(Subpath { nodes, closed })
+    coree_core::BSplineCurve::from_control_points(pts.to_vec(), 3, closed).to_bezier_path()
 }
 
 /// Builds a 3-Point Curve arc from `p1` to `p2` passing cleanly through `p3` at `t = 0.5`.
@@ -837,6 +796,43 @@ pub fn hit_test_canvas_guide(
     None
 }
 
+/// Hit-tests ONLY the inner contents of `pc_id` during PowerClip Edit Mode without falling through to page objects.
+#[must_use]
+pub fn hit_test_powerclip_edit_point(
+    doc: &Document,
+    pc_id: ObjectId,
+    treat_all_objects_as_filled: bool,
+    world_pt: Point2D,
+    tol_mm: f64,
+) -> Option<ObjectId> {
+    if let Some(cid) = hit_test_powerclip_contents(doc, pc_id, world_pt, tol_mm) {
+        return Some(cid);
+    }
+    if treat_all_objects_as_filled {
+        if let Some(NodePayload::PowerClip { contents, .. }) = doc.object(pc_id).map(|o| &o.payload)
+        {
+            for &cid in contents.iter().rev() {
+                let Some(obj) = doc.object(cid) else {
+                    continue;
+                };
+                if !obj.visible || obj.locked {
+                    continue;
+                }
+                if let Some(wp) = doc.world_path_of(cid) {
+                    if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
+                        return Some(cid);
+                    }
+                } else if let Some(bb) = doc.world_object_bounds(cid) {
+                    if bb.contains_point(world_pt) {
+                        return Some(cid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Hit-tests canvas points across active PowerClip contents, page objects, and optional filled fallback.
 #[must_use]
 pub fn hit_test_canvas_point_in_doc(
@@ -847,31 +843,10 @@ pub fn hit_test_canvas_point_in_doc(
     tol_mm: f64,
 ) -> Option<ObjectId> {
     if let Some(pc_id) = powerclip_edit_id {
-        if let Some(cid) = hit_test_powerclip_contents(doc, pc_id, world_pt, tol_mm) {
+        if let Some(cid) =
+            hit_test_powerclip_edit_point(doc, pc_id, treat_all_objects_as_filled, world_pt, tol_mm)
+        {
             return Some(cid);
-        }
-        if treat_all_objects_as_filled {
-            if let Some(NodePayload::PowerClip { contents, .. }) =
-                doc.object(pc_id).map(|o| &o.payload)
-            {
-                for &cid in contents.iter().rev() {
-                    let Some(obj) = doc.object(cid) else {
-                        continue;
-                    };
-                    if !obj.visible || obj.locked {
-                        continue;
-                    }
-                    if let Some(wp) = doc.world_path_of(cid) {
-                        if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
-                            return Some(cid);
-                        }
-                    } else if let Some(bb) = doc.world_object_bounds(cid) {
-                        if bb.contains_point(world_pt) {
-                            return Some(cid);
-                        }
-                    }
-                }
-            }
         }
     }
     let page_idx = doc.active_page_index();
@@ -879,8 +854,7 @@ pub fn hit_test_canvas_point_in_doc(
         return Some(hit);
     }
     if treat_all_objects_as_filled {
-        let page = doc.page(page_idx)?;
-        for layer in page.layers.iter().rev() {
+        for layer in doc.effective_layers_for_page(page_idx).into_iter().rev() {
             if !layer.visible || layer.locked {
                 continue;
             }

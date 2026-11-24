@@ -424,6 +424,57 @@ fn emit_emf_object(
                 max_y,
             );
         }
+        NodePayload::BSpline(bs) => {
+            let bp = bs.to_bezier_path();
+            emit_emf_bezier_shape(
+                &bp,
+                world_xf,
+                &obj.fill,
+                &obj.outline,
+                out,
+                n_records,
+                max_handle,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            );
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let bp = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            emit_emf_bezier_shape(
+                &bp,
+                world_xf,
+                &obj.fill,
+                &obj.outline,
+                out,
+                n_records,
+                max_handle,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            );
+        }
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let bp = match &p {
+                    NodePayload::Path(path) => Some(path.clone()),
+                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                    }
+                    _ => None,
+                };
+                if let Some(bp) = bp {
+                    emit_emf_bezier_shape(
+                        &bp, world_xf, &f, &o, out, n_records, max_handle, min_x, min_y, max_x,
+                        max_y,
+                    );
+                }
+            }
+        }
         NodePayload::ArtisticText(text) => {
             let bp = text_engine.artistic_text_to_curves(text);
             let fill = text

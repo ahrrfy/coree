@@ -8,10 +8,12 @@ use super::loda::{
     encode_loda_args, encode_loda_curve_arg, encode_obj_props, encode_shape_loda_arg,
     PowerClipLodaMeta, CDR_CTYPE_ARTISTIC_TEXT, CDR_CTYPE_BITMAP, CDR_CTYPE_CURVE,
     CDR_CTYPE_ELLIPSE, CDR_CTYPE_GROUP_OR_LAYER, CDR_CTYPE_PARAGRAPH_TEXT, CDR_CTYPE_POLYGON,
-    CDR_CTYPE_RECTANGLE, LODA_ARG_BITMAP_REF, LODA_ARG_CONNECTOR, LODA_ARG_CURVE,
+    CDR_CTYPE_RECTANGLE, LODA_ARG_ARTISTIC_MEDIA, LODA_ARG_BITMAP_REF, LODA_ARG_BSPLINE,
+    LODA_ARG_CLONE, LODA_ARG_COLOR_STYLE_LINK, LODA_ARG_CONNECTOR, LODA_ARG_CURVE,
     LODA_ARG_DIMENSION, LODA_ARG_EFFECTS, LODA_ARG_LAYER_PROPS, LODA_ARG_NAME,
-    LODA_ARG_OBJECT_STYLE_LINK, LODA_ARG_OBJ_PROPS, LODA_ARG_POWERCLIP_META, LODA_ARG_SOURCE_OID,
-    LODA_ARG_SYMBOL_INSTANCE, LODA_ARG_TABLE, LODA_ARG_TEXT_META, LODA_ARG_TEXT_ON_PATH,
+    LODA_ARG_OBJECT_STYLE_LINK, LODA_ARG_OBJ_PROPS, LODA_ARG_PERSPECTIVE_3X3,
+    LODA_ARG_POWERCLIP_META, LODA_ARG_SOURCE_OID, LODA_ARG_SYMBOL_INSTANCE, LODA_ARG_TABLE,
+    LODA_ARG_TEXT_META, LODA_ARG_TEXT_ON_PATH,
 };
 use super::parser::{GuidPayload, StlyPayload, SymbPayload, CBMP_MAGIC};
 use super::text_style::{encode_txsm_artistic, encode_txsm_paragraph};
@@ -437,6 +439,16 @@ fn encode_scene_object(
         if let Some(sid) = obj.style_id {
             g_args.push((LODA_ARG_OBJECT_STYLE_LINK, sid.0.as_bytes().to_vec()));
         }
+        if let Some(persp) = obj.perspective {
+            if let Ok(pb) = serde_json::to_vec(&persp) {
+                g_args.push((LODA_ARG_PERSPECTIVE_3X3, pb));
+            }
+        }
+        if obj.color_style_id.is_some() || obj.color_style_slot.is_some() {
+            if let Ok(cb) = serde_json::to_vec(&(obj.color_style_id, obj.color_style_slot)) {
+                g_args.push((LODA_ARG_COLOR_STYLE_LINK, cb));
+            }
+        }
         let mut deferred_unknown_chunks = Vec::new();
         for unk in &obj.unknown_chunks {
             if &unk.fourcc == b"LODA" && unk.raw_bytes.len() >= 4 {
@@ -484,6 +496,16 @@ fn encode_scene_object(
     }
     if let Some(sid) = obj.style_id {
         loda_args.push((LODA_ARG_OBJECT_STYLE_LINK, sid.0.as_bytes().to_vec()));
+    }
+    if let Some(persp) = obj.perspective {
+        if let Ok(pb) = serde_json::to_vec(&persp) {
+            loda_args.push((LODA_ARG_PERSPECTIVE_3X3, pb));
+        }
+    }
+    if obj.color_style_id.is_some() || obj.color_style_slot.is_some() {
+        if let Ok(cb) = serde_json::to_vec(&(obj.color_style_id, obj.color_style_slot)) {
+            loda_args.push((LODA_ARG_COLOR_STYLE_LINK, cb));
+        }
     }
 
     let chunk_type;
@@ -619,12 +641,43 @@ fn encode_scene_object(
                         NodePayload::Shape(s) => {
                             merged.subpaths.extend(s.to_bezier_path().subpaths)
                         }
+                        NodePayload::BSpline(bs) => {
+                            merged.subpaths.extend(bs.to_bezier_path().subpaths)
+                        }
                         _ => {}
                     }
                 }
                 if !merged.subpaths.is_empty() {
                     loda_args.push((LODA_ARG_CURVE, encode_loda_curve_arg(&merged)));
                 }
+            }
+        }
+        NodePayload::BSpline(bs) => {
+            chunk_type = CDR_CTYPE_CURVE;
+            if let Ok(bb) = serde_json::to_vec(bs) {
+                loda_args.push((LODA_ARG_BSPLINE, bb));
+            }
+            loda_args.push((LODA_ARG_CURVE, encode_loda_curve_arg(&bs.to_bezier_path())));
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            chunk_type = CDR_CTYPE_CURVE;
+            if let Ok(ab) = serde_json::to_vec(&(spine, style)) {
+                loda_args.push((LODA_ARG_ARTISTIC_MEDIA, ab));
+            }
+            let expanded = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            loda_args.push((LODA_ARG_CURVE, encode_loda_curve_arg(&expanded)));
+        }
+        NodePayload::Clone {
+            master_id,
+            link_fill,
+            link_outline,
+            link_shape,
+        } => {
+            chunk_type = CDR_CTYPE_CURVE;
+            if let Ok(cb) =
+                serde_json::to_vec(&(*master_id, *link_fill, *link_outline, *link_shape))
+            {
+                loda_args.push((LODA_ARG_CLONE, cb));
             }
         }
         NodePayload::Group(_) => unreachable!(),

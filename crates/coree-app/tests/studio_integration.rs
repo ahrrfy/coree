@@ -8278,3 +8278,507 @@ fn studio_clipboard_cross_instance_svg_pdf_emf_png_roundtrip_and_undo_redo() {
         );
     }
 }
+
+#[test]
+fn edit_symbol_isolated_session_updates_all_instances_and_supports_undo_redo() {
+    let mut app = StudioApp::new_headless();
+    let lid = app.active_tab().unwrap().document.pages()[0].layers[0].id;
+    let rect = SceneObject::new(
+        ObjectId(0),
+        "SymPart",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::CYAN));
+    let sym = coree_core::SymbolDef::new("Badge", vec![rect]);
+    let sym_id = sym.id;
+    app.execute_command(CommandOp::UpsertSymbol { symbol: sym })
+        .unwrap();
+    app.execute_command(CommandOp::InstantiateSymbol {
+        symbol_id: sym_id,
+        layer_id: Some(lid),
+        transform: Affine2D::translate(10.0, 10.0),
+        name: Some("Inst1".to_owned()),
+    })
+    .unwrap();
+    app.execute_command(CommandOp::InstantiateSymbol {
+        symbol_id: sym_id,
+        layer_id: Some(lid),
+        transform: Affine2D::translate(80.0, 10.0),
+        name: Some("Inst2".to_owned()),
+    })
+    .unwrap();
+    let inst_ids: Vec<ObjectId> = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .values()
+        .filter(|o| matches!(o.payload, NodePayload::SymbolInstance(_)))
+        .map(|o| o.id)
+        .collect();
+    assert_eq!(inst_ids.len(), 2);
+
+    assert!(app.begin_edit_symbol(sym_id));
+    assert!(app.active_tab().unwrap().editing_symbol.is_some());
+    // Resize the isolated symbol part to 45x25 mm
+    let iso_id = app.active_tab().unwrap().selection.objects[0];
+    app.execute_command(CommandOp::EditShape {
+        id: iso_id,
+        shape: ParametricShape::Rectangle {
+            width: 45.0,
+            height: 25.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        },
+    })
+    .unwrap();
+    assert!(app.finish_edit_symbol(true));
+    assert!(app.active_tab().unwrap().editing_symbol.is_none());
+
+    for &iid in &inst_ids {
+        let bb = app
+            .active_tab()
+            .unwrap()
+            .document
+            .world_object_bounds(iid)
+            .unwrap();
+        assert!((bb.width() - 45.0).abs() < 1e-4 && (bb.height() - 25.0).abs() < 1e-4);
+    }
+
+    // Undo restores original 20x20 symbol size across both instances
+    app.undo().unwrap();
+    for &iid in &inst_ids {
+        let bb = app
+            .active_tab()
+            .unwrap()
+            .document
+            .world_object_bounds(iid)
+            .unwrap();
+        assert!((bb.width() - 20.0).abs() < 1e-4);
+    }
+    app.redo().unwrap();
+    for &iid in &inst_ids {
+        let bb = app
+            .active_tab()
+            .unwrap()
+            .document
+            .world_object_bounds(iid)
+            .unwrap();
+        assert!((bb.width() - 45.0).abs() < 1e-4);
+    }
+
+    // Test FitPowerClip & ADD-01 build_selected_effect indices 10..=12
+    app.effects_state.selected_effect_kind = 10;
+    assert!(matches!(
+        app.build_selected_effect(),
+        Effect::InnerShadow { .. }
+    ));
+    app.effects_state.selected_effect_kind = 11;
+    assert!(matches!(app.build_selected_effect(), Effect::Bevel { .. }));
+    app.effects_state.selected_effect_kind = 12;
+    assert!(matches!(
+        app.build_selected_effect(),
+        Effect::Extrude3D { .. }
+    ));
+}
+
+#[test]
+fn w2b_r2_edit_symbol_preserves_group_and_powerclip_hierarchy() {
+    use coree_render::{render_page_to_rgba, ViewMode};
+
+    let mut app = StudioApp::new_headless();
+    let lid = Some(app.active_tab().unwrap().document.pages()[0].layers[0].id);
+
+    // 1. Create a Group on canvas and build a SymbolDef via collect_subtree_objects (matching + Create Symbol from Selection)
+    let r1 = SceneObject::new(
+        ObjectId(0),
+        "SymR1",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 15.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 30, 30, 255)));
+    let mut r2 = SceneObject::new(
+        ObjectId(0),
+        "SymR2",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 15.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(0, 64, 255, 255)));
+    r2.transform = Affine2D::translate(25.0, 0.0);
+    app.execute_command(CommandOp::create_object(r1, lid))
+        .unwrap();
+    app.execute_command(CommandOp::create_object(r2, lid))
+        .unwrap();
+    let layer_objs = app.active_tab().unwrap().document.pages()[0].layers[0]
+        .objects
+        .clone();
+    assert_eq!(layer_objs.len(), 2);
+
+    app.execute_command(CommandOp::Group {
+        ids: layer_objs,
+        name: "SrcGrp".to_owned(),
+    })
+    .unwrap();
+    let grp_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[0];
+    let collected = app
+        .active_tab()
+        .unwrap()
+        .document
+        .collect_subtree_objects(&[grp_id]);
+    assert_eq!(
+        collected.len(),
+        3,
+        "Group symbol creation must collect Group + both children"
+    );
+
+    let sym = SymbolDef::new("GroupSym", collected);
+    let sym_id = sym.id;
+    app.execute_command(CommandOp::UpsertSymbol { symbol: sym })
+        .unwrap();
+    app.execute_command(CommandOp::InstantiateSymbol {
+        symbol_id: sym_id,
+        layer_id: lid,
+        transform: Affine2D::translate(30.0, 30.0),
+        name: Some("GroupSymInst".to_owned()),
+    })
+    .unwrap();
+    let inst_id = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .values()
+        .find(|o| matches!(o.payload, NodePayload::SymbolInstance(_)))
+        .unwrap()
+        .id;
+
+    // 2. Open existing SymbolDef containing a Group via begin_edit_symbol -> verify zero dangling IDs and top-level only on layer
+    assert!(app.begin_edit_symbol(sym_id));
+    {
+        let tab = app.active_tab().unwrap();
+        let sym_layer_objs = &tab.document.pages()[0].layers[0].objects;
+        assert_eq!(
+            sym_layer_objs.len(),
+            1,
+            "Only top-level Group must be attached to sym_doc layer"
+        );
+        let iso_grp = tab.document.object(sym_layer_objs[0]).unwrap();
+        let NodePayload::Group(children) = &iso_grp.payload else {
+            panic!("expected Group in sym_doc");
+        };
+        assert_eq!(children.len(), 2);
+        for &cid in children {
+            assert!(
+                tab.document.has_object(cid),
+                "Group child {cid:?} must exist in sym_doc (zero dangling IDs)"
+            );
+        }
+    }
+
+    // 3. Ungroup and re-group inside SymbolEditSession + add a third rect grouped together -> finish_edit_symbol(true)
+    let iso_grp_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[0];
+    app.execute_command(CommandOp::Ungroup {
+        group_id: iso_grp_id,
+    })
+    .unwrap();
+    let iso_rids = app.active_tab().unwrap().document.pages()[0].layers[0]
+        .objects
+        .clone();
+    assert_eq!(iso_rids.len(), 2);
+    let mut r3 = SceneObject::new(
+        ObjectId(0),
+        "SymR3",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 10.0,
+            height: 10.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(30, 180, 30, 255)));
+    r3.transform = Affine2D::translate(50.0, 0.0);
+    let iso_lid = Some(app.active_tab().unwrap().document.pages()[0].layers[0].id);
+    app.execute_command(CommandOp::create_object(r3, iso_lid))
+        .unwrap();
+    let all_iso = app.active_tab().unwrap().document.pages()[0].layers[0]
+        .objects
+        .clone();
+    app.execute_command(CommandOp::Group {
+        ids: all_iso,
+        name: "EditedGrp".to_owned(),
+    })
+    .unwrap();
+    assert!(app.finish_edit_symbol(true));
+
+    // 4. Verify saved SymbolDef has Group + 3 children, SymbolInstance has valid bounds, non-blank render, and Undo/Redo works
+    let saved_sym = app
+        .active_tab()
+        .unwrap()
+        .document
+        .symbol(sym_id)
+        .expect("GroupSym must exist");
+    assert_eq!(saved_sym.objects.len(), 4);
+    let post_bb = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(inst_id)
+        .expect("SymbolInstance bounds must be Some after grouping inside SymbolEditSession");
+    assert!(
+        (post_bb.width() - 60.0).abs() < 1e-4 && (post_bb.height() - 20.0).abs() < 1e-4,
+        "unexpected post-edit bounds: {post_bb:?}"
+    );
+    let rendered = render_page_to_rgba(
+        &app.active_tab().unwrap().document,
+        0,
+        72.0,
+        ViewMode::Enhanced,
+    )
+    .unwrap();
+    let non_white = rendered
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] < 250 || px[1] < 250 || px[2] < 250)
+        .count();
+    assert!(
+        non_white > 100,
+        "SymbolInstance with Group must render non-blank pixels (got {non_white})"
+    );
+
+    app.undo().unwrap();
+    let undo_bb = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(inst_id)
+        .unwrap();
+    assert!((undo_bb.width() - 40.0).abs() < 1e-4);
+    app.redo().unwrap();
+    let redo_bb = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(inst_id)
+        .unwrap();
+    assert!((redo_bb.width() - 60.0).abs() < 1e-4);
+}
+
+#[test]
+fn w2b_r2_clone_selection_live_sync_and_unlink_with_undo_redo() {
+    let mut app = StudioApp::new_headless();
+    let lid = Some(app.active_tab().unwrap().document.pages()[0].layers[0].id);
+
+    let mut master = SceneObject::new(
+        ObjectId(0),
+        "MasterRect",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 30, 30, 255)));
+    master.transform = Affine2D::translate(10.0, 10.0);
+    app.execute_command(CommandOp::create_object(master, lid))
+        .unwrap();
+    let master_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[0];
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, master_id);
+    }
+
+    let cloned_ids = app.clone_selection();
+    assert_eq!(cloned_ids.len(), 1);
+    let clone_id = cloned_ids[0];
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Clone {
+            master_id: mid,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        } if mid == master_id
+    ));
+
+    // Edit master fill & shape -> live sync on Clone
+    app.execute_command(CommandOp::SetFill {
+        ids: vec![master_id],
+        fill: Fill::Solid(Color::rgba8(30, 180, 30, 255)),
+    })
+    .unwrap();
+    app.execute_command(CommandOp::EditShape {
+        id: master_id,
+        shape: ParametricShape::Rectangle {
+            width: 55.0,
+            height: 25.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        },
+    })
+    .unwrap();
+    {
+        let doc = &app.active_tab().unwrap().document;
+        let clone_obj = doc.object(clone_id).unwrap();
+        let (_, eff_fill, _) = doc.resolve_clone_payload_and_style(clone_obj).unwrap();
+        assert_eq!(eff_fill, Fill::Solid(Color::rgba8(30, 180, 30, 255)));
+        let bb = doc.world_object_bounds(clone_id).unwrap();
+        assert!((bb.width() - 55.0).abs() < 1e-4 && (bb.height() - 25.0).abs() < 1e-4);
+    }
+
+    // Unlink Clone -> independent Shape with Green 55x25
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, clone_id);
+    }
+    app.unlink_clone_selection();
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Shape(ParametricShape::Rectangle { width, .. }) if (width - 55.0).abs() < 1e-4
+    ));
+
+    // Undo unlink -> back to live Clone; Redo unlink -> back to independent Shape
+    app.undo().unwrap();
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Clone { .. }
+    ));
+    app.redo().unwrap();
+    assert!(matches!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(clone_id)
+            .unwrap()
+            .payload,
+        NodePayload::Shape(_)
+    ));
+}
+
+#[test]
+fn w2b_r2_artistic_media_property_bar_edit_and_undo_redo() {
+    use coree_core::{ArtisticMediaStyle, ArtisticWidthProfile, BezierPath};
+
+    let mut app = StudioApp::new_headless();
+    let lid = Some(app.active_tab().unwrap().document.pages()[0].layers[0].id);
+    let spine = BezierPath::from_line(Point2D::new(10.0, 20.0), Point2D::new(90.0, 20.0));
+    let orig_style = ArtisticMediaStyle::Preset {
+        max_width_mm: 5.0,
+        profile: ArtisticWidthProfile::TaperBoth,
+    };
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "ArtMediaProp",
+        NodePayload::ArtisticMedia {
+            spine,
+            style: orig_style,
+        },
+    )
+    .with_fill(Fill::Solid(Color::rgba8(0, 64, 255, 255)));
+    app.execute_command(CommandOp::create_object(obj, lid))
+        .unwrap();
+    let am_id = app.active_tab().unwrap().document.pages()[0].layers[0].objects[0];
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, am_id);
+    }
+
+    assert!(app.edit_selected_artistic_media(Some(14.0), Some(ArtisticWidthProfile::Wave)));
+    match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(am_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticMedia { style, .. } => {
+            assert_eq!(
+                style,
+                &ArtisticMediaStyle::Preset {
+                    max_width_mm: 14.0,
+                    profile: ArtisticWidthProfile::Wave,
+                }
+            );
+        }
+        other => panic!("expected ArtisticMedia, got {other:?}"),
+    }
+
+    app.undo().unwrap();
+    match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(am_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticMedia { style, .. } => {
+            assert_eq!(
+                style,
+                &ArtisticMediaStyle::Preset {
+                    max_width_mm: 5.0,
+                    profile: ArtisticWidthProfile::TaperBoth,
+                }
+            );
+        }
+        other => panic!("expected ArtisticMedia after undo, got {other:?}"),
+    }
+    app.redo().unwrap();
+    match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(am_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticMedia { style, .. } => {
+            assert_eq!(
+                style,
+                &ArtisticMediaStyle::Preset {
+                    max_width_mm: 14.0,
+                    profile: ArtisticWidthProfile::Wave,
+                }
+            );
+        }
+        other => panic!("expected ArtisticMedia after redo, got {other:?}"),
+    }
+}

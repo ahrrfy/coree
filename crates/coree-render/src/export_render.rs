@@ -461,16 +461,32 @@ pub fn render_isolated_object_to_rgba(
                     .then(|| (obj_id, effective_parent_xf.compose(&obj.transform)))
             });
     }
+    let resolved_obj_owned;
+    let obj_eff: &coree_core::SceneObject =
+        if matches!(obj.payload, coree_core::NodePayload::Clone { .. }) {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut c = obj.clone();
+                c.payload = p;
+                c.fill = f;
+                c.outline = o;
+                resolved_obj_owned = c;
+                &resolved_obj_owned
+            } else {
+                obj
+            }
+        } else {
+            obj
+        };
     let use_visual_bounds = matches!(
-        obj.payload,
+        obj_eff.payload,
         NodePayload::Group(_)
             | NodePayload::SymbolInstance(_)
             | NodePayload::Table(_)
             | NodePayload::Dimension(_)
     ) || (matches!(
-        obj.payload,
+        obj_eff.payload,
         NodePayload::TextOnPath(_) | NodePayload::Connector(_)
-    ) && obj.effects.iter().any(|e| {
+    ) && obj_eff.effects.iter().any(|e| {
         matches!(
             e,
             Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
@@ -483,15 +499,15 @@ pub fn render_isolated_object_to_rgba(
             doc.visual_world_bounds_with_parent(obj_id, effective_parent_xf)
         }
     } else {
-        let local_bb = match &obj.payload {
+        let local_bb = match &obj_eff.payload {
             NodePayload::ArtisticText(at) => {
                 Some(renderer.text_engine_mut().measure_artistic_bounds(at))
             }
-            _ => extract_local_geometry_path(obj)
-                .and_then(|p| apply_geometry_effects(&p, &obj.effects).bounding_box()),
+            _ => extract_local_geometry_path(obj_eff)
+                .and_then(|p| apply_geometry_effects(&p, &obj_eff.effects).bounding_box()),
         };
         let doc_world_bb = if local_bb.is_none() {
-            match &obj.payload {
+            match &obj_eff.payload {
                 NodePayload::TextOnPath(top) if parent_xf != Affine2D::IDENTITY => {
                     let doc_parent_world = doc
                         .parent_container_of(obj_id)
@@ -513,16 +529,12 @@ pub fn render_isolated_object_to_rgba(
                     doc.world_object_bounds(obj_id)
                 }
                 _ if parent_xf == Affine2D::IDENTITY => doc.world_object_bounds(obj_id),
-                _ => None,
+                _ => doc.visual_world_bounds_with_parent(obj_id, effective_parent_xf),
             }
         } else {
             None
         };
-        let doc_obj_bb = if local_bb.is_none() && doc_world_bb.is_none() {
-            doc.object_bounds(obj_id)
-        } else {
-            None
-        };
+        let doc_obj_bb: Option<Rect2D> = None;
 
         let mut acc_bb: Option<Rect2D> = None;
         let sym_xfs = symmetry_effect_transforms(&obj.effects);

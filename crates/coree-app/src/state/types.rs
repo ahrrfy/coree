@@ -299,6 +299,10 @@ pub struct ToolSettings {
     pub shape_reduce_tolerance_mm: f64,
     pub text_insert_draft: String,
     pub dimension_offset_mm: f64,
+    pub symmetry_enabled: bool,
+    pub symmetry_folds: u32,
+    pub symmetry_mirror: bool,
+    pub draw_in_perspective: bool,
 }
 
 impl Default for ToolSettings {
@@ -338,6 +342,10 @@ impl Default for ToolSettings {
             shape_reduce_tolerance_mm: 0.5,
             text_insert_draft: "coree Studio".to_owned(),
             dimension_offset_mm: 8.0,
+            symmetry_enabled: false,
+            symmetry_folds: 4,
+            symmetry_mirror: true,
+            draw_in_perspective: false,
         }
     }
 }
@@ -393,6 +401,11 @@ impl ToolSettings {
             effect_frequency: fx.frequency,
             effect_envelope_mode: fx.envelope_mode,
             effect_blend_mode: fx.blend_mode,
+            symmetry_enabled: self.symmetry_enabled,
+            symmetry_folds: self.symmetry_folds.max(2),
+            symmetry_mirror: self.symmetry_mirror,
+            symmetry_center_mm: None,
+            draw_in_perspective: self.draw_in_perspective,
         }
     }
 }
@@ -650,6 +663,18 @@ pub struct EffectsDockerState {
     pub symmetry_axes: u32,
     pub symmetry_mirror: bool,
     pub blend_mode: BlendMode,
+    pub inner_shadow_feather: FeatherDirection,
+    pub bevel_style: coree_core::BevelStyle,
+    pub bevel_distance_mm: f64,
+    pub bevel_softness_mm: f64,
+    pub bevel_light_angle_deg: f64,
+    pub bevel_altitude_deg: f64,
+    pub bevel_highlight_color: Color,
+    pub bevel_shadow_color: Color,
+    pub bevel_intensity: f32,
+    pub extrude3d_rotation: [f64; 3],
+    pub extrude3d_light_dir: [f32; 3],
+    pub extrude3d_light_intensity: f32,
 }
 
 impl Default for EffectsDockerState {
@@ -672,6 +697,18 @@ impl Default for EffectsDockerState {
             symmetry_axes: 4,
             symmetry_mirror: true,
             blend_mode: BlendMode::Multiply,
+            inner_shadow_feather: FeatherDirection::Inside,
+            bevel_style: coree_core::BevelStyle::SoftEdge,
+            bevel_distance_mm: 3.0,
+            bevel_softness_mm: 1.0,
+            bevel_light_angle_deg: 135.0,
+            bevel_altitude_deg: 45.0,
+            bevel_highlight_color: Color::WHITE,
+            bevel_shadow_color: Color::BLACK,
+            bevel_intensity: 0.85,
+            extrude3d_rotation: [12.0, -18.0, 0.0],
+            extrude3d_light_dir: [0.45, -0.6, 0.65],
+            extrude3d_light_intensity: 0.9,
         }
     }
 }

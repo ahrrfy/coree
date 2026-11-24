@@ -7,7 +7,7 @@
 
 use crate::cdr_riff::{
     decode_blend_mode, decode_curve_points, decode_dib_to_rgba_with_budget, encode_blend_mode,
-    encode_curve_points, encode_dib_rgba, render_doc_mini_thumbnail_rgba,
+    encode_curve_points, encode_dib_rgba, render_doc_mini_thumbnail_rgba, GuidPayload, StlyPayload,
 };
 use crate::coord::{
     cdr32_to_mm, cmx16_to_mm, cmx32_to_mm, contains_arabic, decode_cdr_text, mm_to_cdr32,
@@ -22,10 +22,11 @@ use crate::riff::{
 use crate::{CdrFormat, ImportReport};
 use coree_core::{
     math::{sanitize_f32, sanitize_f64},
-    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Fill, GradientStop,
+    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, Fill, GradientStop, GridConfig,
     ImageAssetId, Layer, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId,
-    OutlineStyle, Page, PageId, ParagraphText, Point2D, RasterAsset, RasterLayerData, SceneObject,
-    SymbolDef, TextAlign, TextDirection, TextStyle, UnknownCdrChunk, Vec2D,
+    ObjectStyle, OutlineStyle, Page, PageId, ParagraphText, PerspectiveGridConfig, Point2D,
+    RasterAsset, RasterLayerData, SceneObject, SymbolDef, TextAlign, TextDirection, TextStyle,
+    UnknownCdrChunk, Vec2D,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -200,6 +201,23 @@ pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCm
                         }
                     }
                 }
+                b"stly" => {
+                    if let Ok(st) = serde_json::from_slice::<StlyPayload>(data) {
+                        for cs in st.color_styles {
+                            doc.upsert_color_style(cs);
+                        }
+                        for os in st.object_styles {
+                            doc.upsert_object_style(os);
+                        }
+                    }
+                }
+                b"guid" => {
+                    if let Ok(gp) = serde_json::from_slice::<GuidPayload>(data) {
+                        doc.replace_guides(gp.guides);
+                        doc.set_grid(gp.grid);
+                        doc.set_perspective_grid(gp.perspective_grid);
+                    }
+                }
                 b"rclr" => parse_rclr(data, endian, &mut colors, &mut warnings),
                 b"rpen" => parse_rpen(data, endian, &mut pens, &mut warnings),
                 b"rlin" => parse_rlin(data, endian, &mut lines, &mut warnings),
@@ -286,6 +304,13 @@ pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCm
                             }
                         }
                     }
+                    NodePayload::Clone {
+                        ref mut master_id, ..
+                    } => {
+                        if let Some(&mapped) = oid_remap.get(master_id) {
+                            *master_id = mapped;
+                        }
+                    }
                     _ => {}
                 }
                 for eff in &mut obj.effects {
@@ -336,6 +361,25 @@ pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCm
             .collect();
         for sym in syms {
             doc.insert_symbol(sym);
+        }
+        let styles: Vec<ObjectStyle> = doc
+            .object_styles()
+            .iter()
+            .cloned()
+            .map(|mut os| {
+                if let Some(Fill::BitmapPattern {
+                    ref mut image_id, ..
+                }) = os.fill
+                {
+                    if let Some(&mapped) = asset_remap.get(image_id) {
+                        *image_id = mapped;
+                    }
+                }
+                os
+            })
+            .collect();
+        for os in styles {
+            doc.upsert_object_style(os);
         }
     }
 
@@ -1510,6 +1554,41 @@ pub fn export_cmx_bytes_with_endian(
             nodes.push(RiffNode::chunk(*b"symb", sb));
         }
     }
+    if !doc.color_styles().is_empty() || !doc.object_styles().is_empty() {
+        let mut object_styles = Vec::with_capacity(doc.object_styles().len());
+        for os in doc.object_styles() {
+            let mut os_clone = os.clone();
+            if let Some(Fill::BitmapPattern {
+                ref mut image_id, ..
+            }) = os_clone.fill
+            {
+                if let Some(idx) = tables.intern_image(doc, *image_id)? {
+                    *image_id = cmx_placeholder_asset_id(idx);
+                }
+            }
+            object_styles.push(os_clone);
+        }
+        let st = StlyPayload {
+            color_styles: doc.color_styles().to_vec(),
+            object_styles,
+        };
+        if let Ok(sb) = serde_json::to_vec(&st) {
+            nodes.push(RiffNode::chunk(*b"stly", sb));
+        }
+    }
+    if !doc.guides().is_empty()
+        || doc.grid() != GridConfig::default()
+        || *doc.perspective_grid() != PerspectiveGridConfig::default()
+    {
+        let gp = GuidPayload {
+            guides: doc.guides().to_vec(),
+            grid: doc.grid(),
+            perspective_grid: doc.perspective_grid().clone(),
+        };
+        if let Ok(gb) = serde_json::to_vec(&gp) {
+            nodes.push(RiffNode::chunk(*b"guid", gb));
+        }
+    }
     if !tables.images.is_empty() {
         nodes.push(RiffNode::chunk(
             *b"rimg",
@@ -1558,6 +1637,9 @@ fn obj_needs_cmx_ext(obj: &SceneObject) -> bool {
     if !obj.effects.is_empty()
         || obj.lens.is_some()
         || obj.style_id.is_some()
+        || obj.color_style_id.is_some()
+        || obj.color_style_slot.is_some()
+        || obj.perspective.is_some()
         || !obj.unknown_chunks.is_empty()
         || matches!(
             obj.fill,
@@ -1586,7 +1668,10 @@ fn obj_needs_cmx_ext(obj: &SceneObject) -> bool {
         | NodePayload::Table(_)
         | NodePayload::Dimension(_)
         | NodePayload::Connector(_)
-        | NodePayload::SymbolInstance(_) => true,
+        | NodePayload::SymbolInstance(_)
+        | NodePayload::BSpline(_)
+        | NodePayload::ArtisticMedia { .. }
+        | NodePayload::Clone { .. } => true,
         NodePayload::ArtisticText(t) => t.runs.len() > 1 || has_non_default_obj_attrs,
         NodePayload::ParagraphText(p) => {
             p.runs.len() > 1 || p.linked_next_frame.is_some() || has_non_default_obj_attrs
@@ -1780,6 +1865,9 @@ fn collect_referenced_oids(doc: &Document) -> HashSet<ObjectId> {
                     out.insert(next_id);
                 }
             }
+            NodePayload::Clone { master_id, .. } => {
+                out.insert(*master_id);
+            }
             _ => {}
         }
         for eff in &obj.effects {
@@ -1924,6 +2012,16 @@ fn emit_cmx_object(
             emit_cmx_polycurve(obj, &c.route_path(a, b), tables, stream)?;
         }
         NodePayload::SymbolInstance(_) => {
+            emitted_base_cmd = false;
+        }
+        NodePayload::BSpline(bs) => {
+            emit_cmx_polycurve(obj, &bs.to_bezier_path(), tables, stream)?;
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            emit_cmx_polycurve(obj, &expanded, tables, stream)?;
+        }
+        NodePayload::Clone { .. } => {
             emitted_base_cmd = false;
         }
     }

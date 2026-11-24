@@ -6,6 +6,7 @@
 //! using a right-handed Y-down canvas space (origin at top-left of the active page),
 //! with helpers provided for converting to and from Y-up / page-centered formats.
 
+use kurbo::ParamCurve;
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -1097,6 +1098,322 @@ impl Affine2D {
     }
 }
 
+/// A 3×3 planar projective homography matrix stored in row-major order:
+///
+/// ```text
+/// | m[0]  m[1]  m[2] |   | x |   | x' |
+/// | m[3]  m[4]  m[5] | * | y | = | y' |   =>  (x'/w', y'/w')
+/// | m[6]  m[7]  m[8] |   | 1 |   | w' |
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Perspective3x3 {
+    pub m: [f64; 9],
+}
+
+impl Default for Perspective3x3 {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Perspective3x3 {
+    /// Identity projective transform.
+    pub const IDENTITY: Self = Self {
+        m: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    };
+
+    /// Constructs a homography directly from 9 row-major coefficients.
+    #[inline]
+    #[must_use]
+    pub const fn new(m: [f64; 9]) -> Self {
+        Self { m }
+    }
+
+    /// Returns `true` if all 9 entries are finite.
+    #[inline]
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.m.iter().all(|v| v.is_finite())
+    }
+
+    /// Promotes an [`Affine2D`] into a [`Perspective3x3`] with `[0, 0, 1]` bottom row.
+    #[inline]
+    #[must_use]
+    pub const fn from_affine(a: Affine2D) -> Self {
+        Self {
+            m: [
+                a.m[0], a.m[2], a.m[4], a.m[1], a.m[3], a.m[5], 0.0, 0.0, 1.0,
+            ],
+        }
+    }
+
+    /// Solves the exact 3×3 projective homography mapping `[0, 1]²` corners
+    /// `[(0,0), (1,0), (1,1), (0,1)]` onto `quad` `[TL, TR, BR, BL]`.
+    #[must_use]
+    pub fn from_unit_square_to_quad(q: &[Point2D; 4]) -> Option<Self> {
+        if !q.iter().all(|p| p.is_finite()) {
+            return None;
+        }
+        let src = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let mut a = [[0.0_f64; 9]; 8];
+        for i in 0..4 {
+            let (u, v) = src[i];
+            let (x, y) = (q[i].x, q[i].y);
+            a[2 * i] = [u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v, x];
+            a[2 * i + 1] = [0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v, y];
+        }
+        for col in 0..8 {
+            let mut pivot_row = col;
+            let mut max_val = a[col][col].abs();
+            for (r, row) in a.iter().enumerate().skip(col + 1) {
+                if row[col].abs() > max_val {
+                    max_val = row[col].abs();
+                    pivot_row = r;
+                }
+            }
+            if !max_val.is_finite() || max_val < 1e-10 {
+                return None;
+            }
+            a.swap(col, pivot_row);
+            let div = a[col][col];
+            for cell in a[col].iter_mut().skip(col) {
+                *cell /= div;
+            }
+            for r in 0..8 {
+                if r == col {
+                    continue;
+                }
+                let factor = a[r][col];
+                for c in col..9 {
+                    a[r][c] -= factor * a[col][c];
+                }
+            }
+        }
+        let res = Self {
+            m: [
+                a[0][8], a[1][8], a[2][8], a[3][8], a[4][8], a[5][8], a[6][8], a[7][8], 1.0,
+            ],
+        };
+        res.is_finite().then_some(res)
+    }
+
+    /// Solves the projective homography mapping `rect` `[TL, TR, BR, BL]` onto `quad`.
+    #[must_use]
+    pub fn from_rect_to_quad(rect: Rect2D, quad: &[Point2D; 4]) -> Option<Self> {
+        if !rect.is_finite() || rect.width() <= 1e-9 || rect.height() <= 1e-9 {
+            return None;
+        }
+        let unit_to_quad = Self::from_unit_square_to_quad(quad)?;
+        let inv_w = 1.0 / rect.width();
+        let inv_h = 1.0 / rect.height();
+        let rect_to_unit = Self::new([
+            inv_w,
+            0.0,
+            -rect.min_x * inv_w,
+            0.0,
+            inv_h,
+            -rect.min_y * inv_h,
+            0.0,
+            0.0,
+            1.0,
+        ]);
+        let res = unit_to_quad.compose(&rect_to_unit);
+        res.is_finite().then_some(res)
+    }
+
+    /// Solves the projective homography mapping `src` quad onto `dst` quad.
+    #[must_use]
+    pub fn from_quad_to_quad(src: &[Point2D; 4], dst: &[Point2D; 4]) -> Option<Self> {
+        let u2s = Self::from_unit_square_to_quad(src)?;
+        let s2u = u2s.inverse()?;
+        let u2d = Self::from_unit_square_to_quad(dst)?;
+        let res = u2d.compose(&s2u);
+        res.is_finite().then_some(res)
+    }
+
+    /// Matrix multiplication `self * other` (applies `other` first, then `self`).
+    #[must_use]
+    pub fn compose(&self, other: &Self) -> Self {
+        let a = &self.m;
+        let b = &other.m;
+        Self {
+            m: [
+                a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
+                a[0] * b[1] + a[1] * b[4] + a[2] * b[7],
+                a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
+                a[3] * b[0] + a[4] * b[3] + a[5] * b[6],
+                a[3] * b[1] + a[4] * b[4] + a[5] * b[7],
+                a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
+                a[6] * b[0] + a[7] * b[3] + a[8] * b[6],
+                a[6] * b[1] + a[7] * b[4] + a[8] * b[7],
+                a[6] * b[2] + a[7] * b[5] + a[8] * b[8],
+            ],
+        }
+    }
+
+    /// Exact 3×3 matrix inverse, normalized so `m[8] = 1.0` when non-zero, or `None` if singular.
+    #[must_use]
+    pub fn inverse(&self) -> Option<Self> {
+        if !self.is_finite() {
+            return None;
+        }
+        let [a, b, c, d, e, f, g, h, i] = self.m;
+        let c00 = e * i - f * h;
+        let c01 = -(d * i - f * g);
+        let c02 = d * h - e * g;
+        let c10 = -(b * i - c * h);
+        let c11 = a * i - c * g;
+        let c12 = -(a * h - b * g);
+        let c20 = b * f - c * e;
+        let c21 = -(a * f - c * d);
+        let c22 = a * e - b * d;
+        let det = a * c00 + b * c01 + c * c02;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let mut m = [
+            c00 * inv_det,
+            c10 * inv_det,
+            c20 * inv_det,
+            c01 * inv_det,
+            c11 * inv_det,
+            c21 * inv_det,
+            c02 * inv_det,
+            c12 * inv_det,
+            c22 * inv_det,
+        ];
+        if m[8].abs() > 1e-12 {
+            let norm = 1.0 / m[8];
+            for v in &mut m {
+                *v *= norm;
+            }
+        }
+        let res = Self { m };
+        res.is_finite().then_some(res)
+    }
+
+    /// Projects a 2D point through the homogeneous 3×3 matrix (`None` if at horizon `w ≈ 0`).
+    #[inline]
+    #[must_use]
+    pub fn transform_point(&self, p: Point2D) -> Option<Point2D> {
+        if !p.is_finite() || !self.is_finite() {
+            return None;
+        }
+        let m = &self.m;
+        let w = m[6] * p.x + m[7] * p.y + m[8];
+        if !w.is_finite() || w.abs() <= 1e-6 {
+            return None;
+        }
+        let x = (m[0] * p.x + m[1] * p.y + m[2]) / w;
+        let y = (m[3] * p.x + m[4] * p.y + m[5]) / w;
+        (x.is_finite() && y.is_finite()).then_some(Point2D::new(x, y))
+    }
+
+    /// Projects a 2D point, falling back to `p` if degenerate.
+    #[inline]
+    #[must_use]
+    pub fn transform_point_or(&self, p: Point2D) -> Point2D {
+        self.transform_point(p).unwrap_or(p)
+    }
+
+    /// Computes an axis-aligned bounding box enclosing the projected corners of `rect`.
+    #[must_use]
+    pub fn try_transform_rect(&self, rect: Rect2D) -> Option<Rect2D> {
+        if !self.is_finite() || !rect.is_finite() {
+            return None;
+        }
+        let mut pts = Vec::with_capacity(4);
+        for c in rect.corners() {
+            if let Some(tp) = self.transform_point(c) {
+                pts.push(tp);
+            }
+        }
+        Rect2D::from_iter_points(pts).filter(|r| r.is_finite())
+    }
+
+    /// Subdivides and warps a [`crate::geometry::BezierPath`] through this projective homography.
+    #[must_use]
+    pub fn transform_bezier_path(
+        &self,
+        path: &crate::geometry::BezierPath,
+    ) -> crate::geometry::BezierPath {
+        if path.is_empty() || !self.is_finite() {
+            return path.clone();
+        }
+        let mut out_subpaths = Vec::with_capacity(path.subpaths.len());
+        for sp in &path.subpaths {
+            let seg_count = sp.segment_count();
+            if seg_count == 0 {
+                let nodes = sp
+                    .nodes
+                    .iter()
+                    .map(|n| crate::geometry::PathNode {
+                        pos: self.transform_point_or(n.pos),
+                        handle_in: n.handle_in.map(|h| self.transform_point_or(h)),
+                        handle_out: n.handle_out.map(|h| self.transform_point_or(h)),
+                        kind: n.kind,
+                    })
+                    .collect();
+                out_subpaths.push(crate::geometry::Subpath {
+                    nodes,
+                    closed: sp.closed,
+                });
+                continue;
+            }
+            let mut kb = kurbo::BezPath::new();
+            let mut moved = false;
+            for s in 0..seg_count {
+                let Some(seg) = sp.segment_to_kurbo(s) else {
+                    continue;
+                };
+                let is_cubic = matches!(seg, kurbo::PathSeg::Cubic(_));
+                let chord = seg.start().distance(seg.end());
+                let subdiv = if is_cubic {
+                    ((chord / 2.5).ceil() as usize).clamp(2, 16)
+                } else {
+                    ((chord / 10.0).ceil() as usize).clamp(1, 8)
+                };
+                for k in 0..subdiv {
+                    let t0 = k as f64 / subdiv as f64;
+                    let t1 = (k + 1) as f64 / subdiv as f64;
+                    let piece = kurbo::ParamCurve::subsegment(&seg, t0..t1);
+                    if !moved {
+                        let p0 = self.transform_point_or(Point2D::from_kurbo(piece.start()));
+                        kb.move_to(p0.to_kurbo());
+                        moved = true;
+                    }
+                    match piece {
+                        kurbo::PathSeg::Line(l) => {
+                            let p1 = self.transform_point_or(Point2D::from_kurbo(l.p1));
+                            kb.line_to(p1.to_kurbo());
+                        }
+                        kurbo::PathSeg::Quad(q) => {
+                            let c1 = self.transform_point_or(Point2D::from_kurbo(q.p1));
+                            let p2 = self.transform_point_or(Point2D::from_kurbo(q.p2));
+                            kb.quad_to(c1.to_kurbo(), p2.to_kurbo());
+                        }
+                        kurbo::PathSeg::Cubic(c) => {
+                            let c1 = self.transform_point_or(Point2D::from_kurbo(c.p1));
+                            let c2 = self.transform_point_or(Point2D::from_kurbo(c.p2));
+                            let p3 = self.transform_point_or(Point2D::from_kurbo(c.p3));
+                            kb.curve_to(c1.to_kurbo(), c2.to_kurbo(), p3.to_kurbo());
+                        }
+                    }
+                }
+            }
+            if sp.closed && moved {
+                kb.close_path();
+            }
+            let bp = crate::geometry::BezierPath::from_kurbo(&kb);
+            out_subpaths.extend(bp.subpaths);
+        }
+        crate::geometry::BezierPath {
+            subpaths: out_subpaths,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,5 +1496,38 @@ mod tests {
         assert!(Affine2D::new(f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0)
             .inverse()
             .is_none());
+    }
+
+    #[test]
+    fn perspective_3x3_homography_projects_midpoint_and_inverts() {
+        let rect = Rect2D::from_xywh(0.0, 0.0, 60.0, 60.0);
+        let quad = [
+            Point2D::new(20.0, 0.0),
+            Point2D::new(40.0, 0.0),
+            Point2D::new(60.0, 60.0),
+            Point2D::new(0.0, 60.0),
+        ];
+        let h = Perspective3x3::from_rect_to_quad(rect, &quad).expect("valid homography");
+        let corners = rect.corners();
+        for (c, q) in corners.iter().zip(quad.iter()) {
+            let mapped = h.transform_point(*c).expect("corner mapped");
+            assert!(
+                mapped.distance_to(*q) < 1e-8,
+                "corner {c:?} mapped to {mapped:?} instead of {q:?}"
+            );
+        }
+        // Projective center (30, 30) maps strictly above bilinear midpoint (30, 30) because top edge is narrower!
+        let proj_center = h.transform_point(Point2D::new(30.0, 30.0)).expect("center");
+        assert!(
+            proj_center.y < 25.0 && (proj_center.x - 30.0).abs() < 1e-8,
+            "expected projective midpoint y < 25, got {proj_center:?}"
+        );
+        let inv = h.inverse().expect("invertible homography");
+        let back = inv.transform_point(proj_center).expect("inverse point");
+        assert!(back.distance_to(Point2D::new(30.0, 30.0)) < 1e-7);
+
+        // Degenerate collinear quad safely returns None
+        let colinear = [Point2D::ZERO; 4];
+        assert!(Perspective3x3::from_unit_square_to_quad(&colinear).is_none());
     }
 }

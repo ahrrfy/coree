@@ -1173,10 +1173,37 @@ impl StudioApp {
                             outline_text_object_with_engine(&mut text_engine, obj, &tab.document)
                         {
                             if !path.is_empty() && path.is_finite() {
-                                return CommandOp::Batch(vec![
-                                    CommandOp::ConvertToCurves { id },
-                                    CommandOp::EditPath { id, path },
-                                ]);
+                                let mut batch = Vec::new();
+                                if !obj.fill.is_visible() {
+                                    let run_fill = match &obj.payload {
+                                        NodePayload::ArtisticText(t) => t
+                                            .runs
+                                            .iter()
+                                            .find(|r| r.style.fill.alpha() > 1e-6)
+                                            .map(|r| r.style.fill.clone()),
+                                        NodePayload::ParagraphText(p) => p
+                                            .runs
+                                            .iter()
+                                            .find(|r| r.style.fill.alpha() > 1e-6)
+                                            .map(|r| r.style.fill.clone()),
+                                        NodePayload::TextOnPath(top) => top
+                                            .text
+                                            .runs
+                                            .iter()
+                                            .find(|r| r.style.fill.alpha() > 1e-6)
+                                            .map(|r| r.style.fill.clone()),
+                                        _ => None,
+                                    };
+                                    if let Some(c) = run_fill {
+                                        batch.push(CommandOp::SetFill {
+                                            ids: vec![id],
+                                            fill: Fill::Solid(c),
+                                        });
+                                    }
+                                }
+                                batch.push(CommandOp::ConvertToCurves { id });
+                                batch.push(CommandOp::EditPath { id, path });
+                                return CommandOp::Batch(batch);
                             }
                         }
                     }
@@ -1687,6 +1714,409 @@ impl StudioApp {
             }
             tab.metrics_dirty = true;
             tab.needs_rerender = true;
+        }
+    }
+
+    /// Enters isolated symbol-editing mode for `sym_id`, opening the symbol definition
+    /// inside an isolated working canvas until [`Self::finish_edit_symbol`] is called.
+    pub fn begin_edit_symbol(&mut self, sym_id: SymbolId) -> bool {
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        if tab.editing_symbol.is_some() {
+            return false;
+        }
+        let Some(sym) = tab.document.symbol(sym_id).cloned() else {
+            return false;
+        };
+        tab.cancel_active_drag();
+        let _ = tab.tool_core.cancel_all();
+        tab.powerclip_edit_id = None;
+
+        let backup_document = tab.document.clone();
+        let backup_history = std::mem::take(&mut tab.history);
+        let backup_selection = tab.selection.objects.clone();
+        let backup_active_layer_id = tab.active_layer_id;
+
+        let mut sym_doc = Document::new_a4(format!("Symbol: {}", sym.name));
+        for asset in backup_document.assets().values() {
+            sym_doc.insert_asset_if_absent(asset.clone());
+        }
+        for (sid, sdef) in backup_document.symbols() {
+            if *sid != sym_id {
+                sym_doc.upsert_symbol(sdef.clone());
+            }
+        }
+        let mut referenced_children: HashSet<ObjectId> = HashSet::new();
+        for sub in &sym.objects {
+            match &sub.payload {
+                NodePayload::Group(children) => {
+                    referenced_children.extend(children.iter().copied());
+                }
+                NodePayload::PowerClip { contents, .. } => {
+                    referenced_children.extend(contents.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        let mut old_to_new: HashMap<ObjectId, ObjectId> = HashMap::new();
+        let mut root_id_map: HashMap<ObjectId, ObjectId> = HashMap::new();
+        let mut staged: Vec<(bool, SceneObject)> = Vec::with_capacity(sym.objects.len());
+        for mut sub in sym.objects {
+            let orig_id = sub.id;
+            let new_id = sym_doc.alloc_object_id();
+            if orig_id.0 != 0 {
+                old_to_new.insert(orig_id, new_id);
+            }
+            root_id_map.insert(new_id, orig_id);
+            let is_top = orig_id.0 == 0 || !referenced_children.contains(&orig_id);
+            sub.id = new_id;
+            staged.push((is_top, sub));
+        }
+        let mut inserted_roots = Vec::new();
+        for (is_top, mut sub) in staged {
+            Document::remap_object_refs_with_map(&mut sub, &old_to_new);
+            let new_id = sub.id;
+            if is_top {
+                if sym_doc.add_object(sub, None).is_ok() {
+                    inserted_roots.push(new_id);
+                }
+            } else {
+                let _ = sym_doc.insert_loaded_object(sub);
+            }
+        }
+        let new_layer = sym_doc
+            .pages()
+            .first()
+            .and_then(|p| p.layers.first())
+            .map(|l| l.id);
+
+        tab.editing_symbol = Some(SymbolEditSession {
+            symbol_id: sym_id,
+            symbol_name: sym.name.clone(),
+            backup_document,
+            backup_history,
+            backup_selection,
+            backup_active_layer_id,
+            root_id_map,
+        });
+        tab.document = sym_doc;
+        tab.history = CommandHistory::default();
+        tab.active_layer_id = new_layer;
+        tab.selection.select_many(&tab.document, &inserted_roots);
+        tab.tile_cache.mark_all_dirty();
+        tab.metrics_dirty = true;
+        tab.needs_rerender = true;
+        self.push_toast(
+            format!(
+                "Editing Symbol '{}' — click Finish Editing to apply",
+                sym.name
+            ),
+            false,
+        );
+        true
+    }
+
+    /// Exits isolated symbol-editing mode; when `commit` is `true`, updates the symbol
+    /// definition via [`CommandOp::UpsertSymbol`] with full Undo/Redo support.
+    pub fn finish_edit_symbol(&mut self, commit: bool) -> bool {
+        let Some(session) = self.active_tab_mut().and_then(|t| t.editing_symbol.take()) else {
+            return false;
+        };
+        let edited_doc = {
+            let tab = self.active_tab_mut().expect("active tab exists");
+            tab.cancel_active_drag();
+            let _ = tab.tool_core.cancel_all();
+            let edited_doc = std::mem::replace(&mut tab.document, session.backup_document);
+            tab.history = session.backup_history;
+            tab.active_layer_id = session.backup_active_layer_id;
+            tab.selection
+                .select_many(&tab.document, &session.backup_selection);
+            tab.tile_cache.mark_all_dirty();
+            tab.metrics_dirty = true;
+            tab.needs_rerender = true;
+            edited_doc
+        };
+
+        if commit {
+            let mut root_ids: Vec<ObjectId> = Vec::new();
+            for page in edited_doc.pages() {
+                for layer in &page.layers {
+                    root_ids.extend(layer.objects.iter().copied());
+                }
+            }
+            let mut objects = edited_doc.collect_subtree_objects(&root_ids);
+            let mut used_ids: HashSet<ObjectId> = HashSet::new();
+            let mut final_id_map: HashMap<ObjectId, ObjectId> = HashMap::new();
+            for obj in &objects {
+                if let Some(&orig) = session.root_id_map.get(&obj.id) {
+                    if orig.0 != 0 && used_ids.insert(orig) {
+                        final_id_map.insert(obj.id, orig);
+                    }
+                }
+            }
+            let mut next_free = used_ids
+                .iter()
+                .chain(objects.iter().map(|o| &o.id))
+                .map(|id| id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for obj in &objects {
+                if final_id_map.contains_key(&obj.id) {
+                    continue;
+                }
+                if obj.id.0 != 0 && used_ids.insert(obj.id) {
+                    final_id_map.insert(obj.id, obj.id);
+                } else {
+                    while !used_ids.insert(ObjectId(next_free)) {
+                        next_free = next_free.saturating_add(1);
+                    }
+                    final_id_map.insert(obj.id, ObjectId(next_free));
+                    next_free = next_free.saturating_add(1);
+                }
+            }
+            for obj in &mut objects {
+                if let Some(&mapped) = final_id_map.get(&obj.id) {
+                    obj.id = mapped;
+                }
+                Document::remap_object_refs_with_map(obj, &final_id_map);
+            }
+            let updated_sym = coree_core::SymbolDef {
+                id: session.symbol_id,
+                name: session.symbol_name.clone(),
+                objects,
+            };
+            match self.execute_command(CommandOp::UpsertSymbol {
+                symbol: updated_sym,
+            }) {
+                Ok(()) => {
+                    self.push_toast(
+                        format!("Saved edits to Symbol '{}'", session.symbol_name),
+                        false,
+                    );
+                }
+                Err(e) => {
+                    self.push_toast(e, true);
+                    return false;
+                }
+            }
+        } else {
+            self.push_toast("Cancelled Symbol editing", false);
+        }
+        true
+    }
+
+    /// Fits, centers, or stretches contents inside all selected PowerClip containers.
+    pub fn fit_powerclip_selection(&mut self, mode: coree_core::PowerClipFitMode) {
+        let ops: Vec<CommandOp> = {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            tab.selection
+                .objects
+                .iter()
+                .copied()
+                .filter(|id| {
+                    tab.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
+                })
+                .map(|id| CommandOp::FitPowerClip { id, mode })
+                .collect()
+        };
+        if ops.is_empty() {
+            self.push_toast("Select a PowerClip container first", true);
+            return;
+        }
+        match self.execute_command(CommandOp::Batch(ops)) {
+            Ok(()) => self.push_toast(format!("PowerClip {mode:?} applied"), false),
+            Err(e) => self.push_toast(e, true),
+        }
+    }
+
+    /// Creates live linked [`NodePayload::Clone`] objects from the currently selected
+    /// objects on the active unlocked layer via undoable [`CommandOp`].
+    pub fn clone_selection(&mut self) -> Vec<ObjectId> {
+        let Some(layer_id) = self.ensure_active_creation_layer() else {
+            return Vec::new();
+        };
+        let (ops, created) = {
+            let Some(tab) = self.active_tab() else {
+                return Vec::new();
+            };
+            if tab.selection.is_empty() {
+                return Vec::new();
+            }
+            let ids = tab
+                .document
+                .filter_topmost_selection(&tab.selection.objects);
+            let offset = tab.duplicate_offset_mm;
+            let mut next_id = tab.document.next_id().max(
+                tab.document
+                    .objects()
+                    .keys()
+                    .next_back()
+                    .map_or(1, |id| id.0.saturating_add(1)),
+            );
+            let mut ops = Vec::new();
+            let mut created = Vec::new();
+            for src_id in ids {
+                let Some(src_obj) = tab.document.object(src_id) else {
+                    continue;
+                };
+                let parent_world = tab
+                    .document
+                    .parent_container_of(src_id)
+                    .and_then(|pid| tab.document.world_transform_of(pid))
+                    .unwrap_or(Affine2D::IDENTITY);
+                let master_world_xf = parent_world.compose(&src_obj.transform);
+                let new_id = ObjectId(next_id);
+                next_id = next_id.saturating_add(1);
+                let mut clone_obj = SceneObject::new(
+                    new_id,
+                    format!("Clone of {}", src_obj.name),
+                    NodePayload::Clone {
+                        master_id: src_id,
+                        link_fill: true,
+                        link_outline: true,
+                        link_shape: true,
+                    },
+                );
+                clone_obj.transform =
+                    Affine2D::translate(offset.x, offset.y).compose(&master_world_xf);
+                clone_obj.fill = src_obj.fill.clone();
+                clone_obj.outline = src_obj.outline.clone();
+                clone_obj.opacity = src_obj.opacity;
+                clone_obj.blend_mode = src_obj.blend_mode;
+                clone_obj.perspective = src_obj.perspective;
+                ops.push(CommandOp::create_object(clone_obj, layer_id));
+                created.push(new_id);
+            }
+            (ops, created)
+        };
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        let cmd = if ops.len() == 1 {
+            ops.into_iter().next().expect("single op")
+        } else {
+            CommandOp::Batch(ops)
+        };
+        match self.execute_command(cmd) {
+            Ok(()) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selection.select_many(&tab.document, &created);
+                    tab.metrics_dirty = true;
+                }
+                self.push_toast(format!("Cloned {} object(s)", created.len()), false);
+                created
+            }
+            Err(e) => {
+                self.push_toast(e, true);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Updates width/profile on all selected [`NodePayload::ArtisticMedia`] objects via
+    /// undoable [`CommandOp::EditArtisticMedia`].
+    pub fn edit_selected_artistic_media(
+        &mut self,
+        width_mm: Option<f64>,
+        profile: Option<coree_core::ArtisticWidthProfile>,
+    ) -> bool {
+        let ops: Vec<CommandOp> = {
+            let Some(tab) = self.active_tab() else {
+                return false;
+            };
+            let mut out = Vec::new();
+            for &id in &tab.selection.objects {
+                let Some(obj) = tab.document.object(id) else {
+                    continue;
+                };
+                if let NodePayload::ArtisticMedia { spine, style } = &obj.payload {
+                    let mut next_style = style.clone();
+                    match &mut next_style {
+                        coree_core::ArtisticMediaStyle::Preset {
+                            max_width_mm,
+                            profile: prof,
+                        } => {
+                            if let Some(w) = width_mm {
+                                *max_width_mm = w.max(0.1);
+                            }
+                            if let Some(ref p) = profile {
+                                *prof = p.clone();
+                            }
+                        }
+                        coree_core::ArtisticMediaStyle::Brush { width_mm: bw, .. }
+                        | coree_core::ArtisticMediaStyle::Calligraphic { width_mm: bw, .. } => {
+                            if let Some(w) = width_mm {
+                                *bw = w.max(0.1);
+                            }
+                        }
+                        coree_core::ArtisticMediaStyle::Sprayer { size_mm, .. } => {
+                            if let Some(w) = width_mm {
+                                *size_mm = w.max(0.1);
+                            }
+                        }
+                        coree_core::ArtisticMediaStyle::Expression { max_width_mm, .. } => {
+                            if let Some(w) = width_mm {
+                                *max_width_mm = w.max(0.1);
+                            }
+                        }
+                    }
+                    if next_style != *style {
+                        out.push(CommandOp::EditArtisticMedia {
+                            id,
+                            spine: spine.clone(),
+                            style: next_style,
+                        });
+                    }
+                }
+            }
+            out
+        };
+        if ops.is_empty() {
+            return false;
+        }
+        let cmd = if ops.len() == 1 {
+            ops.into_iter().next().expect("single op")
+        } else {
+            CommandOp::Batch(ops)
+        };
+        match self.execute_command(cmd) {
+            Ok(()) => true,
+            Err(e) => {
+                self.push_toast(e, true);
+                false
+            }
+        }
+    }
+
+    /// Unlinks selected live Clone objects into independent editable shapes/curves.
+    pub fn unlink_clone_selection(&mut self) {
+        let ids: Vec<ObjectId> = {
+            let Some(tab) = self.active_tab() else {
+                return;
+            };
+            tab.selection
+                .objects
+                .iter()
+                .copied()
+                .filter(|id| {
+                    tab.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }))
+                })
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        match self.execute_command(CommandOp::UnlinkClone { ids }) {
+            Ok(()) => self.push_toast("Unlinked Clone object(s)", false),
+            Err(e) => self.push_toast(e, true),
         }
     }
 }

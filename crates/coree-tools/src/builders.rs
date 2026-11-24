@@ -4,20 +4,20 @@
 
 use crate::context::ToolReadContext;
 use crate::math_helpers::{
-    bspline_to_bezier_path, build_mesh_fill_for_bounds, compute_free_transform_affine,
-    enclosing_layer_of_object, find_nearest_object_anchor_in_doc, is_object_editable_in_doc,
-    point_in_polygon, three_point_arc_path, world_inverse_transform_of,
-    world_transform_of_or_local,
+    build_mesh_fill_for_bounds, compute_free_transform_affine, enclosing_layer_of_object,
+    find_nearest_object_anchor_in_doc, is_object_editable_in_doc, point_in_polygon,
+    three_point_arc_path, world_inverse_transform_of, world_transform_of_or_local,
 };
 use crate::output::{ToolActionRequest, ToolOutput};
 use crate::types::ToolId;
 use coree_core::{
-    hit_test_rect, Affine2D, AnchorPoint, ArtisticMedia, ArtisticMediaStyle, ArtisticText,
-    BezierPath, Color, CommandOp, ConnectorObject, ConnectorStyle, ContourMode, DimensionKind,
-    DimensionObject, Document, Effect, EllipseMode, FeatherDirection, Fill, GradientStop, LayerId,
-    LiveSketch, NodeKind, NodePayload, ObjectId, OutlineStyle, ParagraphText, ParametricShape,
-    PathNode, Point2D, Rect2D, SceneObject, SmartDrawing, Subpath, TransparencyMode, Vec2D,
-    VectorTable,
+    closed_subpaths_contain_even_odd, hit_test_powerclip_contents_rect, hit_test_rect,
+    segment_min_dist_to_point, Affine2D, AnchorPoint, ArtisticMediaStyle, ArtisticText,
+    BSplineCurve, BezierPath, Color, CommandOp, ConnectorObject, ConnectorStyle, ContourMode,
+    DimensionKind, DimensionObject, Document, Effect, EllipseMode, FeatherDirection, Fill,
+    GradientStop, LayerId, LiveSketch, NodeKind, NodePayload, ObjectId, OutlineStyle,
+    ParagraphText, ParametricShape, PathNode, Perspective3x3, Point2D, Rect2D, SceneObject,
+    SmartDrawing, Subpath, TransparencyMode, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -59,16 +59,24 @@ pub(crate) fn build_replace_effect_op(
     }
 }
 
-/// Computes lasso-selected object IDs for `FreehandPick`.
+/// Computes lasso-selected object IDs for `FreehandPick`, scoped to `powerclip_edit_id` when active.
 #[must_use]
-pub fn compute_lasso_hits(doc: &Document, polygon: &[Point2D]) -> Vec<ObjectId> {
+pub fn compute_lasso_hits_scoped(
+    doc: &Document,
+    powerclip_edit_id: Option<ObjectId>,
+    polygon: &[Point2D],
+) -> Vec<ObjectId> {
     if polygon.len() < 3 {
         return Vec::new();
     }
     let Some(poly_bb) = Rect2D::from_iter_points(polygon.iter().copied()) else {
         return Vec::new();
     };
-    let candidates = hit_test_rect(doc, doc.active_page_index(), poly_bb, false);
+    let candidates = if let Some(pc_id) = powerclip_edit_id {
+        hit_test_powerclip_contents_rect(doc, pc_id, poly_bb, false)
+    } else {
+        hit_test_rect(doc, doc.active_page_index(), poly_bb, false)
+    };
     let mut hits = Vec::new();
     for oid in candidates {
         let Some(bb) = doc.world_object_bounds(oid) else {
@@ -90,6 +98,12 @@ pub fn compute_lasso_hits(doc: &Document, polygon: &[Point2D]) -> Vec<ObjectId> 
     hits
 }
 
+/// Computes lasso-selected object IDs for `FreehandPick`.
+#[must_use]
+pub fn compute_lasso_hits(doc: &Document, polygon: &[Point2D]) -> Vec<ObjectId> {
+    compute_lasso_hits_scoped(doc, None, polygon)
+}
+
 /// Builds a [`CommandOp::CreateObject`] for a B-Spline through `pts`.
 #[must_use]
 pub fn build_bspline_create_op(
@@ -101,15 +115,27 @@ pub fn build_bspline_create_op(
         return None;
     }
     let layer_id = ctx.target_creation_layer_id()?;
-    let path = bspline_to_bezier_path(pts, closed);
+    let bspline = BSplineCurve::from_control_points(pts.to_vec(), 3, closed);
     let fill = if closed {
         ctx.default_fill.clone()
     } else {
         Fill::None
     };
-    let obj = SceneObject::new(ObjectId(0), "B-Spline", NodePayload::Path(path))
+    let mut obj = SceneObject::new(ObjectId(0), "B-Spline", NodePayload::BSpline(bspline))
         .with_fill(fill)
         .with_outline(ctx.default_outline.clone());
+    if ctx.settings.symmetry_enabled && ctx.settings.symmetry_folds >= 2 {
+        let origin = ctx.settings.symmetry_center_mm.unwrap_or_else(|| {
+            ctx.document.active_page().map_or(Point2D::ZERO, |p| {
+                Point2D::new(p.width_mm * 0.5, p.height_mm * 0.5)
+            })
+        });
+        obj.effects.push(Effect::Symmetry {
+            axes: ctx.settings.symmetry_folds,
+            mirror: ctx.settings.symmetry_mirror,
+            origin,
+        });
+    }
     Some(CommandOp::create_object(obj, Some(layer_id)))
 }
 
@@ -751,7 +777,12 @@ fn point_to_segment_distance_sq(p: Point2D, a: Point2D, b: Point2D) -> f64 {
     d.x * d.x + d.y * d.y
 }
 
-fn path_intersects_disk(path: &BezierPath, center: Point2D, radius: f64) -> bool {
+fn path_intersects_disk(
+    path: &BezierPath,
+    center: Point2D,
+    radius: f64,
+    include_interior: bool,
+) -> bool {
     if path.is_empty() || !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
         return false;
     }
@@ -760,29 +791,25 @@ fn path_intersects_disk(path: &BezierPath, center: Point2D, radius: f64) -> bool
             return false;
         }
     }
-    let r_sq = radius * radius;
-    let mut inside_even_odd = false;
     for sp in &path.subpaths {
-        let polys = BezierPath::from_subpath(sp.clone()).flatten(0.025);
-        for poly in polys {
-            if poly.len() == 1 {
-                let d = center - poly[0];
-                if d.x * d.x + d.y * d.y <= r_sq {
-                    return true;
-                }
-                continue;
-            }
-            for win in poly.windows(2) {
-                if point_to_segment_distance_sq(center, win[0], win[1]) <= r_sq {
+        let seg_count = sp.segment_count();
+        if seg_count == 0 {
+            if let Some(first) = sp.nodes.first() {
+                if center.distance_to(first.pos) <= radius {
                     return true;
                 }
             }
-            if sp.closed && poly.len() >= 3 && point_in_polygon(center, &poly) {
-                inside_even_odd = !inside_even_odd;
+            continue;
+        }
+        for seg_idx in 0..seg_count {
+            if let Some(seg) = sp.segment_to_kurbo(seg_idx) {
+                if segment_min_dist_to_point(seg, center) <= radius {
+                    return true;
+                }
             }
         }
     }
-    inside_even_odd
+    include_interior && closed_subpaths_contain_even_odd(&path.subpaths, center)
 }
 
 fn find_eraser_hit_in_subtree(
@@ -801,7 +828,7 @@ fn find_eraser_hit_in_subtree(
         return None;
     }
     match &obj.payload {
-        NodePayload::Path(_) | NodePayload::Shape(_) => {
+        NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_) => {
             if !is_object_editable_in_doc(doc, id) {
                 return None;
             }
@@ -809,10 +836,11 @@ fn find_eraser_hit_in_subtree(
             let bb_ok = eraser_bb
                 .zip(wp.bounding_box())
                 .is_none_or(|(eb, wb)| wb.intersects(eb));
+            let include_interior = obj.fill.is_visible();
             if bb_ok
                 && centers
                     .iter()
-                    .any(|&c| path_intersects_disk(&wp, c, radius))
+                    .any(|&c| path_intersects_disk(&wp, c, radius, include_interior))
             {
                 Some(id)
             } else {
@@ -875,10 +903,12 @@ pub fn build_vector_eraser_ops(ctx: &ToolReadContext<'_>, points: &[Point2D]) ->
     }
     let is_editable_vector = |id: ObjectId| {
         is_object_editable_in_doc(ctx.document, id)
-            && ctx
-                .document
-                .object(id)
-                .is_some_and(|o| matches!(o.payload, NodePayload::Path(_) | NodePayload::Shape(_)))
+            && ctx.document.object(id).is_some_and(|o| {
+                matches!(
+                    o.payload,
+                    NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::BSpline(_)
+                )
+            })
             && ctx.document.world_path_of(id).is_some()
     };
     let eraser_bb =
@@ -903,11 +933,14 @@ pub fn build_vector_eraser_ops(ctx: &ToolReadContext<'_>, points: &[Point2D]) ->
             let single = [p];
             let mut found_at_p = None;
             if let Some(hit) = hit_test_canvas_point_opt_tol(ctx, p, radius) {
+                let hit_include_interior = ctx
+                    .document
+                    .object(hit)
+                    .is_some_and(|o| o.fill.is_visible());
                 if is_editable_vector(hit)
-                    && ctx
-                        .document
-                        .world_path_of(hit)
-                        .is_some_and(|wp| path_intersects_disk(&wp, p, radius))
+                    && ctx.document.world_path_of(hit).is_some_and(|wp| {
+                        path_intersects_disk(&wp, p, radius, hit_include_interior)
+                    })
                 {
                     found_at_p = Some(hit);
                 } else if ctx
@@ -994,9 +1027,13 @@ pub fn build_vector_eraser_ops(ctx: &ToolReadContext<'_>, points: &[Point2D]) ->
                 continue;
             }
         }
+        let include_interior = ctx
+            .document
+            .object(oid)
+            .is_some_and(|o| o.fill.is_visible());
         if !centers
             .iter()
-            .any(|&c| path_intersects_disk(&wp, c, radius))
+            .any(|&c| path_intersects_disk(&wp, c, radius, include_interior))
         {
             continue;
         }
@@ -1006,7 +1043,7 @@ pub fn build_vector_eraser_ops(ctx: &ToolReadContext<'_>, points: &[Point2D]) ->
             let mut next_pieces = Vec::new();
             for piece in &pieces {
                 if !piece.is_empty() {
-                    if path_intersects_disk(piece, center, radius) {
+                    if path_intersects_disk(piece, center, radius, include_interior) {
                         any_erased = true;
                         next_pieces.extend(coree_core::erase_circle(piece, center, radius));
                     } else {
@@ -1033,6 +1070,7 @@ pub fn build_vector_eraser_ops(ctx: &ToolReadContext<'_>, points: &[Point2D]) ->
         let orig_local = match ctx.document.object(oid).map(|o| &o.payload) {
             Some(NodePayload::Path(p)) => p.clone(),
             Some(NodePayload::Shape(s)) => s.to_bezier_path(),
+            Some(NodePayload::BSpline(bs)) => bs.to_bezier_path(),
             _ => continue,
         };
         if updated_local == orig_local {
@@ -1140,7 +1178,7 @@ fn find_fillable_hit_in_subtree(
         payload if is_fillable_leaf_payload(payload) => {
             let hit = doc
                 .world_path_of(id)
-                .is_some_and(|wp| path_intersects_disk(&wp, pt, tol_mm))
+                .is_some_and(|wp| path_intersects_disk(&wp, pt, tol_mm, true))
                 || doc
                     .world_object_bounds(id)
                     .is_some_and(|bb| bb.expand(tol_mm).contains_point(pt));
@@ -1498,7 +1536,11 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
 
     let (name, payload, xf) = match tool {
         ToolId::Pick => {
-            let hits = hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false);
+            let hits = if let Some(pc_id) = ctx.powerclip_edit_id {
+                hit_test_powerclip_contents_rect(ctx.document, pc_id, rect, false)
+            } else {
+                hit_test_rect(ctx.document, ctx.document.active_page_index(), rect, false)
+            };
             return ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                 ids: hits,
                 additive: false,
@@ -1512,7 +1554,7 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
                 rect.max(),
                 Point2D::new(rect.min_x, rect.max_y),
             ];
-            let hits = compute_lasso_hits(ctx.document, &poly);
+            let hits = compute_lasso_hits_scoped(ctx.document, ctx.powerclip_edit_id, &poly);
             return ToolOutput::actions(vec![ToolActionRequest::SelectObjects {
                 ids: hits,
                 additive: false,
@@ -1716,16 +1758,15 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
         }
         ToolId::ArtisticMedia => {
             let center = BezierPath::from_line(rect.min(), rect.max());
-            let expanded = ArtisticMedia::expand_stroke(
-                &center,
-                &ArtisticMediaStyle::Preset {
-                    max_width_mm: ts.artistic_media_width_mm,
-                    profile: ts.artistic_media_profile.clone(),
-                },
-            );
             (
                 "Artistic Media".to_owned(),
-                NodePayload::Path(expanded),
+                NodePayload::ArtisticMedia {
+                    spine: center,
+                    style: ArtisticMediaStyle::Preset {
+                        max_width_mm: ts.artistic_media_width_mm,
+                        profile: ts.artistic_media_profile.clone(),
+                    },
+                },
                 Affine2D::IDENTITY,
             )
         }
@@ -2011,7 +2052,7 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
             | ToolId::StraightConnector
             | ToolId::RightAngleConnector
     );
-    let obj = SceneObject::new(ObjectId(0), name, payload)
+    let mut obj = SceneObject::new(ObjectId(0), name, payload)
         .with_fill(if is_open_stroke { Fill::None } else { fill })
         .with_outline(if tool == ToolId::ArtisticMedia {
             OutlineStyle::none()
@@ -2019,6 +2060,31 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
             outline
         })
         .with_transform(xf);
+    if ts.draw_in_perspective {
+        if let (Some(world_h), Some(inv_xf)) = (
+            ctx.document
+                .perspective_grid()
+                .plane_homography_for_rect(rect),
+            xf.inverse(),
+        ) {
+            let local_h = Perspective3x3::from_affine(inv_xf)
+                .compose(&world_h)
+                .compose(&Perspective3x3::from_affine(xf));
+            obj.perspective = Some(local_h);
+        }
+    }
+    if ts.symmetry_enabled && ts.symmetry_folds >= 2 {
+        let origin = ts.symmetry_center_mm.unwrap_or_else(|| {
+            ctx.document.active_page().map_or(Point2D::ZERO, |p| {
+                Point2D::new(p.width_mm * 0.5, p.height_mm * 0.5)
+            })
+        });
+        obj.effects.push(Effect::Symmetry {
+            axes: ts.symmetry_folds,
+            mirror: ts.symmetry_mirror,
+            origin,
+        });
+    }
     ToolOutput::Commit {
         ops: vec![CommandOp::create_object(obj, Some(layer_id))],
         clear_overlay: true,
@@ -2128,10 +2194,7 @@ pub fn build_mesh_fill_output(
     }
 }
 
-fn object_active_page_z_rank(
-    doc: &Document,
-    oid: ObjectId,
-) -> Option<(bool, usize, usize, usize, Vec<usize>)> {
+fn object_active_page_z_rank(doc: &Document, oid: ObjectId) -> Option<(usize, usize, Vec<usize>)> {
     let mut cur = oid;
     let mut chain = HashSet::new();
     let mut rev_child_indices = Vec::new();
@@ -2150,23 +2213,16 @@ fn object_active_page_z_rank(
     }
     rev_child_indices.reverse();
     let active_page_idx = doc.active_page_index();
-    for (p_idx, page) in doc.pages().iter().enumerate() {
-        for (l_idx, layer) in page.layers.iter().enumerate() {
-            if let Some(o_idx) = layer.objects.iter().position(|&id| id == cur) {
-                if Document::layer_applies_to_page(layer, p_idx, active_page_idx)
-                    && layer.visible
-                    && !layer.locked
-                {
-                    return Some((
-                        p_idx == active_page_idx,
-                        p_idx,
-                        l_idx,
-                        o_idx,
-                        rev_child_indices,
-                    ));
-                }
-                return None;
+    for (eff_idx, layer) in doc
+        .effective_layers_for_page(active_page_idx)
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(o_idx) = layer.objects.iter().position(|&id| id == cur) {
+            if layer.visible && !layer.locked {
+                return Some((eff_idx, o_idx, rev_child_indices));
             }
+            return None;
         }
     }
     None
@@ -2228,7 +2284,7 @@ pub(crate) fn resolve_selected_object_at_or_first(
         let hit = ctx
             .document
             .world_path_of(id)
-            .is_some_and(|wp| path_intersects_disk(&wp, pt, tol_mm))
+            .is_some_and(|wp| path_intersects_disk(&wp, pt, tol_mm, true))
             || ctx
                 .document
                 .world_object_bounds(id)
@@ -2428,6 +2484,38 @@ pub(crate) fn hit_test_canvas_point_opt(
 ) -> Option<ObjectId> {
     let tol = ctx.hit_tol_mm(6.0, 0.8);
     hit_test_canvas_point_opt_tol(ctx, world_pt, tol)
+}
+
+pub(crate) fn hit_test_canvas_point_scoped_opt_tol(
+    ctx: &ToolReadContext<'_>,
+    world_pt: Point2D,
+    tol_mm: f64,
+) -> Option<ObjectId> {
+    if let Some(pc_id) = ctx.powerclip_edit_id {
+        crate::math_helpers::hit_test_powerclip_edit_point(
+            ctx.document,
+            pc_id,
+            ctx.treat_all_objects_as_filled,
+            world_pt,
+            tol_mm,
+        )
+    } else {
+        crate::math_helpers::hit_test_canvas_point_in_doc(
+            ctx.document,
+            None,
+            ctx.treat_all_objects_as_filled,
+            world_pt,
+            tol_mm,
+        )
+    }
+}
+
+pub(crate) fn hit_test_canvas_point_scoped_opt(
+    ctx: &ToolReadContext<'_>,
+    world_pt: Point2D,
+) -> Option<ObjectId> {
+    let tol = ctx.hit_tol_mm(6.0, 0.8);
+    hit_test_canvas_point_scoped_opt_tol(ctx, world_pt, tol)
 }
 
 pub(crate) fn collect_nodes_in_rect(

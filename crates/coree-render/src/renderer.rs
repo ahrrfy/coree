@@ -1213,15 +1213,64 @@ impl SceneRenderer {
             .filter(|m| m.is_finite())
             .unwrap_or(obj.transform);
 
+        let resolved_clone_sb;
+        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut c = obj.clone();
+                c.payload = p;
+                c.fill = f;
+                c.outline = o;
+                resolved_clone_sb = c;
+                &resolved_clone_sb
+            } else {
+                obj
+            }
+        } else {
+            obj
+        };
+        let apply_persp = |p: &BezierPath| -> BezierPath {
+            if let Some(persp) = obj.perspective {
+                persp.transform_bezier_path(p)
+            } else {
+                p.clone()
+            }
+        };
         let mut base_sb: Option<Rect2D> = match &obj.payload {
-            NodePayload::Path(p) => apply_geometry_effects(p, &obj.effects)
+            NodePayload::Path(p) => apply_geometry_effects(&apply_persp(p), &obj.effects)
                 .transformed(&obj_to_screen)
                 .bounding_box(),
-            NodePayload::Shape(s) => apply_geometry_effects(&s.to_bezier_path(), &obj.effects)
-                .transformed(&obj_to_screen)
-                .bounding_box(),
+            NodePayload::Shape(s) => {
+                apply_geometry_effects(&apply_persp(&s.to_bezier_path()), &obj.effects)
+                    .transformed(&obj_to_screen)
+                    .bounding_box()
+            }
+            NodePayload::BSpline(bs) => {
+                apply_geometry_effects(&apply_persp(&bs.to_bezier_path()), &obj.effects)
+                    .transformed(&obj_to_screen)
+                    .bounding_box()
+            }
+            NodePayload::ArtisticMedia { spine, style } => apply_geometry_effects(
+                &apply_persp(&coree_core::ArtisticMedia::expand_stroke(spine, style)),
+                &obj.effects,
+            )
+            .transformed(&obj_to_screen)
+            .bounding_box(),
+            NodePayload::Clone { .. } => {
+                doc.resolve_clone_payload_and_style(obj)
+                    .and_then(|(p, f, o)| {
+                        let mut tmp = obj.clone();
+                        tmp.payload = p;
+                        tmp.fill = f;
+                        tmp.outline = o;
+                        crate::effects_render::extract_local_geometry_path(&tmp).and_then(|geom| {
+                            apply_geometry_effects(&apply_persp(&geom), &tmp.effects)
+                                .transformed(&obj_to_screen)
+                                .bounding_box()
+                        })
+                    })
+            }
             NodePayload::PowerClip { container, .. } => {
-                apply_geometry_effects(container, &obj.effects)
+                apply_geometry_effects(&apply_persp(container), &obj.effects)
                     .transformed(&obj_to_screen)
                     .bounding_box()
             }
@@ -1681,6 +1730,21 @@ impl SceneRenderer {
         underlying: &[BackdropItem],
         depth: usize,
     ) {
+        let resolved_clone;
+        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut c = obj.clone();
+                c.payload = p;
+                c.fill = f;
+                c.outline = o;
+                resolved_clone = c;
+                &resolved_clone
+            } else {
+                return;
+            }
+        } else {
+            obj
+        };
         let anti_alias = view_mode != ViewMode::Pixels;
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
 
@@ -1690,10 +1754,19 @@ impl SceneRenderer {
                 if let Some(local_path) = match &obj.payload {
                     NodePayload::Path(p) => Some(p.clone()),
                     NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                    }
                     NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                     _ => None,
                 } {
-                    let deformed = apply_geometry_effects(&local_path, &obj.effects);
+                    let local_persp = if let Some(persp) = obj.perspective {
+                        persp.transform_bezier_path(&local_path)
+                    } else {
+                        local_path
+                    };
+                    let deformed = apply_geometry_effects(&local_persp, &obj.effects);
                     render_lens_object_with_backdrop(
                         self,
                         doc,
@@ -1756,6 +1829,58 @@ impl SceneRenderer {
                     backend,
                     depth,
                 );
+            }
+            NodePayload::BSpline(bs) => {
+                let path = bs.to_bezier_path();
+                self.render_vector_geometry(
+                    doc,
+                    obj,
+                    &path,
+                    page_to_surface,
+                    parent_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let path = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                self.render_vector_geometry(
+                    doc,
+                    obj,
+                    &path,
+                    page_to_surface,
+                    parent_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                    let mut tmp = obj.clone();
+                    tmp.payload = p;
+                    tmp.fill = f;
+                    tmp.outline = o;
+                    if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp) {
+                        self.render_vector_geometry(
+                            doc,
+                            &tmp,
+                            &geom,
+                            page_to_surface,
+                            parent_to_screen,
+                            px_per_mm,
+                            view_mode,
+                            options,
+                            backend,
+                            depth,
+                        );
+                    }
+                }
             }
             NodePayload::ArtisticText(text) => {
                 if obj.effects.is_empty() || view_mode == ViewMode::Wireframe {
@@ -2212,7 +2337,12 @@ impl SceneRenderer {
                 contents,
                 ..
             } => {
-                let deformed_container = apply_geometry_effects(container, &obj.effects);
+                let persp_container = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(container)
+                } else {
+                    (**container).clone()
+                };
+                let deformed_container = apply_geometry_effects(&persp_container, &obj.effects);
                 if view_mode == ViewMode::Wireframe {
                     stroke_wireframe(
                         &deformed_container,
@@ -3135,6 +3265,23 @@ impl SceneRenderer {
                         depth + 1,
                         visiting,
                     ),
+                    NodePayload::BSpline(bs) => {
+                        inv_target_world.and_then(|_| c_xf.try_transform_rect(bs.bounding_box()?))
+                    }
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        coree_core::ArtisticMedia::expand_stroke(spine, style)
+                            .transformed(&c_xf)
+                            .bounding_box()
+                    }
+                    NodePayload::Clone { .. } => cobj.and_then(|co| {
+                        doc.resolve_clone_payload_and_style(co)
+                            .and_then(|(p, _, _)| {
+                                let mut tmp = co.clone();
+                                tmp.payload = p;
+                                crate::effects_render::extract_local_geometry_path(&tmp)
+                                    .and_then(|path| path.transformed(&c_xf).bounding_box())
+                            })
+                    }),
                 };
                 if let Some(r) = cb {
                     acc = Some(match acc {
@@ -3682,6 +3829,39 @@ impl SceneRenderer {
                 );
                 deformed.transformed(&group_to_screen).bounding_box()
             }
+            NodePayload::BSpline(bs) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&bs.to_bezier_path(), &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(
+                        &coree_core::ArtisticMedia::expand_stroke(spine, style),
+                        &obj.effects,
+                    ),
+                    c_xf,
+                    deform_frames,
+                );
+                deformed.transformed(&group_to_screen).bounding_box()
+            }
+            NodePayload::Clone { .. } => {
+                doc.resolve_clone_payload_and_style(obj)
+                    .and_then(|(p, _, _)| {
+                        let mut tmp = obj.clone();
+                        tmp.payload = p;
+                        let geom = crate::effects_render::extract_local_geometry_path(&tmp)?;
+                        let deformed = apply_deform_chain_in_bounds(
+                            &apply_geometry_effects(&geom, &obj.effects),
+                            c_xf,
+                            deform_frames,
+                        );
+                        deformed.transformed(&group_to_screen).bounding_box()
+                    })
+            }
             NodePayload::PowerClip { container, .. } => {
                 let deformed = apply_deform_chain_in_bounds(
                     &apply_geometry_effects(container, &obj.effects),
@@ -4154,6 +4334,77 @@ impl SceneRenderer {
                     backend,
                     depth,
                 );
+            }
+            NodePayload::BSpline(bs) => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(&bs.to_bezier_path(), &obj.effects),
+                    c_xf,
+                    deform_frames,
+                );
+                self.render_deformed_leaf(
+                    doc,
+                    obj,
+                    &deformed,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let deformed = apply_deform_chain_in_bounds(
+                    &apply_geometry_effects(
+                        &coree_core::ArtisticMedia::expand_stroke(spine, style),
+                        &obj.effects,
+                    ),
+                    c_xf,
+                    deform_frames,
+                );
+                self.render_deformed_leaf(
+                    doc,
+                    obj,
+                    &deformed,
+                    page_to_surface,
+                    group_to_screen,
+                    px_per_mm,
+                    view_mode,
+                    options,
+                    anti_alias,
+                    backend,
+                    depth,
+                );
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                    let mut tmp = obj.clone();
+                    tmp.payload = p;
+                    tmp.fill = f;
+                    tmp.outline = o;
+                    if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp) {
+                        let deformed = apply_deform_chain_in_bounds(
+                            &apply_geometry_effects(&geom, &tmp.effects),
+                            c_xf,
+                            deform_frames,
+                        );
+                        self.render_deformed_leaf(
+                            doc,
+                            &tmp,
+                            &deformed,
+                            page_to_surface,
+                            group_to_screen,
+                            px_per_mm,
+                            view_mode,
+                            options,
+                            anti_alias,
+                            backend,
+                            depth,
+                        );
+                    }
+                }
             }
             NodePayload::ArtisticText(text) => {
                 let pieces = self.text_engine.layout_artistic_pieces(text);
@@ -5278,7 +5529,12 @@ impl SceneRenderer {
         backend: &mut dyn CanvasBackend,
         depth: usize,
     ) {
-        let deformed = apply_geometry_effects(local_path, &obj.effects);
+        let persp_path = if let Some(persp) = obj.perspective {
+            persp.transform_bezier_path(local_path)
+        } else {
+            local_path.clone()
+        };
+        let deformed = apply_geometry_effects(&persp_path, &obj.effects);
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
         let anti_alias = view_mode != ViewMode::Pixels;
 
@@ -6494,81 +6750,7 @@ pub fn arrowhead_geometry(
     style: &ArrowheadStyle,
     stroke_w_mm: f32,
 ) -> Option<(BezierPath, bool)> {
-    if *style == ArrowheadStyle::None {
-        return None;
-    }
-    let dir = forward_dir.normalized().unwrap_or(Vec2D::new(1.0, 0.0));
-    let perp = dir.perp();
-    let size = (f64::from(stroke_w_mm) * 4.5).max(1.5);
-    let half_w = size * 0.45;
-
-    match style {
-        ArrowheadStyle::None => None,
-        ArrowheadStyle::Triangle | ArrowheadStyle::Custom(_) => {
-            let base = tip - dir * size;
-            Some((
-                BezierPath::from_polygon([tip, base + perp * half_w, base - perp * half_w], true),
-                true,
-            ))
-        }
-        ArrowheadStyle::Stealth => {
-            let base = tip - dir * size;
-            let notch = tip - dir * (size * 0.65);
-            Some((
-                BezierPath::from_polygon(
-                    [tip, base + perp * half_w, notch, base - perp * half_w],
-                    true,
-                ),
-                true,
-            ))
-        }
-        ArrowheadStyle::OpenVee => {
-            let base = tip - dir * size;
-            Some((
-                BezierPath::from_polygon([base + perp * half_w, tip, base - perp * half_w], false),
-                false,
-            ))
-        }
-        ArrowheadStyle::Diamond => {
-            let mid = tip - dir * (size * 0.5);
-            let back = tip - dir * size;
-            Some((
-                BezierPath::from_polygon(
-                    [tip, mid + perp * half_w, back, mid - perp * half_w],
-                    true,
-                ),
-                true,
-            ))
-        }
-        ArrowheadStyle::Circle => {
-            let center = tip - dir * half_w;
-            let mut circle = coree_core::ParametricShape::Ellipse {
-                rx: half_w,
-                ry: half_w,
-                mode: coree_core::EllipseMode::Full,
-                start_deg: 0.0,
-                end_deg: 360.0,
-            }
-            .to_bezier_path();
-            circle.transform(&Affine2D::translate(center.x, center.y));
-            Some((circle, true))
-        }
-        ArrowheadStyle::Square => {
-            let back = tip - dir * (half_w * 2.0);
-            Some((
-                BezierPath::from_polygon(
-                    [
-                        tip + perp * half_w,
-                        tip - perp * half_w,
-                        back - perp * half_w,
-                        back + perp * half_w,
-                    ],
-                    true,
-                ),
-                true,
-            ))
-        }
-    }
+    coree_core::arrowhead_geometry(tip, forward_dir, style, stroke_w_mm)
 }
 
 /// Collects all start and end arrowhead `(path, is_filled)` geometries for open subpaths of `path`.

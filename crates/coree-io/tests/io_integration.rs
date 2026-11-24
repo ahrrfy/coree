@@ -1247,3 +1247,538 @@ fn optional_external_real_file_smoke_check() {
         );
     }
 }
+
+#[test]
+fn w2b_r2_pdf_and_eps_export_inner_shadow_bevel_extrude3d() {
+    use coree_core::{BevelStyle, ExtrudeLight};
+
+    let effects = [
+        (
+            "InnerShadow",
+            Effect::InnerShadow {
+                dx_mm: 2.0,
+                dy_mm: 2.0,
+                blur_mm: 3.0,
+                opacity: 0.7,
+                color: Color::BLACK,
+                feather_direction: FeatherDirection::Average,
+            },
+        ),
+        (
+            "Bevel",
+            Effect::Bevel {
+                style: BevelStyle::SoftEdge,
+                distance_mm: 3.0,
+                softness_mm: 1.5,
+                light_angle_deg: 225.0,
+                altitude_deg: 45.0,
+                highlight_color: Color::WHITE,
+                shadow_color: Color::BLACK,
+                intensity: 0.7,
+            },
+        ),
+        (
+            "Extrude3D",
+            Effect::Extrude3D {
+                vanishing_point: Point2D::new(80.0, 20.0),
+                depth: 8.0,
+                bevel_depth: 1.0,
+                shade_color: Color::rgba8(40, 120, 210, 255),
+                rotation_3d: [15.0, -20.0, 0.0],
+                lights: vec![ExtrudeLight {
+                    dir: [0.5, 0.5, 0.7],
+                    intensity: 1.0,
+                }],
+            },
+        ),
+    ];
+
+    for (label, eff) in effects {
+        let mut doc = Document::new_a4(label);
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            label,
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 40.0,
+                height: 30.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(60, 180, 90, 255)));
+        obj.transform = coree_core::Affine2D::translate(30.0, 30.0);
+        obj.effects.push(eff);
+        doc.add_object(obj, None).unwrap();
+
+        let pdf_bytes = export_pdf_to_bytes(&doc, &PdfExportOptions::default()).unwrap();
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(
+            pdf_text.contains("/DynIm1 Do"),
+            "{label} PDF export must emit raster composite XObject /DynIm1 Do"
+        );
+
+        let eps_text = coree_io::export_eps_to_string(&doc, 0).unwrap();
+        assert!(
+            eps_text.contains("/ImageType 1") && eps_text.contains("/ASCIIHexDecode filter"),
+            "{label} EPS export must emit raster composite image"
+        );
+    }
+}
+
+#[test]
+fn w2b_r2_svg_pdf_eps_apply_perspective_to_path_payload() {
+    use coree_core::Perspective3x3;
+
+    let persp = Perspective3x3::from_unit_square_to_quad(&[
+        Point2D::new(0.0, 0.0),
+        Point2D::new(100.0, 15.0),
+        Point2D::new(85.0, 90.0),
+        Point2D::new(10.0, 80.0),
+    ])
+    .expect("valid perspective quad");
+
+    let rect_path = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 1.0, 1.0));
+    let mut doc_plain = Document::new_a4("PlainPath");
+    doc_plain
+        .add_object(
+            SceneObject::new(ObjectId(0), "Plain", NodePayload::Path(rect_path.clone()))
+                .with_fill(Fill::Solid(Color::rgba8(220, 40, 40, 255))),
+            None,
+        )
+        .unwrap();
+
+    let mut doc_persp = Document::new_a4("PerspPath");
+    let mut obj_persp = SceneObject::new(ObjectId(0), "Persp", NodePayload::Path(rect_path))
+        .with_fill(Fill::Solid(Color::rgba8(220, 40, 40, 255)));
+    obj_persp.perspective = Some(persp);
+    doc_persp.add_object(obj_persp, None).unwrap();
+
+    let svg_plain = coree_io::export_svg_to_string(&doc_plain, 0).unwrap();
+    let svg_persp = coree_io::export_svg_to_string(&doc_persp, 0).unwrap();
+    assert_ne!(svg_plain, svg_persp, "SVG must reflect Path perspective");
+    let imported_svg = import_svg_str_with_limits(&svg_persp, &IoLimits::default()).unwrap();
+    let svg_bb = imported_svg
+        .object(imported_svg.pages()[0].layers[0].objects[0])
+        .and_then(|o| imported_svg.world_object_bounds(o.id))
+        .expect("imported perspective SVG object bounds");
+    assert!(
+        svg_bb.width() > 50.0 && svg_bb.height() > 50.0,
+        "expected warped perspective bounds > 50mm, got {svg_bb:?}"
+    );
+
+    let pdf_plain = export_pdf_to_bytes(&doc_plain, &PdfExportOptions::default()).unwrap();
+    let pdf_persp = export_pdf_to_bytes(&doc_persp, &PdfExportOptions::default()).unwrap();
+    assert_ne!(pdf_plain, pdf_persp, "PDF must reflect Path perspective");
+
+    let eps_plain = coree_io::export_eps_to_string(&doc_plain, 0).unwrap();
+    let eps_persp = coree_io::export_eps_to_string(&doc_persp, 0).unwrap();
+    assert_ne!(eps_plain, eps_persp, "EPS must reflect Path perspective");
+    assert!(
+        eps_persp.contains("curveto") || eps_persp.contains("lineto"),
+        "EPS perspective path must emit warped geometry"
+    );
+}
+
+#[test]
+fn w2b_r3_pdf_cutcontour_shape_overlay_applies_perspective() {
+    use coree_core::{Effect, FeatherDirection, Perspective3x3};
+
+    let persp = Perspective3x3::from_unit_square_to_quad(&[
+        Point2D::new(0.0, 0.0),
+        Point2D::new(120.0, 20.0),
+        Point2D::new(100.0, 110.0),
+        Point2D::new(15.0, 95.0),
+    ])
+    .expect("valid perspective quad");
+
+    let make_doc = |with_persp: bool| {
+        let mut doc = Document::new_a4("CutContourShapePersp");
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            "CutShape",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 1.0,
+                height: 1.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(200, 50, 50, 255)))
+        .with_outline(OutlineStyle {
+            color: Color::cut_contour_spot(),
+            width_mm: 0.25,
+            ..OutlineStyle::default()
+        });
+        obj.effects.push(Effect::DropShadow {
+            dx_mm: 2.0,
+            dy_mm: 2.0,
+            blur_mm: 3.0,
+            color: Color::rgba8(0, 0, 0, 128),
+            opacity: 0.5,
+            feather_direction: FeatherDirection::Outside,
+        });
+        if with_persp {
+            obj.perspective = Some(persp);
+        }
+        doc.add_object(obj, None).unwrap();
+        doc
+    };
+
+    let opts = PdfExportOptions {
+        compress_streams: false,
+        ..PdfExportOptions::default()
+    };
+    let pdf_plain = String::from_utf8_lossy(
+        &export_pdf_to_bytes(&make_doc(false), &opts).expect("plain PDF export"),
+    )
+    .into_owned();
+    let pdf_persp = String::from_utf8_lossy(
+        &export_pdf_to_bytes(&make_doc(true), &opts).expect("persp PDF export"),
+    )
+    .into_owned();
+
+    // Extract the CutContour vector overlay slice after the raster composite image draw (`Do`).
+    let cut_slice = |s: &str| -> String {
+        let idx = s.find("/DynIm1 Do").expect("raster composite image draw");
+        s[idx..].to_owned()
+    };
+    assert_ne!(
+        cut_slice(&pdf_plain),
+        cut_slice(&pdf_persp),
+        "CutContour vector overlay for NodePayload::Shape must apply obj.perspective"
+    );
+}
+
+#[test]
+fn w2b_r4_pdf_cutcontour_scaled_perspective_respects_scale_with_object() {
+    use coree_core::{Affine2D, Effect, FeatherDirection, Perspective3x3};
+
+    let persp = Perspective3x3::from_unit_square_to_quad(&[
+        Point2D::new(2.0, 1.0),
+        Point2D::new(19.0, 3.0),
+        Point2D::new(16.0, 14.0),
+        Point2D::new(3.0, 12.0),
+    ])
+    .expect("valid perspective quad");
+
+    let mut doc = Document::new(
+        "CutContourScaledPersp",
+        210.0,
+        297.0,
+        ColorMode::Cmyk,
+        300.0,
+    );
+    let mut obj = SceneObject::new(
+        ObjectId(0),
+        "CutShapeScaled",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 1.0,
+            height: 1.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(40, 140, 210, 255)))
+    .with_outline(OutlineStyle {
+        color: Color::cut_contour_spot(),
+        width_mm: 1.0,
+        scale_with_object: true,
+        ..OutlineStyle::default()
+    });
+    obj.transform = Affine2D::translate(10.0, 10.0).compose(&Affine2D::scale(2.0, 2.0));
+    obj.perspective = Some(persp);
+    obj.effects.push(Effect::InnerShadow {
+        dx_mm: 1.0,
+        dy_mm: 1.0,
+        blur_mm: 1.5,
+        opacity: 0.6,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Inside,
+    });
+    doc.add_object(obj, None).unwrap();
+
+    let opts = PdfExportOptions {
+        compress_streams: false,
+        ..PdfExportOptions::default()
+    };
+    let pdf = String::from_utf8_lossy(&export_pdf_to_bytes(&doc, &opts).expect("PDF export"))
+        .into_owned();
+    let idx = pdf.find("/DynIm1 Do").expect("raster composite image draw");
+    let cut_slice = &pdf[idx..];
+
+    assert!(
+        cut_slice.contains("/Sep1 CS 1.0000 SCN"),
+        "CutContour overlay must select Spot separation colorspace: {cut_slice}"
+    );
+    assert!(
+        cut_slice.contains("5.6693 w"),
+        "CutContour overlay must scale 1.0mm width by 2.0x to 2.0mm (5.6693 pt): {cut_slice}"
+    );
+    // Expected world corners: [(14,12), (48,16), (42,38), (16,34)] mm -> PDF pt (with 3mm bleed)
+    let pt = 72.0 / 25.4;
+    let bleed = 3.0;
+    for (x_mm, y_mm) in [(14.0, 12.0), (48.0, 16.0), (42.0, 38.0), (16.0, 34.0)] {
+        let px = format!("{:.4}", (x_mm + bleed) * pt);
+        let py = format!("{:.4}", (297.0 + bleed - y_mm) * pt);
+        assert!(
+            cut_slice.contains(&format!("{px} {py}")),
+            "missing expected perspective corner ({x_mm}, {y_mm}) mm -> ({px} {py}) in {cut_slice}"
+        );
+    }
+}
+
+fn assert_gs_cutcontour_tiffsep(pdf_bytes: &[u8], tag: &str) {
+    let gs_path = std::path::Path::new("/usr/bin/gs");
+    if !gs_path.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pdf_path = dir.path().join(format!("{tag}.pdf"));
+    std::fs::write(&pdf_path, pdf_bytes).unwrap();
+    let out_tmpl = dir.path().join(format!("{tag}_sep.tif"));
+    let status = std::process::Command::new(gs_path)
+        .args([
+            "-q",
+            "-dNOPAUSE",
+            "-dBATCH",
+            "-sDEVICE=tiffsep",
+            "-r150",
+            &format!("-sOutputFile={}", out_tmpl.display()),
+            &pdf_path.display().to_string(),
+        ])
+        .status()
+        .expect("invoke gs");
+    assert!(status.success(), "gs tiffsep failed for {tag}");
+    let cut_plate = dir.path().join(format!("{tag}_sep(CutContour).tif"));
+    assert!(
+        cut_plate.exists(),
+        "expected Ghostscript CutContour separation plate {} for {tag}",
+        cut_plate.display()
+    );
+    let img = image::open(&cut_plate).expect("decode CutContour separation TIFF");
+    let luma = img.to_luma8();
+    let mut min_v = u8::MAX;
+    let mut max_v = u8::MIN;
+    for p in luma.pixels() {
+        min_v = min_v.min(p.0[0]);
+        max_v = max_v.max(p.0[0]);
+    }
+    assert!(
+        min_v < max_v,
+        "CutContour separation plate for {tag} must be non-blank (min={min_v}, max={max_v})"
+    );
+}
+
+#[test]
+fn w2b_r5_pdf_cutcontour_clone_inherited_spot_under_inner_shadow() {
+    use coree_core::{Affine2D, ArtisticMediaStyle, Effect, FeatherDirection};
+
+    for (scale_with_object, expected_w) in [(true, "5.6693 w"), (false, "2.8346 w")] {
+        let mut doc = Document::new("CloneCutContour", 210.0, 297.0, ColorMode::Cmyk, 300.0);
+        let mut master = SceneObject::new(
+            ObjectId(0),
+            "HiddenMaster",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 25.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(40, 140, 210, 255)))
+        .with_outline(OutlineStyle {
+            color: Color::cut_contour_spot(),
+            width_mm: 1.0,
+            scale_with_object,
+            ..OutlineStyle::default()
+        });
+        master.visible = false;
+        let master_id = doc.add_object(master, None).unwrap();
+
+        let mut clone_obj = SceneObject::new(
+            ObjectId(0),
+            "CloneWithInnerShadow",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        clone_obj.transform = Affine2D::translate(20.0, 20.0).compose(&Affine2D::scale(2.0, 2.0));
+        clone_obj.effects.push(Effect::InnerShadow {
+            dx_mm: 1.5,
+            dy_mm: 1.5,
+            blur_mm: 2.0,
+            opacity: 0.7,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Inside,
+        });
+        doc.add_object(clone_obj, None).unwrap();
+
+        let opts = PdfExportOptions {
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        };
+        let pdf_bytes = export_pdf_to_bytes(&doc, &opts).expect("PDF export");
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(
+            pdf_text.contains("/Separation /CutContour /DeviceCMYK"),
+            "Clone CutContour must emit /Separation /CutContour resource"
+        );
+        let idx = pdf_text
+            .find("/DynIm1 Do")
+            .expect("raster composite image draw");
+        let cut_slice = &pdf_text[idx..];
+        assert!(
+            cut_slice.contains("/Sep1 CS 1.0000 SCN"),
+            "Clone CutContour overlay must emit /Sep1 CS 1.0000 SCN: {cut_slice}"
+        );
+        assert!(
+            cut_slice.contains(expected_w),
+            "Clone CutContour overlay must emit {expected_w} (scale_with_object={scale_with_object}): {cut_slice}"
+        );
+        assert_gs_cutcontour_tiffsep(&pdf_bytes, &format!("clone_{scale_with_object}"));
+    }
+
+    // Also verify a Clone whose hidden master is an ArtisticMedia payload
+    let mut doc = Document::new(
+        "CloneArtisticMediaCut",
+        210.0,
+        297.0,
+        ColorMode::Cmyk,
+        300.0,
+    );
+    let spine = BezierPath::from_line(Point2D::new(0.0, 0.0), Point2D::new(30.0, 10.0));
+    let mut am_master = SceneObject::new(
+        ObjectId(0),
+        "HiddenArtisticMaster",
+        NodePayload::ArtisticMedia {
+            spine,
+            style: ArtisticMediaStyle::Preset {
+                profile: coree_core::ArtisticWidthProfile::TaperBoth,
+                max_width_mm: 4.0,
+            },
+        },
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle {
+        color: Color::cut_contour_spot(),
+        width_mm: 1.0,
+        scale_with_object: true,
+        ..OutlineStyle::default()
+    });
+    am_master.visible = false;
+    let am_master_id = doc.add_object(am_master, None).unwrap();
+
+    let mut am_clone = SceneObject::new(
+        ObjectId(0),
+        "ArtisticClone",
+        NodePayload::Clone {
+            master_id: am_master_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    am_clone.transform = Affine2D::translate(30.0, 30.0).compose(&Affine2D::scale(2.0, 2.0));
+    am_clone.effects.push(Effect::InnerShadow {
+        dx_mm: 1.0,
+        dy_mm: 1.0,
+        blur_mm: 1.5,
+        opacity: 0.6,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Inside,
+    });
+    doc.add_object(am_clone, None).unwrap();
+
+    let opts = PdfExportOptions {
+        compress_streams: false,
+        ..PdfExportOptions::default()
+    };
+    let pdf_bytes = export_pdf_to_bytes(&doc, &opts).expect("PDF export");
+    let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+    let idx = pdf_text
+        .find("/DynIm1 Do")
+        .expect("raster composite image draw");
+    let cut_slice = &pdf_text[idx..];
+    assert!(cut_slice.contains("/Sep1 CS 1.0000 SCN"));
+    assert!(cut_slice.contains("5.6693 w"));
+    assert_gs_cutcontour_tiffsep(&pdf_bytes, "clone_artistic_media");
+}
+
+#[test]
+fn w2b_r5_pdf_cutcontour_artistic_media_under_inner_shadow() {
+    use coree_core::{Affine2D, ArtisticMediaStyle, Effect, FeatherDirection};
+
+    for (scale_with_object, expected_w) in [(true, "5.6693 w"), (false, "2.8346 w")] {
+        let mut doc = Document::new(
+            "ArtisticMediaCutContour",
+            210.0,
+            297.0,
+            ColorMode::Cmyk,
+            300.0,
+        );
+        let spine = BezierPath::from_line(Point2D::new(0.0, 0.0), Point2D::new(35.0, 12.0));
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            "ArtisticMediaCut",
+            NodePayload::ArtisticMedia {
+                spine,
+                style: ArtisticMediaStyle::Calligraphic {
+                    width_mm: 4.0,
+                    angle_deg: 35.0,
+                },
+            },
+        )
+        .with_fill(Fill::Solid(Color::rgba8(180, 60, 120, 255)))
+        .with_outline(OutlineStyle {
+            color: Color::cut_contour_spot(),
+            width_mm: 1.0,
+            scale_with_object,
+            ..OutlineStyle::default()
+        });
+        obj.transform = Affine2D::translate(25.0, 25.0).compose(&Affine2D::scale(2.0, 2.0));
+        obj.effects.push(Effect::InnerShadow {
+            dx_mm: 1.5,
+            dy_mm: 1.5,
+            blur_mm: 2.0,
+            opacity: 0.7,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Inside,
+        });
+        doc.add_object(obj, None).unwrap();
+
+        let opts = PdfExportOptions {
+            compress_streams: false,
+            ..PdfExportOptions::default()
+        };
+        let pdf_bytes = export_pdf_to_bytes(&doc, &opts).expect("PDF export");
+        let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(
+            pdf_text.contains("/Separation /CutContour /DeviceCMYK"),
+            "ArtisticMedia CutContour must emit /Separation /CutContour resource"
+        );
+        let idx = pdf_text
+            .find("/DynIm1 Do")
+            .expect("raster composite image draw");
+        let cut_slice = &pdf_text[idx..];
+        assert!(
+            cut_slice.contains("/Sep1 CS 1.0000 SCN"),
+            "ArtisticMedia CutContour overlay must emit /Sep1 CS 1.0000 SCN: {cut_slice}"
+        );
+        assert!(
+            cut_slice.contains(expected_w),
+            "ArtisticMedia CutContour overlay must emit {expected_w} (scale_with_object={scale_with_object}): {cut_slice}"
+        );
+        assert_gs_cutcontour_tiffsep(&pdf_bytes, &format!("artistic_media_{scale_with_object}"));
+    }
+}

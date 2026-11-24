@@ -147,6 +147,9 @@ fn eps_requires_raster_composite(obj: &SceneObject) -> bool {
                 | Effect::Extrude25D { .. }
                 | Effect::Blend { .. }
                 | Effect::Transparency { .. }
+                | Effect::InnerShadow { .. }
+                | Effect::Bevel { .. }
+                | Effect::Extrude3D { .. }
         )
     }) {
         return true;
@@ -315,7 +318,12 @@ fn emit_eps_object(
 
         match &obj.payload {
             NodePayload::Path(path) => {
-                let deformed = apply_geometry_effects(path, &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(path)
+                } else {
+                    path.clone()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 emit_eps_styled_path(
                     page,
                     &deformed.transformed(&world_xf),
@@ -327,7 +335,12 @@ fn emit_eps_object(
                 );
             }
             NodePayload::Shape(shape) => {
-                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&shape.to_bezier_path())
+                } else {
+                    shape.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 emit_eps_styled_path(
                     page,
                     &deformed.transformed(&world_xf),
@@ -337,6 +350,71 @@ fn emit_eps_object(
                     use_cmyk,
                     out,
                 );
+            }
+            NodePayload::BSpline(bs) => {
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&bs.to_bezier_path())
+                } else {
+                    bs.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                emit_eps_styled_path(
+                    page,
+                    &deformed.transformed(&world_xf),
+                    &obj.fill,
+                    &obj.outline,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let raw = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&raw)
+                } else {
+                    raw
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                emit_eps_styled_path(
+                    page,
+                    &deformed.transformed(&world_xf),
+                    &obj.fill,
+                    &obj.outline,
+                    world_xf,
+                    use_cmyk,
+                    out,
+                );
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                    let bp = match &p {
+                        NodePayload::Path(path) => Some(path.clone()),
+                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                        }
+                        _ => None,
+                    };
+                    if let Some(raw) = bp {
+                        let wp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&raw)
+                        } else {
+                            raw
+                        };
+                        let deformed = apply_geometry_effects(&wp, &obj.effects);
+                        emit_eps_styled_path(
+                            page,
+                            &deformed.transformed(&world_xf),
+                            &f,
+                            &o,
+                            world_xf,
+                            use_cmyk,
+                            out,
+                        );
+                    }
+                }
             }
             NodePayload::ArtisticText(text) => {
                 emit_eps_artistic_text(
@@ -491,8 +569,13 @@ fn emit_eps_object(
                 contents,
                 ..
             } => {
+                let container_bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(container)
+                } else {
+                    (**container).clone()
+                };
                 let clip_path =
-                    apply_geometry_effects(container, &obj.effects).transformed(&world_xf);
+                    apply_geometry_effects(&container_bp, &obj.effects).transformed(&world_xf);
                 if obj.fill.is_visible() {
                     emit_eps_styled_path(
                         page,

@@ -9,10 +9,10 @@ use crate::error::{CdrError, CdrResult};
 use crate::limits::ByteReader;
 use crate::zcf::{parse_c9_style_override, CdssStyle};
 use coree_core::{
-    math::sanitize_f64, BasicShapeKind, BezierPath, BlendMode, ConnectorObject, CornerStyle,
-    DimensionObject, Effect, EllipseMode, ImpactStyle, MasterLayerScope, NodeKind, ObjectId,
-    ObjectStyleId, ParametricShape, PathNode, Point2D, Rect2D, SceneObject, Subpath, SymbolId,
-    TextOnPath, VectorTable,
+    math::sanitize_f64, ArtisticMediaStyle, BSplineCurve, BasicShapeKind, BezierPath, BlendMode,
+    ColorStyleId, ConnectorObject, CornerStyle, DimensionObject, Effect, EllipseMode, ImpactStyle,
+    MasterLayerScope, NodeKind, ObjectId, ObjectStyleId, ParametricShape, PathNode, Perspective3x3,
+    Point2D, Rect2D, SceneObject, Subpath, SymbolId, TextOnPath, VectorTable,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,11 @@ pub(crate) const LODA_ARG_EFFECTS: u32 = 0x00D8;
 pub(crate) const LODA_ARG_OBJECT_STYLE_LINK: u32 = 0x00D9;
 pub(crate) const LODA_ARG_SOURCE_OID: u32 = 0x00DA;
 pub(crate) const LODA_ARG_LAYER_PROPS: u32 = 0x00DB;
+pub(crate) const LODA_ARG_BSPLINE: u32 = 0x00DC;
+pub(crate) const LODA_ARG_ARTISTIC_MEDIA: u32 = 0x00DD;
+pub(crate) const LODA_ARG_CLONE: u32 = 0x00DE;
+pub(crate) const LODA_ARG_PERSPECTIVE_3X3: u32 = 0x00DF;
+pub(crate) const LODA_ARG_COLOR_STYLE_LINK: u32 = 0x00E0;
 pub(crate) const LODA_ARG_NAME: u32 = 0x03E8;
 
 // Native CDR LODA chunk types (offset 16 in 20-byte LODA header)
@@ -168,6 +173,11 @@ pub(crate) struct ParsedLoda {
     pub effects: Vec<Effect>,
     pub object_style_id: Option<ObjectStyleId>,
     pub source_oid: Option<ObjectId>,
+    pub bspline: Option<BSplineCurve>,
+    pub artistic_media: Option<(BezierPath, ArtisticMediaStyle)>,
+    pub clone_ref: Option<(ObjectId, bool, bool, bool)>,
+    pub perspective: Option<Perspective3x3>,
+    pub color_style_link: Option<(Option<ColorStyleId>, Option<usize>)>,
     pub unknown_args: Vec<(u32, Vec<u8>)>,
 }
 
@@ -309,7 +319,7 @@ pub(crate) fn parse_loda_chunk(data: &[u8]) -> CdrResult<ParsedLoda> {
                 LODA_ARG_OBJ_PROPS
                     | LODA_ARG_RECTANGLE..=LODA_ARG_TEXT_META
                     | LODA_ARG_EXTRA_SHAPE
-                    | LODA_ARG_TABLE..=LODA_ARG_LAYER_PROPS
+                    | LODA_ARG_TABLE..=LODA_ARG_COLOR_STYLE_LINK
             )
         });
         let owned_args: Vec<(u32, &[u8])> = args;
@@ -704,6 +714,36 @@ fn decode_loda_arg_list(
                 ])));
             }
             LODA_ARG_LAYER_PROPS => {}
+            LODA_ARG_BSPLINE => {
+                if let Ok(bs) = serde_json::from_slice::<BSplineCurve>(seg) {
+                    out.bspline = Some(bs);
+                }
+            }
+            LODA_ARG_ARTISTIC_MEDIA => {
+                if let Ok((spine, style)) =
+                    serde_json::from_slice::<(BezierPath, ArtisticMediaStyle)>(seg)
+                {
+                    out.artistic_media = Some((spine, style));
+                }
+            }
+            LODA_ARG_CLONE => {
+                if let Ok((master_id, lf, lo, ls)) =
+                    serde_json::from_slice::<(ObjectId, bool, bool, bool)>(seg)
+                {
+                    out.clone_ref = Some((master_id, lf, lo, ls));
+                }
+            }
+            LODA_ARG_PERSPECTIVE_3X3 => {
+                if let Ok(p) = serde_json::from_slice::<Perspective3x3>(seg) {
+                    out.perspective = Some(p);
+                }
+            }
+            LODA_ARG_COLOR_STYLE_LINK => {
+                if let Ok(cs) = serde_json::from_slice::<(Option<ColorStyleId>, Option<usize>)>(seg)
+                {
+                    out.color_style_link = Some(cs);
+                }
+            }
             other => {
                 out.unknown_args.push((other, seg.to_vec()));
             }

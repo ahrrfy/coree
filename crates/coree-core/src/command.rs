@@ -14,10 +14,12 @@ use crate::document::{
 use crate::effects::{Effect, RasterFilter, TransparencyMode};
 use crate::error::{CoreError, CoreResult};
 use crate::find_replace::{find_and_replace, FindQuery, ReplaceAction};
-use crate::geometry::{BezierPath, ParametricShape};
+use crate::geometry::{
+    ArtisticMedia, ArtisticMediaStyle, BSplineCurve, BezierPath, ParametricShape,
+};
 use crate::ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 use crate::lens::{LensConfig, LensKind};
-use crate::math::{Affine2D, Point2D, Rect2D, Unit, Vec2D};
+use crate::math::{Affine2D, Perspective3x3, Point2D, Rect2D, Unit, Vec2D};
 use crate::style::{BlendMode, Fill, ObjectStyle, OutlineStyle};
 use crate::table::VectorTable;
 use crate::text::TextStyle;
@@ -292,6 +294,28 @@ pub enum CommandOp {
         ids: Vec<ObjectId>,
         style_id: Option<ObjectStyleId>,
     },
+    SetObjectColorStyleLink {
+        ids: Vec<ObjectId>,
+        color_style_id: Option<ColorStyleId>,
+        #[serde(default)]
+        slot: Option<usize>,
+    },
+    SetObjectPerspective {
+        ids: Vec<ObjectId>,
+        perspective: Option<Perspective3x3>,
+    },
+    EditBSpline {
+        id: ObjectId,
+        bspline: BSplineCurve,
+    },
+    EditArtisticMedia {
+        id: ObjectId,
+        spine: BezierPath,
+        style: ArtisticMediaStyle,
+    },
+    UnlinkClone {
+        ids: Vec<ObjectId>,
+    },
     UpsertSymbol {
         symbol: SymbolDef,
     },
@@ -431,6 +455,11 @@ impl CommandOp {
             Self::UpsertObjectStyle { style } => format!("Upsert Object Style {}", style.name),
             Self::DeleteObjectStyle { .. } => "Delete Object Style".to_owned(),
             Self::SetObjectStyleLink { .. } => "Set Object Style Link".to_owned(),
+            Self::SetObjectColorStyleLink { .. } => "Set Color Style Link".to_owned(),
+            Self::SetObjectPerspective { .. } => "Set Object Perspective".to_owned(),
+            Self::EditBSpline { .. } => "Edit B-Spline".to_owned(),
+            Self::EditArtisticMedia { .. } => "Edit Artistic Media".to_owned(),
+            Self::UnlinkClone { .. } => "Unlink Clone".to_owned(),
             Self::UpsertSymbol { symbol } => format!("Upsert Symbol {}", symbol.name),
             Self::DeleteSymbol { .. } => "Delete Symbol".to_owned(),
             Self::InstantiateSymbol { .. } => "Instantiate Symbol".to_owned(),
@@ -689,6 +718,55 @@ fn effect_is_finite(e: &Effect) -> bool {
         },
         Effect::Perspective { quad } => quad.iter().all(|p| p.is_finite()),
         Effect::Symmetry { origin, .. } => origin.is_finite(),
+        Effect::InnerShadow {
+            dx_mm,
+            dy_mm,
+            blur_mm,
+            opacity,
+            color,
+            ..
+        } => {
+            dx_mm.is_finite()
+                && dy_mm.is_finite()
+                && blur_mm.is_finite()
+                && opacity.is_finite()
+                && color_is_finite(color)
+        }
+        Effect::Bevel {
+            distance_mm,
+            softness_mm,
+            light_angle_deg,
+            altitude_deg,
+            highlight_color,
+            shadow_color,
+            intensity,
+            ..
+        } => {
+            distance_mm.is_finite()
+                && softness_mm.is_finite()
+                && light_angle_deg.is_finite()
+                && altitude_deg.is_finite()
+                && color_is_finite(highlight_color)
+                && color_is_finite(shadow_color)
+                && intensity.is_finite()
+        }
+        Effect::Extrude3D {
+            vanishing_point,
+            depth,
+            bevel_depth,
+            shade_color,
+            rotation_3d,
+            lights,
+        } => {
+            vanishing_point.is_finite()
+                && depth.is_finite()
+                && bevel_depth.is_finite()
+                && color_is_finite(shade_color)
+                && rotation_3d.iter().all(|v| v.is_finite())
+                && lights
+                    .iter()
+                    .all(|l| l.dir.iter().all(|v| v.is_finite()) && l.intensity.is_finite())
+        }
     }
 }
 
@@ -800,7 +878,7 @@ fn dimension_is_finite(d: &DimensionObject) -> bool {
 /// Validates that a [`SceneObject`]'s transform, styling, effects, lens, and payload geometry
 /// contain only finite numbers.
 fn validate_scene_object_geometry_finite(object: &SceneObject) -> CoreResult<()> {
-    if !object.transform.is_finite() {
+    if !object.transform.is_finite() || !object.perspective.is_none_or(Perspective3x3::is_finite) {
         return Err(CoreError::InvalidGeometry(
             "detached object transform contains non-finite entries".into(),
         ));
@@ -845,7 +923,37 @@ fn validate_scene_object_geometry_finite(object: &SceneObject) -> CoreResult<()>
                     .as_ref()
                     .is_none_or(|s| s.is_finite() && s.to_bezier_path().is_finite())
         }
-        NodePayload::Group(_) | NodePayload::SymbolInstance(_) => true,
+        NodePayload::BSpline(bs) => bs.is_finite(),
+        NodePayload::ArtisticMedia { spine, style } => {
+            spine.is_finite()
+                && match style {
+                    ArtisticMediaStyle::Preset { max_width_mm, .. } => max_width_mm.is_finite(),
+                    ArtisticMediaStyle::Brush {
+                        width_mm,
+                        smoothness,
+                    } => width_mm.is_finite() && smoothness.is_finite(),
+                    ArtisticMediaStyle::Sprayer {
+                        spacing_mm,
+                        size_mm,
+                        scatter_mm,
+                        ..
+                    } => spacing_mm.is_finite() && size_mm.is_finite() && scatter_mm.is_finite(),
+                    ArtisticMediaStyle::Calligraphic {
+                        width_mm,
+                        angle_deg,
+                    } => width_mm.is_finite() && angle_deg.is_finite(),
+                    ArtisticMediaStyle::Expression {
+                        min_width_mm,
+                        max_width_mm,
+                        pressures,
+                    } => {
+                        min_width_mm.is_finite()
+                            && max_width_mm.is_finite()
+                            && pressures.iter().all(|p| p.is_finite())
+                    }
+                }
+        }
+        NodePayload::Group(_) | NodePayload::SymbolInstance(_) | NodePayload::Clone { .. } => true,
     };
     if !payload_finite {
         return Err(CoreError::InvalidGeometry(
@@ -2040,6 +2148,148 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                         if op.is_finite() {
                             obj.opacity = op.clamp(0.0, 1.0);
                         }
+                    }
+                }
+            }
+            doc.touch();
+        }
+        CommandOp::SetObjectColorStyleLink {
+            ids,
+            color_style_id,
+            slot,
+        } => {
+            let color_opt = if let Some(cs_id) = color_style_id {
+                let cs = doc
+                    .color_styles()
+                    .iter()
+                    .find(|c| c.id == *cs_id)
+                    .ok_or_else(|| {
+                        CoreError::InvalidParameter(format!("color style not found: {cs_id:?}"))
+                    })?;
+                Some(Document::resolve_color_style_color(cs, *slot))
+            } else {
+                None
+            };
+            let effective_locked = doc.effective_locked_object_ids();
+            for &id in ids {
+                if !doc.has_object(id) {
+                    return Err(CoreError::ObjectNotFound(id));
+                }
+                if effective_locked.contains(&id) {
+                    return Err(CoreError::ObjectLocked(id));
+                }
+            }
+            for &id in ids {
+                if let Some(obj) = doc.object_mut(id) {
+                    obj.color_style_id = *color_style_id;
+                    obj.color_style_slot = if color_style_id.is_some() {
+                        *slot
+                    } else {
+                        None
+                    };
+                    if let Some(ref col) = color_opt {
+                        let new_fill = Fill::Solid(col.clone());
+                        obj.fill = new_fill.clone();
+                        sync_text_runs_fill(&mut obj.payload, &new_fill);
+                    }
+                }
+            }
+            doc.touch();
+        }
+        CommandOp::SetObjectPerspective { ids, perspective } => {
+            if let Some(p) = perspective {
+                if !p.is_finite() {
+                    return Err(CoreError::InvalidGeometry(
+                        "perspective homography contains non-finite entries".into(),
+                    ));
+                }
+            }
+            let effective_locked = doc.effective_locked_object_ids();
+            for &id in ids {
+                if !doc.has_object(id) {
+                    return Err(CoreError::ObjectNotFound(id));
+                }
+                if effective_locked.contains(&id) {
+                    return Err(CoreError::ObjectLocked(id));
+                }
+            }
+            for &id in ids {
+                if let Some(obj) = doc.object_mut(id) {
+                    obj.perspective = *perspective;
+                }
+            }
+            doc.touch();
+        }
+        CommandOp::EditBSpline { id, bspline } => {
+            if !bspline.is_finite() {
+                return Err(CoreError::InvalidGeometry(
+                    "edited B-spline contains non-finite values".into(),
+                ));
+            }
+            if !doc.has_object(*id) {
+                return Err(CoreError::ObjectNotFound(*id));
+            }
+            if doc.is_effectively_locked(*id) {
+                return Err(CoreError::ObjectLocked(*id));
+            }
+            let obj = doc.object_mut(*id).ok_or(CoreError::ObjectNotFound(*id))?;
+            if !matches!(obj.payload, NodePayload::BSpline(_)) {
+                return Err(CoreError::InvalidParameter(format!(
+                    "EditBSpline requires a BSpline object; cannot overwrite payload on {id}"
+                )));
+            }
+            obj.payload = NodePayload::BSpline(bspline.clone());
+            doc.touch();
+        }
+        CommandOp::EditArtisticMedia { id, spine, style } => {
+            if !spine.is_finite() {
+                return Err(CoreError::InvalidGeometry(
+                    "edited artistic media spine contains non-finite values".into(),
+                ));
+            }
+            if !doc.has_object(*id) {
+                return Err(CoreError::ObjectNotFound(*id));
+            }
+            if doc.is_effectively_locked(*id) {
+                return Err(CoreError::ObjectLocked(*id));
+            }
+            let obj = doc.object_mut(*id).ok_or(CoreError::ObjectNotFound(*id))?;
+            if !matches!(obj.payload, NodePayload::ArtisticMedia { .. }) {
+                return Err(CoreError::InvalidParameter(format!(
+                    "EditArtisticMedia requires an ArtisticMedia object on {id}"
+                )));
+            }
+            obj.payload = NodePayload::ArtisticMedia {
+                spine: spine.clone(),
+                style: style.clone(),
+            };
+            doc.touch();
+        }
+        CommandOp::UnlinkClone { ids } => {
+            let effective_locked = doc.effective_locked_object_ids();
+            for &id in ids {
+                if !doc.has_object(id) {
+                    return Err(CoreError::ObjectNotFound(id));
+                }
+                if effective_locked.contains(&id) {
+                    return Err(CoreError::ObjectLocked(id));
+                }
+            }
+            for &id in ids {
+                let Some(obj_snap) = doc.object(id).cloned() else {
+                    continue;
+                };
+                if !matches!(obj_snap.payload, NodePayload::Clone { .. }) {
+                    continue;
+                }
+                let resolved = doc.resolve_clone_payload_and_style(&obj_snap);
+                if let Some(obj_mut) = doc.object_mut(id) {
+                    if let Some((eff_payload, eff_fill, eff_outline)) = resolved {
+                        obj_mut.payload = eff_payload;
+                        obj_mut.fill = eff_fill;
+                        obj_mut.outline = eff_outline;
+                    } else {
+                        obj_mut.payload = NodePayload::Path(BezierPath::new());
                     }
                 }
             }
@@ -3295,6 +3545,7 @@ impl CommandHistory {
         }
         match &obj.payload {
             NodePayload::TextOnPath(top) if affected.contains(&top.path_id) => return true,
+            NodePayload::Clone { master_id, .. } if affected.contains(master_id) => return true,
             NodePayload::Connector(conn)
                 if conn.from_obj.is_some_and(|id| affected.contains(&id))
                     || conn.to_obj.is_some_and(|id| affected.contains(&id)) =>
@@ -3410,6 +3661,9 @@ impl CommandHistory {
             || before.visible != after.visible
             || before.printable != after.printable
             || before.style_id != after.style_id
+            || before.color_style_id != after.color_style_id
+            || before.color_style_slot != after.color_style_slot
+            || before.perspective != after.perspective
         {
             return None;
         }
@@ -3524,6 +3778,53 @@ impl CommandHistory {
                 match s.to_bezier_path().transformed(world_xf).bounding_box() {
                     Some(r) => r,
                     None => return BeforeBounds::Empty,
+                }
+            }
+            NodePayload::BSpline(bs) => {
+                match bs.to_bezier_path().transformed(world_xf).bounding_box() {
+                    Some(r) => r,
+                    None => return BeforeBounds::Empty,
+                }
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                match ArtisticMedia::expand_stroke(spine, style)
+                    .transformed(world_xf)
+                    .bounding_box()
+                {
+                    Some(r) => r,
+                    None => return BeforeBounds::Empty,
+                }
+            }
+            NodePayload::Clone {
+                master_id,
+                link_shape,
+                ..
+            } => {
+                if !*link_shape {
+                    return BeforeBounds::Empty;
+                }
+                let Some(master) = Self::before_object_of(*master_id, delta, after_doc) else {
+                    return BeforeBounds::Unresolved;
+                };
+                if !visiting_objs.insert(*master_id) {
+                    return BeforeBounds::Empty;
+                }
+                let m_res = Self::conservative_before_bounds(
+                    master,
+                    world_xf,
+                    sym_map,
+                    delta,
+                    after_doc,
+                    depth + 1,
+                    visiting_objs,
+                    visiting_syms,
+                    include_effects_and_pad,
+                );
+                visiting_objs.remove(master_id);
+                match m_res {
+                    BeforeBounds::Rect(r) => r,
+                    BeforeBounds::Empty => return BeforeBounds::Empty,
+                    BeforeBounds::Unresolved => return BeforeBounds::Unresolved,
                 }
             }
             NodePayload::PowerClip { container, .. } => {
@@ -3790,6 +4091,9 @@ impl CommandHistory {
                     acc = acc.expand(offset_mm.abs());
                 }
                 Effect::Extrude25D {
+                    vanishing_point, ..
+                }
+                | Effect::Extrude3D {
                     vanishing_point, ..
                 } => {
                     if vanishing_point.is_finite() {

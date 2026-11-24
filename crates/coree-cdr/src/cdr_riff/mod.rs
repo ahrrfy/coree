@@ -34,7 +34,7 @@ pub use legacy_v3_v5::{cdr16_to_mm, is_legacy_v3_v5, mm_to_cdr16};
 pub use wavelet_wi::{decode_wi_to_rgba_with_budget, encode_wi_rgba, is_wi_bitmap};
 
 pub(crate) use loda::{decode_curve_points, encode_curve_points};
-pub(crate) use parser::parse_cdr_riff_tree;
+pub(crate) use parser::{parse_cdr_riff_tree, GuidPayload, StlyPayload};
 pub(crate) use text_style::{
     decode_blend_mode, encode_blend_mode, encode_legacy_cp1256_txsm, encode_stlt_chunk,
 };

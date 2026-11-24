@@ -692,9 +692,10 @@ fn draw_print_preview_thumbnail(
                     if thumbs.len() >= 48 {
                         break;
                     }
-                    if let (Some(obj), Some(bb)) =
-                        (tab.document.object(oid), tab.document.object_bounds(oid))
-                    {
+                    if let (Some(obj), Some(bb)) = (
+                        tab.document.object(oid),
+                        tab.document.world_object_bounds(oid),
+                    ) {
                         if !obj.visible || !obj.printable {
                             continue;
                         }

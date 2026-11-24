@@ -4237,3 +4237,430 @@ fn w1c_r17_eraser_across_group_multi_selection_and_unselected_erases_all_crossed
     assert_eq!(h.doc.object(u1).unwrap().payload, orig_u1);
     assert_eq!(h.doc.object(u2).unwrap().payload, orig_u2);
 }
+
+#[test]
+fn symmetry_drawing_mode_attaches_effect_and_preview_guides() {
+    let mut h = Harness::new();
+    h.settings.symmetry_enabled = true;
+    h.settings.symmetry_folds = 6;
+    h.settings.symmetry_mirror = true;
+    h.settings.symmetry_center_mm = Some(Point2D::new(100.0, 100.0));
+
+    let mut tc = ToolCore::new(ToolId::Rectangle);
+    let _ = tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(110.0, 110.0), [110.0, 110.0]),
+    );
+    let out_move = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(130.0, 130.0), [130.0, 130.0]),
+    );
+    let overlay = match out_move {
+        ToolOutput::Continue { overlay } => overlay,
+        other => panic!("expected Continue overlay, got {other:?}"),
+    };
+    assert!(
+        overlay.preview_paths.len() >= 7,
+        "expected box preview + 6 symmetry axis guides, got {}",
+        overlay.preview_paths.len()
+    );
+
+    let out_up = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(130.0, 130.0), [130.0, 130.0]),
+    );
+    h.commit(out_up);
+    let last_id = h.doc.pages()[0].layers[0].objects.last().copied().unwrap();
+    let obj = h.doc.object(last_id).unwrap();
+    assert!(obj.effects.iter().any(|e| matches!(
+        e,
+        Effect::Symmetry {
+            axes: 6,
+            mirror: true,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn table_tool_live_grid_preview_and_commit() {
+    let mut h = Harness::new();
+    h.settings.table_rows = 3;
+    h.settings.table_cols = 4;
+
+    let mut tc = ToolCore::new(ToolId::Table);
+    let _ = tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(20.0, 20.0), [20.0, 20.0]),
+    );
+    let out_move = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(100.0, 80.0), [100.0, 80.0]),
+    );
+    let overlay = match out_move {
+        ToolOutput::Continue { overlay } => overlay,
+        other => panic!("expected Continue overlay, got {other:?}"),
+    };
+    // Outer rectangle (1) + 2 horizontal dividers + 3 vertical dividers = 6 preview paths
+    assert_eq!(overlay.preview_paths.len(), 6);
+
+    let out_up = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(100.0, 80.0), [100.0, 80.0]),
+    );
+    h.commit(out_up);
+    let last_id = h.doc.pages()[0].layers[0].objects.last().copied().unwrap();
+    assert!(matches!(
+        &h.doc.object(last_id).unwrap().payload,
+        NodePayload::Table(t) if t.rows == 3 && t.cols == 4
+    ));
+}
+
+#[test]
+fn rem10_continuity_eraser_hollow_interior_bspline_and_powerclip_marquee() {
+    let mut h = Harness::new();
+
+    // 1. Hollow selected Fill::None rect is NOT erased when dragging inside its interior
+    let hollow = SceneObject::new(
+        ObjectId(0),
+        "Hollow",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 80.0,
+            height: 80.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::None)
+    .with_transform(Affine2D::translate(20.0, 20.0));
+    let hollow_id = h.doc.add_object(hollow, None).unwrap();
+    h.selection.select_many(&h.doc, &[hollow_id]);
+    let mut tc = ToolCore::new(ToolId::Eraser);
+    let _ = tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(50.0, 50.0), [50.0, 50.0]),
+    );
+    let _ = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(65.0, 65.0), [65.0, 65.0]),
+    );
+    let up = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(65.0, 65.0), [65.0, 65.0]),
+    );
+    assert!(
+        !matches!(up, ToolOutput::Commit { .. }),
+        "Expected hollow Fill::None interior erase not to commit, got {up:?}"
+    );
+
+    // 2. B-Spline tool creates NodePayload::BSpline and ShapeNode drags a control point
+    let mut bsp_tc = ToolCore::new(ToolId::BSpline);
+    for pt in [
+        Point2D::new(10.0, 10.0),
+        Point2D::new(40.0, 10.0),
+        Point2D::new(40.0, 40.0),
+        Point2D::new(10.0, 40.0),
+    ] {
+        let _ = bsp_tc.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(pt, [pt.x as f32, pt.y as f32]),
+        );
+        let _ = bsp_tc.on_pointer_up(
+            &h.ctx(),
+            &PointerEvent::primary(pt, [pt.x as f32, pt.y as f32]),
+        );
+    }
+    let commit_bsp = bsp_tc.confirm(&h.ctx());
+    h.commit(commit_bsp);
+    let bsp_id = h.doc.pages()[0].layers[0].objects.last().copied().unwrap();
+    assert!(matches!(
+        h.doc.object(bsp_id).unwrap().payload,
+        NodePayload::BSpline(_)
+    ));
+
+    h.selection.select_many(&h.doc, &[bsp_id]);
+    let mut shape_tc = ToolCore::new(ToolId::ShapeNode);
+    let _ = shape_tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(40.0, 10.0), [40.0, 10.0]),
+    );
+    let _ = shape_tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(55.0, 15.0), [55.0, 15.0]),
+    );
+    let edit_out = shape_tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(55.0, 15.0), [55.0, 15.0]),
+    );
+    h.commit(edit_out);
+    match &h.doc.object(bsp_id).unwrap().payload {
+        NodePayload::BSpline(bs) => {
+            assert!((bs.control_points[1].x - 55.0).abs() < 1e-6);
+        }
+        other => panic!("expected BSpline, got {other:?}"),
+    }
+}
+
+#[test]
+fn w2b_r2_shape_node_edits_artistic_media_spine() {
+    use coree_core::{ArtisticMediaStyle, ArtisticWidthProfile};
+    use coree_tools::ActiveDragState;
+
+    let mut h = Harness::new();
+    let spine = BezierPath::from_line(Point2D::new(20.0, 20.0), Point2D::new(80.0, 20.0));
+    let style = ArtisticMediaStyle::Preset {
+        max_width_mm: 6.0,
+        profile: ArtisticWidthProfile::TaperBoth,
+    };
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "ArtMedia",
+        NodePayload::ArtisticMedia {
+            spine,
+            style: style.clone(),
+        },
+    )
+    .with_fill(Fill::Solid(Color::rgba8(0, 64, 255, 255)));
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(obj, None))
+        .unwrap();
+    let am_id = h.doc.pages()[0].layers[0].objects.last().copied().unwrap();
+    h.selection.select_single(&h.doc, am_id);
+
+    let mut shape_tc = ToolCore::new(ToolId::ShapeNode);
+    let idle_overlay = shape_tc.build_overlay(&h.ctx());
+    assert!(
+        idle_overlay.preview_handles.len() >= 2,
+        "ShapeNode idle overlay must expose ArtisticMedia spine node handles"
+    );
+
+    let down = shape_tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(80.0, 20.0), [80.0, 20.0]),
+    );
+    assert!(
+        matches!(
+            shape_tc.drag_state,
+            ActiveDragState::DraggingArtisticMediaNode { object_id, .. } if object_id == am_id
+        ),
+        "Expected DraggingArtisticMediaNode, got {:?}",
+        shape_tc.drag_state
+    );
+    assert!(matches!(down, ToolOutput::Continue { .. }));
+
+    let mv = shape_tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(95.0, 45.0), [95.0, 45.0]),
+    );
+    assert!(
+        matches!(mv, ToolOutput::Continue { ref overlay } if !overlay.preview_paths.is_empty())
+    );
+
+    let up = shape_tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(95.0, 45.0), [95.0, 45.0]),
+    );
+    assert!(
+        matches!(
+            up,
+            ToolOutput::Commit { ref ops, .. }
+                if matches!(ops.as_slice(), [CommandOp::EditArtisticMedia { id, .. }] if *id == am_id)
+        ),
+        "Expected CommandOp::EditArtisticMedia commit, got {up:?}"
+    );
+    h.commit(up);
+
+    match &h.doc.object(am_id).unwrap().payload {
+        NodePayload::ArtisticMedia {
+            spine: edited_spine,
+            style: edited_style,
+        } => {
+            let end_pt = edited_spine.subpaths[0].nodes[1].pos;
+            assert!((end_pt.x - 95.0).abs() < 1e-6 && (end_pt.y - 45.0).abs() < 1e-6);
+            assert_eq!(edited_style, &style);
+        }
+        other => panic!("expected ArtisticMedia, got {other:?}"),
+    }
+}
+
+#[test]
+fn w2b_r3_powerclip_edit_mode_pick_marquee_and_empty_clicks_ignore_container_and_outer() {
+    use coree_core::Rect2D;
+    use coree_tools::{hit_test_powerclip_edit_point, ActiveDragState};
+
+    let mut h = Harness::new();
+    let lid = Some(h.layer_id());
+
+    // Large outer background object overlapping the PowerClip container
+    let outer_rect = SceneObject::new(
+        ObjectId(0),
+        "OuterBg",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 150.0,
+            height: 150.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(128, 128, 128, 255)))
+    .with_outline(OutlineStyle::default());
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(outer_rect, lid))
+        .unwrap();
+    let outer_id = *h.doc.objects().keys().max().unwrap();
+
+    // Two inner PowerClip children: [40,40]..[55,55] and [80,80]..[95,95]
+    let in1 = SceneObject::new(
+        ObjectId(0),
+        "Inner1",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            40.0, 40.0, 15.0, 15.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle::default());
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(in1, lid))
+        .unwrap();
+    let in1_id = *h.doc.objects().keys().max().unwrap();
+
+    let in2 = SceneObject::new(
+        ObjectId(0),
+        "Inner2",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            80.0, 80.0, 15.0, 15.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::MAGENTA))
+    .with_outline(OutlineStyle::default());
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(in2, lid))
+        .unwrap();
+    let in2_id = *h.doc.objects().keys().max().unwrap();
+
+    // Filled PowerClip container [20, 20]..[120, 120]
+    let pc_obj = SceneObject::new(
+        ObjectId(0),
+        "PowerClipBox",
+        NodePayload::PowerClip {
+            container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(
+                20.0, 20.0, 100.0, 100.0,
+            ))),
+            container_parametric: None,
+            contents: vec![in1_id, in2_id],
+            lock_contents: false,
+        },
+    )
+    .with_fill(Fill::Solid(Color::WHITE))
+    .with_outline(OutlineStyle::default());
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(pc_obj, lid))
+        .unwrap();
+    let pc_id = *h.doc.objects().keys().max().unwrap();
+
+    assert_eq!(
+        hit_test_powerclip_edit_point(&h.doc, pc_id, true, Point2D::new(25.0, 25.0), 3.0),
+        None
+    );
+    assert_eq!(
+        hit_test_powerclip_edit_point(&h.doc, pc_id, true, Point2D::new(47.5, 47.5), 3.0),
+        Some(in1_id)
+    );
+
+    // Pre-select an inner object so empty-space click verification confirms clearing selection.
+    h.selection.select_single(&h.doc, in1_id);
+    let mut ctx = h.ctx();
+    ctx.powerclip_edit_id = Some(pc_id);
+    ctx.treat_all_objects_as_filled = true;
+
+    // 1. Pick marquee starting on empty space INSIDE filled PowerClip container (also over outer_id)
+    let mut pick = ToolCore::new(ToolId::Pick);
+    let start_pt = Point2D::new(25.0, 25.0);
+    let end_pt = Point2D::new(100.0, 100.0);
+    let _down = pick.on_pointer_down(&ctx, &PointerEvent::primary(start_pt, [25.0, 25.0]));
+    assert!(
+        matches!(pick.drag_state, ActiveDragState::MarqueeSelect { .. }),
+        "Pick pointer-down on empty space inside filled PowerClip must enter MarqueeSelect, got {:?}",
+        pick.drag_state
+    );
+    let _mv = pick.on_pointer_move(&ctx, &PointerEvent::primary(end_pt, [100.0, 100.0]));
+    let up = pick.on_pointer_up(&ctx, &PointerEvent::primary(end_pt, [100.0, 100.0]));
+    match up {
+        ToolOutput::Consumed { actions, .. } => {
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    ToolActionRequest::SelectObjects { ids, .. }
+                        if ids.contains(&in1_id)
+                            && ids.contains(&in2_id)
+                            && !ids.contains(&pc_id)
+                            && !ids.contains(&outer_id)
+                )),
+                "Marquee inside PowerClip edit mode must select only inner contents, got {actions:?}"
+            );
+        }
+        other => panic!("Expected Consumed SelectObjects from marquee, got {other:?}"),
+    }
+
+    // 2. Zero-drag empty-space clicks inside pc_id and over outer_id clear selection (never select pc_id/outer_id)
+    for empty_pt in [Point2D::new(25.0, 25.0), Point2D::new(135.0, 135.0)] {
+        let mut pick_click = ToolCore::new(ToolId::Pick);
+        let _ = pick_click.on_pointer_down(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        let click_up = pick_click.on_pointer_up(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        match click_up {
+            ToolOutput::Consumed { actions, .. } => {
+                assert!(
+                    actions
+                        .iter()
+                        .any(|a| matches!(a, ToolActionRequest::ClearSelection)),
+                    "Empty-space Pick click at {empty_pt:?} in PowerClip edit mode must emit ClearSelection, got {actions:?}"
+                );
+            }
+            other => panic!("Expected Consumed ClearSelection, got {other:?}"),
+        }
+
+        let mut lasso_click = ToolCore::new(ToolId::FreehandPick);
+        let _ = lasso_click.on_pointer_down(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        let lasso_up =
+            lasso_click.on_pointer_up(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        match lasso_up {
+            ToolOutput::Consumed { actions, .. } => {
+                assert!(
+                    actions
+                        .iter()
+                        .any(|a| matches!(a, ToolActionRequest::ClearSelection)),
+                    "Empty-space FreehandPick click at {empty_pt:?} in PowerClip edit mode must emit ClearSelection, got {actions:?}"
+                );
+            }
+            other => panic!("Expected Consumed ClearSelection for Lasso, got {other:?}"),
+        }
+
+        let mut node_click = ToolCore::new(ToolId::ShapeNode);
+        let _ = node_click.on_pointer_down(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        let node_up = node_click.on_pointer_up(&ctx, &PointerEvent::primary(empty_pt, [0.0, 0.0]));
+        assert!(
+            matches!(node_up, ToolOutput::Consumed { ref actions, .. } if actions.is_empty())
+                || matches!(node_up, ToolOutput::Continue { .. }),
+            "Empty-space ShapeNode click at {empty_pt:?} must not select pc_id/outer_id, got {node_up:?}"
+        );
+    }
+
+    // 3. Ctrl+Click outside pc_id still emits ExitPowerClipEdit
+    let mut ctrl_ev = PointerEvent::primary(Point2D::new(135.0, 135.0), [135.0, 135.0]);
+    ctrl_ev.modifiers.ctrl = true;
+    let mut pick_exit = ToolCore::new(ToolId::Pick);
+    let ctrl_down = pick_exit.on_pointer_down(&ctx, &ctrl_ev);
+    match ctrl_down {
+        ToolOutput::Consumed { actions, .. } => {
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, ToolActionRequest::ExitPowerClipEdit)),
+                "Ctrl+Click outside PowerClip container must emit ExitPowerClipEdit, got {actions:?}"
+            );
+        }
+        other => panic!("Expected Consumed ExitPowerClipEdit, got {other:?}"),
+    }
+}

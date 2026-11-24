@@ -36,6 +36,9 @@ pub enum FindScope {
 pub enum ObjectKindFilter {
     Path,
     Shape,
+    BSpline,
+    ArtisticMedia,
+    Clone,
     ArtisticText,
     ParagraphText,
     TextOnPath,
@@ -561,6 +564,9 @@ fn matches_object_kind(payload: &NodePayload, filter: ObjectKindFilter) -> bool 
     match filter {
         ObjectKindFilter::Path => matches!(payload, NodePayload::Path(_)),
         ObjectKindFilter::Shape => matches!(payload, NodePayload::Shape(_)),
+        ObjectKindFilter::BSpline => matches!(payload, NodePayload::BSpline(_)),
+        ObjectKindFilter::ArtisticMedia => matches!(payload, NodePayload::ArtisticMedia { .. }),
+        ObjectKindFilter::Clone => matches!(payload, NodePayload::Clone { .. }),
         ObjectKindFilter::ArtisticText => matches!(payload, NodePayload::ArtisticText(_)),
         ObjectKindFilter::ParagraphText => matches!(payload, NodePayload::ParagraphText(_)),
         ObjectKindFilter::TextOnPath => matches!(payload, NodePayload::TextOnPath(_)),

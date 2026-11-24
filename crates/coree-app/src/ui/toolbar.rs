@@ -10,10 +10,10 @@ use crate::state::{
 };
 use crate::theme::{core_color_to_egui, egui_color_to_core, ThemeTokens, PROPERTY_BAR_HEIGHT};
 use coree_core::{
-    Affine2D, AlignOp, ArtisticWidthProfile, BasicShapeKind, BlendMode, BooleanOp, CommandOp,
-    ContourMode, CornerStyle, DistortKind, EllipseMode, EnvelopeMode, Fill, GradientStop,
-    ImpactStyle, NodePayload, ParametricShape, Point2D, Rect2D, TextAlign, TextDirection, Unit,
-    ZOrderOp,
+    Affine2D, AlignOp, ArtisticMediaStyle, ArtisticWidthProfile, BasicShapeKind, BlendMode,
+    BooleanOp, CommandOp, ContourMode, CornerStyle, DistortKind, EllipseMode, EnvelopeMode, Fill,
+    GradientStop, ImpactStyle, NodePayload, ParametricShape, Point2D, Rect2D, TextAlign,
+    TextDirection, Unit, ZOrderOp,
 };
 use coree_render::{ToneRange, ViewMode};
 use egui::{
@@ -1730,13 +1730,16 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
         }
         ToolId::ArtisticMedia => {
             ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.artistic_media_width_mm)
-                    .range(0.4..=50.0)
-                    .speed(0.2)
-                    .prefix(lang.tr_ui("Brush W: ", "عرض الفرشاة: "))
-                    .suffix(" mm"),
-            );
+            let width_changed = ui
+                .add(
+                    DragValue::new(&mut app.tool_settings.artistic_media_width_mm)
+                        .range(0.4..=50.0)
+                        .speed(0.2)
+                        .prefix(lang.tr_ui("Brush W: ", "عرض الفرشاة: "))
+                        .suffix(" mm"),
+                )
+                .changed();
+            let mut profile_changed = false;
             ComboBox::from_id_salt("prop_artistic_profile")
                 .width(110.0)
                 .selected_text(format!("{:?}", app.tool_settings.artistic_media_profile))
@@ -1748,13 +1751,21 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                         ArtisticWidthProfile::Wave,
                         ArtisticWidthProfile::Uniform,
                     ] {
-                        ui.selectable_value(
-                            &mut app.tool_settings.artistic_media_profile,
-                            prof.clone(),
-                            format!("{prof:?}"),
-                        );
+                        profile_changed |= ui
+                            .selectable_value(
+                                &mut app.tool_settings.artistic_media_profile,
+                                prof.clone(),
+                                format!("{prof:?}"),
+                            )
+                            .changed();
                     }
                 });
+            if width_changed || profile_changed {
+                let _ = app.edit_selected_artistic_media(
+                    width_changed.then_some(app.tool_settings.artistic_media_width_mm),
+                    profile_changed.then(|| app.tool_settings.artistic_media_profile.clone()),
+                );
+            }
         }
         ToolId::Freehand
         | ToolId::BSpline
@@ -2239,6 +2250,87 @@ fn show_selected_objects_property_bar(
                                 payload: NodePayload::ParagraphText(para),
                             });
                         }
+                    }
+                }
+                NodePayload::ArtisticMedia { spine, mut style } => {
+                    ui.separator();
+                    let mut width_mm = match &style {
+                        ArtisticMediaStyle::Preset { max_width_mm, .. } => *max_width_mm,
+                        ArtisticMediaStyle::Brush { width_mm, .. }
+                        | ArtisticMediaStyle::Calligraphic { width_mm, .. } => *width_mm,
+                        ArtisticMediaStyle::Sprayer { size_mm, .. } => *size_mm,
+                        ArtisticMediaStyle::Expression { max_width_mm, .. } => *max_width_mm,
+                    };
+                    let mut changed = ui
+                        .add(
+                            DragValue::new(&mut width_mm)
+                                .range(0.4..=50.0)
+                                .speed(0.2)
+                                .prefix("Brush W: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    if changed {
+                        match &mut style {
+                            ArtisticMediaStyle::Preset { max_width_mm, .. } => {
+                                *max_width_mm = width_mm;
+                            }
+                            ArtisticMediaStyle::Brush { width_mm: w, .. }
+                            | ArtisticMediaStyle::Calligraphic { width_mm: w, .. } => {
+                                *w = width_mm;
+                            }
+                            ArtisticMediaStyle::Sprayer { size_mm, .. } => *size_mm = width_mm,
+                            ArtisticMediaStyle::Expression { max_width_mm, .. } => {
+                                *max_width_mm = width_mm;
+                            }
+                        }
+                        app.tool_settings.artistic_media_width_mm = width_mm;
+                    }
+                    if let ArtisticMediaStyle::Preset {
+                        ref mut profile, ..
+                    } = style
+                    {
+                        ComboBox::from_id_salt("prop_sel_artistic_profile")
+                            .width(110.0)
+                            .selected_text(format!("{profile:?}"))
+                            .show_ui(ui, |ui| {
+                                for prof in [
+                                    ArtisticWidthProfile::TaperBoth,
+                                    ArtisticWidthProfile::TaperStart,
+                                    ArtisticWidthProfile::TaperEnd,
+                                    ArtisticWidthProfile::Wave,
+                                    ArtisticWidthProfile::Uniform,
+                                ] {
+                                    if ui
+                                        .selectable_value(
+                                            profile,
+                                            prof.clone(),
+                                            format!("{prof:?}"),
+                                        )
+                                        .changed()
+                                    {
+                                        app.tool_settings.artistic_media_profile = prof;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    }
+                    if changed {
+                        let _ = app.execute_command(CommandOp::EditArtisticMedia {
+                            id: single_id,
+                            spine,
+                            style,
+                        });
+                    }
+                }
+                NodePayload::Clone { .. } => {
+                    ui.separator();
+                    if ui
+                        .small_button("Unlink Clone")
+                        .on_hover_text("Convert live Clone into an independent editable object")
+                        .clicked()
+                    {
+                        app.unlink_clone_selection();
                     }
                 }
                 _ => {}

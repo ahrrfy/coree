@@ -345,6 +345,17 @@ pub(super) fn parse_object_list(
         Some(NodePayload::Connector(conn))
     } else if let Some(sym_id) = loda.symbol_instance {
         Some(NodePayload::SymbolInstance(sym_id))
+    } else if let Some(bs) = loda.bspline {
+        Some(NodePayload::BSpline(bs))
+    } else if let Some((spine, style)) = loda.artistic_media {
+        Some(NodePayload::ArtisticMedia { spine, style })
+    } else if let Some((master_id, link_fill, link_outline, link_shape)) = loda.clone_ref {
+        Some(NodePayload::Clone {
+            master_id,
+            link_fill,
+            link_outline,
+            link_shape,
+        })
     } else if let Some(top) = loda.text_on_path {
         Some(NodePayload::TextOnPath(top))
     } else if let Some(raw_txsm) = txsm_payload {
@@ -469,6 +480,11 @@ pub(super) fn parse_object_list(
     obj.lens = lens;
     obj.effects = loda.effects;
     obj.style_id = loda.object_style_id;
+    obj.perspective = loda.perspective;
+    if let Some((cs_id, cs_slot)) = loda.color_style_link {
+        obj.color_style_id = cs_id;
+        obj.color_style_slot = cs_slot;
+    }
     obj.blend_mode = props.blend_mode;
     obj.opacity = props.opacity;
     obj.visible = props.visible;

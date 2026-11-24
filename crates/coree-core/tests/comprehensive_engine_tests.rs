@@ -4759,6 +4759,8 @@ fn w1b_r8_effective_locks_find_replace_nan_validation_and_command_matrix() {
                 outline: Some(OutlineStyle::solid(Color::rgb(1.0, 0.0, 0.0), 3.0)),
                 blend_mode: Some(BlendMode::Multiply),
                 opacity: Some(0.5),
+                color_style_id: None,
+                color_style_slot: None,
             },
         },
     )

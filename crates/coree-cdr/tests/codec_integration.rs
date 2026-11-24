@@ -3914,3 +3914,148 @@ fn cmx_roundtrip_preserves_group_transform_and_object_flags_opacity_blend() {
         assert_eq!(rt_path.blend_mode, BlendMode::Difference);
     }
 }
+
+#[test]
+fn cmx_roundtrip_preserves_color_styles_object_styles_live_cascade_and_perspective_grid() {
+    use coree_core::{
+        ColorStyle, CommandHistory, CommandOp, Guide, GuideOrientation, ObjectStyle,
+        PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, RasterAsset,
+    };
+
+    let mut doc = Document::new_a4("CMX Styles & Perspective Grid");
+    let pattern_px = vec![
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+    ];
+    let pat_aid = doc
+        .register_asset(RasterAsset::new(2, 2, pattern_px.clone(), 300.0, ColorMode::Rgb).unwrap());
+
+    let initial_color = Color::rgba8(20, 140, 220, 255);
+    let cs = ColorStyle::new("BrandBlue", initial_color.clone(), None);
+    let cs_id = cs.id;
+    doc.upsert_color_style(cs);
+
+    let mut os_solid = ObjectStyle::new("SolidStyled");
+    os_solid.fill = Some(Fill::Solid(initial_color.clone()));
+    os_solid.color_style_id = Some(cs_id);
+    let os_solid_id = os_solid.id;
+    doc.upsert_object_style(os_solid);
+
+    let mut os_pat = ObjectStyle::new("BitmapPatternStyled");
+    os_pat.fill = Some(Fill::BitmapPattern {
+        image_id: pat_aid,
+        tile_w: 12.0,
+        tile_h: 12.0,
+    });
+    let os_pat_id = os_pat.id;
+    doc.upsert_object_style(os_pat);
+
+    let mut styled_obj = SceneObject::new(
+        ObjectId(0),
+        "StyledRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 10.0, 40.0, 30.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(initial_color));
+    styled_obj.style_id = Some(os_solid_id);
+    styled_obj.color_style_id = Some(cs_id);
+    doc.add_object(styled_obj, None).unwrap();
+
+    doc.replace_guides(vec![Guide {
+        id: 1,
+        orientation: GuideOrientation::Vertical(42.5),
+        locked: true,
+    }]);
+    let mut grid = doc.grid();
+    grid.visible = true;
+    grid.snap = true;
+    grid.spacing_x_mm = 12.5;
+    doc.set_grid(grid);
+    doc.set_perspective_grid(PerspectiveGridConfig {
+        enabled: true,
+        mode: PerspectiveGridMode::ThreePoint,
+        horizon_y_mm: 85.0,
+        vanishing_points: vec![
+            Point2D::new(-30.0, 85.0),
+            Point2D::new(240.0, 85.0),
+            Point2D::new(105.0, -60.0),
+        ],
+        density: 16,
+        opacity: 0.45,
+        active_plane: PerspectivePlane::Left,
+    });
+
+    for (prec, endian) in [
+        (CmxPrecision::Bit32, RiffEndian::Little),
+        (CmxPrecision::Bit16, RiffEndian::Little),
+    ] {
+        let bytes = export_cmx_bytes_with_endian(&doc, prec, endian).unwrap();
+        let mut rt = import_cdr_bytes(&bytes).unwrap();
+
+        assert!(
+            !rt.document
+                .unknown_doc_chunks()
+                .iter()
+                .any(|c| &c.fourcc == b"stly" || &c.fourcc == b"guid"),
+            "{prec:?}: stly/guid must not fall into unknown_doc_chunks"
+        );
+        assert_eq!(rt.document.color_styles().len(), 1);
+        assert_eq!(rt.document.object_styles().len(), 2);
+        assert_eq!(rt.document.guides().len(), 1);
+        assert!(rt.document.grid().visible && rt.document.grid().snap);
+        assert!((rt.document.grid().spacing_x_mm - 12.5).abs() < 1e-6);
+        assert!(rt.document.perspective_grid().enabled);
+        assert_eq!(
+            rt.document.perspective_grid().mode,
+            PerspectiveGridMode::ThreePoint
+        );
+        assert_eq!(
+            rt.document.perspective_grid().active_plane,
+            PerspectivePlane::Left
+        );
+
+        let rt_pat_style = rt
+            .document
+            .object_style(os_pat_id)
+            .expect("BitmapPattern ObjectStyle preserved");
+        if let Some(Fill::BitmapPattern { image_id, .. }) = rt_pat_style.fill {
+            let asset = rt
+                .document
+                .asset(image_id)
+                .expect("remapped BitmapPattern asset in ObjectStyle");
+            assert_eq!(asset.rgba_bytes, pattern_px);
+        } else {
+            panic!("expected Fill::BitmapPattern on ObjectStyle");
+        }
+
+        let rt_obj = find_obj_by_name(&rt.document, "StyledRect");
+        assert_eq!(rt_obj.style_id, Some(os_solid_id));
+        assert_eq!(rt_obj.color_style_id, Some(cs_id));
+
+        // Verify live ColorStyle cascade via CommandOp::UpsertColorStyle on imported doc
+        let updated_color = Color::rgba8(240, 40, 80, 255);
+        let updated_cs = ColorStyle {
+            id: cs_id,
+            name: "BrandBlue".to_owned(),
+            base_color: updated_color.clone(),
+            harmony: None,
+            derived_colors: Vec::new(),
+        };
+        let mut history = CommandHistory::new(16);
+        history
+            .execute(
+                &mut rt.document,
+                CommandOp::UpsertColorStyle { style: updated_cs },
+            )
+            .expect("UpsertColorStyle on CMX-imported doc");
+
+        let cascaded_obj = find_obj_by_name(&rt.document, "StyledRect");
+        assert_eq!(
+            cascaded_obj.fill,
+            Fill::Solid(updated_color.clone()),
+            "{prec:?}: ColorStyle cascade must update CMX-imported object fill"
+        );
+        let cascaded_os = rt.document.object_style(os_solid_id).unwrap();
+        assert_eq!(cascaded_os.fill, Some(Fill::Solid(updated_color)));
+    }
+}

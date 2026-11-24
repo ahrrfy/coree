@@ -11,10 +11,14 @@ use crate::color::{
 use crate::dimension::{AnchorPoint, ConnectorObject, DimensionObject};
 use crate::effects::{DistortKind, Effect, EnvelopeMode, RasterFilter};
 use crate::error::{CoreError, CoreResult};
-use crate::geometry::{BezierPath, ParametricShape};
+use crate::geometry::{
+    ArtisticMedia, ArtisticMediaStyle, BSplineCurve, BezierPath, ParametricShape,
+};
 pub use crate::ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 use crate::lens::LensConfig;
-use crate::math::{sanitize_f32, sanitize_f64, Affine2D, Point2D, Rect2D, Unit, Vec2D};
+use crate::math::{
+    sanitize_f32, sanitize_f64, Affine2D, Perspective3x3, Point2D, Rect2D, Unit, Vec2D,
+};
 use crate::style::{BlendMode, Fill, ObjectStyle, OutlineStyle};
 use crate::table::VectorTable;
 use crate::text::{ArtisticText, ParagraphText, TextOnPath};
@@ -274,6 +278,17 @@ pub enum NodePayload {
         contents: Vec<ObjectId>,
     },
     SymbolInstance(SymbolId),
+    BSpline(BSplineCurve),
+    ArtisticMedia {
+        spine: BezierPath,
+        style: ArtisticMediaStyle,
+    },
+    Clone {
+        master_id: ObjectId,
+        link_fill: bool,
+        link_outline: bool,
+        link_shape: bool,
+    },
 }
 
 /// Core scene-graph node representing any drawable object, group, or PowerClip container.
@@ -293,6 +308,12 @@ pub struct SceneObject {
     pub locked: bool,
     pub printable: bool,
     pub style_id: Option<ObjectStyleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_style_id: Option<ColorStyleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_style_slot: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perspective: Option<Perspective3x3>,
     pub unknown_chunks: Vec<UnknownCdrChunk>,
 }
 
@@ -315,6 +336,9 @@ impl SceneObject {
             locked: false,
             printable: true,
             style_id: None,
+            color_style_id: None,
+            color_style_slot: None,
+            perspective: None,
             unknown_chunks: Vec::new(),
         }
     }
@@ -527,6 +551,17 @@ pub enum PerspectiveGridMode {
     Isometric,
 }
 
+/// Active drawing plane when `Draw in Perspective` is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PerspectivePlane {
+    #[default]
+    Orthographic,
+    Top,
+    Left,
+    Right,
+    Front,
+}
+
 /// Interactive perspective grid overlay configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerspectiveGridConfig {
@@ -536,6 +571,8 @@ pub struct PerspectiveGridConfig {
     pub vanishing_points: Vec<Point2D>,
     pub density: u32,
     pub opacity: f32,
+    #[serde(default)]
+    pub active_plane: PerspectivePlane,
 }
 
 impl Default for PerspectiveGridConfig {
@@ -547,7 +584,102 @@ impl Default for PerspectiveGridConfig {
             vanishing_points: vec![Point2D::new(-40.0, 100.0), Point2D::new(250.0, 100.0)],
             density: 12,
             opacity: 0.35,
+            active_plane: PerspectivePlane::Orthographic,
         }
+    }
+}
+
+impl PerspectiveGridConfig {
+    /// Computes a projective 3×3 homography mapping `src_rect` onto the active perspective plane,
+    /// or `None` when perspective drawing is disabled or `Orthographic`.
+    #[must_use]
+    pub fn plane_homography_for_rect(&self, src_rect: Rect2D) -> Option<Perspective3x3> {
+        if !self.enabled || self.active_plane == PerspectivePlane::Orthographic {
+            return None;
+        }
+        let quad = self.plane_quad_for_rect(src_rect)?;
+        Perspective3x3::from_rect_to_quad(src_rect, &quad)
+    }
+
+    /// Computes a destination perspective quad `[TL, TR, BR, BL]` for `src_rect` on the active plane.
+    #[must_use]
+    pub fn plane_quad_for_rect(&self, src_rect: Rect2D) -> Option<[Point2D; 4]> {
+        if !self.enabled
+            || self.active_plane == PerspectivePlane::Orthographic
+            || !src_rect.is_finite()
+            || src_rect.width() <= 1e-6
+            || src_rect.height() <= 1e-6
+        {
+            return None;
+        }
+        let tl = Point2D::new(src_rect.min_x, src_rect.min_y);
+        let tr = Point2D::new(src_rect.max_x, src_rect.min_y);
+        let br = Point2D::new(src_rect.max_x, src_rect.max_y);
+        let bl = Point2D::new(src_rect.min_x, src_rect.max_y);
+        let vp_left = self
+            .vanishing_points
+            .first()
+            .copied()
+            .filter(|p| p.is_finite())
+            .unwrap_or(Point2D::new(src_rect.min_x - 100.0, self.horizon_y_mm));
+        let vp_right = self
+            .vanishing_points
+            .get(1)
+            .copied()
+            .filter(|p| p.is_finite())
+            .unwrap_or(Point2D::new(src_rect.max_x + 100.0, self.horizon_y_mm));
+        let vp_vert = self
+            .vanishing_points
+            .get(2)
+            .copied()
+            .filter(|p| p.is_finite())
+            .unwrap_or(Point2D::new(src_rect.center().x, self.horizon_y_mm + 260.0));
+
+        let lerp_toward = |p: Point2D, vp: Point2D, t: f64| {
+            Point2D::new(p.x + (vp.x - p.x) * t, p.y + (vp.y - p.y) * t)
+        };
+
+        let quad = match self.active_plane {
+            PerspectivePlane::Orthographic => [tl, tr, br, bl],
+            PerspectivePlane::Left => [
+                lerp_toward(tl, vp_left, 0.28),
+                tr,
+                br,
+                lerp_toward(bl, vp_left, 0.28),
+            ],
+            PerspectivePlane::Right => [
+                tl,
+                lerp_toward(tr, vp_right, 0.28),
+                lerp_toward(br, vp_right, 0.28),
+                bl,
+            ],
+            PerspectivePlane::Top => [
+                lerp_toward(tl, vp_left, 0.18),
+                lerp_toward(tr, vp_right, 0.18),
+                br,
+                bl,
+            ],
+            PerspectivePlane::Front => {
+                if self.mode == PerspectiveGridMode::ThreePoint {
+                    [
+                        tl,
+                        tr,
+                        lerp_toward(br, vp_vert, 0.18),
+                        lerp_toward(bl, vp_vert, 0.18),
+                    ]
+                } else {
+                    let c = src_rect.center();
+                    let inset = src_rect.width() * 0.12;
+                    [
+                        Point2D::new(tl.x + inset, tl.y),
+                        Point2D::new(tr.x - inset, tr.y),
+                        Point2D::new(br.x, br.y.max(c.y)),
+                        Point2D::new(bl.x, bl.y.max(c.y)),
+                    ]
+                }
+            }
+        };
+        quad.iter().all(|p| p.is_finite()).then_some(quad)
     }
 }
 
@@ -1975,11 +2107,13 @@ impl Document {
         }
 
         // Pre-pass: collect ParagraphText overflow chain and capture geometric anchors for
-        // surviving Connectors and TextOnPath objects whose targets are doomed.
+        // surviving Connectors, TextOnPath, and live Clone objects whose targets are doomed.
         let mut para_next: HashMap<ObjectId, Option<ObjectId>> = HashMap::new();
         let mut connector_fallbacks: HashMap<ObjectId, (Option<Point2D>, Option<Point2D>)> =
             HashMap::new();
         let mut text_on_path_xfs: HashMap<ObjectId, Option<Affine2D>> = HashMap::new();
+        let mut clone_materialized: HashMap<ObjectId, (NodePayload, Fill, OutlineStyle)> =
+            HashMap::new();
 
         for (&id, obj) in &self.objects {
             if doomed.contains(&id) {
@@ -1991,6 +2125,43 @@ impl Document {
             match &obj.payload {
                 NodePayload::ParagraphText(p) => {
                     para_next.insert(id, p.linked_next_frame);
+                }
+                NodePayload::Clone { master_id, .. } => {
+                    // Check if any ancestor in the Clone -> Master chain is doomed
+                    let mut cur = *master_id;
+                    let mut seen = HashSet::new();
+                    let mut chain_doomed = false;
+                    while seen.insert(cur) {
+                        if doomed.contains(&cur) {
+                            chain_doomed = true;
+                            break;
+                        }
+                        if let Some(m_obj) = self.objects.get(&cur) {
+                            if let NodePayload::Clone {
+                                master_id: next_mid,
+                                ..
+                            } = m_obj.payload
+                            {
+                                cur = next_mid;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if chain_doomed {
+                        if let Some(resolved) = self.resolve_clone_payload_and_style(obj) {
+                            clone_materialized.insert(id, resolved);
+                        } else {
+                            clone_materialized.insert(
+                                id,
+                                (
+                                    NodePayload::Path(BezierPath::new()),
+                                    obj.fill.clone(),
+                                    obj.outline.clone(),
+                                ),
+                            );
+                        }
+                    }
                 }
                 NodePayload::Connector(conn) => {
                     let from_doomed = conn.from_obj.is_some_and(|f| doomed.contains(&f));
@@ -2141,8 +2312,11 @@ impl Document {
                     }
                 }
             }
-            // Extension hook for W2 ADD-02 live Clone objects:
-            // detach/promote any surviving Clone referencing a doomed master_id here.
+            if let Some((mat_payload, mat_fill, mat_outline)) = clone_materialized.remove(&id) {
+                obj.payload = mat_payload;
+                obj.fill = mat_fill;
+                obj.outline = mat_outline;
+            }
         }
     }
 
@@ -2208,6 +2382,53 @@ impl Document {
         }
     }
 
+    /// Collects `root_ids` and all recursive `Group` / `PowerClip` descendant objects (with a
+    /// cycle guard so each object is included at most once) in deterministic traversal order.
+    #[must_use]
+    pub fn collect_subtree_objects(&self, root_ids: &[ObjectId]) -> Vec<SceneObject> {
+        fn visit(
+            doc: &Document,
+            id: ObjectId,
+            visited: &mut HashSet<ObjectId>,
+            out: &mut Vec<SceneObject>,
+            depth: usize,
+        ) {
+            if depth > MAX_SCENE_DEPTH || !visited.insert(id) {
+                return;
+            }
+            let Some(obj) = doc.object(id) else {
+                return;
+            };
+            let cloned = obj.clone();
+            match &cloned.payload {
+                NodePayload::Group(children) => {
+                    for &cid in children {
+                        visit(doc, cid, visited, out, depth + 1);
+                    }
+                }
+                NodePayload::PowerClip { contents, .. } => {
+                    for &cid in contents {
+                        visit(doc, cid, visited, out, depth + 1);
+                    }
+                }
+                _ => {}
+            }
+            out.push(cloned);
+        }
+        let mut visited = HashSet::new();
+        let mut out = Vec::new();
+        for &id in root_ids {
+            visit(self, id, &mut visited, &mut out, 0);
+        }
+        out
+    }
+
+    /// Remaps internal object references (`Group`, `PowerClip`, `TextOnPath`, `Connector`,
+    /// `ParagraphText`, `Clone`, `Effect::Blend`) in `obj` using `id_map`.
+    pub fn remap_object_refs_with_map(obj: &mut SceneObject, id_map: &HashMap<ObjectId, ObjectId>) {
+        Self::remap_single_object_refs(obj, id_map, false);
+    }
+
     fn remap_single_object_refs(
         obj: &mut SceneObject,
         id_map: &HashMap<ObjectId, ObjectId>,
@@ -2252,6 +2473,11 @@ impl Document {
                     }
                 }
             }
+            NodePayload::Clone { master_id, .. } => {
+                if let Some(&mapped) = id_map.get(master_id) {
+                    *master_id = mapped;
+                }
+            }
             _ => {}
         }
         for eff in &mut obj.effects {
@@ -2271,7 +2497,6 @@ impl Document {
                 }
             }
         }
-        // Extension hook for W2 ADD-02 live Clone objects: remap master_id if in id_map.
     }
 
     /// Deep-duplicates `ids` (including nested Group / PowerClip children and cross-object
@@ -3635,17 +3860,168 @@ impl Document {
         Ok(removed)
     }
 
-    /// Inserts or updates a [`ColorStyle`] in `self.color_styles`.
-    pub fn upsert_color_style(&mut self, style: ColorStyle) {
-        if let Some(existing) = self.color_styles.iter_mut().find(|s| s.id == style.id) {
-            *existing = style;
+    /// Resolves a concrete [`Color`] from a [`ColorStyle`] and optional derived harmony slot.
+    #[must_use]
+    pub fn resolve_color_style_color(cs: &ColorStyle, slot: Option<usize>) -> Color {
+        slot.and_then(|idx| cs.derived_colors.get(idx))
+            .cloned()
+            .unwrap_or_else(|| cs.base_color.clone())
+    }
+
+    fn sync_text_runs_fill_in_payload(payload: &mut NodePayload, fill: &Fill) {
+        let Some(solid) = (match fill {
+            Fill::Solid(c) => Some(c.clone()),
+            Fill::LinearGradient { stops, .. }
+            | Fill::RadialGradient { stops, .. }
+            | Fill::ConicalGradient { stops, .. }
+            | Fill::SquareGradient { stops, .. } => stops.first().map(|s| s.color.clone()),
+            Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } => Some(fg.clone()),
+            Fill::MeshFill { nodes, .. } => nodes.first().map(|n| n.color.clone()),
+            Fill::None | Fill::BitmapPattern { .. } | Fill::VectorPattern { .. } => None,
+        }) else {
+            return;
+        };
+        match payload {
+            NodePayload::ArtisticText(t) => {
+                for r in &mut t.runs {
+                    r.style.fill = solid.clone();
+                }
+            }
+            NodePayload::ParagraphText(t) => {
+                for r in &mut t.runs {
+                    r.style.fill = solid.clone();
+                }
+            }
+            NodePayload::TextOnPath(t) => {
+                for r in &mut t.text.runs {
+                    r.style.fill = solid.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolves the effective `(payload, fill, outline)` for a `NodePayload::Clone` object,
+    /// walking Clone-to-Clone chains safely with a cycle guard. Returns `None` if `obj` is not a
+    /// `Clone`, its `master_id` is missing/cyclic, or `link_shape == false`.
+    #[must_use]
+    pub fn resolve_clone_payload_and_style(
+        &self,
+        obj: &SceneObject,
+    ) -> Option<(NodePayload, Fill, OutlineStyle)> {
+        let NodePayload::Clone {
+            master_id,
+            link_fill,
+            link_outline,
+            link_shape,
+        } = &obj.payload
+        else {
+            return None;
+        };
+        if !*link_shape {
+            return None;
+        }
+        let mut visited = HashSet::new();
+        if obj.id.0 != 0 {
+            visited.insert(obj.id);
+        }
+        let mut cur_mid = *master_id;
+        let mut use_fill = *link_fill;
+        let mut use_outline = *link_outline;
+        let mut override_fill: Option<Fill> = if !use_fill {
+            Some(obj.fill.clone())
         } else {
-            self.color_styles.push(style);
+            None
+        };
+        let mut override_outline: Option<OutlineStyle> = if !use_outline {
+            Some(obj.outline.clone())
+        } else {
+            None
+        };
+        for _ in 0..=MAX_SCENE_DEPTH {
+            if !visited.insert(cur_mid) {
+                return None;
+            }
+            let master = self.objects.get(&cur_mid)?;
+            if override_fill.is_none() && !use_fill {
+                override_fill = Some(master.fill.clone());
+            }
+            if override_outline.is_none() && !use_outline {
+                override_outline = Some(master.outline.clone());
+            }
+            match &master.payload {
+                NodePayload::Clone {
+                    master_id: next_mid,
+                    link_fill: next_lf,
+                    link_outline: next_lo,
+                    link_shape: next_ls,
+                } => {
+                    if !*next_ls {
+                        return None;
+                    }
+                    if override_fill.is_none() && !*next_lf {
+                        override_fill = Some(master.fill.clone());
+                        use_fill = false;
+                    }
+                    if override_outline.is_none() && !*next_lo {
+                        override_outline = Some(master.outline.clone());
+                        use_outline = false;
+                    }
+                    cur_mid = *next_mid;
+                }
+                other => {
+                    let eff_fill = override_fill.unwrap_or_else(|| master.fill.clone());
+                    let eff_outline = override_outline.unwrap_or_else(|| master.outline.clone());
+                    return Some((other.clone(), eff_fill, eff_outline));
+                }
+            }
+        }
+        None
+    }
+
+    /// Inserts or updates a [`ColorStyle`] in `self.color_styles` and cascades color changes
+    /// to any linked [`ObjectStyle`]s (`color_style_id`) and unlocked [`SceneObject`]s.
+    pub fn upsert_color_style(&mut self, mut style: ColorStyle) {
+        if let Some(harmony) = style.harmony {
+            style.derived_colors = harmony.generate(&style.base_color);
+        }
+        if let Some(existing) = self.color_styles.iter_mut().find(|s| s.id == style.id) {
+            *existing = style.clone();
+        } else {
+            self.color_styles.push(style.clone());
+        }
+
+        let mut updated_obj_styles: HashMap<ObjectStyleId, Fill> = HashMap::new();
+        for ostyle in &mut self.object_styles {
+            if ostyle.color_style_id == Some(style.id) {
+                let col = Self::resolve_color_style_color(&style, ostyle.color_style_slot);
+                let fill = Fill::Solid(col);
+                ostyle.fill = Some(fill.clone());
+                updated_obj_styles.insert(ostyle.id, fill);
+            }
+        }
+
+        let locked_ids = self.effective_locked_object_ids();
+        for (id, obj) in &mut self.objects {
+            if locked_ids.contains(id) {
+                continue;
+            }
+            if obj.color_style_id == Some(style.id) {
+                let col = Self::resolve_color_style_color(&style, obj.color_style_slot);
+                let fill = Fill::Solid(col);
+                obj.fill = fill.clone();
+                Self::sync_text_runs_fill_in_payload(&mut obj.payload, &fill);
+            } else if let Some(os_id) = obj.style_id {
+                if let Some(fill) = updated_obj_styles.get(&os_id) {
+                    obj.fill = fill.clone();
+                    Self::sync_text_runs_fill_in_payload(&mut obj.payload, fill);
+                }
+            }
         }
         self.touch();
     }
 
-    /// Removes a [`ColorStyle`] by ID.
+    /// Removes a [`ColorStyle`] by ID and clears `color_style_id`/`color_style_slot` references.
     pub fn delete_color_style(&mut self, id: ColorStyleId) -> CoreResult<ColorStyle> {
         let pos = self
             .color_styles
@@ -3653,6 +4029,18 @@ impl Document {
             .position(|s| s.id == id)
             .ok_or_else(|| CoreError::InvalidParameter(format!("color style not found: {id:?}")))?;
         let removed = self.color_styles.remove(pos);
+        for ostyle in &mut self.object_styles {
+            if ostyle.color_style_id == Some(id) {
+                ostyle.color_style_id = None;
+                ostyle.color_style_slot = None;
+            }
+        }
+        for obj in self.objects.values_mut() {
+            if obj.color_style_id == Some(id) {
+                obj.color_style_id = None;
+                obj.color_style_slot = None;
+            }
+        }
         self.touch();
         Ok(removed)
     }
@@ -3667,6 +4055,12 @@ impl Document {
                 None
             };
         }
+        if let Some(cs_id) = style.color_style_id {
+            if let Some(cs) = self.color_styles.iter().find(|c| c.id == cs_id) {
+                let col = Self::resolve_color_style_color(cs, style.color_style_slot);
+                style.fill = Some(Fill::Solid(col));
+            }
+        }
         if let Some(existing) = self.object_styles.iter_mut().find(|s| s.id == style.id) {
             *existing = style.clone();
         } else {
@@ -3677,9 +4071,13 @@ impl Document {
             if !locked_ids.contains(id) && obj.style_id == Some(style.id) {
                 if let Some(ref f) = style.fill {
                     obj.fill = f.clone();
+                    Self::sync_text_runs_fill_in_payload(&mut obj.payload, f);
                 }
                 if let Some(ref o) = style.outline {
                     obj.outline = o.clone();
+                    if let NodePayload::Table(ref mut tbl) = obj.payload {
+                        tbl.border_style = o.clone();
+                    }
                 }
                 if let Some(bm) = style.blend_mode {
                     obj.blend_mode = bm;
@@ -3765,9 +4163,45 @@ impl Document {
         }
         let mut orphaned_contents: Vec<ObjectId> = Vec::new();
         let mut reset_transform = false;
+        let mut propagated_fill: Option<Fill> = None;
+        let mut propagated_outline: Option<OutlineStyle> = None;
         let path = match &obj.payload {
             NodePayload::Path(p) => p.clone(),
             NodePayload::Shape(shape) => shape.to_bezier_path(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+            }
+            NodePayload::Clone { .. } => {
+                let Some((eff_payload, eff_fill, eff_outline)) =
+                    self.resolve_clone_payload_and_style(&obj)
+                else {
+                    return Err(CoreError::InvalidGeometry(format!(
+                        "clone object {id} has no resolvable master geometry"
+                    )));
+                };
+                if !obj.fill.is_visible() && eff_fill.is_visible() {
+                    propagated_fill = Some(eff_fill);
+                }
+                if !obj.outline.is_visible() && eff_outline.is_visible() {
+                    propagated_outline = Some(eff_outline);
+                }
+                match eff_payload {
+                    NodePayload::Path(p) => p,
+                    NodePayload::Shape(s) => s.to_bezier_path(),
+                    NodePayload::BSpline(bs) => bs.to_bezier_path(),
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        ArtisticMedia::expand_stroke(&spine, &style)
+                    }
+                    NodePayload::Table(t) => t.to_grid_paths(),
+                    NodePayload::PowerClip { container, .. } => *container,
+                    _ => {
+                        return Err(CoreError::InvalidGeometry(format!(
+                            "clone object {id} master payload cannot be converted to curves"
+                        )));
+                    }
+                }
+            }
             NodePayload::Table(table) => table.to_grid_paths(),
             NodePayload::Connector(conn) => {
                 let mut bounds_ctx = DocBoundsCtx::new();
@@ -3797,15 +4231,52 @@ impl Document {
                 orphaned_contents = contents.clone();
                 (**container).clone()
             }
-            NodePayload::ArtisticText(t) => text_outliner(&obj, self)
-                .filter(|p| !p.is_empty() && p.is_finite())
-                .unwrap_or_else(|| BezierPath::from_rect(t.estimated_bounds())),
-            NodePayload::ParagraphText(t) => text_outliner(&obj, self)
-                .filter(|p| !p.is_empty() && p.is_finite())
-                .unwrap_or_else(|| BezierPath::from_rect(t.bounding_box())),
-            NodePayload::TextOnPath(top) => text_outliner(&obj, self)
-                .filter(|p| !p.is_empty() && p.is_finite())
-                .unwrap_or_else(|| BezierPath::from_rect(top.text.estimated_bounds())),
+            NodePayload::ArtisticText(t) => {
+                if !obj.fill.is_visible() {
+                    if let Some(run) = t
+                        .runs
+                        .iter()
+                        .find(|r| !r.text.is_empty())
+                        .or_else(|| t.runs.first())
+                    {
+                        propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                    }
+                }
+                text_outliner(&obj, self)
+                    .filter(|p| !p.is_empty() && p.is_finite())
+                    .unwrap_or_else(|| BezierPath::from_rect(t.estimated_bounds()))
+            }
+            NodePayload::ParagraphText(t) => {
+                if !obj.fill.is_visible() {
+                    if let Some(run) = t
+                        .runs
+                        .iter()
+                        .find(|r| !r.text.is_empty())
+                        .or_else(|| t.runs.first())
+                    {
+                        propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                    }
+                }
+                text_outliner(&obj, self)
+                    .filter(|p| !p.is_empty() && p.is_finite())
+                    .unwrap_or_else(|| BezierPath::from_rect(t.bounding_box()))
+            }
+            NodePayload::TextOnPath(top) => {
+                if !obj.fill.is_visible() {
+                    if let Some(run) = top
+                        .text
+                        .runs
+                        .iter()
+                        .find(|r| !r.text.is_empty())
+                        .or_else(|| top.text.runs.first())
+                    {
+                        propagated_fill = Some(Fill::Solid(run.style.fill.clone()));
+                    }
+                }
+                text_outliner(&obj, self)
+                    .filter(|p| !p.is_empty() && p.is_finite())
+                    .unwrap_or_else(|| BezierPath::from_rect(top.text.estimated_bounds()))
+            }
             _ => {
                 return Err(CoreError::InvalidGeometry(format!(
                     "object {id} cannot be converted to curves"
@@ -3815,6 +4286,12 @@ impl Document {
         self.remove_orphaned_contents_before_overwrite(id, &orphaned_contents);
         if let Some(target) = self.objects.get_mut(&id) {
             target.payload = NodePayload::Path(path);
+            if let Some(fill) = propagated_fill {
+                target.fill = fill;
+            }
+            if let Some(outline) = propagated_outline {
+                target.outline = outline;
+            }
             if reset_transform {
                 target.transform = Affine2D::IDENTITY;
             }
@@ -3860,6 +4337,10 @@ impl Document {
         let local_path = match &obj.payload {
             NodePayload::Path(p) => p.clone(),
             NodePayload::Shape(s) => s.to_bezier_path(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+            }
             NodePayload::Table(t) => t.to_grid_paths(),
             NodePayload::Connector(conn) => {
                 let mut bounds_ctx = DocBoundsCtx::new();
@@ -4454,6 +4935,27 @@ impl Document {
         let bounds = match &sub.payload {
             NodePayload::Path(p) => p.transformed(rel_xf).bounding_box(),
             NodePayload::Shape(s) => s.to_bezier_path().transformed(rel_xf).bounding_box(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path().transformed(rel_xf).bounding_box(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+                    .transformed(rel_xf)
+                    .bounding_box()
+            }
+            NodePayload::Clone { .. } => {
+                self.resolve_clone_payload_and_style(sub)
+                    .and_then(|(eff_p, _, _)| {
+                        self.payload_bounds_with_ctx(
+                            &eff_p,
+                            rel_xf,
+                            depth + 1,
+                            bounds_ctx,
+                            visiting_syms,
+                            Some(ctx),
+                            local_space,
+                        )
+                        .0
+                    })
+            }
             NodePayload::ArtisticText(t) => rel_xf.try_transform_rect(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => rel_xf.try_transform_rect(t.bounding_box()),
             NodePayload::PowerClip { container, .. } => {
@@ -4764,6 +5266,9 @@ impl Document {
                 }
                 Effect::Extrude25D {
                     vanishing_point, ..
+                }
+                | Effect::Extrude3D {
+                    vanishing_point, ..
                 } if vanishing_point.is_finite() => {
                     let vp_rect = Rect2D::from_xywh(vanishing_point.x, vanishing_point.y, 0.1, 0.1);
                     acc = acc.union(vp_rect);
@@ -5037,6 +5542,9 @@ impl Document {
                 }
                 Effect::Extrude25D {
                     vanishing_point, ..
+                }
+                | Effect::Extrude3D {
+                    vanishing_point, ..
                 } if vanishing_point.is_finite() => {
                     let vp_rect = Rect2D::from_xywh(vanishing_point.x, vanishing_point.y, 0.1, 0.1);
                     acc = acc.union(vp_rect);
@@ -5096,6 +5604,28 @@ impl Document {
         let bounds = match &obj.payload {
             NodePayload::Path(p) => p.bounding_box(),
             NodePayload::Shape(s) => s.to_bezier_path().bounding_box(),
+            NodePayload::BSpline(bs) => bs.bounding_box(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style).bounding_box()
+            }
+            NodePayload::Clone { .. } => {
+                self.resolve_clone_payload_and_style(obj)
+                    .and_then(|(eff_p, _, _)| {
+                        let mut ctx = DocBoundsCtx::new();
+                        ctx.visiting_depth.insert(id, 0);
+                        let mut visiting_syms = HashSet::new();
+                        self.payload_bounds_with_ctx(
+                            &eff_p,
+                            &Affine2D::IDENTITY,
+                            1,
+                            &mut ctx,
+                            &mut visiting_syms,
+                            None,
+                            None,
+                        )
+                        .0
+                    })
+            }
             NodePayload::ArtisticText(t) => Some(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => Some(t.bounding_box()),
             NodePayload::TextOnPath(top) => self
@@ -5335,15 +5865,31 @@ impl Document {
 
         let my_depth = ctx.visiting_depth.len();
         ctx.visiting_depth.insert(id, my_depth);
-        let (raw_bounds, min_backedge) = self.payload_bounds_with_ctx(
-            &obj.payload,
-            &world_xf,
-            depth,
-            ctx,
-            visiting_syms,
-            None,
-            pc_space,
-        );
+        let (raw_bounds, min_backedge) = if let Some(persp) = obj.perspective {
+            let (local_b, back) = self.payload_bounds_with_ctx(
+                &obj.payload,
+                &Affine2D::IDENTITY,
+                depth,
+                ctx,
+                visiting_syms,
+                None,
+                None,
+            );
+            let warped = local_b
+                .and_then(|lb| persp.try_transform_rect(lb))
+                .and_then(|wb| world_xf.try_transform_rect(wb));
+            (warped, back)
+        } else {
+            self.payload_bounds_with_ctx(
+                &obj.payload,
+                &world_xf,
+                depth,
+                ctx,
+                visiting_syms,
+                None,
+                pc_space,
+            )
+        };
         ctx.visiting_depth.remove(&id);
         let bounds = raw_bounds.filter(|r| r.is_finite());
         if min_backedge == usize::MAX {
@@ -5602,6 +6148,41 @@ impl Document {
         let bounds = match payload {
             NodePayload::Path(p) => p.transformed(world_xf).bounding_box(),
             NodePayload::Shape(s) => s.to_bezier_path().transformed(world_xf).bounding_box(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path().transformed(world_xf).bounding_box(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+                    .transformed(world_xf)
+                    .bounding_box()
+            }
+            NodePayload::Clone {
+                master_id,
+                link_shape,
+                ..
+            } => {
+                if !*link_shape {
+                    None
+                } else if let Some(&active_d) = bounds_ctx.visiting_depth.get(master_id) {
+                    min_backedge = min_backedge.min(active_d);
+                    None
+                } else if let Some(master) = self.objects.get(master_id) {
+                    let md = bounds_ctx.visiting_depth.len();
+                    bounds_ctx.visiting_depth.insert(*master_id, md);
+                    let (bb, back) = self.payload_bounds_with_ctx(
+                        &master.payload,
+                        world_xf,
+                        depth + 1,
+                        bounds_ctx,
+                        visiting_syms,
+                        sym_ctx,
+                        pc_space,
+                    );
+                    bounds_ctx.visiting_depth.remove(master_id);
+                    min_backedge = min_backedge.min(back);
+                    bb
+                } else {
+                    None
+                }
+            }
             NodePayload::ArtisticText(t) => world_xf.try_transform_rect(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => world_xf.try_transform_rect(t.bounding_box()),
             NodePayload::TextOnPath(top) => {
@@ -5947,18 +6528,40 @@ impl Document {
     }
 
     /// Extracts world-space [`BezierPath`] representation of `id` if it is a curve/shape,
-    /// including any ancestor `Group` or `PowerClip` transforms.
+    /// including any ancestor `Group` or `PowerClip` transforms and `SceneObject.perspective`.
     #[must_use]
     pub fn world_path_of(&self, id: ObjectId) -> Option<BezierPath> {
         let obj = self.objects.get(&id)?;
         let local = match &obj.payload {
             NodePayload::Path(p) => p.clone(),
             NodePayload::Shape(s) => s.to_bezier_path(),
+            NodePayload::BSpline(bs) => bs.to_bezier_path(),
+            NodePayload::ArtisticMedia { spine, style } => {
+                ArtisticMedia::expand_stroke(spine, style)
+            }
+            NodePayload::Clone { .. } => {
+                let (eff_p, _, _) = self.resolve_clone_payload_and_style(obj)?;
+                match eff_p {
+                    NodePayload::Path(p) => p,
+                    NodePayload::Shape(s) => s.to_bezier_path(),
+                    NodePayload::BSpline(bs) => bs.to_bezier_path(),
+                    NodePayload::ArtisticMedia { spine, style } => {
+                        ArtisticMedia::expand_stroke(&spine, &style)
+                    }
+                    NodePayload::PowerClip { container, .. } => *container,
+                    _ => return None,
+                }
+            }
             NodePayload::PowerClip { container, .. } => (**container).clone(),
             _ => return None,
         };
+        let local_warped = if let Some(persp) = obj.perspective {
+            persp.transform_bezier_path(&local)
+        } else {
+            local
+        };
         let world_xf = self.world_transform_of(id).unwrap_or(obj.transform);
-        Some(local.transformed(&world_xf))
+        Some(local_warped.transformed(&world_xf))
     }
 
     fn collect_world_paths(
@@ -6015,6 +6618,26 @@ impl Document {
         match &obj.payload {
             NodePayload::Path(p) => out.push(p.transformed(world_xf)),
             NodePayload::Shape(s) => out.push(s.to_bezier_path().transformed(world_xf)),
+            NodePayload::BSpline(bs) => out.push(bs.to_bezier_path().transformed(world_xf)),
+            NodePayload::ArtisticMedia { spine, style } => {
+                out.push(ArtisticMedia::expand_stroke(spine, style).transformed(world_xf));
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((eff_p, _, _)) = self.resolve_clone_payload_and_style(obj) {
+                    let mut tmp = obj.clone();
+                    tmp.payload = eff_p;
+                    self.collect_obj_world_paths(
+                        &tmp,
+                        world_xf,
+                        depth + 1,
+                        visited_doc,
+                        visiting_syms,
+                        sym_ctx,
+                        sym_visited,
+                        out,
+                    );
+                }
+            }
             NodePayload::Table(t) => out.push(t.to_grid_paths().transformed(world_xf)),
             NodePayload::Connector(c) => {
                 if let Some((sym_root_xf, sym_objects, sym_map, sym_parent_map)) = sym_ctx {
@@ -6241,61 +6864,72 @@ impl Document {
             }
     }
 
-    /// Builds an R-Tree [`SpatialIndex`] for all visible, unlocked objects on `page_index`.
+    /// Collects all layers applicable to `page_index` in exact render/hit-test Z-order:
+    /// all applicable Desktop/Master layers across the document first (bottom-most), followed
+    /// by `page_index`'s own non-master layers (topmost).
+    #[must_use]
+    pub fn effective_layers_for_page(&self, page_index: usize) -> Vec<&Layer> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let is_odd = page_index.is_multiple_of(2); // 1-based Page 1 = index 0 = Odd
+
+        for page in &self.pages {
+            for layer in &page.layers {
+                let applies = layer.is_desktop_layer
+                    || match layer.master_scope {
+                        MasterLayerScope::None => false,
+                        MasterLayerScope::AllPages => true,
+                        MasterLayerScope::OddPages => is_odd,
+                        MasterLayerScope::EvenPages => !is_odd,
+                    };
+                if applies && seen.insert(layer.id) {
+                    out.push(layer);
+                }
+            }
+        }
+        if let Some(page) = self.pages.get(page_index) {
+            for layer in &page.layers {
+                if !layer.is_desktop_layer
+                    && layer.master_scope == MasterLayerScope::None
+                    && seen.insert(layer.id)
+                {
+                    out.push(layer);
+                }
+            }
+        }
+        out
+    }
+
+    /// Builds an R-Tree [`SpatialIndex`] for all visible, unlocked objects on `page_index`,
+    /// matching [`Self::effective_layers_for_page`] Z-order and visual/deformed bounds.
     #[must_use]
     pub fn build_spatial_index(&self, page_index: usize) -> SpatialIndex {
-        let Some(page) = self.pages.get(page_index) else {
+        if page_index >= self.pages.len() {
             return SpatialIndex { tree: RTree::new() };
-        };
+        }
         let mut entries = Vec::new();
         let mut z = 0usize;
         let mut bounds_ctx = DocBoundsCtx::new();
         let mut visiting_syms = HashSet::new();
-        // Include cross-page shared Desktop / AllPages / OddPages / EvenPages layers from other pages,
-        // matching `collect_effective_layers` applicability rules.
-        for (p_idx, p) in self.pages.iter().enumerate() {
-            if p_idx == page_index {
-                continue;
-            }
-            for layer in &p.layers {
-                if !layer.visible || !Self::layer_applies_to_page(layer, p_idx, page_index) {
-                    continue;
-                }
-                for &oid in &layer.objects {
-                    if let Some(obj) = self.objects.get(&oid) {
-                        if obj.visible {
-                            if let Some(bounds) = self
-                                .object_bounds_with_ctx(oid, &mut bounds_ctx, &mut visiting_syms)
-                                .filter(|b| b.is_finite())
-                            {
-                                let pad = self.spatial_bounds_padding_mm(oid);
-                                entries.push(SpatialObjectEntry {
-                                    id: oid,
-                                    z_order: z,
-                                    bounds: if pad > 0.0 {
-                                        bounds.expand(pad)
-                                    } else {
-                                        bounds
-                                    },
-                                });
-                            }
-                        }
-                    }
-                    z += 1;
-                }
-            }
-        }
-        for layer in &page.layers {
-            if !layer.visible || !Self::layer_applies_to_page(layer, page_index, page_index) {
+
+        for layer in self.effective_layers_for_page(page_index) {
+            if !layer.visible {
                 continue;
             }
             for &oid in &layer.objects {
                 if let Some(obj) = self.objects.get(&oid) {
                     if obj.visible {
-                        if let Some(bounds) = self
-                            .object_bounds_with_ctx(oid, &mut bounds_ctx, &mut visiting_syms)
-                            .filter(|b| b.is_finite())
-                        {
+                        let bounds = self
+                            .visual_world_bounds(oid)
+                            .or_else(|| {
+                                self.object_bounds_with_ctx(
+                                    oid,
+                                    &mut bounds_ctx,
+                                    &mut visiting_syms,
+                                )
+                            })
+                            .filter(|b| b.is_finite());
+                        if let Some(bounds) = bounds {
                             let pad = self.spatial_bounds_padding_mm(oid);
                             entries.push(SpatialObjectEntry {
                                 id: oid,
@@ -7006,5 +7640,204 @@ mod tests {
             !doc.assets.contains_key(&a2_id),
             "evicted redo asset a2 should be reclaimed"
         );
+    }
+
+    #[test]
+    fn live_clone_sync_duplication_master_removal_and_invalidation() {
+        use crate::command::{CommandHistory, CommandOp, DocumentInvalidation};
+
+        let red = Color::rgb(1.0, 0.0, 0.0);
+        let mut doc = Document::new_a4("Clone Test");
+        let master = doc
+            .add_object(make_rect_obj(10.0, 10.0, 20.0, 20.0, red.clone()), None)
+            .unwrap();
+        let clone_obj = SceneObject::new(
+            ObjectId(0),
+            "Clone",
+            NodePayload::Clone {
+                master_id: master,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(60.0, 10.0));
+        let clone_id = doc.add_object(clone_obj, None).unwrap();
+
+        let clone_bb = doc.world_object_bounds(clone_id).unwrap();
+        assert!((clone_bb.min_x - 60.0).abs() < 1e-6 && (clone_bb.width() - 20.0).abs() < 1e-6);
+
+        // Editing master propagates invalidation to Clone
+        let mut hist = CommandHistory::new(16);
+        hist.execute(
+            &mut doc,
+            CommandOp::EditShape {
+                id: master,
+                shape: ParametricShape::Rectangle {
+                    width: 35.0,
+                    height: 20.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                },
+            },
+        )
+        .unwrap();
+        match hist.last_invalidation() {
+            DocumentInvalidation::Targeted { object_ids, .. } => {
+                assert!(object_ids.contains(&clone_id));
+            }
+            DocumentInvalidation::All => {}
+        }
+        assert!((doc.world_object_bounds(clone_id).unwrap().width() - 35.0).abs() < 1e-6);
+
+        // Duplicating master + clone together remaps clone's master_id
+        let dup_ids = doc
+            .duplicate_objects(&[master, clone_id], Vec2D::new(0.0, 40.0))
+            .unwrap();
+        assert_eq!(dup_ids.len(), 2);
+        let dup_master = dup_ids[0];
+        let dup_clone = dup_ids[1];
+        assert!(matches!(
+            doc.object(dup_clone).unwrap().payload,
+            NodePayload::Clone { master_id, .. } if master_id == dup_master
+        ));
+
+        // Removing master materializes surviving clone without leaving dangling master_id
+        doc.remove_object(master).unwrap();
+        assert!(!matches!(
+            doc.object(clone_id).unwrap().payload,
+            NodePayload::Clone { .. }
+        ));
+        assert_eq!(doc.object(clone_id).unwrap().fill, Fill::Solid(red));
+    }
+
+    #[test]
+    fn fit_powerclip_center_fit_stretch_and_contents_rect_hit_test() {
+        let mut doc = Document::new_a4("PowerClip Fit");
+        let container = doc
+            .add_object(
+                make_rect_obj(20.0, 20.0, 40.0, 40.0, Color::BLACK).with_fill(Fill::None),
+                None,
+            )
+            .unwrap();
+        let child = doc
+            .add_object(make_rect_obj(0.0, 0.0, 10.0, 20.0, Color::CYAN), None)
+            .unwrap();
+        let pc_id = doc.create_powerclip(container, &[child]).unwrap();
+
+        doc.fit_powerclip(pc_id, PowerClipFitMode::CenterContents)
+            .unwrap();
+        let c_bb = doc.world_object_bounds(child).unwrap();
+        assert!((c_bb.center().x - 40.0).abs() < 1e-4 && (c_bb.center().y - 40.0).abs() < 1e-4);
+
+        doc.fit_powerclip(pc_id, PowerClipFitMode::FitContents)
+            .unwrap();
+        let f_bb = doc.world_object_bounds(child).unwrap();
+        assert!((f_bb.height() - 40.0).abs() < 1e-4);
+
+        doc.fit_powerclip(pc_id, PowerClipFitMode::StretchToFill)
+            .unwrap();
+        let s_bb = doc.world_object_bounds(child).unwrap();
+        assert!((s_bb.width() - 40.0).abs() < 1e-4 && (s_bb.height() - 40.0).abs() < 1e-4);
+
+        let hits = crate::hit_test_powerclip_contents_rect(
+            &doc,
+            pc_id,
+            Rect2D::from_xywh(30.0, 30.0, 10.0, 10.0),
+            false,
+        );
+        assert_eq!(hits, vec![child]);
+    }
+
+    #[test]
+    fn master_layer_z_order_page2_and_color_style_live_cascade() {
+        use crate::color::ColorHarmony;
+        use crate::command::{CommandHistory, CommandOp};
+
+        let mut doc = Document::new_a4("Master Page2 & ColorStyle");
+        let _p2 = doc.add_page("Page 2", 210.0, 297.0, 3.0);
+        let p2_layer = doc.pages()[1].layers[0].id;
+        let p2_master = doc
+            .add_layer(
+                doc.pages()[1].id,
+                "MasterOnP2",
+                false,
+                MasterLayerScope::AllPages,
+            )
+            .unwrap();
+
+        let red = Color::rgb(1.0, 0.0, 0.0);
+        let blue = Color::rgb(0.0, 0.0, 1.0);
+        let top_local = doc
+            .add_object(
+                make_rect_obj(10.0, 10.0, 30.0, 30.0, red.clone()),
+                Some(p2_layer),
+            )
+            .unwrap();
+        let bottom_master = doc
+            .add_object(make_rect_obj(10.0, 10.0, 30.0, 30.0, blue), Some(p2_master))
+            .unwrap();
+
+        // Even though p2_master is listed after p2_layer on Page 2, effective Z-order places
+        // master layers below non-master page layers (top_local must win over bottom_master).
+        assert_eq!(
+            crate::hit_test_point(&doc, 1, Point2D::new(20.0, 20.0), 1.0),
+            Some(top_local)
+        );
+        let _ = bottom_master;
+
+        // Live ColorStyle -> ObjectStyle -> SceneObject + ArtisticText cascade
+        let mut cs = ColorStyle::new("Brand", red.clone(), Some(ColorHarmony::Triadic));
+        let cs_id = cs.id;
+        let mut os = ObjectStyle::new("CardStyle");
+        os.color_style_id = Some(cs_id);
+        os.color_style_slot = Some(1);
+        let os_id = os.id;
+
+        let mut hist = CommandHistory::new(16);
+        hist.execute(&mut doc, CommandOp::UpsertColorStyle { style: cs.clone() })
+            .unwrap();
+        hist.execute(&mut doc, CommandOp::UpsertObjectStyle { style: os })
+            .unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetObjectStyleLink {
+                ids: vec![top_local],
+                style_id: Some(os_id),
+            },
+        )
+        .unwrap();
+
+        let txt = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Title",
+                    NodePayload::ArtisticText(ArtisticText::from_plain("Hi", Default::default())),
+                ),
+                None,
+            )
+            .unwrap();
+        hist.execute(
+            &mut doc,
+            CommandOp::SetObjectColorStyleLink {
+                ids: vec![txt],
+                color_style_id: Some(cs_id),
+                slot: None,
+            },
+        )
+        .unwrap();
+
+        cs.set_base_color(Color::CYAN);
+        hist.execute(&mut doc, CommandOp::UpsertColorStyle { style: cs })
+            .unwrap();
+        assert_eq!(doc.object(txt).unwrap().fill, Fill::Solid(Color::CYAN));
+        assert_ne!(
+            doc.object(top_local).unwrap().fill,
+            Fill::Solid(red.clone())
+        );
+        hist.undo(&mut doc).unwrap();
+        assert_eq!(doc.object(txt).unwrap().fill, Fill::Solid(red));
     }
 }

@@ -2,7 +2,7 @@
 
 //! Fill models, outline stroke styling, blend modes, and reusable object styles.
 
-use crate::color::Color;
+use crate::color::{Color, ColorStyleId};
 use crate::ids::{ImageAssetId, ObjectStyleId, SymbolId};
 use crate::math::{sanitize_f64, Affine2D, Point2D};
 use serde::{Deserialize, Serialize};
@@ -434,6 +434,10 @@ pub struct ObjectStyle {
     pub outline: Option<OutlineStyle>,
     pub blend_mode: Option<BlendMode>,
     pub opacity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_style_id: Option<ColorStyleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_style_slot: Option<usize>,
 }
 
 impl ObjectStyle {
@@ -447,6 +451,8 @@ impl ObjectStyle {
             outline: None,
             blend_mode: None,
             opacity: None,
+            color_style_id: None,
+            color_style_slot: None,
         }
     }
 }

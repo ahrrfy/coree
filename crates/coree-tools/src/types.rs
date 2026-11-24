@@ -388,6 +388,11 @@ pub struct ToolSettingsSnapshot {
     pub effect_frequency: f64,
     pub effect_envelope_mode: EnvelopeMode,
     pub effect_blend_mode: BlendMode,
+    pub symmetry_enabled: bool,
+    pub symmetry_folds: u32,
+    pub symmetry_mirror: bool,
+    pub symmetry_center_mm: Option<Point2D>,
+    pub draw_in_perspective: bool,
 }
 
 impl Default for ToolSettingsSnapshot {
@@ -435,6 +440,11 @@ impl Default for ToolSettingsSnapshot {
             effect_frequency: 2.0,
             effect_envelope_mode: EnvelopeMode::SingleArc,
             effect_blend_mode: BlendMode::Multiply,
+            symmetry_enabled: false,
+            symmetry_folds: 4,
+            symmetry_mirror: true,
+            symmetry_center_mm: None,
+            draw_in_perspective: false,
         }
     }
 }

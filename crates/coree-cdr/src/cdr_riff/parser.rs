@@ -320,6 +320,13 @@ fn remap_loaded_references(doc: &mut Document, ctx: &ParseContext<'_>) {
                             }
                         }
                     }
+                    NodePayload::Clone {
+                        ref mut master_id, ..
+                    } => {
+                        if let Some(&mapped) = ctx.oid_remap.get(master_id) {
+                            *master_id = mapped;
+                        }
+                    }
                     NodePayload::Raster(ref mut r) => {
                         if let Some(&mapped) = ctx.asset_id_remap.get(&r.asset_id) {
                             r.asset_id = mapped;
@@ -1316,6 +1323,8 @@ pub(super) fn parse_group_list(
     let mut lens: Option<LensConfig> = None;
     let mut effects: Vec<Effect> = Vec::new();
     let mut style_id = None;
+    let mut perspective = None;
+    let mut color_style_link: Option<(Option<coree_core::ColorStyleId>, Option<usize>)> = None;
     let mut source_oid = None;
     let mut unknown_chunks = Vec::new();
 
@@ -1349,6 +1358,12 @@ pub(super) fn parse_group_list(
                                     effects.extend(parsed.effects);
                                     if parsed.object_style_id.is_some() {
                                         style_id = parsed.object_style_id;
+                                    }
+                                    if parsed.perspective.is_some() {
+                                        perspective = parsed.perspective;
+                                    }
+                                    if parsed.color_style_link.is_some() {
+                                        color_style_link = parsed.color_style_link;
                                     }
                                     if parsed.source_oid.is_some() {
                                         source_oid = parsed.source_oid;
@@ -1448,6 +1463,12 @@ pub(super) fn parse_group_list(
                         if parsed.object_style_id.is_some() {
                             style_id = parsed.object_style_id;
                         }
+                        if parsed.perspective.is_some() {
+                            perspective = parsed.perspective;
+                        }
+                        if parsed.color_style_link.is_some() {
+                            color_style_link = parsed.color_style_link;
+                        }
                         if parsed.source_oid.is_some() {
                             source_oid = parsed.source_oid;
                         }
@@ -1495,6 +1516,11 @@ pub(super) fn parse_group_list(
     grp.lens = lens;
     grp.effects = effects;
     grp.style_id = style_id;
+    grp.perspective = perspective;
+    if let Some((cs_id, cs_slot)) = color_style_link {
+        grp.color_style_id = cs_id;
+        grp.color_style_slot = cs_slot;
+    }
     grp.unknown_chunks = unknown_chunks;
     let _ = doc.insert_loaded_object(grp);
     Ok(Some(gid))

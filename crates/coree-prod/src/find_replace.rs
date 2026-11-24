@@ -528,6 +528,9 @@ fn cql_type_aliases(payload: &NodePayload) -> &'static [&'static str] {
         NodePayload::Group(_) => &["group"],
         NodePayload::PowerClip { .. } => &["powerclip"],
         NodePayload::SymbolInstance(_) => &["symbol", "symbolinstance"],
+        NodePayload::BSpline(_) => &["bspline", "curve"],
+        NodePayload::ArtisticMedia { .. } => &["artisticmedia", "media"],
+        NodePayload::Clone { .. } => &["clone"],
     }
 }
 

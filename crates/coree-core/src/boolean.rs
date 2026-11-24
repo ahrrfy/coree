@@ -7,9 +7,11 @@
 //! with automatic coordinate-range clamping so degenerate or extreme inputs never panic.
 
 use crate::error::{CoreError, CoreResult};
-use crate::geometry::{fit_cubic_bezier_subpath, BezierPath};
-use crate::math::{sanitize_f64, Point2D};
-use crate::style::{LineCap, LineJoin, OutlineStyle};
+use crate::geometry::{
+    fit_cubic_bezier_subpath, BezierPath, EllipseMode, ParametricShape, Subpath,
+};
+use crate::math::{sanitize_f64, Affine2D, Point2D, Vec2D};
+use crate::style::{ArrowheadStyle, LineCap, LineJoin, OutlineStyle};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::Overlay;
 use i_overlay::core::overlay_rule::OverlayRule;
@@ -21,6 +23,7 @@ use i_overlay::mesh::float::style::{
     LineCap as IoLineCap, LineJoin as IoLineJoin, OutlineStyle as IoOutlineStyle,
     StrokeStyle as IoStrokeStyle,
 };
+use kurbo::{BezPath, ParamCurve, ParamCurveArclen};
 use serde::{Deserialize, Serialize};
 
 /// Default integer grid scale (`10_000` units per millimeter = `0.1 µm`).
@@ -267,8 +270,231 @@ pub fn offset_polygon(path: &BezierPath, delta_mm: f64) -> CoreResult<BezierPath
     Ok(BezierPath { subpaths })
 }
 
+/// Builds the geometry `(path, is_filled)` for an arrowhead at `tip` pointing along `forward_dir`.
+#[must_use]
+pub fn arrowhead_geometry(
+    tip: Point2D,
+    forward_dir: Vec2D,
+    style: &ArrowheadStyle,
+    stroke_w_mm: f32,
+) -> Option<(BezierPath, bool)> {
+    if *style == ArrowheadStyle::None {
+        return None;
+    }
+    let dir = forward_dir.normalized().unwrap_or(Vec2D::new(1.0, 0.0));
+    let perp = dir.perp();
+    let size = (f64::from(stroke_w_mm) * 4.5).max(1.5);
+    let half_w = size * 0.45;
+
+    match style {
+        ArrowheadStyle::None => None,
+        ArrowheadStyle::Triangle | ArrowheadStyle::Custom(_) => {
+            let base = tip - dir * size;
+            Some((
+                BezierPath::from_polygon([tip, base + perp * half_w, base - perp * half_w], true),
+                true,
+            ))
+        }
+        ArrowheadStyle::Stealth => {
+            let base = tip - dir * size;
+            let notch = tip - dir * (size * 0.65);
+            Some((
+                BezierPath::from_polygon(
+                    [tip, base + perp * half_w, notch, base - perp * half_w],
+                    true,
+                ),
+                true,
+            ))
+        }
+        ArrowheadStyle::OpenVee => {
+            let base = tip - dir * size;
+            Some((
+                BezierPath::from_polygon([base + perp * half_w, tip, base - perp * half_w], false),
+                false,
+            ))
+        }
+        ArrowheadStyle::Diamond => {
+            let mid = tip - dir * (size * 0.5);
+            let back = tip - dir * size;
+            Some((
+                BezierPath::from_polygon(
+                    [tip, mid + perp * half_w, back, mid - perp * half_w],
+                    true,
+                ),
+                true,
+            ))
+        }
+        ArrowheadStyle::Circle => {
+            let center = tip - dir * half_w;
+            let mut circle = ParametricShape::Ellipse {
+                rx: half_w,
+                ry: half_w,
+                mode: EllipseMode::Full,
+                start_deg: 0.0,
+                end_deg: 360.0,
+            }
+            .to_bezier_path();
+            circle.transform(&Affine2D::translate(center.x, center.y));
+            Some((circle, true))
+        }
+        ArrowheadStyle::Square => {
+            let back = tip - dir * (half_w * 2.0);
+            Some((
+                BezierPath::from_polygon(
+                    [
+                        tip + perp * half_w,
+                        tip - perp * half_w,
+                        back - perp * half_w,
+                        back + perp * half_w,
+                    ],
+                    true,
+                ),
+                true,
+            ))
+        }
+    }
+}
+
+fn slice_subpath_dashes(sp: &Subpath, pattern: &[f64]) -> Vec<Subpath> {
+    let single = BezierPath::from_subpath(sp.clone());
+    let kb = single.to_kurbo();
+    let segs: Vec<kurbo::PathSeg> = kb.segments().collect();
+    if segs.is_empty() || pattern.is_empty() {
+        return vec![sp.clone()];
+    }
+    let seg_lens: Vec<f64> = segs.iter().map(|s| s.arclen(1e-4).max(0.0)).collect();
+    let total_len: f64 = seg_lens.iter().sum();
+    if total_len <= 1e-6 {
+        return Vec::new();
+    }
+
+    let extract_arc_range = |start_s: f64, end_s: f64| -> Option<Subpath> {
+        if end_s <= start_s + 1e-5 {
+            return None;
+        }
+        let mut out_kb = BezPath::new();
+        let mut moved = false;
+        let mut acc = 0.0_f64;
+        for (seg, &slen) in segs.iter().zip(&seg_lens) {
+            let seg_end = acc + slen;
+            if slen > 1e-9 && seg_end > start_s + 1e-7 && acc < end_s - 1e-7 {
+                let d0 = (start_s - acc).clamp(0.0, slen);
+                let d1 = (end_s - acc).clamp(0.0, slen);
+                if d1 > d0 + 1e-7 {
+                    let t0 = seg.inv_arclen(d0, 1e-4).clamp(0.0, 1.0);
+                    let t1 = seg.inv_arclen(d1, 1e-4).clamp(0.0, 1.0);
+                    if t1 > t0 + 1e-7 {
+                        let piece = seg.subsegment(t0..t1);
+                        if !moved {
+                            out_kb.move_to(piece.start());
+                            moved = true;
+                        }
+                        out_kb.push(piece.as_path_el());
+                    }
+                }
+            }
+            acc = seg_end;
+        }
+        if !moved {
+            return None;
+        }
+        BezierPath::from_kurbo(&out_kb).subpaths.into_iter().next()
+    };
+
+    let mut out = Vec::new();
+    let mut cursor = 0.0_f64;
+    let mut pat_idx = 0usize;
+    let mut guard = 0usize;
+    while cursor < total_len - 1e-5 && guard < 10_000 {
+        guard += 1;
+        let step = pattern[pat_idx % pattern.len()].max(1e-3);
+        let next = (cursor + step).min(total_len);
+        if pat_idx.is_multiple_of(2) {
+            if let Some(sub) = extract_arc_range(cursor, next) {
+                if sub.nodes.len() >= 2 {
+                    out.push(sub);
+                }
+            }
+        }
+        cursor = next;
+        pat_idx += 1;
+    }
+    out
+}
+
+fn stroke_single_subpath(
+    sp: &Subpath,
+    style: &IoStrokeStyle<[f64; 2]>,
+    width: f64,
+    use_calligraphy: bool,
+    angle_deg: f64,
+    stretch: f64,
+) -> Option<BezierPath> {
+    let single = BezierPath::from_subpath(sp.clone());
+    if use_calligraphy {
+        let len = single.path_length_mm();
+        if len <= 1e-6 {
+            return None;
+        }
+        let angle = sanitize_f64(angle_deg, 45.0).to_radians();
+        let nib_major = Vec2D::from_angle(angle) * (0.5 * width);
+        let nib_minor = nib_major.perp() * stretch;
+        let steps = ((len / 0.5).ceil() as usize).clamp(8, 256);
+        let mut left = Vec::with_capacity(steps + 1);
+        let mut right = Vec::with_capacity(steps + 1);
+        for i in 0..=steps {
+            let d = (i as f64 / steps as f64) * len;
+            let Some((pt, tangent)) = single.point_and_tangent_at(d) else {
+                continue;
+            };
+            let n = tangent.perp();
+            let proj = (nib_major.dot(n).hypot(nib_minor.dot(n))).max(width * 0.08);
+            left.push(pt + n * proj);
+            right.push(pt - n * proj);
+        }
+        if left.len() >= 2 {
+            right.reverse();
+            left.extend(right);
+            let sub = fit_cubic_bezier_subpath(&left, true, 0.025);
+            if sub.nodes.len() >= 3 {
+                return Some(BezierPath::from_subpath(sub));
+            }
+        }
+        return None;
+    }
+
+    let mut subpaths = Vec::new();
+    for poly in single.flatten(DEFAULT_FLATTEN_TOLERANCE_MM) {
+        let mut pts: Vec<[f64; 2]> = poly
+            .into_iter()
+            .filter(|p| p.is_finite() && p.x.abs() <= 1e9 && p.y.abs() <= 1e9)
+            .map(|p| [p.x, p.y])
+            .collect();
+        if sp.closed && pts.len() > 1 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        if pts.len() < 2 {
+            continue;
+        }
+        let shapes = pts.stroke_as::<i64>(style.clone(), sp.closed);
+        for shape in shapes {
+            for contour in shape {
+                if contour.len() >= 3 {
+                    let pts: Vec<Point2D> = contour
+                        .into_iter()
+                        .map(|[x, y]| Point2D::new(x, y))
+                        .collect();
+                    subpaths.push(fit_cubic_bezier_subpath(&pts, true, 0.025));
+                }
+            }
+        }
+    }
+    (!subpaths.is_empty()).then_some(BezierPath { subpaths })
+}
+
 /// Converts a vector path's stroked outline into closed fillable contours (`Ctrl+Shift+Q`),
-/// honoring `cap`, `join`, `miter_limit`, and open vs. closed subpaths.
+/// honoring `cap`, `join`, `miter_limit`, `dash_pattern`, `start_arrow`/`end_arrow`,
+/// `calligraphy_angle_deg`/`calligraphy_stretch`, and open vs. closed subpaths.
 pub fn stroke_to_closed_path(
     path: &BezierPath,
     outline: &OutlineStyle,
@@ -311,36 +537,76 @@ pub fn stroke_to_closed_path(
         ..IoStrokeStyle::default()
     };
 
+    let mut clean_dash: Vec<f64> = outline
+        .dash_pattern
+        .iter()
+        .copied()
+        .filter(|d| d.is_finite() && *d > 1e-4)
+        .collect();
+    if !clean_dash.is_empty() && clean_dash.len() % 2 == 1 {
+        let copy = clean_dash.clone();
+        clean_dash.extend(copy);
+    }
+
+    let stretch = sanitize_f64(outline.calligraphy_stretch, 1.0).clamp(0.05, 1.0);
+    let use_calligraphy = (stretch - 1.0).abs() > 0.03;
+    let angle_deg = outline.calligraphy_angle_deg;
+
     let mut piece_paths: Vec<BezierPath> = Vec::new();
     for sp in &path.subpaths {
-        let single = BezierPath::from_subpath(sp.clone());
-        for poly in single.flatten(DEFAULT_FLATTEN_TOLERANCE_MM) {
-            let mut pts: Vec<[f64; 2]> = poly
-                .into_iter()
-                .filter(|p| p.is_finite() && p.x.abs() <= 1e9 && p.y.abs() <= 1e9)
-                .map(|p| [p.x, p.y])
-                .collect();
-            if sp.closed && pts.len() > 1 && pts.first() == pts.last() {
-                pts.pop();
+        let stroked_pieces = if clean_dash.is_empty() {
+            vec![sp.clone()]
+        } else {
+            slice_subpath_dashes(sp, &clean_dash)
+        };
+        for dash_sp in &stroked_pieces {
+            if let Some(piece) =
+                stroke_single_subpath(dash_sp, &style, width, use_calligraphy, angle_deg, stretch)
+            {
+                piece_paths.push(piece);
             }
-            if pts.len() < 2 {
-                continue;
-            }
-            let shapes = pts.stroke_as::<i64>(style.clone(), sp.closed);
-            let mut subpaths = Vec::new();
-            for shape in shapes {
-                for contour in shape {
-                    if contour.len() >= 3 {
-                        let pts: Vec<Point2D> = contour
-                            .into_iter()
-                            .map(|[x, y]| Point2D::new(x, y))
-                            .collect();
-                        subpaths.push(fit_cubic_bezier_subpath(&pts, true, 0.025));
+        }
+
+        if !sp.closed
+            && sp.nodes.len() >= 2
+            && (outline.start_arrow != ArrowheadStyle::None
+                || outline.end_arrow != ArrowheadStyle::None)
+        {
+            let single = BezierPath::from_subpath(sp.clone());
+            let total_len = single.path_length_mm();
+            if total_len > 1e-6 {
+                let mut arrows: Vec<(BezierPath, bool)> = Vec::new();
+                if outline.start_arrow != ArrowheadStyle::None {
+                    if let Some((pt, tangent)) = single.point_and_tangent_at(0.0) {
+                        if let Some(geom) =
+                            arrowhead_geometry(pt, -tangent, &outline.start_arrow, width as f32)
+                        {
+                            arrows.push(geom);
+                        }
                     }
                 }
-            }
-            if !subpaths.is_empty() {
-                piece_paths.push(BezierPath { subpaths });
+                if outline.end_arrow != ArrowheadStyle::None {
+                    if let Some((pt, tangent)) = single.point_and_tangent_at(total_len) {
+                        if let Some(geom) =
+                            arrowhead_geometry(pt, tangent, &outline.end_arrow, width as f32)
+                        {
+                            arrows.push(geom);
+                        }
+                    }
+                }
+                for (geom, is_filled) in arrows {
+                    if is_filled {
+                        piece_paths.push(geom);
+                    } else {
+                        for arrow_sp in &geom.subpaths {
+                            if let Some(closed_arrow) =
+                                stroke_single_subpath(arrow_sp, &style, width, false, 0.0, 1.0)
+                            {
+                                piece_paths.push(closed_arrow);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -632,5 +898,37 @@ mod tests {
             .nodes
             .iter()
             .all(|n| n.handle_in.is_none() && n.handle_out.is_none()));
+    }
+
+    #[test]
+    fn stroke_to_closed_path_supports_dashes_arrows_and_calligraphy() {
+        let line = BezierPath::from_line(Point2D::new(0.0, 0.0), Point2D::new(40.0, 0.0));
+        let dashed = OutlineStyle {
+            width_mm: 2.0,
+            dash_pattern: vec![6.0, 4.0],
+            ..Default::default()
+        };
+        let dashed_closed = stroke_to_closed_path(&line, &dashed, None).unwrap();
+        assert!(dashed_closed.subpaths.len() >= 3);
+        assert!(dashed_closed.subpaths.iter().all(|sp| sp.closed));
+
+        let arrowed = OutlineStyle {
+            width_mm: 2.0,
+            start_arrow: ArrowheadStyle::Circle,
+            end_arrow: ArrowheadStyle::Triangle,
+            ..Default::default()
+        };
+        let arrowed_closed = stroke_to_closed_path(&line, &arrowed, None).unwrap();
+        assert!(arrowed_closed.area_mm2() > 80.0);
+
+        let calli = OutlineStyle {
+            width_mm: 4.0,
+            calligraphy_angle_deg: 45.0,
+            calligraphy_stretch: 0.25,
+            ..Default::default()
+        };
+        let calli_closed = stroke_to_closed_path(&line, &calli, None).unwrap();
+        assert!(calli_closed.subpaths.iter().all(|sp| sp.closed));
+        assert!(calli_closed.area_mm2() > 40.0);
     }
 }

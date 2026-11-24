@@ -571,6 +571,9 @@ fn object_requires_raster_composite(obj: &SceneObject) -> bool {
                 | Effect::Extrude25D { .. }
                 | Effect::Blend { .. }
                 | Effect::Transparency { .. }
+                | Effect::InnerShadow { .. }
+                | Effect::Bevel { .. }
+                | Effect::Extrude3D { .. }
         )
     });
     if has_raster_effect {
@@ -677,41 +680,137 @@ fn emit_pdf_object(
                 );
 
                 // Preserve vector Spot /CutContour cutlines on top if present so plotters/RIPs see vector paths
-                if matches!(obj.outline.color, Color::Spot { .. }) && obj.outline.is_visible() {
+                let clone_resolved = if matches!(obj.payload, NodePayload::Clone { .. }) {
+                    ctx.doc.resolve_clone_payload_and_style(obj)
+                } else {
+                    None
+                };
+                let effective_outline = clone_resolved
+                    .as_ref()
+                    .map_or_else(|| obj.outline.clone(), |(_, _, o)| o.clone());
+                if matches!(effective_outline.color, Color::Spot { .. })
+                    && effective_outline.is_visible()
+                {
                     let sym_transforms = symmetry_effect_transforms(&obj.effects);
                     for sym_xf in sym_transforms {
                         let world_xf = parent_xf.compose(&sym_xf).compose(&obj.transform);
+                        if !world_xf.is_finite() {
+                            continue;
+                        }
                         match &obj.payload {
                             NodePayload::Path(path) => {
-                                let p = apply_geometry_effects(path, &obj.effects)
+                                let bp = if let Some(persp) = obj.perspective {
+                                    persp.transform_bezier_path(path)
+                                } else {
+                                    path.clone()
+                                };
+                                let p = apply_geometry_effects(&bp, &obj.effects)
                                     .transformed(&world_xf);
                                 emit_pdf_styled_path(
                                     ctx,
                                     &p,
                                     &Fill::None,
-                                    &obj.outline,
+                                    &effective_outline,
                                     obj.blend_mode,
                                     opacity,
-                                    Affine2D::IDENTITY,
+                                    world_xf,
                                     emit,
                                     out,
                                 );
                             }
                             NodePayload::Shape(shape) => {
-                                let p =
-                                    apply_geometry_effects(&shape.to_bezier_path(), &obj.effects)
-                                        .transformed(&world_xf);
+                                let bp = if let Some(persp) = obj.perspective {
+                                    persp.transform_bezier_path(&shape.to_bezier_path())
+                                } else {
+                                    shape.to_bezier_path()
+                                };
+                                let p = apply_geometry_effects(&bp, &obj.effects)
+                                    .transformed(&world_xf);
                                 emit_pdf_styled_path(
                                     ctx,
                                     &p,
                                     &Fill::None,
-                                    &obj.outline,
+                                    &effective_outline,
                                     obj.blend_mode,
                                     opacity,
-                                    Affine2D::IDENTITY,
+                                    world_xf,
                                     emit,
                                     out,
                                 );
+                            }
+                            NodePayload::BSpline(bs) => {
+                                let bp = if let Some(persp) = obj.perspective {
+                                    persp.transform_bezier_path(&bs.to_bezier_path())
+                                } else {
+                                    bs.to_bezier_path()
+                                };
+                                let p = apply_geometry_effects(&bp, &obj.effects)
+                                    .transformed(&world_xf);
+                                emit_pdf_styled_path(
+                                    ctx,
+                                    &p,
+                                    &Fill::None,
+                                    &effective_outline,
+                                    obj.blend_mode,
+                                    opacity,
+                                    world_xf,
+                                    emit,
+                                    out,
+                                );
+                            }
+                            NodePayload::ArtisticMedia { spine, style } => {
+                                let raw = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                                let bp = if let Some(persp) = obj.perspective {
+                                    persp.transform_bezier_path(&raw)
+                                } else {
+                                    raw
+                                };
+                                let p = apply_geometry_effects(&bp, &obj.effects)
+                                    .transformed(&world_xf);
+                                emit_pdf_styled_path(
+                                    ctx,
+                                    &p,
+                                    &Fill::None,
+                                    &effective_outline,
+                                    obj.blend_mode,
+                                    opacity,
+                                    world_xf,
+                                    emit,
+                                    out,
+                                );
+                            }
+                            NodePayload::Clone { .. } => {
+                                if let Some((payload, _, _)) = &clone_resolved {
+                                    let raw = match payload {
+                                        NodePayload::Path(path) => Some(path.clone()),
+                                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                                        NodePayload::ArtisticMedia { spine, style } => Some(
+                                            coree_core::ArtisticMedia::expand_stroke(spine, style),
+                                        ),
+                                        _ => None,
+                                    };
+                                    if let Some(raw) = raw {
+                                        let bp = if let Some(persp) = obj.perspective {
+                                            persp.transform_bezier_path(&raw)
+                                        } else {
+                                            raw
+                                        };
+                                        let p = apply_geometry_effects(&bp, &obj.effects)
+                                            .transformed(&world_xf);
+                                        emit_pdf_styled_path(
+                                            ctx,
+                                            &p,
+                                            &Fill::None,
+                                            &effective_outline,
+                                            obj.blend_mode,
+                                            opacity,
+                                            world_xf,
+                                            emit,
+                                            out,
+                                        );
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -733,7 +832,12 @@ fn emit_pdf_object(
 
         match &obj.payload {
             NodePayload::Path(path) => {
-                let deformed = apply_geometry_effects(path, &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(path)
+                } else {
+                    path.clone()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 let world_path = deformed.transformed(&world_xf);
                 emit_pdf_styled_path(
                     ctx,
@@ -748,7 +852,12 @@ fn emit_pdf_object(
                 );
             }
             NodePayload::Shape(shape) => {
-                let deformed = apply_geometry_effects(&shape.to_bezier_path(), &obj.effects);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&shape.to_bezier_path())
+                } else {
+                    shape.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
                 let world_path = deformed.transformed(&world_xf);
                 emit_pdf_styled_path(
                     ctx,
@@ -761,6 +870,80 @@ fn emit_pdf_object(
                     emit,
                     out,
                 );
+            }
+            NodePayload::BSpline(bs) => {
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&bs.to_bezier_path())
+                } else {
+                    bs.to_bezier_path()
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let world_path = deformed.transformed(&world_xf);
+                emit_pdf_styled_path(
+                    ctx,
+                    &world_path,
+                    &obj.fill,
+                    &obj.outline,
+                    obj.blend_mode,
+                    opacity,
+                    world_xf,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::ArtisticMedia { spine, style } => {
+                let raw = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                let bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(&raw)
+                } else {
+                    raw
+                };
+                let deformed = apply_geometry_effects(&bp, &obj.effects);
+                let world_path = deformed.transformed(&world_xf);
+                emit_pdf_styled_path(
+                    ctx,
+                    &world_path,
+                    &obj.fill,
+                    &obj.outline,
+                    obj.blend_mode,
+                    opacity,
+                    world_xf,
+                    emit,
+                    out,
+                );
+            }
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = ctx.doc.resolve_clone_payload_and_style(obj) {
+                    let bp = match &p {
+                        NodePayload::Path(path) => Some(path.clone()),
+                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                        }
+                        _ => None,
+                    };
+                    if let Some(raw) = bp {
+                        let wp = if let Some(persp) = obj.perspective {
+                            persp.transform_bezier_path(&raw)
+                        } else {
+                            raw
+                        };
+                        let deformed = apply_geometry_effects(&wp, &obj.effects);
+                        let world_path = deformed.transformed(&world_xf);
+                        emit_pdf_styled_path(
+                            ctx,
+                            &world_path,
+                            &f,
+                            &o,
+                            obj.blend_mode,
+                            opacity,
+                            world_xf,
+                            emit,
+                            out,
+                        );
+                    }
+                }
             }
             NodePayload::ArtisticText(text) => {
                 emit_pdf_artistic_text(
@@ -950,8 +1133,13 @@ fn emit_pdf_object(
                 contents,
                 ..
             } => {
+                let container_bp = if let Some(persp) = obj.perspective {
+                    persp.transform_bezier_path(container)
+                } else {
+                    (**container).clone()
+                };
                 let clip_path =
-                    apply_geometry_effects(container, &obj.effects).transformed(&world_xf);
+                    apply_geometry_effects(&container_bp, &obj.effects).transformed(&world_xf);
                 if obj.fill.is_visible() {
                     emit_pdf_styled_path(
                         ctx,
