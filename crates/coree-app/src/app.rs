@@ -215,7 +215,9 @@ pub fn run_desktop_gui_with_options(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!(
-                "{DISPLAY_NAME} — Vector Graphics & Print Production Studio"
+                "{} — {}",
+                crate::i18n::I18nKey::AppTitle.tr_ui(crate::i18n::StudioLanguage::English),
+                crate::i18n::I18nKey::AppSubtitle.tr_ui(crate::i18n::StudioLanguage::English)
             ))
             .with_icon(app_icon)
             .with_inner_size([1440.0, 900.0])
@@ -258,8 +260,8 @@ impl StudioApp {
         crate::i18n::ShellLayoutDirections::from_language(self.ui_language).apply_to_ctx(&ctx);
         let localized_title = format!(
             "{} — {}",
-            crate::i18n::I18nKey::AppTitle.tr(self.ui_language),
-            crate::i18n::I18nKey::AppSubtitle.tr(self.ui_language)
+            crate::i18n::I18nKey::AppTitle.tr_ui(self.ui_language),
+            crate::i18n::I18nKey::AppSubtitle.tr_ui(self.ui_language)
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(localized_title));
 

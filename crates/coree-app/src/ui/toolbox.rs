@@ -152,33 +152,30 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 let dbl_hint = match primary_tool {
                                     ToolId::Pick => format!(
                                         "\n{}: {}",
-                                        crate::i18n::I18nKey::ToolPick.tr(app.ui_language),
-                                        crate::i18n::I18nKey::EditSelectAll.tr(app.ui_language)
+                                        crate::i18n::I18nKey::ToolPick.tr_ui(app.ui_language),
+                                        crate::i18n::I18nKey::EditSelectAll.tr_ui(app.ui_language)
                                     ),
                                     ToolId::Rectangle => format!(
-                                        "\n{}: Page Frame",
-                                        crate::i18n::I18nKey::ToolRectangle.tr(app.ui_language)
+                                        "\n{}: {}",
+                                        crate::i18n::I18nKey::ToolRectangle.tr_ui(app.ui_language),
+                                        crate::i18n::I18nKey::ToolboxPageFrame
+                                            .tr_ui(app.ui_language)
                                     ),
                                     _ => String::new(),
                                 };
-                                let tip = if sc.is_empty() {
+                                let flyout_hint = if has_flyout {
                                     format!(
-                                        "{tool_name}{}{dbl_hint}",
-                                        if has_flyout {
-                                            "\nRight-click or click corner triangle for flyout"
-                                        } else {
-                                            ""
-                                        }
+                                        "\n{}",
+                                        crate::i18n::I18nKey::ToolboxFlyoutHint
+                                            .tr_ui(app.ui_language)
                                     )
                                 } else {
-                                    format!(
-                                        "{tool_name} [{sc}]{}{dbl_hint}",
-                                        if has_flyout {
-                                            "\nRight-click or click corner triangle for flyout"
-                                        } else {
-                                            ""
-                                        }
-                                    )
+                                    String::new()
+                                };
+                                let tip = if sc.is_empty() {
+                                    format!("{tool_name}{flyout_hint}{dbl_hint}")
+                                } else {
+                                    format!("{tool_name} [{sc}]{flyout_hint}{dbl_hint}")
                                 };
                                 let resp = resp.on_hover_text(tip);
 

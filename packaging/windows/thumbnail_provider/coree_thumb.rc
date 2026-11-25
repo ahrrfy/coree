@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,3,1,0
+ PRODUCTVERSION 0,3,1,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "coree Contributors"
+            VALUE "FileDescription",  "coree Windows Explorer Thumbnail Provider"
+            VALUE "FileVersion",      "0.3.1.0"
+            VALUE "InternalName",     "coree_thumb.dll"
+            VALUE "LegalCopyright",   "Dual-licensed under MIT OR Apache-2.0"
+            VALUE "OriginalFilename", "coree_thumb.dll"
+            VALUE "ProductName",      "coree"
+            VALUE "ProductVersion",   "0.3.1"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -8,6 +8,9 @@
   <?ifndef ComPath?>
     <?define ComPath = "target\release\coree.com"?>
   <?endif?>
+  <?ifndef ThumbDllPath?>
+    <?define ThumbDllPath = "target\release\coree_thumb.dll"?>
+  <?endif?>
   <?ifndef IconPath?>
     <?define IconPath = "packaging\windows\coree.ico"?>
   <?endif?>
@@ -189,6 +192,38 @@
 
       <Component Id="CoreeNotice" Guid="A69DAE34-B217-4F3C-D950-3C84E6BAF724">
         <File Id="NoticeFile" Source="$(var.RepoRoot)\NOTICE" KeyPath="yes" />
+      </Component>
+
+      <Component Id="CoreeThumbnailProvider" Guid="B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F">
+        <File Id="CoreeThumbDll" Source="$(var.ThumbDllPath)" KeyPath="yes" />
+        <RegistryKey Root="HKLM" Key="Software\Classes\CLSID\{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}">
+          <RegistryValue Type="string" Value="coree Thumbnail Provider" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\CLSID\{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}\InprocServer32">
+          <RegistryValue Type="string" Value="[INSTALLFOLDER]coree_thumb.dll" />
+          <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved">
+          <RegistryValue Name="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" Type="string" Value="coree Thumbnail Provider" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\coree.Document\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.coree\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cdr\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cdt\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cmx\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.cpt\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+          <RegistryValue Type="string" Value="{B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}" />
+        </RegistryKey>
       </Component>
     </ComponentGroup>
 

@@ -22,40 +22,12 @@ use egui::{
     Shape, Stroke, StrokeKind, Ui,
 };
 
-const PAGE_PRESETS: [(&str, f64, f64); 6] = [
-    ("A4", 210.0, 297.0),
-    ("A3", 297.0, 420.0),
-    ("Letter", 215.9, 279.4),
-    ("A5", 148.0, 210.0),
-    ("100×100", 100.0, 100.0),
-    ("Laser 300×200", 300.0, 200.0),
-];
-
-const COMMON_FONTS: [&str; 8] = [
-    "Noto Sans",
-    "Noto Sans Arabic",
-    "Noto Naskh Arabic",
-    "DejaVu Sans",
-    "DejaVu Serif",
-    "Liberation Sans",
-    "Arial",
-    "Tahoma",
-];
-
-#[derive(Clone, Copy)]
-enum StdIcon {
-    NewDoc,
-    OpenDoc,
-    SaveDoc,
-    ImportDoc,
-    ExportDoc,
-    Undo,
-    Redo,
-    Cut,
-    Copy,
-    Paste,
-    PreviewF9,
-}
+mod icons;
+mod page_defaults;
+#[cfg(test)]
+mod tests;
+mod tool_bars;
+use icons::*;
 
 /// Renders both the Standard Toolbar (Row 1) and the Context-Sensitive Property Bar (Row 2).
 pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
@@ -210,15 +182,30 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                 .selected_text(format!("{zoom_pct:.0}%"))
                                 .show_ui(ui, |ui| {
                                     if ui
-                                        .selectable_label(false, "To Selected (Shift+F2)")
+                                        .selectable_label(
+                                            false,
+                                            I18nKey::TbZoomToSelectedShort.tr_ui(lang),
+                                        )
                                         .clicked()
                                     {
                                         app.handle_shortcut(ShortcutAction::ZoomToSelected);
                                     }
-                                    if ui.selectable_label(false, "To Page (Shift+F4)").clicked() {
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            I18nKey::TbZoomToPageShort.tr_ui(lang),
+                                        )
+                                        .clicked()
+                                    {
                                         app.handle_shortcut(ShortcutAction::ZoomToPage);
                                     }
-                                    if ui.selectable_label(false, "To All (F4)").clicked() {
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            I18nKey::TbZoomToAllShort.tr_ui(lang),
+                                        )
+                                        .clicked()
+                                    {
                                         app.handle_shortcut(ShortcutAction::ZoomToAll);
                                     }
                                     ui.separator();
@@ -365,36 +352,36 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     |ui| {
                                         ui.checkbox(
                                             &mut tab.snap_options.nodes,
-                                            I18nKey::ViewSnapNodes.tr(lang),
+                                            I18nKey::ViewSnapNodes.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.page_edges,
-                                            I18nKey::ViewSnapPageEdges.tr(lang),
+                                            I18nKey::ViewSnapPageEdges.tr_ui(lang),
                                         );
                                         ui.separator();
                                         ui.checkbox(
                                             &mut tab.snap_options.tangent,
-                                            I18nKey::ViewSnapTangent.tr(lang),
+                                            I18nKey::ViewSnapTangent.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.perpendicular,
-                                            I18nKey::ViewSnapPerpendicular.tr(lang),
+                                            I18nKey::ViewSnapPerpendicular.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.quadrant,
-                                            I18nKey::ViewSnapQuadrant.tr(lang),
+                                            I18nKey::ViewSnapQuadrant.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.intersection,
-                                            I18nKey::ViewSnapIntersection.tr(lang),
+                                            I18nKey::ViewSnapIntersection.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.baseline,
-                                            I18nKey::ViewSnapBaseline.tr(lang),
+                                            I18nKey::ViewSnapBaseline.tr_ui(lang),
                                         );
                                         ui.checkbox(
                                             &mut tab.snap_options.dynamic_guides,
-                                            I18nKey::ViewDynamicGuides.tr(lang),
+                                            I18nKey::ViewDynamicGuides.tr_ui(lang),
                                         );
                                     },
                                 );
@@ -459,7 +446,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         if ui
                             .selectable_label(
                                 app.show_laser_toolpath_overlay,
-                                RichText::new("⚡ Laser Preview").color(
+                                RichText::new(I18nKey::TbLaserPreview.tr_ui(lang)).color(
                                     if app.show_laser_toolpath_overlay {
                                         tokens.accent_secondary
                                     } else {
@@ -467,7 +454,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     },
                                 ),
                             )
-                            .on_hover_text("Compute & Toggle Live Laser Toolpath Overlay")
+                            .on_hover_text(I18nKey::TbLaserPreviewTip.tr_ui(lang))
                             .clicked()
                         {
                             if app.show_laser_toolpath_overlay {
@@ -477,21 +464,21 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             }
                         }
                         for (plugin_id, short_lbl, tip) in [
-                            ("lightburn-bridge", "LightBurn", "Send artwork to LightBurn"),
+                            (
+                                "lightburn-bridge",
+                                "LightBurn",
+                                I18nKey::MenuSendLightBurn.tr_ui(lang),
+                            ),
                             (
                                 "rdworks-ruida",
                                 "RDWorks",
-                                "Send DXF R12 to RDWorks (Ruida)",
+                                I18nKey::MenuSendRdWorks.tr_ui(lang),
                             ),
-                            (
-                                "ezcad-fiber",
-                                "EZCad",
-                                "Send Hatched DXF R12 to EZCad (Fiber)",
-                            ),
+                            ("ezcad-fiber", "EZCad", I18nKey::MenuSendEzCad.tr_ui(lang)),
                             (
                                 "vinyl-plotter-hpgl",
                                 "Plotter",
-                                "Send HPGL PLT to Vinyl Plotter",
+                                I18nKey::MenuSendVinylPlotter.tr_ui(lang),
                             ),
                         ] {
                             if ui.small_button(short_lbl).on_hover_text(tip).clicked() {
@@ -504,11 +491,11 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         // One-Click CutContour & Macro Record
                         if ui
                             .button(
-                                RichText::new("✂ CutContour")
+                                RichText::new(I18nKey::TbCutContourBtn.tr_ui(lang))
                                     .size(11.0)
                                     .color(tokens.cutcontour),
                             )
-                            .on_hover_text("One-click welded CutContour spot hairline")
+                            .on_hover_text(I18nKey::TbCutContourTip.tr_ui(lang))
                             .clicked()
                         {
                             app.generate_cut_contour_active();
@@ -530,7 +517,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             }
                         } else if ui
                             .small_button(format!("● {}", I18nKey::ToolsRecordMacro.tr_ui(lang)))
-                            .on_hover_text("Record actions to Rhai script")
+                            .on_hover_text(I18nKey::TbRecordMacroTip.tr_ui(lang))
                             .clicked()
                         {
                             app.start_macro_recording();
@@ -562,15 +549,16 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
 
 fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let lang = app.ui_language;
 
     // 1. Dedicated Tool Property Bars (takes priority regardless of selection count)
     match app.active_tool {
         ToolId::ShapeNode => {
-            show_shape_node_property_bar(ui, app, &tokens);
+            tool_bars::show_shape_node_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::Smooth | ToolId::Smear | ToolId::Twirl | ToolId::AttractRepel | ToolId::Roughen => {
-            show_sculpt_property_bar(ui, app, &tokens);
+            tool_bars::show_sculpt_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::BitmapBrush
@@ -578,11 +566,11 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
         | ToolId::CloneStamp
         | ToolId::Smudge
         | ToolId::MaskSelect => {
-            show_raster_property_bar(ui, app, &tokens);
+            tool_bars::show_raster_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::LensTool => {
-            show_lens_property_bar(ui, app, &tokens);
+            tool_bars::show_lens_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::DropShadow
@@ -593,41 +581,48 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
         | ToolId::Envelope
         | ToolId::Extrude25D
         | ToolId::Transparency => {
-            show_interactive_effect_property_bar(ui, app, &tokens);
+            tool_bars::show_interactive_effect_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::InteractiveFill | ToolId::MeshFill | ToolId::SmartFill => {
-            show_fill_tool_property_bar(ui, app, &tokens);
+            tool_bars::show_fill_tool_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::ColorEyedropper | ToolId::AttributesEyedropper => {
-            show_eyedropper_property_bar(ui, app, &tokens);
+            tool_bars::show_eyedropper_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::Crop | ToolId::Knife | ToolId::VirtualSegmentDelete | ToolId::Eraser => {
-            show_crop_cut_property_bar(ui, app, &tokens);
+            tool_bars::show_crop_cut_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::Zoom | ToolId::Pan => {
-            show_zoom_pan_property_bar(ui, app, &tokens);
+            tool_bars::show_zoom_pan_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::ArtisticText | ToolId::ParagraphText => {
-            show_text_property_bar(ui, app, &tokens);
+            tool_bars::show_text_property_bar(ui, app, &tokens);
             return;
         }
         ToolId::TwoPointLine => {
-            ui.label(RichText::new("2-Point Line:").color(tokens.accent).strong());
+            ui.label(
+                RichText::new(I18nKey::TbTwoPointLineTitle.tr_ui(lang))
+                    .color(tokens.accent)
+                    .strong(),
+            );
             ui.add(
                 DragValue::new(&mut app.default_outline.width_mm)
                     .range(0.0..=50.0)
                     .speed(0.1)
-                    .prefix("Width: ")
+                    .prefix(I18nKey::PropWidth.tr_ui(lang))
                     .suffix(" mm"),
             );
-            ui.checkbox(&mut app.default_outline.is_hairline, "Hairline");
+            ui.checkbox(
+                &mut app.default_outline.is_hairline,
+                I18nKey::PropOutlineHairline.tr_ui(lang),
+            );
             ui.label(
-                RichText::new("Hold Ctrl: 15° snap · Drag to draw straight segment")
+                RichText::new(I18nKey::TbTwoPointLineHint.tr_ui(lang))
                     .size(11.0)
                     .color(tokens.text_muted),
             );
@@ -635,12 +630,15 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
         }
         ToolId::FreeTransform => {
             ui.label(
-                RichText::new("Free Transform:")
+                RichText::new(I18nKey::TbFreeTransformTitle.tr_ui(lang))
                     .color(tokens.accent)
                     .strong(),
             );
-            ui.checkbox(&mut app.treat_all_objects_as_filled, "Treat All Filled");
-            if ui.small_button("Mirror X").clicked() {
+            ui.checkbox(
+                &mut app.treat_all_objects_as_filled,
+                I18nKey::TbTreatAllFilled.tr_ui(lang),
+            );
+            if ui.small_button(I18nKey::PropMirrorH.tr_ui(lang)).clicked() {
                 if let Some((ids, center)) = app.active_tab().map(|t| {
                     let c = t
                         .selection
@@ -656,7 +654,7 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
                     }
                 }
             }
-            if ui.small_button("Mirror Y").clicked() {
+            if ui.small_button(I18nKey::PropMirrorV.tr_ui(lang)).clicked() {
                 if let Some((ids, center)) = app.active_tab().map(|t| {
                     let c = t
                         .selection
@@ -683,14 +681,17 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
         {
             ui.label(
                 RichText::new(if app.active_tool == ToolId::FreehandPick {
-                    "Freehand Pick:"
+                    I18nKey::TbFreehandPickTitle.tr_ui(lang)
                 } else {
-                    "Pick Tool:"
+                    I18nKey::TbPickToolTitle.tr_ui(lang)
                 })
                 .color(tokens.accent)
                 .strong(),
             );
-            ui.checkbox(&mut app.treat_all_objects_as_filled, "Treat All Filled");
+            ui.checkbox(
+                &mut app.treat_all_objects_as_filled,
+                I18nKey::TbTreatAllFilled.tr_ui(lang),
+            );
             ui.separator();
         }
         _ => {}
@@ -703,7 +704,7 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
 
     // 2. Pick / Drawing Tools with 0 Objects Selected -> Document / Page Defaults Bar
     if sel_ids.is_empty() {
-        show_page_defaults_property_bar(ui, app, &tokens);
+        page_defaults::show_page_defaults_property_bar(ui, app, &tokens);
         return;
     }
 
@@ -715,1658 +716,20 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
 // F10 Shape / Node Editing Property Bar (all 11 ShapeNode operations)
 // -----------------------------------------------------------------------------
 
-fn show_shape_node_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(RichText::new("Shape (F10):").color(tokens.accent).strong());
-    let selected_nodes = app
-        .active_tab()
-        .map_or(0, |t| t.selection.node_selection.nodes.len());
-    ui.label(
-        RichText::new(format!("{selected_nodes} node(s)"))
-            .size(11.0)
-            .color(tokens.text_muted),
-    );
-    ui.separator();
-
-    if ui
-        .small_button("+ Add")
-        .on_hover_text("Add Node(s) at Midpoint")
-        .clicked()
-    {
-        app.shape_add_node();
-    }
-    if ui
-        .small_button("− Del")
-        .on_hover_text("Delete Selected Node(s)")
-        .clicked()
-    {
-        app.shape_delete_selected_nodes();
-    }
-    if ui
-        .small_button("Join")
-        .on_hover_text("Join Two End Nodes")
-        .clicked()
-    {
-        app.shape_join_nodes();
-    }
-    if ui
-        .small_button("Break")
-        .on_hover_text("Break Curve at Selected Node")
-        .clicked()
-    {
-        app.shape_break_curve();
-    }
-    ui.separator();
-
-    if ui
-        .small_button("To Line")
-        .on_hover_text("Convert Segment to Straight Line")
-        .clicked()
-    {
-        app.shape_convert_to_line();
-    }
-    if ui
-        .small_button("To Curve")
-        .on_hover_text("Convert Segment to Bézier Curve")
-        .clicked()
-    {
-        app.shape_convert_to_curve();
-    }
-    ui.separator();
-
-    if ui
-        .small_button("Cusp")
-        .on_hover_text("Make Node Cusp (Sharp Corner)")
-        .clicked()
-    {
-        app.shape_set_node_smoothness(NodeSmoothness::Cusp);
-    }
-    if ui
-        .small_button("Smooth")
-        .on_hover_text("Make Node Smooth (Collinear Tangents)")
-        .clicked()
-    {
-        app.shape_set_node_smoothness(NodeSmoothness::Smooth);
-    }
-    if ui
-        .small_button("Symm")
-        .on_hover_text("Make Node Symmetrical (Equal Tangents)")
-        .clicked()
-    {
-        app.shape_set_node_smoothness(NodeSmoothness::Symmetrical);
-    }
-    ui.separator();
-
-    if ui
-        .small_button("Reverse")
-        .on_hover_text("Reverse Subpath Direction")
-        .clicked()
-    {
-        app.shape_reverse_subpaths();
-    }
-    if ui
-        .small_button("Close")
-        .on_hover_text("Close Open Curve")
-        .clicked()
-    {
-        app.shape_close_curve();
-    }
-    if ui
-        .small_button("Select All")
-        .on_hover_text("Select All Nodes on Curve")
-        .clicked()
-    {
-        app.shape_select_all_nodes();
-    }
-    ui.separator();
-
-    ui.add(
-        DragValue::new(&mut app.tool_settings.shape_reduce_tolerance_mm)
-            .range(0.05..=5.0)
-            .speed(0.05)
-            .prefix("Tol: ")
-            .suffix(" mm"),
-    );
-    if ui
-        .small_button("Reduce Nodes")
-        .on_hover_text("Simplify curve & reduce redundant nodes")
-        .clicked()
-    {
-        let tol = app.tool_settings.shape_reduce_tolerance_mm;
-        app.shape_reduce_nodes(tol);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Sculpting Tools Property Bar
-// -----------------------------------------------------------------------------
-
-fn show_sculpt_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-    ui.add(
-        DragValue::new(&mut app.tool_settings.sculpt_radius_mm)
-            .range(1.0..=100.0)
-            .speed(0.5)
-            .prefix("Nib: ")
-            .suffix(" mm"),
-    );
-    ui.add(
-        DragValue::new(&mut app.tool_settings.sculpt_strength)
-            .range(0.05..=1.0)
-            .speed(0.02)
-            .prefix("Rate: "),
-    );
-    if app.active_tool == ToolId::AttractRepel {
-        ui.separator();
-        ui.selectable_value(
-            &mut app.tool_settings.sculpt_sub_mode,
-            coree_tools::SculptSubMode::Attract,
-            "Attract",
-        );
-        ui.selectable_value(
-            &mut app.tool_settings.sculpt_sub_mode,
-            coree_tools::SculptSubMode::Repel,
-            "Repel",
-        );
-    }
-    if app.active_tool == ToolId::Roughen {
-        ui.separator();
-        ui.add(
-            DragValue::new(&mut app.effects_state.frequency)
-                .range(0.5..=12.0)
-                .speed(0.2)
-                .prefix("Spikes/Freq: "),
-        );
-    }
-    ui.separator();
-    let hint = match app.active_tool {
-        ToolId::Twirl => "Drag across path edges · Shift reverses spin",
-        ToolId::AttractRepel => match app.tool_settings.sculpt_sub_mode {
-            coree_tools::SculptSubMode::Attract => "Drag to Attract · Hold Shift to Repel",
-            coree_tools::SculptSubMode::Repel => "Drag to Repel · Hold Shift to Attract",
-        },
-        ToolId::Roughen => "Drag along outlines to add serrated detail",
-        _ => "Drag across vector outlines to sculpt live",
-    };
-    ui.label(RichText::new(hint).size(11.0).color(tokens.text_muted));
-}
-
-// -----------------------------------------------------------------------------
-// Integrated Bitmap Studio Property Bar (all 8 RasterBrushOps)
-// -----------------------------------------------------------------------------
-
-fn show_raster_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(RichText::new("Bitmap:").color(tokens.accent).strong());
-
-    ComboBox::from_id_salt("prop_raster_op")
-        .width(126.0)
-        .selected_text(app.tool_settings.raster_op.label())
-        .show_ui(ui, |ui| {
-            for op in RasterBrushOp::ALL {
-                ui.selectable_value(&mut app.tool_settings.raster_op, op, op.label());
-            }
-        });
-
-    ui.add(
-        DragValue::new(&mut app.tool_settings.brush_radius_px)
-            .range(1.0..=200.0)
-            .speed(1.0)
-            .prefix("Size: ")
-            .suffix(" px"),
-    );
-    ui.add(
-        DragValue::new(&mut app.tool_settings.brush_hardness)
-            .range(0.0..=1.0)
-            .speed(0.02)
-            .prefix("Hard: "),
-    );
-    let mut bc = core_color_to_egui(&app.tool_settings.brush_color);
-    if ui.color_edit_button_srgba(&mut bc).changed() {
-        app.tool_settings.brush_color = egui_color_to_core(bc);
-    }
-
-    match app.tool_settings.raster_op {
-        RasterBrushOp::Smudge => {
-            ui.add(
-                DragValue::new(&mut app.tool_settings.smudge_strength)
-                    .range(0.05..=1.0)
-                    .speed(0.02)
-                    .prefix("Strength: "),
-            );
-        }
-        RasterBrushOp::Dodge | RasterBrushOp::Burn => {
-            ui.separator();
-            ui.label("Tone:");
-            for (tone, lbl) in [
-                (ToneRange::Shadows, "Shadows"),
-                (ToneRange::Midtones, "Midtones"),
-                (ToneRange::Highlights, "Highlights"),
-            ] {
-                ui.selectable_value(&mut app.tool_settings.dodge_burn_tone, tone, lbl);
-            }
-            ui.add(
-                DragValue::new(&mut app.tool_settings.dodge_burn_exposure)
-                    .range(0.05..=1.0)
-                    .speed(0.02)
-                    .prefix("Exp: "),
-            );
-        }
-        RasterBrushOp::FloodFill => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.flood_tolerance)
-                    .range(0..=255)
-                    .prefix("Tolerance: "),
-            );
-        }
-        _ => {}
-    }
-
-    ComboBox::from_id_salt("prop_raster_pressure_curve")
-        .width(86.0)
-        .selected_text(pressure_curve_label(&app.tool_settings.pressure_curve_json))
-        .show_ui(ui, |ui| {
-            for (lbl, json) in [
-                ("Linear", "[[0.0,0.0],[1.0,1.0]]"),
-                ("Soft", "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]"),
-                ("Firm", "[[0.0,0.0],[0.5,0.25],[1.0,1.0]]"),
-            ] {
-                ui.selectable_value(
-                    &mut app.tool_settings.pressure_curve_json,
-                    json.to_owned(),
-                    lbl,
-                );
-            }
-        });
-
-    let has_mask = app
-        .active_tab()
-        .is_some_and(|t| t.raster_mask.is_some() || t.raster_mask_rect_mm.is_some());
-    if app.active_tool == ToolId::MaskSelect || has_mask {
-        ui.separator();
-        ComboBox::from_id_salt("prop_mask_mode")
-            .width(100.0)
-            .selected_text(app.tool_settings.mask_mode.label())
-            .show_ui(ui, |ui| {
-                for m in [
-                    RasterMaskMode::Rectangle,
-                    RasterMaskMode::Ellipse,
-                    RasterMaskMode::Lasso,
-                    RasterMaskMode::MagicWand,
-                ] {
-                    ui.selectable_value(&mut app.tool_settings.mask_mode, m, m.label());
-                }
-            });
-        let feather_changed = ui
-            .add(
-                DragValue::new(&mut app.tool_settings.mask_feather_px)
-                    .range(0.0..=32.0)
-                    .speed(0.2)
-                    .prefix("Feather: ")
-                    .suffix("px"),
-            )
-            .changed();
-        if app.tool_settings.mask_mode == RasterMaskMode::MagicWand {
-            ui.add(
-                DragValue::new(&mut app.tool_settings.magic_wand_tolerance)
-                    .range(1.0..=150.0)
-                    .prefix("Tol: "),
-            );
-            ui.checkbox(&mut app.tool_settings.magic_wand_contiguous, "Contig");
-        }
-        let inv_changed = ui
-            .checkbox(&mut app.tool_settings.mask_inverted, "Invert")
-            .changed();
-        if feather_changed || inv_changed {
-            let fpx = app.tool_settings.mask_feather_px.max(0.0);
-            let inv = app.tool_settings.mask_inverted;
-            if let Some(tab) = app.active_tab_mut() {
-                if let Some(ref mut sel) = tab.raster_mask {
-                    sel.feather_px = fpx;
-                    sel.inverted = inv;
-                }
-            }
-        }
-        if let Some(mask) = app.active_tab().and_then(|t| t.raster_mask_rect_mm) {
-            ui.label(
-                RichText::new(format!("Mask: {:.1}×{:.1} mm", mask.width(), mask.height()))
-                    .size(11.0)
-                    .color(tokens.text_muted),
-            );
-        }
-        if has_mask {
-            if ui.small_button("Cutout Lab").clicked() {
-                app.run_cutout_lab_active();
-            }
-            if ui.small_button("Clear Mask").clicked() {
-                if let Some(tab) = app.active_tab_mut() {
-                    tab.raster_mask = None;
-                    tab.raster_mask_rect_mm = None;
-                    tab.tool_core.raster_mask_rect_mm = None;
-                    tab.needs_rerender = true;
-                }
-            }
-        } else {
-            ui.label(
-                RichText::new("Drag or click on canvas to define pixel selection mask")
-                    .size(11.0)
-                    .color(tokens.text_muted),
-            );
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Lens, Interactive Effects, Fill, Eyedropper, Crop/Cut, Zoom/Pan Property Bars
-// -----------------------------------------------------------------------------
-
-fn show_lens_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(RichText::new("Lens:").color(tokens.accent).strong());
-    ComboBox::from_id_salt("prop_lens_kind")
-        .width(136.0)
-        .selected_text(LensDockerState::NAMES[app.lens_state.selected_index])
-        .show_ui(ui, |ui| {
-            for (idx, name) in LensDockerState::NAMES.iter().enumerate() {
-                ui.selectable_value(&mut app.lens_state.selected_index, idx, *name);
-            }
-        });
-    ui.checkbox(&mut app.lens_state.frozen, "Frozen");
-    ui.checkbox(&mut app.lens_state.use_viewpoint, "Viewpoint");
-    ui.checkbox(&mut app.lens_state.remove_face, "Remove Face");
-    if ui.small_button("Apply Lens").clicked() {
-        let cfg = app.lens_state.build_config();
-        app.apply_lens_to_selection(Some(cfg));
-    }
-    if ui.small_button("Remove").clicked() {
-        app.apply_lens_to_selection(None);
-    }
-}
-
-fn show_interactive_effect_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    let idx = match app.active_tool {
-        ToolId::DropShadow => 0,
-        ToolId::BlockShadow => 1,
-        ToolId::Contour => 2,
-        ToolId::Blend => 3,
-        ToolId::Distort => 4,
-        ToolId::Envelope => 5,
-        ToolId::Extrude25D => 6,
-        _ => 7,
-    };
-    app.effects_state.selected_effect_kind = idx;
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-
-    let (copy_target_id, envelope_sources): (
-        Option<coree_core::ObjectId>,
-        Vec<(coree_core::ObjectId, String)>,
-    ) = if app.active_tool == ToolId::Envelope {
-        if let Some(tab) = app.active_tab() {
-            let target = tab.selection.objects.first().copied();
-            let mut srcs = Vec::new();
-            if let Some(page) = tab.document.active_page() {
-                for layer in &page.layers {
-                    for &oid in &layer.objects {
-                        if Some(oid) == target {
-                            continue;
-                        }
-                        if let Some(obj) = tab.document.object(oid) {
-                            if obj
-                                .effects
-                                .iter()
-                                .any(|e| matches!(e, coree_core::Effect::Envelope { .. }))
-                            {
-                                srcs.push((oid, format!("{} (#{})", obj.name, oid.0)));
-                            }
-                        }
-                    }
-                }
-            }
-            (target, srcs)
-        } else {
-            (None, Vec::new())
-        }
-    } else {
-        (None, Vec::new())
-    };
-    let mut copy_envelope_from: Option<coree_core::ObjectId> = None;
-
-    let es = &mut app.effects_state;
-    match app.active_tool {
-        ToolId::DropShadow => {
-            ui.add(
-                DragValue::new(&mut es.dx_mm)
-                    .range(-40.0..=40.0)
-                    .prefix("X: ")
-                    .suffix(" mm"),
-            );
-            ui.add(
-                DragValue::new(&mut es.dy_mm)
-                    .range(-40.0..=40.0)
-                    .prefix("Y: ")
-                    .suffix(" mm"),
-            );
-            ui.add(
-                DragValue::new(&mut es.blur_mm)
-                    .range(0.0..=25.0)
-                    .prefix("Feather: ")
-                    .suffix(" mm"),
-            );
-            ui.add(
-                DragValue::new(&mut es.opacity)
-                    .range(0.0..=1.0)
-                    .speed(0.02)
-                    .prefix("Alpha: "),
-            );
-        }
-        ToolId::BlockShadow => {
-            ui.add(
-                DragValue::new(&mut es.dx_mm)
-                    .range(-50.0..=50.0)
-                    .prefix("Depth X: ")
-                    .suffix(" mm"),
-            );
-            ui.add(
-                DragValue::new(&mut es.dy_mm)
-                    .range(-50.0..=50.0)
-                    .prefix("Depth Y: ")
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::Contour => {
-            ui.selectable_value(&mut es.contour_mode, ContourMode::ToCenter, "Center");
-            ui.selectable_value(&mut es.contour_mode, ContourMode::Inside, "Inside");
-            ui.selectable_value(&mut es.contour_mode, ContourMode::Outside, "Outside");
-            ui.add(
-                DragValue::new(&mut es.steps)
-                    .range(1..=30)
-                    .prefix("Steps: "),
-            );
-            ui.add(
-                DragValue::new(&mut es.offset_mm)
-                    .range(0.2..=25.0)
-                    .prefix("Offset: ")
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::Blend => {
-            ui.add(
-                DragValue::new(&mut es.steps)
-                    .range(1..=60)
-                    .prefix("Blend Steps: "),
-            );
-        }
-        ToolId::Distort => {
-            ui.selectable_value(&mut es.distort_kind, DistortKind::PushPull, "Push/Pull");
-            ui.selectable_value(&mut es.distort_kind, DistortKind::Zipper, "Zipper");
-            ui.selectable_value(&mut es.distort_kind, DistortKind::Twister, "Twister");
-            ui.add(
-                DragValue::new(&mut es.amplitude)
-                    .range(1.0..=100.0)
-                    .prefix("Amp: "),
-            );
-            ui.add(
-                DragValue::new(&mut es.frequency)
-                    .range(0.5..=12.0)
-                    .prefix("Freq: "),
-            );
-        }
-        ToolId::Envelope => {
-            ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::Straight, "Straight");
-            ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::SingleArc, "Single Arc");
-            ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::DoubleArc, "Double Arc");
-            ui.selectable_value(
-                &mut es.envelope_mode,
-                EnvelopeMode::Unconstrained,
-                "Unconstrained",
-            );
-            if copy_target_id.is_some() && !envelope_sources.is_empty() {
-                if es
-                    .copy_envelope_source
-                    .is_none_or(|s| !envelope_sources.iter().any(|(id, _)| *id == s))
-                {
-                    es.copy_envelope_source = envelope_sources.first().map(|(id, _)| *id);
-                }
-                let sel_label = es
-                    .copy_envelope_source
-                    .and_then(|s| {
-                        envelope_sources
-                            .iter()
-                            .find(|(id, _)| *id == s)
-                            .map(|(_, n)| n.as_str())
-                    })
-                    .unwrap_or("Source");
-                ComboBox::from_id_salt("prop_copy_env_src")
-                    .width(120.0)
-                    .selected_text(sel_label)
-                    .show_ui(ui, |ui| {
-                        for (oid, label) in &envelope_sources {
-                            ui.selectable_value(&mut es.copy_envelope_source, Some(*oid), label);
-                        }
-                    });
-                if ui.small_button("Copy Envelope").clicked() {
-                    copy_envelope_from = es.copy_envelope_source;
-                }
-            }
-        }
-        ToolId::Extrude25D => {
-            ui.add(
-                DragValue::new(&mut es.extrude_depth)
-                    .range(2.0..=80.0)
-                    .prefix("Depth: ")
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::Transparency => {
-            ui.add(
-                DragValue::new(&mut es.opacity)
-                    .range(0.0..=1.0)
-                    .speed(0.02)
-                    .prefix("Opacity: "),
-            );
-            ComboBox::from_id_salt("prop_trans_blend")
-                .width(100.0)
-                .selected_text(format!("{:?}", es.blend_mode))
-                .show_ui(ui, |ui| {
-                    for bm in [
-                        BlendMode::Normal,
-                        BlendMode::Multiply,
-                        BlendMode::Screen,
-                        BlendMode::Overlay,
-                        BlendMode::Darken,
-                        BlendMode::Lighten,
-                    ] {
-                        ui.selectable_value(&mut es.blend_mode, bm, format!("{bm:?}"));
-                    }
-                });
-        }
-        _ => {}
-    }
-
-    if let (Some(dst), Some(src)) = (copy_target_id, copy_envelope_from) {
-        app.copy_envelope_from_object(dst, src);
-    }
-
-    if ui.small_button("Apply Effect").clicked() {
-        let eff = app.build_selected_effect();
-        app.add_effect_to_selection(eff);
-    }
-    if ui.small_button("Effects Docker").clicked() {
-        app.focus_docker(DockerTab::Effects);
-    }
-}
-
-fn show_fill_tool_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-    match app.active_tool {
-        ToolId::MeshFill => {
-            ui.add(
-                DragValue::new(&mut app.properties_state.mesh_rows)
-                    .range(2..=8)
-                    .prefix("Rows: "),
-            );
-            ui.add(
-                DragValue::new(&mut app.properties_state.mesh_cols)
-                    .range(2..=8)
-                    .prefix("Cols: "),
-            );
-            if ui.small_button("Apply Mesh Grid").clicked() {
-                let bb = app
-                    .selected_local_bounds()
-                    .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 50.0, 50.0));
-                let fill = StudioApp::build_mesh_fill_for_bounds(
-                    bb,
-                    app.properties_state.mesh_rows,
-                    app.properties_state.mesh_cols,
-                );
-                app.apply_fill(fill);
-            }
-            let selected_mesh_info = app.active_tab().and_then(|tab| {
-                let (oid, n_idx) = tab.selected_mesh_node?;
-                let obj = tab.document.object(oid)?;
-                if let Fill::MeshFill { nodes, .. } = &obj.fill {
-                    nodes
-                        .get(n_idx)
-                        .map(|n| (oid, n_idx, obj.fill.clone(), n.alpha))
-                } else {
-                    None
-                }
-            });
-            if let Some((oid, n_idx, mut mesh_fill, mut node_alpha)) = selected_mesh_info {
-                if ui
-                    .add(
-                        DragValue::new(&mut node_alpha)
-                            .range(0.0..=1.0)
-                            .speed(0.02)
-                            .prefix("Node Alpha: "),
-                    )
-                    .changed()
-                {
-                    if let Fill::MeshFill { ref mut nodes, .. } = mesh_fill {
-                        if let Some(node) = nodes.get_mut(n_idx) {
-                            node.alpha = node_alpha.clamp(0.0, 1.0);
-                        }
-                    }
-                    let _ = app.execute_command(CommandOp::SetFill {
-                        ids: vec![oid],
-                        fill: mesh_fill,
-                    });
-                }
-            }
-        }
-        ToolId::InteractiveFill => {
-            let mut sc = core_color_to_egui(&app.properties_state.grad_start_color);
-            let mut ec = core_color_to_egui(&app.properties_state.grad_end_color);
-            ui.label("Start:");
-            if ui.color_edit_button_srgba(&mut sc).changed() {
-                app.properties_state.grad_start_color = egui_color_to_core(sc);
-            }
-            ui.label("End:");
-            if ui.color_edit_button_srgba(&mut ec).changed() {
-                app.properties_state.grad_end_color = egui_color_to_core(ec);
-            }
-            if ui.small_button("Linear").clicked() {
-                app.apply_fill(Fill::LinearGradient {
-                    start: Point2D::ZERO,
-                    end: Point2D::new(60.0, 40.0),
-                    stops: vec![
-                        GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                        GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                    ],
-                });
-            }
-            if ui.small_button("Radial").clicked() {
-                app.apply_fill(Fill::RadialGradient {
-                    center: Point2D::new(30.0, 30.0),
-                    radius: 40.0,
-                    focal: Point2D::new(30.0, 30.0),
-                    stops: vec![
-                        GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                        GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                    ],
-                });
-            }
-            if ui.small_button("Conical").clicked() {
-                app.apply_fill(Fill::ConicalGradient {
-                    center: Point2D::new(30.0, 30.0),
-                    angle_deg: 0.0,
-                    stops: vec![
-                        GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                        GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                    ],
-                });
-            }
-        }
-        ToolId::SmartFill => {
-            let mut c32 = core_color_to_egui(
-                &app.default_fill
-                    .referenced_colors()
-                    .into_iter()
-                    .next()
-                    .unwrap_or(coree_core::Color::CYAN),
-            );
-            ui.label("Fill Color:");
-            if ui.color_edit_button_srgba(&mut c32).changed() {
-                app.default_fill = Fill::Solid(egui_color_to_core(c32));
-            }
-            ui.label(
-                RichText::new("Click any enclosed region to generate a filled vector shape")
-                    .size(11.0)
-                    .color(tokens.text_muted),
-            );
-        }
-        _ => {}
-    }
-}
-
-fn show_eyedropper_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-    ui.selectable_value(
-        &mut app.tool_settings.eyedropper_apply_mode,
-        false,
-        "1. Sample",
-    );
-    ui.selectable_value(
-        &mut app.tool_settings.eyedropper_apply_mode,
-        true,
-        "2. Apply",
-    );
-    ui.separator();
-    let sample_c = app
-        .default_fill
-        .referenced_colors()
-        .into_iter()
-        .next()
-        .unwrap_or(coree_core::Color::CYAN);
-    let (sw_rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-    ui.painter().rect(
-        sw_rect,
-        CornerRadius::same(2),
-        core_color_to_egui(&sample_c),
-        Stroke::new(1.0, tokens.border_input),
-        StrokeKind::Inside,
-    );
-    ui.label(
-        RichText::new("Hold Shift+Click to re-sample anytime")
-            .size(11.0)
-            .color(tokens.text_muted),
-    );
-}
-
-fn show_crop_cut_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-    match app.active_tool {
-        ToolId::Crop => {
-            if let Some(mut rect) = app.active_tab().and_then(|t| t.pending_crop_rect) {
-                let mut w = rect.width();
-                let mut h = rect.height();
-                let mut changed = false;
-                changed |= ui
-                    .add(DragValue::new(&mut rect.min_x).prefix("X: ").suffix(" mm"))
-                    .changed();
-                changed |= ui
-                    .add(DragValue::new(&mut rect.min_y).prefix("Y: ").suffix(" mm"))
-                    .changed();
-                changed |= ui
-                    .add(
-                        DragValue::new(&mut w)
-                            .range(1.0..=5000.0)
-                            .prefix("W: ")
-                            .suffix(" mm"),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        DragValue::new(&mut h)
-                            .range(1.0..=5000.0)
-                            .prefix("H: ")
-                            .suffix(" mm"),
-                    )
-                    .changed();
-                if changed {
-                    rect.max_x = rect.min_x + w;
-                    rect.max_y = rect.min_y + h;
-                    if let Some(tab) = app.active_tab_mut() {
-                        tab.pending_crop_rect = Some(rect);
-                    }
-                }
-                if ui.small_button("✓ Crop (Enter)").clicked() {
-                    app.confirm_active_tool_action();
-                }
-                if ui.small_button("Cancel").clicked() {
-                    if let Some(tab) = app.active_tab_mut() {
-                        tab.pending_crop_rect = None;
-                    }
-                }
-            } else {
-                ui.label(
-                    RichText::new("Drag a crop region on canvas, then press Enter to crop")
-                        .size(11.0)
-                        .color(tokens.text_muted),
-                );
-            }
-        }
-        ToolId::Eraser => {
-            ui.add(
-                DragValue::new(&mut app.tool_settings.eraser_radius_mm)
-                    .range(0.5..=60.0)
-                    .speed(0.2)
-                    .prefix("Eraser Radius: ")
-                    .suffix(" mm"),
-            );
-        }
-        _ => {
-            ui.label(
-                RichText::new("Drag across curves to slice or delete segments")
-                    .size(11.0)
-                    .color(tokens.text_muted),
-            );
-        }
-    }
-}
-
-fn show_zoom_pan_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(
-        RichText::new(format!("{}:", app.active_tool.label()))
-            .color(tokens.accent)
-            .strong(),
-    );
-    if ui.small_button("Zoom In (+)").clicked() {
-        app.zoom_step(1.25);
-    }
-    if ui.small_button("Zoom Out (−)").clicked() {
-        app.zoom_step(0.8);
-    }
-    if ui.small_button("To Selected (Shift+F2)").clicked() {
-        app.handle_shortcut(ShortcutAction::ZoomToSelected);
-    }
-    if ui.small_button("To All (F4)").clicked() {
-        app.handle_shortcut(ShortcutAction::ZoomToAll);
-    }
-    if ui.small_button("To Page (Shift+F4)").clicked() {
-        app.handle_shortcut(ShortcutAction::ZoomToPage);
-    }
-    if ui.small_button("100%").clicked() {
-        app.handle_shortcut(ShortcutAction::ZoomActual);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Text & Arabic RTL / Kashida Property Bar
-// -----------------------------------------------------------------------------
-
-fn show_text_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    ui.label(RichText::new("Text:").color(tokens.accent).strong());
-
-    let selected_text = app.active_tab().and_then(|t| {
-        let oid = *t.selection.objects.first()?;
-        let obj = t.document.object(oid)?;
-        match &obj.payload {
-            NodePayload::ArtisticText(_) | NodePayload::ParagraphText(_) => {
-                Some((oid, obj.payload.clone()))
-            }
-            _ => None,
-        }
-    });
-
-    if let Some((oid, mut payload)) = selected_text {
-        let mut changed = false;
-        match &mut payload {
-            NodePayload::ArtisticText(art) => {
-                if let Some(run) = art.runs.first_mut() {
-                    changed |= render_text_style_strip(
-                        ui,
-                        &mut run.style,
-                        &mut art.direction,
-                        &mut art.align,
-                        "prop_txt_font",
-                    );
-                }
-            }
-            NodePayload::ParagraphText(para) => {
-                if let Some(run) = para.runs.first_mut() {
-                    changed |= render_text_style_strip(
-                        ui,
-                        &mut run.style,
-                        &mut para.direction,
-                        &mut para.align,
-                        "prop_para_font",
-                    );
-                }
-            }
-            _ => {}
-        }
-        if changed {
-            let _ = app.execute_command(CommandOp::EditText { id: oid, payload });
-        }
-    } else {
-        let mut dir = app.default_text_style.direction;
-        let mut align = app.default_text_style.align;
-        let changed = render_text_style_strip(
-            ui,
-            &mut app.default_text_style,
-            &mut dir,
-            &mut align,
-            "prop_def_font",
-        );
-        if changed {
-            app.default_text_style.direction = dir;
-            app.default_text_style.align = align;
-        }
-        ui.separator();
-        ui.add(
-            egui::TextEdit::singleline(&mut app.tool_settings.text_insert_draft)
-                .hint_text("Draft text...")
-                .desired_width(110.0),
-        );
-    }
-
-    ui.separator();
-    if ui
-        .small_button("Fit to Path")
-        .on_hover_text("Fit Selected Text to Selected Path")
-        .clicked()
-    {
-        app.fit_selected_text_to_path();
-    }
-    if ui
-        .small_button("To Curves")
-        .on_hover_text("Convert Text to Vector Curves (Ctrl+Q)")
-        .clicked()
-    {
-        app.convert_selection_to_curves();
-    }
-    if ui
-        .small_button("¶ Glyphs")
-        .on_hover_text("Open Interactive Glyphs Browser")
-        .clicked()
-    {
-        app.properties_state.active_tab = PropertiesSubTab::Text;
-        app.focus_docker(DockerTab::Properties);
-    }
-}
-
-fn render_text_style_strip(
-    ui: &mut Ui,
-    style: &mut coree_core::TextStyle,
-    direction: &mut TextDirection,
-    align: &mut TextAlign,
-    combo_salt: &str,
-) -> bool {
-    let mut changed = false;
-    ComboBox::from_id_salt(combo_salt)
-        .width(116.0)
-        .selected_text(&style.font_family)
-        .show_ui(ui, |ui| {
-            for f in COMMON_FONTS {
-                if ui.selectable_label(style.font_family == f, f).clicked() {
-                    style.font_family = f.to_owned();
-                    changed = true;
-                }
-            }
-        });
-    changed |= ui
-        .add(
-            DragValue::new(&mut style.font_size_pt)
-                .range(4.0..=400.0)
-                .speed(0.5)
-                .suffix(" pt"),
-        )
-        .changed();
-    if ui
-        .selectable_label(style.bold, RichText::new("B").strong())
-        .clicked()
-    {
-        style.set_weight(if style.bold { 400 } else { 700 });
-        changed = true;
-    }
-    let cur_w = style.effective_weight();
-    ComboBox::from_id_salt((combo_salt, "weight"))
-        .width(64.0)
-        .selected_text(format!("w{cur_w}"))
-        .show_ui(ui, |ui| {
-            for (w, lbl) in [
-                (100, "100 Thin"),
-                (300, "300 Light"),
-                (400, "400 Regular"),
-                (500, "500 Medium"),
-                (600, "600 SemiBold"),
-                (700, "700 Bold"),
-                (800, "800 ExtraBold"),
-                (900, "900 Black"),
-            ] {
-                if ui.selectable_label(cur_w == w, lbl).clicked() {
-                    style.set_weight(w);
-                    changed = true;
-                }
-            }
-        });
-    if ui
-        .selectable_label(style.italic, RichText::new("I").italics())
-        .clicked()
-    {
-        style.italic = !style.italic;
-        changed = true;
-    }
-    if ui
-        .selectable_label(style.underline, RichText::new("U").underline())
-        .clicked()
-    {
-        style.underline = !style.underline;
-        changed = true;
-    }
-    let bidi_cur = style.bidi_font_family.as_deref().unwrap_or("Auto");
-    ComboBox::from_id_salt((combo_salt, "bidi_font"))
-        .width(96.0)
-        .selected_text(format!("RTL:{bidi_cur}"))
-        .show_ui(ui, |ui| {
-            if ui
-                .selectable_label(style.bidi_font_family.is_none(), "Auto (Primary)")
-                .clicked()
-            {
-                style.bidi_font_family = None;
-                changed = true;
-            }
-            for f in [
-                "Noto Sans Arabic",
-                "Noto Naskh Arabic",
-                "Amiri",
-                "Cairo",
-                "Tahoma",
-                "Arial",
-            ] {
-                if ui
-                    .selectable_label(style.bidi_font_family.as_deref() == Some(f), f)
-                    .clicked()
-                {
-                    style.bidi_font_family = Some(f.to_owned());
-                    changed = true;
-                }
-            }
-        });
-    if ui
-        .selectable_label(style.opentype_features.liga, "liga")
-        .on_hover_text("OpenType Standard Ligatures")
-        .clicked()
-    {
-        style.opentype_features.liga = !style.opentype_features.liga;
-        changed = true;
-    }
-    if ui
-        .selectable_label(style.opentype_features.calt, "calt")
-        .on_hover_text("OpenType Contextual Alternates (Arabic contextual joining)")
-        .clicked()
-    {
-        style.opentype_features.calt = !style.opentype_features.calt;
-        changed = true;
-    }
-    if ui
-        .selectable_label(style.opentype_features.kern, "kern")
-        .on_hover_text("OpenType Kerning")
-        .clicked()
-    {
-        style.opentype_features.kern = !style.opentype_features.kern;
-        changed = true;
-    }
-    ui.separator();
-    for (al, lbl) in [
-        (TextAlign::Left, "L"),
-        (TextAlign::Center, "C"),
-        (TextAlign::Right, "R"),
-        (TextAlign::Justify, "J"),
-    ] {
-        if ui.selectable_label(*align == al, lbl).clicked() {
-            *align = al;
-            style.align = al;
-            changed = true;
-        }
-    }
-    ui.separator();
-    let is_rtl = *direction == TextDirection::Rtl;
-    if ui
-        .selectable_label(is_rtl, "RTL")
-        .on_hover_text("Toggle Arabic Right-to-Left Direction")
-        .clicked()
-    {
-        let next = if is_rtl {
-            TextDirection::Ltr
-        } else {
-            TextDirection::Rtl
-        };
-        *direction = next;
-        style.direction = next;
-        changed = true;
-    }
-    let is_kashida = *align == TextAlign::ForceJustifyKashida;
-    if ui
-        .selectable_label(is_kashida, "Kashida")
-        .on_hover_text("Arabic Kashida Justification")
-        .clicked()
-    {
-        let next = if is_kashida {
-            TextAlign::Right
-        } else {
-            TextAlign::ForceJustifyKashida
-        };
-        *align = next;
-        style.align = next;
-        if next == TextAlign::ForceJustifyKashida && style.kashida_stretch < 0.1 {
-            style.kashida_stretch = 0.65;
-        }
-        changed = true;
-    }
-    changed |= ui
-        .add(
-            DragValue::new(&mut style.kashida_stretch)
-                .range(0.0..=2.0)
-                .speed(0.05)
-                .prefix("K: "),
-        )
-        .on_hover_text("Arabic Kashida Stretch (0.0 .. 2.0)")
-        .changed();
-    changed
-}
-
-// -----------------------------------------------------------------------------
-// Document / Page Defaults Property Bar (0 Objects Selected)
-// -----------------------------------------------------------------------------
-
-fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeTokens) {
-    let mut autofit_clicked = false;
-    let mut pending_page_cmd: Option<CommandOp> = None;
-    let mut pending_unit_cmd: Option<CommandOp> = None;
-    {
-        let Some(tab) = app.active_tab_mut() else {
-            return;
-        };
-        if let Some(page) = tab.document.active_page() {
-            let page_id = page.id;
-            let cur_w = page.width_mm;
-            let cur_h = page.height_mm;
-            // Page Preset combo
-            let active_preset_name = PAGE_PRESETS
-                .iter()
-                .find(|(_, pw, ph)| {
-                    ((cur_w - *pw).abs() < 0.5 && (cur_h - *ph).abs() < 0.5)
-                        || ((cur_w - *ph).abs() < 0.5 && (cur_h - *pw).abs() < 0.5)
-                })
-                .map_or("Custom", |(n, _, _)| *n);
-            ComboBox::from_id_salt("prop_page_preset")
-                .width(90.0)
-                .selected_text(active_preset_name)
-                .show_ui(ui, |ui| {
-                    for (name, pw, ph) in PAGE_PRESETS {
-                        if ui
-                            .selectable_label(active_preset_name == name, name)
-                            .clicked()
-                        {
-                            pending_page_cmd = Some(CommandOp::SetPageProperties {
-                                page_id,
-                                name: None,
-                                width_mm: Some(pw),
-                                height_mm: Some(ph),
-                                bleed_mm: None,
-                                facing_pages: None,
-                                background_fill: None,
-                                printable_background: None,
-                            });
-                        }
-                    }
-                });
-
-            let mut w = cur_w;
-            let mut h = cur_h;
-            let w_chg = ui
-                .add(
-                    DragValue::new(&mut w)
-                        .range(5.0..=5000.0)
-                        .suffix(" mm")
-                        .prefix("W: "),
-                )
-                .changed();
-            let h_chg = ui
-                .add(
-                    DragValue::new(&mut h)
-                        .range(5.0..=5000.0)
-                        .suffix(" mm")
-                        .prefix("H: "),
-                )
-                .changed();
-            if w_chg || h_chg {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: Some(w),
-                    height_mm: Some(h),
-                    bleed_mm: None,
-                    facing_pages: None,
-                    background_fill: None,
-                    printable_background: None,
-                });
-            }
-            let is_portrait = cur_h >= cur_w;
-            if ui
-                .selectable_label(is_portrait, "▯")
-                .on_hover_text("Portrait Orientation")
-                .clicked()
-                && !is_portrait
-            {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: Some(cur_h),
-                    height_mm: Some(cur_w),
-                    bleed_mm: None,
-                    facing_pages: None,
-                    background_fill: None,
-                    printable_background: None,
-                });
-            }
-            if ui
-                .selectable_label(!is_portrait, "▭")
-                .on_hover_text("Landscape Orientation")
-                .clicked()
-                && is_portrait
-            {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: Some(cur_h),
-                    height_mm: Some(cur_w),
-                    bleed_mm: None,
-                    facing_pages: None,
-                    background_fill: None,
-                    printable_background: None,
-                });
-            }
-            let mut facing = page.facing_pages;
-            if ui
-                .checkbox(&mut facing, "Facing")
-                .on_hover_text("Toggle Facing Pages / Spreads")
-                .changed()
-            {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: None,
-                    height_mm: None,
-                    bleed_mm: None,
-                    facing_pages: Some(facing),
-                    background_fill: None,
-                    printable_background: None,
-                });
-            }
-            let mut printable_bg = page.printable_background;
-            if ui
-                .checkbox(&mut printable_bg, "Print Bg")
-                .on_hover_text("Include Page Background in Print/PDF/SVG Export")
-                .changed()
-            {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: None,
-                    height_mm: None,
-                    bleed_mm: None,
-                    facing_pages: None,
-                    background_fill: Some(page.background_fill.clone()),
-                    printable_background: Some(printable_bg),
-                });
-            }
-            let mut bg_c = page
-                .background_fill
-                .referenced_colors()
-                .into_iter()
-                .next()
-                .map(|c| core_color_to_egui(&c))
-                .unwrap_or(Color32::WHITE);
-            if ui.color_edit_button_srgba(&mut bg_c).changed() {
-                pending_page_cmd = Some(CommandOp::SetPageProperties {
-                    page_id,
-                    name: None,
-                    width_mm: None,
-                    height_mm: None,
-                    bleed_mm: None,
-                    facing_pages: None,
-                    background_fill: Some(Fill::Solid(egui_color_to_core(bg_c))),
-                    printable_background: None,
-                });
-            }
-        }
-        ui.separator();
-
-        // Units
-        let cur_unit = tab.document.default_unit();
-        let mut next_unit = cur_unit;
-        ComboBox::from_id_salt("prop_unit")
-            .width(58.0)
-            .selected_text(cur_unit.suffix())
-            .show_ui(ui, |ui| {
-                for u in [
-                    Unit::Millimeter,
-                    Unit::Centimeter,
-                    Unit::Meter,
-                    Unit::Inch,
-                    Unit::Point,
-                    Unit::Pixel,
-                ] {
-                    ui.selectable_value(&mut next_unit, u, u.suffix());
-                }
-            });
-        if next_unit != cur_unit {
-            pending_unit_cmd = Some(CommandOp::SetDocumentProperties {
-                title: None,
-                color_mode: None,
-                default_unit: Some(next_unit),
-                dpi: None,
-                multipage_view: None,
-                active_page_index: None,
-                metadata: None,
-                custom_icc_profile: None,
-                clear_custom_icc: false,
-                rgb_icc_profile: None,
-                clear_rgb_icc: false,
-                cmyk_icc_profile: None,
-                clear_cmyk_icc: false,
-                gray_icc_profile: None,
-                clear_gray_icc: false,
-                rendering_intent: None,
-                black_point_compensation: None,
-                drawing_scale: None,
-            });
-        }
-        ui.separator();
-
-        // Nudge & Duplicate Offsets
-        ui.add(
-            DragValue::new(&mut tab.nudge_mm)
-                .range(0.05..=100.0)
-                .speed(0.1)
-                .prefix("Nudge: ")
-                .suffix(" mm"),
-        );
-        ui.add(
-            DragValue::new(&mut tab.duplicate_offset_mm.x)
-                .range(-200.0..=200.0)
-                .prefix("Dup X: ")
-                .suffix(" mm"),
-        );
-        ui.add(
-            DragValue::new(&mut tab.duplicate_offset_mm.y)
-                .range(-200.0..=200.0)
-                .prefix("Dup Y: ")
-                .suffix(" mm"),
-        );
-    }
-    if let Some(cmd) = pending_page_cmd {
-        if let Err(err) = app.execute_command(cmd) {
-            app.push_toast(format!("Page update failed: {err}"), true);
-        } else if let Some(tab) = app.active_tab_mut() {
-            tab.needs_rerender = true;
-        }
-    }
-    if let Some(cmd) = pending_unit_cmd {
-        let _ = app.execute_command(cmd);
-    }
-
-    let lang = app.ui_language;
-    ui.separator();
-    ui.checkbox(
-        &mut app.treat_all_objects_as_filled,
-        lang.tr_ui("Treat as Filled", "معاملة الكائن كممتلئ"),
-    )
-    .on_hover_text(lang.tr_ui(
-        "Select hollow/unfilled shapes by clicking anywhere inside them",
-        "تحديد الأشكال المفرغة عند النقر داخلها",
-    ));
-
-    if ui
-        .small_button(
-            RichText::new(lang.tr_ui("Autofit Page", "ملاءمة الصفحة")).color(tokens.accent),
-        )
-        .on_hover_text(lang.tr_ui(
-            "Resize active page tightly around artwork (+5 mm margin)",
-            "تعديل مقاس الصفحة تلقائياً حول المحتوى (+5 مم)",
-        ))
-        .clicked()
-    {
-        autofit_clicked = true;
-    }
-
-    // Creation-tool parameters when a parametric, curve, dimension, connector, or table tool is active
-    match app.active_tool {
-        ToolId::Rectangle | ToolId::ThreePointRectangle => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.rect_corner_radius_mm)
-                    .range(0.0..=100.0)
-                    .speed(0.2)
-                    .prefix(lang.tr_ui("Corner R: ", "نصف القطر: "))
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::Ellipse | ToolId::ThreePointEllipse => {
-            ui.separator();
-            ui.selectable_value(
-                &mut app.tool_settings.ellipse_mode,
-                EllipseMode::Full,
-                lang.tr_ui("Ellipse", "بيضاوي كامل"),
-            );
-            ui.selectable_value(
-                &mut app.tool_settings.ellipse_mode,
-                EllipseMode::Pie,
-                lang.tr_ui("Pie", "قطاع دائري"),
-            );
-            ui.selectable_value(
-                &mut app.tool_settings.ellipse_mode,
-                EllipseMode::Arc,
-                lang.tr_ui("Arc", "قوس"),
-            );
-        }
-        ToolId::Polygon => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.polygon_sides)
-                    .range(3..=64)
-                    .prefix(lang.tr_ui("Sides: ", "الأضلاع: ")),
-            );
-        }
-        ToolId::Star | ToolId::ComplexStar => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.star_points)
-                    .range(3..=64)
-                    .prefix(lang.tr_ui("Points: ", "النقاط: ")),
-            );
-            ui.add(
-                DragValue::new(&mut app.tool_settings.star_inner_ratio)
-                    .range(0.1..=0.9)
-                    .speed(0.02)
-                    .prefix(lang.tr_ui("Sharpness: ", "الحدة: ")),
-            );
-        }
-        ToolId::Spiral => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.spiral_revolutions)
-                    .range(1.0..=20.0)
-                    .speed(0.5)
-                    .prefix(lang.tr_ui("Revs: ", "اللفات: ")),
-            );
-            ui.checkbox(
-                &mut app.tool_settings.spiral_logarithmic,
-                lang.tr_ui("Logarithmic", "لوغاريتمي"),
-            );
-        }
-        ToolId::Impact => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.impact_rays)
-                    .range(4..=128)
-                    .prefix(lang.tr_ui("Rays: ", "الأشعة: ")),
-            );
-            ui.selectable_value(
-                &mut app.tool_settings.impact_style,
-                ImpactStyle::Radial,
-                lang.tr_ui("Radial", "شعاعي"),
-            );
-            ui.selectable_value(
-                &mut app.tool_settings.impact_style,
-                ImpactStyle::Parallel,
-                lang.tr_ui("Parallel", "متوازي"),
-            );
-        }
-        ToolId::BasicShapes => {
-            ui.separator();
-            ComboBox::from_id_salt("prop_basic_shape")
-                .width(120.0)
-                .selected_text(format!("{:?}", app.tool_settings.basic_shape_kind))
-                .show_ui(ui, |ui| {
-                    for kind in [
-                        BasicShapeKind::ArrowRight,
-                        BasicShapeKind::ArrowLeft,
-                        BasicShapeKind::DoubleArrow,
-                        BasicShapeKind::Banner,
-                        BasicShapeKind::Callout,
-                        BasicShapeKind::Heart,
-                        BasicShapeKind::Cross,
-                        BasicShapeKind::Diamond,
-                        BasicShapeKind::Trapezoid,
-                    ] {
-                        ui.selectable_value(
-                            &mut app.tool_settings.basic_shape_kind,
-                            kind,
-                            format!("{kind:?}"),
-                        );
-                    }
-                });
-        }
-        ToolId::ArtisticMedia => {
-            ui.separator();
-            let width_changed = ui
-                .add(
-                    DragValue::new(&mut app.tool_settings.artistic_media_width_mm)
-                        .range(0.4..=50.0)
-                        .speed(0.2)
-                        .prefix(lang.tr_ui("Brush W: ", "عرض الفرشاة: "))
-                        .suffix(" mm"),
-                )
-                .changed();
-            let mut profile_changed = false;
-            ComboBox::from_id_salt("prop_artistic_profile")
-                .width(110.0)
-                .selected_text(format!("{:?}", app.tool_settings.artistic_media_profile))
-                .show_ui(ui, |ui| {
-                    for prof in [
-                        ArtisticWidthProfile::TaperBoth,
-                        ArtisticWidthProfile::TaperStart,
-                        ArtisticWidthProfile::TaperEnd,
-                        ArtisticWidthProfile::Wave,
-                        ArtisticWidthProfile::Uniform,
-                    ] {
-                        profile_changed |= ui
-                            .selectable_value(
-                                &mut app.tool_settings.artistic_media_profile,
-                                prof.clone(),
-                                format!("{prof:?}"),
-                            )
-                            .changed();
-                    }
-                });
-            if width_changed || profile_changed {
-                let _ = app.edit_selected_artistic_media(
-                    width_changed.then_some(app.tool_settings.artistic_media_width_mm),
-                    profile_changed.then(|| app.tool_settings.artistic_media_profile.clone()),
-                );
-            }
-            ComboBox::from_id_salt("prop_artistic_pressure_curve")
-                .width(86.0)
-                .selected_text(pressure_curve_label(&app.tool_settings.pressure_curve_json))
-                .show_ui(ui, |ui| {
-                    for (lbl, json) in [
-                        ("Linear", "[[0.0,0.0],[1.0,1.0]]"),
-                        ("Soft", "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]"),
-                        ("Firm", "[[0.0,0.0],[0.5,0.25],[1.0,1.0]]"),
-                    ] {
-                        ui.selectable_value(
-                            &mut app.tool_settings.pressure_curve_json,
-                            json.to_owned(),
-                            lbl,
-                        );
-                    }
-                });
-        }
-        ToolId::Freehand
-        | ToolId::BSpline
-        | ToolId::Polyline
-        | ToolId::ThreePointCurve
-        | ToolId::SmartDrawing
-        | ToolId::LiveSketch
-        | ToolId::Bezier
-        | ToolId::Pen => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.shape_reduce_tolerance_mm)
-                    .range(0.05..=8.0)
-                    .speed(0.05)
-                    .prefix(lang.tr_ui("Smoothness: ", "التنعيم: "))
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::ParallelDimension
-        | ToolId::HvDimension
-        | ToolId::AngularDimension
-        | ToolId::SegmentDimension
-        | ToolId::ThreePointCallout => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.dimension_offset_mm)
-                    .range(1.0..=100.0)
-                    .speed(0.5)
-                    .prefix(lang.tr_ui("Offset: ", "إزاحة البعد: "))
-                    .suffix(" mm"),
-            );
-        }
-        ToolId::StraightConnector | ToolId::RightAngleConnector => {
-            ui.separator();
-            ui.label(
-                RichText::new(lang.tr_ui(
-                    "Connector: drag between object anchors to route live link",
-                    "الموصل: اسحب بين نقاط الارتباط لإنشاء ربط تلقائي",
-                ))
-                .size(11.0)
-                .color(tokens.text_muted),
-            );
-        }
-        ToolId::GraphPaper => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.graph_cols)
-                    .range(1..=30)
-                    .prefix(lang.tr_ui("Cols: ", "الأعمدة: ")),
-            );
-            ui.add(
-                DragValue::new(&mut app.tool_settings.graph_rows)
-                    .range(1..=30)
-                    .prefix(lang.tr_ui("Rows: ", "الصفوف: ")),
-            );
-        }
-        ToolId::Table => {
-            ui.separator();
-            ui.add(
-                DragValue::new(&mut app.tool_settings.table_cols)
-                    .range(1..=20)
-                    .prefix(lang.tr_ui("Cols: ", "الأعمدة: ")),
-            );
-            ui.add(
-                DragValue::new(&mut app.tool_settings.table_rows)
-                    .range(1..=20)
-                    .prefix(lang.tr_ui("Rows: ", "الصفوف: ")),
-            );
-        }
-        _ => {}
-    }
-
-    if autofit_clicked {
-        app.autofit_active_page(5.0);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Selected Object(s) Property Bar (9-Point Origin Grid + Transform + Contextual)
-// -----------------------------------------------------------------------------
-
 fn show_selected_objects_property_bar(
     ui: &mut Ui,
     app: &mut StudioApp,
     tokens: &ThemeTokens,
     sel_ids: &[coree_core::ObjectId],
 ) {
+    let lang = app.ui_language;
     let bounds = app
         .active_tab()
         .and_then(|t| t.selection.bounding_box(&t.document));
 
     if let Some(bb) = bounds {
         // Interactive 3x3 9-Point Object Origin Anchor Grid
-        render_nine_point_origin_grid(ui, &mut app.object_origin_anchor, tokens);
+        render_nine_point_origin_grid(ui, &mut app.object_origin_anchor, tokens, lang);
         let anchor_pt = anchor_point_in_rect(bb, app.object_origin_anchor);
 
         let mut x = anchor_pt.x;
@@ -2379,7 +742,7 @@ fn show_selected_objects_property_bar(
             .add(
                 DragValue::new(&mut x)
                     .speed(0.5)
-                    .prefix("X: ")
+                    .prefix(I18nKey::PropPositionX.tr_ui(lang))
                     .suffix(" mm"),
             )
             .changed();
@@ -2387,7 +750,7 @@ fn show_selected_objects_property_bar(
             .add(
                 DragValue::new(&mut y)
                     .speed(0.5)
-                    .prefix("Y: ")
+                    .prefix(I18nKey::PropPositionY.tr_ui(lang))
                     .suffix(" mm"),
             )
             .changed();
@@ -2401,7 +764,7 @@ fn show_selected_objects_property_bar(
                 DragValue::new(&mut w)
                     .range(0.1..=5000.0)
                     .speed(0.5)
-                    .prefix("W: ")
+                    .prefix(I18nKey::PropWidth.tr_ui(lang))
                     .suffix(" mm"),
             )
             .changed();
@@ -2410,13 +773,13 @@ fn show_selected_objects_property_bar(
                 DragValue::new(&mut h)
                     .range(0.1..=5000.0)
                     .speed(0.5)
-                    .prefix("H: ")
+                    .prefix(I18nKey::PropHeight.tr_ui(lang))
                     .suffix(" mm"),
             )
             .changed();
         if let Some(t) = app.active_tab_mut() {
             ui.checkbox(&mut t.lock_aspect, "🔒")
-                .on_hover_text("Lock aspect ratio");
+                .on_hover_text(I18nKey::PropLockAspect.tr_ui(lang));
         }
         if w_chg || h_chg {
             let sx = (w / bb.width().max(1e-4)).clamp(0.01, 100.0);
@@ -2443,7 +806,11 @@ fn show_selected_objects_property_bar(
                     .prefix("↻ ")
                     .suffix("°"),
             )
-            .on_hover_text("Drag to rotate selection around active origin anchor")
+            .on_hover_text(format!(
+                "{}: {}",
+                I18nKey::PropRotation.tr_ui(lang),
+                I18nKey::TbRotateSelectionTip.tr_ui(lang)
+            ))
             .changed()
             && rot_step.abs() > 1e-4
         {
@@ -2452,7 +819,7 @@ fn show_selected_objects_property_bar(
         }
         if ui
             .small_button("90°")
-            .on_hover_text("Rotate +90°")
+            .on_hover_text(I18nKey::TbRotate90Tip.tr_ui(lang))
             .clicked()
         {
             let affine = Affine2D::rotate_about(90.0_f64.to_radians(), anchor_pt);
@@ -2460,7 +827,7 @@ fn show_selected_objects_property_bar(
         }
         if ui
             .small_button("⇄")
-            .on_hover_text("Mirror Horizontally")
+            .on_hover_text(I18nKey::PropMirrorH.tr_ui(lang))
             .clicked()
         {
             let affine = Affine2D::translate(anchor_pt.x, anchor_pt.y)
@@ -2470,7 +837,7 @@ fn show_selected_objects_property_bar(
         }
         if ui
             .small_button("⇅")
-            .on_hover_text("Mirror Vertically")
+            .on_hover_text(I18nKey::PropMirrorV.tr_ui(lang))
             .clicked()
         {
             let affine = Affine2D::translate(anchor_pt.x, anchor_pt.y)
@@ -2484,13 +851,22 @@ fn show_selected_objects_property_bar(
     if sel_ids.len() >= 2 {
         ui.separator();
         for (op, lbl) in [
-            (BooleanOp::Weld, "Weld"),
-            (BooleanOp::Trim, "Trim"),
-            (BooleanOp::Intersect, "Intersect"),
-            (BooleanOp::Simplify, "Simplify"),
-            (BooleanOp::FrontMinusBack, "Front−Back"),
-            (BooleanOp::BackMinusFront, "Back−Front"),
-            (BooleanOp::CreateBoundary, "Boundary"),
+            (BooleanOp::Weld, I18nKey::ObjectWeld.tr_ui(lang)),
+            (BooleanOp::Trim, I18nKey::ObjectTrim.tr_ui(lang)),
+            (BooleanOp::Intersect, I18nKey::ObjectIntersect.tr_ui(lang)),
+            (BooleanOp::Simplify, I18nKey::ObjectSimplify.tr_ui(lang)),
+            (
+                BooleanOp::FrontMinusBack,
+                I18nKey::ObjectFrontMinusBack.tr_ui(lang),
+            ),
+            (
+                BooleanOp::BackMinusFront,
+                I18nKey::ObjectBackMinusFront.tr_ui(lang),
+            ),
+            (
+                BooleanOp::CreateBoundary,
+                I18nKey::ObjectCreateBoundary.tr_ui(lang),
+            ),
         ] {
             if ui.small_button(lbl).clicked() {
                 app.apply_boolean_op(op);
@@ -2498,15 +874,15 @@ fn show_selected_objects_property_bar(
         }
         ui.separator();
         if ui
-            .small_button("Combine")
-            .on_hover_text("Combine Curves (Ctrl+L)")
+            .small_button(I18nKey::ObjectCombine.tr_ui(lang))
+            .on_hover_text(I18nKey::TbCombineTip.tr_ui(lang))
             .clicked()
         {
             app.apply_boolean_op(BooleanOp::Combine);
         }
         if ui
-            .small_button("Group")
-            .on_hover_text("Group Selection (Ctrl+G)")
+            .small_button(I18nKey::ObjectGroup.tr_ui(lang))
+            .on_hover_text(I18nKey::TbGroupTip.tr_ui(lang))
             .clicked()
         {
             app.group_selection();
@@ -2526,7 +902,7 @@ fn show_selected_objects_property_bar(
                     DragValue::new(&mut width)
                         .range(0.0..=50.0)
                         .speed(0.05)
-                        .prefix("Line: ")
+                        .prefix(I18nKey::TbLinePrefix.tr_ui(lang))
                         .suffix(" mm"),
                 )
                 .changed()
@@ -2536,7 +912,10 @@ fn show_selected_objects_property_bar(
                 app.apply_outline(outline.clone());
             }
             if ui
-                .selectable_label(outline.is_hairline, "Hairline")
+                .selectable_label(
+                    outline.is_hairline,
+                    I18nKey::PropOutlineHairline.tr_ui(lang),
+                )
                 .clicked()
             {
                 outline.is_hairline = !outline.is_hairline;
@@ -2562,7 +941,11 @@ fn show_selected_objects_property_bar(
                                     DragValue::new(&mut r)
                                         .range(0.0..=max_r)
                                         .speed(0.2)
-                                        .prefix("R: ")
+                                        .prefix(format!(
+                                            "{} / {}: ",
+                                            I18nKey::PropCornerRadius.tr_ui(lang),
+                                            I18nKey::PropCornerStyle.tr_ui(lang)
+                                        ))
                                         .suffix(" mm"),
                                 )
                                 .changed()
@@ -2584,7 +967,7 @@ fn show_selected_objects_property_bar(
                         }
                         if ui
                             .selectable_label(lock_corners, if lock_corners { "🔒" } else { "🔓" })
-                            .on_hover_text("Lock all 4 corner radii together")
+                            .on_hover_text(I18nKey::TbLockCornersTip.tr_ui(lang))
                             .clicked()
                         {
                             lock_corners = !lock_corners;
@@ -2594,9 +977,9 @@ fn show_selected_objects_property_bar(
                             changed = true;
                         }
                         for (st, lbl) in [
-                            (CornerStyle::Rounded, "Round"),
-                            (CornerStyle::Scalloped, "Scallop"),
-                            (CornerStyle::Chamfered, "Chamfer"),
+                            (CornerStyle::Rounded, I18nKey::TbCornerRound.tr_ui(lang)),
+                            (CornerStyle::Scalloped, I18nKey::TbCornerScallop.tr_ui(lang)),
+                            (CornerStyle::Chamfered, I18nKey::TbCornerChamfer.tr_ui(lang)),
                         ] {
                             if ui.selectable_label(corner_style == st, lbl).clicked() {
                                 corner_style = st;
@@ -2627,9 +1010,9 @@ fn show_selected_objects_property_bar(
                         ui.separator();
                         let mut changed = false;
                         for (m, lbl) in [
-                            (EllipseMode::Full, "Full"),
-                            (EllipseMode::Pie, "Pie"),
-                            (EllipseMode::Arc, "Arc"),
+                            (EllipseMode::Full, I18nKey::TbEllipseFull.tr_ui(lang)),
+                            (EllipseMode::Pie, I18nKey::TbEllipsePie.tr_ui(lang)),
+                            (EllipseMode::Arc, I18nKey::TbEllipseArc.tr_ui(lang)),
                         ] {
                             if ui.selectable_label(mode == m, lbl).clicked() {
                                 mode = m;
@@ -2645,7 +1028,7 @@ fn show_selected_objects_property_bar(
                             .add(
                                 DragValue::new(&mut start_deg)
                                     .range(0.0..=360.0)
-                                    .prefix("Start: ")
+                                    .prefix(I18nKey::PropFillStartLabel.tr_ui(lang))
                                     .suffix("°"),
                             )
                             .changed();
@@ -2653,7 +1036,7 @@ fn show_selected_objects_property_bar(
                             .add(
                                 DragValue::new(&mut end_deg)
                                     .range(0.0..=360.0)
-                                    .prefix("End: ")
+                                    .prefix(I18nKey::PropFillEndLabel.tr_ui(lang))
                                     .suffix("°"),
                             )
                             .changed();
@@ -2678,7 +1061,11 @@ fn show_selected_objects_property_bar(
                     } => {
                         ui.separator();
                         if ui
-                            .add(DragValue::new(&mut sides).range(3..=64).prefix("Sides: "))
+                            .add(
+                                DragValue::new(&mut sides)
+                                    .range(3..=64)
+                                    .prefix(I18nKey::PropPolygonSides.tr_ui(lang)),
+                            )
                             .changed()
                         {
                             app.commit_parametric_shape_edit(
@@ -2700,17 +1087,23 @@ fn show_selected_objects_property_bar(
                     } => {
                         ui.separator();
                         let p_chg = ui
-                            .add(DragValue::new(&mut points).range(3..=64).prefix("Pts: "))
+                            .add(
+                                DragValue::new(&mut points)
+                                    .range(3..=64)
+                                    .prefix(I18nKey::PropStarPoints.tr_ui(lang)),
+                            )
                             .changed();
                         let i_chg = ui
                             .add(
                                 DragValue::new(&mut inner_ratio)
                                     .range(0.1..=0.9)
                                     .speed(0.02)
-                                    .prefix("Sharp: "),
+                                    .prefix(I18nKey::PropStarSharpness.tr_ui(lang)),
                             )
                             .changed();
-                        let c_chg = ui.checkbox(&mut complex, "Complex").changed();
+                        let c_chg = ui
+                            .checkbox(&mut complex, I18nKey::TbStarComplex.tr_ui(lang))
+                            .changed();
                         if p_chg || i_chg || c_chg {
                             app.commit_parametric_shape_edit(
                                 single_id,
@@ -2736,17 +1129,19 @@ fn show_selected_objects_property_bar(
                                 DragValue::new(&mut revolutions)
                                     .range(1.0..=30.0)
                                     .speed(0.2)
-                                    .prefix("Rev: "),
+                                    .prefix(I18nKey::PropSpiralRevolutions.tr_ui(lang)),
                             )
                             .changed();
-                        changed |= ui.checkbox(&mut logarithmic, "Log").changed();
+                        changed |= ui
+                            .checkbox(&mut logarithmic, I18nKey::TbSpiralLogShort.tr_ui(lang))
+                            .changed();
                         if logarithmic {
                             changed |= ui
                                 .add(
                                     DragValue::new(&mut expansion)
                                         .range(1.0..=4.0)
                                         .speed(0.05)
-                                        .prefix("Exp: "),
+                                        .prefix(I18nKey::TbSpiralExpPrefix.tr_ui(lang)),
                                 )
                                 .changed();
                         }
@@ -2771,25 +1166,35 @@ fn show_selected_objects_property_bar(
                     } => {
                         ui.separator();
                         let mut changed = ui
-                            .add(DragValue::new(&mut rays).range(4..=120).prefix("Rays: "))
+                            .add(
+                                DragValue::new(&mut rays)
+                                    .range(4..=120)
+                                    .prefix(I18nKey::PropImpactRays.tr_ui(lang)),
+                            )
                             .changed();
                         changed |= ui
                             .add(
                                 DragValue::new(&mut inner_radius)
                                     .range(1.0..=outer_radius.max(2.0))
                                     .speed(0.5)
-                                    .prefix("Inner: "),
+                                    .prefix(I18nKey::TbImpactInnerPrefix.tr_ui(lang)),
                             )
                             .changed();
                         if ui
-                            .selectable_label(style == ImpactStyle::Radial, "Radial")
+                            .selectable_label(
+                                style == ImpactStyle::Radial,
+                                I18nKey::TbImpactRadial.tr_ui(lang),
+                            )
                             .clicked()
                         {
                             style = ImpactStyle::Radial;
                             changed = true;
                         }
                         if ui
-                            .selectable_label(style == ImpactStyle::Parallel, "Parallel")
+                            .selectable_label(
+                                style == ImpactStyle::Parallel,
+                                I18nKey::TbImpactParallel.tr_ui(lang),
+                            )
                             .clicked()
                         {
                             style = ImpactStyle::Parallel;
@@ -2816,10 +1221,18 @@ fn show_selected_objects_property_bar(
                     } => {
                         ui.separator();
                         let c_chg = ui
-                            .add(DragValue::new(&mut cols).range(1..=50).prefix("Cols: "))
+                            .add(
+                                DragValue::new(&mut cols)
+                                    .range(1..=50)
+                                    .prefix(I18nKey::PropGraphCols.tr_ui(lang)),
+                            )
                             .changed();
                         let r_chg = ui
-                            .add(DragValue::new(&mut rows).range(1..=50).prefix("Rows: "))
+                            .add(
+                                DragValue::new(&mut rows)
+                                    .range(1..=50)
+                                    .prefix(I18nKey::PropGraphRows.tr_ui(lang)),
+                            )
                             .changed();
                         if c_chg || r_chg {
                             app.commit_parametric_shape_edit(
@@ -2889,7 +1302,7 @@ fn show_selected_objects_property_bar(
                             DragValue::new(&mut table.border_style.width_mm)
                                 .range(0.05..=10.0)
                                 .speed(0.05)
-                                .prefix("Grid: ")
+                                .prefix(I18nKey::PropTableBorderWidth.tr_ui(lang))
                                 .suffix(" mm"),
                         )
                         .changed()
@@ -2906,7 +1319,7 @@ fn show_selected_objects_property_bar(
                         .add(
                             DragValue::new(&mut dim.precision)
                                 .range(0..=6)
-                                .prefix("Prec: "),
+                                .prefix(I18nKey::PropDimensionPrecision.tr_ui(lang)),
                         )
                         .changed();
                     changed |= ui
@@ -2914,7 +1327,7 @@ fn show_selected_objects_property_bar(
                             DragValue::new(&mut dim.offset_mm)
                                 .range(0.5..=200.0)
                                 .speed(0.5)
-                                .prefix("Off: ")
+                                .prefix(I18nKey::PropDimensionOffset.tr_ui(lang))
                                 .suffix(" mm"),
                         )
                         .changed();
@@ -2922,14 +1335,18 @@ fn show_selected_objects_property_bar(
                         .add(
                             egui::TextEdit::singleline(&mut dim.prefix)
                                 .desired_width(36.0)
-                                .hint_text("Pfx"),
+                                .hint_text(format!(
+                                    "{}: {}",
+                                    I18nKey::PropDimensionUnit.tr_ui(lang),
+                                    I18nKey::TbDimPfxHint.tr_ui(lang)
+                                )),
                         )
                         .changed();
                     changed |= ui
                         .add(
                             egui::TextEdit::singleline(&mut dim.suffix)
                                 .desired_width(36.0)
-                                .hint_text("Sfx"),
+                                .hint_text(I18nKey::TbDimSfxHint.tr_ui(lang)),
                         )
                         .changed();
                     if changed {
@@ -2970,10 +1387,12 @@ fn show_selected_objects_property_bar(
                         .add(
                             DragValue::new(&mut bs.degree)
                                 .range(1..=max_deg)
-                                .prefix("Deg: "),
+                                .prefix(I18nKey::PropBSplineDegree.tr_ui(lang)),
                         )
                         .changed();
-                    let c_chg = ui.checkbox(&mut bs.closed, "Closed").changed();
+                    let c_chg = ui
+                        .checkbox(&mut bs.closed, I18nKey::PropBSplineClosed.tr_ui(lang))
+                        .changed();
                     if d_chg || c_chg {
                         let rebuilt = coree_core::BSplineCurve::from_control_points(
                             bs.control_points,
@@ -2993,7 +1412,7 @@ fn show_selected_objects_property_bar(
                             DragValue::new(&mut top.offset_mm)
                                 .range(0.0..=5000.0)
                                 .speed(0.5)
-                                .prefix("Offset: ")
+                                .prefix(I18nKey::PropTextOnPathOffset.tr_ui(lang))
                                 .suffix(" mm"),
                         )
                         .changed();
@@ -3002,12 +1421,19 @@ fn show_selected_objects_property_bar(
                             DragValue::new(&mut top.distance_mm)
                                 .range(-100.0..=100.0)
                                 .speed(0.25)
-                                .prefix("Dist: ")
+                                .prefix(I18nKey::PropTextOnPathDistance.tr_ui(lang))
                                 .suffix(" mm"),
                         )
                         .changed();
-                    changed |= ui.checkbox(&mut top.flip_vertical, "Flip V").changed();
-                    changed |= ui.checkbox(&mut top.flip_horizontal, "Flip H").changed();
+                    changed |= ui
+                        .checkbox(&mut top.flip_vertical, I18nKey::TbTextPathFlipV.tr_ui(lang))
+                        .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut top.flip_horizontal,
+                            I18nKey::TbTextPathFlipH.tr_ui(lang),
+                        )
+                        .changed();
                     if changed {
                         let _ = app.execute_command(CommandOp::EditText {
                             id: single_id,
@@ -3026,34 +1452,56 @@ fn show_selected_objects_property_bar(
                             .size(11.0)
                             .color(tokens.accent),
                     );
-                    if ui.small_button("Edit").clicked() {
+                    if ui
+                        .small_button(I18nKey::TbPowerClipEditBtn.tr_ui(lang))
+                        .clicked()
+                    {
                         app.enter_powerclip_edit(single_id);
                     }
-                    if ui.small_button("Fit").clicked() {
+                    if ui
+                        .small_button(I18nKey::ObjPowerClipFit.tr_ui(lang))
+                        .clicked()
+                    {
                         app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
                     }
-                    if ui.small_button("Center").clicked() {
+                    if ui
+                        .small_button(I18nKey::ObjPowerClipCenter.tr_ui(lang))
+                        .clicked()
+                    {
                         app.fit_powerclip_selection(coree_core::PowerClipFitMode::CenterContents);
                     }
-                    if ui.small_button("Stretch").clicked() {
+                    if ui
+                        .small_button(I18nKey::ObjPowerClipStretch.tr_ui(lang))
+                        .clicked()
+                    {
                         app.fit_powerclip_selection(coree_core::PowerClipFitMode::StretchToFill);
                     }
-                    if ui.checkbox(&mut lock_contents, "Lock Contents").changed() {
+                    if ui
+                        .checkbox(
+                            &mut lock_contents,
+                            I18nKey::ObjectPowerClipLockContents.tr_ui(lang),
+                        )
+                        .changed()
+                    {
                         app.set_powerclip_lock_selected(Some(lock_contents));
                     }
-                    if ui.small_button("Extract").clicked() {
+                    if ui
+                        .small_button(I18nKey::TbPowerClipExtractBtn.tr_ui(lang))
+                        .clicked()
+                    {
                         app.extract_selected_powerclip();
                     }
                 }
                 NodePayload::ArtisticText(mut art) => {
                     ui.separator();
                     if let Some(run) = art.runs.first_mut() {
-                        if render_text_style_strip(
+                        if tool_bars::render_text_style_strip(
                             ui,
                             &mut run.style,
                             &mut art.direction,
                             &mut art.align,
                             "prop_sel_art_font",
+                            lang,
                         ) {
                             let _ = app.execute_command(CommandOp::EditText {
                                 id: single_id,
@@ -3065,12 +1513,13 @@ fn show_selected_objects_property_bar(
                 NodePayload::ParagraphText(mut para) => {
                     ui.separator();
                     if let Some(run) = para.runs.first_mut() {
-                        if render_text_style_strip(
+                        if tool_bars::render_text_style_strip(
                             ui,
                             &mut run.style,
                             &mut para.direction,
                             &mut para.align,
                             "prop_sel_para_font",
+                            lang,
                         ) {
                             let _ = app.execute_command(CommandOp::EditText {
                                 id: single_id,
@@ -3093,7 +1542,7 @@ fn show_selected_objects_property_bar(
                             DragValue::new(&mut width_mm)
                                 .range(0.4..=50.0)
                                 .speed(0.2)
-                                .prefix("Brush W: ")
+                                .prefix(I18nKey::DockBmpHeading.tr_ui(lang))
                                 .suffix(" mm"),
                         )
                         .changed();
@@ -3153,8 +1602,8 @@ fn show_selected_objects_property_bar(
                 NodePayload::Clone { .. } => {
                     ui.separator();
                     if ui
-                        .small_button("Unlink Clone")
-                        .on_hover_text("Convert live Clone into an independent editable object")
+                        .small_button(I18nKey::CtxUnlinkClone.tr_ui(lang))
+                        .on_hover_text(I18nKey::TbUnlinkCloneTip.tr_ui(lang))
                         .clicked()
                     {
                         app.unlink_clone_selection();
@@ -3183,36 +1632,36 @@ fn show_selected_objects_property_bar(
     // Always-present classic quick-action strip for selected object(s)
     ui.separator();
     if ui
-        .small_button("To Curves")
-        .on_hover_text("Convert to Curves (Ctrl+Q)")
+        .small_button(I18nKey::TbToCurves.tr_ui(lang))
+        .on_hover_text(I18nKey::TbConvertCurvesTip.tr_ui(lang))
         .clicked()
     {
         app.convert_selection_to_curves();
     }
     if ui
-        .small_button("Break Apart")
-        .on_hover_text("Break Apart Group / PowerClip / Effects / Subpaths (Ctrl+K)")
+        .small_button(I18nKey::TbBreakApartBtn.tr_ui(lang))
+        .on_hover_text(I18nKey::TbBreakApartTip.tr_ui(lang))
         .clicked()
     {
         app.break_apart_selection();
     }
     if ui
-        .small_button("Center (P)")
-        .on_hover_text("Center to Active Page (P)")
+        .small_button(I18nKey::TbCenterPageBtn.tr_ui(lang))
+        .on_hover_text(I18nKey::TbCenterPageTip.tr_ui(lang))
         .clicked()
     {
         app.apply_align(AlignOp::CenterPage);
     }
     if ui
-        .small_button("⬆ Front")
-        .on_hover_text("Order to Front of Layer (Shift+PgUp)")
+        .small_button(I18nKey::TbFrontBtn.tr_ui(lang))
+        .on_hover_text(I18nKey::TbFrontTip.tr_ui(lang))
         .clicked()
     {
         app.apply_z_order(ZOrderOp::BringToFront);
     }
     if ui
-        .small_button("⬇ Back")
-        .on_hover_text("Order to Back of Layer (Shift+PgDn)")
+        .small_button(I18nKey::TbBackBtn.tr_ui(lang))
+        .on_hover_text(I18nKey::TbBackTip.tr_ui(lang))
         .clicked()
     {
         app.apply_z_order(ZOrderOp::SendToBack);
@@ -3223,7 +1672,12 @@ fn show_selected_objects_property_bar(
 // Interactive 3x3 Object Origin Anchor Grid Widget
 // -----------------------------------------------------------------------------
 
-fn render_nine_point_origin_grid(ui: &mut Ui, anchor: &mut (u8, u8), tokens: &ThemeTokens) {
+pub(super) fn render_nine_point_origin_grid(
+    ui: &mut Ui,
+    anchor: &mut (u8, u8),
+    tokens: &ThemeTokens,
+    lang: crate::i18n::StudioLanguage,
+) {
     let (rect, resp) = ui.allocate_exact_size(vec2(21.0, 21.0), Sense::click());
     let painter = ui.painter();
     painter.rect(
@@ -3269,12 +1723,14 @@ fn render_nine_point_origin_grid(ui: &mut Ui, anchor: &mut (u8, u8), tokens: &Th
             *anchor = (col, row);
         }
     }
-    resp.on_hover_text(
-        "Object Origin (9-Point Reference Grid)\nClick any dot to set X/Y, Scale & Rotate reference anchor",
-    );
+    resp.on_hover_text(format!(
+        "{}: {}",
+        I18nKey::PropOriginAnchor.tr_ui(lang),
+        I18nKey::TbOriginAnchorTip.tr_ui(lang)
+    ));
 }
 
-fn anchor_point_in_rect(bb: Rect2D, anchor: (u8, u8)) -> Point2D {
+pub(super) fn anchor_point_in_rect(bb: Rect2D, anchor: (u8, u8)) -> Point2D {
     let fx = f64::from(anchor.0.min(2)) * 0.5;
     let fy = f64::from(anchor.1.min(2)) * 0.5;
     Point2D::new(bb.min_x + bb.width() * fx, bb.min_y + bb.height() * fy)
@@ -3283,344 +1739,3 @@ fn anchor_point_in_rect(bb: Rect2D, anchor: (u8, u8)) -> Point2D {
 // -----------------------------------------------------------------------------
 // Crisp Procedural Vector Toolbar Icon Buttons
 // -----------------------------------------------------------------------------
-
-fn std_icon_btn(
-    ui: &mut Ui,
-    tokens: &ThemeTokens,
-    icon: StdIcon,
-    tooltip: &str,
-    enabled: bool,
-    active: bool,
-) -> bool {
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(vec2(23.0, 22.0), sense);
-    let painter = ui.painter();
-
-    let bg = if active {
-        tokens.accent.gamma_multiply(0.24)
-    } else if enabled && resp.hovered() {
-        tokens.surface_elevated
-    } else {
-        Color32::TRANSPARENT
-    };
-    let border = if active {
-        Stroke::new(1.0, tokens.accent)
-    } else if enabled && resp.hovered() {
-        Stroke::new(1.0, tokens.border_input)
-    } else {
-        Stroke::NONE
-    };
-    painter.rect(rect, CornerRadius::same(3), bg, border, StrokeKind::Inside);
-
-    let color = if !enabled {
-        tokens.text_muted.gamma_multiply(0.45)
-    } else if active {
-        tokens.accent
-    } else {
-        tokens.text
-    };
-    paint_std_icon(painter, rect.shrink(4.0), icon, color);
-
-    let resp = resp.on_hover_text(tooltip);
-    enabled && resp.clicked()
-}
-
-fn paint_std_icon(painter: &egui::Painter, r: Rect, icon: StdIcon, color: Color32) {
-    let s = Stroke::new(1.35, color);
-    let thin = Stroke::new(1.05, color);
-    let c = r.center();
-
-    match icon {
-        StdIcon::NewDoc => {
-            let pts = vec![
-                r.left_top() + vec2(2.0, 0.0),
-                pos2(r.right() - 4.0, r.top()),
-                pos2(r.right() - 1.0, r.top() + 3.5),
-                r.right_bottom() - vec2(1.0, 0.0),
-                r.left_bottom() + vec2(2.0, 0.0),
-            ];
-            painter.add(Shape::closed_line(pts, s));
-        }
-        StdIcon::OpenDoc => {
-            let folder = Rect::from_min_max(pos2(r.left(), r.top() + 3.0), r.right_bottom());
-            painter.rect_stroke(folder, CornerRadius::same(1), s, StrokeKind::Inside);
-            painter.line_segment(
-                [
-                    pos2(r.left() + 1.0, r.top() + 1.5),
-                    pos2(c.x, r.top() + 1.5),
-                ],
-                s,
-            );
-        }
-        StdIcon::SaveDoc => {
-            painter.rect_stroke(r.shrink(0.5), CornerRadius::same(1), s, StrokeKind::Inside);
-            painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(r.left() + 3.0, r.top() + 1.0),
-                    pos2(r.right() - 3.0, c.y),
-                ),
-                CornerRadius::ZERO,
-                color.gamma_multiply(0.35),
-            );
-            painter.rect_stroke(
-                Rect::from_min_max(
-                    pos2(r.left() + 3.5, c.y + 1.5),
-                    pos2(r.right() - 3.5, r.bottom() - 1.0),
-                ),
-                CornerRadius::ZERO,
-                thin,
-                StrokeKind::Inside,
-            );
-        }
-        StdIcon::ImportDoc => {
-            painter.line_segment([pos2(c.x, r.top()), pos2(c.x, r.bottom() - 3.0)], s);
-            painter.line_segment([pos2(c.x - 3.0, c.y), pos2(c.x, r.bottom() - 2.5)], s);
-            painter.line_segment([pos2(c.x + 3.0, c.y), pos2(c.x, r.bottom() - 2.5)], s);
-            painter.line_segment([r.left_bottom(), r.right_bottom()], s);
-        }
-        StdIcon::ExportDoc => {
-            painter.line_segment([pos2(c.x, r.bottom() - 2.0), pos2(c.x, r.top() + 1.0)], s);
-            painter.line_segment([pos2(c.x - 3.0, c.y - 1.0), pos2(c.x, r.top() + 1.0)], s);
-            painter.line_segment([pos2(c.x + 3.0, c.y - 1.0), pos2(c.x, r.top() + 1.0)], s);
-            painter.line_segment([r.left_bottom(), r.right_bottom()], s);
-        }
-        StdIcon::Undo => {
-            let pts = vec![
-                pos2(r.left() + 2.0, c.y - 1.0),
-                pos2(r.right() - 2.0, c.y - 1.0),
-                pos2(r.right() - 1.0, r.bottom() - 2.0),
-            ];
-            painter.add(Shape::line(pts, s));
-            painter.line_segment(
-                [
-                    pos2(r.left() + 5.0, r.top() + 2.0),
-                    pos2(r.left() + 1.5, c.y - 1.0),
-                ],
-                s,
-            );
-            painter.line_segment(
-                [
-                    pos2(r.left() + 5.0, c.y + 2.5),
-                    pos2(r.left() + 1.5, c.y - 1.0),
-                ],
-                s,
-            );
-        }
-        StdIcon::Redo => {
-            let pts = vec![
-                pos2(r.right() - 2.0, c.y - 1.0),
-                pos2(r.left() + 2.0, c.y - 1.0),
-                pos2(r.left() + 1.0, r.bottom() - 2.0),
-            ];
-            painter.add(Shape::line(pts, s));
-            painter.line_segment(
-                [
-                    pos2(r.right() - 5.0, r.top() + 2.0),
-                    pos2(r.right() - 1.5, c.y - 1.0),
-                ],
-                s,
-            );
-            painter.line_segment(
-                [
-                    pos2(r.right() - 5.0, c.y + 2.5),
-                    pos2(r.right() - 1.5, c.y - 1.0),
-                ],
-                s,
-            );
-        }
-        StdIcon::Cut => {
-            painter.line_segment(
-                [
-                    r.left_top() + vec2(2.0, 1.0),
-                    r.right_bottom() - vec2(1.0, 2.0),
-                ],
-                s,
-            );
-            painter.line_segment(
-                [
-                    r.right_top() + vec2(-2.0, 1.0),
-                    r.left_bottom() + vec2(1.0, -2.0),
-                ],
-                s,
-            );
-            painter.circle_stroke(r.left_bottom() + vec2(3.0, -2.5), 2.0, thin);
-            painter.circle_stroke(r.right_bottom() + vec2(-3.0, -2.5), 2.0, thin);
-        }
-        StdIcon::Copy => {
-            let b = Rect::from_min_size(r.left_top(), vec2(r.width() * 0.65, r.height() * 0.72));
-            let f = Rect::from_min_size(
-                r.left_top() + vec2(r.width() * 0.32, r.height() * 0.26),
-                vec2(r.width() * 0.65, r.height() * 0.72),
-            );
-            painter.rect_stroke(b, CornerRadius::same(1), thin, StrokeKind::Inside);
-            painter.rect_stroke(f, CornerRadius::same(1), s, StrokeKind::Inside);
-        }
-        StdIcon::Paste => {
-            let board = Rect::from_min_max(
-                pos2(r.left() + 1.5, r.top() + 2.5),
-                r.right_bottom() - vec2(1.5, 0.0),
-            );
-            painter.rect_stroke(board, CornerRadius::same(1), s, StrokeKind::Inside);
-            painter.rect_filled(
-                Rect::from_center_size(pos2(c.x, r.top() + 2.0), vec2(5.5, 2.5)),
-                CornerRadius::same(1),
-                color,
-            );
-        }
-        StdIcon::PreviewF9 => {
-            painter.rect_stroke(r.shrink(0.5), CornerRadius::same(1), s, StrokeKind::Inside);
-            painter.line_segment(
-                [r.left_top() + vec2(2.5, 2.5), r.left_top() + vec2(5.5, 2.5)],
-                thin,
-            );
-            painter.line_segment(
-                [r.left_top() + vec2(2.5, 2.5), r.left_top() + vec2(2.5, 5.5)],
-                thin,
-            );
-            painter.line_segment(
-                [
-                    r.right_bottom() - vec2(2.5, 2.5),
-                    r.right_bottom() - vec2(5.5, 2.5),
-                ],
-                thin,
-            );
-            painter.line_segment(
-                [
-                    r.right_bottom() - vec2(2.5, 2.5),
-                    r.right_bottom() - vec2(2.5, 5.5),
-                ],
-                thin,
-            );
-        }
-    }
-}
-
-fn pressure_curve_label(json: &str) -> &'static str {
-    if json.contains("0.75") {
-        "Soft"
-    } else if json.contains("0.25") {
-        "Firm"
-    } else if json == "[[0.0,0.0],[1.0,1.0]]" {
-        "Linear"
-    } else {
-        "Custom"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::WorkspacePreset;
-    use crate::theme::StudioTheme;
-    use coree_core::{Color, PostScriptFillPreset};
-    use coree_render::GlyphBlockFilter;
-
-    #[test]
-    fn classic_studio_chrome_renders_all_property_bars_options_laser_glyphs_and_ps_fills() {
-        let ctx = egui::Context::default();
-        let mut app = StudioApp::new_headless();
-        app.new_sample_document();
-        app.fonts_configured = true;
-
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 900.0))),
-            ..egui::RawInput::default()
-        };
-
-        // 1. Exercise all 3 themes + all 6 Workspace Presets + Welcome hub
-        app.show_welcome = true;
-        for theme in StudioTheme::ALL {
-            app.set_theme(theme);
-            let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-            assert!(!out.shapes.is_empty());
-            out.textures_delta.clear();
-        }
-        app.show_welcome = false;
-        for preset in WorkspacePreset::ALL {
-            app.apply_workspace_preset(preset);
-        }
-
-        // 2. Exercise Options (Ctrl+J) across all 4 tabs + Export G-Code dialog
-        app.show_options_dialog = true;
-        app.export_dialog.format_index = crate::ui::dialogs::EXPORT_FMT_GCODE;
-        app.export_dialog.open = true;
-        for tab_idx in 0..4 {
-            app.options_tab = tab_idx;
-            let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-            assert!(!out.shapes.is_empty());
-            out.textures_delta.clear();
-        }
-        app.show_options_dialog = false;
-        app.export_dialog.open = false;
-
-        // 3. Exercise Laser & Plugins Studio docker with live computed toolpath plan
-        app.refresh_laser_plan_preview();
-        app.production_state.sub_section = 5;
-        app.focus_docker(DockerTab::Production);
-        app.active_palette_index = 3; // Laser & Cut Colors
-        app.palette_show_names = true;
-        let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-        assert!(!out.shapes.is_empty());
-        out.textures_delta.clear();
-
-        // 4. Exercise PostScript Procedural Fill + Interactive Glyphs Browser
-        app.apply_fill(PostScriptFillPreset::CrossHatch.to_fill(Color::KEY_BLACK, Color::WHITE, 4));
-        app.properties_state.active_tab = PropertiesSubTab::Fill;
-        app.focus_docker(DockerTab::Properties);
-        let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-        assert!(!out.shapes.is_empty());
-        out.textures_delta.clear();
-
-        app.properties_state.active_tab = PropertiesSubTab::Text;
-        app.glyph_block_filter = GlyphBlockFilter::Arabic;
-        let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-        assert!(!out.shapes.is_empty());
-        out.textures_delta.clear();
-
-        // 5. Exercise contextual Property Bar across key tool modes & 9-point anchor
-        for (col, row) in [(0, 0), (1, 1), (2, 2)] {
-            app.object_origin_anchor = (col, row);
-        }
-        for tool in [
-            ToolId::Pick,
-            ToolId::ShapeNode,
-            ToolId::Smooth,
-            ToolId::Roughen,
-            ToolId::BitmapBrush,
-            ToolId::DropShadow,
-            ToolId::Contour,
-            ToolId::InteractiveFill,
-            ToolId::MeshFill,
-            ToolId::ColorEyedropper,
-            ToolId::Crop,
-            ToolId::Zoom,
-            ToolId::ArtisticText,
-        ] {
-            app.select_tool(tool);
-            if tool == ToolId::BitmapBrush {
-                app.tool_settings.raster_op = RasterBrushOp::Dodge;
-            }
-            let mut out = ctx.run_ui(input.clone(), |ui| app.render_ui(ui));
-            assert!(!out.shapes.is_empty());
-            out.textures_delta.clear();
-        }
-
-        // 6. Exercise Command Palette search for Laser & Workspaces
-        app.command_palette.open = true;
-        app.command_palette.query = "lightburn".to_owned();
-        let mut out = ctx.run_ui(input, |ui| app.render_ui(ui));
-        assert!(!out.shapes.is_empty());
-        out.textures_delta.clear();
-
-        // Verify Laser & Cut Colors palette contains all standard laser colors + CutContour
-        let lpal = crate::ui::palette_bar::laser_and_cut_palette();
-        assert!(lpal.swatches.iter().any(|s| s.name.contains("Laser Cut")));
-        assert!(lpal.swatches.iter().any(|s| s.name == "CutContour"));
-
-        app.shutdown_cleanly();
-    }
-}

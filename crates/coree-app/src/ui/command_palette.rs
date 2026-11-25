@@ -5,6 +5,7 @@
 //! macros, Laser & Plugins bridges, Autofit Page, CMYK Soft-Proofing, Options,
 //! and Studio Workspaces.
 
+use crate::i18n::I18nKey;
 use crate::shortcuts::{shortcut_label, ShortcutAction};
 use crate::state::{DockerTab, PaletteCommand, StudioApp, WorkspacePreset};
 use egui::{Align2, CornerRadius, Frame, Key, Margin, RichText, Stroke};
@@ -81,11 +82,16 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut StudioApp) {
                     app.command_palette.selected_index = 0;
                 }
 
+                let lang = app.ui_language;
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(format!("{} command(s) matching", matches.len()))
-                        .size(11.0)
-                        .color(tokens.text_muted),
+                    RichText::new(format!(
+                        "{} {}",
+                        matches.len(),
+                        I18nKey::CmdMatchingSuffix.tr_ui(lang)
+                    ))
+                    .size(11.0)
+                    .color(tokens.text_muted),
                 );
                 ui.separator();
 
@@ -163,113 +169,114 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut StudioApp) {
 
 fn extra_ui_commands(app: &StudioApp) -> Vec<PaletteCommand> {
     let p = app.shortcut_profile;
+    let lang = app.ui_language;
     let mut extra = vec![
         PaletteCommand {
             id: "ui.laser.studio".into(),
-            title: "Open Laser & Plugins Studio Docker".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdOpenLaserStudio.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.preview".into(),
-            title: "Laser: Compute & Toggle Toolpath Preview Overlay".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserPreview.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.lightburn-bridge".into(),
-            title: "Laser: Send to LightBurn".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendLightBurn.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.rdworks-ruida".into(),
-            title: "Laser: Send to RDWorks (Ruida)".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendRdWorks.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.ezcad-fiber".into(),
-            title: "Laser: Send to EZCad (Fiber)".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendEzCad.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.laserdrw-m2nano".into(),
-            title: "Laser: Send to LaserDRW / M2 Nano".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendLaserDrw.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.lasergrbl-bridge".into(),
-            title: "Laser: Send to LaserGRBL".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendLaserGrbl.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.inkcut-visicut".into(),
-            title: "Laser: Send to InkCut / VisiCut".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendInkCut.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.laser.send.vinyl-plotter-hpgl".into(),
-            title: "Laser: Send to Vinyl Plotter (HPGL)".into(),
-            category: "Laser".into(),
+            title: I18nKey::CmdLaserSendPlotter.tr_ui(lang),
+            category: I18nKey::CmdCatLaser.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.layout.autofit".into(),
-            title: "Autofit Page to Content (5 mm Margin)".into(),
-            category: "Layout".into(),
+            title: I18nKey::CmdLayoutAutofit.tr_ui(lang),
+            category: I18nKey::CmdCatLayout.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.view.soft_proof".into(),
-            title: "Toggle Proof Colors (CMYK Soft Proof)".into(),
-            category: "View".into(),
+            title: I18nKey::CmdViewSoftProof.tr_ui(lang),
+            category: I18nKey::CmdCatView.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.view.gamut_warning".into(),
-            title: "Toggle Gamut Warning Overlay".into(),
-            category: "View".into(),
+            title: I18nKey::CmdViewGamutWarning.tr_ui(lang),
+            category: I18nKey::CmdCatView.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.view.fullscreen".into(),
-            title: "Toggle Full-Screen Preview".into(),
-            category: "View".into(),
+            title: I18nKey::CmdViewFullscreen.tr_ui(lang),
+            category: I18nKey::CmdCatView.tr_ui(lang),
             shortcut: shortcut_label(p, ShortcutAction::ToggleFullScreenPreview).into(),
         },
         PaletteCommand {
             id: "ui.tools.options".into(),
-            title: "Open Studio Options & Preferences...".into(),
-            category: "Tools".into(),
+            title: I18nKey::CmdToolsOptions.tr_ui(lang),
+            category: I18nKey::CmdCatTools.tr_ui(lang),
             shortcut: shortcut_label(p, ShortcutAction::OpenOptions).into(),
         },
         PaletteCommand {
             id: "ui.tools.icc".into(),
-            title: "Color Management (ICC Profiles)...".into(),
-            category: "Tools".into(),
+            title: I18nKey::CmdToolsIcc.tr_ui(lang),
+            category: I18nKey::CmdCatTools.tr_ui(lang),
             shortcut: String::new(),
         },
         PaletteCommand {
             id: "ui.object.edit_fill".into(),
-            title: "Edit Fill Dialog (Uniform, Fountain, Pattern, Mesh)...".into(),
-            category: "Object".into(),
+            title: I18nKey::CmdEditFill.tr_ui(lang),
+            category: I18nKey::CmdCatObject.tr_ui(lang),
             shortcut: shortcut_label(p, ShortcutAction::OpenEditFill).into(),
         },
         PaletteCommand {
             id: "ui.object.outline_pen".into(),
-            title: "Outline Pen Dialog (Width, Arrows, Calligraphy, Behind Fill)...".into(),
-            category: "Object".into(),
+            title: I18nKey::CmdOutlinePen.tr_ui(lang),
+            category: I18nKey::CmdCatObject.tr_ui(lang),
             shortcut: shortcut_label(p, ShortcutAction::FocusOutlinePen).into(),
         },
         PaletteCommand {
             id: "ui.view.toggle_lang".into(),
-            title: "Toggle UI Language (English / العربية)".into(),
-            category: "Window".into(),
+            title: I18nKey::CmdToggleLang.tr_ui(lang),
+            category: I18nKey::CmdCatWindow.tr_ui(lang),
             shortcut: String::new(),
         },
     ];
@@ -277,8 +284,12 @@ fn extra_ui_commands(app: &StudioApp) -> Vec<PaletteCommand> {
     for (idx, preset) in WorkspacePreset::ALL.iter().enumerate() {
         extra.push(PaletteCommand {
             id: format!("ui.workspace.{idx}"),
-            title: format!("Workspace: {}", preset.label()),
-            category: "Workspace".into(),
+            title: format!(
+                "{}: {}",
+                I18nKey::CmdCatWorkspace.tr_ui(lang),
+                crate::i18n::workspace_i18n_key(*preset).tr_ui(lang)
+            ),
+            category: I18nKey::CmdCatWorkspace.tr_ui(lang),
             shortcut: String::new(),
         });
     }

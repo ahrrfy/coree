@@ -19,11 +19,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
     let shell_dir = ShellLayoutDirections::from_language(lang);
 
     egui::CentralPanel::default()
-        .frame(
-            Frame::NONE
-                .fill(tokens.bg)
-                .inner_margin(Margin::same(24)),
-        )
+        .frame(Frame::NONE.fill(tokens.bg).inner_margin(Margin::same(24)))
         .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.set_max_width(1020.0);
@@ -56,7 +52,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                 .color(tokens.accent),
                         );
                     });
-                    ui.with_layout(shell_dir.opposite_horizontal_layout(egui::Align::Center), |ui| {
+                    shell_dir.with_opposite_horizontal(ui, |ui| {
                         if !app.tabs.is_empty()
                             && ui.button(I18nKey::ReturnToCanvas.tr_ui(lang)).clicked()
                         {
@@ -87,11 +83,9 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                 .color(tokens.accent_secondary),
                             );
                             ui.label(
-                                RichText::new(
-                                    "Deterministic snapshots + WAL command logs were preserved locally with SHA-256 verification.",
-                                )
-                                .size(12.0)
-                                .color(tokens.text_muted),
+                                RichText::new(I18nKey::WelcomeRecoveryDesc.tr_ui(lang))
+                                    .size(12.0)
+                                    .color(tokens.text_muted),
                             );
                             ui.add_space(8.0);
                             for sess in &sessions {
@@ -138,7 +132,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                 }
 
                 // Quick Actions Row
-                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Center), |ui| {
+                shell_dir.with_horizontal_wrapped(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     if ui
                         .add(
@@ -197,7 +191,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                         .color(tokens.text_muted),
                 );
                 ui.add_space(6.0);
-                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Min), |ui| {
+                shell_dir.with_horizontal_wrapped_align(ui, egui::Align::Min, |ui| {
                     for preset in WorkspacePreset::ALL {
                         let active = app.active_workspace_preset == preset;
                         Frame::NONE
@@ -256,7 +250,10 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             Some("packaging"),
                             I18nKey::TemplateCategoryPackaging.tr_ui(lang),
                         ),
-                        (Some("digital"), I18nKey::TemplateCategoryDigital.tr_ui(lang)),
+                        (
+                            Some("digital"),
+                            I18nKey::TemplateCategoryDigital.tr_ui(lang),
+                        ),
                         (Some("custom"), I18nKey::TemplateCategoryLaser.tr_ui(lang)),
                     ] {
                         let active = app.template_category_filter.as_deref() == cat;
@@ -264,10 +261,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             app.template_category_filter = cat.map(str::to_owned);
                         }
                     }
-                    if ui
-                        .small_button(I18nKey::OpenDocument.tr_ui(lang))
-                        .clicked()
-                    {
+                    if ui.small_button(I18nKey::OpenDocument.tr_ui(lang)).clicked() {
                         app.open_file_dialog();
                     }
                 });
@@ -282,7 +276,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                     })
                     .cloned()
                     .collect();
-                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Min), |ui| {
+                shell_dir.with_horizontal_wrapped_align(ui, egui::Align::Min, |ui| {
                     for tpl in &visible_templates {
                         Frame::NONE
                             .fill(tokens.surface)
@@ -295,7 +289,8 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                 shell_dir.with_horizontal(ui, |ui| {
                                     ui.label(RichText::new(&tpl.name).strong().color(tokens.text));
                                     if tpl.favorite {
-                                        ui.label(RichText::new("★").color(tokens.accent));
+                                        ui.label(RichText::new("★").color(tokens.accent))
+                                            .on_hover_text(I18nKey::FavoriteTemplate.tr_ui(lang));
                                     }
                                 });
                                 ui.label(
@@ -324,8 +319,20 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             });
                     }
                     let quick_presets = [
-                        ("A3 Poster (CMYK)", 297.0, 420.0, ColorMode::Cmyk, 300.0),
-                        ("Laser & Vinyl Bed", 300.0, 200.0, ColorMode::Rgb, 300.0),
+                        (
+                            I18nKey::WelcomePresetA3Poster.tr_ui(lang),
+                            297.0,
+                            420.0,
+                            ColorMode::Cmyk,
+                            300.0,
+                        ),
+                        (
+                            I18nKey::WelcomePresetLaserBed.tr_ui(lang),
+                            300.0,
+                            200.0,
+                            ColorMode::Rgb,
+                            300.0,
+                        ),
                     ];
                     for (name, w, h, mode, dpi) in quick_presets {
                         Frame::NONE
@@ -335,11 +342,13 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             .inner_margin(Margin::same(12))
                             .show(ui, |ui| {
                                 ui.set_min_width(154.0);
-                                ui.label(RichText::new(name).strong().color(tokens.text));
+                                ui.label(RichText::new(&name).strong().color(tokens.text));
                                 ui.label(
-                                    RichText::new(format!("{w:.0} × {h:.0} mm · {mode:?} {dpi:.0} DPI"))
-                                        .size(11.0)
-                                        .color(tokens.text_muted),
+                                    RichText::new(format!(
+                                        "{w:.0} × {h:.0} mm · {mode:?} {dpi:.0} DPI"
+                                    ))
+                                    .size(11.0)
+                                    .color(tokens.text_muted),
                                 );
                                 ui.add_space(6.0);
                                 if ui
@@ -355,12 +364,19 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                 ui.add_space(20.0);
 
                 // Recent Documents from SQLite
-                ui.label(
-                    RichText::new(I18nKey::RecentDocuments.tr_ui(lang))
-                        .size(15.0)
-                        .strong()
-                        .color(tokens.text),
-                );
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(
+                        RichText::new(I18nKey::RecentDocuments.tr_ui(lang))
+                            .size(15.0)
+                            .strong()
+                            .color(tokens.text),
+                    );
+                    if !app.recent_docs.is_empty()
+                        && ui.small_button(I18nKey::ClearRecents.tr_ui(lang)).clicked()
+                    {
+                        app.clear_recent_docs();
+                    }
+                });
                 ui.add_space(6.0);
                 let recents = app.recent_docs.clone();
                 if recents.is_empty() {
@@ -393,22 +409,17 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                             .size(11.0)
                                             .color(tokens.text_muted),
                                     );
-                                    ui.with_layout(
-                                        shell_dir.opposite_horizontal_layout(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .small_button(
-                                                    I18nKey::WelcomeOpenButton.tr_ui(lang),
-                                                )
-                                                .clicked()
-                                            {
-                                                let pb = PathBuf::from(&rec.file_path);
-                                                if let Err(err) = app.open_file_path(&pb) {
-                                                    app.push_toast(err, true);
-                                                }
+                                    shell_dir.with_opposite_horizontal(ui, |ui| {
+                                        if ui
+                                            .small_button(I18nKey::WelcomeOpenButton.tr_ui(lang))
+                                            .clicked()
+                                        {
+                                            let pb = PathBuf::from(&rec.file_path);
+                                            if let Err(err) = app.open_file_path(&pb) {
+                                                app.push_toast(err, true);
                                             }
-                                        },
-                                    );
+                                        }
+                                    });
                                 });
                             });
                         ui.add_space(4.0);

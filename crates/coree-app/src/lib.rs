@@ -18,6 +18,7 @@ pub mod state;
 pub mod stylus;
 pub mod theme;
 pub mod ui;
+pub mod win_thumbnail;
 
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-app";

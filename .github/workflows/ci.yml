@@ -46,27 +46,39 @@ jobs:
       - name: Brand & MIME allowlist sweep (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: python3 scripts/brand_sweep.py
+        run: |
+          set -euo pipefail
+          SWEEP_PATH="${SWEEP_PY:-/home/ahmed/.gemini/config/plugins/replica-skill/skills/replica-brand/sweep.py}"
+          if [ -f "$SWEEP_PATH" ]; then
+            python3 scripts/brand_sweep.py --require-external-sweep --sweep-script "$SWEEP_PATH"
+          else
+            python3 scripts/brand_sweep.py
+          fi
 
       - name: Brand & MIME allowlist sweep (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/brand_sweep.py
+          $sweepPath = if ($env:SWEEP_PY) { $env:SWEEP_PY } else { "/home/ahmed/.gemini/config/plugins/replica-skill/skills/replica-brand/sweep.py" }
+          if (Test-Path $sweepPath) {
+            python scripts/brand_sweep.py --require-external-sweep --sweep-script "$sweepPath"
+          } else {
+            python scripts/brand_sweep.py
+          }
           if ($LASTEXITCODE -ne 0) { throw "brand_sweep.py failed" }
 
       - name: Verify repository invariants (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: python3 scripts/verify_invariants.py --strict-no-std-net
+        run: python3 scripts/verify_invariants.py --expected-version 0.3.1 --strict-no-std-net
 
       - name: Verify repository invariants (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/verify_invariants.py --strict-no-std-net
+          python scripts/verify_invariants.py --expected-version 0.3.1 --strict-no-std-net
           if ($LASTEXITCODE -ne 0) { throw "verify_invariants.py failed" }
 
       - name: Check & run offline fuzz targets (Linux)
@@ -98,6 +110,12 @@ jobs:
           cargo bench --offline --locked --bench studio_startup_and_drag -- --iters 30
           cargo bench --offline --locked --bench scene10k_and_raster_cow -- --iters 60
 
+      - name: Setup MSVC x64 developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build release binary
         run: cargo build --release --package coree-app --bins
 
@@ -112,8 +130,32 @@ jobs:
           ./target/release/coree-cli --diagnostics | tee /tmp/coree-cli-diag.txt
           grep -q "coree v${EXPECTED_VER}" /tmp/coree-cli-diag.txt
           bash -n packaging/linux/install-linux.sh packaging/linux/build-deb.sh packaging/linux/build-appimage.sh
+          python3 scripts/generate_cargo_sources.py --check
           python3 - <<'PY'
-          import xml.etree.ElementTree as ET
+          import json, tomllib, xml.etree.ElementTree as ET
+          from pathlib import Path
+          lock = tomllib.loads(Path("Cargo.lock").read_text(encoding="utf-8"))
+          ext_pkgs = {
+              (p["name"], p["version"]): p["checksum"]
+              for p in lock["package"]
+              if "source" in p
+          }
+          sources = json.loads(Path("packaging/linux/cargo-sources.json").read_text(encoding="utf-8"))
+          assert isinstance(sources, list) and len(sources) >= len(ext_pkgs) * 2 + 1
+          archives = {
+              (e["dest"].removeprefix("cargo/vendor/"), e["sha256"])
+              for e in sources
+              if e.get("type") == "archive"
+          }
+          assert len(archives) == len(ext_pkgs), f"archive count mismatch: {len(archives)} != {len(ext_pkgs)}"
+          assert any(e.get("dest") == ".cargo" and e.get("dest-filename") == "config.toml" for e in sources)
+
+          flatpak = Path("packaging/linux/flatpak/io.github.ahrrfy.coree.yml").read_text(encoding="utf-8")
+          assert "id: io.github.ahrrfy.coree" in flatpak
+          assert "--share=network" not in flatpak
+          assert "CARGO_NET_OFFLINE: 'true'" in flatpak
+          assert "../cargo-sources.json" in flatpak
+
           for path in (
               "packaging/linux/coree-mime.xml",
               "packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml",
@@ -121,13 +163,32 @@ jobs:
               "packaging/windows/coree.exe.manifest",
           ):
               ET.parse(path)
-          print("All Linux & Windows XML manifests parsed cleanly.")
+          print("All Linux & Windows XML/Flatpak manifests parsed cleanly.")
           PY
           if command -v desktop-file-validate >/dev/null 2>&1; then
             desktop-file-validate packaging/linux/coree.desktop
           fi
+          if command -v appstreamcli >/dev/null 2>&1; then
+            appstreamcli validate --no-net packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml
+          fi
+          rm -rf /tmp/coree-deb-ci
+          ./packaging/linux/build-deb.sh --version "${EXPECTED_VER}" --no-build --out-dir /tmp/coree-deb-ci
+          DEB_PATH="/tmp/coree-deb-ci/coree_${EXPECTED_VER}_amd64.deb"
+          dpkg-deb --info "$DEB_PATH"
+          DEB_CONTENTS="$(dpkg-deb --contents "$DEB_PATH")"
+          for req in \
+            "./usr/bin/coree" \
+            "./usr/share/applications/coree.desktop" \
+            "./usr/share/mime/packages/coree-mime.xml" \
+            "./usr/share/thumbnailers/coree.thumbnailer" \
+            "./usr/share/metainfo/io.github.ahrrfy.coree.metainfo.xml" \
+            "./usr/share/icons/hicolor/scalable/apps/coree.svg" \
+            "./usr/share/doc/coree/copyright"; do
+            echo "$DEB_CONTENTS" | grep -qF "$req" || { echo "Missing in .deb: $req"; exit 1; }
+          done
+          rm -rf /tmp/coree-deb-ci
 
-      - name: Smoke test release binary (Windows)
+      - name: Smoke test release binary, COM DLL & signing AST (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -139,3 +200,15 @@ jobs:
           if (($cliOut -join "`n") -notmatch "coree v$([regex]::Escape($expectedVer))") { throw "coree.com --diagnostics missing coree v$expectedVer" }
           $guiProc = Start-Process -FilePath ".\target\release\coree.exe" -ArgumentList "--diagnostics" -NoNewWindow -Wait -PassThru
           if ($guiProc.ExitCode -ne 0) { throw "coree.exe GUI launcher exited with code $($guiProc.ExitCode)" }
+
+          foreach ($ps1 in @("packaging\windows\sign-windows.ps1", "packaging\windows\thumbnail_provider\build-thumb-dll.ps1")) {
+            $tokens = $null; $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ps1), [ref]$tokens, [ref]$errs) | Out-Null
+            if ($errs.Count -gt 0) { throw "PowerShell syntax error in $ps1: $($errs | Out-String)" }
+          }
+          & .\packaging\windows\thumbnail_provider\build-thumb-dll.ps1 -OutDir "target\release"
+          if (-not (Test-Path "target\release\coree_thumb.dll")) { throw "coree_thumb.dll missing after build" }
+          [xml]$wxs = Get-Content "packaging\windows\wix\main.wxs"
+          if (-not ($wxs.OuterXml -match "e357fccd-a995-4576-b01f-234630154e96")) {
+            throw "main.wxs missing IThumbnailProvider ShellEx registration"
+          }

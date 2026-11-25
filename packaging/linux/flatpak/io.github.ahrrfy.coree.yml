@@ -29,14 +29,16 @@ build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
     CARGO_HOME: /run/build/coree/cargo
+    CARGO_NET_OFFLINE: 'true'
     RUST_BACKTRACE: '1'
 
 modules:
   - name: coree
     buildsystem: simple
     build-commands:
-      - cargo build --release --locked --offline
+      - cargo build --release --frozen --locked --offline --package coree-app --bins
       - install -Dm755 target/release/coree /app/bin/coree
+      - install -Dm755 target/release/coree-cli /app/bin/coree-cli
       - install -Dm644 packaging/linux/coree.desktop /app/share/applications/coree.desktop
       # Rewrite icon names inside the exported MIME XML to the Flatpak App ID so
       # flatpak build-export only exports App-ID-prefixed icons and MIME definitions.
@@ -55,3 +57,4 @@ modules:
     sources:
       - type: dir
         path: ../../..
+      - ../cargo-sources.json

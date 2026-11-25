@@ -72,17 +72,17 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 if ui
                     .small_button(if app.palette_show_names { "»" } else { "«" })
-                    .on_hover_text("Toggle Expanded Swatch Names & Palette Selector")
+                    .on_hover_text(I18nKey::PaletteToggleNamesHint.tr_ui(lang))
                     .clicked()
                 {
                     app.palette_show_names = !app.palette_show_names;
                 }
                 if app.palette_show_names {
-                    let pal_names = collect_palette_names(app);
+                    let pal_names = collect_palette_names(app, lang);
                     let cur = pal_names
                         .get(app.active_palette_index)
                         .cloned()
-                        .unwrap_or_else(|| "Default CMYK".to_owned());
+                        .unwrap_or_else(|| I18nKey::PaletteDefaultCmyk.tr_ui(lang).to_owned());
                     egui::ComboBox::from_id_salt("palette_switcher")
                         .width(126.0)
                         .selected_text(cur)
@@ -98,15 +98,15 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
             if !app.palette_show_names {
                 let total = 4 + app.custom_palettes.len();
                 let (short, active_name) = match app.active_palette_index {
-                    0 => ("C", "Default CMYK"),
-                    1 => ("R", "Default RGB"),
-                    2 => ("D", "Document Palette"),
-                    3 => ("L", "Laser & Cut Colors"),
+                    0 => ("C", I18nKey::PaletteDefaultCmyk.tr_ui(lang)),
+                    1 => ("R", I18nKey::PaletteDefaultRgb.tr_ui(lang)),
+                    2 => ("D", I18nKey::PaletteDocument.tr_ui(lang)),
+                    3 => ("L", I18nKey::PaletteLaserCut.tr_ui(lang)),
                     idx => (
                         "+",
                         app.custom_palettes
                             .get(idx.saturating_sub(4))
-                            .map_or("Custom Palette", |p| p.name.as_str()),
+                            .map_or(I18nKey::PaletteCustom.tr_ui(lang), |p| p.name.clone()),
                     ),
                 };
                 let btn_resp = ui
@@ -121,7 +121,9 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                         )),
                     )
                     .on_hover_text(format!(
-                        "Active Palette: {active_name}\nLeft-click: Cycle (CMYK / RGB / Document / Laser & Cut / Custom)\nRight-click: {}",
+                        "{}: {active_name}\n{} {}",
+                        I18nKey::PaletteActivePrefix.tr_ui(lang),
+                        I18nKey::PaletteCycleHint.tr_ui(lang),
                         I18nKey::PaletteImportButton.tr_ui(lang)
                     ));
                 if btn_resp.clicked() {
@@ -292,7 +294,7 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
 
                         let tip = format!(
                             "{}\n{}",
-                            format_swatch_tooltip(&sw.name, &sw.color),
+                            format_swatch_tooltip(lang, &sw.name, &sw.color),
                             I18nKey::PaletteDragSwatchHint.tr_ui(lang)
                         );
                         let resp = resp.on_hover_text(tip);
@@ -304,19 +306,22 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                         }
                         if resp.dragged() {
                             if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-                                let preview_rect =
-                                    egui::Rect::from_min_size(pointer + vec2(10.0, 10.0), vec2(18.0, 18.0));
-                                ui.ctx().layer_painter(egui::LayerId::new(
-                                    egui::Order::Tooltip,
-                                    egui::Id::unique("drag_swatch_preview"),
-                                ))
-                                .rect(
-                                    preview_rect,
-                                    CornerRadius::same(3),
-                                    c32,
-                                    Stroke::new(1.2, Color32::WHITE),
-                                    StrokeKind::Inside,
+                                let preview_rect = egui::Rect::from_min_size(
+                                    pointer + vec2(10.0, 10.0),
+                                    vec2(18.0, 18.0),
                                 );
+                                ui.ctx()
+                                    .layer_painter(egui::LayerId::new(
+                                        egui::Order::Tooltip,
+                                        egui::Id::unique("drag_swatch_preview"),
+                                    ))
+                                    .rect(
+                                        preview_rect,
+                                        CornerRadius::same(3),
+                                        c32,
+                                        Stroke::new(1.2, Color32::WHITE),
+                                        StrokeKind::Inside,
+                                    );
                             }
                         }
 
@@ -361,7 +366,14 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 });
 
             // Render floating TintGrid popup (5x5 tints & shades around held swatch)
-            show_tint_grid(ui, app, &tokens, shell_dir, &mut apply_fill, &mut apply_outline);
+            show_tint_grid(
+                ui,
+                app,
+                &tokens,
+                shell_dir,
+                &mut apply_fill,
+                &mut apply_outline,
+            );
 
             if let Some(c) = apply_fill {
                 app.apply_fill_color(c);
@@ -453,9 +465,13 @@ fn show_tint_grid(
 }
 
 fn import_palette_dialog(app: &mut StudioApp) {
+    let lang = app.ui_language;
     if let Some(path) = rfd::FileDialog::new()
-        .set_title("Import Color Palette")
-        .add_filter("Color Palettes", &["gpl", "ase", "pal", "acb"])
+        .set_title(I18nKey::PaletteImportTitle.tr_ui(lang))
+        .add_filter(
+            I18nKey::MenuColorPalettes.tr_ui(lang),
+            &["gpl", "ase", "pal", "acb"],
+        )
         .pick_file()
     {
         if let Err(err) = app.import_palette_from_path(&path) {
@@ -464,12 +480,12 @@ fn import_palette_dialog(app: &mut StudioApp) {
     }
 }
 
-fn collect_palette_names(app: &StudioApp) -> Vec<String> {
+fn collect_palette_names(app: &StudioApp, lang: crate::i18n::StudioLanguage) -> Vec<String> {
     let mut names = vec![
-        "Default CMYK".to_owned(),
-        "Default RGB".to_owned(),
-        "Document Palette".to_owned(),
-        "Laser & Cut Colors".to_owned(),
+        I18nKey::PaletteDefaultCmyk.tr_ui(lang).to_owned(),
+        I18nKey::PaletteDefaultRgb.tr_ui(lang).to_owned(),
+        I18nKey::PaletteDocument.tr_ui(lang).to_owned(),
+        I18nKey::PaletteLaserCut.tr_ui(lang).to_owned(),
     ];
     for p in &app.custom_palettes {
         names.push(p.name.clone());
@@ -494,7 +510,7 @@ fn resolve_active_palette(app: &StudioApp) -> ColorPalette {
     }
 }
 
-fn format_swatch_tooltip(name: &str, color: &Color) -> String {
+fn format_swatch_tooltip(lang: crate::i18n::StudioLanguage, name: &str, color: &Color) -> String {
     let [r, g, b, _] = color.to_rgba8();
     let [c, m, y, k] = color.to_cmyk();
     let cmyk_str = format!(
@@ -512,7 +528,10 @@ fn format_swatch_tooltip(name: &str, color: &Color) -> String {
         Color::Cmyk { .. } => format!("{cmyk_str}\n{rgb_str}"),
         _ => format!("{rgb_str}\n{cmyk_str}"),
     };
-    format!("{name}\n{detail}\nLeft-click: Apply Fill · Right-click: Apply Outline")
+    format!(
+        "{name}\n{detail}\n{}",
+        I18nKey::PaletteSwatchActionsHint.tr_ui(lang)
+    )
 }
 
 /// Builds a 5x5 shade/tint grid around `base` for the long-press `TintGrid` popup (`ADD-09`).

@@ -10,6 +10,9 @@ setlocal EnableExtensions
 set "BASE_DIR=%~dp0"
 set "EXE_PATH=%BASE_DIR%coree.exe"
 set "ICO_PATH=%BASE_DIR%coree.ico"
+set "THUMB_DLL=%BASE_DIR%coree_thumb.dll"
+set "THUMB_CLSID={B4E8A7C2-5F19-4D3A-9C6E-1A2B3C4D5E6F}"
+set "THUMB_IID={e357fccd-a995-4576-b01f-234630154e96}"
 
 if /I "%~1"=="/u" goto :unregister
 if /I "%~1"=="--unregister" goto :unregister
@@ -54,6 +57,17 @@ for %%E in (.svg .dxf .plt .pdf .eps .psd) do (
     reg add "HKCU\Software\Classes\Applications\coree.exe\SupportedTypes" /v "%%E" /t REG_SZ /d "" /f >nul
 )
 
+rem Optional Explorer IThumbnailProvider registration when coree_thumb.dll sits beside coree.exe
+if exist "%THUMB_DLL%" (
+    reg add "HKCU\Software\Classes\CLSID\%THUMB_CLSID%" /ve /t REG_SZ /d "coree Thumbnail Provider" /f >nul
+    reg add "HKCU\Software\Classes\CLSID\%THUMB_CLSID%\InprocServer32" /ve /t REG_SZ /d "%THUMB_DLL%" /f >nul
+    reg add "HKCU\Software\Classes\CLSID\%THUMB_CLSID%\InprocServer32" /v "ThreadingModel" /t REG_SZ /d "Apartment" /f >nul
+    reg add "HKCU\Software\Classes\coree.Document\ShellEx\%THUMB_IID%" /ve /t REG_SZ /d "%THUMB_CLSID%" /f >nul
+    for %%E in (.coree .cdr .cdt .cmx .cpt) do (
+        reg add "HKCU\Software\Classes\%%E\ShellEx\%THUMB_IID%" /ve /t REG_SZ /d "%THUMB_CLSID%" /f >nul
+    )
+)
+
 rem Refresh Windows Explorer icon cache
 if exist "%SystemRoot%\System32\ie4uinit.exe" (
     "%SystemRoot%\System32\ie4uinit.exe" -show >nul 2>&1
@@ -81,6 +95,12 @@ for %%E in (.coree .cdr .cdt .cmx .cpt) do (
 for %%E in (.coree .cdr .cdt .cmx .cpt .svg .dxf .plt .pdf .eps .psd) do (
     reg delete "HKCU\Software\Classes\%%E\OpenWithProgids" /v "coree.Document" /f >nul 2>&1
 )
+
+for %%E in (.coree .cdr .cdt .cmx .cpt) do (
+    reg delete "HKCU\Software\Classes\%%E\ShellEx\%THUMB_IID%" /f >nul 2>&1
+)
+reg delete "HKCU\Software\Classes\coree.Document\ShellEx\%THUMB_IID%" /f >nul 2>&1
+reg delete "HKCU\Software\Classes\CLSID\%THUMB_CLSID%" /f >nul 2>&1
 
 reg delete "HKCU\Software\Classes\coree.Document" /f >nul 2>&1
 reg delete "HKCU\Software\Classes\Applications\coree.exe" /f >nul 2>&1

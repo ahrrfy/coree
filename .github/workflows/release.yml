@@ -148,6 +148,7 @@ jobs:
              packaging/linux/coree-mime.xml \
              packaging/linux/coree.thumbnailer \
              packaging/linux/install-linux.sh \
+             packaging/linux/cargo-sources.json \
              "dist/${PKG}/packaging/linux/"
           cp packaging/linux/flatpak/io.github.ahrrfy.coree.yml \
              packaging/linux/flatpak/io.github.ahrrfy.coree.metainfo.xml \
@@ -244,8 +245,20 @@ jobs:
       - name: Run full workspace tests on Windows
         run: cargo test --workspace --all-targets
 
+      - name: Setup MSVC x64 developer environment for Windows COM thumbnail DLL
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build release binary (with embedded coree.ico & UTF-8/DPI manifest)
         run: cargo build --release --package coree-app --bins
+
+      - name: Build Windows Explorer IThumbnailProvider COM DLL (coree_thumb.dll)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\packaging\windows\thumbnail_provider\build-thumb-dll.ps1 -OutDir "target\release"
+          if ($LASTEXITCODE -ne 0) { throw "coree_thumb.dll build failed" }
 
       - name: Atomic Windows CLI & Arabic UTF-8 filename verification
         shell: pwsh
@@ -339,15 +352,24 @@ jobs:
           $msiName = "coree-$tag-x86_64-windows-setup.msi"
           $msiPath = "dist\$msiName"
 
+          & .\packaging\windows\sign-windows.ps1 -Files @(
+            "target\release\coree.exe",
+            "target\release\coree.com",
+            "target\release\coree_thumb.dll"
+          )
+
           wix build packaging\windows\wix\main.wxs `
             -arch x64 `
             -d BinaryPath="target\release\coree.exe" `
             -d ComPath="target\release\coree.com" `
+            -d ThumbDllPath="target\release\coree_thumb.dll" `
             -d IconPath="packaging\windows\coree.ico" `
             -d RepoRoot="." `
             -d Version="$msiVer" `
             -o "$msiPath"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+
+          & .\packaging\windows\sign-windows.ps1 -Files @("$msiPath")
 
           $hash = (Get-FileHash $msiPath -Algorithm SHA256).Hash.ToLower()
           "$hash  $msiName" | Out-File -Encoding ascii "$msiPath.sha256"
@@ -364,7 +386,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           Copy-Item "target\release\coree.exe" "$stage\coree.exe"
-          Copy-Item "target\release\coree-cli.exe" "$stage\coree.com"
+          Copy-Item "target\release\coree.com" "$stage\coree.com"
+          Copy-Item "target\release\coree_thumb.dll" "$stage\coree_thumb.dll"
           Copy-Item "packaging\windows\coree.ico" "$stage\coree.ico"
           Copy-Item "packaging\windows\register-file-associations.cmd" "$stage\register-file-associations.cmd"
           Copy-Item "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "README.md", "CHANGELOG.md" "$stage\"
