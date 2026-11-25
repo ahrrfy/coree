@@ -2734,6 +2734,7 @@ def _test_t4_brochure_pdfx(ctx: RunContext) -> TestOutcome:
 
     txt_rep = run_poppler_text(out_pdf, timeout_scale=ctx.timeout_scale)
     extracted = _strip_bidi_controls(txt_rep.get("text", ""))
+    extracted_ws = " ".join(extracted.split())
     missing_txt = [
         tok
         for tok in (
@@ -2743,7 +2744,7 @@ def _test_t4_brochure_pdfx(ctx: RunContext) -> TestOutcome:
             "Second Page",
             "الصفحة الثانية",
         )
-        if tok not in extracted
+        if tok not in extracted_ws
     ]
     if not txt_rep["ok"] or missing_txt:
         failures.append(f"W4 REQ-03: pdftotext missing bilingual P1+P2/ParagraphText tokens {missing_txt}: {extracted[:300]!r}")
@@ -4158,21 +4159,28 @@ def _test_t4_scene10k_bench(ctx: RunContext) -> TestOutcome:
     fps_vals: list[float] = []
     autosave_ms_vals: list[float] = []
     if has_benches:
-        search_deps = [
-            ctx.cli_bin.parent / "deps",
-            ctx.repo_root / "target" / "release" / "deps",
-            ctx.repo_root / "target" / "debug" / "deps",
+        release_search_specs = [
+            (ctx.cli_bin.parent / "deps", "{stem}-*"),
+            (ctx.repo_root / "target" / "release" / "deps", "{stem}-*"),
+            (ctx.repo_root / "target" / "release" / "build", "**/out/{stem}-*"),
+        ]
+        debug_search_specs = [
+            (ctx.repo_root / "target" / "debug" / "deps", "{stem}-*"),
+            (ctx.repo_root / "target" / "debug" / "build", "**/out/{stem}-*"),
         ]
         bench_logs: list[str] = []
         in_repo_target = _cli_in_repo_target(ctx)
         for bf in bench_files:
             stem = bf.stem
             candidates: list[Path] = []
-            for ddir in search_deps:
-                if ddir.is_dir():
-                    for p in ddir.glob(f"{stem}-*"):
-                        if p.is_file() and os.access(p, os.X_OK) and not p.suffix:
-                            candidates.append(p)
+            for specs in (release_search_specs, debug_search_specs):
+                for ddir, pat_tmpl in specs:
+                    if ddir.is_dir():
+                        for p in ddir.glob(pat_tmpl.format(stem=stem)):
+                            if p.is_file() and os.access(p, os.X_OK) and not p.suffix:
+                                candidates.append(p)
+                if candidates:
+                    break
             exec_bin = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
             if exec_bin is not None:
                 rb = run_cmd([str(exec_bin), "--bench"], cwd=work, timeout=120.0, timeout_scale=ctx.timeout_scale)
@@ -4182,7 +4190,9 @@ def _test_t4_scene10k_bench(ctx: RunContext) -> TestOutcome:
                     cwd=ctx.repo_root, env=_cargo_env(), timeout=180.0, timeout_scale=ctx.timeout_scale,
                 )
             else:
-                failures.append(f"W3 IMP-12: prebuilt bench binary for '{stem}' missing under target/*/deps (skipping cargo bench under snapshot isolation)")
+                failures.append(
+                    f"W3 IMP-12: prebuilt bench binary for '{stem}' missing under target/*/deps or target/*/build/**/out (skipping cargo bench under snapshot isolation)"
+                )
                 continue
             if rb.returncode != 0:
                 failures.append(f"W3 IMP-12: offline bench '{stem}' failed: {rb.stderr[-400:]}")

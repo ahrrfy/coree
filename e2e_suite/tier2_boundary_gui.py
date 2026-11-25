@@ -3069,7 +3069,15 @@ def _test_w5_view_guides_navigator_printui(ctx: RunContext) -> TestOutcome:
         return TestOutcome("FAIL", "W5 FEAT-10/ADD-07: compute_page_layouts in renderer.rs missing facing_pages spread layout")
 
     canvas_rs = _strip_cfg_test_modules(_read_rust_stripped(ctx, "crates/coree-app/src/ui/canvas.rs"))
-    hit_rs = _strip_cfg_test_modules(_read_rust_stripped(ctx, "crates/coree-render/src/hit_test.rs"))
+    hit_rs = "\n".join(
+        filter(
+            None,
+            (
+                _strip_cfg_test_modules(_read_rust_stripped(ctx, "crates/coree-core/src/hit_test.rs")),
+                _strip_cfg_test_modules(_read_rust_stripped(ctx, "crates/coree-render/src/hit_test.rs")),
+            ),
+        )
+    )
     tools_dir = ctx.repo_root / "crates" / "coree-tools" / "src"
     tools_src = "\n".join(
         _strip_cfg_test_modules(strip_rust_comments_and_strings(p.read_text(encoding="utf-8", errors="replace")))

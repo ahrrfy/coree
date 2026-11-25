@@ -14,7 +14,7 @@ use tempfile::TempDir;
 /// Current local SQLite schema version.
 pub const SCHEMA_VERSION: u32 = 4;
 
-/// Exact offline-first SQLite DDL from `replica/schema.sql` (all 10 tables,
+/// Exact offline-first SQLite DDL from `replica/schema.sql` (all 11 tables,
 /// CHECK constraints, foreign keys, and indexes).
 pub const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -684,7 +684,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrations_create_all_ten_tables_and_wal_mode_on_disk() {
+    fn migrations_create_all_eleven_tables_and_wal_mode_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coree.db");
         let db = StorageDb::open(&db_path).unwrap();
@@ -704,6 +704,7 @@ mod tests {
             "font_index",
             "brush_presets",
             "app_preferences",
+            "font_substitutions",
         ];
         for table in expected_tables {
             let exists: i64 = db

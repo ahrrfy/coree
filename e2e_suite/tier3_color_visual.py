@@ -1228,9 +1228,19 @@ def _t3_fixture(ctx: RunContext, name: str) -> Path:
 
 def _read_rust_stripped(ctx: RunContext, rel_path: str) -> str:
     p = ctx.repo_root / rel_path
-    if not p.is_file():
+    files: list[Path] = []
+    if p.is_file():
+        files.append(p)
+    if rel_path.endswith(".rs"):
+        mod_dir = p.with_suffix("")
+        if mod_dir.is_dir():
+            files.extend(sorted(mod_dir.rglob("*.rs")))
+    if not files:
         return ""
-    return strip_rust_comments_and_strings(p.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(
+        strip_rust_comments_and_strings(f.read_text(encoding="utf-8", errors="replace"))
+        for f in files
+    )
 
 
 def _extract_brace_block(src: str, header_rx: str) -> Optional[str]:
@@ -3479,7 +3489,15 @@ def _test_t3_w5_viewmodes_snap_shapes_sculpt(ctx: RunContext) -> TestOutcome:
         return TestOutcome("FAIL", "W5 FEAT-23: Polygon and Star rendered identically")
 
     # 3. Genuine FEAT-02 Toolbox flyouts (15 groups / 65 distinct icons), Creation+Selection Property Bars, Status Bar & zero DrawingBox
-    ty_code = _read_rust_stripped(ctx, "crates/coree-app/src/state/types.rs")
+    ty_code = "\n".join(
+        filter(
+            None,
+            (
+                _read_rust_stripped(ctx, "crates/coree-app/src/state/types.rs"),
+                _read_rust_stripped(ctx, "crates/coree-tools/src/types.rs"),
+            ),
+        )
+    )
     tb_code = _read_rust_stripped(ctx, "crates/coree-app/src/ui/toolbox.rs")
     bar_code = _read_rust_stripped(ctx, "crates/coree-app/src/ui/toolbar.rs")
     cv_code = _read_rust_stripped(ctx, "crates/coree-app/src/ui/canvas.rs")

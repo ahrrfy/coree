@@ -7214,19 +7214,61 @@ def _test_w5_view_simple_wireframe_and_inspector_ui(ctx: RunContext) -> TestOutc
     if r_ap1.returncode != 0 or r_ap2.returncode != 0 or not apn_p1_png.is_file() or not apn_p2_png.is_file():
         return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber multipage render failed: {r_ap1.stderr or r_ap2.stderr}")
     try:
-        if parse_png_info(apn_p1_png.read_bytes())["non_white_pixels"] <= 20 or parse_png_info(apn_p2_png.read_bytes())["non_white_pixels"] <= 20:
-            return TestOutcome("FAIL", "W5 ADD-07: AutoPageNumber rendered blank page")
-        apn_diff = _compare_same_page_pngs(
-            apn_p1_png,
-            apn_p2_png,
+        apn_p1_bytes = apn_p1_png.read_bytes()
+        apn_p2_bytes = apn_p2_png.read_bytes()
+        apn_p1_info = parse_png_info(apn_p1_bytes)
+        apn_p2_info = parse_png_info(apn_p2_bytes)
+        if (apn_p1_info["width"], apn_p1_info["height"]) != (apn_p2_info["width"], apn_p2_info["height"]) or apn_p1_info["width"] < 32 or apn_p1_info["height"] < 32:
+            return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber PNG dimensions invalid/mismatched: {apn_p1_info} vs {apn_p2_info}")
+        apn_w1, apn_h1, apn_rgba1 = _decode_png_rgba_bytes_stdlib(apn_p1_bytes)
+        apn_w2, apn_h2, apn_rgba2 = _decode_png_rgba_bytes_stdlib(apn_p2_bytes)
+        if (apn_w1, apn_h1) != (apn_w2, apn_h2):
+            return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber decoded RGBA dimensions mismatched: {(apn_w1, apn_h1)} vs {(apn_w2, apn_h2)}")
+        # Crop local AutoPageNumber region (25..95, 25..75) mm so parse_png_info runs 1x1 (<= 40_000 px) around (40, 40) mm
+        apn_pw_mm = float(apn_doc["pages"][0]["width_mm"])
+        apn_ph_mm = float(apn_doc["pages"][0]["height_mm"])
+        cx0 = max(0, int(25.0 / apn_pw_mm * apn_w1))
+        cx1 = min(apn_w1, int(95.0 / apn_pw_mm * apn_w1))
+        cy0 = max(0, int(25.0 / apn_ph_mm * apn_h1))
+        cy1 = min(apn_h1, int(75.0 / apn_ph_mm * apn_h1))
+        cw, ch = cx1 - cx0, cy1 - cy0
+        if cw < 32 or ch < 32:
+            return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber crop box degenerate: {cw}x{ch}")
+        crop_p1_rgba = bytearray(cw * ch * 4)
+        crop_p2_rgba = bytearray(cw * ch * 4)
+        for row in range(ch):
+            src_off = ((cy0 + row) * apn_w1 + cx0) * 4
+            dst_off = row * cw * 4
+            crop_p1_rgba[dst_off:dst_off + cw * 4] = apn_rgba1[src_off:src_off + cw * 4]
+            crop_p2_rgba[dst_off:dst_off + cw * 4] = apn_rgba2[src_off:src_off + cw * 4]
+        apn_p1_crop_png = work / "autopagenum_p1_crop.png"
+        apn_p2_crop_png = work / "autopagenum_p2_crop.png"
+        apn_p1_crop_png.write_bytes(_encode_png_rgba_stdlib(cw, ch, bytes(crop_p1_rgba)))
+        apn_p2_crop_png.write_bytes(_encode_png_rgba_stdlib(cw, ch, bytes(crop_p2_rgba)))
+        crop_p1_info = parse_png_info(apn_p1_crop_png.read_bytes())
+        crop_p2_info = parse_png_info(apn_p2_crop_png.read_bytes())
+        if crop_p1_info["non_white_pixels"] < 100 or crop_p2_info["non_white_pixels"] < 100:
+            return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber rendered blank/too few pixels in local region: p1={crop_p1_info['non_white_pixels']}, p2={crop_p2_info['non_white_pixels']}")
+        apn_crop_diff = _compare_same_page_pngs(
+            apn_p1_crop_png,
+            apn_p2_crop_png,
             "W5 ADD-07 AutoPageNumber",
-            min_non_white_a=21,
-            min_non_white_b=21,
+            min_non_white_a=100,
+            min_non_white_b=100,
         )
+        apn_full_diff = compare_png_pixels(apn_p1_png, apn_p2_png)
     except _CLI_PARSE_EXCEPTIONS as exc:
         return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber PNG malformed: {exc}")
-    if apn_diff["mean_abs_diff"] <= 0.2:
-        return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber rendered identical output on Page 1 and Page 2: {apn_diff}")
+    if (
+        apn_crop_diff["mean_abs_diff"] <= 1.0
+        or apn_crop_diff["non_white_iou"] >= 0.85
+        or apn_crop_diff["nonzero_diff_ratio"] <= 0.005
+        or not apn_full_diff.get("size_match")
+        or apn_full_diff["max_channel_diff"] <= 0
+        or apn_full_diff["nonzero_diff_ratio"] <= 0.0
+        or apn_full_diff["non_white_iou"] >= 0.85
+    ):
+        return TestOutcome("FAIL", f"W5 ADD-07: AutoPageNumber rendered identical/insufficiently distinct output on Page 1 vs Page 2: crop={apn_crop_diff}, full={apn_full_diff}")
 
     # Runtime 3-page Facing Pages spread render check
     _, fp_doc = inspect_coree_zip(_f(ctx, "fixture.coree"))

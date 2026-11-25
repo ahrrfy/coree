@@ -29,7 +29,7 @@ fn sqlite_schema_matches_all_tables_columns_constraints_and_cascades() {
     assert_eq!(db.journal_mode().unwrap().to_ascii_lowercase(), "wal");
     assert!(db.foreign_keys_enabled().unwrap());
 
-    // Verify critical columns across all 10 tables from replica/schema.sql
+    // Verify critical columns across all 11 tables from replica/schema.sql
     let expected_columns: &[(&str, &[&str])] = &[
         (
             "recent_documents",
