@@ -596,6 +596,12 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
             id: coree_core::ImageAssetId,
             filters: Vec<RasterFilter>,
         },
+        ResampledAsset {
+            id: coree_core::ImageAssetId,
+            filters: Vec<RasterFilter>,
+            width: u32,
+            height: u32,
+        },
         Rendered {
             oid: ObjectId,
             cached_rgba: Option<Vec<u8>>,
@@ -621,12 +627,100 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn push_rendered_psd_meta(
+        doc: &Document,
+        page_index: usize,
+        oid: ObjectId,
+        obj: &SceneObject,
+        dpi: f32,
+        use_cmyk: bool,
+        opacity: u8,
+        blend: [u8; 4],
+        out: &mut Vec<ExportLayerMeta>,
+    ) {
+        if let Ok(Some((rect_mm, buf))) =
+            render_isolated_object_to_rgba(doc, page_index, oid, Affine2D::IDENTITY, f64::from(dpi))
+        {
+            let left = (rect_mm.min_x * f64::from(dpi) / 25.4).round() as i32;
+            let top = (rect_mm.min_y * f64::from(dpi) / 25.4).round() as i32;
+            let expected_w = (rect_mm.width().max(0.1) * f64::from(dpi) / 25.4)
+                .round()
+                .max(1.0) as u32;
+            let expected_h = (rect_mm.height().max(0.1) * f64::from(dpi) / 25.4)
+                .round()
+                .max(1.0) as u32;
+            let (target_w, target_h) = compute_target_dimensions(
+                expected_w,
+                expected_h,
+                MAX_LAYER_OUTPUT_DIM,
+                64_000_000 * 4,
+                4,
+            )
+            .unwrap_or((buf.width.max(1), buf.height.max(1)));
+            let needs_resize = (i64::from(target_w) - i64::from(buf.width)).abs() > 1
+                || (i64::from(target_h) - i64::from(buf.height)).abs() > 1;
+            let (width, height, rgba_vec) = if needs_resize {
+                let resized = resize_rgba8_via_asset(
+                    buf.width, buf.height, buf.rgba, target_w, target_h, dpi,
+                );
+                match resized {
+                    Some(v) => (target_w, target_h, v),
+                    None => (buf.width, buf.height, Vec::new()),
+                }
+            } else {
+                (buf.width, buf.height, buf.rgba)
+            };
+            if width == 0
+                || height == 0
+                || rgba_vec.len() < (width as usize) * (height as usize) * 4
+            {
+                return;
+            }
+            let right = left.saturating_add(width as i32);
+            let bottom = top.saturating_add(height as i32);
+            let ch_ids = if use_cmyk {
+                vec![0, 1, 2, 3, -1]
+            } else {
+                vec![0, 1, 2, -1]
+            };
+            // Cache small renders (<= 16 MiB) so we do not render twice; drop larger ones
+            // and re-render one at a time while streaming channels.
+            let cached_rgba = if rgba_vec.len() <= 16 * 1024 * 1024 {
+                Some(rgba_vec)
+            } else {
+                None
+            };
+            out.push(ExportLayerMeta {
+                name: obj.name.clone(),
+                top,
+                left,
+                bottom,
+                right,
+                opacity,
+                visible: obj.visible,
+                blend,
+                divider_type: None,
+                ch_len_offsets: Vec::with_capacity(ch_ids.len()),
+                ch_written_lens: Vec::with_capacity(ch_ids.len()),
+                ch_ids,
+                source: ExportLayerSource::Rendered {
+                    oid,
+                    cached_rgba,
+                    width,
+                    height,
+                },
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn collect_psd_obj_meta(
         doc: &Document,
         page_index: usize,
         oid: ObjectId,
         dpi: f32,
         use_cmyk: bool,
+        use_16bit: bool,
         out: &mut Vec<ExportLayerMeta>,
         depth_rec: usize,
     ) {
@@ -639,7 +733,7 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
         let blend = blend_mode_to_psd_key(obj.blend_mode);
         let opacity = (obj.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         match &obj.payload {
-            NodePayload::Group(children) => {
+            NodePayload::Group(children) if obj.effects.is_empty() && obj.perspective.is_none() => {
                 // Bottom-to-top: bounding section divider (3) first, then children, then folder (1)
                 let empty_ch = vec![0, 1, 2, -1];
                 out.push(ExportLayerMeta {
@@ -658,7 +752,16 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                     source: ExportLayerSource::Empty,
                 });
                 for &cid in children {
-                    collect_psd_obj_meta(doc, page_index, cid, dpi, use_cmyk, out, depth_rec + 1);
+                    collect_psd_obj_meta(
+                        doc,
+                        page_index,
+                        cid,
+                        dpi,
+                        use_cmyk,
+                        use_16bit,
+                        out,
+                        depth_rec + 1,
+                    );
                 }
                 out.push(ExportLayerMeta {
                     name: obj.name.clone(),
@@ -677,87 +780,99 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                 });
             }
             NodePayload::Raster(r) if obj.effects.is_empty() && obj.perspective.is_none() => {
-                if let Some(asset) = doc.asset(r.asset_id) {
-                    let tx = obj.transform.m[4];
-                    let ty = obj.transform.m[5];
-                    let left = (tx * f64::from(dpi) / 25.4).round() as i32;
-                    let top = (ty * f64::from(dpi) / 25.4).round() as i32;
-                    let lw = asset.width;
-                    let lh = asset.height;
-                    let right = left.saturating_add(lw as i32);
-                    let bottom = top.saturating_add(lh as i32);
-                    let ch_ids = if use_cmyk {
-                        vec![0, 1, 2, 3, -1]
-                    } else {
-                        vec![0, 1, 2, -1]
-                    };
-                    out.push(ExportLayerMeta {
-                        name: obj.name.clone(),
-                        top,
-                        left,
-                        bottom,
-                        right,
-                        opacity,
-                        visible: obj.visible,
-                        blend,
-                        divider_type: None,
-                        ch_len_offsets: Vec::with_capacity(ch_ids.len()),
-                        ch_written_lens: Vec::with_capacity(ch_ids.len()),
-                        ch_ids,
-                        source: ExportLayerSource::Asset {
-                            id: r.asset_id,
-                            filters: r.filters.clone(),
-                        },
-                    });
+                let world_xf = doc.world_transform_of(oid).unwrap_or(obj.transform);
+                let w_mm = if r.width_mm.is_finite() && r.width_mm > 0.0 {
+                    r.width_mm
+                } else {
+                    50.0
+                };
+                let h_mm = if r.height_mm.is_finite() && r.height_mm > 0.0 {
+                    r.height_mm
+                } else {
+                    50.0
+                };
+                let expected_w = (w_mm * f64::from(dpi) / 25.4).round().max(1.0) as u32;
+                let expected_h = (h_mm * f64::from(dpi) / 25.4).round().max(1.0) as u32;
+                let can_direct_raster =
+                    r.crop_rect.is_none() && is_affine_translation_only(&world_xf);
+
+                if can_direct_raster {
+                    if let Some(asset) = doc.asset(r.asset_id) {
+                        let tx = world_xf.m[4];
+                        let ty = world_xf.m[5];
+                        let left = (tx * f64::from(dpi) / 25.4).round() as i32;
+                        let top = (ty * f64::from(dpi) / 25.4).round() as i32;
+                        let ch_ids = if use_cmyk {
+                            vec![0, 1, 2, 3, -1]
+                        } else {
+                            vec![0, 1, 2, -1]
+                        };
+                        if expected_w == asset.width && expected_h == asset.height {
+                            // Zero-resample fast path (preserves 4096x4096 16-bit PSD export RSS <= 768 MiB)
+                            let right = left.saturating_add(asset.width as i32);
+                            let bottom = top.saturating_add(asset.height as i32);
+                            out.push(ExportLayerMeta {
+                                name: obj.name.clone(),
+                                top,
+                                left,
+                                bottom,
+                                right,
+                                opacity,
+                                visible: obj.visible,
+                                blend,
+                                divider_type: None,
+                                ch_len_offsets: Vec::with_capacity(ch_ids.len()),
+                                ch_written_lens: Vec::with_capacity(ch_ids.len()),
+                                ch_ids,
+                                source: ExportLayerSource::Asset {
+                                    id: r.asset_id,
+                                    filters: r.filters.clone(),
+                                },
+                            });
+                            return;
+                        }
+                        let bpp = if use_16bit { 8 } else { 4 };
+                        let (target_w, target_h) = compute_target_dimensions(
+                            expected_w,
+                            expected_h,
+                            MAX_LAYER_OUTPUT_DIM,
+                            64_000_000_usize.saturating_mul(bpp),
+                            bpp,
+                        )
+                        .unwrap_or((1, 1));
+                        let right = left.saturating_add(target_w as i32);
+                        let bottom = top.saturating_add(target_h as i32);
+                        out.push(ExportLayerMeta {
+                            name: obj.name.clone(),
+                            top,
+                            left,
+                            bottom,
+                            right,
+                            opacity,
+                            visible: obj.visible,
+                            blend,
+                            divider_type: None,
+                            ch_len_offsets: Vec::with_capacity(ch_ids.len()),
+                            ch_written_lens: Vec::with_capacity(ch_ids.len()),
+                            ch_ids,
+                            source: ExportLayerSource::ResampledAsset {
+                                id: r.asset_id,
+                                filters: r.filters.clone(),
+                                width: target_w,
+                                height: target_h,
+                            },
+                        });
+                        return;
+                    }
                 }
+                push_rendered_psd_meta(
+                    doc, page_index, oid, obj, dpi, use_cmyk, opacity, blend, out,
+                );
             }
             _ => {
-                if let Ok(Some((rect_mm, buf))) = render_isolated_object_to_rgba(
-                    doc,
-                    page_index,
-                    oid,
-                    Affine2D::IDENTITY,
-                    f64::from(dpi),
-                ) {
-                    let left = (rect_mm.min_x * f64::from(dpi) / 25.4).round() as i32;
-                    let top = (rect_mm.min_y * f64::from(dpi) / 25.4).round() as i32;
-                    let width = buf.width;
-                    let height = buf.height;
-                    let right = left.saturating_add(width as i32);
-                    let bottom = top.saturating_add(height as i32);
-                    let ch_ids = if use_cmyk {
-                        vec![0, 1, 2, 3, -1]
-                    } else {
-                        vec![0, 1, 2, -1]
-                    };
-                    // Cache small renders (<= 16 MiB) so we do not render twice; drop larger ones
-                    // and re-render one at a time while streaming channels.
-                    let cached_rgba = if buf.rgba.len() <= 16 * 1024 * 1024 {
-                        Some(buf.rgba)
-                    } else {
-                        None
-                    };
-                    out.push(ExportLayerMeta {
-                        name: obj.name.clone(),
-                        top,
-                        left,
-                        bottom,
-                        right,
-                        opacity,
-                        visible: obj.visible,
-                        blend,
-                        divider_type: None,
-                        ch_len_offsets: Vec::with_capacity(ch_ids.len()),
-                        ch_written_lens: Vec::with_capacity(ch_ids.len()),
-                        ch_ids,
-                        source: ExportLayerSource::Rendered {
-                            oid,
-                            cached_rgba,
-                            width,
-                            height,
-                        },
-                    });
-                }
+                push_rendered_psd_meta(
+                    doc, page_index, oid, obj, dpi, use_cmyk, opacity, blend, out,
+                );
             }
         }
     }
@@ -765,7 +880,16 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
     let mut layer_metas: Vec<ExportLayerMeta> = Vec::new();
     for layer in &page.layers {
         for &oid in &layer.objects {
-            collect_psd_obj_meta(doc, page_index, oid, dpi, use_cmyk, &mut layer_metas, 0);
+            collect_psd_obj_meta(
+                doc,
+                page_index,
+                oid,
+                dpi,
+                use_cmyk,
+                use_16bit,
+                &mut layer_metas,
+                0,
+            );
         }
     }
 
@@ -916,6 +1040,30 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                         }
                     }
                 }
+                ExportLayerSource::ResampledAsset {
+                    id,
+                    filters,
+                    width,
+                    height,
+                } => {
+                    if let Some(asset) = doc.asset(*id) {
+                        let filtered =
+                            (!filters.is_empty()).then(|| apply_raster_filters(asset, filters));
+                        let active_asset = filtered.as_ref().unwrap_or(asset);
+                        let resampled = coree_render::resample(active_asset, *width, *height)
+                            .map_err(|e| {
+                                psd_err(format!("failed to resample PSD raster layer: {e}"))
+                            })?;
+                        for &cid in &layer.ch_ids {
+                            let ch_start = writer.stream_position()?;
+                            write_asset_channel_rle(
+                                writer, &resampled, cid, depth, use_cmyk, is_psb,
+                            )?;
+                            let ch_end = writer.stream_position()?;
+                            layer.ch_written_lens.push(ch_end - ch_start);
+                        }
+                    }
+                }
                 ExportLayerSource::Rendered {
                     oid,
                     cached_rgba,
@@ -931,7 +1079,14 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                         Affine2D::IDENTITY,
                         f64::from(dpi),
                     ) {
-                        buf.rgba
+                        if buf.width != *width || buf.height != *height {
+                            resize_rgba8_via_asset(
+                                buf.width, buf.height, buf.rgba, *width, *height, dpi,
+                            )
+                            .unwrap_or_default()
+                        } else {
+                            buf.rgba
+                        }
                     } else {
                         Vec::new()
                     };
@@ -1019,12 +1174,48 @@ pub fn export_psd(doc: &Document, page_index: usize, path: &Path) -> IoResult<()
         is_psb,
         ..PsdExportOptions::default()
     };
+    export_psd_with_options(doc, page_index, &opts, path)
+}
+
+/// Atomically exports `page_index` of `doc` to a `.psd` or `.psb` file at `path` with explicit options.
+pub fn export_psd_with_options(
+    doc: &Document,
+    page_index: usize,
+    opts: &PsdExportOptions,
+    path: &Path,
+) -> IoResult<()> {
     atomic_write_with(path, |file| {
         let mut bw = BufWriter::with_capacity(64 * 1024, file);
-        export_psd_to_writer_with_options(doc, page_index, &opts, &mut bw)?;
+        export_psd_to_writer_with_options(doc, page_index, opts, &mut bw)?;
         bw.flush()?;
         Ok(())
     })
+}
+
+fn is_affine_translation_only(xf: &Affine2D) -> bool {
+    xf.is_finite()
+        && (xf.m[0] - 1.0).abs() <= 1e-6
+        && xf.m[1].abs() <= 1e-6
+        && xf.m[2].abs() <= 1e-6
+        && (xf.m[3] - 1.0).abs() <= 1e-6
+}
+
+fn resize_rgba8_via_asset(
+    src_w: u32,
+    src_h: u32,
+    rgba: Vec<u8>,
+    dst_w: u32,
+    dst_h: u32,
+    dpi: f32,
+) -> Option<Vec<u8>> {
+    let safe_dpi = if dpi.is_finite() && dpi >= 1.0 {
+        dpi
+    } else {
+        72.0
+    };
+    let asset = RasterAsset::new(src_w, src_h, rgba, safe_dpi, ColorMode::Rgb).ok()?;
+    let resized = coree_render::resample(&asset, dst_w, dst_h).ok()?;
+    Some(resized.to_rgba8_vec())
 }
 
 fn write_section_len_placeholder<W: Write>(writer: &mut W, is_psb: bool) -> IoResult<()> {
@@ -1082,19 +1273,47 @@ fn write_row_counts_at<W: Write + Seek>(
 }
 
 fn object_uses_16bit_asset(doc: &Document, oid: ObjectId, depth: usize) -> bool {
+    let Some(obj) = doc.object(oid) else {
+        return false;
+    };
+    scene_obj_uses_16bit_asset(doc, obj, None, depth)
+}
+
+fn scene_obj_uses_16bit_asset(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_map: Option<&std::collections::HashMap<ObjectId, &SceneObject>>,
+    depth: usize,
+) -> bool {
     if depth > 32 {
         return false;
     }
-    let Some(obj) = doc.object(oid) else {
-        return false;
+    let lookup = |id: ObjectId| -> Option<&SceneObject> {
+        sym_map
+            .and_then(|m| m.get(&id).copied())
+            .or_else(|| doc.object(id))
     };
     match &obj.payload {
         NodePayload::Raster(r) => doc
             .asset(r.asset_id)
             .is_some_and(|a| a.pixel_depth == PixelDepth::Bit16),
-        NodePayload::Group(c) => c
+        NodePayload::Group(c) | NodePayload::PowerClip { contents: c, .. } => c
             .iter()
-            .any(|&cid| object_uses_16bit_asset(doc, cid, depth + 1)),
+            .filter_map(|&cid| lookup(cid))
+            .any(|child| scene_obj_uses_16bit_asset(doc, child, sym_map, depth + 1)),
+        NodePayload::Clone { master_id, .. } => lookup(*master_id)
+            .is_some_and(|master| scene_obj_uses_16bit_asset(doc, master, sym_map, depth + 1)),
+        NodePayload::SymbolInstance(sym_id) => doc.symbol(*sym_id).is_some_and(|sym| {
+            let child_map: std::collections::HashMap<ObjectId, &SceneObject> = sym
+                .objects
+                .iter()
+                .filter(|so| so.id.0 != 0)
+                .map(|so| (so.id, so))
+                .collect();
+            sym.objects
+                .iter()
+                .any(|so| scene_obj_uses_16bit_asset(doc, so, Some(&child_map), depth + 1))
+        }),
         _ => false,
     }
 }
@@ -4138,5 +4357,254 @@ mod tests {
             "16-bit PSD layer must reflect green filtered pixels, got {:?}",
             &px16[0..4]
         );
+    }
+
+    #[test]
+    fn psd_export_resamples_placed_physical_size_and_preserves_4096_16bit_fast_path() {
+        // 1. 4x4 asset placed at 24x24 mm at 300 DPI -> must export 283x283 layer (not 4x4)
+        let mut doc_small = Document::new("Small Placed", 100.0, 100.0, ColorMode::Rgb, 300.0);
+        let a4 = RasterAsset::new(
+            4,
+            4,
+            [20u8, 120, 200, 255].repeat(16),
+            300.0,
+            ColorMode::Rgb,
+        )
+        .unwrap();
+        let aid4 = doc_small.register_asset(a4);
+        doc_small
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Embedded Swatch Bitmap",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid4,
+                        width_mm: 24.0,
+                        height_mm: 24.0,
+                        filters: Vec::new(),
+                        crop_rect: None,
+                    }),
+                )
+                .with_transform(Affine2D::translate(10.0, 15.0)),
+                None,
+            )
+            .unwrap();
+        let psd_300 = export_psd_to_bytes_with_options(
+            &doc_small,
+            0,
+            &PsdExportOptions {
+                is_psb: false,
+                dpi: Some(300.0),
+            },
+        )
+        .unwrap();
+        let back_300 = import_psd_bytes(&psd_300, "Back300").unwrap();
+        let layer_obj_300 = back_300
+            .objects()
+            .values()
+            .find(|o| o.name == "Embedded Swatch Bitmap")
+            .expect("re-imported swatch layer");
+        let NodePayload::Raster(r300) = &layer_obj_300.payload else {
+            panic!("expected raster layer");
+        };
+        let a300 = back_300.asset(r300.asset_id).unwrap();
+        assert_eq!(
+            (a300.width, a300.height),
+            (283, 283),
+            "4x4 asset placed at 24x24 mm @ 300 DPI must export 283x283 layer"
+        );
+        assert!((r300.width_mm - 24.0).abs() < 0.2);
+        assert!((r300.height_mm - 24.0).abs() < 0.2);
+
+        // 2. 64x64 asset placed at 80x80 mm with ChannelMixer + ToneCurve @ 72 DPI
+        let mut doc_filt = Document::new("Filt 80mm", 120.0, 120.0, ColorMode::Rgb, 72.0);
+        let mut px64 = Vec::with_capacity(64 * 64 * 4);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                if x < 32 {
+                    px64.extend_from_slice(&[220, 20, 180, 255]);
+                } else {
+                    let _ = y;
+                    px64.extend_from_slice(&[30, 230, 180, 255]);
+                }
+            }
+        }
+        let a64 = RasterAsset::new(64, 64, px64, 72.0, ColorMode::Rgb).unwrap();
+        let aid64 = doc_filt.register_asset(a64);
+        let filters = vec![
+            RasterFilter::ChannelMixer {
+                red: [0.0, 1.0, 0.0],
+                green: [1.0, 0.0, 0.0],
+                blue: [0.0, 0.0, 1.0],
+                monochrome: false,
+            },
+            RasterFilter::ToneCurve {
+                points: vec![(0.0, 0.0), (0.5, 0.85), (1.0, 1.0)],
+            },
+        ];
+        doc_filt
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Filtered Placed",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid64,
+                        width_mm: 80.0,
+                        height_mm: 80.0,
+                        filters,
+                        crop_rect: None,
+                    }),
+                )
+                .with_transform(Affine2D::translate(20.0, 20.0)),
+                None,
+            )
+            .unwrap();
+        let psd_filt = export_psd_to_bytes_with_options(
+            &doc_filt,
+            0,
+            &PsdExportOptions {
+                is_psb: false,
+                dpi: Some(72.0),
+            },
+        )
+        .unwrap();
+        let back_filt = import_psd_bytes(&psd_filt, "BackFilt").unwrap();
+        let ren_filt = coree_render::render_page_to_rgba(
+            &back_filt,
+            0,
+            72.0,
+            coree_render::ViewMode::Enhanced,
+        )
+        .unwrap();
+        let sample = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = ((x_mm * 72.0 / 25.4).round() as u32).min(ren_filt.width - 1);
+            let py = ((y_mm * 72.0 / 25.4).round() as u32).min(ren_filt.height - 1);
+            let idx = ((py * ren_filt.width + px) * 4) as usize;
+            [
+                ren_filt.rgba[idx],
+                ren_filt.rgba[idx + 1],
+                ren_filt.rgba[idx + 2],
+                ren_filt.rgba[idx + 3],
+            ]
+        };
+        let ref_filt =
+            coree_render::render_page_to_rgba(&doc_filt, 0, 72.0, coree_render::ViewMode::Enhanced)
+                .unwrap();
+        let ref_sample = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = ((x_mm * 72.0 / 25.4).round() as u32).min(ref_filt.width - 1);
+            let py = ((y_mm * 72.0 / 25.4).round() as u32).min(ref_filt.height - 1);
+            let idx = ((py * ref_filt.width + px) * 4) as usize;
+            [
+                ref_filt.rgba[idx],
+                ref_filt.rgba[idx + 1],
+                ref_filt.rgba[idx + 2],
+                ref_filt.rgba[idx + 3],
+            ]
+        };
+        let left_ref = ref_sample(35.0, 60.0);
+        let right_ref = ref_sample(85.0, 60.0);
+        let left_px = sample(35.0, 60.0);
+        let right_px = sample(85.0, 60.0);
+        assert!(
+            (i32::from(left_px[0]) - i32::from(left_ref[0])).abs() <= 2
+                && (i32::from(left_px[1]) - i32::from(left_ref[1])).abs() <= 2
+                && (i32::from(left_px[2]) - i32::from(left_ref[2])).abs() <= 2,
+            "left filtered 80x80mm region mismatch: got {left_px:?}, ref {left_ref:?}"
+        );
+        assert!(
+            (i32::from(right_px[0]) - i32::from(right_ref[0])).abs() <= 2
+                && (i32::from(right_px[1]) - i32::from(right_ref[1])).abs() <= 2
+                && (i32::from(right_px[2]) - i32::from(right_ref[2])).abs() <= 2,
+            "right filtered 80x80mm region mismatch: got {right_px:?}, ref {right_ref:?}"
+        );
+        assert_eq!(sample(10.0, 10.0), [255, 255, 255, 255]);
+
+        // 3. Cropped & rotated raster routes through Rendered path with matching bounds
+        let mut doc_xf = Document::new("CropRot", 100.0, 100.0, ColorMode::Rgb, 72.0);
+        let aid_xf = doc_xf.register_asset(
+            RasterAsset::new(8, 8, [230u8, 30, 30, 255].repeat(64), 72.0, ColorMode::Rgb).unwrap(),
+        );
+        doc_xf
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Cropped",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid_xf,
+                        width_mm: 40.0,
+                        height_mm: 40.0,
+                        filters: Vec::new(),
+                        crop_rect: Some(coree_core::Rect2D::from_xywh(10.0, 10.0, 20.0, 20.0)),
+                    }),
+                )
+                .with_transform(Affine2D::translate(10.0, 10.0)),
+                None,
+            )
+            .unwrap();
+        let psd_crop = export_psd_to_bytes_with_options(
+            &doc_xf,
+            0,
+            &PsdExportOptions {
+                is_psb: false,
+                dpi: Some(72.0),
+            },
+        )
+        .unwrap();
+        let back_crop = import_psd_bytes(&psd_crop, "BackCrop").unwrap();
+        let crop_obj = back_crop
+            .objects()
+            .values()
+            .find(|o| o.name == "Cropped")
+            .unwrap();
+        let NodePayload::Raster(rc) = &crop_obj.payload else {
+            panic!("expected raster");
+        };
+        // Cropped 20x20mm (plus isolated render pad) must be way larger than raw 8x8 px!
+        assert!(back_crop.asset(rc.asset_id).unwrap().width >= 56);
+
+        // 4. 4096x4096 16-bit PSD whose physical size matches 4096x4096 @ 300 DPI keeps Asset fast path
+        let phys_mm = 4096.0 * 25.4 / 300.0;
+        let mut doc_4k = Document::new("4K16", phys_mm, phys_mm, ColorMode::Rgb, 300.0);
+        let a4k = RasterAsset::new_16bit(
+            4096,
+            4096,
+            [32_000u16, 48_000, 16_000, 65_535].repeat(4096 * 4096),
+            300.0,
+            ColorMode::Rgb,
+        )
+        .unwrap();
+        let aid4k = doc_4k.register_asset(a4k);
+        doc_4k
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Layer4K16",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid4k,
+                        width_mm: phys_mm,
+                        height_mm: phys_mm,
+                        filters: Vec::new(),
+                        crop_rect: None,
+                    }),
+                ),
+                None,
+            )
+            .unwrap();
+        let psd_4k = export_psd_to_bytes_with_options(
+            &doc_4k,
+            0,
+            &PsdExportOptions {
+                is_psb: false,
+                dpi: Some(300.0),
+            },
+        )
+        .unwrap();
+        let back_4k = import_psd_bytes(&psd_4k, "Back4K").unwrap();
+        let a4k_back = back_4k
+            .assets()
+            .values()
+            .find(|a| a.pixel_depth == PixelDepth::Bit16)
+            .expect("4K 16-bit layer");
+        assert_eq!((a4k_back.width, a4k_back.height), (4096, 4096));
     }
 }

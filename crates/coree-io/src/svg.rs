@@ -179,6 +179,7 @@ fn import_svg_str_named(
             if g.id().is_empty()
                 && (g.opacity().get() - 1.0).abs() < 1e-4
                 && g.blend_mode() == usvg::BlendMode::Normal
+                && g.clip_path().is_none()
             {
                 root_to_mm = root_to_mm.compose(&usvg_transform_raw(g.transform()));
                 top_nodes = g.children();
@@ -196,18 +197,31 @@ fn import_svg_str_named(
                     doc.add_layer(page_id, meta.name.clone(), is_cut, MasterLayerScope::None)?;
                 xml_layer_ids.insert(group.id().to_owned(), lid);
                 created_named_layers = true;
-                let group_to_mm = root_to_mm.compose(&usvg_transform_raw(group.transform()));
-                for sub in group.children() {
+                if group.clip_path().is_some() {
                     import_usvg_node(
                         &mut doc,
-                        sub,
+                        child,
                         Some(lid),
-                        group_to_mm,
-                        group.opacity().get(),
+                        root_to_mm,
+                        1.0,
                         0,
                         limits,
                         &mut imported_text_via_usvg,
                     )?;
+                } else {
+                    let group_to_mm = root_to_mm.compose(&usvg_transform_raw(group.transform()));
+                    for sub in group.children() {
+                        import_usvg_node(
+                            &mut doc,
+                            sub,
+                            Some(lid),
+                            group_to_mm,
+                            group.opacity().get(),
+                            0,
+                            limits,
+                            &mut imported_text_via_usvg,
+                        )?;
+                    }
                 }
                 continue;
             }
@@ -372,10 +386,12 @@ fn import_usvg_node_inner(
             let group_opacity = (group.opacity().get() * inherited_opacity).clamp(0.0, 1.0);
             let group_blend = convert_usvg_blend_mode(group.blend_mode());
 
-            // Flatten unnamed single-child wrapper groups created by usvg for transforms.
+            // Flatten unnamed single-child wrapper groups created by usvg for transforms,
+            // EXCEPT when the group carries a `<clipPath>` (which must stay wrapped as PowerClip).
             if group.children().len() == 1
                 && group.id().is_empty()
                 && group_blend == BlendMode::Normal
+                && group.clip_path().is_none()
             {
                 return import_usvg_node_inner(
                     doc,
@@ -390,13 +406,39 @@ fn import_usvg_node_inner(
                 );
             }
 
+            let mut clip_chain = Vec::new();
+            let mut cur_cp = group.clip_path();
+            let mut cp_depth = 0u32;
+            while let Some(cp) = cur_cp {
+                if cp_depth > limits.max_svg_depth {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_svg_depth={}", limits.max_svg_depth),
+                        actual: format!("clip_path depth={cp_depth}"),
+                    });
+                }
+                let cp_xf = usvg_transform_raw(cp.transform());
+                let mut bp = BezierPath::default();
+                collect_usvg_clip_group_paths(cp.root(), cp_xf, 0, limits.max_svg_depth, &mut bp)?;
+                if !bp.is_empty() {
+                    clip_chain.push(bp);
+                }
+                cur_cp = cp.clip_path();
+                cp_depth += 1;
+            }
+            let has_clip = !clip_chain.is_empty();
+            let child_local_xf = if has_clip {
+                combined_local
+            } else {
+                Affine2D::IDENTITY
+            };
+
             let mut child_ids = Vec::new();
             for child in group.children() {
                 if let Some(cid) = import_usvg_node_inner(
                     doc,
                     child,
                     None,
-                    Affine2D::IDENTITY,
+                    child_local_xf,
                     combined_world,
                     1.0,
                     depth + 1,
@@ -411,10 +453,58 @@ fn import_usvg_node_inner(
             }
 
             let name = if group.id().is_empty() {
-                "Group".to_owned()
+                if has_clip {
+                    "ClipGroup".to_owned()
+                } else {
+                    "Group".to_owned()
+                }
             } else {
                 group.id().to_owned()
             };
+
+            if has_clip {
+                let singular = combined_local.inverse().is_none();
+                let mut current_ids = child_ids;
+                let last_idx = clip_chain.len() - 1;
+                for (idx, mut clip_bp) in clip_chain.into_iter().enumerate() {
+                    let is_outermost = idx == last_idx;
+                    let container_xf = if singular {
+                        clip_bp = clip_bp.transformed(&combined_local);
+                        Affine2D::IDENTITY
+                    } else {
+                        combined_local
+                    };
+                    let mut container = SceneObject::new(
+                        ObjectId(0),
+                        if is_outermost {
+                            name.clone()
+                        } else {
+                            "Clip".to_owned()
+                        },
+                        NodePayload::Path(clip_bp),
+                    )
+                    .with_fill(Fill::None)
+                    .with_outline(OutlineStyle::none())
+                    .with_transform(container_xf);
+                    if is_outermost {
+                        container.opacity = group_opacity;
+                        container.blend_mode = group_blend;
+                    }
+                    let pc_id = if is_outermost {
+                        if let Some(lid) = target_layer {
+                            doc.add_object(container, Some(lid))?
+                        } else {
+                            doc.insert_loaded_object(container)?
+                        }
+                    } else {
+                        doc.insert_loaded_object(container)?
+                    };
+                    let created_id = doc.create_powerclip(pc_id, &current_ids)?;
+                    current_ids = vec![created_id];
+                }
+                return Ok(current_ids.into_iter().next());
+            }
+
             let mut obj = SceneObject::new(ObjectId(0), name, NodePayload::Group(child_ids));
             obj.transform = combined_local;
             obj.opacity = group_opacity;
@@ -912,6 +1002,38 @@ fn usvg_path_to_bezier_raw(path: &usvg::tiny_skia_path::Path) -> BezierPath {
         }
     }
     BezierPath::from_kurbo(&kb)
+}
+
+fn collect_usvg_clip_group_paths(
+    group: &usvg::Group,
+    acc_xf: Affine2D,
+    depth: u32,
+    max_depth: u32,
+    out: &mut BezierPath,
+) -> IoResult<()> {
+    if depth > max_depth {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_svg_depth={max_depth}"),
+            actual: format!("clip_path depth={depth}"),
+        });
+    }
+    let xf = acc_xf.compose(&usvg_transform_raw(group.transform()));
+    for child in group.children() {
+        match child {
+            usvg::Node::Group(sub_g) => {
+                collect_usvg_clip_group_paths(sub_g, xf, depth + 1, max_depth, out)?;
+            }
+            usvg::Node::Path(p) => {
+                let bez = usvg_path_to_bezier_raw(p.data()).transformed(&xf);
+                out.subpaths.extend(bez.subpaths);
+            }
+            usvg::Node::Text(t) => {
+                collect_usvg_clip_group_paths(t.flattened(), xf, depth + 1, max_depth, out)?;
+            }
+            usvg::Node::Image(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2626,5 +2748,139 @@ mod tests {
         );
         let imported = import_svg_str(&svg).expect("re-import SVG");
         assert!(!imported.objects().is_empty());
+    }
+
+    #[test]
+    fn svg_powerclip_and_clone_powerclip_roundtrip_preserves_clip_bounds() {
+        let mut doc = Document::new("PowerClip SVG RT", 160.0, 80.0, ColorMode::Rgb, 72.0);
+        let inner = SceneObject::new(
+            ObjectId(0),
+            "InnerRed",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 80.0, 80.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(230, 26, 26, 255)))
+        .with_outline(OutlineStyle::none());
+        let inner_id = doc.add_object(inner, None).unwrap();
+
+        let container = SceneObject::new(
+            ObjectId(0),
+            "PowerClipMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                20.0, 20.0, 40.0, 40.0,
+            ))),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        let container_id = doc.add_object(container, None).unwrap();
+        let master_id = doc.create_powerclip(container_id, &[inner_id]).unwrap();
+
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CloneOfPowerClip",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(80.0, 0.0)),
+            None,
+        )
+        .unwrap();
+
+        let svg = export_svg_to_string(&doc, 0).expect("export PowerClip SVG");
+        assert!(svg.contains("<clipPath "), "SVG must emit <clipPath>");
+        assert!(
+            svg.contains("clip-path=\"url(#"),
+            "SVG must reference clip-path"
+        );
+
+        let imported = import_svg_str(&svg).expect("import PowerClip SVG");
+        let pc_count = imported
+            .objects()
+            .values()
+            .filter(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
+            .count();
+        assert_eq!(
+            pc_count, 2,
+            "both PowerClip master and translated Clone->PowerClip must import as PowerClip"
+        );
+
+        let rendered =
+            coree_render::render_page_to_rgba(&imported, 0, 72.0, coree_render::ViewMode::Enhanced)
+                .expect("render imported PowerClip SVG");
+        let px_at = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = ((x_mm * 72.0 / 25.4).round() as u32).min(rendered.width - 1);
+            let py = ((y_mm * 72.0 / 25.4).round() as u32).min(rendered.height - 1);
+            let idx = ((py * rendered.width + px) * 4) as usize;
+            [
+                rendered.rgba[idx],
+                rendered.rgba[idx + 1],
+                rendered.rgba[idx + 2],
+                rendered.rgba[idx + 3],
+            ]
+        };
+
+        assert_eq!(
+            px_at(40.0, 40.0),
+            [230, 26, 26, 255],
+            "master_in must be red"
+        );
+        assert_eq!(
+            px_at(10.0, 10.0),
+            [255, 255, 255, 255],
+            "master_out must be clipped to white"
+        );
+        assert_eq!(
+            px_at(120.0, 40.0),
+            [230, 26, 26, 255],
+            "clone_in must be red"
+        );
+        assert_eq!(
+            px_at(90.0, 10.0),
+            [255, 255, 255, 255],
+            "clone_out must be clipped to white"
+        );
+
+        // Also test unnamed single-child <g clip-path="..."> and <clipPath transform="...">
+        // plus <use> referencing a clipped group and <use> inside <clipPath>.
+        let single_child_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+  <defs>
+    <rect id="clip_sub" x="5" y="5" width="25" height="25"/>
+    <clipPath id="c_tf" transform="translate(15, 15)">
+      <use href="#clip_sub"/>
+    </clipPath>
+    <g id="def_pc" clip-path="url(#c_tf)">
+      <rect x="0" y="0" width="60" height="60" fill="#1020e0"/>
+    </g>
+  </defs>
+  <g clip-path="url(#c_tf)">
+    <rect x="0" y="0" width="60" height="60" fill="#e61a1a"/>
+  </g>
+  <use href="#def_pc" transform="translate(40, 40)"/>
+</svg>"##;
+        let sc_doc = import_svg_str(single_child_svg).expect("import single-child clip SVG");
+        let sc_ren =
+            coree_render::render_page_to_rgba(&sc_doc, 0, 72.0, coree_render::ViewMode::Enhanced)
+                .expect("render single-child clip SVG");
+        let sc_px = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = ((x_mm * 72.0 / 25.4).round() as u32).min(sc_ren.width - 1);
+            let py = ((y_mm * 72.0 / 25.4).round() as u32).min(sc_ren.height - 1);
+            let idx = ((py * sc_ren.width + px) * 4) as usize;
+            [
+                sc_ren.rgba[idx],
+                sc_ren.rgba[idx + 1],
+                sc_ren.rgba[idx + 2],
+                sc_ren.rgba[idx + 3],
+            ]
+        };
+        assert_eq!(sc_px(35.0, 35.0), [230, 26, 26, 255]);
+        assert_eq!(sc_px(10.0, 10.0), [255, 255, 255, 255]);
+        assert_eq!(sc_px(75.0, 75.0), [16, 32, 224, 255]);
+        assert_eq!(sc_px(50.0, 50.0), [255, 255, 255, 255]);
     }
 }

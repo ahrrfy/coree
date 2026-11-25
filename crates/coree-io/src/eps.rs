@@ -1436,7 +1436,7 @@ fn tokenize_ps_inner(
                 tokens.push(PsToken::ExecName("<<".to_owned()));
             } else if *pos + 1 < len && bytes[*pos + 1] == b'~' {
                 *pos += 2;
-                let s = read_ps_inline_ascii85_stream(bytes, pos);
+                let s = read_ps_inline_ascii85_stream(bytes, pos)?;
                 *total_tokens += 1;
                 tokens.push(PsToken::Str(s));
             } else {
@@ -1523,7 +1523,7 @@ fn tokenize_ps_inner(
             if def_before {
                 *pos = look + 3;
                 let raw_img = if use_a85 {
-                    read_ps_inline_ascii85_stream(bytes, pos)
+                    read_ps_inline_ascii85_stream(bytes, pos)?
                 } else {
                     read_ps_inline_hex_stream(bytes, pos)
                 };
@@ -1531,7 +1531,7 @@ fn tokenize_ps_inner(
                 tokens.push(PsToken::ExecName("def".to_owned()));
             } else {
                 let raw_img = if use_a85 {
-                    read_ps_inline_ascii85_stream(bytes, pos)
+                    read_ps_inline_ascii85_stream(bytes, pos)?
                 } else {
                     read_ps_inline_hex_stream(bytes, pos)
                 };
@@ -1547,7 +1547,7 @@ fn tokenize_ps_inner(
             if word == "def" {
                 tokens.push(PsToken::ExecName("def".to_owned()));
                 let raw_img = if use_a85 {
-                    read_ps_inline_ascii85_stream(bytes, pos)
+                    read_ps_inline_ascii85_stream(bytes, pos)?
                 } else {
                     read_ps_inline_hex_stream(bytes, pos)
                 };
@@ -1563,7 +1563,7 @@ fn tokenize_ps_inner(
                 }
             } else {
                 let raw_img = if use_a85 {
-                    read_ps_inline_ascii85_stream(bytes, pos)
+                    read_ps_inline_ascii85_stream(bytes, pos)?
                 } else {
                     read_ps_inline_hex_stream(bytes, pos)
                 };
@@ -1654,7 +1654,15 @@ fn read_ps_hex_string(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
     read_ps_inline_hex_stream(bytes, pos)
 }
 
-fn read_ps_inline_ascii85_stream(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
+fn read_ps_inline_ascii85_stream(bytes: &[u8], pos: &mut usize) -> IoResult<Vec<u8>> {
+    read_ps_inline_ascii85_stream_with_limit(bytes, pos, MAX_PS_STREAM_BYTES)
+}
+
+fn read_ps_inline_ascii85_stream_with_limit(
+    bytes: &[u8],
+    pos: &mut usize,
+    max_bytes: usize,
+) -> IoResult<Vec<u8>> {
     let len = bytes.len();
     while *pos < len && (bytes[*pos].is_ascii_whitespace() || bytes[*pos] == 0) {
         *pos += 1;
@@ -1663,7 +1671,7 @@ fn read_ps_inline_ascii85_stream(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
         *pos += 2;
     }
     let mut out = Vec::new();
-    let mut tuple = [0u32; 5];
+    let mut tuple = [0u8; 5];
     let mut count = 0usize;
     while *pos < len {
         let b = bytes[*pos];
@@ -1677,37 +1685,78 @@ fn read_ps_inline_ascii85_stream(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
         if b.is_ascii_whitespace() {
             continue;
         }
-        if b == b'z' && count == 0 {
+        if b == b'z' {
+            if count != 0 {
+                return Err(IoError::InvalidFormat {
+                    format: "eps".into(),
+                    message: "unexpected 'z' inside ASCII85 5-tuple".into(),
+                });
+            }
+            if out.len().saturating_add(4) > max_bytes {
+                return Err(IoError::LimitExceeded {
+                    limit: format!("max_ps_stream_bytes={max_bytes}"),
+                    actual: format!("ASCII85 stream exceeded {max_bytes} bytes"),
+                });
+            }
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
         if (b'!'..=b'u').contains(&b) {
-            tuple[count] = u32::from(b - b'!');
+            tuple[count] = b - b'!';
             count += 1;
             if count == 5 {
-                let val = tuple[0] * 52_200_625
-                    + tuple[1] * 614_125
-                    + tuple[2] * 7_225
-                    + tuple[3] * 85
-                    + tuple[4];
-                out.extend_from_slice(&val.to_be_bytes());
+                let mut val = 0u64;
+                for &d in &tuple {
+                    val = val * 85 + u64::from(d);
+                }
+                if val > u64::from(u32::MAX) {
+                    return Err(IoError::InvalidFormat {
+                        format: "eps".into(),
+                        message: format!("ASCII85 5-tuple value {val} exceeds u32::MAX"),
+                    });
+                }
+                if out.len().saturating_add(4) > max_bytes {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_ps_stream_bytes={max_bytes}"),
+                        actual: format!("ASCII85 stream exceeded {max_bytes} bytes"),
+                    });
+                }
+                out.extend_from_slice(&(val as u32).to_be_bytes());
                 count = 0;
             }
         }
+    }
+    if count == 1 {
+        return Err(IoError::InvalidFormat {
+            format: "eps".into(),
+            message: "invalid 1-character ASCII85 tail".into(),
+        });
     }
     if count >= 2 {
         for slot in tuple.iter_mut().skip(count) {
             *slot = 84;
         }
-        let val = tuple[0] * 52_200_625
-            + tuple[1] * 614_125
-            + tuple[2] * 7_225
-            + tuple[3] * 85
-            + tuple[4];
-        let bytes4 = val.to_be_bytes();
-        out.extend_from_slice(&bytes4[..(count - 1)]);
+        let mut val = 0u64;
+        for &d in &tuple {
+            val = val * 85 + u64::from(d);
+        }
+        if val > u64::from(u32::MAX) {
+            return Err(IoError::InvalidFormat {
+                format: "eps".into(),
+                message: format!("ASCII85 partial tail value {val} exceeds u32::MAX"),
+            });
+        }
+        let rem = count - 1;
+        if out.len().saturating_add(rem) > max_bytes {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_ps_stream_bytes={max_bytes}"),
+                actual: format!("ASCII85 stream exceeded {max_bytes} bytes"),
+            });
+        }
+        let bytes4 = (val as u32).to_be_bytes();
+        out.extend_from_slice(&bytes4[..rem]);
     }
-    out
+    Ok(out)
 }
 
 fn read_ps_inline_hex_stream(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
@@ -3677,5 +3726,69 @@ grestore\n\
         let imported = import_eps_bytes(eps.as_bytes(), "EPS Large Roundtrip").unwrap();
         assert_eq!(imported.assets().len(), 1);
         assert_eq!(imported.objects().len(), 1);
+    }
+
+    #[test]
+    fn eps_import_ascii85_overflow_and_z_flood_adversarial() {
+        // 1. Exact u32::MAX (0xFFFF_FFFF) valid boundary: <~s8W-!~>
+        let mut pos = 0;
+        let max_valid = read_ps_inline_ascii85_stream(b"<~s8W-!~>", &mut pos).unwrap();
+        assert_eq!(max_valid, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+
+        // Round-trip <~s8W-!~> through an EPS CMYK 1x1 image (4 bytes = 0xFF_FF_FF_FF)
+        let eps_max_valid = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n\
+            gsave /DeviceCMYK setcolorspace \
+            << /ImageType 1 /Width 1 /Height 1 /BitsPerComponent 8 \
+            /ImageMatrix [1 0 0 -1 0 1] /Decode [0 1 0 1 0 1 0 1] \
+            /DataSource currentfile /ASCII85Decode filter >> image\n\
+            <~s8W-!~>\ngrestore\n%%EOF\n";
+        let max_doc = import_eps_bytes(eps_max_valid.as_bytes(), "A85 u32::MAX").unwrap();
+        assert_eq!(max_doc.assets().len(), 1);
+
+        // 2. Overflow > u32::MAX cases: <~s8W-"~> (u32::MAX + 1), <~uuuuu~>, <~uuuu~>, <~t!~>,
+        //    plus invalid 1-char tail <~u~> and mid-tuple 'z' <~az~>.
+        for payload in [
+            "<~s8W-\"~>",
+            "<~uuuuu~>",
+            "<~uuuu~>",
+            "<~t!~>",
+            "<~u~>",
+            "<~az~>",
+        ] {
+            let mut p = 0;
+            let direct = read_ps_inline_ascii85_stream(payload.as_bytes(), &mut p);
+            assert!(
+                matches!(direct, Err(IoError::InvalidFormat { .. })),
+                "expected InvalidFormat for {payload}, got {direct:?}"
+            );
+
+            let eps = format!(
+                "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n{payload} pop\n0 0 10 10 rectfill\n%%EOF\n"
+            );
+            let res = import_eps_bytes(eps.as_bytes(), "A85 Overflow");
+            assert!(
+                matches!(res, Err(IoError::InvalidFormat { .. })),
+                "expected clean InvalidFormat error for {payload}, got {res:?}"
+            );
+        }
+
+        // 3. 'z'-flood expansion capped cleanly at max_bytes without panic/OOM
+        let mut p = 0;
+        let z_small = format!("<~{}~>", "z".repeat(300));
+        let capped = read_ps_inline_ascii85_stream_with_limit(z_small.as_bytes(), &mut p, 1024);
+        assert!(
+            matches!(capped, Err(IoError::LimitExceeded { .. })),
+            "expected LimitExceeded for 'z'-flood, got {capped:?}"
+        );
+
+        let mut z_flood = Vec::with_capacity(MAX_PS_STREAM_BYTES / 4 + 128);
+        z_flood.extend_from_slice(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n<~");
+        z_flood.resize(z_flood.len() + MAX_PS_STREAM_BYTES / 4 + 16, b'z');
+        z_flood.extend_from_slice(b"~> pop\n%%EOF\n");
+        let flood_res = import_eps_bytes(&z_flood, "A85 Z-Flood");
+        assert!(
+            matches!(flood_res, Err(IoError::LimitExceeded { .. })),
+            "expected LimitExceeded for full 'z'-flood, got {flood_res:?}"
+        );
     }
 }

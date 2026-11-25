@@ -19,7 +19,7 @@ use coree_io::{
     export_plt_with_options, export_psd, export_raster, export_svg, export_wmf, import_dwg,
     import_dxf, import_emf, import_eps, import_pdf, import_plt, import_psd, import_raster,
     import_svg, import_wmf, load_coree, save_coree_with_preview, DxfExportOptions, PdfColorSpace,
-    PdfExportOptions, PltExportOptions, RasterExportOptions, RasterFormat,
+    PdfExportOptions, PltExportOptions, PsdExportOptions, RasterExportOptions, RasterFormat,
 };
 use coree_prod::{export_laser_gcode, plan_laser_toolpath, GcodeDialect, LaserJobConfig};
 use coree_render::{render_page_to_rgba, ViewMode};
@@ -1071,8 +1071,17 @@ pub fn export_any_document(
             Ok(format!("Exported .emf to {}", output_path.display()))
         }
         "psd" | "psb" => {
-            export_psd(doc, page_idx, output_path)
-                .map_err(|e| format!("failed to export .{ext}: {e}"))?;
+            if opts.dpi.is_finite() && opts.dpi > 0.0 {
+                let psd_opts = PsdExportOptions {
+                    is_psb: ext == "psb",
+                    dpi: Some(opts.dpi),
+                };
+                coree_io::psd::export_psd_with_options(doc, page_idx, &psd_opts, output_path)
+                    .map_err(|e| format!("failed to export .{ext}: {e}"))?;
+            } else {
+                export_psd(doc, page_idx, output_path)
+                    .map_err(|e| format!("failed to export .{ext}: {e}"))?;
+            }
             Ok(format!("Exported .{ext} to {}", output_path.display()))
         }
         "plt" | "hpgl" => {
@@ -1461,5 +1470,46 @@ mod tests {
             assert!(opened.document.object_count() > 0);
         }
         assert_eq!(crate::ui::dialogs::EXPORT_FMT_GCODE, 11);
+    }
+
+    #[test]
+    fn io_bridge_respects_opts_dpi_for_psd_export() {
+        let tmp = ScopedTempDir::new("psd_dpi_bridge");
+        let mut doc = Document::new("PsdDpiBridge", 100.0, 100.0, ColorMode::Rgb, 300.0);
+        let asset = coree_core::RasterAsset::new(
+            4,
+            4,
+            [20u8, 120, 200, 255].repeat(16),
+            300.0,
+            ColorMode::Rgb,
+        )
+        .unwrap();
+        let aid = doc.register_asset(asset);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Swatch24mm",
+                NodePayload::Raster(RasterLayerData {
+                    asset_id: aid,
+                    width_mm: 24.0,
+                    height_mm: 24.0,
+                    filters: Vec::new(),
+                    crop_rect: None,
+                }),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let psd72 = tmp.path().join("out72.psd");
+        let opts72 = UniversalExportOptions {
+            dpi: 72.0,
+            ..UniversalExportOptions::default()
+        };
+        export_any_document(&doc, &psd72, &opts72).unwrap();
+        let back72 = import_psd(&psd72).unwrap();
+        assert!((back72.dpi() - 72.0).abs() < 0.01);
+        let a72 = back72.assets().values().next().unwrap();
+        assert_eq!((a72.width, a72.height), (68, 68));
     }
 }
