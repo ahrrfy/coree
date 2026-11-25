@@ -40,6 +40,7 @@ const META_RECTANGLE: u16 = 0x041B;
 const META_TEXTOUT: u16 = 0x0521;
 const META_POLYPOLYGON: u16 = 0x0538;
 const META_EXTTEXTOUT: u16 = 0x0A32;
+const META_STRETCHDIB: u16 = 0x0F43;
 
 // =============================================================================
 // Enhanced Metafile (.emf) — [MS-EMF]
@@ -185,6 +186,45 @@ pub fn export_wmf_to_bytes(doc: &Document, page_index: usize) -> IoResult<Vec<u8
                         &mut recs,
                         &mut max_record_words,
                         &mut n_objects,
+                    );
+                }
+            }
+            DisplayOp::DrawRaster {
+                asset_id,
+                inline_rgba,
+                rect_mm,
+                bl,
+                br,
+                tl,
+                opacity,
+                visible,
+                ..
+            } if *visible => {
+                let src_rgba = if let Some(arc) = inline_rgba {
+                    Some((arc.0, arc.1, arc.2.clone()))
+                } else if let Some(aid) = asset_id {
+                    doc.asset(*aid)
+                        .map(|a| (a.width, a.height, a.to_rgba8_vec()))
+                } else {
+                    None
+                };
+                if let Some((rw, rh, rgba)) = src_rgba {
+                    let tr = Point2D::new(br.x + (tl.x - bl.x), br.y + (tl.y - bl.y));
+                    let rect = rect_mm.unwrap_or_else(|| {
+                        let min_x = bl.x.min(br.x).min(tl.x).min(tr.x);
+                        let min_y = bl.y.min(br.y).min(tl.y).min(tr.y);
+                        let max_x = bl.x.max(br.x).max(tl.x).max(tr.x);
+                        let max_y = bl.y.max(br.y).max(tl.y).max(tr.y);
+                        Rect2D::from_xywh(min_x, min_y, max_x - min_x, max_y - min_y)
+                    });
+                    emit_wmf_raster_dib(
+                        rw,
+                        rh,
+                        &rgba,
+                        *opacity,
+                        rect,
+                        &mut recs,
+                        &mut max_record_words,
                     );
                 }
             }
@@ -337,6 +377,7 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     let mut cur_pos = Point2D::ZERO;
 
     let mut emitted_objs: Vec<SceneObject> = Vec::new();
+    let mut pending_rasters: Vec<(coree_core::RasterAsset, Rect2D)> = Vec::new();
     let mut rec_count = 0usize;
 
     let map_pt = |lx: i16, ly: i16, ox: f64, oy: f64, ex: f64, ey: f64| -> Point2D {
@@ -569,6 +610,26 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                     }
                 }
             }
+            META_STRETCHDIB if params.len() >= 22 + 40 => {
+                // params[0..2]=colorUsage, [2..6]=rop, [6..14]=src(h,w,y,x), [14..22]=dst(h,w,y,x), [22..]=BITMAPINFO+bits
+                let dh = read_i16_le(params, 14);
+                let dw = read_i16_le(params, 16);
+                let dy = read_i16_le(params, 18);
+                let dx = read_i16_le(params, 20);
+                let p0 = map_pt(dx, dy, win_ox, win_oy, win_ex, win_ey);
+                let p1 = map_pt(
+                    dx.saturating_add(dw),
+                    dy.saturating_add(dh),
+                    win_ox,
+                    win_oy,
+                    win_ex,
+                    win_ey,
+                );
+                let rect = Rect2D::from_points(p0, p1);
+                if let Some(asset) = parse_dib_24bpp_to_asset(&params[22..]) {
+                    pending_rasters.push((asset, rect));
+                }
+            }
             _ => {}
         }
     }
@@ -576,6 +637,23 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     let mut doc = Document::new(title, page_w, page_h, ColorMode::Rgb, 96.0);
     doc.metadata_mut().source_format = Some("wmf".to_owned());
     for obj in emitted_objs {
+        doc.add_object(obj, None)?;
+    }
+    for (idx, (asset, rect)) in pending_rasters.into_iter().enumerate() {
+        let asset_id = doc.register_asset(asset);
+        let obj = SceneObject::new(
+            ObjectId(0),
+            format!("WMF Raster {}", idx + 1),
+            NodePayload::Raster(coree_core::RasterLayerData {
+                asset_id,
+                width_mm: rect.width().max(0.1),
+                height_mm: rect.height().max(0.1),
+                filters: Vec::new(),
+                filter_enabled: Vec::new(),
+                crop_rect: None,
+            }),
+        )
+        .with_transform(Affine2D::translate(rect.min_x, rect.min_y));
         doc.add_object(obj, None)?;
     }
     doc.refresh_document_palette();
@@ -691,6 +769,139 @@ fn emit_wmf_path(
 
     push_wmf_record(recs, META_DELETEOBJECT, &[1], max_words);
     push_wmf_record(recs, META_DELETEOBJECT, &[0], max_words);
+}
+
+fn emit_wmf_raster_dib(
+    src_w: u32,
+    src_h: u32,
+    rgba: &[u8],
+    opacity: f32,
+    rect_mm: Rect2D,
+    recs: &mut Vec<u8>,
+    max_words: &mut u32,
+) {
+    if src_w == 0 || src_h == 0 || rgba.len() < (src_w as usize) * (src_h as usize) * 4 {
+        return;
+    }
+    let max_dim = 128u32;
+    let scale = (src_w.max(src_h) as f64 / f64::from(max_dim)).max(1.0);
+    let dst_w = ((src_w as f64 / scale).round() as u32).clamp(1, max_dim);
+    let dst_h = ((src_h as f64 / scale).round() as u32).clamp(1, max_dim);
+    let stride = (dst_w as usize * 3 + 3) & !3;
+    let img_bytes = stride * dst_h as usize;
+
+    let x_tw = (rect_mm.min_x * MM_TO_TWIPS)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+    let y_tw = (rect_mm.min_y * MM_TO_TWIPS)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+    let w_tw = (rect_mm.width() * MM_TO_TWIPS)
+        .round()
+        .clamp(1.0, i16::MAX as f64) as i16;
+    let h_tw = (rect_mm.height() * MM_TO_TWIPS)
+        .round()
+        .clamp(1.0, i16::MAX as f64) as i16;
+
+    let mut words: Vec<u16> = Vec::with_capacity(11 + 20 + img_bytes / 2);
+    // ColorUsage = 0 (DIB_RGB_COLORS), RasterOperation = 0x00CC0020 (SRCCOPY, LE u32)
+    words.push(0x0000);
+    words.push(0x0020);
+    words.push(0x00CC);
+    words.push((dst_h as i16) as u16);
+    words.push((dst_w as i16) as u16);
+    words.push(0); // YSrc
+    words.push(0); // XSrc
+    words.push(h_tw as u16);
+    words.push(w_tw as u16);
+    words.push(y_tw as u16);
+    words.push(x_tw as u16);
+
+    let mut dib = Vec::with_capacity(40 + img_bytes);
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(dst_w as i32).to_le_bytes());
+    dib.extend_from_slice(&(dst_h as i32).to_le_bytes()); // bottom-up
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&(img_bytes as u32).to_le_bytes());
+    dib.extend_from_slice(&0i32.to_le_bytes());
+    dib.extend_from_slice(&0i32.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes());
+
+    let op = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let mut row = vec![0u8; stride];
+    for dy in (0..dst_h).rev() {
+        row.fill(0);
+        let sy = ((u64::from(dy) * u64::from(src_h)) / u64::from(dst_h)).min(u64::from(src_h - 1))
+            as usize;
+        for dx in 0..dst_w {
+            let sx = ((u64::from(dx) * u64::from(src_w)) / u64::from(dst_w))
+                .min(u64::from(src_w - 1)) as usize;
+            let idx = (sy * src_w as usize + sx) * 4;
+            let a = (f32::from(rgba[idx + 3]) / 255.0) * op;
+            let blend = |ch: u8| -> u8 {
+                (f32::from(ch) * a + 255.0 * (1.0 - a))
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            let out_off = dx as usize * 3;
+            row[out_off] = blend(rgba[idx + 2]); // B
+            row[out_off + 1] = blend(rgba[idx + 1]); // G
+            row[out_off + 2] = blend(rgba[idx]); // R
+        }
+        dib.extend_from_slice(&row);
+    }
+    for &pair in dib.as_chunks::<2>().0 {
+        words.push(u16::from_le_bytes(pair));
+    }
+    push_wmf_record(recs, META_STRETCHDIB, &words, max_words);
+}
+
+pub(crate) fn parse_dib_24bpp_to_asset(dib: &[u8]) -> Option<coree_core::RasterAsset> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let bi_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
+    if bi_size < 40 || bi_size > dib.len() {
+        return None;
+    }
+    let bw = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]);
+    let bh = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
+    let bpp = u16::from_le_bytes([dib[14], dib[15]]);
+    let comp = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+    if bw <= 0 || bh == 0 || bpp != 24 || comp != 0 {
+        return None;
+    }
+    let w = (bw as u32).min(4096);
+    let h = bh.unsigned_abs().min(4096);
+    let bottom_up = bh > 0;
+    let stride = (w as usize * 3 + 3) & !3;
+    let bits = &dib[bi_size..];
+    if bits.len() < stride * h as usize {
+        return None;
+    }
+    let mut rgba = vec![255u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h as usize {
+        let src_y = if bottom_up { h as usize - 1 - y } else { y };
+        let row = &bits[src_y * stride..src_y * stride + w as usize * 3];
+        for x in 0..w as usize {
+            let b = row[x * 3];
+            let g = row[x * 3 + 1];
+            let r = row[x * 3 + 2];
+            let dst = (y * w as usize + x) * 4;
+            rgba[dst] = r;
+            rgba[dst + 1] = g;
+            rgba[dst + 2] = b;
+            rgba[dst + 3] = 255;
+        }
+    }
+    coree_core::RasterAsset::new(w, h, rgba, 96.0, ColorMode::Rgb).ok()
 }
 
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {

@@ -1691,10 +1691,20 @@ fn encode_pdf417(data: &str) -> ProdResult<(String, Vec<bool>, usize, usize, f64
     let body = pdf417_compact_codewords(data.as_bytes());
     let ec_level: u8 = if body.len() <= 40 { 2 } else { 3 };
     let ecc_len = 1usize << (ec_level + 1);
-    let cols = ((body.len() + ecc_len + 1).div_ceil(12)).clamp(2, 12);
     let total_raw = 1 + body.len() + ecc_len;
+    if total_raw > 90 * 12 {
+        return Err(ProdError::BarcodeError(format!(
+            "PDF417 payload exceeds maximum 1080-codeword matrix capacity ({total_raw} > 1080)"
+        )));
+    }
+    let cols = (total_raw.div_ceil(12)).clamp(2, 12);
     let rows = total_raw.div_ceil(cols).clamp(3, 90);
     let total_cells = rows * cols;
+    if total_cells < total_raw {
+        return Err(ProdError::BarcodeError(format!(
+            "PDF417 matrix capacity {total_cells} insufficient for {total_raw} codewords"
+        )));
+    }
     let pad_len = total_cells - ecc_len - 1 - body.len();
 
     let mut data_cw = Vec::with_capacity(total_cells - ecc_len);

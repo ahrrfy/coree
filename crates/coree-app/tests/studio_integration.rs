@@ -10,7 +10,7 @@ use coree_app::cli::{execute_cli, Cli, CliOutcome};
 use coree_app::io_bridge::{import_document_into, read_text_file_bounded, UniversalExportOptions};
 use coree_app::shortcuts::{resolve_shortcut, ShortcutAction, ShortcutProfile};
 use coree_app::state::{
-    BitmapDockerState, DockerTab, LensDockerState, StudioApp, ToolId, TOOL_GROUPS,
+    BitmapDockerState, DockerTab, LensDockerState, StudioApp, ToolId, WorkspacePreset, TOOL_GROUPS,
 };
 use coree_app::theme::{apply_theme, StudioLanguage, StudioTheme};
 use coree_core::{
@@ -873,7 +873,7 @@ fn studio_app_vector_effects_bitmap_studio_trace_macros_and_async_jobs() {
 
     let async_svg = tmp.path().join("async_export.svg");
     app.export_active_async(async_svg.clone(), UniversalExportOptions::default());
-    for _ in 0..500 {
+    for _ in 0..2000 {
         app.tick_background_jobs();
         if app.active_jobs.is_empty() {
             break;
@@ -2799,6 +2799,8 @@ fn w1b_r2_app_wiring_shape_close_align_print_marks_trace_bitmap_and_resample() {
         height_mm: Some(100.0),
         bleed_mm: None,
         facing_pages: None,
+        background_fill: None,
+        printable_background: None,
     })
     .unwrap();
     assert!(
@@ -2845,6 +2847,7 @@ fn w1b_r2_app_wiring_shape_close_align_print_marks_trace_bitmap_and_resample() {
         clear_gray_icc: false,
         rendering_intent: None,
         black_point_compensation: None,
+        drawing_scale: None,
     })
     .unwrap();
     assert_eq!(
@@ -3112,6 +3115,7 @@ fn w1b_r2_app_wiring_shape_close_align_print_marks_trace_bitmap_and_resample() {
             width_mm: 20.0,
             height_mm: 20.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -4146,6 +4150,7 @@ fn w1b_r10_cross_tab_paste_clipboard_sanitizes_styles_symbols_and_object_refs() 
                 width_mm: 10.0,
                 height_mm: 10.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )],
@@ -4859,6 +4864,7 @@ fn w1b_r11_paste_clipboard_respects_locked_hidden_layers_and_active_page() {
         clear_gray_icc: false,
         rendering_intent: None,
         black_point_compensation: None,
+        drawing_scale: None,
     })
     .unwrap();
 
@@ -5504,6 +5510,7 @@ fn w1b_r13_studio_creation_refuses_locked_and_hidden_active_layers_and_propagate
                 width_mm: 20.0,
                 height_mm: 20.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         ),
@@ -6114,6 +6121,7 @@ fn w1b_r14_apply_raster_filter_locked_emits_error_toast() {
             width_mm: 20.0,
             height_mm: 20.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -6255,6 +6263,8 @@ fn w1b_r14_duplicate_page_preserves_facing_pages() {
         height_mm: None,
         bleed_mm: None,
         facing_pages: Some(true),
+        background_fill: None,
+        printable_background: None,
     })
     .unwrap();
     app.duplicate_page(0);
@@ -6625,6 +6635,7 @@ fn w1b_r15_convert_to_bitmap_and_trace_raster_preserve_nested_world_coords() {
             width_mm: 20.0,
             height_mm: 20.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -7231,6 +7242,7 @@ fn w1b_r16_trace_selected_raster_filters_and_crop_rect() {
                         height_mm: 40.0,
                         crop_rect: Some(Rect2D::from_xywh(20.0, 20.0, 20.0, 20.0)),
                         filters: vec![coree_core::RasterFilter::Invert],
+                        filter_enabled: vec![true],
                     }),
                 ),
                 Some(lid),
@@ -8000,6 +8012,7 @@ fn w1b_r17_trace_selected_raster_fallback_skips_locked_hidden_and_other_page() {
                 width_mm: 20.0,
                 height_mm: 20.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )
@@ -8957,6 +8970,7 @@ fn w3a_frozen_lens_capture_masked_brushes_16bit_convert_and_wal_compaction() {
             width_mm: 32.0,
             height_mm: 32.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     )
@@ -9742,6 +9756,7 @@ fn w3a_r9_wal_delete_page_and_icc_undo_redo_recovery() {
         clear_gray_icc: false,
         rendering_intent: Some(RenderingIntent::Perceptual),
         black_point_compensation: None,
+        drawing_scale: None,
     })
     .unwrap();
     app.perform_autosave_active().unwrap();
@@ -10125,4 +10140,514 @@ fn font_manager_docker_glyphs_quarantine_and_panose_substitution() {
     let mut full_out = ctx.run_ui(raw, |ui| app.render_ui(ui));
     full_out.textures_delta.clear();
     assert!(!full_out.shapes.is_empty());
+}
+
+// =============================================================================
+// Wave 5.A Integration & UI Coverage (`W5.A`)
+// =============================================================================
+
+#[test]
+fn w5a_welcome_templates_cdt_and_recovery_hub() {
+    let tmp = TempTestDir::new("w5a-welcome");
+    let db_path = tmp.path().join("studio.db");
+    let db = StorageDb::open(&db_path).expect("open db");
+    let mut app = StudioApp::new_with_storage(db);
+    app.show_welcome = true;
+    assert!(
+        !app.templates.is_empty(),
+        "offline SQLite templates must be seeded on first launch"
+    );
+
+    // Render Welcome Hub headlessly with category filter
+    app.template_category_filter = Some("print".to_owned());
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+    assert!(!out.shapes.is_empty());
+
+    // Create document from SQLite template, save as .cdt template, and reopen via template record
+    let first_tpl = app.templates[0].clone();
+    app.create_document_from_template(&first_tpl);
+    assert!(!app.show_welcome);
+    let cdt_path = tmp.path().join("custom_flyer.cdt");
+    app.save_active_as_cdt_template(&cdt_path, "custom", "W5A test template")
+        .expect("save .cdt template");
+    assert!(cdt_path.is_file());
+    let saved_tpl = app
+        .templates
+        .iter()
+        .find(|t| t.template_path == cdt_path.to_string_lossy())
+        .cloned()
+        .expect("saved .cdt template listed in StudioApp::templates");
+    let tabs_before = app.tabs.len();
+    app.create_document_from_template(&saved_tpl);
+    assert_eq!(app.tabs.len(), tabs_before + 1);
+}
+
+#[test]
+fn w5a_illustrator_workspace_preset_and_rearrange_docker_tabs() {
+    let mut app = StudioApp::new_headless();
+    app.apply_workspace_preset(WorkspacePreset::Illustrator);
+    assert_eq!(app.active_workspace_preset, WorkspacePreset::Illustrator);
+    assert_eq!(app.shortcut_profile, ShortcutProfile::StandardVector);
+    assert!(app.toolbox_two_column);
+    assert!(app.show_dockers);
+
+    // Rearrange docker tabs & export/import workspace bundle roundtrip
+    app.focus_docker(DockerTab::CdrInspector);
+    app.toolbar_config.show_drawing_scale = false;
+    let json = app.export_workspace_json();
+    let mut app2 = StudioApp::new_headless();
+    app2.import_workspace_json(&json).expect("import .coreews");
+    assert_eq!(app2.active_workspace_preset, WorkspacePreset::Illustrator);
+    assert!(!app2.toolbar_config.show_drawing_scale);
+    assert!(app2.dock_state.find_tab(&DockerTab::CdrInspector).is_some());
+}
+
+#[test]
+fn w5a_toggle_dockers_and_toolbar_config_persistence() {
+    let tmp = TempTestDir::new("w5a-docker-persist");
+    let db_path = tmp.path().join("studio.db");
+    {
+        let db = StorageDb::open(&db_path).expect("open db");
+        let mut app = StudioApp::new_with_storage(db);
+        app.show_dockers = false;
+        app.toolbar_config.show_snap_toggles = false;
+        app.shutdown_cleanly();
+    }
+    let db2 = StorageDb::open(&db_path).expect("reopen db");
+    let app2 = StudioApp::new_with_storage(db2);
+    assert!(!app2.show_dockers);
+    assert!(!app2.toolbar_config.show_snap_toggles);
+}
+
+#[test]
+fn w5a_navigator_pan_zoom_and_simple_wireframe_view() {
+    let mut app = StudioApp::new_headless();
+    app.show_navigator_popup = true;
+    if let Some(tab) = app.active_tab_mut() {
+        tab.view_mode = coree_render::ViewMode::SimpleWireframe;
+        tab.viewport.pan_mm = Point2D::new(42.0, 64.0);
+        tab.viewport.zoom = 1.75;
+    }
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+    assert!(!out.shapes.is_empty());
+    assert!(app.show_navigator_popup);
+}
+
+#[test]
+fn w5a_reorder_pages_and_reorder_layers_and_cut_toggle() {
+    let mut app = StudioApp::new_headless();
+    app.execute_command(CommandOp::AddPage {
+        name: "Page 2".to_owned(),
+        width_mm: 210.0,
+        height_mm: 297.0,
+        bleed_mm: 3.0,
+    })
+    .unwrap();
+    let p_ids: Vec<_> = app
+        .active_tab()
+        .unwrap()
+        .document
+        .pages()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(p_ids.len(), 2);
+    app.execute_command(CommandOp::ReorderPages {
+        page_ids: vec![p_ids[1], p_ids[0]],
+    })
+    .unwrap();
+    assert_eq!(app.active_tab().unwrap().document.pages()[0].id, p_ids[1]);
+
+    // Add second layer on active page, toggle is_cut_layer, and reorder layers
+    let active_pi = app.active_tab().unwrap().document.active_page_index();
+    let pid = app.active_tab().unwrap().document.pages()[active_pi].id;
+    app.add_layer_active(
+        "Cut Layer".to_owned(),
+        false,
+        coree_core::MasterLayerScope::None,
+    );
+    let l_ids: Vec<_> = app.active_tab().unwrap().document.pages()[active_pi]
+        .layers
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    assert!(l_ids.len() >= 2);
+    app.execute_command(CommandOp::SetLayerFlags {
+        layer_id: l_ids[1],
+        visible: None,
+        locked: None,
+        printable: None,
+        is_cut_layer: Some(true),
+    })
+    .unwrap();
+    assert!(app.active_tab().unwrap().document.pages()[active_pi].layers[1].is_cut_layer);
+    app.execute_command(CommandOp::ReorderLayers {
+        page_id: pid,
+        layer_ids: vec![l_ids[1], l_ids[0]],
+    })
+    .unwrap();
+    assert_eq!(
+        app.active_tab().unwrap().document.pages()[active_pi].layers[0].id,
+        l_ids[1]
+    );
+}
+
+#[test]
+fn w5a_autofit_facing_pages_drawing_scale_and_printable_background() {
+    let mut app = StudioApp::new_headless();
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(20.0, 20.0, 60.0, 40.0));
+    app.autofit_active_page(5.0);
+
+    let pid = app.active_tab().unwrap().document.active_page().unwrap().id;
+    app.execute_command(CommandOp::SetPageProperties {
+        page_id: pid,
+        name: None,
+        width_mm: None,
+        height_mm: None,
+        bleed_mm: None,
+        facing_pages: Some(true),
+        background_fill: Some(Fill::Solid(Color::rgba8(240, 235, 220, 255))),
+        printable_background: Some(true),
+    })
+    .unwrap();
+    app.execute_command(CommandOp::SetDocumentProperties {
+        title: None,
+        color_mode: None,
+        default_unit: None,
+        dpi: None,
+        multipage_view: Some(true),
+        active_page_index: None,
+        metadata: None,
+        custom_icc_profile: None,
+        clear_custom_icc: false,
+        rgb_icc_profile: None,
+        clear_rgb_icc: false,
+        cmyk_icc_profile: None,
+        clear_cmyk_icc: false,
+        gray_icc_profile: None,
+        clear_gray_icc: false,
+        rendering_intent: None,
+        black_point_compensation: None,
+        drawing_scale: Some(coree_core::DrawingScale::new(1.0, 10.0)),
+    })
+    .unwrap();
+    let tab = app.active_tab().unwrap();
+    assert!(tab.document.active_page().unwrap().facing_pages);
+    assert!(tab.document.active_page().unwrap().printable_background);
+    assert!((tab.document.drawing_scale().scale_factor() - 10.0).abs() < 1e-6);
+}
+
+#[test]
+fn w5a_trace_split_preview_and_cli_large_png_oversize() {
+    let mut app = StudioApp::new_headless();
+    let asset =
+        coree_core::RasterAsset::new(16, 16, vec![20u8; 16 * 16 * 4], 150.0, ColorMode::Rgb)
+            .unwrap();
+    let aid = asset.id;
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "SplitTraceBmp",
+        NodePayload::Raster(coree_core::RasterLayerData {
+            asset_id: aid,
+            width_mm: 20.0,
+            height_mm: 20.0,
+            filters: Vec::new(),
+            filter_enabled: Vec::new(),
+            crop_rect: None,
+        }),
+    );
+    app.execute_command(CommandOp::Batch(vec![
+        CommandOp::RegisterAsset { asset },
+        CommandOp::create_object(obj, None),
+    ]))
+    .unwrap();
+    app.trace_state.split_preview = true;
+    app.trace_state.split_divider = 0.4;
+    app.focus_docker(DockerTab::VectorTrace);
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+    assert!(app.trace_state.split_preview_cache.borrow().is_some());
+}
+
+#[test]
+fn w5a_trace_filtered_stack_respects_disabled_filters() {
+    let mut app = StudioApp::new_headless();
+    let rgba = vec![255u8; 16 * 16 * 4];
+    let asset = coree_core::RasterAsset::new(16, 16, rgba, 150.0, ColorMode::Rgb).unwrap();
+    let aid = asset.id;
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "FilteredTraceBmp",
+        NodePayload::Raster(coree_core::RasterLayerData {
+            asset_id: aid,
+            width_mm: 20.0,
+            height_mm: 20.0,
+            filters: vec![coree_core::RasterFilter::Invert],
+            filter_enabled: vec![false],
+            crop_rect: None,
+        }),
+    );
+    app.execute_command(CommandOp::Batch(vec![
+        CommandOp::RegisterAsset { asset },
+        CommandOp::create_object(obj, None),
+    ]))
+    .unwrap();
+    let oid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .last()
+        .unwrap();
+    if let Some(tab) = app.active_tab_mut() {
+        let doc_snap = tab.document.clone();
+        tab.selection.select_single(&doc_snap, oid);
+    }
+    let rdata = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(oid)
+        .unwrap()
+        .payload
+    {
+        NodePayload::Raster(r) => r.clone(),
+        _ => panic!("expected raster"),
+    };
+    assert!(rdata.active_filters().is_empty());
+    let hist = app.selected_bitmap_histogram(64).expect("64-bin histogram");
+    assert_eq!(hist.bins, 64);
+}
+
+#[test]
+fn w5a_tint_grid_and_drag_swatch_drop_to_canvas() {
+    let tints = coree_app::ui::palette_bar::build_tint_grid_colors(&Color::CYAN);
+    assert_eq!(tints.len(), 25);
+    let mut app = StudioApp::new_headless();
+    app.tint_grid_popup = Some((Color::CYAN, egui::pos2(800.0, 200.0)));
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 40.0, 40.0));
+    let oid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+    if let Some(tab) = app.active_tab_mut() {
+        let doc_snap = tab.document.clone();
+        tab.selection.select_single(&doc_snap, oid);
+    }
+    app.apply_fill_color(tints[12].clone());
+    assert!(matches!(
+        app.active_tab().unwrap().document.object(oid).unwrap().fill,
+        Fill::Solid(_)
+    ));
+}
+
+#[test]
+fn w5a_i18n_rtl_shell_directions_and_arabic_ui_render() {
+    let mut app = StudioApp::new_headless();
+    app.set_ui_language(coree_app::theme::StudioLanguage::Arabic);
+    let dirs = coree_app::i18n::ShellLayoutDirections::from_language(app.ui_language);
+    assert!(dirs.is_rtl);
+    assert!(dirs.toolbox_on_right);
+    assert!(dirs.palette_on_left);
+    assert!(dirs.dockers_on_left);
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+    assert!(!out.shapes.is_empty());
+}
+
+#[test]
+fn w5a_find_replace_ui_build_query_and_replace_outline_font() {
+    let mut app = StudioApp::new_headless();
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 40.0, 30.0));
+    let oid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+    let red = Color::rgba8(255, 0, 0, 255);
+    app.execute_command(CommandOp::SetOutline {
+        ids: vec![oid],
+        outline: OutlineStyle::solid(red.clone(), 1.0),
+    })
+    .unwrap();
+
+    app.find_replace_state.use_outline_color = true;
+    app.find_replace_state.find_outline_color = red;
+    app.find_replace_state.use_outline_width = true;
+    app.find_replace_state.outline_width_min_mm = 0.5;
+    app.find_replace_state.outline_width_max_mm = 2.0;
+    let q = app.build_find_query();
+    assert!(q.outline_color.is_some());
+    assert_eq!(q.outline_width_min_mm, Some(0.5));
+    assert_eq!(q.outline_width_max_mm, Some(2.0));
+
+    let rep = app.run_find_and_replace_action(coree_prod::ReplaceAction::ReplaceOutlineColor {
+        color: Color::MAGENTA,
+    });
+    assert_eq!(rep.matched_ids, vec![oid]);
+    assert_eq!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(oid)
+            .unwrap()
+            .outline
+            .color,
+        Color::MAGENTA
+    );
+}
+
+#[test]
+fn w5a_crlfom_missing_font_panose_modal_and_sqlite_persist() {
+    let tmp = TempTestDir::new("w5a-crlfom");
+    let db_path = tmp.path().join("studio.db");
+    let db = StorageDb::open(&db_path).expect("open db");
+    let mut app = StudioApp::new_with_storage(db);
+    let art = ArtisticText::from_plain(
+        "Hello World",
+        TextStyle {
+            font_family: "NonExistentW5TestFont_XYZ".to_owned(),
+            ..TextStyle::default()
+        },
+    );
+    let text_obj = SceneObject::new(
+        ObjectId(0),
+        "MissingFontText",
+        NodePayload::ArtisticText(art),
+    );
+    app.execute_command(CommandOp::create_object(text_obj, None))
+        .unwrap();
+    app.check_missing_fonts_on_active_tab("MissingFontDoc");
+    assert!(app.missing_font_dialog.open);
+    assert_eq!(app.missing_font_dialog.entries.len(), 1);
+    assert_eq!(
+        app.missing_font_dialog.entries[0].missing_family,
+        "NonExistentW5TestFont_XYZ"
+    );
+    app.missing_font_dialog.entries[0].selected_family = "Noto Sans".to_owned();
+    let replaced = app.apply_missing_font_dialog_substitutions();
+    assert_eq!(replaced, 1);
+    assert!(!app.missing_font_dialog.open);
+    assert!(!app.list_font_substitutions().is_empty());
+}
+
+#[test]
+fn w5a_cdr_cp1256_import_and_hex_inspector_dump() {
+    let tmp = TempTestDir::new("w5a-cp1256-hex");
+    let mut doc = Document::new_a4("Arabic CP1256 CDR");
+    let cdr_path = tmp.path().join("legacy_ar.cdr");
+    coree_cdr::export_cdr(&doc, &cdr_path, coree_cdr::CdrWriteVersion::RiffV12).unwrap();
+    let _ = &mut doc;
+
+    let mut app = StudioApp::new_headless();
+    app.open_file_path_with_codepage(&cdr_path, Some(1256))
+        .expect("open CDR with CP1256");
+    let rep = app
+        .active_tab()
+        .unwrap()
+        .inspection_report
+        .as_ref()
+        .expect("inspection report attached");
+    assert!(!rep.chunks.is_empty());
+    let hex_dump = coree_app::cdr_bridge::format_inspection_hex_dumps(rep);
+    assert!(hex_dump.contains("Chunk") || !rep.chunks.is_empty());
+
+    app.selected_cdr_chunk_idx = Some(0);
+    app.focus_docker(DockerTab::CdrInspector);
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out.textures_delta.clear();
+    assert!(!out.shapes.is_empty());
+}
+
+#[test]
+fn w5a_bitmap_filter_stack_tone_curve_channel_mixer_and_patterns() {
+    let mut app = StudioApp::new_headless();
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 50.0, 40.0));
+    let oid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+    if let Some(tab) = app.active_tab_mut() {
+        let doc_snap = tab.document.clone();
+        tab.selection.select_single(&doc_snap, oid);
+    }
+
+    let sym = coree_core::SymbolDef::new("PatSym", Vec::new());
+    let sid = sym.id;
+    app.execute_command(CommandOp::UpsertSymbol { symbol: sym })
+        .unwrap();
+    app.apply_fill(Fill::VectorPattern {
+        symbol_id: sid,
+        tile_w: 10.0,
+        tile_h: 10.0,
+    });
+    assert!(matches!(
+        app.active_tab().unwrap().document.object(oid).unwrap().fill,
+        Fill::VectorPattern { .. }
+    ));
+
+    app.bitmap_state.filter_idx = 1; // ToneCurve
+    let tc = app.bitmap_state.build_filter();
+    assert!(matches!(tc, coree_core::RasterFilter::ToneCurve { .. }));
+    app.bitmap_state.filter_idx = 19; // ChannelMixer
+    let cm = app.bitmap_state.build_filter();
+    assert!(matches!(cm, coree_core::RasterFilter::ChannelMixer { .. }));
 }

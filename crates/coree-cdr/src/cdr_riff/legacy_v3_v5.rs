@@ -261,7 +261,10 @@ pub(crate) fn parse_v3_v5_outl(data: &[u8]) -> Option<(u32, OutlineStyle, bool)>
 }
 
 /// Parses a legacy CDR v3–v5 `txsm` chunk (`[u8 0x03, u8 is_para, u16 codepage, u16 pt_size, u16 len, bytes...]`).
-pub(crate) fn parse_v3_v5_txsm(data: &[u8]) -> CdrResult<Option<NodePayload>> {
+pub(crate) fn parse_v3_v5_txsm(
+    data: &[u8],
+    default_codepage: Option<u16>,
+) -> CdrResult<Option<NodePayload>> {
     if data.len() < 8 || data[0] != 0x03 {
         return Ok(None);
     }
@@ -272,7 +275,11 @@ pub(crate) fn parse_v3_v5_txsm(data: &[u8]) -> CdrResult<Option<NodePayload>> {
     let pt_size = f64::from(r.read_u16_le("v3-5 txsm pt")?.max(4));
     let len = usize::from(r.read_u16_le("v3-5 txsm len")?);
     let text_bytes = r.read_bytes(len, "v3-5 txsm text")?;
-    let decoded = decode_cdr_text(text_bytes, (cp != 0).then_some(cp), None);
+    let decoded = decode_cdr_text(
+        text_bytes,
+        (cp != 0).then_some(cp).or(default_codepage),
+        None,
+    );
     let style = TextStyle {
         font_size_pt: pt_size,
         ..TextStyle::default()

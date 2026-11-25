@@ -48,8 +48,14 @@ pub fn show_dockers_panel(ui: &mut Ui, app: &mut StudioApp) {
     }
     let tokens = app.theme.tokens();
     let d_style = dock_style(&tokens, ui.style());
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(app.ui_language);
 
-    egui::Panel::right("coree_dockers_host")
+    let panel = if shell_dir.dockers_on_left {
+        egui::Panel::left("coree_dockers_host")
+    } else {
+        egui::Panel::right("coree_dockers_host")
+    };
+    panel
         .resizable(true)
         .default_size(DOCKER_DEFAULT_WIDTH)
         .size_range(DOCKER_MIN_WIDTH..=DOCKER_MAX_WIDTH)
@@ -89,23 +95,26 @@ impl TabViewer for StudioDockViewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
+        let shell_dir = crate::i18n::ShellLayoutDirections::from_language(self.app.ui_language);
         egui::ScrollArea::vertical()
             .id_salt(("docker_scroll", *tab))
-            .show(ui, |ui| match *tab {
-                DockerTab::Objects => ui_objects_docker(ui, self.app),
-                DockerTab::Properties => ui_properties_docker(ui, self.app),
-                DockerTab::Lens => ui_lens_docker(ui, self.app),
-                DockerTab::Effects => ui_effects_docker(ui, self.app),
-                DockerTab::TransformAlignShape => ui_transform_align_shape_docker(ui, self.app),
-                DockerTab::VectorTrace => ui_vector_trace_docker(ui, self.app),
-                DockerTab::BitmapStudio => ui_bitmap_studio_docker(ui, self.app),
-                DockerTab::Production => ui_production_docker(ui, self.app),
-                DockerTab::FindReplace => ui_find_replace_docker(ui, self.app),
-                DockerTab::SymbolsStyles => ui_symbols_styles_docker(ui, self.app),
-                DockerTab::FontManager => ui_font_manager_docker(ui, self.app),
-                DockerTab::History => ui_history_docker(ui, self.app),
-                DockerTab::Macros => ui_macros_docker(ui, self.app),
-                DockerTab::CdrInspector => ui_cdr_inspector_docker(ui, self.app),
+            .show(ui, |ui| {
+                shell_dir.with_vertical(ui, |ui| match *tab {
+                    DockerTab::Objects => ui_objects_docker(ui, self.app),
+                    DockerTab::Properties => ui_properties_docker(ui, self.app),
+                    DockerTab::Lens => ui_lens_docker(ui, self.app),
+                    DockerTab::Effects => ui_effects_docker(ui, self.app),
+                    DockerTab::TransformAlignShape => ui_transform_align_shape_docker(ui, self.app),
+                    DockerTab::VectorTrace => ui_vector_trace_docker(ui, self.app),
+                    DockerTab::BitmapStudio => ui_bitmap_studio_docker(ui, self.app),
+                    DockerTab::Production => ui_production_docker(ui, self.app),
+                    DockerTab::FindReplace => ui_find_replace_docker(ui, self.app),
+                    DockerTab::SymbolsStyles => ui_symbols_styles_docker(ui, self.app),
+                    DockerTab::FontManager => ui_font_manager_docker(ui, self.app),
+                    DockerTab::History => ui_history_docker(ui, self.app),
+                    DockerTab::Macros => ui_macros_docker(ui, self.app),
+                    DockerTab::CdrInspector => ui_cdr_inspector_docker(ui, self.app),
+                });
             });
     }
 }
@@ -116,163 +125,334 @@ impl TabViewer for StudioDockViewer<'_> {
 
 fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
-    ui.horizontal(|ui| {
-        if ui.small_button("+ Layer").clicked() {
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    shell_dir.with_horizontal(ui, |ui| {
+        if ui
+            .small_button(crate::i18n::I18nKey::ObjAddLayer.tr_ui(lang))
+            .clicked()
+        {
             let n = app
                 .active_tab()
                 .and_then(|t| t.document.active_page())
                 .map_or(2, |p| p.layers.len() + 1);
             app.add_layer_active(format!("Layer {n}"), false, MasterLayerScope::None);
         }
-        if ui.small_button("+ Cut Layer").clicked() {
+        if ui
+            .small_button(crate::i18n::I18nKey::ObjAddCutLayer.tr_ui(lang))
+            .clicked()
+        {
             app.add_layer_active("CutContour".to_owned(), true, MasterLayerScope::None);
         }
-        if ui.small_button("+ Master").clicked() {
+        if ui
+            .small_button(crate::i18n::I18nKey::ObjAddMasterLayer.tr_ui(lang))
+            .clicked()
+        {
             app.add_layer_active("Master".to_owned(), false, MasterLayerScope::AllPages);
         }
         if ui
-            .small_button("Desktop")
-            .on_hover_text("Move selection to persistent cross-page Desktop layer")
+            .small_button(crate::i18n::I18nKey::ObjDesktopLayer.tr_ui(lang))
+            .on_hover_text(crate::i18n::I18nKey::ObjectMoveToDesktop.tr_ui(lang))
             .clicked()
         {
             app.move_selection_to_desktop_layer();
         }
     });
-    ui.horizontal(|ui| {
-        if ui.small_button("⬆ Front").clicked() {
+    shell_dir.with_horizontal(ui, |ui| {
+        if ui
+            .small_button(format!(
+                "⬆ {}",
+                crate::i18n::I18nKey::ObjectOrderToFront.tr_ui(lang)
+            ))
+            .clicked()
+        {
             app.apply_z_order(ZOrderOp::BringToFront);
         }
-        if ui.small_button("↑ Up").clicked() {
+        if ui
+            .small_button(format!(
+                "↑ {}",
+                crate::i18n::I18nKey::ObjectOrderForwardOne.tr_ui(lang)
+            ))
+            .clicked()
+        {
             app.apply_z_order(ZOrderOp::BringForward);
         }
-        if ui.small_button("↓ Down").clicked() {
+        if ui
+            .small_button(format!(
+                "↓ {}",
+                crate::i18n::I18nKey::ObjectOrderBackOne.tr_ui(lang)
+            ))
+            .clicked()
+        {
             app.apply_z_order(ZOrderOp::SendBackward);
         }
-        if ui.small_button("⬇ Back").clicked() {
+        if ui
+            .small_button(format!(
+                "⬇ {}",
+                crate::i18n::I18nKey::ObjectOrderToBack.tr_ui(lang)
+            ))
+            .clicked()
+        {
             app.apply_z_order(ZOrderOp::SendToBack);
+        }
+    });
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.label(crate::i18n::I18nKey::ObjSearchFilter.tr_ui(lang));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.objects_filter)
+                .desired_width(160.0)
+                .hint_text("Name or @CQL (@outline.hairline)"),
+        );
+        if !app.objects_filter.is_empty() && ui.small_button("✕").clicked() {
+            app.objects_filter.clear();
         }
     });
     ui.separator();
 
-    let Some(tab) = app.active_tab_mut() else {
-        ui.label("No active document.");
-        return;
+    let filter_trim = app.objects_filter.trim().to_owned();
+    let parsed_cql = if filter_trim.starts_with('@') {
+        coree_prod::parse_cql_query(&filter_trim).ok()
+    } else {
+        None
     };
 
     let mut flag_ops = Vec::new();
-    let page_count = tab.document.pages().len();
+    let mut reorder_layer_cmd: Option<CommandOp> = None;
+    let mut reorder_objs_cmd: Option<CommandOp> = None;
+    let mut fit_powerclip_req: Option<(ObjectId, coree_core::PowerClipFitMode)> = None;
 
-    for p_idx in 0..page_count {
-        let p_name = tab.document.pages()[p_idx].name.clone();
-        let is_active_page = p_idx == tab.document.active_page_index();
-        let hdr = if is_active_page {
-            RichText::new(format!("📄 {p_name}"))
-                .strong()
-                .color(tokens.accent)
-        } else {
-            RichText::new(format!("📄 {p_name}")).color(tokens.text_muted)
+    {
+        let Some(tab) = app.active_tab_mut() else {
+            ui.label(crate::i18n::I18nKey::ErrorNoActiveDocument.tr_ui(lang));
+            return;
         };
-        egui::CollapsingHeader::new(hdr)
-            .id_salt(("obj_page", p_idx))
-            .default_open(is_active_page)
-            .show(ui, |ui| {
-                let layer_ids: Vec<_> = tab.document.pages()[p_idx]
-                    .layers
-                    .iter()
-                    .rev()
-                    .map(|l| {
-                        (
-                            l.id,
-                            l.name.clone(),
-                            l.visible,
-                            l.locked,
-                            l.printable,
-                            l.is_cut_layer,
-                            l.is_desktop_layer,
-                            l.master_scope,
-                            l.objects.clone(),
-                        )
-                    })
-                    .collect();
 
-                for (lid, lname, vis, lck, prn, is_cut, is_desktop, scope, objs) in layer_ids {
-                    ui.horizontal(|ui| {
-                        let is_act_layer = tab.active_layer_id == Some(lid);
-                        if ui
-                            .selectable_label(is_act_layer, RichText::new(&lname).strong())
-                            .clicked()
-                        {
-                            tab.active_layer_id = Some(lid);
-                            let _ = tab.document.set_active_page_index(p_idx);
-                        }
-                        if is_cut {
-                            ui.label(RichText::new("CUT").size(9.5).color(tokens.cutcontour));
-                        }
-                        if is_desktop {
-                            ui.label(RichText::new("DESKTOP").size(9.5).color(tokens.accent));
-                        } else if scope != MasterLayerScope::None {
-                            ui.label(
-                                RichText::new("MASTER")
-                                    .size(9.5)
-                                    .color(tokens.accent_secondary),
+        let page_count = tab.document.pages().len();
+
+        for p_idx in 0..page_count {
+            let page_id = tab.document.pages()[p_idx].id;
+            let p_name = tab.document.pages()[p_idx].name.clone();
+            let is_active_page = p_idx == tab.document.active_page_index();
+            let hdr = if is_active_page {
+                RichText::new(format!("📄 {p_name}"))
+                    .strong()
+                    .color(tokens.accent)
+            } else {
+                RichText::new(format!("📄 {p_name}")).color(tokens.text_muted)
+            };
+            egui::CollapsingHeader::new(hdr)
+                .id_salt(("obj_page", p_idx))
+                .default_open(is_active_page)
+                .show(ui, |ui| {
+                    let bottom_to_top_layer_ids: Vec<_> = tab.document.pages()[p_idx]
+                        .layers
+                        .iter()
+                        .map(|l| l.id)
+                        .collect();
+                    let layer_ids: Vec<_> = tab.document.pages()[p_idx]
+                        .layers
+                        .iter()
+                        .rev()
+                        .map(|l| {
+                            (
+                                l.id,
+                                l.name.clone(),
+                                l.visible,
+                                l.locked,
+                                l.printable,
+                                l.is_cut_layer,
+                                l.is_desktop_layer,
+                                l.master_scope,
+                                l.objects.clone(),
+                            )
+                        })
+                        .collect();
+
+                    for (lid, lname, vis, lck, prn, is_cut, is_desktop, scope, objs) in layer_ids {
+                        ui.horizontal(|ui| {
+                            let is_act_layer = tab.active_layer_id == Some(lid);
+                            let layer_btn = ui.add(
+                                egui::Button::new(RichText::new(&lname).strong().color(
+                                    if is_act_layer {
+                                        tokens.accent
+                                    } else {
+                                        tokens.text
+                                    },
+                                ))
+                                .frame(is_act_layer)
+                                .sense(egui::Sense::click_and_drag()),
                             );
-                        }
-                        if ui
-                            .small_button(if vis { "👁" } else { "—" })
-                            .on_hover_text("Toggle Visible")
-                            .clicked()
-                        {
-                            flag_ops.push((lid, Some(!vis), None, None, None));
-                        }
-                        if ui
-                            .small_button(if lck { "🔒" } else { "🔓" })
-                            .on_hover_text("Toggle Lock")
-                            .clicked()
-                        {
-                            flag_ops.push((lid, None, Some(!lck), None, None));
-                        }
-                        if ui
-                            .small_button(if prn { "🖨" } else { "⊘" })
-                            .on_hover_text("Toggle Printable")
-                            .clicked()
-                        {
-                            flag_ops.push((lid, None, None, Some(!prn), None));
-                        }
-                    });
-
-                    ui.indent(("layer_objs", lid), |ui| {
-                        for &oid in objs.iter().rev() {
-                            if let Some(obj) = tab.document.object(oid) {
-                                let selected = tab.selection.contains(oid);
-                                let badge = match &obj.payload {
-                                    NodePayload::Group(c) => format!(" [Grp:{}]", c.len()),
-                                    NodePayload::PowerClip { contents, .. } => {
-                                        format!(" [Clip:{}]", contents.len())
+                            if layer_btn.drag_started() {
+                                egui::DragAndDrop::set_payload(ui.ctx(), (page_id, lid));
+                            }
+                            if let Some(payload) = layer_btn
+                                .dnd_release_payload::<(coree_core::PageId, coree_core::LayerId)>()
+                            {
+                                let (src_pid, src_lid) = *payload;
+                                if src_pid == page_id && src_lid != lid {
+                                    let mut next = bottom_to_top_layer_ids.clone();
+                                    if let (Some(from_i), Some(to_i)) = (
+                                        next.iter().position(|&x| x == src_lid),
+                                        next.iter().position(|&x| x == lid),
+                                    ) {
+                                        let item = next.remove(from_i);
+                                        next.insert(to_i, item);
+                                        reorder_layer_cmd = Some(CommandOp::ReorderLayers {
+                                            page_id,
+                                            layer_ids: next,
+                                        });
                                     }
-                                    NodePayload::Raster(_) => " [Img]".to_owned(),
-                                    NodePayload::ArtisticText(_)
-                                    | NodePayload::ParagraphText(_) => " [Txt]".to_owned(),
-                                    _ => String::new(),
-                                };
-                                let lens_tag = obj
-                                    .lens
-                                    .as_ref()
-                                    .map(|l| format!(" ◉{}", l.kind.name()))
-                                    .unwrap_or_default();
-                                let label = format!("{}{badge}{lens_tag}", obj.name);
-                                if ui.selectable_label(selected, label).clicked() {
-                                    let _ = tab.document.set_active_page_index(p_idx);
-                                    tab.active_layer_id = Some(lid);
-                                    tab.sync_active_layer();
-                                    tab.selection.select_single(&tab.document, oid);
-                                    tab.metrics_dirty = true;
-                                    tab.needs_rerender = true;
                                 }
                             }
-                        }
-                    });
-                }
-            });
+                            if layer_btn.clicked() {
+                                tab.active_layer_id = Some(lid);
+                                let _ = tab.document.set_active_page_index(p_idx);
+                            }
+                            if ui
+                                .small_button(RichText::new("CUT").size(9.5).color(if is_cut {
+                                    tokens.cutcontour
+                                } else {
+                                    tokens.text_muted
+                                }))
+                                .on_hover_text("Toggle Cut Layer (CutContour)")
+                                .clicked()
+                            {
+                                flag_ops.push((lid, None, None, None, Some(!is_cut)));
+                            }
+                            if is_desktop {
+                                ui.label(RichText::new("DESKTOP").size(9.5).color(tokens.accent));
+                            } else if scope != MasterLayerScope::None {
+                                ui.label(
+                                    RichText::new("MASTER")
+                                        .size(9.5)
+                                        .color(tokens.accent_secondary),
+                                );
+                            }
+                            if ui
+                                .small_button(if vis { "👁" } else { "—" })
+                                .on_hover_text("Toggle Visible")
+                                .clicked()
+                            {
+                                flag_ops.push((lid, Some(!vis), None, None, None));
+                            }
+                            if ui
+                                .small_button(if lck { "🔒" } else { "🔓" })
+                                .on_hover_text("Toggle Lock")
+                                .clicked()
+                            {
+                                flag_ops.push((lid, None, Some(!lck), None, None));
+                            }
+                            if ui
+                                .small_button(if prn { "🖨" } else { "⊘" })
+                                .on_hover_text("Toggle Printable")
+                                .clicked()
+                            {
+                                flag_ops.push((lid, None, None, Some(!prn), None));
+                            }
+                        });
+
+                        ui.indent(("layer_objs", lid), |ui| {
+                            for &oid in objs.iter().rev() {
+                                if let Some(obj) = tab.document.object(oid) {
+                                    if !filter_trim.is_empty() {
+                                        let matches = if let Some(ref expr) = parsed_cql {
+                                            coree_prod::cql_matches_object(obj, expr)
+                                        } else {
+                                            obj.name
+                                                .to_ascii_lowercase()
+                                                .contains(&filter_trim.to_ascii_lowercase())
+                                        };
+                                        if !matches {
+                                            continue;
+                                        }
+                                    }
+                                    let selected = tab.selection.contains(oid);
+                                    let is_powerclip =
+                                        matches!(obj.payload, NodePayload::PowerClip { .. });
+                                    let badge = match &obj.payload {
+                                        NodePayload::Group(c) => format!(" [Grp:{}]", c.len()),
+                                        NodePayload::PowerClip { contents, .. } => {
+                                            format!(" [Clip:{}]", contents.len())
+                                        }
+                                        NodePayload::Raster(_) => " [Img]".to_owned(),
+                                        NodePayload::ArtisticText(_)
+                                        | NodePayload::ParagraphText(_) => " [Txt]".to_owned(),
+                                        _ => String::new(),
+                                    };
+                                    let lens_tag = obj
+                                        .lens
+                                        .as_ref()
+                                        .map(|l| format!(" ◉{}", l.kind.name()))
+                                        .unwrap_or_default();
+                                    let label = format!("{}{badge}{lens_tag}", obj.name);
+                                    ui.horizontal(|ui| {
+                                        let obj_btn = ui.add(
+                                            egui::Button::new(RichText::new(label).color(
+                                                if selected { tokens.accent } else { tokens.text },
+                                            ))
+                                            .frame(selected)
+                                            .sense(egui::Sense::click_and_drag()),
+                                        );
+                                        if obj_btn.drag_started() {
+                                            egui::DragAndDrop::set_payload(ui.ctx(), (lid, oid));
+                                        }
+                                        if let Some(payload) = obj_btn.dnd_release_payload::<(
+                                            coree_core::LayerId,
+                                            ObjectId,
+                                        )>(
+                                        ) {
+                                            let (src_lid, src_oid) = *payload;
+                                            if src_lid == lid && src_oid != oid {
+                                                let mut next = objs.clone();
+                                                if let (Some(from_i), Some(to_i)) = (
+                                                    next.iter().position(|&x| x == src_oid),
+                                                    next.iter().position(|&x| x == oid),
+                                                ) {
+                                                    let item = next.remove(from_i);
+                                                    next.insert(to_i, item);
+                                                    reorder_objs_cmd =
+                                                        Some(CommandOp::ReorderLayerObjects {
+                                                            layer_id: lid,
+                                                            object_ids: next,
+                                                        });
+                                                }
+                                            }
+                                        }
+                                        if obj_btn.clicked() {
+                                            let _ = tab.document.set_active_page_index(p_idx);
+                                            tab.active_layer_id = Some(lid);
+                                            tab.sync_active_layer();
+                                            tab.selection.select_single(&tab.document, oid);
+                                            tab.metrics_dirty = true;
+                                            tab.needs_rerender = true;
+                                        }
+                                        if is_powerclip {
+                                            if ui.small_button("Fit").clicked() {
+                                                fit_powerclip_req = Some((
+                                                    oid,
+                                                    coree_core::PowerClipFitMode::FitContents,
+                                                ));
+                                            }
+                                            if ui.small_button("Ctr").clicked() {
+                                                fit_powerclip_req = Some((
+                                                    oid,
+                                                    coree_core::PowerClipFitMode::CenterContents,
+                                                ));
+                                            }
+                                            if ui.small_button("Str").clicked() {
+                                                fit_powerclip_req = Some((
+                                                    oid,
+                                                    coree_core::PowerClipFitMode::StretchToFill,
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                });
+        }
     }
 
     for (layer_id, visible, locked, printable, is_cut_layer) in flag_ops {
@@ -284,6 +464,15 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
             is_cut_layer,
         });
     }
+    if let Some(cmd) = reorder_layer_cmd {
+        let _ = app.execute_command(cmd);
+    }
+    if let Some(cmd) = reorder_objs_cmd {
+        let _ = app.execute_command(cmd);
+    }
+    if let Some((pc_id, mode)) = fit_powerclip_req {
+        let _ = app.execute_command(CommandOp::FitPowerClip { id: pc_id, mode });
+    }
 }
 
 // =============================================================================
@@ -292,16 +481,18 @@ fn ui_objects_docker(ui: &mut Ui, app: &mut StudioApp) {
 
 fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
-    ui.horizontal(|ui| {
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    shell_dir.with_horizontal(ui, |ui| {
         ui.selectable_value(
             &mut app.properties_state.active_tab,
             PropertiesSubTab::Fill,
-            "Fill",
+            crate::i18n::I18nKey::PropFillType.tr_ui(lang),
         );
         ui.selectable_value(
             &mut app.properties_state.active_tab,
             PropertiesSubTab::Outline,
-            "Outline",
+            crate::i18n::I18nKey::PropOutlineWidth.tr_ui(lang),
         );
         ui.selectable_value(
             &mut app.properties_state.active_tab,
@@ -311,7 +502,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
         ui.selectable_value(
             &mut app.properties_state.active_tab,
             PropertiesSubTab::Text,
-            "Text",
+            crate::i18n::I18nKey::MenuText.tr_ui(lang),
         );
     });
     ui.separator();
@@ -341,135 +532,190 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                 app.open_edit_fill_dialog();
             }
 
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::None), "None")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::None);
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::Solid(_)), "Solid")
-                    .clicked()
-                {
-                    let c = cur_fill
-                        .referenced_colors()
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Color::CYAN);
-                    app.apply_fill(Fill::Solid(c));
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::LinearGradient { .. }), "Linear")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::LinearGradient {
-                        start: Point2D::ZERO,
-                        end: Point2D::new(60.0, 40.0),
-                        stops: vec![
-                            GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                            GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                        ],
-                    });
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::RadialGradient { .. }), "Radial")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::RadialGradient {
-                        center: Point2D::new(30.0, 30.0),
-                        radius: 40.0,
-                        focal: Point2D::new(30.0, 30.0),
-                        stops: vec![
-                            GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                            GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                        ],
-                    });
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::ConicalGradient { .. }), "Conical")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::ConicalGradient {
-                        center: Point2D::new(30.0, 30.0),
-                        angle_deg: 0.0,
-                        stops: vec![
-                            GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                            GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                        ],
-                    });
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::SquareGradient { .. }), "Square")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::SquareGradient {
-                        center: Point2D::new(30.0, 30.0),
-                        size: 50.0,
-                        angle_deg: 0.0,
-                        stops: vec![
-                            GradientStop::new(0.0, app.properties_state.grad_start_color.clone()),
-                            GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
-                        ],
-                    });
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::TwoColorPattern { .. }), "Pattern")
-                    .clicked()
-                {
-                    app.apply_fill(Fill::TwoColorPattern {
-                        fg: Color::CYAN,
-                        bg: Color::WHITE,
-                        pattern_name: "Checker".to_owned(),
-                        tile_w: 8.0,
-                        tile_h: 8.0,
-                    });
-                }
-                let is_ps_fill = matches!(
-                    &cur_fill,
-                    Fill::TextureFill { preset, .. }
-                        if PostScriptFillPreset::from_preset_str(preset).is_some()
-                );
-                if ui
-                    .selectable_label(
-                        matches!(cur_fill, Fill::TextureFill { .. }) && !is_ps_fill,
-                        "Texture",
-                    )
-                    .clicked()
-                {
-                    app.apply_fill(Fill::TextureFill {
-                        preset: "Marble".to_owned(),
-                        seed: 7,
-                        fg: Color::CYAN,
-                        bg: Color::WHITE,
-                    });
-                }
-                if ui.selectable_label(is_ps_fill, "PostScript").clicked() {
-                    let fg = cur_fill
-                        .referenced_colors()
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Color::KEY_BLACK);
-                    app.apply_fill(PostScriptFillPreset::Hatch.to_fill(fg, Color::WHITE, 1));
-                }
-                if ui
-                    .selectable_label(matches!(cur_fill, Fill::MeshFill { .. }), "Mesh")
-                    .clicked()
-                {
-                    let local_bb = sel_id
-                        .and_then(|id| {
-                            app.active_tab()
-                                .and_then(|t| StudioApp::object_local_bounds(&t.document, id))
-                        })
-                        .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 50.0, 50.0));
-                    let fill = StudioApp::build_mesh_fill_for_bounds(
-                        local_bb,
-                        app.properties_state.mesh_rows,
-                        app.properties_state.mesh_cols,
+            ui.with_layout(
+                shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .selectable_label(
+                            matches!(cur_fill, Fill::None),
+                            crate::i18n::I18nKey::PropFillNone.tr_ui(lang),
+                        )
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::None);
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(cur_fill, Fill::Solid(_)),
+                            crate::i18n::I18nKey::PropFillSolid.tr_ui(lang),
+                        )
+                        .clicked()
+                    {
+                        let c = cur_fill
+                            .referenced_colors()
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Color::CYAN);
+                        app.apply_fill(Fill::Solid(c));
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::LinearGradient { .. }), "Linear")
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::LinearGradient {
+                            start: Point2D::ZERO,
+                            end: Point2D::new(60.0, 40.0),
+                            stops: vec![
+                                GradientStop::new(
+                                    0.0,
+                                    app.properties_state.grad_start_color.clone(),
+                                ),
+                                GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
+                            ],
+                        });
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::RadialGradient { .. }), "Radial")
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::RadialGradient {
+                            center: Point2D::new(30.0, 30.0),
+                            radius: 40.0,
+                            focal: Point2D::new(30.0, 30.0),
+                            stops: vec![
+                                GradientStop::new(
+                                    0.0,
+                                    app.properties_state.grad_start_color.clone(),
+                                ),
+                                GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
+                            ],
+                        });
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(cur_fill, Fill::ConicalGradient { .. }),
+                            "Conical",
+                        )
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::ConicalGradient {
+                            center: Point2D::new(30.0, 30.0),
+                            angle_deg: 0.0,
+                            stops: vec![
+                                GradientStop::new(
+                                    0.0,
+                                    app.properties_state.grad_start_color.clone(),
+                                ),
+                                GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
+                            ],
+                        });
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::SquareGradient { .. }), "Square")
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::SquareGradient {
+                            center: Point2D::new(30.0, 30.0),
+                            size: 50.0,
+                            angle_deg: 0.0,
+                            stops: vec![
+                                GradientStop::new(
+                                    0.0,
+                                    app.properties_state.grad_start_color.clone(),
+                                ),
+                                GradientStop::new(1.0, app.properties_state.grad_end_color.clone()),
+                            ],
+                        });
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(cur_fill, Fill::TwoColorPattern { .. }),
+                            "Pattern",
+                        )
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::TwoColorPattern {
+                            fg: Color::CYAN,
+                            bg: Color::WHITE,
+                            pattern_name: "Checker".to_owned(),
+                            tile_w: 8.0,
+                            tile_h: 8.0,
+                        });
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::VectorPattern { .. }), "VecPat")
+                        .clicked()
+                    {
+                        let sym_id = app
+                            .active_tab()
+                            .and_then(|t| t.document.symbols().keys().next().copied())
+                            .unwrap_or_default();
+                        app.apply_fill(Fill::VectorPattern {
+                            symbol_id: sym_id,
+                            tile_w: 12.0,
+                            tile_h: 12.0,
+                        });
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::BitmapPattern { .. }), "BmpPat")
+                        .clicked()
+                    {
+                        let img_id = app
+                            .active_tab()
+                            .and_then(|t| t.document.assets().keys().next().copied())
+                            .unwrap_or_default();
+                        app.apply_fill(Fill::BitmapPattern {
+                            image_id: img_id,
+                            tile_w: 16.0,
+                            tile_h: 16.0,
+                        });
+                    }
+                    let is_ps_fill = matches!(
+                        &cur_fill,
+                        Fill::TextureFill { preset, .. }
+                            if PostScriptFillPreset::from_preset_str(preset).is_some()
                     );
-                    app.apply_fill(fill);
-                }
-            });
+                    if ui
+                        .selectable_label(
+                            matches!(cur_fill, Fill::TextureFill { .. }) && !is_ps_fill,
+                            "Texture",
+                        )
+                        .clicked()
+                    {
+                        app.apply_fill(Fill::TextureFill {
+                            preset: "Marble".to_owned(),
+                            seed: 7,
+                            fg: Color::CYAN,
+                            bg: Color::WHITE,
+                        });
+                    }
+                    if ui.selectable_label(is_ps_fill, "PostScript").clicked() {
+                        let fg = cur_fill
+                            .referenced_colors()
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Color::KEY_BLACK);
+                        app.apply_fill(PostScriptFillPreset::Hatch.to_fill(fg, Color::WHITE, 1));
+                    }
+                    if ui
+                        .selectable_label(matches!(cur_fill, Fill::MeshFill { .. }), "Mesh")
+                        .clicked()
+                    {
+                        let local_bb = sel_id
+                            .and_then(|id| {
+                                app.active_tab()
+                                    .and_then(|t| StudioApp::object_local_bounds(&t.document, id))
+                            })
+                            .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 50.0, 50.0));
+                        let fill = StudioApp::build_mesh_fill_for_bounds(
+                            local_bb,
+                            app.properties_state.mesh_rows,
+                            app.properties_state.mesh_cols,
+                        );
+                        app.apply_fill(fill);
+                    }
+                },
+            );
 
             ui.separator();
             // Color Model Editors (CMYK / RGB / HSL / Spot / Hex)
@@ -518,10 +764,13 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         base_color = egui_color_to_core(c32);
                         color_changed = true;
                     }
-                    ui.horizontal(|ui| {
-                        ui.label("Hex:");
+                    shell_dir.with_horizontal(ui, |ui| {
+                        ui.label(crate::i18n::I18nKey::PropFillHexLabel.tr_ui(lang));
                         ui.text_edit_singleline(&mut app.properties_state.hex_input);
-                        if ui.small_button("Apply").clicked() {
+                        if ui
+                            .small_button(crate::i18n::I18nKey::DialogApply.tr_ui(lang))
+                            .clicked()
+                        {
                             if let Ok(parsed) = Color::from_hex(&app.properties_state.hex_input) {
                                 base_color = parsed;
                                 color_changed = true;
@@ -545,15 +794,18 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     }
                 }
                 _ => {
-                    ui.horizontal(|ui| {
-                        ui.label("Spot:");
+                    shell_dir.with_horizontal(ui, |ui| {
+                        ui.label(crate::i18n::I18nKey::PropFillSpotLabel.tr_ui(lang));
                         ui.text_edit_singleline(&mut app.properties_state.spot_name);
                     });
                     ui.add(
                         egui::Slider::new(&mut app.properties_state.spot_tint, 0.0..=1.0)
                             .text("Tint"),
                     );
-                    if ui.button("Apply Spot Fill").clicked() {
+                    if ui
+                        .button(crate::i18n::I18nKey::DialogApply.tr_ui(lang))
+                        .clicked()
+                    {
                         let cmyk = base_color.to_cmyk();
                         base_color = Color::spot(
                             app.properties_state.spot_name.clone(),
@@ -580,10 +832,10 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                 ui.label(RichText::new("Gradient Colors").strong());
                 let mut sc = core_color_to_egui(&app.properties_state.grad_start_color);
                 let mut ec = core_color_to_egui(&app.properties_state.grad_end_color);
-                ui.horizontal(|ui| {
-                    ui.label("Start:");
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::PropFillStartLabel.tr_ui(lang));
                     let c1 = ui.color_edit_button_srgba(&mut sc).changed();
-                    ui.label("End:");
+                    ui.label(crate::i18n::I18nKey::PropFillEndLabel.tr_ui(lang));
                     let c2 = ui.color_edit_button_srgba(&mut ec).changed();
                     if c1 || c2 {
                         app.properties_state.grad_start_color = egui_color_to_core(sc);
@@ -603,6 +855,125 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         app.apply_fill(updated);
                     }
                 });
+            }
+
+            // VectorPattern & BitmapPattern parameter editors (`ADD-12`)
+            if let Fill::VectorPattern {
+                mut symbol_id,
+                mut tile_w,
+                mut tile_h,
+            } = cur_fill
+            {
+                ui.separator();
+                ui.label(
+                    RichText::new("Vector Pattern Fill")
+                        .strong()
+                        .color(tokens.accent),
+                );
+                let syms: Vec<(coree_core::SymbolId, String)> = app
+                    .active_tab()
+                    .map(|t| {
+                        t.document
+                            .symbols()
+                            .iter()
+                            .map(|(&id, s)| (id, s.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut changed = false;
+                ComboBox::from_id_salt("prop_vecpat_sym")
+                    .selected_text(
+                        syms.iter()
+                            .find(|(id, _)| *id == symbol_id)
+                            .map_or_else(|| format!("Sym #{}", symbol_id.0), |(_, n)| n.clone()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (sid, sname) in &syms {
+                            if ui.selectable_value(&mut symbol_id, *sid, sname).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut tile_w)
+                                .range(1.0..=500.0)
+                                .prefix("W: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut tile_h)
+                                .range(1.0..=500.0)
+                                .prefix("H: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+                if changed {
+                    app.apply_fill(Fill::VectorPattern {
+                        symbol_id,
+                        tile_w,
+                        tile_h,
+                    });
+                }
+            }
+            if let Fill::BitmapPattern {
+                mut image_id,
+                mut tile_w,
+                mut tile_h,
+            } = cur_fill
+            {
+                ui.separator();
+                ui.label(
+                    RichText::new("Bitmap Pattern Fill")
+                        .strong()
+                        .color(tokens.accent),
+                );
+                let assets: Vec<coree_core::ImageAssetId> = app
+                    .active_tab()
+                    .map(|t| t.document.assets().keys().copied().collect())
+                    .unwrap_or_default();
+                let mut changed = false;
+                ComboBox::from_id_salt("prop_bmppat_asset")
+                    .selected_text(format!("{image_id}"))
+                    .show_ui(ui, |ui| {
+                        for aid in &assets {
+                            if ui
+                                .selectable_value(&mut image_id, *aid, format!("{aid}"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut tile_w)
+                                .range(1.0..=500.0)
+                                .prefix("W: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut tile_h)
+                                .range(1.0..=500.0)
+                                .prefix("H: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+                if changed {
+                    app.apply_fill(Fill::BitmapPattern {
+                        image_id,
+                        tile_w,
+                        tile_h,
+                    });
+                }
             }
 
             // PostScript Procedural Pattern Fill editor (all 10 clean-room presets)
@@ -856,6 +1227,28 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         let mut changed = false;
                         if let Some(run) = art.runs.first_mut() {
                             changed |= ui.text_edit_multiline(&mut run.text).changed();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Dynamic Field:").size(10.5));
+                                for (fld, lbl) in [
+                                    (None, "Static"),
+                                    (Some(coree_core::TextField::AutoPageNumber), "Page #"),
+                                    (Some(coree_core::TextField::PageCount), "Count"),
+                                    (Some(coree_core::TextField::DocumentTitle), "Title"),
+                                    (Some(coree_core::TextField::CurrentDate), "Date"),
+                                ] {
+                                    if ui.selectable_label(run.field == fld, lbl).clicked() {
+                                        run.field = fld;
+                                        if matches!(
+                                            fld,
+                                            Some(coree_core::TextField::AutoPageNumber)
+                                        ) && run.text.is_empty()
+                                        {
+                                            run.text = "Page #".to_owned();
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            });
                             changed |= render_docker_text_style_fields(
                                 ui,
                                 &mut run.style,
@@ -879,6 +1272,21 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                         let mut changed = false;
                         if let Some(run) = para.runs.first_mut() {
                             changed |= ui.text_edit_multiline(&mut run.text).changed();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Dynamic Field:").size(10.5));
+                                for (fld, lbl) in [
+                                    (None, "Static"),
+                                    (Some(coree_core::TextField::AutoPageNumber), "Page #"),
+                                    (Some(coree_core::TextField::PageCount), "Count"),
+                                    (Some(coree_core::TextField::DocumentTitle), "Title"),
+                                    (Some(coree_core::TextField::CurrentDate), "Date"),
+                                ] {
+                                    if ui.selectable_label(run.field == fld, lbl).clicked() {
+                                        run.field = fld;
+                                        changed = true;
+                                    }
+                                }
+                            });
                             changed |= render_docker_text_style_fields(
                                 ui,
                                 &mut run.style,
@@ -2099,6 +2507,7 @@ fn ui_transform_align_shape_docker(ui: &mut Ui, app: &mut StudioApp) {
 // =============================================================================
 
 fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
+    let tokens = app.theme.tokens();
     ui.label(RichText::new("Bitmap-to-Vector Trace").strong());
     let tr = &mut app.trace_state;
     ui.horizontal(|ui| {
@@ -2135,6 +2544,157 @@ fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
             .suffix(" px"),
     );
     ui.checkbox(&mut tr.remove_background, "Remove Background");
+    ui.checkbox(&mut tr.split_preview, "Split Preview (Before / After)");
+
+    if tr.split_preview {
+        let preview_src = app.active_tab().and_then(|tab| {
+            let target_id = tab
+                .selection
+                .objects
+                .iter()
+                .copied()
+                .find(|id| {
+                    tab.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+                })
+                .or_else(|| {
+                    tab.document
+                        .objects()
+                        .iter()
+                        .find(|(_, o)| matches!(o.payload, NodePayload::Raster(_)))
+                        .map(|(&id, _)| id)
+                })?;
+            let NodePayload::Raster(ref r) = tab.document.object(target_id)?.payload else {
+                return None;
+            };
+            let asset = tab.document.asset(r.asset_id)?;
+            Some((target_id, r.clone(), asset.clone()))
+        });
+        if let Some((oid, r, asset)) = preview_src {
+            let cfg = app.trace_state.to_config();
+            let mut key: u64 = oid.0 ^ ((asset.width as u64) << 16) ^ (asset.height as u64);
+            for b in format!("{:?}", cfg).as_bytes() {
+                key = key.wrapping_mul(0x0100_0000_01b3) ^ u64::from(*b);
+            }
+            let cached_paths = {
+                let mut cache = app.trace_state.split_preview_cache.borrow_mut();
+                if cache.as_ref().is_some_and(|(k, _)| *k == key) {
+                    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+                } else {
+                    let traced = coree_render::trace_raster_to_mm(
+                        &asset,
+                        r.width_mm.max(1.0),
+                        r.height_mm.max(1.0),
+                        &cfg,
+                    );
+                    *cache = Some((key, traced.clone()));
+                    traced
+                }
+            };
+            let (rect, resp) =
+                ui.allocate_exact_size(vec2(220.0, 110.0), egui::Sense::click_and_drag());
+            if (resp.clicked() || resp.dragged()) && rect.width() > 1.0 {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    app.trace_state.split_divider =
+                        ((pos.x - rect.left()) / rect.width()).clamp(0.05, 0.95);
+                }
+            }
+            let split_x =
+                rect.left() + rect.width() * app.trace_state.split_divider.clamp(0.05, 0.95);
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, CornerRadius::same(4), tokens.canvas_well);
+
+            // Left half: source bitmap grid sample (Before)
+            let left_clip = egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y));
+            let left_painter = painter.with_clip_rect(left_clip);
+            let cols = 16u32.min(asset.width.max(1));
+            let rows = 10u32.min(asset.height.max(1));
+            let rgba = asset.to_rgba8_vec();
+            let cell_w = rect.width() / cols as f32;
+            let cell_h = rect.height() / rows as f32;
+            for ry in 0..rows {
+                let sy = ((ry as f32 + 0.5) / rows as f32 * asset.height as f32) as u32;
+                let sy = sy.min(asset.height.saturating_sub(1));
+                for cx in 0..cols {
+                    let sx = ((cx as f32 + 0.5) / cols as f32 * asset.width as f32) as u32;
+                    let sx = sx.min(asset.width.saturating_sub(1));
+                    let idx = ((sy * asset.width + sx) * 4) as usize;
+                    if idx + 3 < rgba.len() {
+                        let c = Color32::from_rgba_unmultiplied(
+                            rgba[idx],
+                            rgba[idx + 1],
+                            rgba[idx + 2],
+                            rgba[idx + 3],
+                        );
+                        left_painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(
+                                    rect.left() + cx as f32 * cell_w,
+                                    rect.top() + ry as f32 * cell_h,
+                                ),
+                                vec2(cell_w + 0.5, cell_h + 0.5),
+                            ),
+                            CornerRadius::ZERO,
+                            c,
+                        );
+                    }
+                }
+            }
+
+            // Right half: live traced vector contours (After)
+            let right_clip = egui::Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
+            let right_painter = painter.with_clip_rect(right_clip);
+            right_painter.rect_filled(right_clip, CornerRadius::ZERO, Color32::WHITE);
+            let sx = rect.width() / (r.width_mm.max(1.0) as f32);
+            let sy = rect.height() / (r.height_mm.max(1.0) as f32);
+            for (path, col) in cached_paths.iter().take(120) {
+                let c32 = core_color_to_egui(col);
+                for sub in &path.subpaths {
+                    let pts: Vec<egui::Pos2> = sub
+                        .nodes
+                        .iter()
+                        .map(|n| {
+                            egui::pos2(
+                                rect.left() + n.pos.x as f32 * sx,
+                                rect.top() + n.pos.y as f32 * sy,
+                            )
+                        })
+                        .collect();
+                    if pts.len() >= 2 {
+                        right_painter.add(egui::Shape::line(pts, Stroke::new(1.2, c32)));
+                    }
+                }
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(split_x, rect.top()),
+                    egui::pos2(split_x, rect.bottom()),
+                ],
+                Stroke::new(2.0, tokens.accent),
+            );
+            painter.text(
+                rect.left_top() + vec2(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                "Before",
+                egui::FontId::proportional(9.5),
+                tokens.text,
+            );
+            painter.text(
+                rect.right_top() + vec2(-4.0, 2.0),
+                egui::Align2::RIGHT_TOP,
+                format!("After ({})", cached_paths.len()),
+                egui::FontId::proportional(9.5),
+                Color32::BLACK,
+            );
+        } else {
+            ui.label(
+                RichText::new("Select or add a bitmap to view Split Preview.")
+                    .size(10.5)
+                    .color(tokens.text_muted),
+            );
+        }
+    }
 
     ui.add_space(6.0);
     if ui
@@ -2236,12 +2796,119 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
                 ui.selectable_value(&mut bm.filter_idx, idx, *name);
             }
         });
-    ui.add(egui::Slider::new(&mut bm.param_a, -1.0..=1.0).text("Param A"));
-    ui.add(egui::Slider::new(&mut bm.param_b, -1.0..=1.0).text("Param B"));
-    ui.add(egui::Slider::new(&mut bm.param_c, 0.1..=10.0).text("Strength/Radius"));
+    if bm.filter_idx == 1 {
+        // ToneCurve parameters also editable numerically
+        ui.label(RichText::new("Tone Curve (drag nodes on Histogram below)").size(10.5));
+    } else if bm.filter_idx == 19 {
+        ui.checkbox(&mut bm.mixer_mono, "Monochrome Mix");
+        for (lbl, row) in [
+            ("Red out:", &mut bm.mixer_red),
+            ("Green out:", &mut bm.mixer_green),
+            ("Blue out:", &mut bm.mixer_blue),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(lbl).size(10.0));
+                ui.add(
+                    DragValue::new(&mut row[0])
+                        .range(-2.0..=2.0)
+                        .speed(0.05)
+                        .prefix("R:"),
+                );
+                ui.add(
+                    DragValue::new(&mut row[1])
+                        .range(-2.0..=2.0)
+                        .speed(0.05)
+                        .prefix("G:"),
+                );
+                ui.add(
+                    DragValue::new(&mut row[2])
+                        .range(-2.0..=2.0)
+                        .speed(0.05)
+                        .prefix("B:"),
+                );
+            });
+        }
+    } else {
+        ui.add(egui::Slider::new(&mut bm.param_a, -1.0..=1.0).text("Param A"));
+        ui.add(egui::Slider::new(&mut bm.param_b, -1.0..=1.0).text("Param B"));
+        ui.add(egui::Slider::new(&mut bm.param_c, 0.1..=10.0).text("Strength/Radius"));
+    }
     let filter = bm.build_filter();
     if ui.button("+ Apply Filter to Bitmap").clicked() {
         app.apply_raster_filter_to_selection(filter);
+    }
+
+    // Non-destructive Filter Stack Inspector (Toggle / Reorder / Remove) (`S10` `#51`)
+    let active_raster = app.active_tab().and_then(|tab| {
+        let oid = tab.selection.objects.iter().copied().find(|id| {
+            tab.document
+                .object(*id)
+                .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+        })?;
+        match &tab.document.object(oid)?.payload {
+            NodePayload::Raster(r) => Some((oid, r.clone())),
+            _ => None,
+        }
+    });
+    if let Some((raster_oid, mut rdata)) = active_raster {
+        if !rdata.filters.is_empty() {
+            ui.separator();
+            ui.label(
+                RichText::new(format!("Filter Stack ({})", rdata.filters.len()))
+                    .strong()
+                    .color(app.theme.tokens().accent),
+            );
+            let mut stack_dirty = false;
+            let len = rdata.filters.len();
+            if rdata.filter_enabled.len() < len {
+                rdata.filter_enabled.resize(len, true);
+            }
+            let mut remove_idx: Option<usize> = None;
+            let mut move_up: Option<usize> = None;
+            let mut move_down: Option<usize> = None;
+            for i in 0..len {
+                let mut enabled = rdata.filter_enabled[i];
+                let fname = format!("{:?}", rdata.filters[i]);
+                let short_name: String = fname.chars().take(24).collect();
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        rdata.filter_enabled[i] = enabled;
+                        stack_dirty = true;
+                    }
+                    ui.label(RichText::new(format!("{}. {short_name}", i + 1)).size(10.5));
+                    if i > 0 && ui.small_button("↑").clicked() {
+                        move_up = Some(i);
+                    }
+                    if i + 1 < len && ui.small_button("↓").clicked() {
+                        move_down = Some(i);
+                    }
+                    if ui.small_button("✕").clicked() {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(idx) = move_up {
+                rdata.filters.swap(idx, idx - 1);
+                rdata.filter_enabled.swap(idx, idx - 1);
+                stack_dirty = true;
+            }
+            if let Some(idx) = move_down {
+                rdata.filters.swap(idx, idx + 1);
+                rdata.filter_enabled.swap(idx, idx + 1);
+                stack_dirty = true;
+            }
+            if let Some(idx) = remove_idx {
+                rdata.filters.remove(idx);
+                rdata.filter_enabled.remove(idx);
+                stack_dirty = true;
+            }
+            if stack_dirty {
+                let _ = app.execute_command(CommandOp::UpdateRaster {
+                    id: raster_oid,
+                    data: rdata,
+                });
+            }
+        }
     }
 
     ui.separator();
@@ -2318,27 +2985,140 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
             app.run_cutout_lab_active();
         }
     });
-    if let Some(hist) = app.selected_bitmap_histogram(16) {
+    let hist_opt = app.selected_bitmap_histogram(64);
+    ui.separator();
+    ui.label(RichText::new("Tone Curve & 64-Bin Histogram").strong());
+    let (curve_rect, curve_resp) =
+        ui.allocate_exact_size(egui::vec2(224.0, 96.0), egui::Sense::click_and_drag());
+    let tokens = app.theme.tokens();
+    let painter = ui.painter_at(curve_rect);
+    painter.rect_filled(curve_rect, CornerRadius::same(3), tokens.bg);
+    painter.rect_stroke(
+        curve_rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, tokens.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if let Some(ref hist) = hist_opt {
+        let peak = hist.luma.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let bar_w = curve_rect.width() / (hist.luma.len().max(1) as f32);
+        for (i, &count) in hist.luma.iter().enumerate() {
+            let frac = (count as f32 / peak).clamp(0.02, 1.0);
+            let x0 = curve_rect.left() + i as f32 * bar_w;
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0, curve_rect.bottom() - curve_rect.height() * frac),
+                egui::pos2(x0 + bar_w.max(1.0), curve_rect.bottom()),
+            );
+            painter.rect_filled(bar, 0.0, tokens.accent.gamma_multiply(0.32));
+        }
+    }
+
+    // Interactive ToneCurve spline nodes (`0..=1`, `0..=1`)
+    {
+        let pts = &mut app.bitmap_state.tone_curve_points;
+        if pts.len() < 2 {
+            *pts = vec![(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)];
+        }
+        if let Some(pos) = curve_resp.interact_pointer_pos() {
+            let nx = ((pos.x - curve_rect.left()) / curve_rect.width().max(1.0)).clamp(0.0, 1.0);
+            let ny =
+                (1.0 - (pos.y - curve_rect.top()) / curve_rect.height().max(1.0)).clamp(0.0, 1.0);
+            if curve_resp.drag_started() || curve_resp.clicked() {
+                let nearest = pts
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let da = (a.0 - nx).hypot(a.1 - ny);
+                        let db = (b.0 - nx).hypot(b.1 - ny);
+                        da.total_cmp(&db)
+                    })
+                    .filter(|(_, p)| (p.0 - nx).hypot(p.1 - ny) < 0.12)
+                    .map(|(i, _)| i);
+                if let Some(idx) = nearest {
+                    app.bitmap_state.selected_curve_point = Some(idx);
+                } else if curve_resp.clicked() && pts.len() < 12 {
+                    pts.push((nx, ny));
+                    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    app.bitmap_state.selected_curve_point = pts
+                        .iter()
+                        .position(|p| (p.0 - nx).abs() < 1e-4 && (p.1 - ny).abs() < 1e-4);
+                }
+            } else if curve_resp.dragged() {
+                if let Some(idx) = app.bitmap_state.selected_curve_point {
+                    let n_pts = pts.len();
+                    if let Some(pt) = pts.get_mut(idx) {
+                        pt.0 = if idx == 0 {
+                            0.0
+                        } else if idx + 1 == n_pts {
+                            1.0
+                        } else {
+                            nx.clamp(0.02, 0.98)
+                        };
+                        pt.1 = ny;
+                    }
+                    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                }
+            } else if curve_resp.secondary_clicked() && pts.len() > 2 {
+                if let Some((idx, _)) = pts.iter().enumerate().min_by(|(_, a), (_, b)| {
+                    (a.0 - nx)
+                        .hypot(a.1 - ny)
+                        .total_cmp(&(b.0 - nx).hypot(b.1 - ny))
+                }) {
+                    if idx > 0 && idx + 1 < pts.len() {
+                        pts.remove(idx);
+                        app.bitmap_state.selected_curve_point = None;
+                    }
+                }
+            }
+        }
+        let screen_pts: Vec<egui::Pos2> = pts
+            .iter()
+            .map(|(x, y)| {
+                egui::pos2(
+                    curve_rect.left() + x * curve_rect.width(),
+                    curve_rect.bottom() - y * curve_rect.height(),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            screen_pts.clone(),
+            Stroke::new(1.8, tokens.accent),
+        ));
+        for (i, sp) in screen_pts.iter().enumerate() {
+            let sel = app.bitmap_state.selected_curve_point == Some(i);
+            painter.circle_filled(
+                *sp,
+                if sel { 4.2 } else { 3.2 },
+                if sel {
+                    tokens.accent_secondary
+                } else {
+                    Color32::WHITE
+                },
+            );
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Apply Tone Curve").clicked() {
+            let filter = coree_core::RasterFilter::ToneCurve {
+                points: app.bitmap_state.tone_curve_points.clone(),
+            };
+            app.apply_raster_filter_to_selection(filter);
+        }
+        if ui.small_button("Reset Curve").clicked() {
+            app.bitmap_state.tone_curve_points = vec![(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)];
+            app.bitmap_state.selected_curve_point = None;
+        }
+    });
+    if let Some(hist) = hist_opt {
         ui.label(
             RichText::new(format!(
                 "Histogram ({} px, {} bins)",
                 hist.total_pixels, hist.bins
             ))
-            .size(11.0),
+            .size(10.5)
+            .color(tokens.text_muted),
         );
-        let peak = hist.luma.iter().copied().max().unwrap_or(1).max(1) as f32;
-        ui.horizontal(|ui| {
-            for &count in &hist.luma {
-                let frac = (count as f32 / peak).clamp(0.05, 1.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 22.0), egui::Sense::hover());
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.max.y - rect.height() * frac),
-                    rect.max,
-                );
-                ui.painter()
-                    .rect_filled(bar, 1.0, app.theme.tokens().accent);
-            }
-        });
     }
 }
 
@@ -2348,18 +3128,47 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
 
 fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
-    ui.horizontal_wrapped(|ui| {
-        ui.selectable_value(
-            &mut app.production_state.sub_section,
-            5,
-            RichText::new("⚡ Laser & Plugins").color(tokens.accent_secondary),
-        );
-        ui.selectable_value(&mut app.production_state.sub_section, 0, "Preflight");
-        ui.selectable_value(&mut app.production_state.sub_section, 1, "Prepress");
-        ui.selectable_value(&mut app.production_state.sub_section, 2, "Cut & Box");
-        ui.selectable_value(&mut app.production_state.sub_section, 3, "Barcode");
-        ui.selectable_value(&mut app.production_state.sub_section, 4, "Merge/Pack");
-    });
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    ui.with_layout(
+        shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+        |ui| {
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                5,
+                RichText::new(format!(
+                    "⚡ {}",
+                    crate::i18n::I18nKey::ToolsPlugins.tr_ui(lang)
+                ))
+                .color(tokens.accent_secondary),
+            );
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                0,
+                crate::i18n::I18nKey::ProdPreflightTab.tr_ui(lang),
+            );
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                1,
+                crate::i18n::I18nKey::ProdSeparationsTab.tr_ui(lang),
+            );
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                2,
+                crate::i18n::I18nKey::ProdCutDielinesTab.tr_ui(lang),
+            );
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                3,
+                crate::i18n::I18nKey::ProdBarcodeTab.tr_ui(lang),
+            );
+            ui.selectable_value(
+                &mut app.production_state.sub_section,
+                4,
+                crate::i18n::I18nKey::ProdMergeCollectTab.tr_ui(lang),
+            );
+        },
+    );
     ui.separator();
 
     match app.production_state.sub_section {
@@ -2367,34 +3176,126 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
             ui_laser_plugins_studio(ui, app);
         }
         0 => {
-            // Preflight Inspector with click-to-select offending object!
-            ui.horizontal(|ui| {
+            // Preflight Inspector (`S13`): Rule checklist + Severity filter tabs + Selection change hook (`#20e`)
+            shell_dir.with_horizontal(ui, |ui| {
                 ui.add(
                     DragValue::new(&mut app.production_state.preflight_min_dpi)
                         .range(72.0..=600.0)
                         .prefix("Min DPI: "),
                 );
-                if ui.button("Run Preflight").clicked() {
+                if ui
+                    .button(crate::i18n::I18nKey::PreflightRunAudit.tr_ui(lang))
+                    .clicked()
+                {
                     app.run_preflight_active();
                 }
             });
+            egui::CollapsingHeader::new("Preflight Rules Checklist")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let r = &mut app.production_state.preflight_rules;
+                    ui.checkbox(
+                        &mut r.check_rgb_in_cmyk,
+                        crate::i18n::I18nKey::PreflightRuleRgbInCmyk.tr_ui(lang),
+                    );
+                    ui.checkbox(
+                        &mut r.warn_live_text,
+                        crate::i18n::I18nKey::PreflightRuleLiveText.tr_ui(lang),
+                    );
+                    ui.checkbox(
+                        &mut r.check_missing_fonts,
+                        crate::i18n::I18nKey::PreflightRuleMissingFont.tr_ui(lang),
+                    );
+                    ui.checkbox(
+                        &mut r.check_bleed,
+                        crate::i18n::I18nKey::PreflightRuleBleed.tr_ui(lang),
+                    );
+                    ui.checkbox(
+                        &mut r.check_layer_states,
+                        crate::i18n::I18nKey::PreflightRuleLayerStates.tr_ui(lang),
+                    );
+                    ui.add(
+                        DragValue::new(&mut r.min_outline_width_mm)
+                            .range(0.01..=5.0)
+                            .speed(0.02)
+                            .prefix(format!(
+                                "{}: ",
+                                crate::i18n::I18nKey::PreflightMinOutline.tr_ui(lang)
+                            ))
+                            .suffix(" mm"),
+                    );
+                    ui.add(
+                        DragValue::new(&mut r.max_tac_pct)
+                            .range(180.0..=400.0)
+                            .speed(5.0)
+                            .prefix(format!(
+                                "{}: ",
+                                crate::i18n::I18nKey::PreflightMaxTac.tr_ui(lang)
+                            ))
+                            .suffix(" %"),
+                    );
+                });
             let report = app.active_tab().and_then(|t| t.preflight_report.clone());
             if let Some(rep) = report {
-                ui.label(
-                    RichText::new(format!(
-                        "{} Errors · {} Warnings · {} Info",
-                        rep.error_count(),
-                        rep.warning_count(),
-                        rep.info_count()
-                    ))
-                    .color(if rep.has_errors() {
-                        tokens.danger
-                    } else {
-                        tokens.success
-                    }),
+                ui.with_layout(
+                    shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                    |ui| {
+                        use crate::state::PreflightSeverityFilter;
+                        ui.selectable_value(
+                            &mut app.production_state.preflight_severity,
+                            PreflightSeverityFilter::All,
+                            format!(
+                                "{} ({})",
+                                crate::i18n::I18nKey::PreflightAllIssues.tr_ui(lang),
+                                rep.issues.len()
+                            ),
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.preflight_severity,
+                            PreflightSeverityFilter::Errors,
+                            format!(
+                                "{} ({})",
+                                crate::i18n::I18nKey::PreflightErrorsOnly.tr_ui(lang),
+                                rep.error_count()
+                            ),
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.preflight_severity,
+                            PreflightSeverityFilter::Warnings,
+                            format!(
+                                "{} ({})",
+                                crate::i18n::I18nKey::PreflightWarningsOnly.tr_ui(lang),
+                                rep.warning_count()
+                            ),
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.preflight_severity,
+                            PreflightSeverityFilter::Info,
+                            format!(
+                                "{} ({})",
+                                crate::i18n::I18nKey::PreflightInfoOnly.tr_ui(lang),
+                                rep.info_count()
+                            ),
+                        );
+                    },
                 );
+                let sev_filter = app.production_state.preflight_severity;
                 let mut select_obj: Option<ObjectId> = None;
                 for issue in &rep.issues {
+                    use crate::state::PreflightSeverityFilter;
+                    let show = match sev_filter {
+                        PreflightSeverityFilter::All => true,
+                        PreflightSeverityFilter::Errors => {
+                            issue.severity == PreflightSeverity::Error
+                        }
+                        PreflightSeverityFilter::Warnings => {
+                            issue.severity == PreflightSeverity::Warning
+                        }
+                        PreflightSeverityFilter::Info => issue.severity == PreflightSeverity::Info,
+                    };
+                    if !show {
+                        continue;
+                    }
                     let col = match issue.severity {
                         PreflightSeverity::Error => tokens.danger,
                         PreflightSeverity::Warning => tokens.warning,
@@ -2415,10 +3316,16 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                     });
                 }
                 if let Some(oid) = select_obj {
+                    let before_sel = app
+                        .active_tab()
+                        .map(|t| t.selection.objects.clone())
+                        .unwrap_or_default();
                     if let Some(tab) = app.active_tab_mut() {
                         tab.selection.select_single(&tab.document, oid);
                         tab.metrics_dirty = true;
+                        tab.needs_rerender = true;
                     }
+                    app.maybe_fire_selection_change(&before_sel);
                 }
             }
         }
@@ -2813,6 +3720,74 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                     app.run_collect_for_output(&dir);
                 }
             });
+            if let Some(tab) = app.active_tab() {
+                let doc = &tab.document;
+                let mut fonts: Vec<String> = Vec::new();
+                for obj in doc.objects().values() {
+                    let runs: Option<&[coree_core::TextRun]> = match &obj.payload {
+                        NodePayload::ArtisticText(t) => Some(&t.runs),
+                        NodePayload::ParagraphText(p) => Some(&p.runs),
+                        NodePayload::TextOnPath(t) => Some(&t.text.runs),
+                        _ => None,
+                    };
+                    if let Some(rlist) = runs {
+                        for r in rlist {
+                            let fam = r.style.font_family.trim();
+                            if !fam.is_empty() && !fonts.iter().any(|f| f == fam) {
+                                fonts.push(fam.to_owned());
+                            }
+                        }
+                    }
+                }
+                let mut spots: Vec<String> = Vec::new();
+                for obj in doc.objects().values() {
+                    for c in obj.fill.referenced_colors() {
+                        if let Color::Spot { name, .. } = c {
+                            if !spots.contains(&name) {
+                                spots.push(name);
+                            }
+                        }
+                    }
+                    if obj.outline.is_visible() {
+                        if let Color::Spot { ref name, .. } = obj.outline.color {
+                            if !spots.contains(name) {
+                                spots.push(name.clone());
+                            }
+                        }
+                    }
+                }
+                egui::CollapsingHeader::new("Collect Manifest Preview (fsType / Assets / Spots)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Pages: {} · Assets: {} · Fonts: {} · Spot Inks: {}",
+                                doc.pages().len(),
+                                doc.assets().len(),
+                                fonts.len(),
+                                spots.len()
+                            ))
+                            .size(10.5),
+                        );
+                        if !fonts.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Fonts (fsType verified on Collect): {}",
+                                    fonts.join(", ")
+                                ))
+                                .size(10.0)
+                                .color(tokens.text_muted),
+                            );
+                        }
+                        if !spots.is_empty() {
+                            ui.label(
+                                RichText::new(format!("Spot Plates: {}", spots.join(", ")))
+                                    .size(10.0)
+                                    .color(tokens.cutcontour),
+                            );
+                        }
+                    });
+            }
 
             ui.separator();
             ui.label(RichText::new("Open Laser Controller Stream").strong());
@@ -2856,18 +3831,19 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
 fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
     let lang = app.ui_language;
     let tokens = app.theme.tokens();
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
     let fr = &mut app.find_replace_state;
-    ui.horizontal(|ui| {
+    shell_dir.with_horizontal(ui, |ui| {
         ui.label(lang.tr_ui("Scope:", "النطاق:"));
         ui.selectable_value(
             &mut fr.scope,
             FindScope::CurrentPage,
-            lang.tr_ui("Page", "الصفحة"),
+            crate::i18n::I18nKey::FindScopePage.tr_ui(lang),
         );
         ui.selectable_value(
             &mut fr.scope,
             FindScope::WholeDocument,
-            lang.tr_ui("Document", "المستند"),
+            crate::i18n::I18nKey::FindScopeDocument.tr_ui(lang),
         );
     });
     ComboBox::from_id_salt("fr_kind")
@@ -2923,11 +3899,11 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
             );
             ui.selectable_value(&mut fr.lens_filter, Some(LensKindFilter::Invert), "Invert");
         });
-    ui.horizontal(|ui| {
+    shell_dir.with_horizontal(ui, |ui| {
         ui.label(lang.tr_ui("Find Text:", "البحث عن نص:"));
         ui.text_edit_singleline(&mut fr.text_query);
     });
-    ui.horizontal(|ui| {
+    shell_dir.with_horizontal(ui, |ui| {
         ui.label(lang.tr_ui("Replace:", "استبدال بـ:"));
         ui.text_edit_singleline(&mut fr.replace_text);
     });
@@ -2936,47 +3912,154 @@ fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
         lang.tr_ui("Case Sensitive", "مطابقة حالة الأحرف"),
     );
 
-    let mut action_to_run: Option<ReplaceAction> = None;
-    let mut find_only = false;
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .button(lang.tr_ui("Find & Select", "بحث وتحديد"))
-            .clicked()
-        {
-            find_only = true;
+    ui.separator();
+    ui.label(RichText::new("Attribute Filters").strong().size(11.0));
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.checkbox(
+            &mut fr.use_fill_color,
+            crate::i18n::I18nKey::FindFillColor.tr_ui(lang),
+        );
+        let mut fc = core_color_to_egui(&fr.find_fill_color);
+        if ui.color_edit_button_srgba(&mut fc).changed() {
+            fr.find_fill_color = egui_color_to_core(fc);
+            fr.use_fill_color = true;
         }
-        if ui
-            .button(lang.tr_ui("Replace Text", "استبدال النص"))
-            .clicked()
-        {
-            action_to_run = Some(ReplaceAction::ReplaceText {
-                find: fr.text_query.clone(),
-                replace_with: fr.replace_text.clone(),
-                case_sensitive: fr.case_sensitive,
-            });
-        }
-        if ui
-            .button(lang.tr_ui("Replace Fill", "استبدال التعبئة"))
-            .clicked()
-        {
-            action_to_run = Some(ReplaceAction::ReplaceFillColor {
-                color: fr.replace_fill_color.clone(),
-            });
-        }
-        if ui
-            .button(lang.tr_ui("Set Overprint", "تفعيل الطباعة الفوقية"))
-            .clicked()
-        {
-            action_to_run = Some(ReplaceAction::ConvertOverprint { overprint: true });
+        ui.checkbox(
+            &mut fr.use_outline_color,
+            crate::i18n::I18nKey::FindOutlineColor.tr_ui(lang),
+        );
+        let mut oc = core_color_to_egui(&fr.find_outline_color);
+        if ui.color_edit_button_srgba(&mut oc).changed() {
+            fr.find_outline_color = egui_color_to_core(oc);
+            fr.use_outline_color = true;
         }
     });
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.checkbox(
+            &mut fr.use_outline_width,
+            crate::i18n::I18nKey::PropOutlineWidth.tr_ui(lang),
+        );
+        ui.add_enabled(
+            fr.use_outline_width,
+            DragValue::new(&mut fr.outline_width_min_mm)
+                .range(0.0..=100.0)
+                .speed(0.05)
+                .prefix(format!(
+                    "{}: ",
+                    crate::i18n::I18nKey::FindOutlineWidthMin.tr_ui(lang)
+                )),
+        );
+        ui.add_enabled(
+            fr.use_outline_width,
+            DragValue::new(&mut fr.outline_width_max_mm)
+                .range(0.0..=100.0)
+                .speed(0.05)
+                .prefix(format!(
+                    "{}: ",
+                    crate::i18n::I18nKey::FindOutlineWidthMax.tr_ui(lang)
+                )),
+        );
+    });
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.label(crate::i18n::I18nKey::PropOutlineHairline.tr_ui(lang));
+        ui.selectable_value(
+            &mut fr.filter_hairline,
+            None,
+            crate::i18n::I18nKey::FindHairlineAny.tr_ui(lang),
+        );
+        ui.selectable_value(
+            &mut fr.filter_hairline,
+            Some(true),
+            crate::i18n::I18nKey::FindHairlineOnly.tr_ui(lang),
+        );
+        ui.selectable_value(
+            &mut fr.filter_hairline,
+            Some(false),
+            crate::i18n::I18nKey::FindHairlineNon.tr_ui(lang),
+        );
+    });
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.label(crate::i18n::I18nKey::FindFontFamily.tr_ui(lang));
+        ui.add(egui::TextEdit::singleline(&mut fr.font_query).desired_width(96.0));
+        ui.label(crate::i18n::I18nKey::FindLayerFilter.tr_ui(lang));
+        ui.add(egui::TextEdit::singleline(&mut fr.layer_filter).desired_width(72.0));
+    });
+
+    let mut action_to_run: Option<ReplaceAction> = None;
+    let mut find_only = false;
+    ui.with_layout(
+        shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+        |ui| {
+            if ui
+                .button(crate::i18n::I18nKey::FindRunSelect.tr_ui(lang))
+                .clicked()
+            {
+                find_only = true;
+            }
+            if ui
+                .button(crate::i18n::I18nKey::ReplaceRunAction.tr_ui(lang))
+                .clicked()
+            {
+                action_to_run = Some(ReplaceAction::ReplaceText {
+                    find: fr.text_query.clone(),
+                    replace_with: fr.replace_text.clone(),
+                    case_sensitive: fr.case_sensitive,
+                });
+            }
+            if ui
+                .button(crate::i18n::I18nKey::ReplaceFillColor.tr_ui(lang))
+                .clicked()
+            {
+                action_to_run = Some(ReplaceAction::ReplaceFillColor {
+                    color: fr.replace_fill_color.clone(),
+                });
+            }
+            if ui.button("Replace Outline").clicked() {
+                action_to_run = Some(ReplaceAction::ReplaceOutlineColor {
+                    color: fr.replace_outline_color.clone(),
+                });
+            }
+            if ui.button("Replace Width").clicked() {
+                action_to_run = Some(ReplaceAction::ReplaceOutlineWidth {
+                    width_mm: fr.replace_outline_width_mm,
+                    is_hairline: fr.replace_outline_width_mm <= 0.05,
+                });
+            }
+            if ui.button("Replace Font").clicked() && !fr.replace_font.trim().is_empty() {
+                action_to_run = Some(ReplaceAction::ReplaceFontFamily {
+                    font_family: fr.replace_font.trim().to_owned(),
+                });
+            }
+            if ui
+                .button(lang.tr_ui("Set Overprint", "تفعيل الطباعة الفوقية"))
+                .clicked()
+            {
+                action_to_run = Some(ReplaceAction::ConvertOverprint { overprint: true });
+            }
+        },
+    );
 
     let mut rc = core_color_to_egui(&fr.replace_fill_color);
+    let mut roc = core_color_to_egui(&fr.replace_outline_color);
     ui.horizontal(|ui| {
-        ui.label(lang.tr_ui("Fill Color:", "لون التعبئة:"));
+        ui.label(lang.tr_ui("Fill:", "التعبئة:"));
         if ui.color_edit_button_srgba(&mut rc).changed() {
             fr.replace_fill_color = egui_color_to_core(rc);
         }
+        ui.label("Line:");
+        if ui.color_edit_button_srgba(&mut roc).changed() {
+            fr.replace_outline_color = egui_color_to_core(roc);
+        }
+        ui.add(
+            DragValue::new(&mut fr.replace_outline_width_mm)
+                .range(0.01..=50.0)
+                .speed(0.05)
+                .suffix(" mm"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Replace Font:");
+        ui.add(egui::TextEdit::singleline(&mut fr.replace_font).desired_width(140.0));
     });
 
     ui.separator();
@@ -3649,10 +4732,32 @@ fn ui_macros_docker(ui: &mut Ui, app: &mut StudioApp) {
 // =============================================================================
 
 fn ui_cdr_inspector_docker(ui: &mut Ui, app: &mut StudioApp) {
+    const CP1256: u16 = 1256;
     let tokens = app.theme.tokens();
-    if ui.button("Refresh Structural Inspection").clicked() {
-        app.refresh_inspector_for_active(true);
-    }
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    shell_dir.with_horizontal(ui, |ui| {
+        if ui.button("Refresh Structural Inspection").clicked() {
+            app.refresh_inspector_for_active(true);
+        }
+        if ui
+            .button(crate::i18n::I18nKey::FileOpenCdrWithCodepage.tr_ui(lang))
+            .clicked()
+        {
+            app.cdr_import_dialog.pending_path =
+                app.active_tab().and_then(|t| t.source_path.clone());
+            if app.cdr_import_dialog.selected_codepage.is_none() {
+                app.cdr_import_dialog.selected_codepage = Some(CP1256);
+            }
+            if app.cdr_import_dialog.preview_summary.is_empty() {
+                if let Some(rep) = app.active_tab().and_then(|t| t.inspection_report.as_ref()) {
+                    app.cdr_import_dialog.preview_summary =
+                        format!("{} · {} chunk(s)", rep.format_era, rep.chunks.len());
+                }
+            }
+            app.cdr_import_dialog.open = true;
+        }
+    });
     let Some(rep) = app.active_tab().and_then(|t| t.inspection_report.as_ref()) else {
         ui.label(
             RichText::new(
@@ -3699,40 +4804,85 @@ fn ui_cdr_inspector_docker(ui: &mut Ui, app: &mut StudioApp) {
 
     if !rep.zip_entries.is_empty() {
         ui.separator();
-        egui::CollapsingHeader::new(format!("ZIP Entries ({})", rep.zip_entries.len())).show(
-            ui,
-            |ui| {
-                for ze in &rep.zip_entries {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} ({} → {} B)",
-                            ze.name, ze.compressed_size, ze.uncompressed_size
-                        ))
-                        .monospace()
-                        .size(10.5),
-                    );
-                }
-            },
-        );
+        egui::CollapsingHeader::new(format!(
+            "{} ({})",
+            crate::i18n::I18nKey::CdrZipEntries.tr_ui(lang),
+            rep.zip_entries.len()
+        ))
+        .show(ui, |ui| {
+            for ze in &rep.zip_entries {
+                ui.label(
+                    RichText::new(format!(
+                        "{} ({} → {} B)",
+                        ze.name, ze.compressed_size, ze.uncompressed_size
+                    ))
+                    .monospace()
+                    .size(10.5),
+                );
+            }
+        });
     }
 
     if !rep.chunks.is_empty() {
         ui.separator();
-        egui::CollapsingHeader::new(format!("RIFF Chunk Tree ({})", rep.chunks.len())).show(
-            ui,
-            |ui| {
-                for ch in rep.chunks.iter().take(150) {
-                    let indent = "  ".repeat(ch.depth.min(8));
-                    let tag = if ch.is_list { "LIST " } else { "" };
-                    ui.label(
+        let mut next_selected = app.selected_cdr_chunk_idx;
+        egui::CollapsingHeader::new(format!(
+            "{} ({})",
+            crate::i18n::I18nKey::CdrRiffChunkTree.tr_ui(lang),
+            rep.chunks.len()
+        ))
+        .default_open(true)
+        .show(ui, |ui| {
+            for (c_idx, ch) in rep.chunks.iter().take(150).enumerate() {
+                let indent = "  ".repeat(ch.depth.min(8));
+                let tag = if ch.is_list { "LIST " } else { "" };
+                let sel = next_selected == Some(c_idx);
+                if ui
+                    .selectable_label(
+                        sel,
                         RichText::new(format!("{indent}{tag}'{}' ({} B)", ch.fourcc, ch.size))
                             .monospace()
                             .size(10.5),
-                    );
+                    )
+                    .clicked()
+                {
+                    next_selected = Some(c_idx);
                 }
-            },
-        );
+            }
+        });
+        if let Some(chunk) = next_selected.and_then(|idx| rep.chunks.get(idx)) {
+            hex_view(ui, chunk, lang);
+        }
+        app.selected_cdr_chunk_idx = next_selected;
     }
+}
+
+fn hex_view(ui: &mut Ui, ch: &coree_cdr::ChunkSummary, lang: crate::theme::StudioLanguage) {
+    let hex_str = if ch.preview_bytes.is_empty() {
+        format!(
+            "'{}' ({} B): <container/no inline payload bytes>",
+            ch.fourcc, ch.size
+        )
+    } else {
+        format!(
+            "'{}' ({} B) Hex / ASCII:\n{}",
+            ch.fourcc,
+            ch.size,
+            coree_cdr::format_hex_ascii_dump(&ch.preview_bytes, 0)
+        )
+    };
+    ui.separator();
+    ui.label(
+        RichText::new(crate::i18n::I18nKey::CdrHexAsciiViewer.tr_ui(lang))
+            .strong()
+            .size(11.0),
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("cdr_hex_dump_scroll")
+        .max_height(160.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new(hex_str).monospace().size(10.0));
+        });
 }
 
 // =============================================================================

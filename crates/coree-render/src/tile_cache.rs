@@ -185,11 +185,23 @@ impl SceneChromeKey {
             }
         }
         let mut pages_hash = 0xcbf2_9ce4_8422_2325_u64;
+        let ds = doc.drawing_scale();
+        fnv_mix(&mut pages_hash, ds.numerator.to_bits());
+        fnv_mix(&mut pages_hash, ds.denominator.to_bits());
         for p in pages {
             fnv_mix(&mut pages_hash, p.id.0);
             fnv_mix(&mut pages_hash, p.width_mm.to_bits());
             fnv_mix(&mut pages_hash, p.height_mm.to_bits());
             fnv_mix(&mut pages_hash, p.bleed_mm.to_bits());
+            fnv_mix(&mut pages_hash, u64::from(p.facing_pages));
+            fnv_mix(&mut pages_hash, u64::from(p.printable_background));
+            let bg_repr = format!("{:?}", p.background_fill);
+            fnv_mix(&mut pages_hash, bg_repr.len() as u64);
+            for chunk in bg_repr.as_bytes().chunks(8) {
+                let mut buf = [0u8; 8];
+                buf[..chunk.len()].copy_from_slice(chunk);
+                fnv_mix(&mut pages_hash, u64::from_le_bytes(buf));
+            }
         }
         let proof_hash = compute_proof_hash(options);
         let icc_hash = compute_icc_hash(doc, options);

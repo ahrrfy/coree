@@ -521,6 +521,7 @@ fn find_replace_scope_locked_protection_and_preflight_scaled_dpi() {
                     width_mm: 25.4,
                     height_mm: 25.4,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )
@@ -2930,4 +2931,103 @@ fn w2_exit_r8_generate_cut_contour_applies_perspective3x3_and_effect_perspective
             cut.cut_length_mm
         );
     }
+}
+
+#[test]
+fn w5a_coree_prod_pdf417_quad_persp_text_effects_preflight() {
+    // 1. #20g PDF417 > 1063 payload returns Err cleanly instead of panicking on underflow
+    let huge_payload = "A".repeat(2500);
+    let pdf417_err = generate_barcode(
+        BarcodeSymbology::Pdf417,
+        &huge_payload,
+        &BarcodeOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(pdf417_err, coree_prod::ProdError::BarcodeError(_)));
+
+    // 2. #20i CMYK preflight detects RGB color inside Effect::DropShadow
+    let mut cmyk_doc = Document::new("CmykFxPreflight", 100.0, 100.0, ColorMode::Cmyk, 300.0);
+    let mut rect = make_rect(
+        10.0,
+        10.0,
+        30.0,
+        30.0,
+        Fill::Solid(Color::cmyk(1.0, 0.0, 0.0, 0.0)),
+        OutlineStyle::none(),
+    );
+    rect.effects.push(coree_core::Effect::DropShadow {
+        dx_mm: 2.0,
+        dy_mm: 2.0,
+        blur_mm: 1.5,
+        opacity: 0.6,
+        color: Color::rgba8(255, 0, 0, 255),
+        feather_direction: coree_core::FeatherDirection::Average,
+    });
+    cmyk_doc.add_object(rect, None).unwrap();
+    let report = run_preflight(&cmyk_doc, &PreflightRules::default());
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.kind == PreflightIssueKind::RgbInCmykDocument),
+        "CMYK preflight must flag RGB color in DropShadow effect"
+    );
+
+    // 3. #20h Separation applies obj.perspective to text separation and exports plates PDF cleanly
+    let mut sep_doc = Document::new("SepQuadPersp", 120.0, 120.0, ColorMode::Cmyk, 150.0);
+    let mut ptext = SceneObject::new(
+        ObjectId(0),
+        "PerspText",
+        NodePayload::ArtisticText(ArtisticText::from_plain(
+            "HI",
+            TextStyle {
+                fill: Color::cmyk(0.0, 1.0, 0.0, 0.0),
+                font_size_pt: 24.0,
+                ..TextStyle::default()
+            },
+        )),
+    );
+    ptext.perspective = coree_core::Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 20.0, 10.0),
+        &[
+            Point2D::new(60.0, 60.0),
+            Point2D::new(100.0, 60.0),
+            Point2D::new(100.0, 90.0),
+            Point2D::new(60.0, 90.0),
+        ],
+    );
+    sep_doc.add_object(ptext, None).unwrap();
+
+    let (sep_pdf_bytes, _) =
+        coree_prod::export_separated_plates_pdf_bytes(&sep_doc, 0, &SeparationOptions::default())
+            .unwrap();
+    assert!(!sep_pdf_bytes.is_empty());
+
+    let sep_res = compute_separations(&sep_doc, 0, &SeparationOptions::default()).unwrap();
+    let magenta = sep_res
+        .plates
+        .iter()
+        .find(|p| p.channel == SeparationChannel::Magenta)
+        .unwrap();
+    let idx = |x_mm: f64, y_mm: f64| -> usize {
+        let px = ((x_mm * f64::from(magenta.width)) / 120.0).round() as usize;
+        let py = ((y_mm * f64::from(magenta.height)) / 120.0).round() as usize;
+        py.min(magenta.height as usize - 1) * magenta.width as usize
+            + px.min(magenta.width as usize - 1)
+    };
+    let mut max_warped = 0u8;
+    for xm in [70.0, 80.0, 90.0] {
+        for ym in [68.0, 75.0, 82.0] {
+            max_warped = max_warped.max(magenta.ink_map[idx(xm, ym)]);
+        }
+    }
+    assert!(
+        max_warped > 50,
+        "perspective ArtisticText must render inside warped quad [60..100,60..90]"
+    );
+    assert_eq!(
+        magenta.ink_map[idx(5.0, 5.0)],
+        0,
+        "perspective ArtisticText must not render at unwarped origin (5,5)"
+    );
 }

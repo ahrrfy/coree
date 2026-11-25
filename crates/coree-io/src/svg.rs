@@ -575,6 +575,7 @@ fn import_usvg_node_inner(
                         width_mm,
                         height_mm,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )
@@ -2429,6 +2430,7 @@ mod tests {
                     width_mm: 10.0,
                     height_mm: 10.0,
                     filters: vec![],
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),

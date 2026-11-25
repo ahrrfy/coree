@@ -896,6 +896,7 @@ fn w1b_wal_snapshot_and_command_journal_replay_new_ops() {
             clear_gray_icc: false,
             rendering_intent: None,
             black_point_compensation: None,
+            drawing_scale: None,
         },
         CommandOp::SetPageProperties {
             page_id: p1_id,
@@ -904,6 +905,8 @@ fn w1b_wal_snapshot_and_command_journal_replay_new_ops() {
             height_mm: Some(200.0),
             bleed_mm: Some(3.0),
             facing_pages: Some(true),
+            background_fill: None,
+            printable_background: None,
         },
         CommandOp::UpsertSymbol { symbol: sym },
         CommandOp::InstantiateSymbol {
@@ -1026,6 +1029,7 @@ fn wal_command_journal_replays_w1b_r4_command_ops_exactly() {
             width_mm: 10.0,
             height_mm: 10.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );

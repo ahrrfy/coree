@@ -151,6 +151,7 @@ pub(crate) fn parse_stlt_body(r: &mut ByteReader<'_>) -> CdrResult<ParsedStyleEn
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_txsm_chunk(
     data: &[u8],
     loda_style_id: Option<u32>,
@@ -159,6 +160,29 @@ pub(crate) fn parse_txsm_chunk(
     styles: &HashMap<u32, ParsedStyleEntry>,
     fonts: &HashMap<u32, ParsedFontEntry>,
     cdss_default: Option<&TextStyle>,
+) -> CdrResult<NodePayload> {
+    parse_txsm_chunk_with_default_codepage(
+        data,
+        loda_style_id,
+        inline_style,
+        text_meta,
+        styles,
+        fonts,
+        cdss_default,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_txsm_chunk_with_default_codepage(
+    data: &[u8],
+    loda_style_id: Option<u32>,
+    inline_style: Option<&ParsedStyleEntry>,
+    text_meta: Option<ParsedTextMeta>,
+    styles: &HashMap<u32, ParsedStyleEntry>,
+    fonts: &HashMap<u32, ParsedFontEntry>,
+    cdss_default: Option<&TextStyle>,
+    default_codepage: Option<u16>,
 ) -> CdrResult<NodePayload> {
     let mut r = ByteReader::new(data);
     let format_ver = r.read_u8("txsm version")?;
@@ -186,7 +210,8 @@ pub(crate) fn parse_txsm_chunk(
                 let codepage = (cp_raw != 0)
                     .then_some(cp_raw)
                     .or_else(|| resolved_entry.and_then(|e| e.codepage))
-                    .or_else(|| font_hint.and_then(|f| f.codepage));
+                    .or_else(|| font_hint.and_then(|f| f.codepage))
+                    .or(default_codepage);
                 let charset = (cs_raw != 0)
                     .then_some(cs_raw)
                     .or_else(|| resolved_entry.and_then(|e| e.charset))
@@ -223,7 +248,13 @@ pub(crate) fn parse_txsm_chunk(
                     decoded, style,
                 )));
             }
-            parse_cdr_native_txsm(data, inline_style, text_meta, cdss_default)
+            parse_cdr_native_txsm(
+                data,
+                inline_style,
+                text_meta,
+                cdss_default,
+                default_codepage,
+            )
         }
         0x02 if data.len() >= 22 => {
             let is_para = r.read_u8("txsm2 is_para")? != 0;
@@ -261,7 +292,8 @@ pub(crate) fn parse_txsm_chunk(
 
                 let cp = (cp_raw != 0)
                     .then_some(cp_raw)
-                    .or_else(|| entry.as_ref().and_then(|e| e.codepage));
+                    .or_else(|| entry.as_ref().and_then(|e| e.codepage))
+                    .or(default_codepage);
                 let cs = (cs_raw != 0)
                     .then_some(cs_raw)
                     .or_else(|| entry.as_ref().and_then(|e| e.charset));
@@ -295,12 +327,24 @@ pub(crate) fn parse_txsm_chunk(
             }
         }
         0x03 if data.len() >= 8 => {
-            if let Some(p) = parse_v3_v5_txsm(data)? {
+            if let Some(p) = parse_v3_v5_txsm(data, default_codepage)? {
                 return Ok(p);
             }
-            parse_cdr_native_txsm(data, inline_style, text_meta, cdss_default)
+            parse_cdr_native_txsm(
+                data,
+                inline_style,
+                text_meta,
+                cdss_default,
+                default_codepage,
+            )
         }
-        _ => parse_cdr_native_txsm(data, inline_style, text_meta, cdss_default),
+        _ => parse_cdr_native_txsm(
+            data,
+            inline_style,
+            text_meta,
+            cdss_default,
+            default_codepage,
+        ),
     }
 }
 
@@ -311,8 +355,9 @@ fn parse_cdr_native_txsm(
     inline_style: Option<&ParsedStyleEntry>,
     text_meta: Option<ParsedTextMeta>,
     cdss_default: Option<&TextStyle>,
+    default_codepage: Option<u16>,
 ) -> CdrResult<NodePayload> {
-    let cp = inline_style.and_then(|s| s.codepage);
+    let cp = inline_style.and_then(|s| s.codepage).or(default_codepage);
     let cs = inline_style.and_then(|s| s.charset);
 
     let decoded = if data.len() >= 16 {
@@ -595,7 +640,7 @@ mod tests {
             linked_next_frame: Some(ObjectId(42)),
         };
 
-        let payload = parse_cdr_native_txsm(&raw, None, Some(meta), None).unwrap();
+        let payload = parse_cdr_native_txsm(&raw, None, Some(meta), None, None).unwrap();
         match payload {
             NodePayload::ParagraphText(para) => {
                 assert_eq!(para.plain_text(), "Hello");

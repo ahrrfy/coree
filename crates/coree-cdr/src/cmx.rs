@@ -106,6 +106,15 @@ pub fn is_cmx_form_type(form: &[u8; 4]) -> bool {
 
 /// Parses a `.cmx` (16-bit or 32-bit RIFF/RIFX) container into a [`ParsedCmx`].
 pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCmx> {
+    parse_cmx_bytes_with_options(bytes, limits, crate::CdrReadOptions::default())
+}
+
+/// Parses a `.cmx` container with explicit [`crate::CdrReadOptions`].
+pub fn parse_cmx_bytes_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    opts: crate::CdrReadOptions,
+) -> CdrResult<ParsedCmx> {
     let mut budget_remaining = limits.max_uncompressed_bytes;
     let riff_tree = parse_riff_with_budget(bytes, limits, &mut budget_remaining, true)?;
     if !is_cmx_form_type(&riff_tree.form_type) {
@@ -221,7 +230,13 @@ pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCm
                 b"rclr" => parse_rclr(data, endian, &mut colors, &mut warnings),
                 b"rpen" => parse_rpen(data, endian, &mut pens, &mut warnings),
                 b"rlin" => parse_rlin(data, endian, &mut lines, &mut warnings),
-                b"rstr" => parse_rstr(data, endian, &mut strings, &mut warnings),
+                b"rstr" => parse_rstr(
+                    data,
+                    endian,
+                    opts.default_codepage,
+                    &mut strings,
+                    &mut warnings,
+                ),
                 b"rimg" => parse_rimg(
                     data,
                     endian,
@@ -400,7 +415,16 @@ pub fn parse_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedCm
 
 /// Imports a `.cmx` file from raw bytes into an [`ImportReport`].
 pub fn import_cmx_bytes(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportReport> {
-    let parsed = parse_cmx_bytes(bytes, limits)?;
+    import_cmx_bytes_with_options(bytes, limits, crate::CdrReadOptions::default())
+}
+
+/// Imports a `.cmx` file from raw bytes using explicit [`crate::CdrReadOptions`].
+pub fn import_cmx_bytes_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    opts: crate::CdrReadOptions,
+) -> CdrResult<ImportReport> {
+    let parsed = parse_cmx_bytes_with_options(bytes, limits, opts)?;
     let detected_format = match parsed.precision {
         CmxPrecision::Bit16 => CdrFormat::Cmx16,
         CmxPrecision::Bit32 => CdrFormat::Cmx32,
@@ -569,7 +593,13 @@ fn parse_rlin(
     }
 }
 
-fn parse_rstr(data: &[u8], endian: RiffEndian, out: &mut Vec<String>, warnings: &mut Vec<String>) {
+fn parse_rstr(
+    data: &[u8],
+    endian: RiffEndian,
+    default_codepage: Option<u16>,
+    out: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
     let mut r = ByteReader::new(data);
     let Ok(count) = endian.read_u16(&mut r, "rstr count") else {
         warnings.push("truncated rstr table".into());
@@ -585,7 +615,11 @@ fn parse_rstr(data: &[u8], endian: RiffEndian, out: &mut Vec<String>, warnings: 
         let Ok(bytes) = r.read_bytes(usize::from(len), "rstr bytes") else {
             break;
         };
-        out.push(decode_cdr_text(bytes, (cp != 0).then_some(cp), None));
+        out.push(decode_cdr_text(
+            bytes,
+            (cp != 0).then_some(cp).or(default_codepage),
+            None,
+        ));
     }
 }
 
@@ -692,6 +726,8 @@ fn parse_cmx_page_chunk(
                     height_mm: h,
                     bleed_mm: bleed,
                     facing_pages: false,
+                    background_fill: Fill::None,
+                    printable_background: false,
                     layers: Vec::new(),
                     unknown_chunks: Vec::new(),
                 });
@@ -734,6 +770,8 @@ fn parse_cmx_page_chunk(
                             height_mm: 297.0,
                             bleed_mm: 3.0,
                             facing_pages: false,
+                            background_fill: Fill::None,
+                            printable_background: false,
                             layers: Vec::new(),
                             unknown_chunks: Vec::new(),
                         });
@@ -969,6 +1007,7 @@ fn parse_cmx_page_chunk(
                             width_mm: w_mm.max(1.0),
                             height_mm: h_mm.max(1.0),
                             filters: Vec::new(),
+                            filter_enabled: Vec::new(),
                             crop_rect: None,
                         }),
                     );

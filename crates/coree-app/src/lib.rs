@@ -9,6 +9,7 @@ pub mod cdr_bridge;
 pub mod cli;
 pub mod clipboard;
 pub mod display_icc;
+pub mod i18n;
 pub mod io_bridge;
 pub mod ipc;
 pub mod printing;
@@ -17,3 +18,6 @@ pub mod state;
 pub mod stylus;
 pub mod theme;
 pub mod ui;
+
+/// Crate identifier used during workspace initialization and diagnostics.
+pub const CRATE_NAME: &str = "coree-app";

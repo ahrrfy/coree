@@ -407,6 +407,7 @@ fn import_psd_reader<R: Read + Seek>(
                         width_mm,
                         height_mm,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )
@@ -489,6 +490,7 @@ fn import_psd_reader<R: Read + Seek>(
                         width_mm: page_w_mm,
                         height_mm: page_h_mm,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )
@@ -826,7 +828,7 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                                 ch_ids,
                                 source: ExportLayerSource::Asset {
                                     id: r.asset_id,
-                                    filters: r.filters.clone(),
+                                    filters: r.active_filters(),
                                 },
                             });
                             return;
@@ -857,7 +859,7 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                             ch_ids,
                             source: ExportLayerSource::ResampledAsset {
                                 id: r.asset_id,
-                                filters: r.filters.clone(),
+                                filters: r.active_filters(),
                                 width: target_w,
                                 height: target_h,
                             },
@@ -4056,6 +4058,7 @@ mod tests {
                     width_mm: 4.0 * 25.4 / 72.0,
                     height_mm: 4.0 * 25.4 / 72.0,
                     filters: vec![],
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),
@@ -4289,6 +4292,7 @@ mod tests {
                         height_mm: 10.0,
                         crop_rect: None,
                         filters: f,
+                        filter_enabled: Vec::new(),
                     }),
                 ),
                 None,
@@ -4334,6 +4338,7 @@ mod tests {
                         height_mm: 10.0,
                         crop_rect: None,
                         filters,
+                        filter_enabled: Vec::new(),
                     }),
                 ),
                 None,
@@ -4382,6 +4387,7 @@ mod tests {
                         width_mm: 24.0,
                         height_mm: 24.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )
@@ -4452,6 +4458,7 @@ mod tests {
                         width_mm: 80.0,
                         height_mm: 80.0,
                         filters,
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )
@@ -4534,6 +4541,7 @@ mod tests {
                         width_mm: 40.0,
                         height_mm: 40.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: Some(coree_core::Rect2D::from_xywh(10.0, 10.0, 20.0, 20.0)),
                     }),
                 )
@@ -4584,6 +4592,7 @@ mod tests {
                         width_mm: phys_mm,
                         height_mm: phys_mm,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 ),

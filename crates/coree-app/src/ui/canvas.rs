@@ -36,6 +36,9 @@ pub fn show_canvas_and_status(ui: &mut Ui, app: &mut StudioApp) {
     show_status_bar(ui, app);
     show_page_tabs_and_doc_palette(ui, app);
     show_central_viewport(ui, app);
+    if app.show_navigator_popup {
+        show_navigator_popup_area(ui, app);
+    }
 }
 
 // =============================================================================
@@ -81,6 +84,8 @@ fn tool_status_hint(tool: ToolId) -> &'static str {
 
 fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
 
     egui::Panel::bottom("coree_status_bar")
         .exact_size(STATUS_BAR_HEIGHT)
@@ -91,7 +96,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 .stroke(Stroke::new(1.0, tokens.border)),
         )
         .show(ui, |ui| {
-            let active_tool_label = app.active_tool.label();
+            let active_tool_label = crate::i18n::tool_i18n_key(app.active_tool).tr_ui(lang);
             let tool_hint = tool_status_hint(app.active_tool);
             let (
                 cursor_txt,
@@ -104,18 +109,23 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 fill_c,
                 stroke_c,
                 preflight_errs,
+                snap_summary,
+                scale_label,
             ) = if let Some(tab) = app.active_tab_mut() {
                 tab.ensure_metrics_fresh();
                 let u = tab.document.default_unit();
                 let dpi = f64::from(tab.document.dpi());
-                let cx = u.from_mm(tab.cursor_world_mm.x, dpi);
-                let cy = u.from_mm(tab.cursor_world_mm.y, dpi);
+                let scale = tab.document.drawing_scale();
+                let sf = scale.scale_factor();
+                let cx = u.from_mm(tab.cursor_world_mm.x * sf, dpi);
+                let cy = u.from_mm(tab.cursor_world_mm.y * sf, dpi);
                 let c_txt = format!("({cx:.1}, {cy:.1}) {}", u.suffix());
                 let s_txt = if tab.selection.is_empty() {
                     format!(
-                        "{} · {} obj(s)",
+                        "{} · {} {}",
                         active_tool_label,
-                        tab.document.objects().len()
+                        tab.document.objects().len(),
+                        crate::i18n::I18nKey::StatusObjectsCount.tr_ui(lang)
                     )
                 } else if tab.selection.len() == 1 {
                     let oid = tab.selection.objects[0];
@@ -130,16 +140,23 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     };
                     format!("Sel: {name} [{mode_lbl}]")
                 } else {
-                    format!("Sel: {} objects", tab.selection.len())
+                    format!(
+                        "Sel: {} {}",
+                        tab.selection.len(),
+                        crate::i18n::I18nKey::StatusObjectsCount.tr_ui(lang)
+                    )
                 };
-                let dim_txt = if tab.powerclip_edit_id.is_some() {
-                    "PowerClip Edit · Ctrl+Click outside or Esc to finish".to_owned()
+                let dim_txt = if matches!(tab.tool_core.drag_state, ActiveDragState::DraggingPivot)
+                {
+                    crate::i18n::I18nKey::StatusDraggingPivot.tr_ui(lang)
+                } else if tab.powerclip_edit_id.is_some() {
+                    crate::i18n::I18nKey::StatusPowerClipEdit.tr_ui(lang)
                 } else if let Some(bb) = (!tab.selection.is_empty())
                     .then(|| tab.selection.bounding_box(&tab.document))
                     .flatten()
                 {
-                    let bw = u.from_mm(bb.width(), dpi);
-                    let bh = u.from_mm(bb.height(), dpi);
+                    let bw = u.from_mm(bb.width() * sf, dpi);
+                    let bh = u.from_mm(bb.height() * sf, dpi);
                     format!("{bw:.1} × {bh:.1} {} · {tool_hint}", u.suffix())
                 } else {
                     tool_hint.to_owned()
@@ -159,6 +176,52 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     .preflight_report
                     .as_ref()
                     .map_or(0, |r| r.error_count() + r.warning_count());
+                let so = &tab.snap_options;
+                let mut active_snaps = Vec::new();
+                if so.objects {
+                    active_snaps.push("Obj");
+                }
+                if so.nodes {
+                    active_snaps.push("Node");
+                }
+                if so.guidelines {
+                    active_snaps.push("Guide");
+                }
+                if so.grid {
+                    active_snaps.push("Grid");
+                }
+                if so.page_edges {
+                    active_snaps.push("Page");
+                }
+                if so.tangent {
+                    active_snaps.push("Tan");
+                }
+                if so.perpendicular {
+                    active_snaps.push("Perp");
+                }
+                if so.quadrant {
+                    active_snaps.push("Quad");
+                }
+                if so.intersection {
+                    active_snaps.push("Int");
+                }
+                if so.baseline {
+                    active_snaps.push("Base");
+                }
+                let snap_txt = if active_snaps.is_empty() {
+                    crate::i18n::I18nKey::StatusSnapOff.tr_ui(lang)
+                } else {
+                    format!(
+                        "{}: {}",
+                        crate::i18n::I18nKey::StatusSnapActive.tr_ui(lang),
+                        active_snaps.join("+")
+                    )
+                };
+                let scale_txt = if (sf - 1.0).abs() > 1e-6 {
+                    format!(" · {}", scale.label())
+                } else {
+                    String::new()
+                };
                 (
                     c_txt,
                     s_txt,
@@ -170,11 +233,13 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     fc,
                     sc,
                     pf_errs,
+                    snap_txt,
+                    scale_txt,
                 )
             } else {
                 (
                     "(0.0, 0.0) mm".to_owned(),
-                    "No document".to_owned(),
+                    crate::i18n::I18nKey::StatusNoDocument.tr_ui(lang),
                     String::new(),
                     Default::default(),
                     100.0,
@@ -183,10 +248,12 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     None,
                     None,
                     0,
+                    crate::i18n::I18nKey::StatusSnapOff.tr_ui(lang),
+                    String::new(),
                 )
             };
 
-            ui.horizontal(|ui| {
+            shell_dir.with_horizontal(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 // Zone 1: Cursor coordinates, selection dimensions & contextual modifier hint
                 ui.label(
@@ -223,7 +290,8 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     .add(
                         egui::Button::new(
                             RichText::new(format!(
-                                "Cut: {cut_m:.2} m | Area: {area_cm2:.2} cm² | {} nodes",
+                                "{}: {cut_m:.2} m | Area: {area_cm2:.2} cm² | {} nodes",
+                                crate::i18n::I18nKey::StatusCutMeter.tr_ui(lang),
                                 metrics.node_count
                             ))
                             .monospace()
@@ -250,107 +318,127 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                     );
                 }
 
-                // Right-aligned zone: swatches, color mode, preflight badge, zoom, status
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{zoom_pct:.0}%"))
-                            .monospace()
-                            .size(11.0)
-                            .color(tokens.text),
-                    );
-                    ui.separator();
-                    ui.label(
-                        RichText::new(color_mode)
-                            .size(11.0)
-                            .color(tokens.text_muted),
-                    );
-
-                    if rec_macro {
-                        ui.label(
-                            RichText::new("● REC")
-                                .size(11.0)
-                                .strong()
-                                .color(tokens.accent_secondary),
-                        );
-                    }
-
-                    if preflight_errs > 0
-                        && ui
-                            .small_button(
-                                RichText::new(format!("⚠ {preflight_errs} Preflight"))
-                                    .size(10.5)
-                                    .color(tokens.warning),
+                // Opposite-aligned zone: navigator, swatches, color mode, snap pill, zoom
+                ui.with_layout(
+                    shell_dir.opposite_horizontal_layout(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .selectable_label(
+                                app.show_navigator_popup,
+                                format!("🧭 {}", crate::i18n::I18nKey::ViewNavigator.tr_ui(lang)),
                             )
+                            .on_hover_text(crate::i18n::I18nKey::NavigatorTitle.tr_ui(lang))
                             .clicked()
-                    {
-                        app.production_state.sub_section = 0;
-                        app.focus_docker(DockerTab::Production);
-                    }
+                        {
+                            app.show_navigator_popup = !app.show_navigator_popup;
+                        }
+                        ui.label(
+                            RichText::new(format!("{zoom_pct:.0}%{scale_label}"))
+                                .monospace()
+                                .size(11.0)
+                                .color(tokens.text),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(snap_summary)
+                                .monospace()
+                                .size(10.0)
+                                .color(tokens.accent),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(color_mode)
+                                .size(11.0)
+                                .color(tokens.text_muted),
+                        );
 
-                    // Active Fill (F11) & Outline (F12) mini swatches + right-click quick clear
-                    let stroke_label = stroke_c
-                        .as_ref()
-                        .map_or_else(|| "None".to_owned(), short_color_status_label);
-                    ui.label(
-                        RichText::new(stroke_label)
-                            .monospace()
-                            .size(10.0)
-                            .color(tokens.text_muted),
-                    );
-                    let (stroke_rect, stroke_resp) =
-                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
-                    ui.painter().rect(
-                        stroke_rect,
-                        CornerRadius::same(2),
-                        Color32::TRANSPARENT,
-                        Stroke::new(
-                            2.5,
-                            stroke_c.as_ref().map_or(tokens.border, core_color_to_egui),
-                        ),
-                        StrokeKind::Inside,
-                    );
-                    let stroke_resp = stroke_resp
-                        .on_hover_text("Outline Pen (F12) · Right-click: Remove Outline");
-                    if stroke_resp.clicked() {
-                        app.open_outline_pen_dialog();
-                    } else if stroke_resp.secondary_clicked() {
-                        app.remove_outline();
-                    }
+                        if rec_macro {
+                            ui.label(
+                                RichText::new("● REC")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(tokens.accent_secondary),
+                            );
+                        }
 
-                    let fill_label = fill_c
-                        .as_ref()
-                        .map_or_else(|| "None".to_owned(), short_color_status_label);
-                    ui.label(
-                        RichText::new(fill_label)
-                            .monospace()
-                            .size(10.0)
-                            .color(tokens.text_muted),
-                    );
-                    let (fill_rect, fill_resp) =
-                        ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
-                    ui.painter().rect(
-                        fill_rect,
-                        CornerRadius::same(2),
-                        fill_c
+                        if preflight_errs > 0
+                            && ui
+                                .small_button(
+                                    RichText::new(format!("⚠ {preflight_errs} Preflight"))
+                                        .size(10.5)
+                                        .color(tokens.warning),
+                                )
+                                .clicked()
+                        {
+                            app.production_state.sub_section = 0;
+                            app.focus_docker(DockerTab::Production);
+                        }
+
+                        // Active Fill (F11) & Outline (F12) mini swatches + right-click quick clear
+                        let stroke_label = stroke_c
                             .as_ref()
-                            .map_or(Color32::TRANSPARENT, core_color_to_egui),
-                        Stroke::new(1.0, tokens.border_input),
-                        StrokeKind::Inside,
-                    );
-                    let fill_resp =
-                        fill_resp.on_hover_text("Edit Fill (F11) · Right-click: Remove Fill");
-                    if fill_resp.clicked() {
-                        app.open_edit_fill_dialog();
-                    } else if fill_resp.secondary_clicked() {
-                        app.remove_fill();
-                    }
+                            .map_or_else(|| "None".to_owned(), short_color_status_label);
+                        ui.label(
+                            RichText::new(stroke_label)
+                                .monospace()
+                                .size(10.0)
+                                .color(tokens.text_muted),
+                        );
+                        let (stroke_rect, stroke_resp) =
+                            ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
+                        ui.painter().rect(
+                            stroke_rect,
+                            CornerRadius::same(2),
+                            Color32::TRANSPARENT,
+                            Stroke::new(
+                                2.5,
+                                stroke_c.as_ref().map_or(tokens.border, core_color_to_egui),
+                            ),
+                            StrokeKind::Inside,
+                        );
+                        let stroke_resp = stroke_resp
+                            .on_hover_text("Outline Pen (F12) · Right-click: Remove Outline");
+                        if stroke_resp.clicked() {
+                            app.open_outline_pen_dialog();
+                        } else if stroke_resp.secondary_clicked() {
+                            app.remove_outline();
+                        }
 
-                    ui.label(
-                        RichText::new(&app.status_message)
-                            .size(11.0)
-                            .color(tokens.text_muted),
-                    );
-                });
+                        let fill_label = fill_c
+                            .as_ref()
+                            .map_or_else(|| "None".to_owned(), short_color_status_label);
+                        ui.label(
+                            RichText::new(fill_label)
+                                .monospace()
+                                .size(10.0)
+                                .color(tokens.text_muted),
+                        );
+                        let (fill_rect, fill_resp) =
+                            ui.allocate_exact_size(vec2(15.0, 14.0), Sense::click());
+                        ui.painter().rect(
+                            fill_rect,
+                            CornerRadius::same(2),
+                            fill_c
+                                .as_ref()
+                                .map_or(Color32::TRANSPARENT, core_color_to_egui),
+                            Stroke::new(1.0, tokens.border_input),
+                            StrokeKind::Inside,
+                        );
+                        let fill_resp =
+                            fill_resp.on_hover_text("Edit Fill (F11) · Right-click: Remove Fill");
+                        if fill_resp.clicked() {
+                            app.open_edit_fill_dialog();
+                        } else if fill_resp.secondary_clicked() {
+                            app.remove_fill();
+                        }
+
+                        ui.label(
+                            RichText::new(&app.status_message)
+                                .size(11.0)
+                                .color(tokens.text_muted),
+                        );
+                    },
+                );
             });
         });
 }
@@ -361,6 +449,8 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
 
 fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let page_lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(page_lang);
 
     egui::Panel::bottom("coree_page_tabs")
         .exact_size(PAGE_TABS_HEIGHT)
@@ -375,18 +465,21 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
             let mut delete_page_req = None;
             let mut duplicate_page_req = None;
             let mut rename_page_req: Option<(coree_core::PageId, String)> = None;
+            let mut reorder_pages_req: Option<Vec<coree_core::PageId>> = None;
             let mut multipage_toggle_req: Option<bool> = None;
             let mut apply_doc_fill: Option<Color> = None;
             let mut apply_doc_stroke: Option<Color> = None;
 
-            ui.horizontal(|ui| {
+            shell_dir.with_horizontal(ui, |ui| {
                 if let Some(tab) = app.active_tab_mut() {
                     let active_idx = tab.document.active_page_index();
-                    let page_count = tab.document.pages().len();
+                    let page_ids: Vec<coree_core::PageId> =
+                        tab.document.pages().iter().map(|p| p.id).collect();
+                    let page_count = page_ids.len();
 
                     for idx in 0..page_count {
                         let page_name = tab.document.pages()[idx].name.clone();
-                        let page_id = tab.document.pages()[idx].id;
+                        let page_id = page_ids[idx];
                         let is_active = idx == active_idx;
 
                         if tab.inline_renaming_page == Some(idx) {
@@ -412,6 +505,7 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                                     tokens.text_muted
                                 },
                             ))
+                            .sense(Sense::click_and_drag())
                             .fill(if is_active {
                                 tokens.surface_elevated
                             } else {
@@ -423,6 +517,18 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                                 Stroke::new(1.0, tokens.border)
                             }),
                         );
+                        if btn.drag_started() {
+                            egui::DragAndDrop::set_payload(ui.ctx(), idx);
+                        }
+                        if let Some(src_idx) = btn.dnd_release_payload::<usize>() {
+                            let src = *src_idx;
+                            if src < page_count && src != idx {
+                                let mut reordered = page_ids.clone();
+                                let moved = reordered.remove(src);
+                                reordered.insert(idx, moved);
+                                reorder_pages_req = Some(reordered);
+                            }
+                        }
                         if btn.clicked() {
                             let _ = tab.document.set_active_page_index(idx);
                             tab.selection.clear();
@@ -434,17 +540,49 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                             tab.inline_page_name_buf = page_name.clone();
                         }
                         btn.context_menu(|ui| {
-                            if ui.button("Rename Page").clicked() {
+                            let lang = page_lang;
+                            if ui
+                                .button(crate::i18n::I18nKey::LayoutRenamePage.tr_ui(lang))
+                                .clicked()
+                            {
                                 tab.inline_renaming_page = Some(idx);
                                 tab.inline_page_name_buf = page_name.clone();
                                 ui.close();
                             }
-                            if ui.button("Duplicate Page").clicked() {
+                            if ui
+                                .button(crate::i18n::I18nKey::LayoutDuplicatePage.tr_ui(lang))
+                                .clicked()
+                            {
                                 duplicate_page_req = Some(idx);
                                 ui.close();
                             }
+                            if idx > 0
+                                && ui
+                                    .button(crate::i18n::I18nKey::PageMoveLeft.tr_ui(lang))
+                                    .clicked()
+                            {
+                                let mut reordered = page_ids.clone();
+                                reordered.swap(idx - 1, idx);
+                                reorder_pages_req = Some(reordered);
+                                ui.close();
+                            }
+                            if idx + 1 < page_count
+                                && ui
+                                    .button(crate::i18n::I18nKey::PageMoveRight.tr_ui(lang))
+                                    .clicked()
+                            {
+                                let mut reordered = page_ids.clone();
+                                reordered.swap(idx, idx + 1);
+                                reorder_pages_req = Some(reordered);
+                                ui.close();
+                            }
                             if ui
-                                .add_enabled(page_count > 1, egui::Button::new("Delete Page"))
+                                .add_enabled(
+                                    page_count > 1,
+                                    egui::Button::new(
+                                        crate::i18n::I18nKey::LayoutDeletePage.tr_ui(lang),
+                                    ),
+                                )
                                 .clicked()
                             {
                                 delete_page_req = Some(page_id);
@@ -455,7 +593,7 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
 
                     if ui
                         .small_button(RichText::new("+").color(tokens.accent))
-                        .on_hover_text("Add Page")
+                        .on_hover_text(crate::i18n::I18nKey::PageAddButton.tr_ui(page_lang))
                         .clicked()
                     {
                         add_page_req = true;
@@ -463,7 +601,10 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
 
                     ui.separator();
                     if ui
-                        .selectable_label(tab.document.multipage_view(), "⊞ Multipage")
+                        .selectable_label(
+                            tab.document.multipage_view(),
+                            format!("⊞ {}", crate::i18n::I18nKey::ViewMultipage.tr_ui(page_lang)),
+                        )
                         .clicked()
                     {
                         let next = !tab.document.multipage_view();
@@ -525,6 +666,9 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
             if let Some((page_id, new_name)) = rename_page_req {
                 let _ = app.execute_command(CommandOp::RenamePage { page_id, new_name });
             }
+            if let Some(page_ids) = reorder_pages_req {
+                let _ = app.execute_command(CommandOp::ReorderPages { page_ids });
+            }
             if let Some(next) = multipage_toggle_req {
                 let _ = app.execute_command(CommandOp::SetDocumentProperties {
                     title: None,
@@ -544,6 +688,7 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                     clear_gray_icc: false,
                     rendering_intent: None,
                     black_point_compensation: None,
+                    drawing_scale: None,
                 });
             }
             if let Some(idx) = duplicate_page_req {
@@ -1064,18 +1209,54 @@ fn handle_canvas_interaction(
             tab.cursor_world_mm = screen_to_world(canvas_rect, tab, hover);
         }
         let (scroll_y, pinch_zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-        let factor = if scroll_y.abs() > 0.05 {
+        let scroll_factor = if scroll_y.abs() > 0.05 {
             (f64::from(scroll_y) * 0.0022).exp().clamp(0.88, 1.14)
-        } else if (pinch_zoom - 1.0).abs() > 1e-4 {
+        } else {
+            1.0
+        };
+        let pinch_factor = if (pinch_zoom - 1.0).abs() > 1e-4 {
             f64::from(pinch_zoom).powf(0.55).clamp(0.88, 1.14)
         } else {
             1.0
         };
+        let factor = scroll_factor * pinch_factor;
         if (factor - 1.0).abs() > 1e-6 {
             if let Some(tab) = app.active_tab_mut() {
                 let local = screen_to_viewport_local(canvas_rect, tab, hover);
                 tab.viewport.zoom_at_screen_point(local, factor);
                 tab.needs_rerender = true;
+            }
+        }
+        // Accept DragSwatch color drop onto hovered canvas object (`ADD-09`)
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some(dropped_color) = egui::DragAndDrop::take_payload::<Color>(ui.ctx()) {
+                let shift_held = ui.input(|i| i.modifiers.shift);
+                let hit_id = app.active_tab().and_then(|tab| {
+                    let world_pt = screen_to_world(canvas_rect, tab, hover);
+                    let tol = (4.0 / tab.viewport.logical_px_per_mm().max(0.05)).max(1.5);
+                    coree_render::hit_test_point(
+                        &tab.document,
+                        tab.document.active_page_index(),
+                        world_pt,
+                        tol,
+                    )
+                });
+                if let Some(oid) = hit_id {
+                    if let Some(tab) = app.active_tab_mut() {
+                        tab.selection.select_single(&tab.document, oid);
+                    }
+                    if shift_held {
+                        app.apply_outline_color((*dropped_color).clone());
+                    } else {
+                        app.apply_fill_color((*dropped_color).clone());
+                    }
+                } else {
+                    if shift_held {
+                        app.apply_outline_color((*dropped_color).clone());
+                    } else {
+                        app.apply_fill_color((*dropped_color).clone());
+                    }
+                }
             }
         }
     }
@@ -1215,10 +1396,17 @@ fn handle_canvas_interaction(
     let is_dragging = app.active_tab().is_some_and(|t| t.tool_core.is_dragging());
     if is_dragging {
         if secondary_pressed || space_pressed {
-            app.run_tool_key_event(&KeyEvent {
-                key: ToolKey::Space,
-                modifiers,
-            });
+            if app
+                .active_tab()
+                .is_some_and(|t| t.tool_core.active_live_world_transform().is_some())
+            {
+                let _ = app.stamp_duplicate_during_active_drag();
+            } else {
+                app.run_tool_key_event(&KeyEvent {
+                    key: ToolKey::Space,
+                    modifiers,
+                });
+            }
         }
         if (primary_down && !primary_pressed)
             || (primary_released && pointer_delta.length_sq() > 0.0)
@@ -1355,7 +1543,10 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             ui.close();
         }
         if ui
-            .add_enabled(has_sel, egui::Button::new("Delete (Del)"))
+            .add_enabled(
+                has_sel,
+                egui::Button::new(crate::i18n::I18nKey::EditDelete.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.delete_selection();
@@ -1365,7 +1556,12 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
         ui.separator();
 
         if ui
-            .add_enabled(has_sel, egui::Button::new("Convert to Curves (Ctrl+Q)"))
+            .add_enabled(
+                has_sel,
+                egui::Button::new(
+                    crate::i18n::I18nKey::ObjectConvertToCurves.tr_ui(app.ui_language),
+                ),
+            )
             .clicked()
         {
             app.convert_selection_to_curves();
@@ -1374,7 +1570,9 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
         if ui
             .add_enabled(
                 has_sel,
-                egui::Button::new("Convert Outline to Object (Ctrl+Shift+Q)"),
+                egui::Button::new(
+                    crate::i18n::I18nKey::ObjectConvertOutlineToObject.tr_ui(app.ui_language),
+                ),
             )
             .clicked()
         {
@@ -1382,53 +1580,83 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             ui.close();
         }
         if ui
-            .add_enabled(has_sel, egui::Button::new("Break Apart (Ctrl+K)"))
+            .add_enabled(
+                has_sel,
+                egui::Button::new(crate::i18n::I18nKey::ObjectBreakApart.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.break_apart_selection();
             ui.close();
         }
         if ui
-            .add_enabled(has_multi, egui::Button::new("Combine (Ctrl+L)"))
+            .add_enabled(
+                has_multi,
+                egui::Button::new(crate::i18n::I18nKey::ObjectCombine.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.apply_boolean_op(BooleanOp::Combine);
             ui.close();
         }
         ui.menu_button("Order", |ui| {
-            if ui.button("To Front of Layer (Shift+PgUp)").clicked() {
+            let lang = app.ui_language;
+            if ui
+                .button(crate::i18n::I18nKey::ObjectOrderToFront.tr_ui(lang))
+                .clicked()
+            {
                 app.apply_z_order(ZOrderOp::BringToFront);
                 ui.close();
             }
-            if ui.button("Forward One (Ctrl+PgUp)").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectOrderForwardOne.tr_ui(lang))
+                .clicked()
+            {
                 app.apply_z_order(ZOrderOp::BringForward);
                 ui.close();
             }
-            if ui.button("Back One (Ctrl+PgDn)").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectOrderBackOne.tr_ui(lang))
+                .clicked()
+            {
                 app.apply_z_order(ZOrderOp::SendBackward);
                 ui.close();
             }
-            if ui.button("To Back of Layer (Shift+PgDn)").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectOrderToBack.tr_ui(lang))
+                .clicked()
+            {
                 app.apply_z_order(ZOrderOp::SendToBack);
                 ui.close();
             }
         });
         if ui
-            .add_enabled(has_multi, egui::Button::new("Group (Ctrl+G)"))
+            .add_enabled(
+                has_multi,
+                egui::Button::new(crate::i18n::I18nKey::ObjectGroup.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.group_selection();
             ui.close();
         }
         if ui
-            .add_enabled(has_sel, egui::Button::new("Ungroup (Ctrl+U)"))
+            .add_enabled(
+                has_sel,
+                egui::Button::new(crate::i18n::I18nKey::ObjectUngroup.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.ungroup_selection();
             ui.close();
         }
         if ui
-            .add_enabled(has_multi, egui::Button::new("PowerClip Inside"))
+            .add_enabled(
+                has_multi,
+                egui::Button::new(
+                    crate::i18n::I18nKey::ObjectPowerClipPlaceInside.tr_ui(app.ui_language),
+                ),
+            )
             .clicked()
         {
             app.create_powerclip_from_selection();
@@ -1443,19 +1671,32 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             .then_some(oid)
         });
         if let Some(pc_id) = selected_pc {
-            if ui.button("Edit PowerClip Contents (Ctrl+Click)").clicked() {
+            let lang = app.ui_language;
+            if ui
+                .button(crate::i18n::I18nKey::ObjectPowerClipEdit.tr_ui(lang))
+                .clicked()
+            {
                 app.enter_powerclip_edit(pc_id);
                 ui.close();
             }
-            if ui.button("Fit PowerClip Contents").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectPowerClipFitContents.tr_ui(lang))
+                .clicked()
+            {
                 app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
                 ui.close();
             }
-            if ui.button("Center PowerClip Contents").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectPowerClipCenterContents.tr_ui(lang))
+                .clicked()
+            {
                 app.fit_powerclip_selection(coree_core::PowerClipFitMode::CenterContents);
                 ui.close();
             }
-            if ui.button("Stretch PowerClip to Fill").clicked() {
+            if ui
+                .button(crate::i18n::I18nKey::ObjectPowerClipStretchToFill.tr_ui(lang))
+                .clicked()
+            {
                 app.fit_powerclip_selection(coree_core::PowerClipFitMode::StretchToFill);
                 ui.close();
             }
@@ -1463,13 +1704,18 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
         if app
             .active_tab()
             .is_some_and(|t| t.powerclip_edit_id.is_some())
-            && ui.button("Finish Editing PowerClip (Esc)").clicked()
+            && ui
+                .button(crate::i18n::I18nKey::ObjectPowerClipFinish.tr_ui(app.ui_language))
+                .clicked()
         {
             app.exit_powerclip_edit();
             ui.close();
         }
         if ui
-            .add_enabled(has_sel, egui::Button::new("Lock / Unlock"))
+            .add_enabled(
+                has_sel,
+                egui::Button::new(crate::i18n::I18nKey::ObjectLock.tr_ui(app.ui_language)),
+            )
             .clicked()
         {
             app.toggle_lock_selection();
@@ -1482,11 +1728,17 @@ fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut StudioApp) {
             app.generate_cut_contour_active();
             ui.close();
         }
-        if ui.button("Autofit Page to Content").clicked() {
+        if ui
+            .button(crate::i18n::I18nKey::LayoutAutofitPage.tr_ui(app.ui_language))
+            .clicked()
+        {
             app.autofit_active_page(2.0);
             ui.close();
         }
-        if ui.button("Properties").clicked() {
+        if ui
+            .button(crate::i18n::I18nKey::DockerProperties.tr_ui(app.ui_language))
+            .clicked()
+        {
             app.focus_docker(DockerTab::Properties);
             ui.close();
         }
@@ -2532,6 +2784,7 @@ fn paint_rulers(
         return;
     };
     let u = tab.document.default_unit();
+    let sf = tab.document.drawing_scale().scale_factor();
     painter.text(
         corner.center(),
         Align2::CENTER_CENTER,
@@ -2568,7 +2821,7 @@ fn paint_rulers(
                 [pos2(sx, top.bottom() - 7.0), pos2(sx, top.bottom())],
                 Stroke::new(1.0, tokens.border_input),
             );
-            let val = u.from_mm(x, f64::from(tab.document.dpi()));
+            let val = u.from_mm(x * sf, f64::from(tab.document.dpi()));
             top_painter.text(
                 pos2(sx + 2.0, top.top() + 2.0),
                 Align2::LEFT_TOP,
@@ -2593,7 +2846,7 @@ fn paint_rulers(
                 [pos2(left.right() - 7.0, sy), pos2(left.right(), sy)],
                 Stroke::new(1.0, tokens.border_input),
             );
-            let val = u.from_mm(y, f64::from(tab.document.dpi()));
+            let val = u.from_mm(y * sf, f64::from(tab.document.dpi()));
             left_painter.text(
                 pos2(left.left() + 1.0, sy + 2.0),
                 Align2::LEFT_TOP,
@@ -2779,6 +3032,128 @@ fn insert_stop_on_fill_ray(fill: &Fill, t: f32) -> Option<Fill> {
     stops.push(GradientStop::new(clamped, color));
     stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
     Some(updated)
+}
+
+/// Interactive `Navigator` pan/zoom minimap popup (`ADD-08`).
+pub fn show_navigator_popup_area(ui: &mut Ui, app: &mut StudioApp) {
+    let tokens = app.theme.tokens();
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(app.ui_language);
+    let screen = ui
+        .ctx()
+        .input(|i| i.raw.screen_rect)
+        .unwrap_or_else(|| ui.ctx().content_rect());
+    let anchor = if shell_dir.is_rtl {
+        pos2(16.0, (screen.bottom() - 252.0).max(40.0))
+    } else {
+        pos2(
+            (screen.right() - 238.0).max(16.0),
+            (screen.bottom() - 252.0).max(40.0),
+        )
+    };
+    let mut close_req = false;
+    egui::Area::new(egui::Id::unique("coree_navigator_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ui.ctx(), |ui| {
+            Frame::NONE
+                .fill(tokens.surface_elevated)
+                .stroke(Stroke::new(1.2, tokens.accent))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    close_req = navigator(ui, app);
+                });
+        });
+    if close_req {
+        app.show_navigator_popup = false;
+    }
+}
+
+fn navigator(ui: &mut Ui, app: &mut StudioApp) -> bool {
+    let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    let mut close_req = false;
+    shell_dir.with_horizontal(ui, |ui| {
+        ui.label(
+            RichText::new(crate::i18n::I18nKey::NavigatorTitle.tr_ui(lang))
+                .strong()
+                .size(11.5)
+                .color(tokens.text),
+        );
+        ui.with_layout(
+            shell_dir.opposite_horizontal_layout(egui::Align::Center),
+            |ui| {
+                if ui.small_button("✕").clicked() {
+                    close_req = true;
+                }
+            },
+        );
+    });
+    if let Some(tab) = app.active_tab_mut() {
+        let page = tab.document.active_page().cloned();
+        let (pw, ph) = page.as_ref().map_or((210.0, 297.0), |p| {
+            (p.width_mm.max(1.0), p.height_mm.max(1.0))
+        });
+        let map_size = vec2(204.0, 148.0);
+        let (map_rect, resp) = ui.allocate_exact_size(map_size, Sense::click_and_drag());
+        let painter = ui.painter_at(map_rect);
+        painter.rect_filled(map_rect, CornerRadius::same(3), tokens.canvas_well);
+
+        let pad = 12.0_f32;
+        let inner_w = (map_rect.width() - pad * 2.0).max(20.0);
+        let inner_h = (map_rect.height() - pad * 2.0).max(20.0);
+        let scale = (inner_w / pw as f32).min(inner_h / ph as f32).max(0.05);
+        let page_screen_w = pw as f32 * scale;
+        let page_screen_h = ph as f32 * scale;
+        let page_origin = pos2(
+            map_rect.center().x - page_screen_w * 0.5,
+            map_rect.center().y - page_screen_h * 0.5,
+        );
+        let page_rect = Rect::from_min_size(page_origin, vec2(page_screen_w, page_screen_h));
+        painter.rect(
+            page_rect,
+            CornerRadius::ZERO,
+            Color32::WHITE,
+            Stroke::new(1.0, tokens.border),
+            StrokeKind::Inside,
+        );
+
+        // Viewport frame inside navigator minimap
+        let vis = tab.viewport.visible_world_rect();
+        let vx0 = page_origin.x + (vis.min_x as f32) * scale;
+        let vy0 = page_origin.y + (vis.min_y as f32) * scale;
+        let vx1 = page_origin.x + (vis.max_x as f32) * scale;
+        let vy1 = page_origin.y + (vis.max_y as f32) * scale;
+        let vis_rect = Rect::from_min_max(pos2(vx0, vy0), pos2(vx1, vy1)).intersect(map_rect);
+        painter.rect_stroke(
+            vis_rect,
+            CornerRadius::same(1),
+            Stroke::new(1.6, tokens.accent),
+            StrokeKind::Inside,
+        );
+
+        // Click or drag anywhere in minimap to pan canvas center there
+        if (resp.clicked() || resp.dragged()) && scale > 1e-6 {
+            if let Some(pt) = resp.interact_pointer_pos() {
+                let target_x = f64::from((pt.x - page_origin.x) / scale);
+                let target_y = f64::from((pt.y - page_origin.y) / scale);
+                tab.viewport.pan_mm = Point2D::new(target_x, target_y);
+                tab.needs_rerender = true;
+            }
+        }
+
+        ui.add_space(4.0);
+        let mut zoom_pct = (tab.viewport.zoom * 100.0) as f32;
+        if ui
+            .add(egui::Slider::new(&mut zoom_pct, 10.0..=800.0).text("%"))
+            .changed()
+        {
+            tab.viewport.zoom = f64::from(zoom_pct / 100.0).clamp(0.05, 64.0);
+            tab.needs_rerender = true;
+        }
+    }
+    close_req
 }
 
 #[cfg(test)]

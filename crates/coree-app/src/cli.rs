@@ -6,11 +6,12 @@
 //! collect-for-output, bitmap vectorization, and sandboxed Rhai macros.
 
 use crate::cdr_bridge::{
-    extract_file_thumbnail_png, inspect_any_file, read_png_dimensions, MAX_THUMBNAIL_SIZE_PX,
+    extract_file_thumbnail_png, format_inspection_hex_dumps, inspect_any_file, read_png_dimensions,
+    MAX_THUMBNAIL_SIZE_PX,
 };
 use crate::io_bridge::{
-    export_any_document, open_any_document, read_text_file_bounded, UniversalExportOptions,
-    MAX_TEXT_READ_BYTES,
+    export_any_document, open_any_document, open_any_document_with_codepage,
+    read_text_file_bounded, UniversalExportOptions, MAX_TEXT_READ_BYTES,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use coree_cdr::{generate_sample_document, CdrWriteVersion};
@@ -97,6 +98,8 @@ impl From<CdrVersionArg> for CdrWriteVersion {
 /// Rendering fidelity mode for `coree render --view`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ViewModeArg {
+    #[value(name = "simple-wireframe")]
+    SimpleWireframe,
     Wireframe,
     Normal,
     Enhanced,
@@ -106,6 +109,7 @@ pub enum ViewModeArg {
 impl From<ViewModeArg> for ViewMode {
     fn from(value: ViewModeArg) -> Self {
         match value {
+            ViewModeArg::SimpleWireframe => Self::SimpleWireframe,
             ViewModeArg::Wireframe => Self::Wireframe,
             ViewModeArg::Normal => Self::Normal,
             ViewModeArg::Enhanced => Self::Enhanced,
@@ -244,6 +248,9 @@ pub enum Commands {
         /// Emit structured JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
+        /// Include bounded Hex/ASCII dumps for RIFF chunks (`S16`).
+        #[arg(long)]
+        hex: bool,
     },
     /// Universal offline converter across `.coree`, `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.dwg`, `.wmf`, `.emf`, `.plt`, `.psd`, `.gcode`, `.png`, `.jpg`, `.webp`, `.tiff`, `.bmp` (note: `.acb` swatch palettes use `inspect` / Palette Import).
     Convert {
@@ -263,6 +270,9 @@ pub enum Commands {
         /// Add trim crop marks on PDF output.
         #[arg(long)]
         crop_marks: bool,
+        /// Fallback legacy `.cdr` codepage (`auto`, `cp1256`, `cp1251`, `utf8`, `cp1252`).
+        #[arg(long)]
+        codepage: Option<String>,
     },
     /// Headless high-DPI page renderer outputting straight-RGBA PNG.
     Render {
@@ -531,14 +541,26 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             let msg = export_any_document(&doc, &target_path, &opts)?;
             Ok(CliOutcome::Printed(msg))
         }
-        Commands::Inspect { input_path, json } => {
+        Commands::Inspect {
+            input_path,
+            json,
+            hex,
+        } => {
             let report = inspect_any_file(input_path)?;
             if *json {
                 let s = serde_json::to_string_pretty(&report)
                     .map_err(|e| format!("JSON serialization failed: {e}"))?;
                 Ok(CliOutcome::Printed(s))
             } else {
-                Ok(CliOutcome::Printed(report.format_human()))
+                let mut out = report.format_human();
+                if *hex {
+                    let dump = format_inspection_hex_dumps(&report);
+                    if !dump.is_empty() {
+                        out.push_str("\n--- Chunk Hex / ASCII Dumps ---\n");
+                        out.push_str(&dump);
+                    }
+                }
+                Ok(CliOutcome::Printed(out))
             }
         }
         Commands::Convert {
@@ -548,11 +570,13 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             dpi,
             cmyk,
             crop_marks,
+            codepage,
         } => {
             if !dpi.is_finite() || *dpi <= 0.0 {
                 return Err(format!("invalid DPI value: {dpi} (must be finite and > 0)"));
             }
-            let opened = open_any_document(input_path)?;
+            let cp = parse_cli_codepage(codepage.as_deref())?;
+            let opened = open_any_document_with_codepage(input_path, cp)?;
             let opts = UniversalExportOptions {
                 cdr_version: (*cdr_version).into(),
                 dpi: *dpi,
@@ -812,11 +836,28 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             remove_background,
             speckle_size,
         } => {
-            let asset = import_raster(input_image)
+            let asset_raw = import_raster(input_image)
                 .map_err(|e| format!("failed to load raster '{}': {e}", input_image.display()))?;
-            let dpi = f64::from(asset.source_dpi.max(1.0));
-            let w_mm = (f64::from(asset.width) / dpi * MM_PER_INCH).max(10.0);
-            let h_mm = (f64::from(asset.height) / dpi * MM_PER_INCH).max(10.0);
+            let dpi = f64::from(asset_raw.source_dpi.max(1.0));
+            let w_mm = (f64::from(asset_raw.width) / dpi * MM_PER_INCH).max(10.0);
+            let h_mm = (f64::from(asset_raw.height) / dpi * MM_PER_INCH).max(10.0);
+            // Guard against >16MP memory spikes during trace while preserving physical document size
+            let px_count = u64::from(asset_raw.width) * u64::from(asset_raw.height);
+            let asset = if px_count > 4_000_000 {
+                let max_dim = 2048.0_f64;
+                let scale = max_dim / f64::from(asset_raw.width.max(asset_raw.height).max(1));
+                let nw = (f64::from(asset_raw.width) * scale).round().max(1.0) as u32;
+                let nh = (f64::from(asset_raw.height) * scale).round().max(1.0) as u32;
+                coree_render::resample_with_algorithm(
+                    &asset_raw,
+                    nw,
+                    nh,
+                    coree_render::ResampleAlgorithm::Bilinear,
+                )
+                .map_err(|e| format!("trace pre-resample failed: {e}"))?
+            } else {
+                asset_raw
+            };
             let trace_mode = match mode {
                 TraceModeArg::Quick => TraceMode::QuickTrace,
                 TraceModeArg::Outline => TraceMode::OutlineTrace((*preset).into()),
@@ -1227,6 +1268,23 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+fn parse_cli_codepage(raw: Option<&str>) -> Result<Option<u16>, String> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let lower = val.to_ascii_lowercase();
+    match lower.as_str() {
+        "auto" => Ok(None),
+        "cp1256" | "1256" | "arabic" => Ok(Some(1256)),
+        "cp1251" | "1251" | "cyrillic" => Ok(Some(1251)),
+        "cp1252" | "1252" | "western" | "latin1" => Ok(Some(1252)),
+        "utf8" | "utf-8" | "65001" => Ok(Some(65001)),
+        _ => val.parse::<u16>().map(Some).map_err(|_| {
+            format!("unsupported codepage '{val}' (expected auto|cp1256|cp1251|cp1252|utf8)")
+        }),
+    }
+}
+
 /// Builds the `--diagnostics` summary string with version, license, formats, crates,
 /// built-in laser/plotter plugin count, and local font count.
 #[must_use]
@@ -1238,9 +1296,9 @@ pub fn build_diagnostics_report() -> String {
     format!(
         "{} v{} ({})\n\
          Repository: {}\n\
-         Workspace Crates: {}, {}, {}, {}, {}, {}, {}\n\
+         Workspace Crates: {}, {}, {}, {}, {}, {}, {}, {}\n\
          Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025 / .cdr.zip), .cdt (.cdt.zip), .cmx (16/32-bit), .cpt, .svg, .svgz, .pdf, .ai, .eps, .dxf, .dwg, .wmf, .emf, .plt (HPGL), .psd, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal, .acb\n\
-         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .dwg, .wmf, .emf, .plt (HPGL), .psd, .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
+         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .cpt, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .dwg, .wmf, .emf, .plt (HPGL), .psd, .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
          Built-in Laser & Plotter Plugins: {} ({})\n\
          Local System Fonts Indexed: {}\n\
          Mode: 100% Offline Pure-Rust (#![forbid(unsafe_code)])",
@@ -1255,6 +1313,7 @@ pub fn build_diagnostics_report() -> String {
         coree_storage::CRATE_NAME,
         coree_render::CRATE_NAME,
         coree_prod::CRATE_NAME,
+        crate::CRATE_NAME,
         builtin_plugins.len(),
         plugin_ids.join(", "),
         font_count

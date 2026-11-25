@@ -177,6 +177,8 @@ pub fn show_dialogs(ctx: &egui::Context, app: &mut StudioApp) {
     show_options_dialog(ctx, app);
     show_edit_fill_dialog(ctx, app);
     show_outline_pen_dialog(ctx, app);
+    show_missing_font_dialog(ctx, app);
+    show_cdr_import_codepage_dialog(ctx, app);
     show_about_dialog(ctx, app);
 }
 
@@ -184,109 +186,119 @@ fn show_new_document_dialog(ctx: &egui::Context, app: &mut StudioApp) {
     if !app.new_doc_dialog.open {
         return;
     }
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
     let mut open = app.new_doc_dialog.open;
     let mut create_now = false;
 
-    egui::Window::new("New Document")
+    egui::Window::new(crate::i18n::I18nKey::NewDocument.tr_ui(lang))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .fixed_size(egui::vec2(440.0, 325.0))
         .show(ctx, |ui| {
-            let d = &mut app.new_doc_dialog;
-            if d.preset_index >= NEW_DOC_PRESETS.len() {
-                d.preset_index = 0;
-            }
-            ui.horizontal(|ui| {
-                ui.label("Preset:");
-                let prev = d.preset_index;
-                ComboBox::from_id_salt("new_doc_preset")
-                    .width(290.0)
-                    .selected_text(NEW_DOC_PRESETS[d.preset_index].0)
-                    .show_ui(ui, |ui| {
-                        for (idx, p) in NEW_DOC_PRESETS.iter().enumerate() {
-                            ui.selectable_value(&mut d.preset_index, idx, p.0);
-                        }
-                    });
-                if d.preset_index != prev {
-                    let p = NEW_DOC_PRESETS[d.preset_index];
-                    d.width_mm = p.1;
-                    d.height_mm = p.2;
-                    d.color_mode = p.3;
-                    d.dpi = p.4;
-                    d.bleed_mm = p.5;
+            shell_dir.with_vertical(ui, |ui| {
+                let d = &mut app.new_doc_dialog;
+                if d.preset_index >= NEW_DOC_PRESETS.len() {
+                    d.preset_index = 0;
                 }
-            });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DocPresetLabel.tr_ui(lang));
+                    let prev = d.preset_index;
+                    ComboBox::from_id_salt("new_doc_preset")
+                        .width(290.0)
+                        .selected_text(NEW_DOC_PRESETS[d.preset_index].0)
+                        .show_ui(ui, |ui| {
+                            for (idx, p) in NEW_DOC_PRESETS.iter().enumerate() {
+                                ui.selectable_value(&mut d.preset_index, idx, p.0);
+                            }
+                        });
+                    if d.preset_index != prev {
+                        let p = NEW_DOC_PRESETS[d.preset_index];
+                        d.width_mm = p.1;
+                        d.height_mm = p.2;
+                        d.color_mode = p.3;
+                        d.dpi = p.4;
+                        d.bleed_mm = p.5;
+                    }
+                });
 
-            ui.horizontal(|ui| {
-                ui.label("Title:");
-                ui.text_edit_singleline(&mut d.title);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Width:");
-                ui.add(
-                    DragValue::new(&mut d.width_mm)
-                        .range(5.0..=45000.0)
-                        .suffix(" mm"),
-                );
-                ui.label("Height:");
-                ui.add(
-                    DragValue::new(&mut d.height_mm)
-                        .range(5.0..=45000.0)
-                        .suffix(" mm"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Unit:");
-                ComboBox::from_id_salt("new_doc_unit")
-                    .selected_text(d.unit.suffix())
-                    .show_ui(ui, |ui| {
-                        for u in [
-                            Unit::Millimeter,
-                            Unit::Centimeter,
-                            Unit::Meter,
-                            Unit::Inch,
-                            Unit::Point,
-                            Unit::Pixel,
-                        ] {
-                            ui.selectable_value(&mut d.unit, u, u.suffix());
-                        }
-                    });
-                ui.label("Color Mode:");
-                ui.selectable_value(&mut d.color_mode, ColorMode::Cmyk, "CMYK");
-                ui.selectable_value(&mut d.color_mode, ColorMode::Rgb, "RGB");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Resolution:");
-                ui.add(
-                    DragValue::new(&mut d.dpi)
-                        .range(72.0..=1200.0)
-                        .suffix(" DPI"),
-                );
-                ui.label("Bleed:");
-                ui.add(
-                    DragValue::new(&mut d.bleed_mm)
-                        .range(0.0..=50.0)
-                        .suffix(" mm"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Pages:");
-                ui.add(DragValue::new(&mut d.pages).range(1..=200));
-            });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DocTitleLabel.tr_ui(lang));
+                    ui.text_edit_singleline(&mut d.title);
+                });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::PropWidth.tr_ui(lang));
+                    ui.add(
+                        DragValue::new(&mut d.width_mm)
+                            .range(5.0..=45000.0)
+                            .suffix(" mm"),
+                    );
+                    ui.label(crate::i18n::I18nKey::PropHeight.tr_ui(lang));
+                    ui.add(
+                        DragValue::new(&mut d.height_mm)
+                            .range(5.0..=45000.0)
+                            .suffix(" mm"),
+                    );
+                });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DocUnitLabel.tr_ui(lang));
+                    ComboBox::from_id_salt("new_doc_unit")
+                        .selected_text(d.unit.suffix())
+                        .show_ui(ui, |ui| {
+                            for u in [
+                                Unit::Millimeter,
+                                Unit::Centimeter,
+                                Unit::Meter,
+                                Unit::Inch,
+                                Unit::Point,
+                                Unit::Pixel,
+                            ] {
+                                ui.selectable_value(&mut d.unit, u, u.suffix());
+                            }
+                        });
+                    ui.label(crate::i18n::I18nKey::DocColorModeLabel.tr_ui(lang));
+                    ui.selectable_value(&mut d.color_mode, ColorMode::Cmyk, "CMYK");
+                    ui.selectable_value(&mut d.color_mode, ColorMode::Rgb, "RGB");
+                });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DocResolutionLabel.tr_ui(lang));
+                    ui.add(
+                        DragValue::new(&mut d.dpi)
+                            .range(72.0..=1200.0)
+                            .suffix(" DPI"),
+                    );
+                    ui.label(crate::i18n::I18nKey::DocBleedLabel.tr_ui(lang));
+                    ui.add(
+                        DragValue::new(&mut d.bleed_mm)
+                            .range(0.0..=50.0)
+                            .suffix(" mm"),
+                    );
+                });
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DocPagesLabel.tr_ui(lang));
+                    ui.add(DragValue::new(&mut d.pages).range(1..=200));
+                });
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    d.open = false;
-                }
-                if ui
-                    .button(RichText::new("Create Document").strong())
-                    .clicked()
-                {
-                    create_now = true;
-                }
+                ui.add_space(12.0);
+                ui.separator();
+                shell_dir.with_horizontal(ui, |ui| {
+                    if ui
+                        .button(crate::i18n::I18nKey::DialogCancel.tr_ui(lang))
+                        .clicked()
+                    {
+                        d.open = false;
+                    }
+                    if ui
+                        .button(
+                            RichText::new(crate::i18n::I18nKey::DocCreateButton.tr_ui(lang))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        create_now = true;
+                    }
+                });
             });
         });
 
@@ -309,146 +321,159 @@ fn show_export_dialog(ctx: &egui::Context, app: &mut StudioApp) {
     if !app.export_dialog.open {
         return;
     }
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
     let mut open = app.export_dialog.open;
     let mut trigger_export = false;
     let mut browse_clicked = false;
 
-    egui::Window::new("Export Production Document")
+    egui::Window::new(crate::i18n::I18nKey::ExportDialogTitle.tr_ui(lang))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .fixed_size(egui::vec2(490.0, 380.0))
         .show(ctx, |ui| {
-            let ex = &mut app.export_dialog;
-            if ex.format_index >= EXPORT_FORMATS.len() {
-                ex.format_index = 0;
-            }
-            let prev = ex.format_index;
-            ui.horizontal(|ui| {
-                ui.label("Format:");
-                ComboBox::from_id_salt("export_format_combo")
-                    .width(310.0)
-                    .selected_text(EXPORT_FORMATS[ex.format_index].0)
-                    .show_ui(ui, |ui| {
-                        for (idx, f) in EXPORT_FORMATS.iter().enumerate() {
-                            ui.selectable_value(&mut ex.format_index, idx, f.0);
-                        }
-                    });
-            });
-            if ex.format_index != prev {
-                let ext = EXPORT_FORMATS[ex.format_index].1;
-                let trimmed = ex.output_path.trim();
-                let mut target = if trimmed.is_empty() {
-                    PathBuf::from("export")
-                } else {
-                    PathBuf::from(trimmed)
-                };
-                if target.file_stem().is_none() {
-                    target = target.join("export");
+            shell_dir.with_vertical(ui, |ui| {
+                let ex = &mut app.export_dialog;
+                if ex.format_index >= EXPORT_FORMATS.len() {
+                    ex.format_index = 0;
                 }
-                target.set_extension(ext);
-                ex.output_path = target.to_string_lossy().into_owned();
-                ex.options.cdr_version = match ex.format_index {
-                    3 => CdrWriteVersion::ZipX4,
-                    4 => CdrWriteVersion::RiffV12,
-                    _ => CdrWriteVersion::ZipX6,
-                };
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Output:");
-                ui.text_edit_singleline(&mut ex.output_path);
-                if ui.button("Browse...").clicked() {
-                    browse_clicked = true;
-                }
-            });
-
-            ui.separator();
-            ui.label(RichText::new("Format Options").strong());
-            match ex.format_index {
-                0 => {
-                    // PDF
-                    ui.checkbox(
-                        &mut ex.options.force_cmyk,
-                        "Force DeviceCMYK (Press Output)",
-                    );
-                    ui.checkbox(&mut ex.options.include_bleed, "Include BleedBox");
-                    ui.checkbox(&mut ex.options.crop_marks, "Crop Marks");
-                    ui.checkbox(&mut ex.options.registration_marks, "Registration Targets");
-                    ui.checkbox(
-                        &mut ex.options.color_calibration_bars,
-                        "CMYK Color Calibration Bars",
-                    );
-                    ui.checkbox(&mut ex.options.page_info_slug, "Page Info Slug");
-                }
-                9 | 10 => {
-                    // DXF / PLT
-                    ui.checkbox(
-                        &mut ex.options.cut_layers_only,
-                        "Export CutContour / Cut Layers Only",
-                    );
-                }
-                EXPORT_FMT_GCODE => {
-                    // Laser G-Code (.gcode)
-                    ui.horizontal(|ui| {
-                        ui.label("Firmware Dialect:");
-                        ComboBox::from_id_salt("export_gcode_dialect")
-                            .width(190.0)
-                            .selected_text(gcode_dialect_label(ex.options.gcode_dialect))
-                            .show_ui(ui, |ui| {
-                                for d in [
-                                    GcodeDialect::Grbl11,
-                                    GcodeDialect::Marlin,
-                                    GcodeDialect::RuidaGcode,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut ex.options.gcode_dialect,
-                                        d,
-                                        gcode_dialect_label(d),
-                                    );
-                                }
-                            });
-                    });
-                    ui.checkbox(
-                        &mut ex.options.cut_layers_only,
-                        "Export CutContour / Cut Layers Only",
-                    );
-                    ui.label("Applies duplicate line removal, open curve joining & inner-loops-first ordering.");
-                }
-                12..=16 => {
-                    // Raster (PNG / JPEG / WebP / TIFF / BMP)
-                    ui.horizontal(|ui| {
-                        ui.label("Resolution:");
-                        ui.add(
-                            DragValue::new(&mut ex.options.dpi)
-                                .range(72.0..=1200.0)
-                                .suffix(" DPI"),
-                        );
-                    });
-                    if ex.format_index == 13 {
-                        ui.horizontal(|ui| {
-                            ui.label("JPEG Quality:");
-                            ui.add(DragValue::new(&mut ex.options.jpeg_quality).range(10..=100));
+                let prev = ex.format_index;
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::ExportFormatLabel.tr_ui(lang));
+                    ComboBox::from_id_salt("export_format_combo")
+                        .width(310.0)
+                        .selected_text(EXPORT_FORMATS[ex.format_index].0)
+                        .show_ui(ui, |ui| {
+                            for (idx, f) in EXPORT_FORMATS.iter().enumerate() {
+                                ui.selectable_value(&mut ex.format_index, idx, f.0);
+                            }
                         });
+                });
+                if ex.format_index != prev {
+                    let ext = EXPORT_FORMATS[ex.format_index].1;
+                    let trimmed = ex.output_path.trim();
+                    let mut target = if trimmed.is_empty() {
+                        PathBuf::from("export")
+                    } else {
+                        PathBuf::from(trimmed)
+                    };
+                    if target.file_stem().is_none() {
+                        target = target.join("export");
+                    }
+                    target.set_extension(ext);
+                    ex.output_path = target.to_string_lossy().into_owned();
+                    ex.options.cdr_version = match ex.format_index {
+                        3 => CdrWriteVersion::ZipX4,
+                        4 => CdrWriteVersion::RiffV12,
+                        _ => CdrWriteVersion::ZipX6,
+                    };
+                }
+
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::ExportOutputLabel.tr_ui(lang));
+                    ui.text_edit_singleline(&mut ex.output_path);
+                    if ui
+                        .button(crate::i18n::I18nKey::ExportBrowseButton.tr_ui(lang))
+                        .clicked()
+                    {
+                        browse_clicked = true;
+                    }
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Format Options").strong());
+                match ex.format_index {
+                    0 => {
+                        // PDF
+                        ui.checkbox(
+                            &mut ex.options.force_cmyk,
+                            "Force DeviceCMYK (Press Output)",
+                        );
+                        ui.checkbox(&mut ex.options.include_bleed, "Include BleedBox");
+                        ui.checkbox(&mut ex.options.crop_marks, "Crop Marks");
+                        ui.checkbox(&mut ex.options.registration_marks, "Registration Targets");
+                        ui.checkbox(
+                            &mut ex.options.color_calibration_bars,
+                            "CMYK Color Calibration Bars",
+                        );
+                        ui.checkbox(&mut ex.options.page_info_slug, "Page Info Slug");
+                    }
+                    9 | 10 => {
+                        // DXF / PLT
+                        ui.checkbox(
+                            &mut ex.options.cut_layers_only,
+                            "Export CutContour / Cut Layers Only",
+                        );
+                    }
+                    EXPORT_FMT_GCODE => {
+                        // Laser G-Code (.gcode)
+                        shell_dir.with_horizontal(ui, |ui| {
+                            ui.label("Firmware Dialect:");
+                            ComboBox::from_id_salt("export_gcode_dialect")
+                                .width(190.0)
+                                .selected_text(gcode_dialect_label(ex.options.gcode_dialect))
+                                .show_ui(ui, |ui| {
+                                    for d in [
+                                        GcodeDialect::Grbl11,
+                                        GcodeDialect::Marlin,
+                                        GcodeDialect::RuidaGcode,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut ex.options.gcode_dialect,
+                                            d,
+                                            gcode_dialect_label(d),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.checkbox(
+                            &mut ex.options.cut_layers_only,
+                            "Export CutContour / Cut Layers Only",
+                        );
+                        ui.label("Applies duplicate line removal, open curve joining & inner-loops-first ordering.");
+                    }
+                    12..=16 => {
+                        // Raster (PNG / JPEG / WebP / TIFF / BMP)
+                        shell_dir.with_horizontal(ui, |ui| {
+                            ui.label(crate::i18n::I18nKey::DocResolutionLabel.tr_ui(lang));
+                            ui.add(
+                                DragValue::new(&mut ex.options.dpi)
+                                    .range(72.0..=1200.0)
+                                    .suffix(" DPI"),
+                            );
+                        });
+                        if ex.format_index == 13 {
+                            shell_dir.with_horizontal(ui, |ui| {
+                                ui.label("JPEG Quality:");
+                                ui.add(DragValue::new(&mut ex.options.jpeg_quality).range(10..=100));
+                            });
+                        }
+                    }
+                    _ => {
+                        ui.label("Lossless offline export with atomic writes & safety checks.");
                     }
                 }
-                _ => {
-                    ui.label("Lossless offline export with atomic writes & safety checks.");
-                }
-            }
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    ex.open = false;
-                }
-                if ui
-                    .button(RichText::new("Export Now (Background)").strong())
-                    .clicked()
-                {
-                    trigger_export = true;
-                }
+                ui.add_space(12.0);
+                ui.separator();
+                shell_dir.with_horizontal(ui, |ui| {
+                    if ui
+                        .button(crate::i18n::I18nKey::DialogCancel.tr_ui(lang))
+                        .clicked()
+                    {
+                        ex.open = false;
+                    }
+                    if ui
+                        .button(
+                            RichText::new(crate::i18n::I18nKey::ExportRunBackground.tr_ui(lang))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        trigger_export = true;
+                    }
+                });
             });
         });
 
@@ -488,139 +513,208 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
         return;
     }
     let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
     let mut open = app.show_print_preview_dialog;
     let mut print_now = false;
     let mut refresh_printers = false;
-    egui::Window::new("Print Studio, Native OS Spooler & Imposition (Ctrl+P)")
+    egui::Window::new(crate::i18n::I18nKey::PrintPreviewTitle.tr_ui(lang))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .default_size(egui::vec2(560.0, 440.0))
         .show(ctx, |ui| {
-            ui.label(RichText::new("Native OS Print Queue (CUPS / Windows Spooler)").strong());
-            ui.horizontal(|ui| {
-                ui.label("Printer:");
-                let current_printer = app
-                    .print_job_config
-                    .printer_name
-                    .clone()
-                    .unwrap_or_else(|| "System Default Printer".to_owned());
-                ComboBox::from_id_salt("print_os_printer_combo")
-                    .width(260.0)
-                    .selected_text(&current_printer)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(
-                                app.print_job_config.printer_name.is_none(),
-                                "System Default Printer",
-                            )
-                            .clicked()
-                        {
-                            app.print_job_config.printer_name = None;
-                        }
-                        for p in &app.available_printers {
-                            let label = if p.is_default {
-                                format!("{} (Default · {})", p.name, p.status)
-                            } else {
-                                format!("{} ({})", p.name, p.status)
-                            };
+            shell_dir.with_vertical(ui, |ui| {
+                ui.label(RichText::new("Native OS Print Queue (CUPS / Windows Spooler)").strong());
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::PrintPrinterLabel.tr_ui(lang));
+                    let current_printer = app
+                        .print_job_config
+                        .printer_name
+                        .clone()
+                        .unwrap_or_else(|| "System Default Printer".to_owned());
+                    ComboBox::from_id_salt("print_os_printer_combo")
+                        .width(260.0)
+                        .selected_text(&current_printer)
+                        .show_ui(ui, |ui| {
                             if ui
                                 .selectable_label(
-                                    app.print_job_config.printer_name.as_deref() == Some(&p.name),
-                                    label,
+                                    app.print_job_config.printer_name.is_none(),
+                                    "System Default Printer",
                                 )
                                 .clicked()
                             {
-                                app.print_job_config.printer_name = Some(p.name.clone());
+                                app.print_job_config.printer_name = None;
                             }
-                        }
-                    });
-                let refresh_lbl = if app.scanning_printers {
-                    "Scanning..."
-                } else {
-                    "Refresh"
-                };
-                if ui
-                    .add_enabled(!app.scanning_printers, egui::Button::new(refresh_lbl))
-                    .clicked()
-                {
-                    refresh_printers = true;
+                            for p in &app.available_printers {
+                                let label = if p.is_default {
+                                    format!("{} (Default · {})", p.name, p.status)
+                                } else {
+                                    format!("{} ({})", p.name, p.status)
+                                };
+                                if ui
+                                    .selectable_label(
+                                        app.print_job_config.printer_name.as_deref()
+                                            == Some(&p.name),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    app.print_job_config.printer_name = Some(p.name.clone());
+                                }
+                            }
+                        });
+                    let refresh_lbl = if app.scanning_printers {
+                        "Scanning..."
+                    } else {
+                        "Refresh"
+                    };
+                    if ui
+                        .add_enabled(!app.scanning_printers, egui::Button::new(refresh_lbl))
+                        .clicked()
+                    {
+                        refresh_printers = true;
+                    }
+                });
+
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::PrintCopiesLabel.tr_ui(lang));
+                    ui.add(DragValue::new(&mut app.print_job_config.copies).range(1..=999));
+                    ui.label(crate::i18n::I18nKey::DocPagesLabel.tr_ui(lang));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.print_job_config.page_range)
+                            .desired_width(100.0)
+                            .hint_text("all or 1,3-5"),
+                    );
+                });
+
+                ui.with_layout(
+                    shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                    |ui| {
+                        ui.checkbox(&mut app.print_job_config.force_cmyk, "CMYK Press Output");
+                        ui.checkbox(
+                            &mut app.print_job_config.fit_to_page,
+                            crate::i18n::I18nKey::NavigatorZoomFit.tr_ui(lang),
+                        );
+                        ui.checkbox(&mut app.print_job_config.crop_marks, "Crop Marks");
+                        ui.checkbox(&mut app.print_job_config.collate, "Collate");
+                    },
+                );
+
+                shell_dir.with_horizontal(ui, |ui| {
+                    if ui
+                        .button(
+                            RichText::new(crate::i18n::I18nKey::PrintSendButton.tr_ui(lang))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        print_now = true;
+                    }
+                    if let Some(ref status) = app.printers_status {
+                        ui.label(RichText::new(status).size(11.0).color(tokens.text_muted));
+                    }
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Prepress Sheet & Separation Studio").strong());
+                ui.with_layout(
+                    shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                    |ui| {
+                        ui.selectable_value(
+                            &mut app.production_state.imposition_kind,
+                            0,
+                            "N-Up Grid",
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.imposition_kind,
+                            1,
+                            "Booklet Saddle-Stitch",
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.imposition_kind,
+                            2,
+                            "Large-Format Tiling",
+                        );
+                        ui.selectable_value(
+                            &mut app.production_state.imposition_kind,
+                            3,
+                            "Perfect-Bound Signatures",
+                        );
+                    },
+                );
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(lang.tr_ui("Sheet W:", "عرض اللوح:"));
+                    ui.add(
+                        DragValue::new(&mut app.production_state.sheet_w_mm)
+                            .range(50.0..=5000.0)
+                            .suffix(" mm"),
+                    );
+                    ui.label(lang.tr_ui("H:", "الارتفاع:"));
+                    ui.add(
+                        DragValue::new(&mut app.production_state.sheet_h_mm)
+                            .range(50.0..=5000.0)
+                            .suffix(" mm"),
+                    );
+                });
+                ui.separator();
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(
+                        RichText::new(lang.tr_ui(
+                            "Live Sheet, Bleed, Margin & Separation Preview",
+                            "معاينة حية للوح الطباعة والهوامش وفصل الألوان",
+                        ))
+                        .strong(),
+                    );
+                    ui.with_layout(
+                        shell_dir.opposite_horizontal_layout(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .small_button(crate::i18n::I18nKey::NavigatorResetView.tr_ui(lang))
+                                .clicked()
+                            {
+                                app.print_preview_zoom = 1.0;
+                                app.print_preview_pan = [0.0, 0.0];
+                            }
+                            ui.add(
+                                DragValue::new(&mut app.print_preview_zoom)
+                                    .range(0.5..=6.0)
+                                    .speed(0.05)
+                                    .prefix("Zoom: ")
+                                    .suffix("x"),
+                            );
+                        },
+                    );
+                });
+                if let Some(sep) = app.active_tab().and_then(|t| t.separations_preview.clone()) {
+                    ui.with_layout(
+                        shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                        |ui| {
+                            ui.label("Plate:");
+                            if ui
+                                .selectable_label(
+                                    app.print_preview_plate.is_none(),
+                                    crate::i18n::I18nKey::PrintSeparationsComposite.tr_ui(lang),
+                                )
+                                .clicked()
+                            {
+                                app.print_preview_plate = None;
+                            }
+                            for (p_idx, plate) in sep.plates.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        app.print_preview_plate == Some(p_idx),
+                                        &plate.name,
+                                    )
+                                    .clicked()
+                                {
+                                    app.print_preview_plate = Some(p_idx);
+                                }
+                            }
+                        },
+                    );
                 }
             });
-
-            ui.horizontal(|ui| {
-                ui.label("Copies:");
-                ui.add(DragValue::new(&mut app.print_job_config.copies).range(1..=999));
-                ui.label("Pages:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.print_job_config.page_range)
-                        .desired_width(100.0)
-                        .hint_text("all or 1,3-5"),
-                );
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut app.print_job_config.force_cmyk, "CMYK Press Output");
-                ui.checkbox(&mut app.print_job_config.fit_to_page, "Fit to Page");
-                ui.checkbox(&mut app.print_job_config.crop_marks, "Crop Marks");
-                ui.checkbox(&mut app.print_job_config.collate, "Collate");
-            });
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button(RichText::new("Print Document Now").strong())
-                    .clicked()
-                {
-                    print_now = true;
-                }
-                if let Some(ref status) = app.printers_status {
-                    ui.label(RichText::new(status).size(11.0).color(tokens.text_muted));
-                }
-            });
-
-            ui.separator();
-            ui.label(RichText::new("Prepress Sheet & Separation Studio").strong());
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut app.production_state.imposition_kind, 0, "N-Up Grid");
-                ui.selectable_value(
-                    &mut app.production_state.imposition_kind,
-                    1,
-                    "Booklet Saddle-Stitch",
-                );
-                ui.selectable_value(
-                    &mut app.production_state.imposition_kind,
-                    2,
-                    "Large-Format Tiling",
-                );
-                ui.selectable_value(
-                    &mut app.production_state.imposition_kind,
-                    3,
-                    "Perfect-Bound Signatures",
-                );
-            });
-            let lang = app.ui_language;
-            ui.horizontal(|ui| {
-                ui.label(lang.tr_ui("Sheet W:", "عرض اللوح:"));
-                ui.add(
-                    DragValue::new(&mut app.production_state.sheet_w_mm)
-                        .range(50.0..=5000.0)
-                        .suffix(" mm"),
-                );
-                ui.label(lang.tr_ui("H:", "الارتفاع:"));
-                ui.add(
-                    DragValue::new(&mut app.production_state.sheet_h_mm)
-                        .range(50.0..=5000.0)
-                        .suffix(" mm"),
-                );
-            });
-            ui.separator();
-            ui.label(
-                RichText::new(lang.tr_ui(
-                    "Live Sheet, Bleed, Margin & Imposition Preview",
-                    "معاينة حية للوح الطباعة والهوامش والتركيب",
-                ))
-                .strong(),
-            );
             draw_print_preview_thumbnail(ui, app, &tokens);
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -701,11 +795,16 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
 
 fn draw_print_preview_thumbnail(
     ui: &mut egui::Ui,
-    app: &StudioApp,
+    app: &mut StudioApp,
     tokens: &crate::theme::ThemeTokens,
 ) {
     let sheet_w = app.production_state.sheet_w_mm.max(10.0) as f32;
     let sheet_h = app.production_state.sheet_h_mm.max(10.0) as f32;
+    let active_plate_info = app
+        .active_tab()
+        .and_then(|t| t.separations_preview.as_ref())
+        .and_then(|sep| app.print_preview_plate.and_then(|idx| sep.plates.get(idx)))
+        .map(|p| (p.name.clone(), p.average_coverage_pct));
     let (page_w, page_h, bleed_mm, doc_thumbs) = if let Some(tab) = app.active_tab() {
         let p = tab.document.active_page();
         let (pw, ph, bm) = p.map_or((210.0_f32, 297.0_f32, 3.0_f32), |pg| {
@@ -732,12 +831,30 @@ fn draw_print_preview_thumbnail(
                         if !obj.visible || !obj.printable {
                             continue;
                         }
-                        let fill_c = obj
+                        let base_c = obj
                             .fill
                             .referenced_colors()
                             .first()
                             .map(core_color_to_egui)
                             .unwrap_or(core_color_to_egui(&obj.outline.color));
+                        let fill_c = if let Some((ref pname, _)) = active_plate_info {
+                            let luma = (u16::from(base_c.r())
+                                + u16::from(base_c.g())
+                                + u16::from(base_c.b()))
+                                / 3;
+                            let shade = (luma as u8).clamp(35, 225);
+                            if pname.to_ascii_lowercase().contains("cyan") {
+                                Color32::from_rgb(0, 210 - shade / 3, 240)
+                            } else if pname.to_ascii_lowercase().contains("magenta") {
+                                Color32::from_rgb(235, 20, 150)
+                            } else if pname.to_ascii_lowercase().contains("yellow") {
+                                Color32::from_rgb(245, 215, 25)
+                            } else {
+                                Color32::from_gray(shade)
+                            }
+                        } else {
+                            base_c
+                        };
                         let nx = (bb.min_x as f32 / pw).clamp(-0.1, 1.1);
                         let ny = (bb.min_y as f32 / ph).clamp(-0.1, 1.1);
                         let nw = ((bb.max_x - bb.min_x) as f32 / pw).clamp(0.01, 1.2);
@@ -753,7 +870,19 @@ fn draw_print_preview_thumbnail(
     };
 
     let avail_w = ui.available_width().clamp(260.0, 480.0);
-    let (resp, painter) = ui.allocate_painter(vec2(avail_w, 190.0), Sense::hover());
+    let (resp, painter) = ui.allocate_painter(vec2(avail_w, 190.0), Sense::click_and_drag());
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        app.print_preview_pan[0] = (app.print_preview_pan[0] + d.x).clamp(-300.0, 300.0);
+        app.print_preview_pan[1] = (app.print_preview_pan[1] + d.y).clamp(-300.0, 300.0);
+    }
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            app.print_preview_zoom =
+                (app.print_preview_zoom * (1.0 + scroll * 0.002)).clamp(0.5, 6.0);
+        }
+    }
     painter.rect_filled(resp.rect, CornerRadius::same(4), tokens.canvas_well);
     painter.rect_stroke(
         resp.rect,
@@ -765,9 +894,13 @@ fn draw_print_preview_thumbnail(
     let inner = resp.rect.shrink2(vec2(18.0, 14.0));
     let scale = (inner.width() / sheet_w)
         .min(inner.height() / sheet_h)
-        .max(1e-3);
+        .max(1e-3)
+        * app.print_preview_zoom.clamp(0.5, 6.0);
     let sheet_px_size = vec2(sheet_w * scale, sheet_h * scale);
-    let sheet_rect = Rect::from_center_size(inner.center(), sheet_px_size);
+    let sheet_rect = Rect::from_center_size(
+        inner.center() + vec2(app.print_preview_pan[0], app.print_preview_pan[1]),
+        sheet_px_size,
+    );
 
     painter.rect_filled(
         sheet_rect.translate(vec2(2.5, 2.5)),
@@ -1092,6 +1225,19 @@ fn show_options_appearance_workspace(
         "Treat All Objects as Filled (Click anywhere inside hollow shapes to select)",
     );
 
+    ui.add_space(6.0);
+    ui.label(RichText::new("Standard Toolbar Groups Customization").strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut app.toolbar_config.show_file_ops, "File");
+        ui.checkbox(&mut app.toolbar_config.show_undo_redo, "Undo/Redo");
+        ui.checkbox(&mut app.toolbar_config.show_clipboard, "Clipboard");
+        ui.checkbox(&mut app.toolbar_config.show_zoom, "Zoom");
+        ui.checkbox(&mut app.toolbar_config.show_view_mode, "View Mode");
+        ui.checkbox(&mut app.toolbar_config.show_snap_toggles, "Snaps");
+        ui.checkbox(&mut app.toolbar_config.show_layout_toggles, "Facing/Pages");
+        ui.checkbox(&mut app.toolbar_config.show_drawing_scale, "Scale");
+    });
+
     ui.add_space(8.0);
     ui.label(RichText::new("Keyboard Shortcut Profile").strong());
     ui.horizontal(|ui| {
@@ -1283,6 +1429,7 @@ fn show_options_general_nudge(
             clear_gray_icc: false,
             rendering_intent: None,
             black_point_compensation: None,
+            drawing_scale: None,
         });
     }
 
@@ -1436,6 +1583,7 @@ fn show_options_color_management(
             clear_gray_icc: false,
             rendering_intent: Some(next_doc_intent),
             black_point_compensation: None,
+            drawing_scale: None,
         });
         if let Some(tab) = app.active_tab_mut() {
             tab.needs_rerender = true;
@@ -1469,6 +1617,7 @@ fn show_options_color_management(
             clear_gray_icc: false,
             rendering_intent: None,
             black_point_compensation: Some(next_bpc),
+            drawing_scale: None,
         });
         if let Some(tab) = app.active_tab_mut() {
             tab.needs_rerender = true;
@@ -1527,6 +1676,7 @@ fn show_options_color_management(
                                 clear_gray_icc: false,
                                 rendering_intent: None,
                                 black_point_compensation: None,
+                                drawing_scale: None,
                             };
                             if let CommandOp::SetDocumentProperties {
                                 rgb_icc_profile,
@@ -1572,6 +1722,7 @@ fn show_options_color_management(
                 clear_gray_icc: true,
                 rendering_intent: None,
                 black_point_compensation: None,
+                drawing_scale: None,
             });
             if let Some(tab) = app.active_tab_mut() {
                 tab.needs_rerender = true;
@@ -1729,6 +1880,7 @@ fn show_options_color_management(
                             clear_gray_icc: false,
                             rendering_intent: None,
                             black_point_compensation: None,
+                            drawing_scale: None,
                         }) {
                             Ok(()) => {
                                 let desc = app
@@ -1773,6 +1925,7 @@ fn show_options_color_management(
                 clear_gray_icc: false,
                 rendering_intent: None,
                 black_point_compensation: None,
+                drawing_scale: None,
             }) {
                 app.push_toast(format!("Clear ICC failed: {err}"), true);
             } else {
@@ -2208,6 +2361,40 @@ fn show_edit_fill_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                         bg: Color::WHITE,
                     };
                 }
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::VectorPattern { .. }),
+                        lang.tr("Vector Pattern", "نمط متجه"),
+                    )
+                    .clicked()
+                {
+                    let sym_id = app
+                        .active_tab()
+                        .and_then(|t| t.document.symbols().keys().next().copied())
+                        .unwrap_or_default();
+                    app.edit_fill_draft = Fill::VectorPattern {
+                        symbol_id: sym_id,
+                        tile_w: 12.0,
+                        tile_h: 12.0,
+                    };
+                }
+                if ui
+                    .selectable_label(
+                        matches!(app.edit_fill_draft, Fill::BitmapPattern { .. }),
+                        lang.tr("Bitmap Pattern", "نمط نقطي"),
+                    )
+                    .clicked()
+                {
+                    let image_id = app
+                        .active_tab()
+                        .and_then(|t| t.document.assets().keys().next().copied())
+                        .unwrap_or_default();
+                    app.edit_fill_draft = Fill::BitmapPattern {
+                        image_id,
+                        tile_w: 16.0,
+                        tile_h: 16.0,
+                    };
+                }
             });
             ui.separator();
 
@@ -2493,8 +2680,52 @@ fn show_edit_fill_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                     ui.label("Background:");
                     edit_color_compact_sliders(ui, bg, "f11_tex_bg");
                 }
+                Fill::VectorPattern {
+                    symbol_id,
+                    tile_w,
+                    tile_h,
+                } => {
+                    ui.label(RichText::new(format!("Vector Pattern Fill ({symbol_id})")).strong());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            DragValue::new(tile_w)
+                                .prefix("Tile W ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                        ui.add(
+                            DragValue::new(tile_h)
+                                .prefix("Tile H ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                    });
+                }
+                Fill::BitmapPattern {
+                    image_id,
+                    tile_w,
+                    tile_h,
+                } => {
+                    ui.label(
+                        RichText::new(format!("Bitmap Pattern Fill (Asset {image_id})")).strong(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            DragValue::new(tile_w)
+                                .prefix("Tile W ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                        ui.add(
+                            DragValue::new(tile_h)
+                                .prefix("Tile H ")
+                                .suffix(" mm")
+                                .range(1.0..=500.0),
+                        );
+                    });
+                }
                 _ => {
-                    ui.label("Vector/Bitmap/Mesh fills can be edited directly via canvas handles.");
+                    ui.label("Mesh fills can be edited directly via canvas handles.");
                 }
             }
 
@@ -2792,5 +3023,260 @@ fn show_outline_pen_dialog(ctx: &egui::Context, app: &mut StudioApp) {
         app.show_outline_pen_dialog = false;
     } else if !open || cancel_clicked {
         app.show_outline_pen_dialog = false;
+    }
+}
+
+/// Interactive `CRLFOM` modal missing-font substitution dialog with `PANOSE` suggestions (`REQ-07`).
+fn show_missing_font_dialog(ctx: &egui::Context, app: &mut StudioApp) {
+    if !app.missing_font_dialog.open {
+        return;
+    }
+    let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    let mut open = app.missing_font_dialog.open;
+    let mut apply_now = false;
+    let mut skip_now = false;
+    let doc_title = app.missing_font_dialog.document_title.clone();
+    egui::Window::new(crate::i18n::I18nKey::MissingFontDialogTitle.tr_ui(lang))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(vec2(520.0, 320.0))
+        .show(ctx, |ui| {
+            shell_dir.with_vertical(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} ({doc_title})",
+                        crate::i18n::I18nKey::MissingFontDialogDesc.tr_ui(lang)
+                    ))
+                    .color(tokens.text_muted),
+                );
+                ui.add_space(6.0);
+                for (idx, entry) in app.missing_font_dialog.entries.iter_mut().enumerate() {
+                    Frame::NONE
+                        .fill(tokens.surface)
+                        .stroke(Stroke::new(1.0, tokens.border))
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(Margin::same(8))
+                        .show(ui, |ui| {
+                            shell_dir.with_horizontal(ui, |ui| {
+                                ui.label(
+                                    RichText::new(&entry.missing_family)
+                                        .strong()
+                                        .color(tokens.warning),
+                                );
+                                ui.label("->");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut entry.selected_family)
+                                        .id_salt(("crlfom_sub", idx))
+                                        .desired_width(170.0),
+                                );
+                                let dist_txt = entry.panose_distance.map_or_else(
+                                    || crate::i18n::I18nKey::MissingFontSuggestedPanose.tr_ui(lang),
+                                    |d| format!("PANOSE Δ={d}"),
+                                );
+                                ui.label(RichText::new(dist_txt).size(10.5).color(tokens.accent));
+                            });
+                            ui.with_layout(
+                                shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                                |ui| {
+                                    for cand in [
+                                        entry.suggested_family.as_str(),
+                                        "Noto Sans",
+                                        "Noto Sans Arabic",
+                                        "Noto Naskh Arabic",
+                                        "DejaVu Sans",
+                                    ] {
+                                        if ui.small_button(cand).clicked() {
+                                            entry.selected_family = cand.to_owned();
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+                ui.checkbox(
+                    &mut app.missing_font_dialog.remember_rules,
+                    crate::i18n::I18nKey::MissingFontRememberRule.tr_ui(lang),
+                );
+                ui.separator();
+                shell_dir.with_horizontal(ui, |ui| {
+                    if ui
+                        .button(
+                            RichText::new(crate::i18n::I18nKey::MissingFontApplyAll.tr_ui(lang))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        apply_now = true;
+                    }
+                    if ui
+                        .button(crate::i18n::I18nKey::MissingFontSkip.tr_ui(lang))
+                        .clicked()
+                    {
+                        skip_now = true;
+                    }
+                });
+            });
+        });
+    if apply_now {
+        app.apply_missing_font_dialog_substitutions();
+    } else if skip_now || !open {
+        app.missing_font_dialog.open = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdrCodepage {
+    Auto,
+    Cp1256,
+    Cp1251,
+    Cp1252,
+    Utf8,
+}
+
+impl CdrCodepage {
+    const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Cp1256,
+        Self::Cp1251,
+        Self::Cp1252,
+        Self::Utf8,
+    ];
+
+    const fn codepage_id(self) -> Option<u16> {
+        match self {
+            Self::Auto => None,
+            Self::Cp1256 => Some(1256),
+            Self::Cp1251 => Some(1251),
+            Self::Cp1252 => Some(1252),
+            Self::Utf8 => Some(65001),
+        }
+    }
+
+    const fn i18n_key(self) -> crate::i18n::I18nKey {
+        match self {
+            Self::Auto => crate::i18n::I18nKey::CdrCodepageAuto,
+            Self::Cp1256 => crate::i18n::I18nKey::CdrCodepageCp1256,
+            Self::Cp1251 => crate::i18n::I18nKey::CdrCodepageCp1251,
+            Self::Cp1252 => crate::i18n::I18nKey::CdrCodepageCp1252,
+            Self::Utf8 => crate::i18n::I18nKey::CdrCodepageUtf8,
+        }
+    }
+
+    const fn preview_hint(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto-detect codepage from RIFF font/stlt/txsm chunks",
+            Self::Cp1256 => "Preview fallback: Windows-1256 (Arabic) legacy single-byte decoding",
+            Self::Cp1251 => "Preview fallback: Windows-1251 (Cyrillic) legacy single-byte decoding",
+            Self::Cp1252 => "Preview fallback: Windows-1252 (Western Latin) single-byte decoding",
+            Self::Utf8 => "Preview fallback: UTF-8 multi-byte decoding",
+        }
+    }
+}
+
+/// Interactive `S15` `.cdr` legacy codepage selector modal (`CP1256` / `CP1251` / `CP1252` / `UTF-8`).
+fn show_cdr_import_codepage_dialog(ctx: &egui::Context, app: &mut StudioApp) {
+    if !app.cdr_import_dialog.open {
+        return;
+    }
+    let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
+    let mut open = app.cdr_import_dialog.open;
+    let mut open_now = false;
+    let mut cancel_now = false;
+    egui::Window::new(crate::i18n::I18nKey::CdrImportCodepageTitle.tr_ui(lang))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(vec2(460.0, 240.0))
+        .show(ctx, |ui| {
+            shell_dir.with_vertical(ui, |ui| {
+                let path_txt = app.cdr_import_dialog.pending_path.as_ref().map_or_else(
+                    || "<select a .cdr / .cdt / .cmx file>".to_owned(),
+                    |p| p.display().to_string(),
+                );
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(RichText::new(path_txt).monospace().size(11.0));
+                    if ui
+                        .small_button(crate::i18n::I18nKey::ExportBrowseButton.tr_ui(lang))
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_title("Choose .cdr File")
+                            .add_filter("CDR / CDT / CMX Vector Files", &["cdr", "cdt", "cmx"])
+                            .pick_file()
+                        {
+                            app.cdr_import_dialog.pending_path = Some(p);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Legacy Text Encoding / Windows Codepage:").strong());
+                ui.with_layout(
+                    shell_dir.horizontal_wrapped_layout(egui::Align::Center),
+                    |ui| {
+                        for cp_enum in CdrCodepage::ALL {
+                            let cp = cp_enum.codepage_id();
+                            if ui
+                                .selectable_value(
+                                    &mut app.cdr_import_dialog.selected_codepage,
+                                    cp,
+                                    cp_enum.i18n_key().tr_ui(lang),
+                                )
+                                .clicked()
+                                || app.cdr_import_dialog.preview_summary.is_empty()
+                                    && app.cdr_import_dialog.selected_codepage == cp
+                            {
+                                app.cdr_import_dialog.preview_summary =
+                                    cp_enum.preview_hint().to_owned();
+                            }
+                        }
+                    },
+                );
+                if !app.cdr_import_dialog.preview_summary.is_empty() {
+                    ui.label(
+                        RichText::new(&app.cdr_import_dialog.preview_summary)
+                            .size(10.5)
+                            .color(tokens.text_muted),
+                    );
+                }
+                ui.separator();
+                shell_dir.with_horizontal(ui, |ui| {
+                    let has_path = app.cdr_import_dialog.pending_path.is_some();
+                    if ui
+                        .add_enabled(
+                            has_path,
+                            egui::Button::new(
+                                RichText::new(crate::i18n::I18nKey::WelcomeOpenButton.tr_ui(lang))
+                                    .strong(),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        open_now = true;
+                    }
+                    if ui
+                        .button(crate::i18n::I18nKey::DialogCancel.tr_ui(lang))
+                        .clicked()
+                    {
+                        cancel_now = true;
+                    }
+                });
+            });
+        });
+    if open_now {
+        if let Some(path) = app.cdr_import_dialog.pending_path.clone() {
+            let cp = app.cdr_import_dialog.selected_codepage;
+            match app.open_file_path_with_codepage(&path, cp) {
+                Ok(()) => app.cdr_import_dialog.open = false,
+                Err(err) => app.push_toast(err, true),
+            }
+        }
+    } else if cancel_now || !open {
+        app.cdr_import_dialog.open = false;
     }
 }

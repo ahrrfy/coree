@@ -649,6 +649,7 @@ mod tests {
                     width_mm: 50.0,
                     height_mm: 50.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),

@@ -8,7 +8,7 @@
 //! All archive entries are validated strictly against Zip-Slip and Zip-Bomb limits.
 
 use crate::cdr_riff::{
-    encode_bmp_file_rgba, parse_cdr_riff_tree, render_doc_mini_thumbnail_rgba,
+    encode_bmp_file_rgba, parse_cdr_riff_tree_with_options, render_doc_mini_thumbnail_rgba,
     write_cdr_riff_with_options, RiffWriteOptions,
 };
 use crate::error::{CdrError, CdrResult};
@@ -66,6 +66,15 @@ pub fn is_zip_bytes(bytes: &[u8]) -> bool {
 /// Parses a ZIP/OPC CDR (X4–X5 or X6–2025) or CDT template archive with full
 /// Zip-Slip and Zip-Bomb security enforcement.
 pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipCdr> {
+    parse_cdr_zip_with_options(bytes, limits, crate::CdrReadOptions::default())
+}
+
+/// Parses a ZIP/OPC CDR/CDT archive with explicit [`crate::CdrReadOptions`].
+pub fn parse_cdr_zip_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    opts: crate::CdrReadOptions,
+) -> CdrResult<ParsedZipCdr> {
     let archive_len = bytes.len() as u64;
     let cursor = Cursor::new(bytes);
     let mut archive =
@@ -386,12 +395,13 @@ pub fn parse_cdr_zip(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ParsedZipC
         };
 
     // Share remaining cumulative budget across decoded RGBA bitmaps & scene objects!
-    let mut parsed_riff = parse_cdr_riff_tree(
+    let mut parsed_riff = parse_cdr_riff_tree_with_options(
         resolved_riff_tree,
         limits,
         &external_bitmaps,
         &mut budget_remaining,
         &zcf_ctx,
+        opts.default_codepage,
     )?;
     warnings.extend(parsed_riff.warnings);
     if parsed_riff.is_template {

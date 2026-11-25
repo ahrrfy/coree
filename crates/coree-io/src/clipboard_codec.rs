@@ -51,6 +51,7 @@ const EMR_CLOSEFIGURE: u32 = 61;
 const EMR_FILLPATH: u32 = 62;
 const EMR_STROKEANDFILLPATH: u32 = 63;
 const EMR_STROKEPATH: u32 = 64;
+const EMR_STRETCHDIBITS: u32 = 81;
 const EMR_SIGNATURE_EMF: u32 = 0x464D_4520; // " EMF" in little-endian
 const MM_ANISOTROPIC: u32 = 8;
 const BS_SOLID: u32 = 0;
@@ -321,7 +322,18 @@ pub fn encode_clipboard_emf(doc: &Document, page_index: usize) -> IoResult<Vec<u
     n_records += 1;
 
     let (bx0, by0, bx1, by1) = if bounds_min_x <= bounds_max_x && bounds_min_y <= bounds_max_y {
-        (bounds_min_x, bounds_min_y, bounds_max_x, bounds_max_y)
+        let to_dev_x = |hx: i32| -> i32 {
+            ((f64::from(hx) * f64::from(w_dev)) / f64::from(w_himetric.max(1))).round() as i32
+        };
+        let to_dev_y = |hy: i32| -> i32 {
+            ((f64::from(hy) * f64::from(h_dev)) / f64::from(h_himetric.max(1))).round() as i32
+        };
+        (
+            to_dev_x(bounds_min_x),
+            to_dev_y(bounds_min_y),
+            to_dev_x(bounds_max_x),
+            to_dev_y(bounds_max_y),
+        )
     } else {
         (0, 0, w_dev, h_dev)
     };
@@ -613,25 +625,54 @@ fn emit_emf_object(
             }
         }
         NodePayload::Raster(raster) => {
-            let bp = BezierPath::from_rect(Rect2D::from_xywh(
-                0.0,
-                0.0,
-                raster.width_mm.max(1.0),
-                raster.height_mm.max(1.0),
-            ));
-            emit_emf_bezier_shape(
-                &bp,
-                world_xf,
-                &obj.fill,
-                &obj.outline,
-                out,
-                n_records,
-                max_handle,
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            );
+            if let Some(asset) = doc.asset(raster.asset_id) {
+                let active_filters = raster.active_filters();
+                let filtered = (!active_filters.is_empty())
+                    .then(|| coree_render::apply_raster_filters(asset, &active_filters));
+                let active_asset = filtered.as_ref().unwrap_or(asset);
+                let p0 = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                let p1 = world_xf.transform_point(Point2D::new(
+                    raster.width_mm.max(0.1),
+                    raster.height_mm.max(0.1),
+                ));
+                let x0 = mm_to_himetric(p0.x.min(p1.x));
+                let y0 = mm_to_himetric(p0.y.min(p1.y));
+                let x1 = mm_to_himetric(p0.x.max(p1.x));
+                let y1 = mm_to_himetric(p0.y.max(p1.y));
+                *min_x = (*min_x).min(x0);
+                *min_y = (*min_y).min(y0);
+                *max_x = (*max_x).max(x1);
+                *max_y = (*max_y).max(y1);
+                emit_emf_stretch_dibits(
+                    active_asset.width,
+                    active_asset.height,
+                    &active_asset.to_rgba8_vec(),
+                    obj.opacity,
+                    [x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)],
+                    out,
+                    n_records,
+                );
+            } else {
+                let bp = BezierPath::from_rect(Rect2D::from_xywh(
+                    0.0,
+                    0.0,
+                    raster.width_mm.max(1.0),
+                    raster.height_mm.max(1.0),
+                ));
+                emit_emf_bezier_shape(
+                    &bp,
+                    world_xf,
+                    &obj.fill,
+                    &obj.outline,
+                    out,
+                    n_records,
+                    max_handle,
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                );
+            }
         }
         NodePayload::Connector(conn) => {
             let (a, b) = resolve_export_connector_endpoints(doc, conn, &world_xf, sym_ctx);
@@ -892,6 +933,89 @@ fn emit_emf_bezier_shape(
 
     emit_emr_u32_1(out, EMR_DELETEOBJECT, brush_handle, n_records);
     emit_emr_u32_1(out, EMR_DELETEOBJECT, pen_handle, n_records);
+}
+
+fn emit_emf_stretch_dibits(
+    src_w: u32,
+    src_h: u32,
+    rgba: &[u8],
+    opacity: f32,
+    dest_xywh_himetric: [i32; 4],
+    out: &mut Vec<u8>,
+    n_records: &mut u32,
+) {
+    if src_w == 0 || src_h == 0 || rgba.len() < (src_w as usize) * (src_h as usize) * 4 {
+        return;
+    }
+    let max_dim = 256u32;
+    let scale = (src_w.max(src_h) as f64 / f64::from(max_dim)).max(1.0);
+    let dst_w = ((src_w as f64 / scale).round() as u32).clamp(1, max_dim);
+    let dst_h = ((src_h as f64 / scale).round() as u32).clamp(1, max_dim);
+    let stride = (dst_w as usize * 3 + 3) & !3;
+    let img_bytes = stride * dst_h as usize;
+    let rsize = 80u32 + 40u32 + img_bytes as u32;
+    let [xd, yd, cwd, chd] = dest_xywh_himetric;
+
+    out.extend_from_slice(&EMR_STRETCHDIBITS.to_le_bytes());
+    out.extend_from_slice(&rsize.to_le_bytes());
+    for v in [xd, yd, xd.saturating_add(cwd), yd.saturating_add(chd)] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&xd.to_le_bytes());
+    out.extend_from_slice(&yd.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes()); // xSrc
+    out.extend_from_slice(&0i32.to_le_bytes()); // ySrc
+    out.extend_from_slice(&(dst_w as i32).to_le_bytes());
+    out.extend_from_slice(&(dst_h as i32).to_le_bytes());
+    out.extend_from_slice(&80u32.to_le_bytes()); // offBmiSrc
+    out.extend_from_slice(&40u32.to_le_bytes()); // cbBmiSrc
+    out.extend_from_slice(&120u32.to_le_bytes()); // offBitsSrc
+    out.extend_from_slice(&(img_bytes as u32).to_le_bytes()); // cbBitsSrc
+    out.extend_from_slice(&0u32.to_le_bytes()); // iUsageSrc = DIB_RGB_COLORS
+    out.extend_from_slice(&0x00CC_0020u32.to_le_bytes()); // SRCCOPY
+    out.extend_from_slice(&cwd.to_le_bytes());
+    out.extend_from_slice(&chd.to_le_bytes());
+
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(dst_w as i32).to_le_bytes());
+    out.extend_from_slice(&(dst_h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(img_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    let op = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let mut row = vec![0u8; stride];
+    for dy in (0..dst_h).rev() {
+        row.fill(0);
+        let sy = ((u64::from(dy) * u64::from(src_h)) / u64::from(dst_h)).min(u64::from(src_h - 1))
+            as usize;
+        for dx in 0..dst_w {
+            let sx = ((u64::from(dx) * u64::from(src_w)) / u64::from(dst_w))
+                .min(u64::from(src_w - 1)) as usize;
+            let idx = (sy * src_w as usize + sx) * 4;
+            let a = (f32::from(rgba[idx + 3]) / 255.0) * op;
+            let blend = |ch: u8| -> u8 {
+                (f32::from(ch) * a + 255.0 * (1.0 - a))
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            let out_off = dx as usize * 3;
+            row[out_off] = blend(rgba[idx + 2]);
+            row[out_off + 1] = blend(rgba[idx + 1]);
+            row[out_off + 2] = blend(rgba[idx]);
+        }
+        out.extend_from_slice(&row);
+    }
+    *n_records += 1;
 }
 
 fn mm_to_himetric(mm: f64) -> i32 {
@@ -1169,6 +1293,7 @@ pub fn decode_clipboard_png(bytes: &[u8]) -> IoResult<Document> {
             width_mm: w_mm,
             height_mm: h_mm,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -1416,6 +1541,38 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                             })
                             .with_outline(current_outline.clone());
                     doc.add_object(obj, layer_id)?;
+                }
+            }
+            EMR_STRETCHDIBITS if rsize >= 120 => {
+                let x_dest = himetric_to_mm(read_i32_le(rec, 24));
+                let y_dest = himetric_to_mm(read_i32_le(rec, 28));
+                let off_bmi = read_u32_le(rec, 48) as usize;
+                let cb_bmi = read_u32_le(rec, 52) as usize;
+                let off_bits = read_u32_le(rec, 56) as usize;
+                let cb_bits = read_u32_le(rec, 60) as usize;
+                let w_mm = himetric_to_mm(read_i32_le(rec, 72)).max(0.1);
+                let h_mm = himetric_to_mm(read_i32_le(rec, 76)).max(0.1);
+                if off_bmi >= 80 && off_bmi + cb_bmi == off_bits && off_bits + cb_bits <= rsize {
+                    if let Some(asset) =
+                        crate::wmf_emf::parse_dib_24bpp_to_asset(&rec[off_bmi..off_bits + cb_bits])
+                    {
+                        let asset_id = doc.register_asset(asset);
+                        let oid = doc.alloc_object_id();
+                        let obj = SceneObject::new(
+                            oid,
+                            format!("EMF Raster {}", oid.0),
+                            NodePayload::Raster(coree_core::RasterLayerData {
+                                asset_id,
+                                width_mm: w_mm,
+                                height_mm: h_mm,
+                                filters: Vec::new(),
+                                filter_enabled: Vec::new(),
+                                crop_rect: None,
+                            }),
+                        )
+                        .with_transform(Affine2D::translate(x_dest, y_dest));
+                        doc.add_object(obj, layer_id)?;
+                    }
                 }
             }
             _ => {}

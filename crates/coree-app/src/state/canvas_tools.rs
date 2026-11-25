@@ -1496,7 +1496,8 @@ impl StudioApp {
                         path.twirl_near(lp, local_radius, angle);
                     }
                     ToolId::AttractRepel => {
-                        path.attract_repel_near(lp, local_radius, strength, !shift_invert);
+                        let attract = self.tool_settings.sculpt_sub_mode.is_attract(shift_invert);
+                        path.attract_repel_near(lp, local_radius, strength, attract);
                     }
                     ToolId::Roughen => {
                         let amp = (local_radius * 0.18 * strength).max(0.4);
@@ -1595,6 +1596,8 @@ impl StudioApp {
                 height_mm: Some(new_h),
                 bleed_mm: None,
                 facing_pages: None,
+                background_fill: None,
+                printable_background: None,
             });
             (ops, new_w, new_h, outside_ids.len())
         };
@@ -2449,280 +2452,46 @@ impl StudioApp {
     }
 
     /// Applies any of the 7 Interactive Effect tools (`DropShadow`, `BlockShadow`, `Contour`,
-    /// `Blend`, `Distort`, `Envelope`, `Extrude25D`) or `Transparency` from an on-canvas drag vector.
+    /// `Blend`, `Distort`, `Envelope`, `Extrude25D`) or `Transparency` from an on-canvas drag vector,
+    /// delegating directly to `coree_tools::builders::build_interactive_effect_output` (`#7`).
     pub fn apply_interactive_effect_drag(
         &mut self,
         tool: ToolId,
         start_mm: Point2D,
         end_mm: Point2D,
     ) -> bool {
-        // Resolve primary target object (editable selection first; only fall back to hit-test when selection is empty)
-        let target_id = self.active_tab().and_then(|tab| {
-            if !tab.selection.objects.is_empty() {
-                tab.selection
-                    .objects
-                    .iter()
-                    .copied()
-                    .find(|&id| is_object_editable_in_doc(&tab.document, id))
-            } else {
-                hit_test_point(
-                    &tab.document,
-                    tab.document.active_page_index(),
-                    start_mm,
-                    8.0,
-                )
-                .filter(|&id| is_object_editable_in_doc(&tab.document, id))
-            }
-        });
-        let Some(oid) = target_id else {
-            self.push_toast(
-                "Select or click an object to apply this interactive effect",
-                false,
-            );
+        let creation_layer_id = self.active_creation_layer_or_err().ok().flatten();
+        let (settings, default_lens) = self.current_tool_snapshot();
+        let treat_all = self.treat_all_objects_as_filled;
+        let default_fill = self.default_fill.clone();
+        let default_outline = self.default_outline.clone();
+        let default_text_style = self.default_text_style.clone();
+
+        let Some(out) = self.tabs.get(self.active_tab).map(|tab| {
+            let ctx = ToolReadContext {
+                document: &tab.document,
+                selection: &tab.selection,
+                snap_engine: &SnapEngine,
+                viewport: &tab.viewport,
+                snap_options: &tab.snap_options,
+                active_layer_id: tab.active_layer_id,
+                creation_layer_id,
+                powerclip_edit_id: tab.powerclip_edit_id,
+                treat_all_objects_as_filled: treat_all,
+                default_fill: &default_fill,
+                default_outline: &default_outline,
+                default_text_style: &default_text_style,
+                default_lens: &default_lens,
+                settings: &settings,
+            };
+            coree_tools::builders::build_interactive_effect_output(&ctx, tool, start_mm, end_mm)
+        }) else {
             return false;
         };
-        if let Some(tab) = self.active_tab_mut() {
-            if !tab.selection.contains(oid) {
-                tab.selection.select_single(&tab.document, oid);
-            }
-        }
 
-        let delta = end_mm - start_mm;
-        let dist = delta.length();
-        let es = self.effects_state.clone();
-
-        let (existing_idx, new_effect) = match tool {
-            ToolId::DropShadow => {
-                let idx = self.active_tab().and_then(|t| {
-                    t.document
-                        .object(oid)?
-                        .effects
-                        .iter()
-                        .position(|e| matches!(e, Effect::DropShadow { .. }))
-                });
-                let dx = if dist > 0.25 { delta.x } else { es.dx_mm };
-                let dy = if dist > 0.25 { delta.y } else { es.dy_mm };
-                (
-                    idx,
-                    Effect::DropShadow {
-                        dx_mm: dx,
-                        dy_mm: dy,
-                        blur_mm: es.blur_mm.max(0.5),
-                        opacity: es.opacity.clamp(0.1, 1.0),
-                        color: es.color,
-                        feather_direction: FeatherDirection::Middle,
-                    },
-                )
-            }
-            ToolId::BlockShadow => {
-                let idx = self.active_tab().and_then(|t| {
-                    t.document
-                        .object(oid)?
-                        .effects
-                        .iter()
-                        .position(|e| matches!(e, Effect::BlockShadow { .. }))
-                });
-                let dx = if dist > 0.25 { delta.x } else { es.dx_mm };
-                let dy = if dist > 0.25 { delta.y } else { es.dy_mm };
-                (
-                    idx,
-                    Effect::BlockShadow {
-                        dx_mm: dx,
-                        dy_mm: dy,
-                        color: es.color,
-                        simplify: true,
-                        overprint: false,
-                    },
-                )
-            }
-            ToolId::Contour => {
-                let (idx, wb) = self
-                    .active_tab()
-                    .map(|t| {
-                        let i = t.document.object(oid).and_then(|o| {
-                            o.effects
-                                .iter()
-                                .position(|e| matches!(e, Effect::Contour { .. }))
-                        });
-                        (i, t.document.world_object_bounds(oid))
-                    })
-                    .unwrap_or((None, None));
-                let (mode, offset_mm) = if let Some(bb) = wb {
-                    let c = bb.center();
-                    let rx = (bb.width() * 0.5).max(1.0);
-                    let ry = (bb.height() * 0.5).max(1.0);
-                    let rel = ((end_mm.x - c.x) / rx).hypot((end_mm.y - c.y) / ry);
-                    if rel < 0.25 {
-                        (ContourMode::ToCenter, (dist / 3.0).clamp(0.5, 25.0))
-                    } else if bb.contains_point(end_mm) {
-                        (ContourMode::Inside, (dist / 2.5).clamp(0.5, 25.0))
-                    } else {
-                        (ContourMode::Outside, (dist / 2.5).clamp(0.5, 25.0))
-                    }
-                } else {
-                    (es.contour_mode, dist.clamp(0.5, 25.0))
-                };
-                (
-                    idx,
-                    Effect::Contour {
-                        mode,
-                        steps: es.steps.clamp(1, 50),
-                        offset_mm,
-                        fill_color: es.color,
-                        outline_color: Color::BLACK,
-                    },
-                )
-            }
-            ToolId::Blend => {
-                let (idx, target_b) = self
-                    .active_tab()
-                    .map(|t| {
-                        let i = t.document.object(oid).and_then(|o| {
-                            o.effects
-                                .iter()
-                                .position(|e| matches!(e, Effect::Blend { .. }))
-                        });
-                        let hit_b = hit_test_point(
-                            &t.document,
-                            t.document.active_page_index(),
-                            end_mm,
-                            12.0,
-                        )
-                        .filter(|&id| id != oid)
-                        .or_else(|| t.selection.objects.iter().copied().find(|&id| id != oid))
-                        .or_else(|| t.document.objects().keys().copied().find(|&id| id != oid));
-                        (i, hit_b)
-                    })
-                    .unwrap_or((None, None));
-                let Some(target_id) = target_b else {
-                    self.push_toast("Drag from one object to a second object to Blend", false);
-                    return false;
-                };
-                (
-                    idx,
-                    Effect::Blend {
-                        target_id,
-                        steps: es.steps.clamp(1, 200),
-                        rotation_deg: 0.0,
-                        along_path: None,
-                        rotate_along_path: es.rotate_along_path,
-                    },
-                )
-            }
-            ToolId::Distort => {
-                let (idx, local_center) = self
-                    .active_tab()
-                    .map(|t| {
-                        let obj = t.document.object(oid);
-                        let i = obj.and_then(|o| {
-                            o.effects
-                                .iter()
-                                .position(|e| matches!(e, Effect::Distort { .. }))
-                        });
-                        let inv = world_inverse_transform_of(&t.document, oid);
-                        (i, inv.transform_point(start_mm))
-                    })
-                    .unwrap_or((None, Point2D::ZERO));
-                (
-                    idx,
-                    Effect::Distort {
-                        kind: es.distort_kind,
-                        amplitude: dist.clamp(2.0, 120.0),
-                        frequency: es.frequency.max(0.5),
-                        center: local_center,
-                    },
-                )
-            }
-            ToolId::Envelope => {
-                let Some(idx) = self.ensure_envelope_on_object(oid) else {
-                    return false;
-                };
-                // Warp the nearest cage node toward local end_mm
-                let warped = self.active_tab().and_then(|tab| {
-                    let obj = tab.document.object(oid)?;
-                    let Effect::Envelope { mode, mut cage } = obj.effects.get(idx)?.clone() else {
-                        return None;
-                    };
-                    let inv = world_inverse_transform_of(&tab.document, oid);
-                    let ls = inv.transform_point(start_mm);
-                    let le = inv.transform_point(end_mm);
-                    if let Some((best_i, _)) = cage.iter().enumerate().min_by(|a, b| {
-                        a.1.distance_to(ls)
-                            .partial_cmp(&b.1.distance_to(ls))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    }) {
-                        cage[best_i] = le;
-                    }
-                    Some(Effect::Envelope { mode, cage })
-                });
-                if let Some(eff) = warped {
-                    return self.replace_effect_on_object(oid, Some(idx), eff);
-                }
-                return true;
-            }
-            ToolId::Extrude25D => {
-                let idx = self.active_tab().and_then(|t| {
-                    t.document
-                        .object(oid)?
-                        .effects
-                        .iter()
-                        .position(|e| matches!(e, Effect::Extrude25D { .. }))
-                });
-                (
-                    idx,
-                    Effect::Extrude25D {
-                        vanishing_point: end_mm,
-                        depth: dist.clamp(2.0, 200.0),
-                        bevel_depth: 1.0,
-                        shade_color: es.color,
-                        light_dir: [0.4, -0.5, 0.75],
-                    },
-                )
-            }
-            ToolId::Transparency => {
-                let (idx, local_start, local_end) = self
-                    .active_tab()
-                    .map(|t| {
-                        let obj = t.document.object(oid);
-                        let i = obj.and_then(|o| {
-                            o.effects
-                                .iter()
-                                .position(|e| matches!(e, Effect::Transparency { .. }))
-                        });
-                        let inv = world_inverse_transform_of(&t.document, oid);
-                        (
-                            i,
-                            inv.transform_point(start_mm),
-                            inv.transform_point(end_mm),
-                        )
-                    })
-                    .unwrap_or((None, start_mm, end_mm));
-                let mode = if local_start.distance_to(local_end) < 0.5 {
-                    TransparencyMode::Uniform(es.opacity.clamp(0.05, 0.95))
-                } else {
-                    TransparencyMode::FountainLinear {
-                        start: local_start,
-                        end: local_end,
-                        start_alpha: 1.0,
-                        end_alpha: 0.0,
-                    }
-                };
-                (
-                    idx,
-                    Effect::Transparency {
-                        mode,
-                        blend_mode: es.blend_mode,
-                    },
-                )
-            }
-            _ => return false,
-        };
-
-        let ok = self.replace_effect_on_object(oid, existing_idx, new_effect);
-        if ok {
-            self.push_toast(format!("Applied {}", tool.label()), false);
-        }
-        ok
+        let applied = matches!(&out, ToolOutput::Commit { ops, .. } if !ops.is_empty());
+        self.apply_tool_output(out);
+        applied
     }
 
     // -------------------------------------------------------------------------
@@ -3059,6 +2828,7 @@ impl StudioApp {
                 width_mm: page_w,
                 height_mm: page_h,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )

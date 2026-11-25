@@ -1614,6 +1614,7 @@ fn hit_test_and_snap_engine_and_svg_render() {
             nodes: false,
             dynamic_guides: true,
             tolerance_mm: 3.0,
+            ..SnapOptions::default()
         },
     );
     assert!((snapped_grid.x - 130.0).abs() < 1e-6);
@@ -1634,6 +1635,7 @@ fn hit_test_and_snap_engine_and_svg_render() {
             nodes: false,
             dynamic_guides: true,
             tolerance_mm: 2.5,
+            ..SnapOptions::default()
         },
     );
     assert!((snapped_guide.x - 75.0).abs() < 1e-6);
@@ -1656,6 +1658,7 @@ fn hit_test_and_snap_engine_and_svg_render() {
             nodes: false,
             dynamic_guides: true,
             tolerance_mm: 2.5,
+            ..SnapOptions::default()
         },
     );
     assert!((snapped_obj.x - 60.0).abs() < 1e-6);
@@ -1679,6 +1682,7 @@ fn hit_test_and_snap_engine_and_svg_render() {
                     width_mm: 40.0,
                     height_mm: 40.0,
                     filters: vec![RasterFilter::Invert],
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )
@@ -2039,6 +2043,7 @@ fn edge_cases_nan_safety_viewport_math_and_remaining_variants() {
             grid: false,
             dynamic_guides: true,
             tolerance_mm: 2.5,
+            ..SnapOptions::default()
         },
     );
     assert!(snapped_edge.x.abs() < 1e-6);
@@ -2774,6 +2779,7 @@ fn regression_6_hit_test_locked_layer_grouped_objects_and_snap_angled_guide() {
             nodes: false,
             dynamic_guides: false,
             tolerance_mm: 2.0,
+            ..SnapOptions::default()
         },
     );
     assert!(guides.is_empty());
@@ -3924,6 +3930,7 @@ fn r16_hit_test_non_aabb_rotated_and_symbol_and_rect() {
                         height_mm: 10.0,
                         crop_rect: None,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                     }),
                 )
             }
@@ -3996,13 +4003,7 @@ fn r16_hit_test_non_aabb_rotated_and_symbol_and_rect() {
             );
             assert_eq!(hit_test_point(&doc, 0, empty_aabb_corner, 0.5), None);
         } else {
-            if kind != 1 {
-                assert_eq!(
-                    hit_test_point(&doc, 0, on_bar, 0.5),
-                    Some(oid),
-                    "kind {kind} rotated body must hit"
-                );
-            } else {
+            if kind == 1 {
                 // ArtisticText estimated bounds center
                 let at_center = match &doc.object(oid).unwrap().payload {
                     NodePayload::ArtisticText(at) => {
@@ -4011,6 +4012,27 @@ fn r16_hit_test_non_aabb_rotated_and_symbol_and_rect() {
                     _ => unreachable!(),
                 };
                 assert_eq!(hit_test_point(&doc, 0, at_center, 0.5), Some(oid));
+            } else if kind == 2 {
+                // Unfilled ParagraphText ("Para Bar" at x=0..40.6 inside 100x10 frame):
+                // hits on wrapped text, misses empty interior at x=75
+                let on_para_text = rot45.transform_point(Point2D::new(20.0, 5.0));
+                let empty_para_interior = rot45.transform_point(Point2D::new(75.0, 5.0));
+                assert_eq!(
+                    hit_test_point(&doc, 0, on_para_text, 0.5),
+                    Some(oid),
+                    "kind 2 rotated ParagraphText text span must hit"
+                );
+                assert_eq!(
+                    hit_test_point(&doc, 0, empty_para_interior, 0.5),
+                    None,
+                    "kind 2 unfilled ParagraphText empty frame interior must NOT hit"
+                );
+            } else {
+                assert_eq!(
+                    hit_test_point(&doc, 0, on_bar, 0.5),
+                    Some(oid),
+                    "kind {kind} rotated body must hit"
+                );
             }
             assert_eq!(
                 hit_test_point(&doc, 0, empty_aabb_corner, 0.5),
@@ -4027,6 +4049,8 @@ fn r16_hit_test_non_aabb_rotated_and_symbol_and_rect() {
         );
         let hit_pt = if kind == 4 {
             rot45.transform_point(Point2D::new(5.0, 5.0))
+        } else if kind == 2 {
+            rot45.transform_point(Point2D::new(20.0, 5.0))
         } else if kind == 1 {
             match &doc.object(oid).unwrap().payload {
                 NodePayload::ArtisticText(at) => {
@@ -11498,4 +11522,482 @@ fn w3_linked_paragraph_frame_dirty_tile_cache_invalidation_matches_direct_render
         apply_inv(&mut cache, &doc, hist.last_invalidation());
         assert_zero_diff(&mut cache, &mut renderer, &doc, "delete undo");
     }
+}
+
+#[test]
+fn w5a_snap_five_geometric_modes_and_extension_guides() {
+    let mut doc = Document::new("W5ASnaps", 200.0, 200.0, ColorMode::Rgb, 96.0);
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "Circle",
+            NodePayload::Shape(ParametricShape::Ellipse {
+                rx: 20.0,
+                ry: 20.0,
+                start_deg: 0.0,
+                end_deg: 360.0,
+                mode: coree_core::EllipseMode::Full,
+            }),
+        )
+        .with_transform(Affine2D::translate(50.0, 50.0)),
+        None,
+    )
+    .unwrap();
+    let l1 = BezierPath::from_line(Point2D::new(100.0, 20.0), Point2D::new(140.0, 60.0));
+    let l2 = BezierPath::from_line(Point2D::new(100.0, 60.0), Point2D::new(140.0, 20.0));
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "L1", NodePayload::Path(l1)),
+        None,
+    )
+    .unwrap();
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "L2", NodePayload::Path(l2)),
+        None,
+    )
+    .unwrap();
+    let at = ArtisticText::from_plain("ABC", TextStyle::default());
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "Txt", NodePayload::ArtisticText(at))
+            .with_transform(Affine2D::translate(20.0, 120.0)),
+        None,
+    )
+    .unwrap();
+
+    let opts = SnapOptions {
+        grid: false,
+        page_edges: false,
+        guidelines: false,
+        objects: false,
+        nodes: false,
+        dynamic_guides: true,
+        tangent: true,
+        perpendicular: true,
+        quadrant: true,
+        intersection: true,
+        baseline: true,
+        tolerance_mm: 3.0,
+    };
+
+    let (quad_pt, _) =
+        SnapEngine::snap_point_with_reference(&doc, 0, Point2D::new(70.5, 50.3), None, &[], &opts);
+    assert!(quad_pt.distance_to(Point2D::new(70.0, 50.0)) < 0.01);
+
+    let (tan_pt, _) = SnapEngine::snap_point_with_reference(
+        &doc,
+        0,
+        Point2D::new(50.2, 69.8),
+        Some(Point2D::new(50.0, 100.0)),
+        &[],
+        &opts,
+    );
+    assert!(tan_pt.distance_to(Point2D::new(50.0, 70.0)) < 0.01);
+
+    let (inter_pt, _) =
+        SnapEngine::snap_point_with_reference(&doc, 0, Point2D::new(120.4, 40.3), None, &[], &opts);
+    assert!(inter_pt.distance_to(Point2D::new(120.0, 40.0)) < 0.01);
+
+    let expected_base_y = 120.0 + TextStyle::default().font_size_mm() * 0.85;
+    let (base_pt, base_guides) = SnapEngine::snap_point_with_reference(
+        &doc,
+        0,
+        Point2D::new(25.0, expected_base_y + 0.3),
+        None,
+        &[],
+        &opts,
+    );
+    assert!((base_pt.y - expected_base_y).abs() < 0.01);
+    assert!(base_guides.iter().any(|g| matches!(
+        g.kind,
+        DynamicGuideKind::Baseline | DynamicGuideKind::AlignmentY
+    )));
+}
+
+#[test]
+fn w5a_drawing_scale_dimension_render_and_tile_cache_invalidation() {
+    let mut doc = Document::new("W5ADrawScale", 120.0, 80.0, ColorMode::Rgb, 96.0);
+    let dim = DimensionObject::linear(
+        DimensionKind::Horizontal,
+        Point2D::new(20.0, 40.0),
+        Point2D::new(50.0, 40.0),
+        10.0,
+    );
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "Dim", NodePayload::Dimension(dim))
+            .with_outline(OutlineStyle::solid(Color::BLACK, 0.4)),
+        None,
+    )
+    .unwrap();
+
+    let vp = Viewport::for_export(400, 260, 96.0);
+    let opts = RenderOptions::export();
+    let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut renderer = SceneRenderer::new();
+
+    let img_1_1 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetDocumentProperties {
+            title: None,
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
+            drawing_scale: Some(coree_core::DrawingScale::new(1.0, 100.0)),
+        },
+    )
+    .unwrap();
+    let img_1_100 = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+    assert!(
+        count_rgba_diff(&img_1_1, &img_1_100) > 20,
+        "1:100 drawing_scale must re-render dimension label and invalidate tile cache"
+    );
+}
+
+#[test]
+fn w5a_facing_pages_spread_layout_and_autopage_number() {
+    let mut doc = Document::new("W5AFacing", 100.0, 140.0, ColorMode::Rgb, 96.0);
+    doc.add_page("P2", 100.0, 140.0, 0.0);
+    doc.add_page("P3", 100.0, 140.0, 0.0);
+
+    let non_facing = compute_page_layouts(&doc, true, 20.0);
+    assert!((non_facing[1].origin_mm.y - non_facing[2].origin_mm.y).abs() < 1e-6);
+    assert!((non_facing[2].origin_mm.x - non_facing[1].origin_mm.x - 120.0).abs() < 1e-6);
+
+    let p0_id = doc.page(0).unwrap().id;
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetPageProperties {
+            page_id: p0_id,
+            name: None,
+            width_mm: None,
+            height_mm: None,
+            bleed_mm: None,
+            facing_pages: Some(true),
+            background_fill: None,
+            printable_background: None,
+        },
+    )
+    .unwrap();
+    let facing = compute_page_layouts(&doc, true, 20.0);
+    assert!(
+        (facing[2].origin_mm.x - (facing[1].origin_mm.x + facing[1].width_mm)).abs() < 1e-6,
+        "facing pages P2 and P3 must touch at zero-gap spine"
+    );
+    assert!(
+        facing[1].origin_mm.y > facing[0].origin_mm.y + 140.0,
+        "spread 1 must stack below cover recto page"
+    );
+
+    let mut at = ArtisticText::default();
+    at.runs.push(
+        coree_core::TextRun::new(
+            "0",
+            TextStyle {
+                font_size_pt: 24.0,
+                fill: Color::BLACK,
+                ..TextStyle::default()
+            },
+        )
+        .with_field(coree_core::TextField::AutoPageNumber),
+    );
+    let master_id = doc
+        .add_layer(
+            p0_id,
+            "Folio",
+            false,
+            coree_core::MasterLayerScope::AllPages,
+        )
+        .unwrap();
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "PageNum", NodePayload::ArtisticText(at))
+            .with_transform(Affine2D::translate(30.0, 40.0)),
+        Some(master_id),
+    )
+    .unwrap();
+
+    let p0_img = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    let p1_img = render_page_to_rgba(&doc, 1, 72.0, ViewMode::Enhanced).unwrap();
+    let page_num_diff = p0_img
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(p1_img.rgba.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        page_num_diff > 15,
+        "AutoPageNumber on master layer must render '1' on page 0 vs '2' on page 1 (diff={page_num_diff})"
+    );
+}
+
+#[test]
+fn w5a_simple_wireframe_page_bg_and_carryover_fixes() {
+    // 1. SimpleWireframe hides Blend/Contour/Extrude/Raster-X vs Wireframe & Enhanced
+    let mut doc = Document::new("W5ASimpleWF", 100.0, 100.0, ColorMode::Rgb, 96.0);
+    let mut r1 = SceneObject::new(
+        ObjectId(0),
+        "Src",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgb(0.0, 0.0, 1.0)))
+    .with_transform(Affine2D::translate(10.0, 10.0));
+    let r2 = SceneObject::new(
+        ObjectId(0),
+        "Dst",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgb(1.0, 0.0, 0.0)))
+    .with_transform(Affine2D::translate(60.0, 60.0));
+    let r2_id = doc.add_object(r2, None).unwrap();
+    r1.effects.push(Effect::Blend {
+        target_id: r2_id,
+        steps: 5,
+        rotation_deg: 0.0,
+        along_path: None,
+        rotate_along_path: false,
+    });
+    doc.add_object(r1, None).unwrap();
+
+    let simple = render_page_to_rgba(&doc, 0, 72.0, ViewMode::SimpleWireframe).unwrap();
+    let wf = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Wireframe).unwrap();
+    let enh = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    let simple_ink = count_non_white_pixels(&simple.rgba);
+    let wf_ink = count_non_white_pixels(&wf.rgba);
+    let enh_ink = count_non_white_pixels(&enh.rgba);
+    assert!(simple_ink > 20 && simple_ink < wf_ink && wf_ink < enh_ink);
+
+    // 2. Page background_fill + printable_background
+    let p0_id = doc.page(0).unwrap().id;
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetPageProperties {
+            page_id: p0_id,
+            name: None,
+            width_mm: None,
+            height_mm: None,
+            bleed_mm: None,
+            facing_pages: None,
+            background_fill: Some(Fill::Solid(Color::rgb(0.2, 0.8, 0.3))),
+            printable_background: Some(false),
+        },
+    )
+    .unwrap();
+    let exp_no_bg = render_page_to_rgba_with_options(
+        &doc,
+        0,
+        72.0,
+        ViewMode::Enhanced,
+        &RenderOptions::export(),
+    )
+    .unwrap();
+    assert_eq!(pixel_at_mm(&exp_no_bg, 2.0, 2.0), [255, 255, 255, 255]);
+    coree_core::apply_command(
+        &mut doc,
+        &coree_core::CommandOp::SetPageProperties {
+            page_id: p0_id,
+            name: None,
+            width_mm: None,
+            height_mm: None,
+            bleed_mm: None,
+            facing_pages: None,
+            background_fill: None,
+            printable_background: Some(true),
+        },
+    )
+    .unwrap();
+    let exp_with_bg = render_page_to_rgba_with_options(
+        &doc,
+        0,
+        72.0,
+        ViewMode::Enhanced,
+        &RenderOptions::export(),
+    )
+    .unwrap();
+    assert!(pixel_at_mm(&exp_with_bg, 2.0, 2.0)[1] > 180);
+
+    // 3. #19a RTL DropCap + ContourLeft & #19b cyclic linked_next_frame determinism
+    let mut rtl_doc = Document::new("RtlDrop", 120.0, 120.0, ColorMode::Rgb, 96.0);
+    rtl_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Obs",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 25.0,
+                    height: 60.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_transform(Affine2D::translate(75.0, 10.0)),
+            None,
+        )
+        .unwrap();
+    let mut para = ParagraphText::new(
+        "مرحبا بكم في اختبار النص العربي مع الحرف الاستهلالي والالتفاف",
+        Vec2D::new(90.0, 60.0),
+        TextStyle {
+            font_size_pt: 12.0,
+            ..TextStyle::default()
+        },
+    );
+    para.wrap_mode = coree_core::TextWrapMode::ContourLeft;
+    para.drop_cap = Some(coree_core::DropCapConfig {
+        enabled: true,
+        lines: 2,
+        gap_mm: 1.5,
+    });
+    let pid = rtl_doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "RtlPara",
+                NodePayload::ParagraphText(para.clone()),
+            )
+            .with_transform(Affine2D::translate(10.0, 10.0)),
+            None,
+        )
+        .unwrap();
+    let mut te = coree_render::TextEngine::new();
+    let pieces = te.layout_paragraph_in_doc(&rtl_doc, pid, &para);
+    assert!(
+        pieces.len() > 2,
+        "RTL paragraph with DropCap must lay out glyphs"
+    );
+    for p in pieces.iter().skip(1) {
+        if let Some(bb) = p.path.bounding_box() {
+            assert!(
+                bb.max_x <= 65.0 && bb.min_x >= 0.0,
+                "RTL body text after DropCap must wrap left of ContourLeft obstacle [65..90]: {bb:?}"
+            );
+        }
+    }
+
+    // #19b cyclic linked_next_frame determinism
+    let mut cyc = Document::new("Cycle", 100.0, 100.0, ColorMode::Rgb, 96.0);
+    let mut f1 = ParagraphText::new(
+        "ALPHA BETA GAMMA DELTA",
+        Vec2D::new(40.0, 40.0),
+        TextStyle::default(),
+    );
+    let mut f2 = ParagraphText::new("", Vec2D::new(40.0, 40.0), TextStyle::default());
+    f1.linked_next_frame = Some(ObjectId(2));
+    f2.linked_next_frame = Some(ObjectId(1));
+    let id1 = cyc
+        .add_object(
+            SceneObject::new(ObjectId(0), "F1", NodePayload::ParagraphText(f1.clone())),
+            None,
+        )
+        .unwrap();
+    let id2 = cyc
+        .add_object(
+            SceneObject::new(ObjectId(0), "F2", NodePayload::ParagraphText(f2)),
+            None,
+        )
+        .unwrap();
+    let c1 = te.layout_paragraph_in_doc(&cyc, id1, &f1);
+    let c2 = te.layout_paragraph_in_doc(&cyc, id1, &f1);
+    assert_eq!(c1.len(), c2.len());
+    assert_ne!(id1, id2);
+
+    // 4. #20d tilted stylus smudge_stroke_stylus_masked covers tilted ellipse
+    let mut asset =
+        RasterAsset::new(32, 32, vec![255u8; 32 * 32 * 4], 96.0, ColorMode::Rgb).unwrap();
+    for x in 0..10u32 {
+        for y in 0..32u32 {
+            asset.write_pixel_f32(x, y, [1.0, 0.0, 0.0, 1.0]);
+        }
+    }
+    let pts = vec![
+        coree_render::StylusPoint {
+            pos: Point2D::new(4.0, 16.0),
+            pressure: 1.0,
+            tilt_x_deg: 75.0,
+            tilt_y_deg: 0.0,
+            twist_deg: 0.0,
+        },
+        coree_render::StylusPoint {
+            pos: Point2D::new(14.0, 16.0),
+            pressure: 1.0,
+            tilt_x_deg: 75.0,
+            tilt_y_deg: 0.0,
+            twist_deg: 0.0,
+        },
+    ];
+    coree_render::smudge_stroke_stylus_masked(&mut asset, &pts, 4.0, 0.9, None);
+    let px_far = asset.read_pixel_f32(19, 16).unwrap();
+    assert!(
+        px_far[1] < 0.99 || px_far[2] < 0.99,
+        "tilted smudge ellipse must reach beyond untilted radius=4: {px_far:?}"
+    );
+}
+
+#[test]
+fn autopagenumber_expanded_width_not_culled_by_placeholder_bbox() {
+    use coree_core::{ArtisticText, MasterLayerScope, TextField, TextStyle};
+
+    let mut doc = Document::new("AutoPageNumberCull", 100.0, 50.0, ColorMode::Rgb, 72.0);
+    let p0_id = doc.pages()[0].id;
+    let master_lid = doc
+        .add_layer(p0_id, "MasterNum", false, MasterLayerScope::AllPages)
+        .unwrap();
+    for p in 2..=100 {
+        doc.add_page(format!("Page {p}"), 100.0, 50.0, 0.0);
+    }
+    let style = TextStyle {
+        font_size_pt: 24.0,
+        fill: Color::BLACK,
+        ..TextStyle::default()
+    };
+    let mut at = ArtisticText::from_plain("1", style);
+    at.runs[0].field = Some(TextField::AutoPageNumber);
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "PageNum", NodePayload::ArtisticText(at))
+            .with_transform(Affine2D::translate(10.0, 10.0))
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none()),
+        Some(master_lid),
+    )
+    .unwrap();
+
+    // Render page 0 ("1") and page 99 ("100") at 72 DPI; "100" is wider than placeholder "1"
+    // and must not be clipped by SpatialIndex placeholder tile culling.
+    let img_1 = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_100 = render_page_to_rgba(&doc, 99, 72.0, ViewMode::Enhanced).unwrap();
+    let px_1 = count_non_white_pixels(&img_1.rgba);
+    let px_100 = count_non_white_pixels(&img_100.rgba);
+    assert!(
+        px_1 > 50,
+        "Page 1 AutoPageNumber rendered too few pixels: {px_1}"
+    );
+    assert!(
+        px_100 > px_1 + 80,
+        "Page 100 AutoPageNumber ('100') must render full 3-digit width without culling: px_1={px_1}, px_100={px_100}"
+    );
 }

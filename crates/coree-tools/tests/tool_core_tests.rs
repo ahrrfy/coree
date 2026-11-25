@@ -5321,3 +5321,190 @@ fn w3a_mesh_handle_drag_and_12pt_envelope_initialization() {
         Some(Effect::Envelope { cage, .. }) if cage.len() == 12
     ));
 }
+
+#[test]
+fn w5a_live_geometric_previews_three_point_dims_and_perspective_curves() {
+    let mut h = Harness::new();
+    let mut tc = ToolCore::new(ToolId::Star);
+
+    // 1. Star live drag overlay must emit a 10-vertex star path, NOT a 4-vertex box
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(10.0, 10.0), [0.0, 0.0]),
+    );
+    let move_out = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(50.0, 50.0), [0.0, 0.0]),
+    );
+    let ToolOutput::Continue { overlay } = move_out else {
+        panic!("expected Continue overlay for Star");
+    };
+    assert_eq!(overlay.preview_paths.len(), 1);
+    assert!(
+        overlay.preview_paths[0].path.node_count() >= 10,
+        "Star preview must have >=10 nodes, got {}",
+        overlay.preview_paths[0].path.node_count()
+    );
+    tc.cancel();
+
+    // 2. MeshFill live drag overlay must render (rows x cols) grid + handles
+    h.settings.mesh_rows = 3;
+    h.settings.mesh_cols = 3;
+    tc.set_active_tool(ToolId::MeshFill);
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(10.0, 10.0), [0.0, 0.0]),
+    );
+    let mesh_out = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(60.0, 60.0), [0.0, 0.0]),
+    );
+    let ToolOutput::Continue { overlay: m_ov } = mesh_out else {
+        panic!("expected Continue overlay for MeshFill");
+    };
+    assert!(
+        m_ov.preview_paths.len() >= 5,
+        "MeshFill overlay must render grid lines"
+    );
+    assert!(
+        m_ov.preview_handles.len() >= 16,
+        "MeshFill overlay must render NxM nodes"
+    );
+    tc.cancel();
+
+    // 3. 2-stage AngularDimension interactive workflow
+    tc.set_active_tool(ToolId::AngularDimension);
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(20.0, 20.0), [0.0, 0.0]),
+    );
+    tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(60.0, 20.0), [0.0, 0.0]),
+    );
+    tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(60.0, 20.0), [0.0, 0.0]),
+    );
+    assert!(tc.three_point_dim_chord.is_some());
+    let stage2_commit = tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(20.0, 60.0), [0.0, 0.0]),
+    );
+    match stage2_commit {
+        ToolOutput::Commit { ops, .. } => {
+            h.history.execute(&mut h.doc, ops[0].clone()).unwrap();
+        }
+        other => panic!("Expected Commit on AngularDimension stage 2, got {other:?}"),
+    }
+    assert!(tc.three_point_dim_chord.is_none());
+
+    // 4. draw_in_perspective applies homography on BSpline & ThreePointCurve
+    let mut pg = h.doc.perspective_grid().clone();
+    pg.enabled = true;
+    pg.active_plane = coree_core::PerspectivePlane::Left;
+    h.doc.set_perspective_grid(pg);
+    h.settings.draw_in_perspective = true;
+    let bs_op = coree_tools::build_bspline_create_op(
+        &h.ctx(),
+        &[
+            Point2D::new(10.0, 10.0),
+            Point2D::new(30.0, 40.0),
+            Point2D::new(60.0, 15.0),
+        ],
+        false,
+    )
+    .unwrap();
+    let CommandOp::CreateObject { object, .. } = bs_op else {
+        panic!("expected CreateObject");
+    };
+    assert!(
+        object.perspective.is_some(),
+        "BSpline with draw_in_perspective must carry Perspective3x3"
+    );
+}
+
+#[test]
+fn sculpt_sub_mode_attract_repel_and_shift_inversion() {
+    use coree_tools::SculptSubMode;
+
+    let mut h = Harness::new();
+    h.settings.sculpt_radius_mm = 30.0;
+    h.settings.sculpt_strength = 0.8;
+
+    let base_rect = ParametricShape::Rectangle {
+        width: 40.0,
+        height: 40.0,
+        corner_radii: [0.0; 4],
+        corner_style: CornerStyle::Rounded,
+        lock_corners: true,
+    }
+    .to_bezier_path();
+
+    let add_box = |h: &mut Harness, name: &str| {
+        let obj = SceneObject::new(ObjectId(0), name, NodePayload::Path(base_rect.clone()))
+            .with_transform(Affine2D::translate(20.0, 20.0));
+        let lid = Some(h.layer_id());
+        h.history
+            .execute(&mut h.doc, CommandOp::create_object(obj, lid))
+            .unwrap();
+        *h.doc.objects().keys().max().unwrap()
+    };
+
+    let brush_pt = Point2D::new(35.0, 35.0);
+    let target_corner = Point2D::new(20.0, 20.0);
+
+    // 1. Default Attract pulls corner (20,20) inward toward brush (35,35)
+    let id_attract = add_box(&mut h, "AttractBox");
+    h.selection.select_single(&h.doc, id_attract);
+    h.settings.sculpt_sub_mode = SculptSubMode::Attract;
+    let mut tc = ToolCore::new(ToolId::AttractRepel);
+    tc.on_pointer_down(&h.ctx(), &PointerEvent::primary(brush_pt, [0.0, 0.0]));
+    tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(36.0, 36.0), [1.0, 1.0]),
+    );
+    let out = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(36.0, 36.0), [1.0, 1.0]),
+    );
+    h.commit(out);
+    let corner_attract = match &h.doc.object(id_attract).unwrap().payload {
+        NodePayload::Path(p) => p.subpaths[0].nodes[0].pos + coree_core::Vec2D::new(20.0, 20.0),
+        _ => panic!("expected Path"),
+    };
+    assert!(
+        corner_attract.distance_to(brush_pt) < target_corner.distance_to(brush_pt),
+        "Attract must pull corner inward: {corner_attract:?}"
+    );
+
+    // 2. SculptSubMode::Repel pushes corner (20,20) outward away from brush (35,35)
+    let id_repel = add_box(&mut h, "RepelBox");
+    h.selection.select_single(&h.doc, id_repel);
+    h.settings.sculpt_sub_mode = SculptSubMode::Repel;
+    let mut tc_repel = ToolCore::new(ToolId::AttractRepel);
+    tc_repel.on_pointer_down(&h.ctx(), &PointerEvent::primary(brush_pt, [0.0, 0.0]));
+    tc_repel.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(36.0, 36.0), [1.0, 1.0]),
+    );
+    let out_repel = tc_repel.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(36.0, 36.0), [1.0, 1.0]),
+    );
+    h.commit(out_repel);
+    let corner_repel = match &h.doc.object(id_repel).unwrap().payload {
+        NodePayload::Path(p) => p.subpaths[0].nodes[0].pos + coree_core::Vec2D::new(20.0, 20.0),
+        _ => panic!("expected Path"),
+    };
+    assert!(
+        corner_repel.distance_to(brush_pt) > target_corner.distance_to(brush_pt),
+        "Repel must push corner outward: {corner_repel:?}"
+    );
+
+    // 3. Attract + Shift inverts to Repel
+    assert!(SculptSubMode::Attract.is_attract(false));
+    assert!(!SculptSubMode::Attract.is_attract(true));
+    assert!(!SculptSubMode::Repel.is_attract(false));
+    assert!(SculptSubMode::Repel.is_attract(true));
+}

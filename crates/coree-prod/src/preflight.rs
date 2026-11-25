@@ -734,6 +734,45 @@ fn check_object(
             colors.push(("lens tint", tint));
         }
     }
+    for eff in &obj.effects {
+        match eff {
+            coree_core::Effect::DropShadow { color, .. } => {
+                colors.push(("drop shadow", color));
+            }
+            coree_core::Effect::InnerShadow { color, .. } => {
+                colors.push(("inner shadow", color));
+            }
+            coree_core::Effect::BlockShadow { color, .. } => {
+                colors.push(("block shadow", color));
+            }
+            coree_core::Effect::Contour {
+                fill_color,
+                outline_color,
+                ..
+            } => {
+                colors.push(("contour fill", fill_color));
+                colors.push(("contour outline", outline_color));
+            }
+            coree_core::Effect::Bevel {
+                highlight_color,
+                shadow_color,
+                ..
+            } => {
+                colors.push(("bevel highlight", highlight_color));
+                colors.push(("bevel shadow", shadow_color));
+            }
+            coree_core::Effect::Extrude25D { shade_color, .. }
+            | coree_core::Effect::Extrude3D { shade_color, .. } => {
+                colors.push(("extrude shade", shade_color));
+            }
+            coree_core::Effect::Blend { .. }
+            | coree_core::Effect::Distort { .. }
+            | coree_core::Effect::Envelope { .. }
+            | coree_core::Effect::Transparency { .. }
+            | coree_core::Effect::Perspective { .. }
+            | coree_core::Effect::Symmetry { .. } => {}
+        }
+    }
 
     let mut font_families: Vec<&str> = Vec::new();
     match &obj.payload {
@@ -1104,6 +1143,7 @@ mod tests {
                         width_mm: 25.4,
                         height_mm: 25.4,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 )

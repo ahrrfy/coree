@@ -16,6 +16,7 @@ use egui::{
 /// Renders the left vertical Toolbox rail and any open Tool Flyout popup drawer.
 pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(app.ui_language);
     let width = if app.toolbox_two_column {
         80.0
     } else {
@@ -23,7 +24,12 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
     };
     let mut flyout_anchor: Option<(usize, Pos2)> = None;
 
-    egui::Panel::left("coree_toolbox")
+    let panel = if shell_dir.toolbox_on_right {
+        egui::Panel::right("coree_toolbox")
+    } else {
+        egui::Panel::left("coree_toolbox")
+    };
+    panel
         .exact_size(width)
         .frame(
             Frame::NONE
@@ -39,7 +45,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                     let cols = if app.toolbox_two_column { 2 } else { 1 };
                     let mut idx = 0usize;
                     while idx < TOOL_GROUPS.len() {
-                        ui.horizontal(|ui| {
+                        shell_dir.with_horizontal(ui, |ui| {
                             for _ in 0..cols {
                                 if idx >= TOOL_GROUPS.len() {
                                     break;
@@ -82,12 +88,19 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     StrokeKind::Inside,
                                 );
 
-                                // 3px left accent indicator when active
+                                // 3px edge accent indicator when active (left in LTR, right in RTL)
                                 if is_active {
-                                    let bar = Rect::from_min_size(
-                                        rect.left_top() + vec2(0.0, 3.0),
-                                        vec2(3.0, rect.height() - 6.0),
-                                    );
+                                    let bar = if shell_dir.toolbox_on_right {
+                                        Rect::from_min_size(
+                                            rect.right_top() + vec2(-3.0, 3.0),
+                                            vec2(3.0, rect.height() - 6.0),
+                                        )
+                                    } else {
+                                        Rect::from_min_size(
+                                            rect.left_top() + vec2(0.0, 3.0),
+                                            vec2(3.0, rect.height() - 6.0),
+                                        )
+                                    };
                                     painter.rect_filled(bar, CornerRadius::same(1), tokens.accent);
                                 }
 
@@ -105,7 +118,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     &tokens,
                                 );
 
-                                // Bottom-right crisp corner flyout triangle
+                                // Crisp corner flyout triangle (bottom-right in LTR, bottom-left in RTL)
                                 if has_flyout {
                                     let tri_color = if app.open_flyout_group == Some(g) || is_active
                                     {
@@ -113,29 +126,44 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     } else {
                                         tokens.text_muted
                                     };
-                                    let br = rect.right_bottom() - vec2(2.0, 2.0);
-                                    painter.add(Shape::convex_polygon(
-                                        vec![br, br - vec2(5.5, 0.0), br - vec2(0.0, 5.5)],
-                                        tri_color,
-                                        Stroke::NONE,
-                                    ));
+                                    if shell_dir.toolbox_on_right {
+                                        let bl = rect.left_bottom() + vec2(2.0, -2.0);
+                                        painter.add(Shape::convex_polygon(
+                                            vec![bl, bl + vec2(5.5, 0.0), bl - vec2(0.0, 5.5)],
+                                            tri_color,
+                                            Stroke::NONE,
+                                        ));
+                                    } else {
+                                        let br = rect.right_bottom() - vec2(2.0, 2.0);
+                                        painter.add(Shape::convex_polygon(
+                                            vec![br, br - vec2(5.5, 0.0), br - vec2(0.0, 5.5)],
+                                            tri_color,
+                                            Stroke::NONE,
+                                        ));
+                                    }
                                 }
 
-                                // Tooltip showing tool name + active profile shortcut + double-click shortcut
+                                // Tooltip showing localized tool name + active profile shortcut + double-click shortcut
+                                let tool_name =
+                                    crate::i18n::tool_i18n_key(primary_tool).tr_ui(app.ui_language);
                                 let sc = crate::state::tool_shortcut_action(primary_tool)
                                     .map(|a| shortcut_label(app.shortcut_profile, a))
                                     .unwrap_or("");
                                 let dbl_hint = match primary_tool {
-                                    ToolId::Pick => "\nDouble-click: Select All objects",
-                                    ToolId::Rectangle => {
-                                        "\nDouble-click: Page Frame · Shift+DblClick: Selection Frame"
-                                    }
-                                    _ => "",
+                                    ToolId::Pick => format!(
+                                        "\n{}: {}",
+                                        crate::i18n::I18nKey::ToolPick.tr(app.ui_language),
+                                        crate::i18n::I18nKey::EditSelectAll.tr(app.ui_language)
+                                    ),
+                                    ToolId::Rectangle => format!(
+                                        "\n{}: Page Frame",
+                                        crate::i18n::I18nKey::ToolRectangle.tr(app.ui_language)
+                                    ),
+                                    _ => String::new(),
                                 };
                                 let tip = if sc.is_empty() {
                                     format!(
-                                        "{}{}{dbl_hint}",
-                                        primary_tool.label(),
+                                        "{tool_name}{}{dbl_hint}",
                                         if has_flyout {
                                             "\nRight-click or click corner triangle for flyout"
                                         } else {
@@ -144,9 +172,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                     )
                                 } else {
                                     format!(
-                                        "{} [{}]{}{dbl_hint}",
-                                        primary_tool.label(),
-                                        sc,
+                                        "{tool_name} [{sc}]{}{dbl_hint}",
                                         if has_flyout {
                                             "\nRight-click or click corner triangle for flyout"
                                         } else {
@@ -180,7 +206,13 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 } else if resp.clicked() {
                                     let clicked_corner =
                                         resp.interact_pointer_pos().is_some_and(|p| {
-                                            p.x > rect.right() - 10.0 && p.y > rect.bottom() - 10.0
+                                            if shell_dir.toolbox_on_right {
+                                                p.x < rect.left() + 10.0
+                                                    && p.y > rect.bottom() - 10.0
+                                            } else {
+                                                p.x > rect.right() - 10.0
+                                                    && p.y > rect.bottom() - 10.0
+                                            }
                                         });
                                     if has_flyout && (clicked_corner || is_active) {
                                         app.open_flyout_group = if app.open_flyout_group == Some(g)
@@ -195,7 +227,12 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 }
 
                                 if app.open_flyout_group == Some(g) {
-                                    flyout_anchor = Some((g, pos2(rect.right() + 5.0, rect.top())));
+                                    let anchor_pos = if shell_dir.toolbox_on_right {
+                                        pos2((rect.left() - 234.0).max(8.0), rect.top())
+                                    } else {
+                                        pos2(rect.right() + 5.0, rect.top())
+                                    };
+                                    flyout_anchor = Some((g, anchor_pos));
                                 }
                             }
                         });
@@ -203,7 +240,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                 });
         });
 
-    // Floating Tool Flyout Drawer anchored right of the clicked Toolbox button
+    // Floating Tool Flyout Drawer anchored beside the clicked Toolbox button
     if let Some((g, anchor)) = flyout_anchor {
         let ctx = ui.ctx().clone();
         Area::new(Id::unique("coree_tool_flyout"))
@@ -222,7 +259,9 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                             let sc = crate::state::tool_shortcut_action(tool)
                                 .map(|a| shortcut_label(app.shortcut_profile, a))
                                 .unwrap_or("");
-                            let row_resp = ui.horizontal(|ui| {
+                            let tool_label =
+                                crate::i18n::tool_i18n_key(tool).tr_ui(app.ui_language);
+                            let row_resp = shell_dir.with_horizontal(ui, |ui| {
                                 let (icon_rect, _) =
                                     ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
                                 paint_tool_icon(
@@ -234,7 +273,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 );
                                 let btn =
                                     ui.add(
-                                        egui::Button::new(RichText::new(tool.label()).color(
+                                        egui::Button::new(RichText::new(tool_label).color(
                                             if selected { tokens.accent } else { tokens.text },
                                         ))
                                         .shortcut_text(sc)
@@ -602,21 +641,47 @@ fn paint_tool_icon(
             ];
             painter.add(Shape::convex_polygon(poly, color.gamma_multiply(0.85), s));
         }
-        ToolId::Rectangle | ToolId::ThreePointRectangle => {
+        ToolId::Rectangle => {
             painter.rect_filled(
                 r.shrink(2.2),
                 CornerRadius::same(1),
                 accent.gamma_multiply(0.24),
             );
             painter.rect_stroke(r.shrink(1.5), CornerRadius::same(1), s, StrokeKind::Inside);
-            if tool == ToolId::ThreePointRectangle {
-                painter.circle_filled(r.left_bottom() + vec2(2.0, -2.0), 1.9, amber);
-                painter.circle_filled(r.right_bottom() + vec2(-2.0, -2.0), 1.9, amber);
-            }
         }
-        ToolId::Ellipse | ToolId::ThreePointEllipse => {
+        ToolId::ThreePointRectangle => {
+            let p0 = pos2(r.left() + 2.0, c.y + 2.0);
+            let p1 = pos2(c.x + 2.0, r.top() + 2.5);
+            let p2 = pos2(r.right() - 2.0, c.y - 1.5);
+            let p3 = pos2(c.x - 2.0, r.bottom() - 2.5);
+            painter.add(Shape::closed_line(vec![p0, p1, p2, p3], s));
+            painter.circle_filled(p0, 1.8, amber);
+            painter.circle_filled(p1, 1.8, amber);
+            painter.circle_filled(p2, 1.8, accent);
+        }
+        ToolId::Ellipse => {
             painter.circle_filled(c, w.min(h) * 0.42, accent.gamma_multiply(0.22));
             painter.circle_stroke(c, w.min(h) * 0.44, s);
+        }
+        ToolId::ThreePointEllipse => {
+            let rx = w * 0.44;
+            let ry = h * 0.28;
+            let pts: Vec<Pos2> = (0..24)
+                .map(|i| {
+                    let a = std::f32::consts::TAU * (i as f32) / 24.0;
+                    let lx = rx * a.cos();
+                    let ly = ry * a.sin();
+                    let rot = -0.38_f32;
+                    pos2(
+                        c.x + lx * rot.cos() - ly * rot.sin(),
+                        c.y + lx * rot.sin() + ly * rot.cos(),
+                    )
+                })
+                .collect();
+            painter.add(Shape::closed_line(pts, s));
+            painter.circle_filled(pos2(r.left() + 2.5, c.y + 3.0), 1.8, amber);
+            painter.circle_filled(pos2(r.right() - 2.5, c.y - 3.0), 1.8, amber);
+            painter.circle_filled(pos2(c.x - 1.5, r.top() + 3.0), 1.8, accent);
         }
         ToolId::Polygon => {
             let rad = w.min(h) * 0.45;
@@ -628,7 +693,7 @@ fn paint_tool_icon(
                 .collect();
             painter.add(Shape::closed_line(pts, s));
         }
-        ToolId::Star | ToolId::ComplexStar => {
+        ToolId::Star => {
             let outer = w.min(h) * 0.46;
             let inner = outer * 0.42;
             let pts: Vec<Pos2> = (0..10)
@@ -639,6 +704,19 @@ fn paint_tool_icon(
                 })
                 .collect();
             painter.add(Shape::closed_line(pts, s));
+        }
+        ToolId::ComplexStar => {
+            let outer = w.min(h) * 0.47;
+            let pts: Vec<Pos2> = (0..7)
+                .map(|i| {
+                    let idx = (i * 3) % 7;
+                    let a =
+                        std::f32::consts::TAU * (idx as f32) / 7.0 - std::f32::consts::FRAC_PI_2;
+                    pos2(c.x + outer * a.cos(), c.y + outer * a.sin())
+                })
+                .collect();
+            painter.add(Shape::closed_line(pts, accent_s));
+            painter.circle_filled(c, 1.8, amber);
         }
         ToolId::Spiral => {
             let max_r = w.min(h) * 0.45;
@@ -662,7 +740,7 @@ fn paint_tool_icon(
                 painter.line_segment([pos2(g.left(), y), pos2(g.right(), y)], thin);
             }
         }
-        ToolId::Impact | ToolId::BasicShapes => {
+        ToolId::Impact => {
             let rad = w.min(h) * 0.45;
             for i in 0..8 {
                 let a = std::f32::consts::TAU * (i as f32) / 8.0;
@@ -674,6 +752,22 @@ fn paint_tool_icon(
                     thin,
                 );
             }
+        }
+        ToolId::BasicShapes => {
+            // Crisp clean-room diamond + embedded arrow badge for Basic Shapes library
+            let pts = vec![
+                pos2(c.x, r.top() + 1.5),
+                pos2(r.right() - 1.5, c.y),
+                pos2(c.x, r.bottom() - 1.5),
+                pos2(r.left() + 1.5, c.y),
+            ];
+            painter.add(Shape::convex_polygon(
+                pts.clone(),
+                accent.gamma_multiply(0.22),
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(pts, s));
+            painter.circle_filled(c, 2.0, amber);
         }
         ToolId::ArtisticText => {
             painter.line_segment(
@@ -716,7 +810,14 @@ fn paint_tool_icon(
             painter.line_segment([pos2(g.left(), c.y), pos2(g.right(), c.y)], thin);
             painter.line_segment([pos2(c.x, g.top()), pos2(c.x, g.bottom())], thin);
         }
-        ToolId::StraightConnector | ToolId::RightAngleConnector => {
+        ToolId::StraightConnector => {
+            let p0 = r.left_bottom() + vec2(3.0, -3.0);
+            let p1 = r.right_top() + vec2(-3.0, 3.0);
+            painter.line_segment([p0, p1], s);
+            painter.circle_filled(p0, 2.2, color);
+            painter.circle_filled(p1, 2.2, accent);
+        }
+        ToolId::RightAngleConnector => {
             painter.line_segment([r.left_top() + vec2(3.0, 3.0), pos2(c.x, r.top() + 3.0)], s);
             painter.line_segment([pos2(c.x, r.top() + 3.0), pos2(c.x, r.bottom() - 3.0)], s);
             painter.line_segment(
@@ -729,11 +830,14 @@ fn paint_tool_icon(
             painter.circle_filled(r.left_top() + vec2(3.0, 3.0), 2.0, color);
             painter.circle_filled(r.right_bottom() - vec2(3.0, 3.0), 2.0, color);
         }
-        ToolId::ParallelDimension
-        | ToolId::HvDimension
-        | ToolId::AngularDimension
-        | ToolId::SegmentDimension
-        | ToolId::ThreePointCallout => {
+        ToolId::ParallelDimension => {
+            let a = pos2(r.left() + 2.5, r.bottom() - 4.0);
+            let b = pos2(r.right() - 2.5, r.top() + 4.0);
+            painter.line_segment([a, b], s);
+            painter.line_segment([a + vec2(-1.5, -2.5), a + vec2(1.5, 2.5)], thin);
+            painter.line_segment([b + vec2(-1.5, -2.5), b + vec2(1.5, 2.5)], thin);
+        }
+        ToolId::HvDimension => {
             painter.line_segment([pos2(r.left() + 1.5, c.y), pos2(r.right() - 1.5, c.y)], s);
             painter.line_segment(
                 [
@@ -749,6 +853,49 @@ fn paint_tool_icon(
                 ],
                 s,
             );
+        }
+        ToolId::AngularDimension => {
+            let vtx = pos2(r.left() + 3.0, r.bottom() - 3.0);
+            painter.line_segment([vtx, pos2(r.right() - 2.0, r.bottom() - 3.0)], s);
+            painter.line_segment([vtx, pos2(r.right() - 3.0, r.top() + 3.0)], s);
+            let arc: Vec<Pos2> = (0..=8)
+                .map(|i| {
+                    let a = -0.8 * (i as f32 / 8.0);
+                    pos2(vtx.x + 11.0 * a.cos(), vtx.y + 11.0 * a.sin())
+                })
+                .collect();
+            painter.add(Shape::line(arc, accent_s));
+            painter.circle_filled(vtx, 2.0, amber);
+        }
+        ToolId::SegmentDimension => {
+            let y = c.y - 2.0;
+            painter.line_segment([pos2(r.left() + 2.0, y), pos2(r.right() - 2.0, y)], s);
+            painter.line_segment(
+                [
+                    pos2(r.left() + 2.0, y - 3.0),
+                    pos2(r.left() + 2.0, r.bottom() - 2.0),
+                ],
+                thin,
+            );
+            painter.line_segment(
+                [
+                    pos2(r.right() - 2.0, y - 3.0),
+                    pos2(r.right() - 2.0, r.bottom() - 2.0),
+                ],
+                thin,
+            );
+            painter.circle_filled(pos2(c.x, y), 1.9, accent);
+        }
+        ToolId::ThreePointCallout => {
+            let tip = pos2(r.left() + 2.0, r.bottom() - 2.5);
+            let knee = pos2(c.x - 1.5, r.top() + 5.0);
+            let box_r = Rect::from_min_max(
+                pos2(c.x - 1.5, r.top() + 2.0),
+                pos2(r.right() - 1.5, c.y + 1.0),
+            );
+            painter.line_segment([tip, knee], s);
+            painter.rect_stroke(box_r, CornerRadius::same(1), s, StrokeKind::Inside);
+            painter.circle_filled(tip, 2.0, amber);
         }
         ToolId::Contour => {
             painter.rect_stroke(r.shrink(1.0), CornerRadius::same(1), s, StrokeKind::Inside);

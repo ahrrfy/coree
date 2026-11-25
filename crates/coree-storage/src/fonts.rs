@@ -1313,11 +1313,15 @@ mod tests {
         // Persist user substitution preference in SQLite and verify CRUD roundtrip
         db.set_font_substitution("Missing Helv", "Clean Sans", Some(&target_sans))
             .unwrap();
+        // #19h: case-insensitive upsert must overwrite without duplicate row
+        db.set_font_substitution("missing helv", "Book Serif", Some(&target_sans))
+            .unwrap();
+        assert_eq!(db.list_font_substitutions().unwrap().len(), 1);
         let got = db
-            .get_font_substitution("missing helv")
+            .get_font_substitution("MISSING HELV")
             .unwrap()
             .expect("case-insensitive substitution lookup");
-        assert_eq!(got.substitute_family, "Clean Sans");
+        assert_eq!(got.substitute_family, "Book Serif");
         assert_eq!(got.panose, target_sans);
         assert_eq!(db.list_font_substitutions().unwrap().len(), 1);
         assert!(db.remove_font_substitution("Missing Helv").unwrap());

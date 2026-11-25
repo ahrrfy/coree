@@ -343,6 +343,27 @@ pub enum NodeDragPart {
     HandleOut,
 }
 
+/// Active polarity sub-mode for [`ToolId::AttractRepel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum SculptSubMode {
+    /// Pulls path nodes and handles inward toward the brush center.
+    #[default]
+    Attract,
+    /// Pushes path nodes and handles outward away from the brush center.
+    Repel,
+}
+
+impl SculptSubMode {
+    /// Returns `true` to attract or `false` to repel, inverted when `Shift` is held.
+    #[must_use]
+    pub const fn is_attract(self, shift_invert: bool) -> bool {
+        match self {
+            Self::Attract => !shift_invert,
+            Self::Repel => shift_invert,
+        }
+    }
+}
+
 /// Read-only snapshot of tool parameters passed to [`ToolCore`](crate::ToolCore).
 #[derive(Debug, Clone)]
 pub struct ToolSettingsSnapshot {
@@ -365,6 +386,7 @@ pub struct ToolSettingsSnapshot {
     pub artistic_media_profile: ArtisticWidthProfile,
     pub sculpt_radius_mm: f64,
     pub sculpt_strength: f64,
+    pub sculpt_sub_mode: SculptSubMode,
     pub eraser_radius_mm: f64,
     pub brush_radius_px: f32,
     pub raster_op: RasterBrushOp,
@@ -423,6 +445,7 @@ impl Default for ToolSettingsSnapshot {
             artistic_media_profile: ArtisticWidthProfile::TaperBoth,
             sculpt_radius_mm: 10.0,
             sculpt_strength: 0.35,
+            sculpt_sub_mode: SculptSubMode::Attract,
             eraser_radius_mm: 5.0,
             brush_radius_px: 12.0,
             raster_op: RasterBrushOp::Paint,

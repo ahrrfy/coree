@@ -57,6 +57,7 @@ pub(crate) struct ParseContext<'a> {
     pub budget_remaining: &'a mut u64,
     pub endian: RiffEndian,
     pub version: u16,
+    pub default_codepage: Option<u16>,
     pub is_zcf: bool,
     pub is_v3_v5: bool,
     pub doc_page_width_mm: f64,
@@ -84,12 +85,13 @@ pub(crate) struct ParseContext<'a> {
 
 /// Decodes a pre-parsed (and for ZCF v16–26, already dereferenced) [`RiffDocument`]
 /// into a [`ParsedRiffCdr`], merging any document-wide [`ZcfContext`] resources.
-pub(crate) fn parse_cdr_riff_tree(
+pub(crate) fn parse_cdr_riff_tree_with_options(
     riff_tree: RiffDocument,
     limits: &CodecLimits,
     external_bitmaps: &HashMap<u32, Vec<u8>>,
     budget_remaining: &mut u64,
     zcf: &ZcfContext,
+    default_codepage: Option<u16>,
 ) -> CdrResult<ParsedRiffCdr> {
     let is_template = is_cdt_form_type(&riff_tree.form_type);
     if !is_cdr_form_type(&riff_tree.form_type) && !is_template {
@@ -139,6 +141,7 @@ pub(crate) fn parse_cdr_riff_tree(
         budget_remaining,
         endian: riff_tree.endian,
         version,
+        default_codepage,
         is_zcf: zcf.is_zcf || &riff_tree.form_type == b"CDRO" || &riff_tree.form_type == b"CDTO",
         is_v3_v5,
         doc_page_width_mm: init_w,
@@ -1018,6 +1021,8 @@ fn parse_page_list(
         height_mm,
         bleed_mm,
         facing_pages,
+        background_fill: coree_core::Fill::None,
+        printable_background: false,
         layers: Vec::new(),
         unknown_chunks: page_unknown_chunks,
     };

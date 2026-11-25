@@ -649,7 +649,16 @@ pub fn smudge_stroke_stylus_masked(
     if dabs.len() < 2 {
         return;
     }
-    let rad_i = r.ceil() as i32;
+    let dab_aspect_max = dabs
+        .iter()
+        .map(|dab| {
+            let tx = sanitize_f32(dab.tilt_x_deg, 0.0).clamp(-85.0, 85.0);
+            let ty = sanitize_f32(dab.tilt_y_deg, 0.0).clamp(-85.0, 85.0);
+            let tilt_mag = tx.hypot(ty).clamp(0.0, 85.0);
+            1.0 + tilt_mag / 60.0
+        })
+        .fold(1.0_f32, f32::max);
+    let rad_i = (r * dab_aspect_max).ceil() as i32;
     let rad_i64 = i64::from(rad_i);
     let side = (rad_i * 2 + 1) as usize;
     let mut pickup = vec![[0.0_f32; 4]; side * side];
@@ -680,21 +689,11 @@ pub fn smudge_stroke_stylus_masked(
         let eff_str = str_f * (0.2 + 0.8 * p);
         let cx = dab.pos.x.round().clamp(-1e9, 1e9) as i64;
         let cy = dab.pos.y.round().clamp(-1e9, 1e9) as i64;
-        if cx + rad_i64 < 0 || cx - rad_i64 >= w_i64 || cy + rad_i64 < 0 || cy - rad_i64 >= h_i64 {
-            continue;
-        }
-        for dy in -rad_i..=rad_i {
-            let py = cy + i64::from(dy);
-            if py < 0 || py >= h_i64 {
-                continue;
-            }
-            for dx in -rad_i..=rad_i {
-                let px_i = cx + i64::from(dx);
-                if px_i < 0 || px_i >= w_i64 {
-                    continue;
-                }
-                let ux = px_i as u32;
-                let uy = py as u32;
+        let (x0, y0, x1, y1) = dab_bounds_stylus(dab, dab_r, asset.width, asset.height);
+        for uy in y0..y1 {
+            let dy = (i64::from(uy) - cy).clamp(-rad_i64, rad_i64) as i32;
+            for ux in x0..x1 {
+                let dx = (i64::from(ux) - cx).clamp(-rad_i64, rad_i64) as i32;
                 let mask_f = mask.map_or(1.0, |m| f32::from(m.get(ux, uy)) / 255.0);
                 if mask_f <= 1e-5 {
                     continue;

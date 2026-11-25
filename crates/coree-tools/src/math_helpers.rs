@@ -3,13 +3,15 @@
 //! Pure geometry, coordinate conjugation, hit-test, and parametric/gradient/effect helpers
 //! shared between [`ToolCore`](crate::ToolCore) and `coree-app`.
 
-use crate::types::{NodeDragPart, ParametricHandleKind, ScaleHandle};
+use crate::context::ToolReadContext;
+use crate::types::{NodeDragPart, ParametricHandleKind, ScaleHandle, ToolId, ToolSettingsSnapshot};
 use coree_core::{
-    hit_test_object_warped_world_bounds, hit_test_object_warped_world_path, hit_test_point,
-    hit_test_powerclip_contents, Affine2D, AnchorPoint, BezierPath, Color, CommandOp, Document,
-    Effect, EllipseMode, Fill, GradientStop, GuideOrientation, LayerId, MeshNode, NodeKind,
-    NodePayload, NodeRef, ObjectId, ParametricShape, PathNode, Point2D, Rect2D, SceneObject,
-    Subpath, Viewport,
+    hit_test_object_warped_world_bounds, hit_test_point, hit_test_point_exact,
+    hit_test_powerclip_contents, hit_test_powerclip_contents_exact, Affine2D, AnchorPoint,
+    BezierPath, Color, CommandOp, Document, DynamicGuideKind, DynamicGuideLine, Effect,
+    EllipseMode, Fill, GradientStop, GuideOrientation, LayerId, MeshNode, NodeKind, NodePayload,
+    NodeRef, ObjectId, ParametricShape, PathNode, Perspective3x3, Point2D, Rect2D, SceneObject,
+    SnapEngine, SnapOptions, Subpath, Viewport,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -810,32 +812,12 @@ pub fn hit_test_powerclip_edit_point(
         return Some(cid);
     }
     if treat_all_objects_as_filled {
-        if let Some(NodePayload::PowerClip { contents, .. }) = doc.object(pc_id).map(|o| &o.payload)
-        {
-            for &cid in contents.iter().rev() {
-                let Some(obj) = doc.object(cid) else {
-                    continue;
-                };
-                if !obj.visible || obj.locked {
-                    continue;
-                }
-                if let Some(wp) = hit_test_object_warped_world_path(doc, cid, Some(pc_id)) {
-                    if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
-                        return Some(cid);
-                    }
-                } else if let Some(bb) = hit_test_object_warped_world_bounds(doc, cid, Some(pc_id))
-                {
-                    if bb.contains_point(world_pt) {
-                        return Some(cid);
-                    }
-                }
-            }
-        }
+        return hit_test_powerclip_contents_exact(doc, pc_id, world_pt, tol_mm, true);
     }
     None
 }
 
-/// Hit-tests canvas points across active PowerClip contents, page objects, and optional filled fallback.
+/// Hit-tests canvas points across active PowerClip contents, page objects, and optional exact filled fallback.
 #[must_use]
 pub fn hit_test_canvas_point_in_doc(
     doc: &Document,
@@ -856,30 +838,44 @@ pub fn hit_test_canvas_point_in_doc(
         return Some(hit);
     }
     if treat_all_objects_as_filled {
-        for layer in doc.effective_layers_for_page(page_idx).into_iter().rev() {
-            if !layer.visible || layer.locked {
-                continue;
-            }
-            for &oid in layer.objects.iter().rev() {
-                let Some(obj) = doc.object(oid) else {
-                    continue;
-                };
-                if !obj.visible || obj.locked {
-                    continue;
-                }
-                if let Some(wp) = hit_test_object_warped_world_path(doc, oid, None) {
-                    if wp.subpaths.iter().any(|sp| sp.closed) && wp.contains_point(world_pt) {
-                        return Some(oid);
-                    }
-                } else if let Some(bb) = hit_test_object_warped_world_bounds(doc, oid, None) {
-                    if bb.contains_point(world_pt) {
-                        return Some(oid);
-                    }
-                }
-            }
-        }
+        return hit_test_point_exact(doc, page_idx, world_pt, tol_mm, true);
     }
     None
+}
+
+/// Snaps `pt_mm` using optional reference anchor `ref_pt_mm` for `Tangent` / `Perpendicular`
+/// alongside `Quadrant`, `Intersection`, and `Baseline` geometric snaps.
+#[must_use]
+pub fn snap_point_with_reference(
+    doc: &Document,
+    page_index: usize,
+    pt_mm: Point2D,
+    ref_pt_mm: Option<Point2D>,
+    exclude_ids: &[ObjectId],
+    options: &SnapOptions,
+) -> (Point2D, Vec<DynamicGuideLine>) {
+    let (snapped, mut guides) = SnapEngine::snap_point_with_reference(
+        doc,
+        page_index,
+        pt_mm,
+        ref_pt_mm,
+        exclude_ids,
+        options,
+    );
+    for g in &mut guides {
+        if g.label.is_none() {
+            g.label = match g.kind {
+                DynamicGuideKind::Tangent => Some("Tangent".to_owned()),
+                DynamicGuideKind::Perpendicular => Some("Perpendicular".to_owned()),
+                DynamicGuideKind::Quadrant => Some("Quadrant".to_owned()),
+                DynamicGuideKind::Intersection => Some("Intersection".to_owned()),
+                DynamicGuideKind::Baseline => Some("Baseline".to_owned()),
+                DynamicGuideKind::ExtensionRay => Some("Extension".to_owned()),
+                _ => None,
+            };
+        }
+    }
+    (snapped, guides)
 }
 
 /// Returns world-space `(anchor, knob)` points for an interactive effect handle on `obj`.
@@ -891,8 +887,8 @@ pub fn interactive_effect_handle_points(
     tool: crate::types::ToolId,
 ) -> Option<(Point2D, Point2D)> {
     use crate::types::ToolId;
-    let center = doc
-        .world_object_bounds(obj.id)
+    let center = hit_test_object_warped_world_bounds(doc, obj.id, None)
+        .or_else(|| doc.world_object_bounds(obj.id))
         .map_or(Point2D::ZERO, |b| b.center());
     match (tool, eff) {
         (ToolId::DropShadow, Effect::DropShadow { dx_mm, dy_mm, .. })
@@ -1241,6 +1237,139 @@ pub fn object_preview_world_path(
         _ => doc
             .local_object_bounds(id)
             .map(|bb| rect_to_bezier_path(bb).transformed(&world_xf)),
+    }
+}
+
+/// Applies active `draw_in_perspective` plane homography to `obj` (relative to `world_bounds`)
+/// when `ctx.settings.draw_in_perspective` is enabled.
+pub fn apply_draw_in_perspective_to_obj(
+    ctx: &ToolReadContext<'_>,
+    obj: &mut SceneObject,
+    world_bounds: Option<Rect2D>,
+) {
+    if !ctx.settings.draw_in_perspective {
+        return;
+    }
+    let Some(rect) = world_bounds.or_else(|| match &obj.payload {
+        NodePayload::Path(p) => p.transformed(&obj.transform).bounding_box(),
+        NodePayload::BSpline(bs) => bs
+            .to_bezier_path()
+            .transformed(&obj.transform)
+            .bounding_box(),
+        NodePayload::Shape(s) => s
+            .to_bezier_path()
+            .transformed(&obj.transform)
+            .bounding_box(),
+        NodePayload::ArtisticMedia { spine, style } => {
+            coree_core::ArtisticMedia::expand_stroke(spine, style)
+                .transformed(&obj.transform)
+                .bounding_box()
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+    if let (Some(world_h), Some(inv_xf)) = (
+        ctx.document
+            .perspective_grid()
+            .plane_homography_for_rect(rect),
+        obj.transform.inverse(),
+    ) {
+        let local_h = Perspective3x3::from_affine(inv_xf)
+            .compose(&world_h)
+            .compose(&Perspective3x3::from_affine(obj.transform));
+        obj.perspective = Some(local_h);
+    }
+}
+
+/// Constructs `(ParametricShape, local_to_world_transform)` for a parametric shape tool drag `rect`.
+#[must_use]
+pub fn parametric_shape_for_tool_rect(
+    tool: ToolId,
+    rect: Rect2D,
+    ts: &ToolSettingsSnapshot,
+) -> Option<(ParametricShape, Affine2D)> {
+    let w = rect.width().max(1.0);
+    let h = rect.height().max(1.0);
+    let c = rect.center();
+    match tool {
+        ToolId::Rectangle | ToolId::ThreePointRectangle => Some((
+            ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [ts.rect_corner_radius_mm; 4],
+                corner_style: ts.rect_corner_style,
+                lock_corners: true,
+            },
+            Affine2D::translate(rect.min_x, rect.min_y),
+        )),
+        ToolId::Ellipse | ToolId::ThreePointEllipse | ToolId::LensTool => Some((
+            ParametricShape::Ellipse {
+                rx: w * 0.5,
+                ry: h * 0.5,
+                mode: if tool == ToolId::LensTool {
+                    EllipseMode::Full
+                } else {
+                    ts.ellipse_mode
+                },
+                start_deg: 0.0,
+                end_deg: 360.0,
+            },
+            Affine2D::translate(c.x, c.y),
+        )),
+        ToolId::Polygon => Some((
+            ParametricShape::Polygon {
+                sides: ts.polygon_sides.clamp(3, 64),
+                radius_x: w * 0.5,
+                radius_y: h * 0.5,
+            },
+            Affine2D::translate(c.x, c.y),
+        )),
+        ToolId::Star | ToolId::ComplexStar => Some((
+            ParametricShape::Star {
+                points: ts.star_points.clamp(3, 64),
+                outer_radius: w.max(h) * 0.5,
+                inner_ratio: ts.star_inner_ratio.clamp(0.1, 0.9),
+                complex: tool == ToolId::ComplexStar,
+            },
+            Affine2D::translate(c.x, c.y),
+        )),
+        ToolId::Spiral => Some((
+            ParametricShape::Spiral {
+                revolutions: ts.spiral_revolutions.clamp(1.0, 30.0),
+                radius: w.max(h) * 0.5,
+                logarithmic: ts.spiral_logarithmic,
+                expansion: 1.5,
+            },
+            Affine2D::translate(c.x, c.y),
+        )),
+        ToolId::GraphPaper => Some((
+            ParametricShape::GraphPaper {
+                cols: ts.graph_cols.clamp(1, 50),
+                rows: ts.graph_rows.clamp(1, 50),
+                width: w,
+                height: h,
+            },
+            Affine2D::translate(rect.min_x, rect.min_y),
+        )),
+        ToolId::Impact => Some((
+            ParametricShape::Impact {
+                rays: ts.impact_rays.clamp(4, 128),
+                inner_radius: w.min(h) * 0.15,
+                outer_radius: w.max(h) * 0.5,
+                style: ts.impact_style,
+            },
+            Affine2D::translate(c.x, c.y),
+        )),
+        ToolId::BasicShapes => Some((
+            ParametricShape::BasicShape {
+                kind: ts.basic_shape_kind,
+                width: w,
+                height: h,
+            },
+            Affine2D::translate(rect.min_x, rect.min_y),
+        )),
+        _ => None,
     }
 }
 

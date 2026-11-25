@@ -1263,6 +1263,20 @@ fn obtain_sample_backdrop(
             &renderer.active_icc,
             &mut sub,
         );
+        if p.background_fill.is_visible() && (options.show_page_shadow || p.printable_background) {
+            let page_path = BezierPath::from_rect(p.trim_rect());
+            renderer.draw_fill_styled(
+                doc,
+                &page_path,
+                &p.background_fill,
+                local_page_xf,
+                1.0,
+                BlendMode::Normal,
+                anti_alias,
+                &mut sub,
+                0,
+            );
+        }
     } else if options.page_bg.alpha() > 1e-6 {
         sub.clear(icc_srgb(&options.page_bg, &renderer.active_icc));
     }
@@ -1594,7 +1608,15 @@ fn obtain_sample_backdrop(
                             depth + 1,
                         );
                     }
-                    sub.push_clip(&deformed_container, FillRule::Winding, pc_obj_to_sub);
+                    sub.push_clip(
+                        &deformed_container,
+                        if pc_obj.clip_even_odd {
+                            FillRule::EvenOdd
+                        } else {
+                            FillRule::Winding
+                        },
+                        pc_obj_to_sub,
+                    );
                     open_clips += 1;
                 }
             }
@@ -2112,7 +2134,15 @@ fn render_wireframe_lens(
                         &wire_opts,
                         &mut sub_backend,
                     );
-                    sub_backend.push_clip(&deformed_container, FillRule::Winding, pc_obj_to_sub);
+                    sub_backend.push_clip(
+                        &deformed_container,
+                        if pc_obj.clip_even_odd {
+                            FillRule::EvenOdd
+                        } else {
+                            FillRule::Winding
+                        },
+                        pc_obj_to_sub,
+                    );
                     open_clips += 1;
                 }
             }
@@ -2411,7 +2441,15 @@ fn rasterize_backdrop_coverage(
                             pc_obj_to_sub,
                         );
                     }
-                    mask_backend.push_clip(&deformed_container, FillRule::Winding, pc_obj_to_sub);
+                    mask_backend.push_clip(
+                        &deformed_container,
+                        if pc_obj.clip_even_odd {
+                            FillRule::EvenOdd
+                        } else {
+                            FillRule::Winding
+                        },
+                        pc_obj_to_sub,
+                    );
                     open_clips += 1;
                 }
             }
@@ -2651,12 +2689,17 @@ fn rasterize_silhouette_payload(
                     .flatten();
                 let local_geom =
                     apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects);
+                let pc_rule = if obj.clip_even_odd {
+                    FillRule::EvenOdd
+                } else {
+                    FillRule::Winding
+                };
                 if deform_frames.is_empty() {
-                    backend.push_clip(&local_geom, FillRule::Winding, world_xf);
+                    backend.push_clip(&local_geom, pc_rule, world_xf);
                 } else {
                     let deformed =
                         apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
-                    backend.push_clip(&deformed, FillRule::Winding, outer_to_sub);
+                    backend.push_clip(&deformed, pc_rule, outer_to_sub);
                 }
                 if pc_has_deform {
                     let (next_outer_to_sub, rel_to_outer) = if deform_frames.is_empty() {
@@ -2934,8 +2977,11 @@ fn rasterize_silhouette_payload(
                     }
                 }
             }
-            let label_text =
-                d.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+            let label_text = d.compute_measurement_with_scale(
+                doc.default_unit(),
+                f64::from(doc.dpi()),
+                doc.drawing_scale(),
+            );
             if !label_text.trim().is_empty() {
                 let at = ArtisticText::from_plain(label_text, d.text_style.clone());
                 let pieces = text_engine.layout_artistic_pieces(&at);
@@ -2950,8 +2996,8 @@ fn rasterize_silhouette_payload(
         }
         NodePayload::Raster(r) => {
             if let Some(asset) = doc.asset(r.asset_id) {
-                let filtered =
-                    (!r.filters.is_empty()).then(|| apply_raster_filters(asset, &r.filters));
+                let active = r.active_filters();
+                let filtered = (!active.is_empty()).then(|| apply_raster_filters(asset, &active));
                 let active_asset = filtered.as_ref().unwrap_or(asset);
                 let mut mask_rgba = active_asset.to_rgba8_vec();
                 for px in mask_rgba.as_chunks_mut::<4>().0 {

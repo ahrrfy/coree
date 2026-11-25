@@ -1530,38 +1530,50 @@ impl IccProfile {
         let r = clamp_unit_finite(rgb[0]);
         let g = clamp_unit_finite(rgb[1]);
         let b = clamp_unit_finite(rgb[2]);
-        let rel = if let Some(v4) = self
+        let (rel, used_lut) = if let Some(v4) = self
             .select_v4_a2b(intent)
             .filter(|v4| v4.in_channels == 3 && v4.out_channels == 3)
         {
             let raw = v4.evaluate(&[r, g, b]);
-            decode_lut_pcs_to_xyz(
-                [raw[0], raw[1], raw[2]],
-                self.header.pcs,
-                v4.clut_is_16bit,
-                4,
+            (
+                decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    v4.clut_is_16bit,
+                    4,
+                )
+                .map(sanitize_finite),
+                true,
             )
-            .map(sanitize_finite)
         } else if let Some(lut) = self
             .select_a2b(intent)
             .filter(|lut| lut.in_channels == 3 && lut.out_channels == 3)
         {
             let raw = lut.evaluate(&[r, g, b], false);
-            decode_lut_pcs_to_xyz(
-                [raw[0], raw[1], raw[2]],
-                self.header.pcs,
-                lut.is_16bit,
-                self.header.version_major,
+            (
+                decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    lut.is_16bit,
+                    self.header.version_major,
+                )
+                .map(sanitize_finite),
+                true,
             )
-            .map(sanitize_finite)
         } else {
             let mat = self.rgb_to_xyz_matrix?;
             let rl = self.r_trc.as_ref().map_or(r, |t| t.eval(r));
             let gl = self.g_trc.as_ref().map_or(g, |t| t.eval(g));
             let bl = self.b_trc.as_ref().map_or(b, |t| t.eval(b));
-            mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite)
+            (mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite), false)
         };
-        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+        let apply_bpc_now = bpc
+            && if used_lut {
+                intent == RenderingIntent::RelativeColorimetric
+            } else {
+                intent != RenderingIntent::AbsoluteColorimetric
+            };
+        let bpc_adj = if apply_bpc_now {
             if let Some(src_bp) = self.detect_black_point(intent) {
                 Self::apply_bpc(rel, src_bp, 0.0, intent, true)
             } else {
@@ -1741,7 +1753,7 @@ impl IccProfile {
                 bpc_adj
             });
         };
-        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+        let bpc_adj = if bpc && intent == RenderingIntent::RelativeColorimetric {
             if let Some(src_bp) = self.detect_black_point(intent) {
                 Self::apply_bpc(rel, src_bp, 0.0, intent, true)
             } else {
@@ -1795,35 +1807,50 @@ impl IccProfile {
             return None;
         }
         let g = clamp_unit_finite(gray);
-        let rel = if let Some(trc) = self.k_trc.as_ref() {
+        let (rel, used_lut) = if let Some(trc) = self.k_trc.as_ref() {
             let y = trc.eval(g);
-            [y * D50_WHITE[0], y * D50_WHITE[1], y * D50_WHITE[2]]
+            (
+                [y * D50_WHITE[0], y * D50_WHITE[1], y * D50_WHITE[2]],
+                false,
+            )
         } else if let Some(v4) = self
             .select_v4_a2b(intent)
             .filter(|v4| v4.in_channels == 1 && v4.out_channels == 3)
         {
             let raw = v4.evaluate(&[g]);
-            decode_lut_pcs_to_xyz(
-                [raw[0], raw[1], raw[2]],
-                self.header.pcs,
-                v4.clut_is_16bit,
-                4,
+            (
+                decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    v4.clut_is_16bit,
+                    4,
+                )
+                .map(sanitize_finite),
+                true,
             )
-            .map(sanitize_finite)
         } else {
             let lut = self
                 .select_a2b(intent)
                 .filter(|lut| lut.in_channels == 1 && lut.out_channels == 3)?;
             let raw = lut.evaluate(&[g], false);
-            decode_lut_pcs_to_xyz(
-                [raw[0], raw[1], raw[2]],
-                self.header.pcs,
-                lut.is_16bit,
-                self.header.version_major,
+            (
+                decode_lut_pcs_to_xyz(
+                    [raw[0], raw[1], raw[2]],
+                    self.header.pcs,
+                    lut.is_16bit,
+                    self.header.version_major,
+                )
+                .map(sanitize_finite),
+                true,
             )
-            .map(sanitize_finite)
         };
-        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+        let apply_bpc_now = bpc
+            && if used_lut {
+                intent == RenderingIntent::RelativeColorimetric
+            } else {
+                intent != RenderingIntent::AbsoluteColorimetric
+            };
+        let bpc_adj = if apply_bpc_now {
             if let Some(src_bp) = self.detect_black_point(intent) {
                 Self::apply_bpc(rel, src_bp, 0.0, intent, true)
             } else {

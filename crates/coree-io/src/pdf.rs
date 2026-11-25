@@ -1210,10 +1210,15 @@ fn emit_display_op(
         | DisplayOp::PopGroup
         | DisplayOp::PushTransparencyGroup { .. }
         | DisplayOp::PopTransparencyGroup => {}
-        DisplayOp::PushClip { path, .. } => {
+        DisplayOp::PushClip {
+            path, fill_rule, ..
+        } => {
             out.push_str("q\n");
             emit_pdf_path_ops(ctx, path, out);
-            out.push_str("W n\n");
+            match fill_rule {
+                coree_render::FillRule::EvenOdd => out.push_str("W* n\n"),
+                coree_render::FillRule::Winding => out.push_str("W n\n"),
+            }
         }
         DisplayOp::PopClip => {
             out.push_str("Q\n");
@@ -2610,6 +2615,7 @@ mod tests {
                     width_mm: 40.0,
                     height_mm: 40.0,
                     filters: vec![],
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),

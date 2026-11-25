@@ -34,7 +34,7 @@ pub use legacy_v3_v5::{cdr16_to_mm, is_legacy_v3_v5, mm_to_cdr16};
 pub use wavelet_wi::{decode_wi_to_rgba_with_budget, encode_wi_rgba, is_wi_bitmap};
 
 pub(crate) use loda::{decode_curve_points, encode_curve_points};
-pub(crate) use parser::{parse_cdr_riff_tree, GuidPayload, StlyPayload};
+pub(crate) use parser::{parse_cdr_riff_tree_with_options, GuidPayload, StlyPayload};
 pub(crate) use text_style::{
     decode_blend_mode, encode_blend_mode, encode_legacy_cp1256_txsm, encode_stlt_chunk,
 };
@@ -113,8 +113,23 @@ pub fn parse_cdr_riff(
     limits: &CodecLimits,
     external_bitmaps: &HashMap<u32, Vec<u8>>,
 ) -> CdrResult<ParsedRiffCdr> {
+    parse_cdr_riff_with_options(
+        bytes,
+        limits,
+        external_bitmaps,
+        crate::CdrReadOptions::default(),
+    )
+}
+
+/// Parses a standalone RIFF CDR/CDT byte stream using explicit [`crate::CdrReadOptions`].
+pub fn parse_cdr_riff_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    external_bitmaps: &HashMap<u32, Vec<u8>>,
+    opts: crate::CdrReadOptions,
+) -> CdrResult<ParsedRiffCdr> {
     let mut budget = limits.max_uncompressed_bytes;
-    parse_cdr_riff_with_budget(bytes, limits, external_bitmaps, &mut budget)
+    parse_cdr_riff_with_budget_and_options(bytes, limits, external_bitmaps, &mut budget, opts)
 }
 
 /// Parses a standalone RIFF CDR/CDT byte stream using a shared decompression budget.
@@ -123,6 +138,23 @@ pub fn parse_cdr_riff_with_budget(
     limits: &CodecLimits,
     external_bitmaps: &HashMap<u32, Vec<u8>>,
     budget_remaining: &mut u64,
+) -> CdrResult<ParsedRiffCdr> {
+    parse_cdr_riff_with_budget_and_options(
+        bytes,
+        limits,
+        external_bitmaps,
+        budget_remaining,
+        crate::CdrReadOptions::default(),
+    )
+}
+
+/// Parses a standalone RIFF CDR/CDT byte stream with a shared budget and explicit [`crate::CdrReadOptions`].
+pub fn parse_cdr_riff_with_budget_and_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    external_bitmaps: &HashMap<u32, Vec<u8>>,
+    budget_remaining: &mut u64,
+    opts: crate::CdrReadOptions,
 ) -> CdrResult<ParsedRiffCdr> {
     if bytes.len() < 12 {
         return Err(CdrError::UnexpectedEof {
@@ -133,12 +165,13 @@ pub fn parse_cdr_riff_with_budget(
     }
     let riff_tree = parse_riff_with_budget(bytes, limits, budget_remaining, true)?;
     let empty_zcf = ZcfContext::default();
-    parse_cdr_riff_tree(
+    parse_cdr_riff_tree_with_options(
         riff_tree,
         limits,
         external_bitmaps,
         budget_remaining,
         &empty_zcf,
+        opts.default_codepage,
     )
 }
 

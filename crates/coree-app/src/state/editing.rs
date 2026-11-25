@@ -166,6 +166,8 @@ impl StudioApp {
                     height_mm: None,
                     bleed_mm: None,
                     facing_pages: Some(true),
+                    background_fill: None,
+                    printable_background: None,
                 });
             }
 
@@ -258,6 +260,7 @@ impl StudioApp {
                 clear_gray_icc: false,
                 rendering_intent: None,
                 black_point_compensation: None,
+                drawing_scale: None,
             });
 
             Some(ops)
@@ -946,6 +949,33 @@ impl StudioApp {
                         NodePayload::Group(_) => ops.push(CommandOp::Ungroup { group_id: id }),
                         NodePayload::PowerClip { .. } => {
                             ops.push(CommandOp::ExtractPowerClip { powerclip_id: id });
+                        }
+                        NodePayload::Clone { .. } if obj.effects.is_empty() => {
+                            if let Some((payload, fill, outline, _linked)) = tab
+                                .document
+                                .resolve_clone_payload_and_style_with_sym_scope(obj, None)
+                            {
+                                let world_xf =
+                                    tab.document.world_transform_of(id).unwrap_or(obj.transform);
+                                let layer_id = enclosing_layer_of_object(&tab.document, id)
+                                    .or(tab.active_layer_id);
+                                let mut detached =
+                                    SceneObject::new(ObjectId(next_id), obj.name.clone(), payload)
+                                        .with_transform(world_xf)
+                                        .with_fill(fill)
+                                        .with_outline(outline);
+                                detached.opacity = obj.opacity;
+                                detached.blend_mode = obj.blend_mode;
+                                detached.visible = obj.visible;
+                                detached.locked = obj.locked;
+                                detached.printable = obj.printable;
+                                next_id = next_id.saturating_add(1);
+                                new_selection.push(detached.id);
+                                ops.push(CommandOp::DeleteObjects { ids: vec![id] });
+                                ops.push(CommandOp::create_object(detached, layer_id));
+                            } else {
+                                path_ids.push(id);
+                            }
                         }
                         _ if !obj.effects.is_empty() => {
                             let world_xf =
@@ -1817,6 +1847,12 @@ impl StudioApp {
         let mut sym_doc = Document::new_a4(format!("Symbol: {}", sym.name));
         for asset in backup_document.assets().values() {
             sym_doc.insert_asset_if_absent(asset.clone());
+        }
+        for cs in backup_document.color_styles() {
+            sym_doc.upsert_color_style(cs.clone());
+        }
+        for os in backup_document.object_styles() {
+            sym_doc.upsert_object_style(os.clone());
         }
         for (sid, sdef) in backup_document.symbols() {
             if *sid != sym_id {

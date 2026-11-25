@@ -231,7 +231,8 @@ impl TextEngine {
         px_per_mm: f64,
     ) {
         let frame_path = BezierPath::from_rect(para.bounding_box());
-        if view_mode != ViewMode::Wireframe {
+        let wire = matches!(view_mode, ViewMode::Wireframe | ViewMode::SimpleWireframe);
+        if !wire {
             backend.push_clip(&frame_path, FillRule::Winding, transform);
         }
         let pieces = self.layout_paragraph_pieces(para);
@@ -246,12 +247,12 @@ impl TextEngine {
             px_per_mm,
             &IccColorPipeline::default(),
         );
-        if view_mode != ViewMode::Wireframe {
+        if !wire {
             backend.pop_clip();
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn render_paragraph_text_in_doc_icc(
         &mut self,
         backend: &mut dyn CanvasBackend,
@@ -266,15 +267,48 @@ impl TextEngine {
         px_per_mm: f64,
         icc: &IccColorPipeline,
     ) {
+        self.render_paragraph_text_in_doc_on_page_icc(
+            backend,
+            doc,
+            obj_id,
+            para,
+            doc.active_page_index(),
+            transform,
+            outline,
+            opacity,
+            blend_mode,
+            view_mode,
+            px_per_mm,
+            icc,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_paragraph_text_in_doc_on_page_icc(
+        &mut self,
+        backend: &mut dyn CanvasBackend,
+        doc: &Document,
+        obj_id: ObjectId,
+        para: &ParagraphText,
+        page_index: usize,
+        transform: Affine2D,
+        outline: &OutlineStyle,
+        opacity: f32,
+        blend_mode: BlendMode,
+        view_mode: ViewMode,
+        px_per_mm: f64,
+        icc: &IccColorPipeline,
+    ) {
         let frame_path = BezierPath::from_rect(para.bounding_box());
-        if view_mode != ViewMode::Wireframe {
+        let wire = matches!(view_mode, ViewMode::Wireframe | ViewMode::SimpleWireframe);
+        if !wire {
             backend.push_clip(&frame_path, FillRule::Winding, transform);
         }
-        let pieces = self.layout_paragraph_in_doc(doc, obj_id, para);
+        let pieces = self.layout_paragraph_in_doc_for_page(doc, obj_id, para, page_index);
         draw_text_pieces_icc(
             backend, &pieces, transform, outline, opacity, blend_mode, view_mode, px_per_mm, icc,
         );
-        if view_mode != ViewMode::Wireframe {
+        if !wire {
             backend.pop_clip();
         }
     }
@@ -649,9 +683,22 @@ impl TextEngine {
         obj_id: ObjectId,
         para: &ParagraphText,
     ) -> (Vec<ShapedPdfRun>, Vec<ShapedGlyphDraw>) {
+        self.layout_paragraph_pdf_runs_on_page(doc, obj_id, para, doc.active_page_index())
+    }
+
+    /// Lays out a [`ParagraphText`] object on `page_index` into positioned PDF font runs plus
+    /// vector curve fallbacks, resolving dynamic fields such as [`coree_core::TextField::AutoPageNumber`].
+    #[must_use]
+    pub fn layout_paragraph_pdf_runs_on_page(
+        &mut self,
+        doc: &Document,
+        obj_id: ObjectId,
+        para: &ParagraphText,
+        page_index: usize,
+    ) -> (Vec<ShapedPdfRun>, Vec<ShapedGlyphDraw>) {
         let mut pdf_runs = Vec::new();
         let fallback_curves =
-            self.layout_paragraph_in_doc_inner(doc, obj_id, para, Some(&mut pdf_runs));
+            self.layout_paragraph_in_doc_inner(doc, obj_id, para, page_index, Some(&mut pdf_runs));
         (pdf_runs, fallback_curves)
     }
 
@@ -671,7 +718,20 @@ impl TextEngine {
         obj_id: ObjectId,
         para: &ParagraphText,
     ) -> Vec<ShapedGlyphDraw> {
-        self.layout_paragraph_in_doc_inner(doc, obj_id, para, None)
+        self.layout_paragraph_in_doc_inner(doc, obj_id, para, doc.active_page_index(), None)
+    }
+
+    /// Lays out a [`ParagraphText`] object inside `doc` for an explicit `page_index`, resolving
+    /// dynamic text fields (`AutoPageNumber`, `PageCount`, `DocumentTitle`, `CurrentDate`).
+    #[must_use]
+    pub fn layout_paragraph_in_doc_for_page(
+        &mut self,
+        doc: &Document,
+        obj_id: ObjectId,
+        para: &ParagraphText,
+        page_index: usize,
+    ) -> Vec<ShapedGlyphDraw> {
+        self.layout_paragraph_in_doc_inner(doc, obj_id, para, page_index, None)
     }
 
     fn layout_paragraph_in_doc_inner(
@@ -679,30 +739,46 @@ impl TextEngine {
         doc: &Document,
         obj_id: ObjectId,
         para: &ParagraphText,
+        page_index: usize,
         mut pdf_out: Option<&mut Vec<ShapedPdfRun>>,
     ) -> Vec<ShapedGlyphDraw> {
+        let resolved_para = doc.resolve_paragraph_text_fields(page_index, para);
         if obj_id.0 == 0 || doc.object(obj_id).is_none() {
-            let obstacles = collect_frame_wrap_obstacles(doc, obj_id, para.wrap_mode);
-            return self.layout_paragraph_core_inner(para, &obstacles, pdf_out);
+            let obstacles = collect_frame_wrap_obstacles(doc, obj_id, resolved_para.wrap_mode);
+            return self.layout_paragraph_core_inner(&resolved_para, &obstacles, pdf_out);
         }
 
-        // Find chain head by walking incoming `linked_next_frame` pointers (cycle-safe)
+        // Find chain head by walking incoming `linked_next_frame` pointers (cycle-safe & deterministic)
         let mut incoming: HashMap<ObjectId, ObjectId> = HashMap::new();
         for (&oid, obj) in doc.objects() {
             if let NodePayload::ParagraphText(p) = &obj.payload {
                 if let Some(next_id) = p.linked_next_frame {
                     if next_id.0 != 0 && next_id != oid {
-                        incoming.entry(next_id).or_insert(oid);
+                        incoming
+                            .entry(next_id)
+                            .and_modify(|e| {
+                                if oid.0 < e.0 {
+                                    *e = oid;
+                                }
+                            })
+                            .or_insert(oid);
                     }
                 }
             }
         }
         let mut head_id = obj_id;
+        let mut back_path = vec![head_id];
         let mut back_seen = HashSet::from([head_id]);
         while let Some(&prev) = incoming.get(&head_id) {
             if !back_seen.insert(prev) {
+                if let Some(pos) = back_path.iter().position(|&id| id == prev) {
+                    if let Some(&min_cycle_id) = back_path[pos..].iter().min_by_key(|id| id.0) {
+                        head_id = min_cycle_id;
+                    }
+                }
                 break;
             }
+            back_path.push(prev);
             head_id = prev;
         }
 
@@ -724,17 +800,15 @@ impl TextEngine {
             });
         }
         if !chain.contains(&obj_id) {
-            let obstacles = collect_frame_wrap_obstacles(doc, obj_id, para.wrap_mode);
-            return self.layout_paragraph_core_inner(para, &obstacles, pdf_out);
+            let obstacles = collect_frame_wrap_obstacles(doc, obj_id, resolved_para.wrap_mode);
+            return self.layout_paragraph_core_inner(&resolved_para, &obstacles, pdf_out);
         }
 
-        let head_para = doc
-            .object(head_id)
-            .and_then(|o| match &o.payload {
-                NodePayload::ParagraphText(p) => Some(p),
-                _ => None,
-            })
-            .unwrap_or(para);
+        let head_para_storage = doc.object(head_id).and_then(|o| match &o.payload {
+            NodePayload::ParagraphText(p) => Some(doc.resolve_paragraph_text_fields(page_index, p)),
+            _ => None,
+        });
+        let head_para = head_para_storage.as_ref().unwrap_or(&resolved_para);
 
         if chain.len() == 1 {
             let obstacles = collect_frame_wrap_obstacles(doc, obj_id, head_para.wrap_mode);
@@ -753,13 +827,13 @@ impl TextEngine {
                 }
                 continue;
             };
-            let frame_para = doc
-                .object(fid)
-                .and_then(|o| match &o.payload {
-                    NodePayload::ParagraphText(p) => Some(p),
-                    _ => None,
-                })
-                .unwrap_or(para);
+            let frame_para_storage = doc.object(fid).and_then(|o| match &o.payload {
+                NodePayload::ParagraphText(p) => {
+                    Some(doc.resolve_paragraph_text_fields(page_index, p))
+                }
+                _ => None,
+            });
+            let frame_para = frame_para_storage.as_ref().unwrap_or(&resolved_para);
             let obstacles = collect_frame_wrap_obstacles(doc, fid, frame_para.wrap_mode);
             let is_target = fid == obj_id;
             let (pieces, next_cursor) = self.layout_paragraph_frame_slice(
@@ -1133,6 +1207,8 @@ impl TextEngine {
                     let col_x_mm = (visual_col as f64) * (col_w_mm + gutter_mm);
                     let c_left = col_x_mm;
                     let c_right = col_x_mm + col_w_mm;
+                    let col_left_edge_mm = c_left;
+                    let col_right_edge_mm = c_right;
 
                     let mut obs_l = c_left;
                     let mut obs_r = c_right;
@@ -1200,11 +1276,15 @@ impl TextEngine {
                             let cur_y_mm = f64::from(col_y_px / LAYOUT_UNITS_PER_MM);
                             if cur_y_mm < dc_h_mm - 0.1 {
                                 if is_rtl {
-                                    body_r_mm =
-                                        (body_r_mm - dc_w_mm).max(body_l_mm + 2.0).min(body_r_mm);
+                                    body_r_mm = body_r_mm
+                                        .min(col_right_edge_mm - dc_w_mm)
+                                        .max(body_l_mm + 2.0)
+                                        .min(body_r_mm);
                                 } else {
-                                    body_l_mm =
-                                        (body_l_mm + dc_w_mm).min(body_r_mm - 2.0).max(body_l_mm);
+                                    body_l_mm = body_l_mm
+                                        .max(col_left_edge_mm + dc_w_mm)
+                                        .min(body_r_mm - 2.0)
+                                        .max(body_l_mm);
                                 }
                             }
                         }
@@ -2920,7 +3000,7 @@ pub(crate) fn draw_text_pieces_icc(
 ) {
     let anti_alias = view_mode != ViewMode::Pixels;
     let op = sanitize_f32(opacity, 1.0).clamp(0.0, 1.0);
-    if view_mode == ViewMode::Wireframe {
+    if matches!(view_mode, ViewMode::Wireframe | ViewMode::SimpleWireframe) {
         let wire = StrokeParams {
             color: Color::BLACK,
             width: (1.0 / px_per_mm.max(1e-3)) as f32,

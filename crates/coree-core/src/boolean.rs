@@ -476,11 +476,33 @@ fn stroke_single_subpath(
             right.push(pt - n * proj);
         }
         if left.len() >= 2 {
-            right.reverse();
-            left.extend(right);
-            let sub = fit_cubic_bezier_subpath(&left, true, 0.025);
-            if sub.nodes.len() >= 3 {
-                return Some(BezierPath::from_subpath(sub));
+            if sp.closed {
+                if left.first() == left.last() && left.len() > 2 {
+                    left.pop();
+                }
+                if right.first() == right.last() && right.len() > 2 {
+                    right.pop();
+                }
+                right.reverse();
+                let outer = fit_cubic_bezier_subpath(&left, true, 0.025);
+                let inner = fit_cubic_bezier_subpath(&right, true, 0.025);
+                let mut subs = Vec::new();
+                if outer.nodes.len() >= 3 {
+                    subs.push(outer);
+                }
+                if inner.nodes.len() >= 3 {
+                    subs.push(inner);
+                }
+                if !subs.is_empty() {
+                    return Some(BezierPath { subpaths: subs });
+                }
+            } else {
+                right.reverse();
+                left.extend(right);
+                let sub = fit_cubic_bezier_subpath(&left, true, 0.025);
+                if sub.nodes.len() >= 3 {
+                    return Some(BezierPath::from_subpath(sub));
+                }
             }
         }
         return None;

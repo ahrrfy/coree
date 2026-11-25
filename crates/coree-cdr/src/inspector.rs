@@ -29,6 +29,39 @@ pub struct ChunkSummary {
     pub depth: usize,
     pub is_list: bool,
     pub compressed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_bytes: Vec<u8>,
+}
+
+/// Formats `bytes` into an uppercase hex + printable ASCII inspector dump (16 bytes per row).
+#[must_use]
+pub fn format_hex_ascii_dump(bytes: &[u8], base_offset: usize) -> String {
+    let mut out = String::new();
+    for (row_idx, chunk) in bytes.chunks(16).enumerate() {
+        let off = base_offset.saturating_add(row_idx * 16);
+        let _ = write!(out, "{off:08X}: ");
+        for i in 0..16 {
+            if let Some(b) = chunk.get(i) {
+                let _ = write!(out, "{b:02X} ");
+            } else {
+                out.push_str("   ");
+            }
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+        out.push_str(" |");
+        for &b in chunk {
+            let ch = if (0x20..=0x7E).contains(&b) {
+                b as char
+            } else {
+                '.'
+            };
+            out.push(ch);
+        }
+        out.push_str("|\n");
+    }
+    out
 }
 
 /// Summary of one entry inside a ZIP/OPC CDR or CDT container.
@@ -440,6 +473,7 @@ fn summarize_riff_tree(tree: &RiffDocument) -> Vec<ChunkSummary> {
         depth: 0,
         is_list: true,
         compressed: false,
+        preview_bytes: Vec::new(),
     });
     for child in &tree.children {
         collect_node_summaries(child, 1, &mut out);
@@ -469,6 +503,7 @@ fn collect_node_summaries(node: &RiffNode, depth: usize, out: &mut Vec<ChunkSumm
                 depth,
                 is_list: false,
                 compressed: *compressed,
+                preview_bytes: data[..data.len().min(256)].to_vec(),
             });
         }
         RiffNode::List {
@@ -482,6 +517,7 @@ fn collect_node_summaries(node: &RiffNode, depth: usize, out: &mut Vec<ChunkSumm
                 depth,
                 is_list: true,
                 compressed: *compressed,
+                preview_bytes: Vec::new(),
             });
             for ch in children {
                 collect_node_summaries(ch, depth + 1, out);

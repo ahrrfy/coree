@@ -812,6 +812,7 @@ fn insert_cpt_object_into_doc(
             width_mm: w_mm,
             height_mm: h_mm,
             filters: obj_spec.adjustments.clone(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -853,6 +854,8 @@ fn insert_cpt_object_into_doc(
             height_mm: h_mm,
             bleed_mm: 0.0,
             facing_pages: false,
+            background_fill: coree_core::Fill::None,
+            printable_background: false,
             layers: vec![layer],
             unknown_chunks: Vec::new(),
         });

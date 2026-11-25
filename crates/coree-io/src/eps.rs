@@ -112,10 +112,15 @@ fn emit_eps_display_op(
         | DisplayOp::PopGroup
         | DisplayOp::PushTransparencyGroup { .. }
         | DisplayOp::PopTransparencyGroup => {}
-        DisplayOp::PushClip { path, .. } => {
+        DisplayOp::PushClip {
+            path, fill_rule, ..
+        } => {
             out.push_str("gsave\n");
             emit_eps_path_ops(page, path, out);
-            out.push_str("clip newpath\n");
+            match fill_rule {
+                coree_render::FillRule::EvenOdd => out.push_str("eoclip newpath\n"),
+                coree_render::FillRule::Winding => out.push_str("clip newpath\n"),
+            }
         }
         DisplayOp::PopClip => {
             out.push_str("grestore\n");
@@ -125,6 +130,7 @@ fn emit_eps_display_op(
             fill,
             outline,
             fill_xf,
+            opacity,
             emit_arrowheads,
             ..
         } => {
@@ -134,6 +140,7 @@ fn emit_eps_display_op(
                 fill,
                 outline,
                 *fill_xf,
+                *opacity,
                 use_cmyk,
                 *emit_arrowheads,
                 out,
@@ -564,6 +571,90 @@ fn emit_eps_gradient_fill(
     }
 }
 
+fn apply_eps_opacity_to_color(c: &Color, opacity: f32) -> Color {
+    let op = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if (op - 1.0).abs() <= 1e-4 {
+        return c.clone();
+    }
+    match c {
+        Color::Cmyk { c, m, y, k, a } => {
+            let eff = (op * a.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            Color::Cmyk {
+                c: c * eff,
+                m: m * eff,
+                y: y * eff,
+                k: k * eff,
+                a: 1.0,
+            }
+        }
+        Color::Spot {
+            name,
+            tint,
+            fallback_cmyk,
+            alpha,
+        } => {
+            let eff = (op * alpha.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            Color::Spot {
+                name: name.clone(),
+                tint: tint * eff,
+                fallback_cmyk: *fallback_cmyk,
+                alpha: 1.0,
+            }
+        }
+        _ => {
+            let [r, g, b, a] = c.to_rgba_f32();
+            let eff = (op * a.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            Color::rgba(
+                r * eff + (1.0 - eff),
+                g * eff + (1.0 - eff),
+                b * eff + (1.0 - eff),
+                1.0,
+            )
+        }
+    }
+}
+
+fn apply_eps_opacity_to_fill(fill: &Fill, opacity: f32) -> Fill {
+    let op = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if (op - 1.0).abs() <= 1e-4 {
+        return fill.clone();
+    }
+    match fill {
+        Fill::Solid(c) => Fill::Solid(apply_eps_opacity_to_color(c, op)),
+        Fill::LinearGradient { start, end, stops } => Fill::LinearGradient {
+            start: *start,
+            end: *end,
+            stops: stops
+                .iter()
+                .map(|s| GradientStop::new(s.offset, apply_eps_opacity_to_color(&s.color, op)))
+                .collect(),
+        },
+        Fill::RadialGradient {
+            center,
+            radius,
+            focal,
+            stops,
+        } => Fill::RadialGradient {
+            center: *center,
+            radius: *radius,
+            focal: *focal,
+            stops: stops
+                .iter()
+                .map(|s| GradientStop::new(s.offset, apply_eps_opacity_to_color(&s.color, op)))
+                .collect(),
+        },
+        other => other.clone(),
+    }
+}
+
 fn emit_eps_styled_path(
     page: &Page,
     path: &BezierPath,
@@ -573,7 +664,7 @@ fn emit_eps_styled_path(
     use_cmyk: bool,
     out: &mut String,
 ) {
-    emit_eps_styled_path_opts(page, path, fill, outline, fill_xf, use_cmyk, true, out);
+    emit_eps_styled_path_opts(page, path, fill, outline, fill_xf, 1.0, use_cmyk, true, out);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -583,6 +674,7 @@ fn emit_eps_styled_path_opts(
     fill: &Fill,
     outline: &OutlineStyle,
     fill_xf: Affine2D,
+    opacity: f32,
     use_cmyk: bool,
     emit_arrowheads: bool,
     out: &mut String,
@@ -590,6 +682,17 @@ fn emit_eps_styled_path_opts(
     if path.is_empty() {
         return;
     }
+    let eff_op = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if eff_op <= 1e-4 {
+        return;
+    }
+    let eff_fill_owned = apply_eps_opacity_to_fill(fill, eff_op);
+    let fill = &eff_fill_owned;
+    let eff_outline_color = apply_eps_opacity_to_color(&outline.color, eff_op);
 
     let emit_stroke_block = |out: &mut String| {
         if !outline.is_visible() {
@@ -599,7 +702,7 @@ fn emit_eps_styled_path_opts(
         if outline.overprint {
             out.push_str("true setoverprint\n");
         }
-        emit_eps_color(out, &outline.color, use_cmyk);
+        emit_eps_color(out, &eff_outline_color, use_cmyk);
         let raw_w = outline.scaled_width_mm_for_transform(&fill_xf);
         let width_pt = if raw_w.is_finite() {
             (raw_w * MM_TO_PT).max(0.1)
@@ -1145,6 +1248,7 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                             width_mm: w_mm,
                             height_mm: h_mm,
                             filters: Vec::new(),
+                            filter_enabled: Vec::new(),
                             crop_rect: None,
                         }),
                     )
@@ -3517,6 +3621,7 @@ grestore\n\
                     width_mm: 20.0,
                     height_mm: 20.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )
@@ -3563,6 +3668,7 @@ grestore\n\
                     width_mm: 40.0,
                     height_mm: 40.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )

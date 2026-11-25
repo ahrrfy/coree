@@ -6,23 +6,25 @@ use crate::builders::{
     build_bspline_create_op, build_connector_op, build_drawn_box_output,
     build_interactive_effect_output, build_interactive_fill_op, build_knife_cut_op,
     build_mesh_fill_output, build_replace_effect_op, build_three_point_curve_op,
-    build_three_point_shape_op, build_vector_eraser_ops, build_virtual_segment_delete_stroke_ops,
-    collect_editable_fillable_targets, collect_nodes_in_rect, compute_lasso_hits_scoped,
-    hit_test_canvas_point_opt, hit_test_canvas_point_scoped_opt,
-    hit_test_canvas_point_scoped_opt_tol, is_object_in_or_descendant_of_selection,
-    order_selection_frontmost_first, resolve_sculpt_target_at, resolve_sculpt_target_in_selection,
+    build_three_point_dimension_op, build_three_point_shape_op, build_vector_eraser_ops,
+    build_virtual_segment_delete_stroke_ops, collect_editable_fillable_targets,
+    collect_nodes_in_rect, compute_lasso_hits_scoped, hit_test_canvas_point_opt,
+    hit_test_canvas_point_scoped_opt, hit_test_canvas_point_scoped_opt_tol,
+    is_object_in_or_descendant_of_selection, order_selection_frontmost_first,
+    resolve_sculpt_target_at, resolve_sculpt_target_in_selection,
     resolve_selected_object_at_or_first,
 };
 use crate::context::{KeyEvent, PointerButton, PointerEvent, ToolKey, ToolReadContext};
 use crate::math_helpers::{
-    bspline_to_bezier_path, build_world_transform_command, compute_constrained_box,
-    compute_free_transform_affine, compute_scale_affine, constrain_line_15deg,
-    editable_topmost_selection, ellipse_rect_to_bezier_path, find_nearest_object_anchor_in_doc,
-    gradient_ray_local, gradient_stops_mut, hit_curve_segment_on_selection_world,
-    hit_editable_bezier_node_or_handle_world, hit_parametric_shape_handle_world,
-    hit_scale_handle_world, hit_test_canvas_guide, interactive_effect_handle_points,
-    is_object_editable_in_doc, object_preview_world_path, parametric_shape_handles,
-    rect_to_bezier_path, selection_handle_world_positions, three_point_arc_path,
+    apply_draw_in_perspective_to_obj, bspline_to_bezier_path, build_world_transform_command,
+    compute_constrained_box, compute_free_transform_affine, compute_scale_affine,
+    constrain_line_15deg, editable_topmost_selection, ellipse_rect_to_bezier_path,
+    find_nearest_object_anchor_in_doc, gradient_ray_local, gradient_stops_mut,
+    hit_curve_segment_on_selection_world, hit_editable_bezier_node_or_handle_world,
+    hit_parametric_shape_handle_world, hit_scale_handle_world, hit_test_canvas_guide,
+    interactive_effect_handle_points, is_object_editable_in_doc, object_preview_world_path,
+    parametric_shape_for_tool_rect, parametric_shape_handles, rect_to_bezier_path,
+    selection_handle_world_positions, snap_point_with_reference, three_point_arc_path,
     try_insert_gradient_stop_on_ray_world, update_parametric_shape_live,
     world_inverse_transform_of, world_transform_of_or_local,
 };
@@ -226,7 +228,19 @@ pub enum ActiveDragState {
         orig_fill: Fill,
         draft_fill: Fill,
     },
-    DrawingBox {
+    DrawingShapeBox {
+        start_mm: Point2D,
+        current_mm: Point2D,
+        ctrl: bool,
+        shift: bool,
+    },
+    DrawingLinearDrag {
+        start_mm: Point2D,
+        current_mm: Point2D,
+        ctrl: bool,
+        shift: bool,
+    },
+    DrawingMeshBox {
         start_mm: Point2D,
         current_mm: Point2D,
         ctrl: bool,
@@ -251,6 +265,7 @@ pub struct ToolCore {
     pub bezier_draft_nodes: Vec<PathNode>,
     pub three_point_curve_chord: Option<(Point2D, Point2D)>,
     pub three_point_shape_chord: Option<(ToolId, Point2D, Point2D)>,
+    pub three_point_dim_chord: Option<(ToolId, Point2D, Point2D)>,
     pub live_sketch_strokes: Vec<Vec<Point2D>>,
     pub live_sketch_object_id: Option<ObjectId>,
     pub symmetry_enabled: bool,
@@ -283,6 +298,7 @@ impl ToolCore {
             bezier_draft_nodes: Vec::new(),
             three_point_curve_chord: None,
             three_point_shape_chord: None,
+            three_point_dim_chord: None,
             live_sketch_strokes: Vec::new(),
             live_sketch_object_id: None,
             symmetry_enabled: false,
@@ -325,6 +341,7 @@ impl ToolCore {
         self.bezier_draft_nodes.clear();
         self.three_point_curve_chord = None;
         self.three_point_shape_chord = None;
+        self.three_point_dim_chord = None;
         self.live_sketch_strokes.clear();
         self.live_sketch_object_id = None;
     }
@@ -370,6 +387,7 @@ impl ToolCore {
             || !self.poly_points_mm.is_empty()
             || self.three_point_curve_chord.is_some()
             || self.three_point_shape_chord.is_some()
+            || self.three_point_dim_chord.is_some()
             || self.pending_crop_rect.is_some()
             || self.raster_mask_rect_mm.is_some()
     }
@@ -478,13 +496,14 @@ impl ToolCore {
         } else {
             Fill::None
         };
-        let obj = SceneObject::new(
+        let mut obj = SceneObject::new(
             ObjectId(0),
             self.active_tool.label(),
             NodePayload::Path(path),
         )
         .with_fill(fill)
         .with_outline(ctx.default_outline.clone());
+        apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
         Some(CommandOp::create_object(obj, Some(layer_id)))
     }
 
@@ -514,13 +533,14 @@ impl ToolCore {
                 }
             } else if let Some(layer_id) = ctx.target_creation_layer_id() {
                 let path = BezierPath::from_polygon(pts, false);
-                let obj = SceneObject::new(
+                let mut obj = SceneObject::new(
                     ObjectId(0),
                     self.active_tool.label(),
                     NodePayload::Path(path),
                 )
                 .with_fill(Fill::None)
                 .with_outline(ctx.default_outline.clone());
+                apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                 return ToolOutput::Commit {
                     ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                     clear_overlay: true,
@@ -542,13 +562,7 @@ impl ToolCore {
         match self.active_tool {
             ToolId::Pick | ToolId::FreehandPick | ToolId::ArtisticText | ToolId::ParagraphText => {
                 let tol = ctx.hit_tol_mm(6.0, 1.2);
-                let hit = crate::math_helpers::hit_test_canvas_point_in_doc(
-                    ctx.document,
-                    ctx.powerclip_edit_id,
-                    ctx.treat_all_objects_as_filled,
-                    pt,
-                    tol,
-                );
+                let hit = hit_test_canvas_point_scoped_opt_tol(ctx, pt, tol);
                 if let Some(oid) = hit {
                     if let Some(obj) = ctx.document.object(oid) {
                         if matches!(
@@ -569,10 +583,20 @@ impl ToolCore {
                 if matches!(self.active_tool, ToolId::Pick | ToolId::FreehandPick)
                     && !ev.modifiers.shift
                 {
-                    let handle_hit = ctx
-                        .selection
-                        .bounding_box(ctx.document)
-                        .is_some_and(|bb| hit_scale_handle_world(ctx.viewport, bb, pt).is_some());
+                    let scoped_sel_ok = ctx.powerclip_edit_id.is_none_or(|pc_id| {
+                        ctx.selection.objects.iter().all(|&id| {
+                            ctx.document.object(pc_id).is_some_and(|o| {
+                                matches!(
+                                    &o.payload,
+                                    NodePayload::PowerClip { contents, .. } if contents.contains(&id)
+                                )
+                            })
+                        })
+                    });
+                    let handle_hit = scoped_sel_ok
+                        && ctx.selection.bounding_box(ctx.document).is_some_and(|bb| {
+                            hit_scale_handle_world(ctx.viewport, bb, pt).is_some()
+                        });
                     let sole_selected_hit =
                         hit.is_some_and(|oid| ctx.selection.objects == vec![oid]);
                     if handle_hit || sole_selected_hit {
@@ -770,6 +794,15 @@ impl ToolCore {
                 };
             }
         }
+        if let Some((dim_tool, p1, p2)) = self.three_point_dim_chord.take() {
+            if let Some(op) = build_three_point_dimension_op(ctx, dim_tool, p1, p2, pt) {
+                return ToolOutput::Commit {
+                    ops: vec![op],
+                    clear_overlay: true,
+                    post_actions: Vec::new(),
+                };
+            }
+        }
 
         let tol_mm = ctx.hit_tol_mm(7.0, 1.2);
         let close_tol_mm = ctx.hit_tol_mm(8.0, 1.2);
@@ -795,7 +828,7 @@ impl ToolCore {
             }
             ToolId::FreeTransform => {
                 let sel_ids = if ctx.selection.is_empty() {
-                    if let Some(hit_id) = hit_test_canvas_point_opt_tol(ctx, pt, tol_mm) {
+                    if let Some(hit_id) = hit_test_canvas_point_scoped_opt_tol(ctx, pt, tol_mm) {
                         actions.push(ToolActionRequest::SelectObjects {
                             ids: vec![hit_id],
                             additive: false,
@@ -1230,7 +1263,7 @@ impl ToolCore {
                         return ToolOutput::Continue { overlay };
                     }
                 }
-                self.drag_state = ActiveDragState::DrawingBox {
+                self.drag_state = ActiveDragState::DrawingShapeBox {
                     start_mm: pt,
                     current_mm: pt,
                     ctrl,
@@ -1238,10 +1271,12 @@ impl ToolCore {
                 };
             }
             ToolId::Bezier | ToolId::Pen => {
-                let (snapped, guides) = SnapEngine::snap_point(
+                let ref_pt = self.bezier_draft_nodes.last().map(|n| n.pos);
+                let (snapped, guides) = snap_point_with_reference(
                     ctx.document,
                     ctx.document.active_page_index(),
                     pt,
+                    ref_pt,
                     &[],
                     ctx.snap_options,
                 );
@@ -1260,10 +1295,12 @@ impl ToolCore {
                 };
             }
             ToolId::BSpline | ToolId::Polyline => {
-                let (snapped, guides) = SnapEngine::snap_point(
+                let ref_pt = self.poly_points_mm.last().copied();
+                let (snapped, guides) = snap_point_with_reference(
                     ctx.document,
                     ctx.document.active_page_index(),
                     pt,
+                    ref_pt,
                     &[],
                     ctx.snap_options,
                 );
@@ -1282,10 +1319,11 @@ impl ToolCore {
                         }
                     } else if let Some(layer_id) = ctx.target_creation_layer_id() {
                         let path = BezierPath::from_polygon(pts, true);
-                        let obj =
+                        let mut obj =
                             SceneObject::new(ObjectId(0), "Polyline", NodePayload::Path(path))
                                 .with_fill(ctx.default_fill.clone())
                                 .with_outline(ctx.default_outline.clone());
+                        apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                         return ToolOutput::Commit {
                             ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                             clear_overlay: true,
@@ -1370,7 +1408,7 @@ impl ToolCore {
                         }
                     }
                 }
-                self.drag_state = ActiveDragState::DrawingBox {
+                self.drag_state = ActiveDragState::DrawingLinearDrag {
                     start_mm: pt,
                     current_mm: pt,
                     ctrl,
@@ -1601,7 +1639,7 @@ impl ToolCore {
                         }
                     }
                 }
-                self.drag_state = ActiveDragState::DrawingBox {
+                self.drag_state = ActiveDragState::DrawingMeshBox {
                     start_mm: pt,
                     current_mm: pt,
                     ctrl,
@@ -1652,7 +1690,7 @@ impl ToolCore {
                     self.drag_state = ActiveDragState::Idle;
                 }
                 RasterMaskMode::Rectangle | RasterMaskMode::Ellipse => {
-                    self.drag_state = ActiveDragState::DrawingBox {
+                    self.drag_state = ActiveDragState::DrawingShapeBox {
                         start_mm: pt,
                         current_mm: pt,
                         ctrl,
@@ -1660,16 +1698,43 @@ impl ToolCore {
                     };
                 }
             },
-            _ => {
-                let (snapped, guides) = SnapEngine::snap_point(
+            ToolId::ThreePointCurve
+            | ToolId::ThreePointRectangle
+            | ToolId::ThreePointEllipse
+            | ToolId::StraightConnector
+            | ToolId::RightAngleConnector
+            | ToolId::ParallelDimension
+            | ToolId::HvDimension
+            | ToolId::AngularDimension
+            | ToolId::SegmentDimension
+            | ToolId::ThreePointCallout => {
+                let (snapped, guides) = snap_point_with_reference(
                     ctx.document,
                     ctx.document.active_page_index(),
                     pt,
+                    None,
                     &[],
                     ctx.snap_options,
                 );
                 self.active_guides = guides;
-                self.drag_state = ActiveDragState::DrawingBox {
+                self.drag_state = ActiveDragState::DrawingLinearDrag {
+                    start_mm: snapped,
+                    current_mm: snapped,
+                    ctrl,
+                    shift,
+                };
+            }
+            _ => {
+                let (snapped, guides) = snap_point_with_reference(
+                    ctx.document,
+                    ctx.document.active_page_index(),
+                    pt,
+                    None,
+                    &[],
+                    ctx.snap_options,
+                );
+                self.active_guides = guides;
+                self.drag_state = ActiveDragState::DrawingShapeBox {
                     start_mm: snapped,
                     current_mm: snapped,
                     ctrl,
@@ -1999,7 +2064,8 @@ impl ToolCore {
                             draft_path.twirl_near(lp, local_r, sign * (0.25 * eff_strength + 0.08));
                         }
                         ToolId::AttractRepel => {
-                            draft_path.attract_repel_near(lp, local_r, eff_strength, !shift);
+                            let attract = ctx.settings.sculpt_sub_mode.is_attract(shift);
+                            draft_path.attract_repel_near(lp, local_r, eff_strength, attract);
                         }
                         ToolId::Roughen => {
                             let amp = (local_r * 0.16 * eff_strength).max(0.35);
@@ -2275,16 +2341,29 @@ impl ToolCore {
                     }
                 }
             }
-            ActiveDragState::DrawingBox {
+            ActiveDragState::DrawingShapeBox {
+                start_mm,
                 current_mm,
                 ctrl: d_ctrl,
                 shift: d_shift,
-                ..
+            }
+            | ActiveDragState::DrawingLinearDrag {
+                start_mm,
+                current_mm,
+                ctrl: d_ctrl,
+                shift: d_shift,
+            }
+            | ActiveDragState::DrawingMeshBox {
+                start_mm,
+                current_mm,
+                ctrl: d_ctrl,
+                shift: d_shift,
             } => {
-                let (snapped, guides) = SnapEngine::snap_point(
+                let (snapped, guides) = snap_point_with_reference(
                     ctx.document,
                     ctx.document.active_page_index(),
                     pt,
+                    Some(*start_mm),
                     &[],
                     ctx.snap_options,
                 );
@@ -2294,12 +2373,25 @@ impl ToolCore {
                 *d_shift = shift;
             }
             ActiveDragState::DrawingStroke { points_mm, samples } => {
-                let next_pt =
-                    if active_tool == ToolId::TwoPointLine && ctrl && !points_mm.is_empty() {
+                let next_pt = if active_tool == ToolId::TwoPointLine && !points_mm.is_empty() {
+                    let base_pt = if ctrl {
                         constrain_line_15deg(points_mm[0], pt)
                     } else {
                         pt
                     };
+                    let (snapped, guides) = snap_point_with_reference(
+                        ctx.document,
+                        ctx.document.active_page_index(),
+                        base_pt,
+                        Some(points_mm[0]),
+                        &[],
+                        ctx.snap_options,
+                    );
+                    self.active_guides = guides;
+                    snapped
+                } else {
+                    pt
+                };
                 if active_tool == ToolId::TwoPointLine && points_mm.len() >= 2 {
                     *points_mm.last_mut().expect("len >= 2") = next_pt;
                     if let Some(last_s) = samples.last_mut() {
@@ -2822,7 +2914,40 @@ impl ToolCore {
                     build_interactive_effect_output(ctx, active_tool, start_mm, current_mm)
                 }
             }
-            ActiveDragState::DrawingBox {
+            ActiveDragState::DrawingLinearDrag {
+                start_mm,
+                current_mm,
+                ..
+            } => {
+                if matches!(
+                    active_tool,
+                    ToolId::AngularDimension | ToolId::ThreePointCallout
+                ) && start_mm.distance_to(current_mm) >= 1.0
+                {
+                    self.three_point_dim_chord = Some((active_tool, start_mm, current_mm));
+                    let overlay = self.finalize_overlay(self.build_overlay(ctx));
+                    let msg = if active_tool == ToolId::AngularDimension {
+                        "Move cursor to second angle ray, then click to commit Angular Dimension"
+                    } else {
+                        "Move cursor to label endpoint, then click to commit 3-Point Callout"
+                    };
+                    ToolOutput::Consumed {
+                        overlay: Some(overlay),
+                        actions: vec![ToolActionRequest::Toast {
+                            message: msg.to_owned(),
+                            is_error: false,
+                        }],
+                    }
+                } else {
+                    self.finish_drawn_box(ctx, active_tool, start_mm, current_mm, ctrl, shift)
+                }
+            }
+            ActiveDragState::DrawingShapeBox {
+                start_mm,
+                current_mm,
+                ..
+            }
+            | ActiveDragState::DrawingMeshBox {
                 start_mm,
                 current_mm,
                 ..
@@ -2913,7 +3038,7 @@ impl ToolCore {
             }
             ToolId::MeshFill => build_mesh_fill_output(ctx, pt, pt, shift),
             ToolId::LensTool => {
-                if let Some(oid) = hit_test_canvas_point_opt_tol(ctx, pt, 6.0) {
+                if let Some(oid) = hit_test_canvas_point_scoped_opt_tol(ctx, pt, 6.0) {
                     ToolOutput::actions(vec![
                         ToolActionRequest::SelectObjects {
                             ids: vec![oid],
@@ -3098,7 +3223,7 @@ impl ToolCore {
                 }])
             }
             ToolId::LensTool if start_mm.distance_to(current_mm) < 1.0 => {
-                if let Some(oid) = hit_test_canvas_point_opt_tol(ctx, start_mm, 6.0) {
+                if let Some(oid) = hit_test_canvas_point_scoped_opt_tol(ctx, start_mm, 6.0) {
                     ToolOutput::actions(vec![
                         ToolActionRequest::SelectObjects {
                             ids: vec![oid],
@@ -3191,9 +3316,10 @@ impl ToolCore {
                     return ToolOutput::noop();
                 };
                 let path = BezierPath::from_line(points[0], *points.last().expect("len >= 2"));
-                let obj = SceneObject::new(ObjectId(0), "Line", NodePayload::Path(path))
+                let mut obj = SceneObject::new(ObjectId(0), "Line", NodePayload::Path(path))
                     .with_fill(Fill::None)
                     .with_outline(ctx.default_outline.clone());
+                apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                 ToolOutput::Commit {
                     ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                     clear_overlay: true,
@@ -3217,7 +3343,7 @@ impl ToolCore {
                     } else {
                         Fill::Solid(ctx.default_outline.color.clone())
                     };
-                    let obj = SceneObject::new(
+                    let mut obj = SceneObject::new(
                         ObjectId(0),
                         "Freehand Pressure Stroke",
                         NodePayload::ArtisticMedia {
@@ -3231,6 +3357,7 @@ impl ToolCore {
                     )
                     .with_fill(fill)
                     .with_outline(OutlineStyle::none());
+                    apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                     ToolOutput::Commit {
                         ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                         clear_overlay: true,
@@ -3239,10 +3366,11 @@ impl ToolCore {
                 } else {
                     let mut path = BezierPath::from_polygon(points, false);
                     path.reduce_nodes(0.15);
-                    let obj =
+                    let mut obj =
                         SceneObject::new(ObjectId(0), "Freehand Curve", NodePayload::Path(path))
                             .with_fill(Fill::None)
                             .with_outline(ctx.default_outline.clone());
+                    apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                     ToolOutput::Commit {
                         ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                         clear_overlay: true,
@@ -3256,9 +3384,10 @@ impl ToolCore {
                 };
                 let recognized = coree_core::SmartDrawing::recognize_rough_stroke(&points);
                 let path = recognized.to_bezier_path();
-                let obj = SceneObject::new(ObjectId(0), "Smart Shape", NodePayload::Path(path))
+                let mut obj = SceneObject::new(ObjectId(0), "Smart Shape", NodePayload::Path(path))
                     .with_fill(ctx.default_fill.clone())
                     .with_outline(ctx.default_outline.clone());
+                apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                 ToolOutput::Commit {
                     ops: vec![CommandOp::create_object(obj, Some(layer_id))],
                     clear_overlay: true,
@@ -3321,6 +3450,7 @@ impl ToolCore {
                     SceneObject::new(ObjectId(0), "LiveSketch Curve", NodePayload::Path(path))
                         .with_fill(Fill::None)
                         .with_outline(ctx.default_outline.clone());
+                apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                 if ctx.settings.symmetry_enabled || self.symmetry_enabled {
                     let folds = if self.symmetry_enabled {
                         self.symmetry_folds
@@ -3386,6 +3516,7 @@ impl ToolCore {
                 )
                 .with_fill(ctx.default_fill.clone())
                 .with_outline(OutlineStyle::none());
+                apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
                 if ctx.settings.symmetry_enabled || self.symmetry_enabled {
                     let folds = if self.symmetry_enabled {
                         self.symmetry_folds
@@ -4002,54 +4133,97 @@ impl ToolCore {
                 preview_handles.push(OverlayHandle::new(*handle_out_mm, HandleShape::Circle));
                 preview_handles.push(OverlayHandle::new(hi, HandleShape::Circle));
             }
-            ActiveDragState::DrawingBox {
+            ActiveDragState::DrawingLinearDrag {
                 start_mm,
                 current_mm,
                 ctrl,
                 shift,
-            } => {
-                if self.active_tool == ToolId::InteractiveFill {
+            } => match self.active_tool {
+                ToolId::InteractiveFill
+                | ToolId::ThreePointCurve
+                | ToolId::ThreePointRectangle
+                | ToolId::ThreePointEllipse
+                | ToolId::StraightConnector
+                | ToolId::RightAngleConnector
+                | ToolId::AngularDimension
+                | ToolId::ThreePointCallout => {
                     preview_paths.push(OverlayPath::stroke(
                         BezierPath::from_line(*start_mm, *current_mm),
                         OverlayStrokeKind::Accent,
                     ));
                     preview_handles.push(OverlayHandle::new(*start_mm, HandleShape::Square));
                     preview_handles.push(OverlayHandle::new(*current_mm, HandleShape::Circle));
-                } else if matches!(
-                    self.active_tool,
-                    ToolId::ThreePointCurve
-                        | ToolId::ThreePointRectangle
-                        | ToolId::ThreePointEllipse
-                        | ToolId::StraightConnector
-                        | ToolId::RightAngleConnector
-                ) {
+                }
+                ToolId::ParallelDimension | ToolId::HvDimension | ToolId::SegmentDimension => {
+                    let (p1, p2) = if self.active_tool == ToolId::HvDimension {
+                        if (current_mm.x - start_mm.x).abs() >= (current_mm.y - start_mm.y).abs() {
+                            (*start_mm, Point2D::new(current_mm.x, start_mm.y))
+                        } else {
+                            (*start_mm, Point2D::new(start_mm.x, current_mm.y))
+                        }
+                    } else {
+                        (*start_mm, *current_mm)
+                    };
+                    let d = p2 - p1;
+                    let len = d.length().max(1e-3);
+                    let n = Vec2D::new(-d.y / len, d.x / len);
+                    let off = ctx.settings.dimension_offset_mm;
+                    let q1 = p1 + n * off;
+                    let q2 = p2 + n * off;
                     preview_paths.push(OverlayPath::stroke(
-                        BezierPath::from_line(*start_mm, *current_mm),
+                        BezierPath::from_line(p1, q1),
+                        OverlayStrokeKind::Secondary,
+                    ));
+                    preview_paths.push(OverlayPath::stroke(
+                        BezierPath::from_line(p2, q2),
+                        OverlayStrokeKind::Secondary,
+                    ));
+                    preview_paths.push(OverlayPath::stroke(
+                        BezierPath::from_line(q1, q2),
                         OverlayStrokeKind::Accent,
                     ));
-                    preview_handles.push(OverlayHandle::new(*start_mm, HandleShape::Circle));
-                    preview_handles.push(OverlayHandle::new(*current_mm, HandleShape::Circle));
-                } else {
+                    preview_handles.push(OverlayHandle::new(p1, HandleShape::Square));
+                    preview_handles.push(OverlayHandle::new(p2, HandleShape::Square));
+                    preview_handles.push(OverlayHandle::new(q1, HandleShape::Diamond));
+                    preview_handles.push(OverlayHandle::new(q2, HandleShape::Diamond));
+                }
+                _ => {
                     let box_mm = compute_constrained_box(*start_mm, *current_mm, *ctrl, *shift);
-                    if self.active_tool == ToolId::Table {
+                    preview_paths.push(OverlayPath::stroke(
+                        rect_to_bezier_path(box_mm),
+                        OverlayStrokeKind::Accent,
+                    ));
+                }
+            },
+            ActiveDragState::DrawingMeshBox {
+                start_mm,
+                current_mm,
+                ctrl,
+                shift,
+            } => {
+                let box_mm = compute_constrained_box(*start_mm, *current_mm, *ctrl, *shift);
+                preview_paths.push(OverlayPath::stroke(
+                    rect_to_bezier_path(box_mm),
+                    OverlayStrokeKind::Accent,
+                ));
+                let rows = ctx.settings.mesh_rows.clamp(1, 16);
+                let cols = ctx.settings.mesh_cols.clamp(1, 16);
+                for r in 0..=rows {
+                    let v = r as f64 / rows as f64;
+                    let y = box_mm.min_y + box_mm.height() * v;
+                    if r > 0 && r < rows {
                         preview_paths.push(OverlayPath::stroke(
-                            rect_to_bezier_path(box_mm),
-                            OverlayStrokeKind::Accent,
+                            BezierPath::from_line(
+                                Point2D::new(box_mm.min_x, y),
+                                Point2D::new(box_mm.max_x, y),
+                            ),
+                            OverlayStrokeKind::Secondary,
                         ));
-                        let rows = ctx.settings.table_rows.clamp(1, 30);
-                        let cols = ctx.settings.table_cols.clamp(1, 30);
-                        for r in 1..rows {
-                            let y = box_mm.min_y + box_mm.height() * (r as f64 / rows as f64);
-                            preview_paths.push(OverlayPath::stroke(
-                                BezierPath::from_line(
-                                    Point2D::new(box_mm.min_x, y),
-                                    Point2D::new(box_mm.max_x, y),
-                                ),
-                                OverlayStrokeKind::Secondary,
-                            ));
-                        }
-                        for c in 1..cols {
-                            let x = box_mm.min_x + box_mm.width() * (c as f64 / cols as f64);
+                    }
+                    for c in 0..=cols {
+                        let u = c as f64 / cols as f64;
+                        let x = box_mm.min_x + box_mm.width() * u;
+                        if r == 0 && c > 0 && c < cols {
                             preview_paths.push(OverlayPath::stroke(
                                 BezierPath::from_line(
                                     Point2D::new(x, box_mm.min_y),
@@ -4058,31 +4232,77 @@ impl ToolCore {
                                 OverlayStrokeKind::Secondary,
                             ));
                         }
-                    } else {
-                        let is_ellipse =
-                            matches!(self.active_tool, ToolId::Ellipse | ToolId::LensTool)
-                                || (self.active_tool == ToolId::MaskSelect
-                                    && ctx.settings.mask_mode == RasterMaskMode::Ellipse);
-                        let p = if is_ellipse {
-                            ellipse_rect_to_bezier_path(box_mm)
-                        } else {
-                            rect_to_bezier_path(box_mm)
-                        };
-                        let p = if ctx.settings.draw_in_perspective {
-                            if let Some(hm) = ctx
-                                .document
-                                .perspective_grid()
-                                .plane_homography_for_rect(box_mm)
-                            {
-                                hm.transform_bezier_path(&p)
-                            } else {
-                                p
-                            }
-                        } else {
-                            p
-                        };
-                        preview_paths.push(OverlayPath::stroke(p, OverlayStrokeKind::Accent));
+                        preview_handles
+                            .push(OverlayHandle::new(Point2D::new(x, y), HandleShape::Circle));
                     }
+                }
+            }
+            ActiveDragState::DrawingShapeBox {
+                start_mm,
+                current_mm,
+                ctrl,
+                shift,
+            } => {
+                let box_mm = compute_constrained_box(*start_mm, *current_mm, *ctrl, *shift);
+                if self.active_tool == ToolId::Table {
+                    preview_paths.push(OverlayPath::stroke(
+                        rect_to_bezier_path(box_mm),
+                        OverlayStrokeKind::Accent,
+                    ));
+                    let rows = ctx.settings.table_rows.clamp(1, 30);
+                    let cols = ctx.settings.table_cols.clamp(1, 30);
+                    for r in 1..rows {
+                        let y = box_mm.min_y + box_mm.height() * (r as f64 / rows as f64);
+                        preview_paths.push(OverlayPath::stroke(
+                            BezierPath::from_line(
+                                Point2D::new(box_mm.min_x, y),
+                                Point2D::new(box_mm.max_x, y),
+                            ),
+                            OverlayStrokeKind::Secondary,
+                        ));
+                    }
+                    for c in 1..cols {
+                        let x = box_mm.min_x + box_mm.width() * (c as f64 / cols as f64);
+                        preview_paths.push(OverlayPath::stroke(
+                            BezierPath::from_line(
+                                Point2D::new(x, box_mm.min_y),
+                                Point2D::new(x, box_mm.max_y),
+                            ),
+                            OverlayStrokeKind::Secondary,
+                        ));
+                    }
+                } else if let Some((shape, xf)) =
+                    parametric_shape_for_tool_rect(self.active_tool, box_mm, ctx.settings)
+                {
+                    let mut p = shape.to_bezier_path().transformed(&xf);
+                    if ctx.settings.draw_in_perspective {
+                        if let Some(hm) = ctx
+                            .document
+                            .perspective_grid()
+                            .plane_homography_for_rect(box_mm)
+                        {
+                            p = hm.transform_bezier_path(&p);
+                        }
+                    }
+                    preview_paths.push(OverlayPath::stroke(p, OverlayStrokeKind::Accent));
+                } else {
+                    let is_ellipse = self.active_tool == ToolId::MaskSelect
+                        && ctx.settings.mask_mode == RasterMaskMode::Ellipse;
+                    let mut p = if is_ellipse {
+                        ellipse_rect_to_bezier_path(box_mm)
+                    } else {
+                        rect_to_bezier_path(box_mm)
+                    };
+                    if ctx.settings.draw_in_perspective {
+                        if let Some(hm) = ctx
+                            .document
+                            .perspective_grid()
+                            .plane_homography_for_rect(box_mm)
+                        {
+                            p = hm.transform_bezier_path(&p);
+                        }
+                    }
+                    preview_paths.push(OverlayPath::stroke(p, OverlayStrokeKind::Accent));
                 }
             }
             ActiveDragState::DrawingStroke { points_mm, samples } => {
@@ -4194,6 +4414,54 @@ impl ToolCore {
                 BezierPath::from_polygon(corners, true),
                 OverlayStrokeKind::Accent,
             ));
+        }
+        if let Some((dim_tool, p1, p2)) = self.three_point_dim_chord {
+            let p3 = self.cursor_world_mm;
+            preview_paths.push(OverlayPath::stroke(
+                BezierPath::from_line(p1, p2),
+                OverlayStrokeKind::Secondary,
+            ));
+            if dim_tool == ToolId::AngularDimension {
+                preview_paths.push(OverlayPath::stroke(
+                    BezierPath::from_line(p1, p3),
+                    OverlayStrokeKind::Accent,
+                ));
+                let r = p1.distance_to(p2).min(p1.distance_to(p3)).clamp(4.0, 25.0);
+                let a1 = (p2.y - p1.y).atan2(p2.x - p1.x);
+                let mut a2 = (p3.y - p1.y).atan2(p3.x - p1.x);
+                while a2 - a1 > std::f64::consts::PI {
+                    a2 -= std::f64::consts::TAU;
+                }
+                while a2 - a1 < -std::f64::consts::PI {
+                    a2 += std::f64::consts::TAU;
+                }
+                let arc_pts: Vec<Point2D> = (0..=16)
+                    .map(|i| {
+                        let a = a1 + (a2 - a1) * (i as f64 / 16.0);
+                        Point2D::new(p1.x + r * a.cos(), p1.y + r * a.sin())
+                    })
+                    .collect();
+                preview_paths.push(OverlayPath::stroke(
+                    BezierPath::from_polygon(arc_pts, false),
+                    OverlayStrokeKind::Accent,
+                ));
+                preview_handles.push(OverlayHandle::new(p1, HandleShape::Square));
+                preview_handles.push(OverlayHandle::new(p2, HandleShape::Circle));
+                preview_handles.push(OverlayHandle::new(p3, HandleShape::Diamond));
+            } else {
+                preview_paths.push(OverlayPath::stroke(
+                    BezierPath::from_line(p2, p3),
+                    OverlayStrokeKind::Accent,
+                ));
+                let box_r = Rect2D::from_xywh(p3.x, p3.y - 4.0, 18.0, 8.0);
+                preview_paths.push(OverlayPath::stroke(
+                    rect_to_bezier_path(box_r),
+                    OverlayStrokeKind::Secondary,
+                ));
+                preview_handles.push(OverlayHandle::new(p1, HandleShape::Square));
+                preview_handles.push(OverlayHandle::new(p2, HandleShape::Circle));
+                preview_handles.push(OverlayHandle::new(p3, HandleShape::Diamond));
+            }
         }
 
         // 5. Connector snap target ring indicator

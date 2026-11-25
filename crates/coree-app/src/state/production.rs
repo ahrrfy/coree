@@ -10,11 +10,9 @@ impl StudioApp {
     /// Runs `coree_prod::run_preflight` on the active document.
     pub fn run_preflight_active(&mut self) -> Option<PreflightReport> {
         let min_dpi = self.production_state.preflight_min_dpi;
+        let mut rules = self.production_state.preflight_rules.clone();
+        rules.min_dpi = min_dpi;
         let tab = self.tabs.get_mut(self.active_tab)?;
-        let rules = PreflightRules {
-            min_dpi,
-            ..PreflightRules::default()
-        };
         let report = run_preflight(&tab.document, &rules);
         let summary = format!(
             "Preflight: {} error(s), {} warning(s), {} info",
@@ -914,7 +912,7 @@ impl StudioApp {
                     .unwrap_or(obj.transform);
                 (
                     asset,
-                    r.filters,
+                    r.active_filters(),
                     r.crop_rect,
                     r.width_mm,
                     r.height_mm,
@@ -1096,6 +1094,7 @@ impl StudioApp {
                             width_mm: padded.width().max(1.0),
                             height_mm: padded.height().max(1.0),
                             filters: Vec::new(),
+                            filter_enabled: Vec::new(),
                             crop_rect: None,
                         }),
                     )
@@ -1149,6 +1148,9 @@ impl StudioApp {
             _ => return,
         };
         data.filters.push(filter);
+        if !data.filter_enabled.is_empty() {
+            data.filter_enabled.push(true);
+        }
         match self.execute_command(CommandOp::UpdateRaster { id, data }) {
             Ok(()) => self.push_toast("Applied non-destructive bitmap filter", false),
             Err(e) => self.push_toast(e, true),
@@ -1309,7 +1311,7 @@ impl StudioApp {
         mix((data.asset_id.0.as_u128() >> 64) as u64);
         mix(bins as u64);
         mix(data.filters.len() as u64);
-        for b in format!("{:?}", data.filters).as_bytes() {
+        for b in format!("{:?}{:?}", data.filters, data.filter_enabled).as_bytes() {
             mix(u64::from(*b));
         }
         if let Some(cr) = data.crop_rect {
@@ -1328,10 +1330,11 @@ impl StudioApp {
         }
 
         let filtered;
-        let filtered_ref = if data.filters.is_empty() {
+        let active_f = data.active_filters();
+        let filtered_ref = if active_f.is_empty() {
             asset
         } else {
-            filtered = coree_render::apply_raster_filters(asset, &data.filters);
+            filtered = coree_render::apply_raster_filters(asset, &active_f);
             &filtered
         };
 
@@ -1479,13 +1482,31 @@ impl StudioApp {
     #[must_use]
     pub fn build_find_query(&self) -> FindQuery {
         let fr = &self.find_replace_state;
+        let (min_w, max_w) = if fr.use_outline_width {
+            let lo = fr
+                .outline_width_min_mm
+                .min(fr.outline_width_max_mm)
+                .max(0.0);
+            let hi = fr.outline_width_min_mm.max(fr.outline_width_max_mm).max(lo);
+            (Some(lo), Some(hi))
+        } else {
+            (None, None)
+        };
+        let layer_trim = fr.layer_filter.trim();
+        let parsed_layer_id = layer_trim.parse::<u64>().ok().map(LayerId);
+        let layer_name =
+            (!layer_trim.is_empty() && parsed_layer_id.is_none()).then(|| layer_trim.to_owned());
         FindQuery {
             scope: fr.scope,
             object_kind: fr.object_kind,
-            fill_color: None,
-            outline_color: None,
-            outline_width_min_mm: None,
-            outline_width_max_mm: None,
+            fill_color: fr
+                .use_fill_color
+                .then(|| coree_core::ColorMatch::exact(fr.find_fill_color.clone())),
+            outline_color: fr
+                .use_outline_color
+                .then(|| coree_core::ColorMatch::exact(fr.find_outline_color.clone())),
+            outline_width_min_mm: min_w,
+            outline_width_max_mm: max_w,
             is_hairline: fr.filter_hairline,
             font_family: (!fr.font_query.trim().is_empty())
                 .then(|| fr.font_query.trim().to_owned()),
@@ -1498,8 +1519,8 @@ impl StudioApp {
                 )
             }),
             lens_kind: fr.lens_filter,
-            layer_id: None,
-            layer_name: None,
+            layer_id: parsed_layer_id,
+            layer_name,
         }
     }
 
@@ -2014,6 +2035,23 @@ impl StudioApp {
                 self.toolbox_two_column = false;
                 self.show_dockers = true;
             }
+            WorkspacePreset::Illustrator => {
+                let mut state = DockState::new(vec![
+                    DockerTab::Properties,
+                    DockerTab::Objects,
+                    DockerTab::Effects,
+                    DockerTab::SymbolsStyles,
+                ]);
+                state.main_surface_mut().split_below(
+                    NodeIndex::root(),
+                    0.56,
+                    vec![DockerTab::TransformAlignShape, DockerTab::History],
+                );
+                self.dock_state = state;
+                self.toolbox_two_column = true;
+                self.show_dockers = true;
+                self.set_shortcut_profile(ShortcutProfile::StandardVector);
+            }
             WorkspacePreset::PageLayout => {
                 let mut state = DockState::new(vec![
                     DockerTab::Objects,
@@ -2087,6 +2125,7 @@ impl StudioApp {
             dock_state: Some(sanitize_dock_state_for_serde(&self.dock_state)),
             group_active_tools: Some(self.group_active_tools),
             custom_shortcuts: self.custom_shortcuts.clone(),
+            toolbar_config: self.toolbar_config.clone(),
         };
         serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".to_owned())
     }
@@ -2122,6 +2161,7 @@ impl StudioApp {
         if let Some(tools) = bundle.group_active_tools {
             self.group_active_tools = tools;
         }
+        self.toolbar_config = bundle.toolbar_config;
         self.custom_shortcuts = bundle.custom_shortcuts;
         self.set_theme(bundle.theme);
         self.set_ui_language(bundle.ui_language);
@@ -2307,6 +2347,8 @@ impl StudioApp {
                 height_mm: Some(new_h),
                 bleed_mm: None,
                 facing_pages: None,
+                background_fill: None,
+                printable_background: None,
             });
             Ok((ops, new_w, new_h))
         })();
@@ -2701,6 +2743,7 @@ impl StudioApp {
             ShortcutAction::SelectInteractiveFill => self.select_tool(ToolId::InteractiveFill),
             ShortcutAction::SelectMeshFill => self.select_tool(ToolId::MeshFill),
             ShortcutAction::SelectEyedropper => self.select_tool(ToolId::ColorEyedropper),
+            ShortcutAction::SelectTool(tool) => self.select_tool(tool),
             ShortcutAction::OpenEditFill => self.open_edit_fill_dialog(),
             ShortcutAction::FocusOutlinePen => self.open_outline_pen_dialog(),
             ShortcutAction::ZoomIn => self.zoom_step(1.25),
@@ -3466,6 +3509,7 @@ impl StudioApp {
                         clear_gray_icc: false,
                         rendering_intent: None,
                         black_point_compensation: None,
+                        drawing_scale: None,
                     });
                     if let Some(t) = self.active_tab_mut() {
                         t.viewport.multipage_view = next;

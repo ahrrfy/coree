@@ -6,27 +6,90 @@ use super::*;
 // 15 Toolbox Flyout Groups & Complete Tool Registry (re-exported from coree-tools)
 // =============================================================================
 
-/// Associated shortcut action for a [`ToolId`] if one exists.
+/// Associated shortcut action for any of the 65 [`ToolId`] tools (zero unmapped tools).
 #[must_use]
-pub const fn tool_shortcut_action(tool: ToolId) -> Option<ShortcutAction> {
+pub const fn shortcut_action(tool: ToolId) -> Option<ShortcutAction> {
     match tool {
         ToolId::Pick => Some(ShortcutAction::SelectPick),
+        ToolId::FreehandPick => Some(ShortcutAction::SelectTool(ToolId::FreehandPick)),
+        ToolId::FreeTransform => Some(ShortcutAction::SelectTool(ToolId::FreeTransform)),
         ToolId::ShapeNode => Some(ShortcutAction::SelectShapeNode),
+        ToolId::Smooth => Some(ShortcutAction::SelectTool(ToolId::Smooth)),
+        ToolId::Smear => Some(ShortcutAction::SelectTool(ToolId::Smear)),
+        ToolId::Twirl => Some(ShortcutAction::SelectTool(ToolId::Twirl)),
+        ToolId::AttractRepel => Some(ShortcutAction::SelectTool(ToolId::AttractRepel)),
+        ToolId::Roughen => Some(ShortcutAction::SelectTool(ToolId::Roughen)),
+        ToolId::Crop => Some(ShortcutAction::SelectTool(ToolId::Crop)),
+        ToolId::Knife => Some(ShortcutAction::SelectTool(ToolId::Knife)),
+        ToolId::VirtualSegmentDelete => {
+            Some(ShortcutAction::SelectTool(ToolId::VirtualSegmentDelete))
+        }
+        ToolId::Eraser => Some(ShortcutAction::SelectTool(ToolId::Eraser)),
         ToolId::Zoom => Some(ShortcutAction::SelectZoom),
         ToolId::Pan => Some(ShortcutAction::SelectPan),
         ToolId::Freehand => Some(ShortcutAction::SelectFreehand),
+        ToolId::TwoPointLine => Some(ShortcutAction::SelectTool(ToolId::TwoPointLine)),
+        ToolId::Bezier => Some(ShortcutAction::SelectTool(ToolId::Bezier)),
         ToolId::Pen => Some(ShortcutAction::SelectPen),
+        ToolId::BSpline => Some(ShortcutAction::SelectTool(ToolId::BSpline)),
+        ToolId::Polyline => Some(ShortcutAction::SelectTool(ToolId::Polyline)),
+        ToolId::ThreePointCurve => Some(ShortcutAction::SelectTool(ToolId::ThreePointCurve)),
+        ToolId::SmartDrawing => Some(ShortcutAction::SelectTool(ToolId::SmartDrawing)),
+        ToolId::LiveSketch => Some(ShortcutAction::SelectTool(ToolId::LiveSketch)),
+        ToolId::ArtisticMedia => Some(ShortcutAction::SelectTool(ToolId::ArtisticMedia)),
         ToolId::Rectangle => Some(ShortcutAction::SelectRectangle),
+        ToolId::ThreePointRectangle => {
+            Some(ShortcutAction::SelectTool(ToolId::ThreePointRectangle))
+        }
         ToolId::Ellipse => Some(ShortcutAction::SelectEllipse),
+        ToolId::ThreePointEllipse => Some(ShortcutAction::SelectTool(ToolId::ThreePointEllipse)),
         ToolId::Polygon => Some(ShortcutAction::SelectPolygon),
+        ToolId::Star => Some(ShortcutAction::SelectTool(ToolId::Star)),
+        ToolId::ComplexStar => Some(ShortcutAction::SelectTool(ToolId::ComplexStar)),
         ToolId::Spiral => Some(ShortcutAction::SelectSpiral),
         ToolId::GraphPaper => Some(ShortcutAction::SelectGraphPaper),
+        ToolId::Impact => Some(ShortcutAction::SelectTool(ToolId::Impact)),
+        ToolId::BasicShapes => Some(ShortcutAction::SelectTool(ToolId::BasicShapes)),
         ToolId::ArtisticText => Some(ShortcutAction::SelectArtisticText),
+        ToolId::ParagraphText => Some(ShortcutAction::SelectTool(ToolId::ParagraphText)),
+        ToolId::Table => Some(ShortcutAction::SelectTool(ToolId::Table)),
+        ToolId::ParallelDimension => Some(ShortcutAction::SelectTool(ToolId::ParallelDimension)),
+        ToolId::HvDimension => Some(ShortcutAction::SelectTool(ToolId::HvDimension)),
+        ToolId::AngularDimension => Some(ShortcutAction::SelectTool(ToolId::AngularDimension)),
+        ToolId::SegmentDimension => Some(ShortcutAction::SelectTool(ToolId::SegmentDimension)),
+        ToolId::ThreePointCallout => Some(ShortcutAction::SelectTool(ToolId::ThreePointCallout)),
+        ToolId::StraightConnector => Some(ShortcutAction::SelectTool(ToolId::StraightConnector)),
+        ToolId::RightAngleConnector => {
+            Some(ShortcutAction::SelectTool(ToolId::RightAngleConnector))
+        }
+        ToolId::DropShadow => Some(ShortcutAction::SelectTool(ToolId::DropShadow)),
+        ToolId::BlockShadow => Some(ShortcutAction::SelectTool(ToolId::BlockShadow)),
+        ToolId::Contour => Some(ShortcutAction::SelectTool(ToolId::Contour)),
+        ToolId::Blend => Some(ShortcutAction::SelectTool(ToolId::Blend)),
+        ToolId::Distort => Some(ShortcutAction::SelectTool(ToolId::Distort)),
+        ToolId::Envelope => Some(ShortcutAction::SelectTool(ToolId::Envelope)),
+        ToolId::Extrude25D => Some(ShortcutAction::SelectTool(ToolId::Extrude25D)),
+        ToolId::Transparency => Some(ShortcutAction::SelectTool(ToolId::Transparency)),
         ToolId::ColorEyedropper => Some(ShortcutAction::SelectEyedropper),
+        ToolId::AttributesEyedropper => {
+            Some(ShortcutAction::SelectTool(ToolId::AttributesEyedropper))
+        }
         ToolId::InteractiveFill => Some(ShortcutAction::SelectInteractiveFill),
         ToolId::MeshFill => Some(ShortcutAction::SelectMeshFill),
-        _ => None,
+        ToolId::SmartFill => Some(ShortcutAction::SelectTool(ToolId::SmartFill)),
+        ToolId::LensTool => Some(ShortcutAction::SelectTool(ToolId::LensTool)),
+        ToolId::BitmapBrush => Some(ShortcutAction::SelectTool(ToolId::BitmapBrush)),
+        ToolId::BitmapEraser => Some(ShortcutAction::SelectTool(ToolId::BitmapEraser)),
+        ToolId::CloneStamp => Some(ShortcutAction::SelectTool(ToolId::CloneStamp)),
+        ToolId::Smudge => Some(ShortcutAction::SelectTool(ToolId::Smudge)),
+        ToolId::MaskSelect => Some(ShortcutAction::SelectTool(ToolId::MaskSelect)),
     }
+}
+
+/// Associated shortcut action for a [`ToolId`] if one exists.
+#[must_use]
+pub const fn tool_shortcut_action(tool: ToolId) -> Option<ShortcutAction> {
+    shortcut_action(tool)
 }
 
 // =============================================================================
@@ -95,22 +158,7 @@ impl DockerTab {
     /// Localized short tab title displayed in `egui_dock` (respecting English / Arabic UAX #9 BiDi).
     #[must_use]
     pub fn title_for(self, lang: crate::theme::StudioLanguage) -> String {
-        match self {
-            Self::Objects => lang.tr_ui("Objects", "الكائنات والطبقات"),
-            Self::Properties => lang.tr_ui("Properties", "الخصائص"),
-            Self::Lens => lang.tr_ui("Lens", "العدسات"),
-            Self::Effects => lang.tr_ui("Effects", "التأثيرات"),
-            Self::TransformAlignShape => lang.tr_ui("Transform", "التحويل والمحاذاة"),
-            Self::VectorTrace => lang.tr_ui("Vector Trace", "التتبع المتجهي"),
-            Self::BitmapStudio => lang.tr_ui("Bitmap Studio", "استوديو الصور"),
-            Self::Production => lang.tr_ui("Production", "الإنتاج والطباعة"),
-            Self::FindReplace => lang.tr_ui("Find & Replace", "البحث والاستبدال"),
-            Self::SymbolsStyles => lang.tr_ui("Symbols", "الرموز والأنماط"),
-            Self::FontManager => lang.tr_ui("Fonts", "الخطوط"),
-            Self::History => lang.tr_ui("History", "السجل والتراجع"),
-            Self::Macros => lang.tr_ui("Macros", "الماكرو والأتمتة"),
-            Self::CdrInspector => lang.tr_ui("CDR Inspector", "فاحص CDR"),
-        }
+        crate::i18n::docker_i18n_key(self).tr_ui(lang)
     }
 }
 
@@ -151,17 +199,19 @@ pub enum WorkspacePreset {
     DefaultClassic,
     Lite,
     Illustration,
+    Illustrator,
     PageLayout,
     LaserSignStudio,
     TouchCompact,
 }
 
 impl WorkspacePreset {
-    /// All 6 built-in workspace presets.
-    pub const ALL: [Self; 6] = [
+    /// All 7 built-in workspace presets.
+    pub const ALL: [Self; 7] = [
         Self::DefaultClassic,
         Self::Lite,
         Self::Illustration,
+        Self::Illustrator,
         Self::PageLayout,
         Self::LaserSignStudio,
         Self::TouchCompact,
@@ -174,10 +224,17 @@ impl WorkspacePreset {
             Self::DefaultClassic => "Default Classic",
             Self::Lite => "Lite",
             Self::Illustration => "Illustration",
+            Self::Illustrator => "Illustrator",
             Self::PageLayout => "Page Layout",
             Self::LaserSignStudio => "Laser & Sign Studio",
             Self::TouchCompact => "Touch Compact",
         }
+    }
+
+    /// Localized workspace name respecting English / Arabic UAX #9 BiDi.
+    #[must_use]
+    pub fn label_for(self, lang: crate::theme::StudioLanguage) -> String {
+        crate::i18n::workspace_i18n_key(self).tr_ui(lang)
     }
 
     /// Short description for Preferences & Workspace switcher.
@@ -189,11 +246,57 @@ impl WorkspacePreset {
             Self::Illustration => {
                 "Focused drawing workspace with Effects, Lens, Symbols & History."
             }
+            Self::Illustrator => {
+                "Universal vector workflow (`V`/`P`/`R`/`O`/`T`) with Properties, Symbols & Effects."
+            }
             Self::PageLayout => "Multi-page publishing with Fonts, Find & Replace & Production.",
             Self::LaserSignStudio => {
                 "Cut/engrave workflow with Production, Transform & CDR Inspector."
             }
             Self::TouchCompact => "Two-column toolbox and compact dockers for smaller displays.",
+        }
+    }
+}
+
+/// Customizable visibility & group ordering for the top Standard Toolbar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolbarConfig {
+    #[serde(default = "default_true_persist")]
+    pub show_file_ops: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_undo_redo: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_clipboard: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_zoom: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_view_mode: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_snap_toggles: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_layout_toggles: bool,
+    #[serde(default = "default_true_persist")]
+    pub show_drawing_scale: bool,
+    #[serde(default = "default_toolbar_group_order")]
+    pub group_order: Vec<usize>,
+}
+
+fn default_toolbar_group_order() -> Vec<usize> {
+    vec![0, 1, 2, 3, 4, 5, 6, 7]
+}
+
+impl Default for ToolbarConfig {
+    fn default() -> Self {
+        Self {
+            show_file_ops: true,
+            show_undo_redo: true,
+            show_clipboard: true,
+            show_zoom: true,
+            show_view_mode: true,
+            show_snap_toggles: true,
+            show_layout_toggles: true,
+            show_drawing_scale: true,
+            group_order: default_toolbar_group_order(),
         }
     }
 }
@@ -219,6 +322,8 @@ pub(crate) struct ToolboxPersistConfig {
     pub(crate) object_origin_anchor: (u8, u8),
     #[serde(default)]
     pub(crate) group_active_tools: Option<[ToolId; 15]>,
+    #[serde(default)]
+    pub(crate) toolbar_config: ToolbarConfig,
 }
 
 /// Serializable `.coreews` workspace configuration bundle (portable across headless & desktop sessions).
@@ -242,6 +347,8 @@ pub(crate) struct WorkspaceBundle {
     pub(crate) group_active_tools: Option<[ToolId; 15]>,
     #[serde(default)]
     pub(crate) custom_shortcuts: CustomShortcutMap,
+    #[serde(default)]
+    pub(crate) toolbar_config: ToolbarConfig,
 }
 
 /// Live on-canvas inline text editing state (`ArtisticText` / `ParagraphText`).
@@ -284,6 +391,7 @@ pub struct ToolSettings {
     pub artistic_media_profile: ArtisticWidthProfile,
     pub sculpt_radius_mm: f64,
     pub sculpt_strength: f64,
+    pub sculpt_sub_mode: coree_tools::SculptSubMode,
     pub eraser_radius_mm: f64,
     pub brush_radius_px: f32,
     pub brush_hardness: f32,
@@ -333,6 +441,7 @@ impl Default for ToolSettings {
             artistic_media_profile: ArtisticWidthProfile::TaperBoth,
             sculpt_radius_mm: 10.0,
             sculpt_strength: 0.35,
+            sculpt_sub_mode: coree_tools::SculptSubMode::Attract,
             eraser_radius_mm: 5.0,
             brush_radius_px: 12.0,
             brush_hardness: 0.8,
@@ -390,6 +499,7 @@ impl ToolSettings {
             artistic_media_profile: self.artistic_media_profile.clone(),
             sculpt_radius_mm: self.sculpt_radius_mm,
             sculpt_strength: self.sculpt_strength,
+            sculpt_sub_mode: self.sculpt_sub_mode,
             eraser_radius_mm: self.eraser_radius_mm,
             brush_radius_px: self.brush_radius_px,
             raster_op: self.raster_op,
@@ -776,6 +886,10 @@ impl Default for TransformDockerState {
     }
 }
 
+/// Cached traced contours for `SplitPreview` `(config_hash, Vec<(path, color)>)`.
+pub type SplitPreviewCache =
+    std::cell::RefCell<Option<(u64, Vec<(coree_core::BezierPath, Color)>)>>;
+
 /// Vector Trace Docker state (`S11`).
 #[derive(Debug, Clone)]
 pub struct TraceDockerState {
@@ -787,6 +901,9 @@ pub struct TraceDockerState {
     pub remove_background: bool,
     pub corner_threshold: f64,
     pub speckle_size: usize,
+    pub split_preview: bool,
+    pub split_divider: f32,
+    pub split_preview_cache: SplitPreviewCache,
 }
 
 impl Default for TraceDockerState {
@@ -800,6 +917,9 @@ impl Default for TraceDockerState {
             remove_background: true,
             corner_threshold: 60.0,
             speckle_size: 4,
+            split_preview: false,
+            split_divider: 0.5,
+            split_preview_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -833,6 +953,13 @@ pub struct BitmapDockerState {
     pub param_a: f32,
     pub param_b: f32,
     pub param_c: f32,
+    pub tone_curve_points: Vec<(f32, f32)>,
+    pub selected_curve_point: Option<usize>,
+    pub mixer_red: [f32; 3],
+    pub mixer_green: [f32; 3],
+    pub mixer_blue: [f32; 3],
+    pub mixer_mono: bool,
+    pub selected_filter_stack_idx: Option<usize>,
     pub resample_w: u32,
     pub resample_h: u32,
     pub resample_algo: coree_render::ResampleAlgorithm,
@@ -851,6 +978,13 @@ impl Default for BitmapDockerState {
             param_a: 0.15,
             param_b: 0.15,
             param_c: 1.0,
+            tone_curve_points: vec![(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
+            selected_curve_point: None,
+            mixer_red: [1.0, 0.0, 0.0],
+            mixer_green: [0.0, 1.0, 0.0],
+            mixer_blue: [0.0, 0.0, 1.0],
+            mixer_mono: false,
+            selected_filter_stack_idx: None,
             resample_w: 512,
             resample_h: 512,
             resample_algo: coree_render::ResampleAlgorithm::Bicubic,
@@ -898,11 +1032,15 @@ impl BitmapDockerState {
                 contrast: self.param_b.clamp(-1.0, 1.0),
             },
             1 => RasterFilter::ToneCurve {
-                points: vec![
-                    (0.0, 0.0),
-                    (0.5, (0.5 + self.param_a * 0.4).clamp(0.05, 0.95)),
-                    (1.0, 1.0),
-                ],
+                points: if self.tone_curve_points.len() >= 2 {
+                    self.tone_curve_points.clone()
+                } else {
+                    vec![
+                        (0.0, 0.0),
+                        (0.5, (0.5 + self.param_a * 0.4).clamp(0.05, 0.95)),
+                        (1.0, 1.0),
+                    ]
+                },
             },
             2 => RasterFilter::Levels {
                 in_black: self.param_a.clamp(0.0, 0.45),
@@ -970,13 +1108,23 @@ impl BitmapDockerState {
                 sensitivity: self.param_c.clamp(0.2, 4.0),
             },
             _ => RasterFilter::ChannelMixer {
-                red: [self.param_c.clamp(-2.0, 2.0), self.param_a, 0.0],
-                green: [0.0, self.param_c.clamp(-2.0, 2.0), self.param_b],
-                blue: [self.param_a * 0.5, 0.0, self.param_c.clamp(-2.0, 2.0)],
-                monochrome: self.param_b < -0.5,
+                red: self.mixer_red,
+                green: self.mixer_green,
+                blue: self.mixer_blue,
+                monochrome: self.mixer_mono,
             },
         }
     }
+}
+
+/// Severity filter tabs for Preflight Audit (`S13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreflightSeverityFilter {
+    #[default]
+    All,
+    Errors,
+    Warnings,
+    Info,
 }
 
 /// Production & Prepress Docker state (`S12`, `S13`, `S14`).
@@ -984,6 +1132,8 @@ impl BitmapDockerState {
 pub struct ProductionDockerState {
     pub sub_section: usize, // 0=Preflight, 1=Separations/Imposition, 2=Cut/Dielines, 3=Barcode/QR, 4=Merge/Collect
     pub preflight_min_dpi: f64,
+    pub preflight_severity: PreflightSeverityFilter,
+    pub preflight_rules: PreflightRules,
     pub cut_offset_mm: f64,
     pub cut_spot_name: String,
     pub dieline_type: usize, // 0=TuckEndBox, 1=Envelope, 2=ShoppingBag, 3=StickerSheet, 4=Fefco
@@ -1028,6 +1178,8 @@ impl Default for ProductionDockerState {
         Self {
             sub_section: 0,
             preflight_min_dpi: 300.0,
+            preflight_severity: PreflightSeverityFilter::All,
+            preflight_rules: PreflightRules::default(),
             cut_offset_mm: 2.0,
             cut_spot_name: "CutContour".to_owned(),
             dieline_type: 0,
@@ -1078,10 +1230,20 @@ pub struct FindReplaceState {
     pub text_query: String,
     pub replace_text: String,
     pub case_sensitive: bool,
+    pub use_fill_color: bool,
+    pub find_fill_color: Color,
+    pub use_outline_color: bool,
+    pub find_outline_color: Color,
+    pub use_outline_width: bool,
+    pub outline_width_min_mm: f64,
+    pub outline_width_max_mm: f64,
     pub filter_hairline: Option<bool>,
     pub font_query: String,
     pub replace_font: String,
     pub replace_fill_color: Color,
+    pub replace_outline_color: Color,
+    pub replace_outline_width_mm: f64,
+    pub layer_filter: String,
     pub cql_query: String,
     pub last_cql_error: Option<String>,
     pub last_report: Option<FindReplaceReport>,
@@ -1096,15 +1258,63 @@ impl Default for FindReplaceState {
             text_query: String::new(),
             replace_text: String::new(),
             case_sensitive: false,
+            use_fill_color: false,
+            find_fill_color: Color::BLACK,
+            use_outline_color: false,
+            find_outline_color: Color::BLACK,
+            use_outline_width: false,
+            outline_width_min_mm: 0.0,
+            outline_width_max_mm: 5.0,
             filter_hairline: None,
             font_query: String::new(),
             replace_font: "Noto Sans".to_owned(),
             replace_fill_color: Color::CYAN,
+            replace_outline_color: Color::MAGENTA,
+            replace_outline_width_mm: 0.5,
+            layer_filter: String::new(),
             cql_query: String::new(),
             last_cql_error: None,
             last_report: None,
         }
     }
+}
+
+/// One missing font entry in the `CRLFOM` modal substitution dialog (`REQ-07`).
+#[derive(Debug, Clone)]
+pub struct MissingFontPromptEntry {
+    pub missing_family: String,
+    pub suggested_family: String,
+    pub selected_family: String,
+    pub panose_distance: Option<u32>,
+}
+
+/// Interactive `CRLFOM` missing-font `PANOSE` substitution dialog state.
+#[derive(Debug, Clone)]
+pub struct MissingFontPromptState {
+    pub open: bool,
+    pub document_title: String,
+    pub entries: Vec<MissingFontPromptEntry>,
+    pub remember_rules: bool,
+}
+
+impl Default for MissingFontPromptState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            document_title: String::new(),
+            entries: Vec::new(),
+            remember_rules: true,
+        }
+    }
+}
+
+/// Interactive `S15` `.cdr` legacy codepage import dialog state (`CP1256` / `CP1251` / `UTF-8`).
+#[derive(Debug, Clone, Default)]
+pub struct CdrImportPromptState {
+    pub open: bool,
+    pub pending_path: Option<PathBuf>,
+    pub selected_codepage: Option<u16>,
+    pub preview_summary: String,
 }
 
 /// Font Manager Docker state (`S07`).

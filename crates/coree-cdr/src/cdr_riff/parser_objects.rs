@@ -8,7 +8,9 @@ use super::fild_outl::{
 use super::legacy_v3_v5::parse_v3_v5_loda;
 use super::loda::{parse_loda_chunk, CdrNativeEllipse, CdrNativeRect, ParsedLoda, ParsedObjProps};
 use super::parser::{parse_group_list, register_bmp_chunk_payload, ParseContext};
-use super::text_style::{parse_stlt_chunk, parse_txsm_chunk, ParsedStyleEntry};
+use super::text_style::{
+    parse_stlt_chunk, parse_txsm_chunk_with_default_codepage, ParsedStyleEntry,
+};
 use crate::coord::{cdr32_to_mm, read_tagged_color};
 use crate::error::{CdrError, CdrResult};
 use crate::limits::ByteReader;
@@ -364,7 +366,7 @@ pub(super) fn parse_object_list(
         } else {
             ctx.zcf.stylesheet.default_artistic_text()
         };
-        match parse_txsm_chunk(
+        match parse_txsm_chunk_with_default_codepage(
             &raw_txsm,
             loda.style_id,
             inline_style.as_ref(),
@@ -372,6 +374,7 @@ pub(super) fn parse_object_list(
             &ctx.styles,
             &ctx.fonts,
             cdss_default,
+            ctx.default_codepage,
         ) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -393,6 +396,7 @@ pub(super) fn parse_object_list(
                 width_mm: bmp_ref.width_mm,
                 height_mm: bmp_ref.height_mm,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: bmp_ref.crop_rect,
             })
         })
@@ -409,6 +413,7 @@ pub(super) fn parse_object_list(
             width_mm: w_mm,
             height_mm: h_mm,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }))
     } else if !powerclip_children.is_empty() || loda.powerclip_meta.is_some() {

@@ -1604,6 +1604,7 @@ const fn command_op_type_name(op: &CommandOp) -> &'static str {
         CommandOp::SetPageProperties { .. } => "SetPageProperties",
         CommandOp::ReorderPages { .. } => "ReorderPages",
         CommandOp::RenameLayer { .. } => "RenameLayer",
+        CommandOp::ReorderLayers { .. } => "ReorderLayers",
         CommandOp::ReorderLayerObjects { .. } => "ReorderLayerObjects",
         CommandOp::SetGridConfig { .. } => "SetGridConfig",
         CommandOp::SetPerspectiveGrid { .. } => "SetPerspectiveGrid",

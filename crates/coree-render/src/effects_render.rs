@@ -172,6 +172,37 @@ pub fn render_underlay_effects(
     icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
+    render_underlay_effects_with_sym(
+        doc,
+        obj,
+        deformed_local_path,
+        world_xf,
+        parent_to_screen,
+        page_to_surface,
+        None,
+        px_per_mm,
+        anti_alias,
+        icc,
+        backend,
+    );
+}
+
+/// Symbol-aware variant of [`render_underlay_effects`] resolving `Blend` targets and guide paths
+/// within an enclosing [`crate::renderer::SymRenderCtx`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_underlay_effects_with_sym(
+    doc: &Document,
+    obj: &SceneObject,
+    deformed_local_path: &BezierPath,
+    world_xf: Affine2D,
+    parent_to_screen: Affine2D,
+    page_to_surface: Affine2D,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    px_per_mm: f64,
+    anti_alias: bool,
+    icc: &IccColorPipeline,
+    backend: &mut dyn CanvasBackend,
+) {
     if !world_xf.is_finite() || !parent_to_screen.is_finite() || !page_to_surface.is_finite() {
         return;
     }
@@ -290,6 +321,7 @@ pub fn render_underlay_effects(
                     *rotation_deg,
                     *along_path,
                     *rotate_along_path,
+                    sym_ctx,
                     page_to_surface,
                     px_per_mm,
                     anti_alias,
@@ -318,6 +350,130 @@ pub fn render_underlay_effects(
                     icc,
                     backend,
                 );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Renders wireframe construction skeletons for live effects (`Contour`, `Extrude25D`,
+/// `BlockShadow`, `Blend`) in [`coree_core::ViewMode::Wireframe`]. Skipped in
+/// [`coree_core::ViewMode::SimpleWireframe`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stroke_wireframe_effects(
+    doc: &Document,
+    obj: &SceneObject,
+    deformed_local_path: &BezierPath,
+    world_xf: Affine2D,
+    parent_to_screen: Affine2D,
+    page_to_surface: Affine2D,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    px_per_mm: f64,
+    wireframe_color: &Color,
+    backend: &mut dyn CanvasBackend,
+) {
+    if obj.effects.is_empty()
+        || !world_xf.is_finite()
+        || !parent_to_screen.is_finite()
+        || !page_to_surface.is_finite()
+    {
+        return;
+    }
+    let st = StrokeParams {
+        color: wireframe_color.clone(),
+        width: (1.0 / px_per_mm.max(1e-3)) as f32,
+        cap: coree_core::LineCap::Butt,
+        join: coree_core::LineJoin::Miter,
+        miter_limit: 4.0,
+        dash_pattern: Vec::new(),
+        dash_offset: 0.0,
+        opacity: 1.0,
+        blend_mode: BlendMode::Normal,
+        anti_alias: true,
+    };
+    let world_path = deformed_local_path.transformed(&world_xf);
+    let page_world_xf = page_to_surface
+        .inverse()
+        .map(|inv| inv.compose(&parent_to_screen).compose(&world_xf))
+        .filter(|m| m.is_finite())
+        .unwrap_or(world_xf);
+    let page_world_path = deformed_local_path.transformed(&page_world_xf);
+    let icc = IccColorPipeline::default();
+
+    for eff in &obj.effects {
+        match eff {
+            Effect::Contour {
+                mode,
+                steps,
+                offset_mm,
+                fill_color,
+                outline_color,
+            } => {
+                for (_, ring, _, _) in compute_contour_rings(
+                    &world_path,
+                    *mode,
+                    *steps,
+                    *offset_mm,
+                    &Color::BLACK,
+                    fill_color,
+                    &obj.outline,
+                    outline_color,
+                    &icc,
+                    false,
+                ) {
+                    backend.stroke_path(&ring, &st, parent_to_screen);
+                }
+            }
+            Effect::BlockShadow { dx_mm, dy_mm, .. } => {
+                let shifted = world_path.transformed(&Affine2D::translate(
+                    sanitize_f64(*dx_mm, 0.0),
+                    sanitize_f64(*dy_mm, 0.0),
+                ));
+                backend.stroke_path(&shifted, &st, parent_to_screen);
+            }
+            Effect::Extrude25D {
+                vanishing_point,
+                depth,
+                shade_color,
+                light_dir,
+                ..
+            } => {
+                for (quad, _) in compute_extrude_25d_faces(
+                    &page_world_path,
+                    Color::BLACK,
+                    *vanishing_point,
+                    *depth,
+                    shade_color,
+                    *light_dir,
+                    &icc,
+                    false,
+                ) {
+                    let qp = BezierPath::from_polygon(quad, true);
+                    backend.stroke_path(&qp, &st, page_to_surface);
+                }
+            }
+            Effect::Blend {
+                target_id,
+                steps,
+                rotation_deg,
+                along_path,
+                rotate_along_path,
+            } => {
+                for step in compute_blend_steps(
+                    doc,
+                    obj,
+                    &page_world_path,
+                    *target_id,
+                    *steps,
+                    *rotation_deg,
+                    *along_path,
+                    *rotate_along_path,
+                    sym_ctx,
+                    &icc,
+                    false,
+                ) {
+                    backend.stroke_path(&step.path, &st, page_to_surface);
+                }
             }
             _ => {}
         }
@@ -1580,14 +1736,20 @@ fn compute_blend_steps(
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
     icc: &IccColorPipeline,
     preserve_doc_rgb: bool,
 ) -> Vec<ComputedBlendStep> {
     let n_steps = steps.clamp(1, 999);
-    let Some(target_obj) = doc.object(target_id) else {
+    let sym_map = sym_ctx.map(|(m, _, _)| m);
+    let Some(target_obj) = sym_map
+        .and_then(|m| m.get(&target_id).copied())
+        .or_else(|| doc.object(target_id))
+    else {
         return Vec::new();
     };
-    let Some(target_world_path) = doc.world_path_of(target_id) else {
+    let Some(target_world_path) = crate::renderer::resolve_sym_world_path(doc, target_id, sym_ctx)
+    else {
         return Vec::new();
     };
 
@@ -1627,7 +1789,8 @@ fn compute_blend_steps(
 
     let src_root = centroid(&contour_pairs.iter().map(|p| p.2).collect::<Vec<_>>());
     let dst_root = centroid(&contour_pairs.iter().map(|p| p.3).collect::<Vec<_>>());
-    let host_path = along_path.and_then(|pid| doc.world_path_of(pid));
+    let host_path =
+        along_path.and_then(|pid| crate::renderer::resolve_sym_world_path(doc, pid, sym_ctx));
 
     let src_fill = primary_fill_color(&src_obj.fill);
     let dst_fill = primary_fill_color(&target_obj.fill);
@@ -1708,6 +1871,7 @@ fn render_blend_effect(
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
     page_to_screen: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
@@ -1723,6 +1887,7 @@ fn render_blend_effect(
         rotation_deg,
         along_path,
         rotate_along_path,
+        sym_ctx,
         icc,
         false,
     ) {
@@ -2751,6 +2916,7 @@ fn emit_lowered_blend_objects(
         rotation_deg,
         along_path,
         rotate_along_path,
+        None,
         icc,
         true,
     )

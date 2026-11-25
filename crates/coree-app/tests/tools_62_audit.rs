@@ -9,7 +9,8 @@
 
 use coree_app::shortcuts::{resolve_shortcut, ShortcutAction, ShortcutProfile};
 use coree_app::state::{
-    NodeSmoothness, PointerEvent, RasterBrushOp, StudioApp, ToolId, WorkspacePreset, TOOL_GROUPS,
+    KeyEvent, ModifiersState, NodeSmoothness, PointerButton, PointerEvent, RasterBrushOp,
+    StudioApp, ToolId, ToolKey, WorkspacePreset, TOOL_GROUPS,
 };
 use coree_core::{
     Affine2D, AlignOp, BezierPath, Color, ColorMode, CommandOp, ContourMode, CornerStyle, Effect,
@@ -928,7 +929,7 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         .iter()
         .any(|e| matches!(e, Effect::Distort { .. })));
 
-    // 6. Envelope (8-point Coons cage initialized and warped)
+    // 6. Envelope (12-point cubic cage initialized and warped via coree-tools)
     assert!(app.apply_interactive_effect_drag(
         ToolId::Envelope,
         Point2D::new(45.0, 20.0),
@@ -942,7 +943,7 @@ fn audit_all_7_interactive_effect_tools_transparency_and_mesh_fill() {
         .unwrap()
         .effects
         .iter()
-        .any(|e| matches!(e, Effect::Envelope { cage, .. } if cage.len() == 8)));
+        .any(|e| matches!(e, Effect::Envelope { cage, .. } if cage.len() == 12)));
 
     // 7. Extrude25D
     assert!(app.apply_interactive_effect_drag(
@@ -1796,6 +1797,7 @@ fn regression_raster_zero_dim_floodfill_no_panic() {
             width_mm: 50.0,
             height_mm: 50.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -2008,6 +2010,7 @@ fn regression_locked_layer_and_nested_container_invariants() {
             width_mm: 50.0,
             height_mm: 50.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -2288,5 +2291,226 @@ fn regression_locked_layer_and_nested_container_invariants() {
             .unwrap()
             .effects,
         effects_before
+    );
+}
+
+#[test]
+fn w5a_audit_65_tools_toolcore_pointer_transient_overlay_and_space_stamp() {
+    let mut all_count = 0usize;
+    for &tool in TOOL_GROUPS.iter().flat_map(|g| g.iter()) {
+        all_count += 1;
+        assert!(
+            coree_app::state::tool_shortcut_action(tool).is_some(),
+            "every ToolId ({tool:?}) must map to a ShortcutAction without fallback"
+        );
+    }
+    assert_eq!(all_count, 65, "TOOL_GROUPS must enumerate all 65 ToolIds");
+    let mut app = StudioApp::new_headless();
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(30.0, 30.0, 50.0, 40.0));
+    let id = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+    if let Some(tab) = app.active_tab_mut() {
+        let doc_snap = tab.document.clone();
+        tab.selection.select_single(&doc_snap, id);
+    }
+    app.select_tool(ToolId::Pick);
+
+    // 1. ToolCore pointer down/move/up produces TransientOverlay + active_live_world_transform
+    //    without mutating Document mid-drag, and Spacebar stamps a live duplicate (`MND-02`/`IMP-08`).
+    let initial_count = app.active_tab().unwrap().document.objects().len();
+    let orig_bounds = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(id)
+        .expect("rect bounds before drag");
+    app.run_tool_pointer_down(&PointerEvent {
+        world_pt_mm: Point2D::new(50.0, 45.0),
+        screen_pt_px: [200.0, 200.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    app.run_tool_pointer_move(&PointerEvent {
+        world_pt_mm: Point2D::new(80.0, 65.0),
+        screen_pt_px: [300.0, 260.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    {
+        let tab = app.active_tab().unwrap();
+        assert_eq!(
+            tab.tool_core.active_live_world_transform(),
+            Some(Affine2D::translate(30.0, 20.0)),
+            "ToolCore must report live world transform delta mid-drag"
+        );
+        assert!(
+            !tab.transient_overlay.preview_paths.is_empty(),
+            "TransientOverlay must carry live preview paths during Pick move drag"
+        );
+        assert_eq!(
+            tab.transient_overlay.cursor_hint,
+            coree_app::state::CursorHint::Move
+        );
+        assert_eq!(
+            tab.document.world_object_bounds(id),
+            Some(orig_bounds),
+            "Document must remain unmutated mid-drag prior to pointer release"
+        );
+    }
+    app.run_tool_key_event(&KeyEvent {
+        key: ToolKey::Space,
+        modifiers: ModifiersState::default(),
+    });
+    assert_eq!(
+        app.active_tab().unwrap().document.objects().len(),
+        initial_count + 1,
+        "Spacebar during active drag must stamp a duplicate object"
+    );
+    app.run_tool_pointer_move(&PointerEvent {
+        world_pt_mm: Point2D::new(120.0, 90.0),
+        screen_pt_px: [420.0, 330.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    app.run_tool_pointer_up(&PointerEvent {
+        world_pt_mm: Point2D::new(120.0, 90.0),
+        screen_pt_px: [420.0, 330.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    {
+        let tab = app.active_tab().unwrap();
+        assert!(
+            tab.transient_overlay.preview_paths.is_empty(),
+            "TransientOverlay must clear on pointer up"
+        );
+        assert!(
+            tab.tool_core.active_live_world_transform().is_none(),
+            "live world transform must clear on pointer up"
+        );
+        let moved_bounds = tab
+            .document
+            .world_object_bounds(id)
+            .expect("moved rect bounds");
+        assert!((moved_bounds.min().x - (orig_bounds.min().x + 70.0)).abs() < 1e-4);
+        assert!((moved_bounds.min().y - (orig_bounds.min().y + 45.0)).abs() < 1e-4);
+        let stamped_id = *tab
+            .document
+            .objects()
+            .keys()
+            .find(|&&oid| oid != id)
+            .expect("stamped duplicate object");
+        let stamped_bounds = tab
+            .document
+            .world_object_bounds(stamped_id)
+            .expect("stamped rect bounds");
+        assert!((stamped_bounds.min().x - (orig_bounds.min().x + 30.0)).abs() < 1e-4);
+        assert!((stamped_bounds.min().y - (orig_bounds.min().y + 20.0)).abs() < 1e-4);
+    }
+
+    // 2. Double-click toggles RotateAndSkew and dragging the center pivot enters DraggingPivot.
+    if let Some(tab) = app.active_tab_mut() {
+        let doc_snap = tab.document.clone();
+        tab.selection.select_single(&doc_snap, id);
+    }
+    let center = app
+        .active_tab()
+        .unwrap()
+        .document
+        .world_object_bounds(id)
+        .unwrap()
+        .center();
+    app.run_tool_pointer_down(&PointerEvent {
+        world_pt_mm: center,
+        screen_pt_px: [320.0, 270.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 2,
+        stylus: coree_core::StylusSample::default(),
+    });
+    app.run_tool_pointer_up(&PointerEvent {
+        world_pt_mm: center,
+        screen_pt_px: [320.0, 270.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 2,
+        stylus: coree_core::StylusSample::default(),
+    });
+    assert_eq!(
+        app.active_tab().unwrap().selection.transform_mode,
+        coree_core::TransformMode::RotateAndSkew,
+        "double-clicking solely selected object must enter RotateAndSkew mode"
+    );
+    let pivot_before = app.active_tab().unwrap().selection.pivot;
+    let pivot_target = Point2D::new(pivot_before.x + 12.0, pivot_before.y - 8.0);
+    app.run_tool_pointer_down(&PointerEvent {
+        world_pt_mm: pivot_before,
+        screen_pt_px: [320.0, 270.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    assert!(
+        matches!(
+            app.active_tab().unwrap().tool_core.drag_state,
+            coree_app::state::ActiveDragState::DraggingPivot
+        ),
+        "pressing on rotation pivot in RotateAndSkew mode must enter ActiveDragState::DraggingPivot"
+    );
+    app.run_tool_pointer_move(&PointerEvent {
+        world_pt_mm: pivot_target,
+        screen_pt_px: [360.0, 240.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    assert!(
+        app.active_tab()
+            .unwrap()
+            .selection
+            .pivot
+            .distance_to(pivot_target)
+            < 1e-4,
+        "DraggingPivot move must update SelectionState::pivot"
+    );
+    app.run_tool_pointer_up(&PointerEvent {
+        world_pt_mm: pivot_target,
+        screen_pt_px: [360.0, 240.0],
+        button: PointerButton::Primary,
+        modifiers: ModifiersState::default(),
+        click_count: 1,
+        stylus: coree_core::StylusSample::default(),
+    });
+    assert!(
+        matches!(
+            app.active_tab().unwrap().tool_core.drag_state,
+            coree_app::state::ActiveDragState::Idle
+        ),
+        "releasing pivot drag must return ToolCore to Idle"
+    );
+    assert!(
+        app.active_tab()
+            .unwrap()
+            .selection
+            .pivot
+            .distance_to(pivot_target)
+            < 1e-4
     );
 }

@@ -425,10 +425,16 @@ pub fn list_cups_printers_ipp(socket_path: &Path) -> Result<Vec<PrinterInfo>, St
     let printers_pkt = encode_ipp_packet(
         IPP_OP_CUPS_GET_PRINTERS,
         2,
-        &[(
-            "requested-attributes",
-            IppAttrValue::Str(IPP_TAG_KEYWORD, "printer-name".to_owned()),
-        )],
+        &[
+            (
+                "requested-attributes",
+                IppAttrValue::Str(IPP_TAG_KEYWORD, "printer-name".to_owned()),
+            ),
+            (
+                "",
+                IppAttrValue::Str(IPP_TAG_KEYWORD, "printer-state".to_owned()),
+            ),
+        ],
         &[],
         &[],
     );

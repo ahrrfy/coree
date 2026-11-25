@@ -255,6 +255,13 @@ impl StudioApp {
             apply_theme(&ctx, self.theme);
             self.theme_dirty = false;
         }
+        crate::i18n::ShellLayoutDirections::from_language(self.ui_language).apply_to_ctx(&ctx);
+        let localized_title = format!(
+            "{} — {}",
+            crate::i18n::I18nKey::AppTitle.tr(self.ui_language),
+            crate::i18n::I18nKey::AppSubtitle.tr(self.ui_language)
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(localized_title));
 
         // Poll async background jobs, printer discovery, incoming single-instance IPC files, toasts, autosave
         self.tick_background_jobs();

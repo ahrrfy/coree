@@ -7,9 +7,9 @@ use crate::boolean::{apply_boolean, apply_boolean_many, BooleanOp};
 use crate::color::{Color, ColorMode, ColorPalette, ColorStyle, ColorStyleId};
 use crate::dimension::{AnchorPoint, DimensionObject};
 use crate::document::{
-    AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig, Guide, GuideOrientation,
-    MasterLayerScope, NodePayload, Page, PerspectiveGridConfig, PowerClipFitMode, RasterAsset,
-    RasterLayerData, SceneObject, SymbolDef, UnknownCdrChunk, ZOrderOp,
+    AlignOp, DistributeOp, Document, DocumentMetadata, DrawingScale, GridConfig, Guide,
+    GuideOrientation, MasterLayerScope, NodePayload, Page, PerspectiveGridConfig, PowerClipFitMode,
+    RasterAsset, RasterLayerData, SceneObject, SymbolDef, UnknownCdrChunk, ZOrderOp,
 };
 use crate::effects::{Effect, RasterFilter, TransparencyMode};
 use crate::error::{CoreError, CoreResult};
@@ -264,6 +264,8 @@ pub enum CommandOp {
         rendering_intent: Option<RenderingIntent>,
         #[serde(default)]
         black_point_compensation: Option<bool>,
+        #[serde(default)]
+        drawing_scale: Option<DrawingScale>,
     },
     SetPageProperties {
         page_id: PageId,
@@ -277,6 +279,10 @@ pub enum CommandOp {
         bleed_mm: Option<f64>,
         #[serde(default)]
         facing_pages: Option<bool>,
+        #[serde(default)]
+        background_fill: Option<Fill>,
+        #[serde(default)]
+        printable_background: Option<bool>,
     },
     ReorderPages {
         page_ids: Vec<PageId>,
@@ -284,6 +290,10 @@ pub enum CommandOp {
     RenameLayer {
         layer_id: LayerId,
         new_name: String,
+    },
+    ReorderLayers {
+        page_id: PageId,
+        layer_ids: Vec<LayerId>,
     },
     ReorderLayerObjects {
         layer_id: LayerId,
@@ -464,6 +474,7 @@ impl CommandOp {
             Self::SetPageProperties { .. } => "Set Page Properties".to_owned(),
             Self::ReorderPages { .. } => "Reorder Pages".to_owned(),
             Self::RenameLayer { new_name, .. } => format!("Rename Layer {new_name}"),
+            Self::ReorderLayers { .. } => "Reorder Layers".to_owned(),
             Self::ReorderLayerObjects { .. } => "Reorder Layer Objects".to_owned(),
             Self::SetGridConfig { .. } => "Set Grid Config".to_owned(),
             Self::SetPerspectiveGrid { .. } => "Set Perspective Grid".to_owned(),
@@ -2006,6 +2017,7 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             clear_gray_icc,
             rendering_intent,
             black_point_compensation,
+            drawing_scale,
         } => {
             if let Some(d) = dpi {
                 if !d.is_finite() || *d < 1.0 || *d > 2400.0 {
@@ -2046,6 +2058,18 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             if let Some(bpc) = black_point_compensation {
                 doc.set_black_point_compensation(*bpc);
             }
+            if let Some(ds) = drawing_scale {
+                if !ds.numerator.is_finite()
+                    || ds.numerator <= 0.0
+                    || !ds.denominator.is_finite()
+                    || ds.denominator <= 0.0
+                {
+                    return Err(CoreError::InvalidParameter(
+                        "drawing_scale numerator and denominator must be finite and > 0".into(),
+                    ));
+                }
+                doc.set_drawing_scale(*ds);
+            }
             if let Some(t) = title {
                 doc.set_title(t.clone());
             }
@@ -2076,6 +2100,8 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             height_mm,
             bleed_mm,
             facing_pages,
+            background_fill,
+            printable_background,
         } => {
             if let Some(w) = width_mm {
                 if !w.is_finite() || *w <= 0.0 {
@@ -2098,6 +2124,13 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                     ));
                 }
             }
+            if let Some(bg) = background_fill {
+                if !fill_is_finite(bg) {
+                    return Err(CoreError::InvalidGeometry(
+                        "page background_fill contains non-finite values".into(),
+                    ));
+                }
+            }
             let page = doc
                 .pages_mut()
                 .iter_mut()
@@ -2117,6 +2150,12 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             }
             if let Some(fp) = facing_pages {
                 page.facing_pages = *fp;
+            }
+            if let Some(bg) = background_fill {
+                page.background_fill = bg.clone();
+            }
+            if let Some(pb) = printable_background {
+                page.printable_background = *pb;
             }
             doc.touch();
         }
@@ -2157,6 +2196,9 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                 .ok_or(CoreError::LayerNotFound(*layer_id))?;
             layer.name = new_name.clone();
             doc.touch();
+        }
+        CommandOp::ReorderLayers { page_id, layer_ids } => {
+            doc.reorder_layers(*page_id, layer_ids)?;
         }
         CommandOp::ReorderLayerObjects {
             layer_id,
@@ -2712,6 +2754,7 @@ struct DocumentDelta {
     gray_icc_name: Option<(Option<String>, Option<String>)>,
     rendering_intent: Option<(RenderingIntent, RenderingIntent)>,
     black_point_compensation: Option<(bool, bool)>,
+    drawing_scale: Option<(DrawingScale, DrawingScale)>,
     next_id: Option<(u64, u64)>,
 }
 
@@ -2751,6 +2794,7 @@ struct DocumentStateSnapshot {
     gray_icc_name: Option<String>,
     rendering_intent: RenderingIntent,
     black_point_compensation: bool,
+    drawing_scale: DrawingScale,
     next_id: u64,
 }
 
@@ -2787,6 +2831,7 @@ impl DocumentStateSnapshot {
             gray_icc_name: doc.gray_icc_name().map(str::to_owned),
             rendering_intent: doc.rendering_intent(),
             black_point_compensation: doc.black_point_compensation(),
+            drawing_scale: doc.drawing_scale(),
             next_id: doc.next_id(),
         }
     }
@@ -2820,6 +2865,7 @@ impl DocumentStateSnapshot {
         doc.set_gray_icc_raw(self.gray_icc_profile.clone(), self.gray_icc_name.clone());
         doc.set_rendering_intent_raw(self.rendering_intent);
         doc.set_bpc_raw(self.black_point_compensation);
+        doc.set_drawing_scale_raw(self.drawing_scale);
         doc.set_next_id_raw(self.next_id);
         // Restore exact metadata (including `modified_at`) last so setters above do not perturb it.
         *doc.metadata_mut() = self.metadata.clone();
@@ -2970,6 +3016,8 @@ impl DocumentStateSnapshot {
                 self.black_point_compensation,
                 after.black_point_compensation(),
             )),
+            drawing_scale: (self.drawing_scale != after.drawing_scale())
+                .then_some((self.drawing_scale, after.drawing_scale())),
             next_id: (self.next_id != after.next_id()).then_some((self.next_id, after.next_id())),
         }
     }
@@ -3104,6 +3152,9 @@ impl DocumentDelta {
         }
         if let Some((b, _)) = self.black_point_compensation {
             doc.set_bpc_raw(b);
+        }
+        if let Some((b, _)) = self.drawing_scale {
+            doc.set_drawing_scale_raw(b);
         }
         if let Some((b, _)) = self.next_id {
             doc.set_next_id_raw(b);
@@ -3242,6 +3293,9 @@ impl DocumentDelta {
         if let Some((_, a)) = self.black_point_compensation {
             doc.set_bpc_raw(a);
         }
+        if let Some((_, a)) = self.drawing_scale {
+            doc.set_drawing_scale_raw(a);
+        }
         if let Some((_, a)) = self.next_id {
             doc.set_next_id_raw(a);
         }
@@ -3284,6 +3338,8 @@ fn pages_change_is_only_layer_objects(
             || (bp.height_mm - ap.height_mm).abs() > 1e-9
             || (bp.bleed_mm - ap.bleed_mm).abs() > 1e-9
             || bp.facing_pages != ap.facing_pages
+            || bp.background_fill != ap.background_fill
+            || bp.printable_background != ap.printable_background
             || bp.layers.len() != ap.layers.len()
         {
             return false;

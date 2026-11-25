@@ -4,12 +4,15 @@
 //! `hit_test_node`) and intelligent multi-target [`SnapEngine`] emitting
 //! [`DynamicGuideLine`] alignment overlays.
 
-use crate::geometry::{point_to_segment_distance, ArtisticMedia};
+use crate::geometry::{
+    closed_subpaths_contain_even_odd, point_to_segment_distance, ArtisticMedia, NodeKind,
+    ParametricShape, PathNode, Subpath,
+};
 use crate::math::{sanitize_f64, Perspective3x3};
 use crate::{
     Affine2D, ArtisticText, BezierPath, DimensionKind, DimensionObject, Document, Effect,
-    GuideOrientation, NodePayload, NodeRef, ObjectId, Point2D, Rect2D, SceneObject, SymbolId,
-    Vec2D,
+    GuideOrientation, NodePayload, NodeRef, ObjectId, ParagraphText, Point2D, Rect2D, SceneObject,
+    SymbolId, TextAlign, TextDirection, Vec2D,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -32,6 +35,19 @@ pub fn hit_test_point(
     pt_mm: Point2D,
     tolerance_mm: f64,
 ) -> Option<ObjectId> {
+    hit_test_point_exact(doc, page_index, pt_mm, tolerance_mm, false)
+}
+
+/// Non-AABB exact point hit-test with configurable `treat_all_filled` behavior (for Coree
+/// "Treat all objects as filled" Pick mode without falling back to coarse AABB boxes).
+#[must_use]
+pub fn hit_test_point_exact(
+    doc: &Document,
+    page_index: usize,
+    pt_mm: Point2D,
+    tolerance_mm: f64,
+    treat_all_filled: bool,
+) -> Option<ObjectId> {
     if !pt_mm.is_finite() || page_index >= doc.pages().len() {
         return None;
     }
@@ -49,7 +65,16 @@ pub fn hit_test_point(
         if !obj.visible || obj.locked {
             continue;
         }
-        if object_hits_point(doc, oid, &Affine2D::IDENTITY, pt_mm, tol, 0) {
+        if object_hits_point_impl(
+            doc,
+            oid,
+            &Affine2D::IDENTITY,
+            None,
+            pt_mm,
+            tol,
+            treat_all_filled,
+            0,
+        ) {
             return Some(oid);
         }
     }
@@ -64,6 +89,18 @@ pub fn hit_test_powerclip_contents(
     pc_id: ObjectId,
     pt_mm: Point2D,
     tolerance_mm: f64,
+) -> Option<ObjectId> {
+    hit_test_powerclip_contents_exact(doc, pc_id, pt_mm, tolerance_mm, false)
+}
+
+/// Non-AABB exact `PowerClip` inner-contents hit-test with configurable `treat_all_filled`.
+#[must_use]
+pub fn hit_test_powerclip_contents_exact(
+    doc: &Document,
+    pc_id: ObjectId,
+    pt_mm: Point2D,
+    tolerance_mm: f64,
+    treat_all_filled: bool,
 ) -> Option<ObjectId> {
     if !pt_mm.is_finite() {
         return None;
@@ -82,7 +119,7 @@ pub fn hit_test_powerclip_contents(
         if !child.visible || child.locked {
             continue;
         }
-        if object_hits_point_with_persp(doc, cid, &pc_xf, pc_persp, pt_mm, tol, 0) {
+        if object_hits_point_impl(doc, cid, &pc_xf, pc_persp, pt_mm, tol, treat_all_filled, 0) {
             return Some(cid);
         }
     }
@@ -224,7 +261,8 @@ fn locked_or_hidden_layer_objects(doc: &Document, page_index: usize) -> HashSet<
     blocked
 }
 
-/// Finds the closest Bézier anchor node on any object in `object_ids` within `tolerance_mm` of `pt_mm`.
+/// Finds the closest Bézier anchor node or B-Spline control point on any object in `object_ids`
+/// within `tolerance_mm` of `pt_mm`.
 #[must_use]
 pub fn hit_test_node(
     doc: &Document,
@@ -239,6 +277,27 @@ pub fn hit_test_node(
     let mut best: Option<NodeHit> = None;
 
     for &oid in object_ids {
+        if let Some(obj) = doc.object(oid) {
+            if let NodePayload::BSpline(bs) = &obj.payload {
+                let world_xf = doc.world_transform_of(oid).unwrap_or(obj.transform);
+                for (node_idx, &cp) in bs.control_points.iter().enumerate() {
+                    let wp = world_xf.transform_point(cp);
+                    let d = wp.distance_to(pt_mm);
+                    if d <= tol && best.is_none_or(|b| d < b.distance_mm) {
+                        best = Some(NodeHit {
+                            node: NodeRef {
+                                object_id: oid,
+                                subpath_index: 0,
+                                node_index: node_idx,
+                            },
+                            position_mm: wp,
+                            distance_mm: d,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
         let Some(world_path) = doc.world_path_of(oid) else {
             continue;
         };
@@ -262,24 +321,15 @@ pub fn hit_test_node(
     best
 }
 
-fn object_hits_point(
-    doc: &Document,
-    id: ObjectId,
-    parent_xf: &Affine2D,
-    pt_mm: Point2D,
-    tol_mm: f64,
-    depth: usize,
-) -> bool {
-    object_hits_point_with_persp(doc, id, parent_xf, None, pt_mm, tol_mm, depth)
-}
-
-fn object_hits_point_with_persp(
+#[allow(clippy::too_many_arguments)]
+fn object_hits_point_impl(
     doc: &Document,
     id: ObjectId,
     parent_xf: &Affine2D,
     parent_persp: Option<Perspective3x3>,
     pt_mm: Point2D,
     tol_mm: f64,
+    treat_all_filled: bool,
     depth: usize,
 ) -> bool {
     let Some(obj) = doc.object(id) else {
@@ -293,6 +343,7 @@ fn object_hits_point_with_persp(
         parent_persp,
         pt_mm,
         tol_mm,
+        treat_all_filled,
         None,
         &mut visited_syms,
         depth,
@@ -961,6 +1012,32 @@ fn apply_obj_perspective_to_local_path(local: BezierPath, obj: &SceneObject) -> 
     cur
 }
 
+fn apply_obj_perspective_with_ref_bounds(
+    local: BezierPath,
+    ref_rect: Rect2D,
+    obj: &SceneObject,
+) -> BezierPath {
+    let mut cur = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local)
+    } else {
+        local
+    };
+    let mut cur_ref = if let Some(persp) = obj.perspective {
+        persp.try_transform_rect(ref_rect).unwrap_or(ref_rect)
+    } else {
+        ref_rect
+    };
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(h) = Perspective3x3::from_rect_to_quad(cur_ref, quad) {
+                cur = h.transform_bezier_path(&cur);
+                cur_ref = h.try_transform_rect(cur_ref).unwrap_or(cur_ref);
+            }
+        }
+    }
+    cur
+}
+
 #[inline]
 fn warp_local_to_world(
     local: &BezierPath,
@@ -1464,6 +1541,7 @@ fn object_ref_hits_point(
     parent_persp: Option<Perspective3x3>,
     pt_mm: Point2D,
     tol_mm: f64,
+    treat_all_filled: bool,
     sym_ctx: Option<HitSymCtx<'_>>,
     visited_syms: &mut HashSet<SymbolId>,
     depth: usize,
@@ -1476,48 +1554,29 @@ fn object_ref_hits_point(
         return false;
     }
     let stroke_tol = tol_mm + obj.outline.scaled_width_mm_for_transform(&world_xf) * 0.5;
+    let fill_hit = obj.fill.is_visible() || obj.lens.is_some() || treat_all_filled;
 
     match &obj.payload {
         NodePayload::Path(p) => {
             let local = apply_obj_perspective_to_local_path(p.clone(), obj);
             let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(
-                &wp,
-                obj.fill.is_visible() || obj.lens.is_some(),
-                pt_mm,
-                stroke_tol,
-            )
+            path_hits_point(&wp, fill_hit, pt_mm, stroke_tol)
         }
         NodePayload::Shape(s) => {
             let local = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
             let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(
-                &wp,
-                obj.fill.is_visible() || obj.lens.is_some(),
-                pt_mm,
-                stroke_tol,
-            )
+            path_hits_point(&wp, fill_hit, pt_mm, stroke_tol)
         }
         NodePayload::BSpline(bs) => {
             let local = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
             let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(
-                &wp,
-                obj.fill.is_visible() || obj.lens.is_some(),
-                pt_mm,
-                stroke_tol,
-            )
+            path_hits_point(&wp, fill_hit, pt_mm, stroke_tol)
         }
         NodePayload::ArtisticMedia { spine, style } => {
             let expanded = ArtisticMedia::expand_stroke(spine, style);
             let local = apply_obj_perspective_to_local_path(expanded, obj);
             let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(
-                &wp,
-                obj.fill.is_visible() || obj.lens.is_some(),
-                pt_mm,
-                stroke_tol,
-            )
+            path_hits_point(&wp, fill_hit, pt_mm, stroke_tol)
         }
         NodePayload::Clone { .. } => {
             let Some((eff_p, eff_fill, eff_outline, in_sym)) =
@@ -1536,6 +1595,7 @@ fn object_ref_hits_point(
                 parent_persp,
                 pt_mm,
                 tol_mm,
+                treat_all_filled,
                 if in_sym { sym_ctx } else { None },
                 visited_syms,
                 depth + 1,
@@ -1544,7 +1604,7 @@ fn object_ref_hits_point(
         NodePayload::PowerClip { container, .. } => {
             let local = apply_obj_perspective_to_local_path((**container).clone(), obj);
             let wp = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(&wp, true, pt_mm, stroke_tol)
+            path_hits_point_rule(&wp, true, obj.clip_even_odd, pt_mm, stroke_tol)
         }
         NodePayload::Connector(c) => {
             let mut sym_visiting = HashMap::new();
@@ -1560,11 +1620,20 @@ fn object_ref_hits_point(
                 depth + 1,
             );
             let route = c.route_path(a, b);
-            let wp = if let Some(pp) = parent_persp {
-                let local_route = parent_xf
-                    .inverse()
-                    .map_or(route.clone(), |inv| route.transformed(&inv));
-                pp.transform_bezier_path(&local_route)
+            let has_own_persp = obj.perspective.is_some()
+                || obj
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Perspective { .. }));
+            let wp = if parent_persp.is_some() || has_own_persp {
+                let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                let local_route = route.transformed(&inv_parent);
+                let warped_local = apply_obj_perspective_to_local_path(local_route, obj);
+                if let Some(pp) = parent_persp {
+                    pp.transform_bezier_path(&warped_local)
+                } else {
+                    warped_local.transformed(parent_xf)
+                }
             } else {
                 route
             };
@@ -1586,6 +1655,7 @@ fn object_ref_hits_point(
                         child_persp,
                         pt_mm,
                         tol_mm,
+                        treat_all_filled,
                         sym_ctx,
                         visited_syms,
                         depth + 1,
@@ -1594,20 +1664,31 @@ fn object_ref_hits_point(
             })
         }
         NodePayload::ArtisticText(at) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(at.estimated_bounds()),
-                obj,
-            );
-            let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(&poly, true, pt_mm, stroke_tol)
+            let line_rects = artistic_text_line_rects(at);
+            line_rects.into_iter().any(|lr| {
+                let local = apply_obj_perspective_to_local_path(BezierPath::from_rect(lr), obj);
+                let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                path_hits_point(&poly, true, pt_mm, stroke_tol)
+            })
         }
         NodePayload::ParagraphText(para) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(para.bounding_box()),
-                obj,
-            );
-            let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(&poly, true, pt_mm, tol_mm)
+            let ref_box = para.bounding_box();
+            let frame_local =
+                apply_obj_perspective_with_ref_bounds(BezierPath::from_rect(ref_box), ref_box, obj);
+            let frame_poly =
+                warp_local_to_world(&frame_local, &world_xf, &obj.transform, parent_persp);
+            if fill_hit {
+                return path_hits_point(&frame_poly, true, pt_mm, tol_mm.max(stroke_tol));
+            }
+            if path_hits_point(&frame_poly, false, pt_mm, tol_mm.max(stroke_tol)) {
+                return true;
+            }
+            paragraph_text_line_rects(para).into_iter().any(|lr| {
+                let local =
+                    apply_obj_perspective_with_ref_bounds(BezierPath::from_rect(lr), ref_box, obj);
+                let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                path_hits_point(&poly, true, pt_mm, tol_mm.max(stroke_tol))
+            })
         }
         NodePayload::Raster(r) => {
             let local = apply_obj_perspective_to_local_path(
@@ -1618,12 +1699,36 @@ fn object_ref_hits_point(
             path_hits_point(&poly, true, pt_mm, tol_mm)
         }
         NodePayload::Table(table) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(table.to_bounding_box()),
-                obj,
-            );
-            let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_hits_point(&poly, true, pt_mm, stroke_tol)
+            let grid_local = apply_obj_perspective_to_local_path(table.to_grid_paths(), obj);
+            let grid_wp = warp_local_to_world(&grid_local, &world_xf, &obj.transform, parent_persp);
+            if path_hits_point(&grid_wp, false, pt_mm, stroke_tol) {
+                return true;
+            }
+            for r in 0..table.rows {
+                for c in 0..table.cols {
+                    let Some(cell) = table.cell(r, c) else {
+                        continue;
+                    };
+                    if cell.is_covered() {
+                        continue;
+                    }
+                    let cell_filled =
+                        fill_hit || cell.fill.is_visible() || !cell.text.trim().is_empty();
+                    if !cell_filled {
+                        continue;
+                    }
+                    if let Some(cr) = table.cell_rect(r, c) {
+                        let local =
+                            apply_obj_perspective_to_local_path(BezierPath::from_rect(cr), obj);
+                        let poly =
+                            warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                        if path_hits_point(&poly, true, pt_mm, stroke_tol) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
         }
         NodePayload::Dimension(dim) => {
             let (strokes, label_rect) = dimension_local_geometry(dim, doc);
@@ -1649,6 +1754,10 @@ fn object_ref_hits_point(
                     .map(|r| r.style.font_size_mm())
                     .filter(|v| v.is_finite())
                     .fold(4.0_f64, f64::max);
+                let text_chars = top.text.plain_text().chars().count().max(1) as f64;
+                let est_len_mm = (text_chars * font_h * 0.65).max(font_h);
+                let offset_mm = sanitize_f64(top.offset_mm, 0.0).max(0.0);
+                let sliced_host = slice_path_arc_interval(&host_path, offset_mm, est_len_mm);
                 let band_tol = tol_mm + sanitize_f64(top.distance_mm, 0.0).abs() + font_h;
                 let has_own_persp = obj.perspective.is_some()
                     || obj
@@ -1657,7 +1766,7 @@ fn object_ref_hits_point(
                         .any(|e| matches!(e, Effect::Perspective { .. }));
                 let wp = if parent_persp.is_some() || has_own_persp {
                     let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-                    let local_host = host_path.transformed(&inv_parent);
+                    let local_host = sliced_host.transformed(&inv_parent);
                     let warped_local = apply_obj_perspective_to_local_path(local_host, obj);
                     if let Some(pp) = parent_persp {
                         pp.transform_bezier_path(&warped_local)
@@ -1665,7 +1774,7 @@ fn object_ref_hits_point(
                         warped_local.transformed(parent_xf)
                     }
                 } else {
-                    host_path
+                    sliced_host
                 };
                 path_hits_point(&wp, false, pt_mm, band_tol)
             } else {
@@ -1711,6 +1820,7 @@ fn object_ref_hits_point(
                             child_persp,
                             pt_mm,
                             tol_mm,
+                            treat_all_filled,
                             Some((&child_map, Some(&sym.objects), world_xf)),
                             visited_syms,
                             depth + 1,
@@ -1804,11 +1914,20 @@ fn object_intersects_rect(
                 depth + 1,
             );
             let route = c.route_path(a, b);
-            let wp = if let Some(pp) = parent_persp {
-                let local_route = parent_xf
-                    .inverse()
-                    .map_or(route.clone(), |inv| route.transformed(&inv));
-                pp.transform_bezier_path(&local_route)
+            let has_own_persp = obj.perspective.is_some()
+                || obj
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Perspective { .. }));
+            let wp = if parent_persp.is_some() || has_own_persp {
+                let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                let local_route = route.transformed(&inv_parent);
+                let warped_local = apply_obj_perspective_to_local_path(local_route, obj);
+                if let Some(pp) = parent_persp {
+                    pp.transform_bezier_path(&warped_local)
+                } else {
+                    warped_local.transformed(parent_xf)
+                }
             } else {
                 route
             };
@@ -1836,21 +1955,29 @@ fn object_intersects_rect(
                 })
             })
         }
-        NodePayload::ArtisticText(at) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(at.estimated_bounds()),
-                obj,
-            );
+        NodePayload::ArtisticText(at) => artistic_text_line_rects(at).into_iter().any(|lr| {
+            let local = apply_obj_perspective_to_local_path(BezierPath::from_rect(lr), obj);
             let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
             path_intersects_rect(&poly, true, rect_mm)
-        }
+        }),
         NodePayload::ParagraphText(para) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(para.bounding_box()),
-                obj,
-            );
-            let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_intersects_rect(&poly, true, rect_mm)
+            let ref_box = para.bounding_box();
+            let frame_local =
+                apply_obj_perspective_with_ref_bounds(BezierPath::from_rect(ref_box), ref_box, obj);
+            let frame_poly =
+                warp_local_to_world(&frame_local, &world_xf, &obj.transform, parent_persp);
+            if obj.fill.is_visible() || obj.lens.is_some() {
+                return path_intersects_rect(&frame_poly, true, rect_mm);
+            }
+            if path_intersects_rect(&frame_poly, false, rect_mm) {
+                return true;
+            }
+            paragraph_text_line_rects(para).into_iter().any(|lr| {
+                let local =
+                    apply_obj_perspective_with_ref_bounds(BezierPath::from_rect(lr), ref_box, obj);
+                let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                path_intersects_rect(&poly, true, rect_mm)
+            })
         }
         NodePayload::Raster(r) => {
             let local = apply_obj_perspective_to_local_path(
@@ -1861,12 +1988,37 @@ fn object_intersects_rect(
             path_intersects_rect(&poly, true, rect_mm)
         }
         NodePayload::Table(table) => {
-            let local = apply_obj_perspective_to_local_path(
-                BezierPath::from_rect(table.to_bounding_box()),
-                obj,
-            );
-            let poly = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
-            path_intersects_rect(&poly, true, rect_mm)
+            let grid_local = apply_obj_perspective_to_local_path(table.to_grid_paths(), obj);
+            let grid_wp = warp_local_to_world(&grid_local, &world_xf, &obj.transform, parent_persp);
+            if path_intersects_rect(&grid_wp, false, rect_mm) {
+                return true;
+            }
+            for r in 0..table.rows {
+                for c in 0..table.cols {
+                    let Some(cell) = table.cell(r, c) else {
+                        continue;
+                    };
+                    if cell.is_covered() {
+                        continue;
+                    }
+                    let cell_filled = obj.fill.is_visible()
+                        || cell.fill.is_visible()
+                        || !cell.text.trim().is_empty();
+                    if !cell_filled {
+                        continue;
+                    }
+                    if let Some(cr) = table.cell_rect(r, c) {
+                        let local =
+                            apply_obj_perspective_to_local_path(BezierPath::from_rect(cr), obj);
+                        let poly =
+                            warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                        if path_intersects_rect(&poly, true, rect_mm) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
         }
         NodePayload::Dimension(dim) => {
             let (strokes, label_rect) = dimension_local_geometry(dim, doc);
@@ -1892,6 +2044,10 @@ fn object_intersects_rect(
                     .map(|r| r.style.font_size_mm())
                     .filter(|v| v.is_finite())
                     .fold(4.0_f64, f64::max);
+                let text_chars = top.text.plain_text().chars().count().max(1) as f64;
+                let est_len_mm = (text_chars * font_h * 0.65).max(font_h);
+                let offset_mm = sanitize_f64(top.offset_mm, 0.0).max(0.0);
+                let sliced_host = slice_path_arc_interval(&host_path, offset_mm, est_len_mm);
                 let margin = sanitize_f64(top.distance_mm, 0.0).abs() + font_h;
                 let has_own_persp = obj.perspective.is_some()
                     || obj
@@ -1900,7 +2056,7 @@ fn object_intersects_rect(
                         .any(|e| matches!(e, Effect::Perspective { .. }));
                 let wp = if parent_persp.is_some() || has_own_persp {
                     let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-                    let local_host = host_path.transformed(&inv_parent);
+                    let local_host = sliced_host.transformed(&inv_parent);
                     let warped_local = apply_obj_perspective_to_local_path(local_host, obj);
                     if let Some(pp) = parent_persp {
                         pp.transform_bezier_path(&warped_local)
@@ -1908,7 +2064,7 @@ fn object_intersects_rect(
                         warped_local.transformed(parent_xf)
                     }
                 } else {
-                    host_path
+                    sliced_host
                 };
                 path_intersects_rect(&wp, false, rect_mm.expand(margin))
             } else {
@@ -2001,6 +2157,24 @@ fn segment_intersects_rect(a: Point2D, b: Point2D, r: Rect2D) -> bool {
     t0 <= t1
 }
 
+fn segment_intersection(a1: Point2D, a2: Point2D, b1: Point2D, b2: Point2D) -> Option<Point2D> {
+    let r = a2 - a1;
+    let s = b2 - b1;
+    let denom = r.cross(s);
+    if denom.abs() <= 1e-12 {
+        return None;
+    }
+    let qp = b1 - a1;
+    let t = qp.cross(s) / denom;
+    let u = qp.cross(r) / denom;
+    if (-1e-7..=1.0 + 1e-7).contains(&t) && (-1e-7..=1.0 + 1e-7).contains(&u) {
+        let tc = t.clamp(0.0, 1.0);
+        Some(a1 + r * tc)
+    } else {
+        None
+    }
+}
+
 fn path_intersects_rect(path: &BezierPath, check_fill: bool, rect: Rect2D) -> bool {
     if !path.bounding_box().is_some_and(|bb| bb.intersects(rect)) {
         return false;
@@ -2030,9 +2204,223 @@ fn path_intersects_rect(path: &BezierPath, check_fill: bool, rect: Rect2D) -> bo
     false
 }
 
+fn artistic_text_line_rects(at: &ArtisticText) -> Vec<Rect2D> {
+    let full = at.plain_text();
+    if full.is_empty() {
+        return vec![at.estimated_bounds()];
+    }
+    let max_size_mm = at
+        .runs
+        .iter()
+        .map(|r| r.style.font_size_mm())
+        .fold(4.0_f64, f64::max);
+    let line_ratio = at.runs.first().map_or(1.2, |r| {
+        sanitize_f64(r.style.line_height_ratio, 1.2).max(0.5)
+    });
+    let line_h = max_size_mm * line_ratio;
+    let lines: Vec<&str> = full.split('\n').collect();
+    let max_chars = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_w = (max_chars as f64) * max_size_mm * 0.6;
+    let mut rects = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        let chars = line.chars().count();
+        if chars == 0 {
+            continue;
+        }
+        let w = ((chars as f64) * max_size_mm * 0.6).max(max_size_mm * 0.35);
+        let x0 = match at.align {
+            TextAlign::Center => (max_w - w) * 0.5,
+            TextAlign::Right => (max_w - w).max(0.0),
+            TextAlign::Left | TextAlign::Justify | TextAlign::ForceJustifyKashida => 0.0,
+        };
+        rects.push(Rect2D::from_xywh(x0, (idx as f64) * line_h, w, line_h));
+    }
+    if rects.is_empty() {
+        rects.push(at.estimated_bounds());
+    }
+    rects
+}
+
+fn paragraph_text_line_rects(para: &ParagraphText) -> Vec<Rect2D> {
+    let full = para.plain_text();
+    if full.trim().is_empty() {
+        return Vec::new();
+    }
+    let cols = para.columns.clamp(1, 16) as usize;
+    let frame_w = sanitize_f64(para.frame_size.x, 80.0).max(2.0);
+    let frame_h = sanitize_f64(para.frame_size.y, 40.0).max(2.0);
+    let gutter = sanitize_f64(para.column_gutter_mm, 5.0).max(0.0);
+    let col_w = ((frame_w - gutter * (cols.saturating_sub(1) as f64)) / (cols as f64)).max(2.0);
+
+    let font_mm = para
+        .runs
+        .iter()
+        .map(|r| r.style.font_size_mm())
+        .fold(4.0_f64, f64::max);
+    let line_ratio = para.runs.first().map_or(1.2, |r| {
+        sanitize_f64(r.style.line_height_ratio, 1.2).max(0.5)
+    });
+    let line_h = (font_mm * line_ratio).max(0.5);
+    let char_w = (font_mm * 0.6).max(0.5);
+    let max_chars = (col_w / char_w).floor().max(1.0) as usize;
+    let is_rtl = para.effective_direction() == TextDirection::Rtl;
+
+    let mut rects = Vec::new();
+    let mut current_col = 0usize;
+    let mut col_y = 0.0_f64;
+
+    for raw_para in full.split('\n') {
+        if raw_para.trim().is_empty() {
+            if col_y + line_h > frame_h && col_y > 0.0 {
+                current_col += 1;
+                col_y = 0.0;
+            }
+            if current_col >= cols {
+                break;
+            }
+            col_y += line_h;
+            continue;
+        }
+
+        let mut wrapped_lines: Vec<usize> = Vec::new();
+        let mut cur_chars = 0usize;
+        for word in raw_para.split_whitespace() {
+            let wlen = word.chars().count();
+            if cur_chars == 0 {
+                if wlen <= max_chars {
+                    cur_chars = wlen;
+                } else {
+                    let mut rem = wlen;
+                    while rem > max_chars {
+                        wrapped_lines.push(max_chars);
+                        rem -= max_chars;
+                    }
+                    cur_chars = rem;
+                }
+            } else if cur_chars + 1 + wlen <= max_chars {
+                cur_chars += 1 + wlen;
+            } else {
+                wrapped_lines.push(cur_chars);
+                if wlen <= max_chars {
+                    cur_chars = wlen;
+                } else {
+                    let mut rem = wlen;
+                    while rem > max_chars {
+                        wrapped_lines.push(max_chars);
+                        rem -= max_chars;
+                    }
+                    cur_chars = rem;
+                }
+            }
+        }
+        if cur_chars > 0 {
+            wrapped_lines.push(cur_chars);
+        }
+
+        let total_lines = wrapped_lines.len();
+        for (l_idx, chars) in wrapped_lines.into_iter().enumerate() {
+            if col_y + line_h > frame_h && col_y > 0.0 {
+                current_col += 1;
+                col_y = 0.0;
+            }
+            if current_col >= cols {
+                break;
+            }
+            let is_last = l_idx + 1 == total_lines;
+            let visual_col = if is_rtl {
+                cols - 1 - current_col
+            } else {
+                current_col
+            };
+            let col_x0 = (visual_col as f64) * (col_w + gutter);
+            let w = if matches!(
+                para.align,
+                TextAlign::Justify | TextAlign::ForceJustifyKashida
+            ) && !is_last
+            {
+                col_w
+            } else {
+                ((chars as f64) * char_w).clamp(font_mm * 0.35, col_w)
+            };
+            let x0 = match para.align {
+                TextAlign::Center => col_x0 + (col_w - w) * 0.5,
+                TextAlign::Right => col_x0 + (col_w - w).max(0.0),
+                TextAlign::Justify | TextAlign::ForceJustifyKashida if is_rtl => {
+                    col_x0 + (col_w - w).max(0.0)
+                }
+                _ => col_x0,
+            };
+            let h = line_h.min((frame_h - col_y).max(0.1));
+            rects.push(Rect2D::from_xywh(x0, col_y, w, h));
+            col_y += line_h;
+        }
+        if current_col >= cols {
+            break;
+        }
+    }
+    rects
+}
+
+fn slice_path_arc_interval(path: &BezierPath, start_mm: f64, len_mm: f64) -> BezierPath {
+    let total = path.path_length_mm();
+    if total <= 1e-6 || len_mm <= 1e-6 {
+        return path.clone();
+    }
+    let is_closed = path.subpaths.first().is_some_and(|sp| sp.closed);
+    let end_mm = start_mm + len_mm;
+    let steps = ((len_mm / 1.0).ceil() as usize).clamp(4, 128);
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let mut d = start_mm + (end_mm - start_mm) * (i as f64 / steps as f64);
+        if is_closed {
+            d = d.rem_euclid(total);
+        } else {
+            if d < 0.0 || d > total {
+                continue;
+            }
+        }
+        if let Some((pt, _)) = path.point_and_tangent_at(d) {
+            pts.push(pt);
+        }
+    }
+    if pts.len() < 2 {
+        return path.clone();
+    }
+    let nodes = pts
+        .into_iter()
+        .map(|p| PathNode::new(p, None, None, NodeKind::Cusp))
+        .collect();
+    BezierPath::from_subpath(Subpath {
+        nodes,
+        closed: false,
+    })
+}
+
 fn path_hits_point(path: &BezierPath, check_fill: bool, pt: Point2D, stroke_tol: f64) -> bool {
-    if check_fill && path.contains_point(pt) {
-        return true;
+    path_hits_point_rule(path, check_fill, false, pt, stroke_tol)
+}
+
+fn path_hits_point_rule(
+    path: &BezierPath,
+    check_fill: bool,
+    even_odd: bool,
+    pt: Point2D,
+    stroke_tol: f64,
+) -> bool {
+    if check_fill {
+        let inside = if even_odd {
+            closed_subpaths_contain_even_odd(&path.subpaths, pt)
+        } else {
+            path.contains_point(pt)
+        };
+        if inside {
+            return true;
+        }
     }
     for poly in path.flatten(0.15) {
         for win in poly.windows(2) {
@@ -2053,6 +2441,11 @@ pub struct SnapOptions {
     pub objects: bool,
     pub nodes: bool,
     pub dynamic_guides: bool,
+    pub tangent: bool,
+    pub perpendicular: bool,
+    pub quadrant: bool,
+    pub intersection: bool,
+    pub baseline: bool,
     pub tolerance_mm: f64,
 }
 
@@ -2065,6 +2458,11 @@ impl Default for SnapOptions {
             objects: true,
             nodes: true,
             dynamic_guides: true,
+            tangent: true,
+            perpendicular: true,
+            quadrant: true,
+            intersection: true,
+            baseline: true,
             tolerance_mm: 2.5,
         }
     }
@@ -2081,6 +2479,12 @@ pub enum DynamicGuideKind {
     GuideLine,
     Node,
     Grid,
+    Tangent,
+    Perpendicular,
+    Quadrant,
+    Intersection,
+    Baseline,
+    ExtensionRay,
 }
 
 /// Dynamic visual alignment guide emitted by [`SnapEngine::snap_point`].
@@ -2093,7 +2497,8 @@ pub struct DynamicGuideLine {
 }
 
 /// Multi-target snapping engine supporting grid, guidelines, page edges, objects, nodes,
-/// and live interactive dynamic alignment guides.
+/// 5 geometric CAD snaps (`Tangent`, `Perpendicular`, `Quadrant`, `Intersection`, `Baseline`),
+/// and live interactive dynamic alignment & extension-ray guides.
 pub struct SnapEngine;
 
 impl SnapEngine {
@@ -2105,6 +2510,20 @@ impl SnapEngine {
         doc: &Document,
         page_index: usize,
         pt_mm: Point2D,
+        exclude_ids: &[ObjectId],
+        options: &SnapOptions,
+    ) -> (Point2D, Vec<DynamicGuideLine>) {
+        Self::snap_point_with_reference(doc, page_index, pt_mm, None, exclude_ids, options)
+    }
+
+    /// Snaps `pt_mm` on `page_index` with an optional drawing anchor `ref_pt_mm` (used to
+    /// compute exact `Tangent` and `Perpendicular` rays/points from the active anchor).
+    #[must_use]
+    pub fn snap_point_with_reference(
+        doc: &Document,
+        page_index: usize,
+        pt_mm: Point2D,
+        ref_pt_mm: Option<Point2D>,
         exclude_ids: &[ObjectId],
         options: &SnapOptions,
     ) -> (Point2D, Vec<DynamicGuideLine>) {
@@ -2121,14 +2540,19 @@ impl SnapEngine {
             .map(crate::Page::trim_rect)
             .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 210.0, 297.0));
 
-        // Priority 1: Exact 2D node snapping (highest geometric precision)
-        if options.nodes && page.is_some() {
+        let candidates: Vec<ObjectId> = if page.is_some() {
             let index = doc.build_spatial_index(page_index);
-            let candidates: Vec<ObjectId> = index
-                .query_point(pt_mm, tol)
+            index
+                .query_point(pt_mm, tol.max(8.0))
                 .into_iter()
                 .filter(|id| !exclude.contains(id))
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Priority 1: Exact 2D node snapping (highest geometric precision)
+        if options.nodes && page.is_some() {
             if let Some(hit) = hit_test_node(doc, &candidates, pt_mm, tol) {
                 let mut guides = Vec::new();
                 if options.dynamic_guides {
@@ -2147,6 +2571,442 @@ impl SnapEngine {
                 }
                 return (hit.position_mm, guides);
             }
+        }
+
+        // Priority 1.5: Exact 2D Geometric Snaps (Intersection, Quadrant, Tangent, Perpendicular, Baseline)
+        let mut geom_best: Option<(f64, Point2D, Vec<DynamicGuideLine>)> = None;
+        let mut try_geom = |cand_pt: Point2D, mut g_lines: Vec<DynamicGuideLine>| {
+            if !cand_pt.is_finite() {
+                return;
+            }
+            let d = cand_pt.distance_to(pt_mm);
+            if d <= tol && geom_best.as_ref().is_none_or(|b| d < b.0) {
+                if !options.dynamic_guides {
+                    g_lines.clear();
+                }
+                geom_best = Some((d, cand_pt, g_lines));
+            }
+        };
+
+        if page.is_some() {
+            // Collect visible object paths & ellipses in/near query radius
+            let mut seg_groups: Vec<(ObjectId, Vec<(Point2D, Point2D)>)> = Vec::new();
+            let mut world_paths: Vec<(ObjectId, BezierPath, bool)> = Vec::new();
+
+            for &oid in &candidates {
+                let Some(obj) = doc.object(oid) else {
+                    continue;
+                };
+                if !obj.visible {
+                    continue;
+                }
+                let world_xf = doc.world_transform_of(oid).unwrap_or(obj.transform);
+
+                // Quadrant & analytical circle/ellipse Tangent
+                if let NodePayload::Shape(ParametricShape::Ellipse { rx, ry, .. }) = &obj.payload {
+                    let rx = sanitize_f64(*rx, 1.0).abs();
+                    let ry = sanitize_f64(*ry, 1.0).abs();
+                    if rx > 1e-6 && ry > 1e-6 {
+                        if options.quadrant {
+                            let wc = world_xf.transform_point(Point2D::ZERO);
+                            for (dx, dy, lbl) in [
+                                (rx, 0.0, "quadrant 0°"),
+                                (0.0, ry, "quadrant 90°"),
+                                (-rx, 0.0, "quadrant 180°"),
+                                (0.0, -ry, "quadrant 270°"),
+                            ] {
+                                let qp = world_xf.transform_point(Point2D::new(dx, dy));
+                                let guides = vec![
+                                    DynamicGuideLine {
+                                        start: wc,
+                                        end: qp,
+                                        kind: DynamicGuideKind::ExtensionRay,
+                                        label: None,
+                                    },
+                                    DynamicGuideLine {
+                                        start: Point2D::new(qp.x - 2.5, qp.y),
+                                        end: Point2D::new(qp.x + 2.5, qp.y),
+                                        kind: DynamicGuideKind::Quadrant,
+                                        label: Some(lbl.into()),
+                                    },
+                                ];
+                                try_geom(qp, guides);
+                            }
+                        }
+
+                        if options.tangent {
+                            if let Some(ref_pt) = ref_pt_mm.filter(|p| p.is_finite()) {
+                                let ellipse_to_world = world_xf.compose(&Affine2D::scale(rx, ry));
+                                if let Some(world_to_unit) = ellipse_to_world.inverse() {
+                                    let u_ref = world_to_unit.transform_point(ref_pt);
+                                    let d2 = u_ref.x * u_ref.x + u_ref.y * u_ref.y;
+                                    if d2 > 1.0 + 1e-9 {
+                                        let inv_d2 = 1.0 / d2;
+                                        let perp_scale = (d2 - 1.0).sqrt() * inv_d2;
+                                        for sign in [-1.0_f64, 1.0_f64] {
+                                            let ux = u_ref.x * inv_d2 - sign * u_ref.y * perp_scale;
+                                            let uy = u_ref.y * inv_d2 + sign * u_ref.x * perp_scale;
+                                            let tp = ellipse_to_world
+                                                .transform_point(Point2D::new(ux, uy));
+                                            let guides = vec![
+                                                DynamicGuideLine {
+                                                    start: ref_pt,
+                                                    end: tp,
+                                                    kind: DynamicGuideKind::ExtensionRay,
+                                                    label: Some("tangent".into()),
+                                                },
+                                                DynamicGuideLine {
+                                                    start: Point2D::new(tp.x - 2.5, tp.y),
+                                                    end: Point2D::new(tp.x + 2.5, tp.y),
+                                                    kind: DynamicGuideKind::Tangent,
+                                                    label: Some("tangent".into()),
+                                                },
+                                            ];
+                                            try_geom(tp, guides);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Text Baseline snaps
+                if options.baseline {
+                    match &obj.payload {
+                        NodePayload::ArtisticText(at) => {
+                            let font_mm = at
+                                .runs
+                                .iter()
+                                .map(|r| r.style.font_size_mm())
+                                .fold(4.0_f64, f64::max);
+                            let line_ratio = at.runs.first().map_or(1.2, |r| {
+                                sanitize_f64(r.style.line_height_ratio, 1.2).max(0.5)
+                            });
+                            let est_w = at.estimated_bounds().width().max(10.0);
+                            let line_count = at.plain_text().split('\n').count().max(1);
+                            for li in 0..line_count {
+                                let base_y = (li as f64) * font_mm * line_ratio + font_mm * 0.85;
+                                let p0 = world_xf.transform_point(Point2D::new(0.0, base_y));
+                                let p1 = world_xf.transform_point(Point2D::new(est_w, base_y));
+                                let dir = p1 - p0;
+                                let len2 = dir.dot(dir);
+                                if len2 > 1e-9 {
+                                    let t = (pt_mm - p0).dot(dir) / len2;
+                                    let proj = p0 + dir * t;
+                                    let guides = vec![
+                                        DynamicGuideLine {
+                                            start: p0,
+                                            end: proj,
+                                            kind: DynamicGuideKind::ExtensionRay,
+                                            label: None,
+                                        },
+                                        DynamicGuideLine {
+                                            start: Point2D::new(proj.x - 3.0, proj.y),
+                                            end: Point2D::new(proj.x + 3.0, proj.y),
+                                            kind: DynamicGuideKind::Baseline,
+                                            label: Some("baseline".into()),
+                                        },
+                                    ];
+                                    try_geom(proj, guides);
+                                }
+                            }
+                        }
+                        NodePayload::ParagraphText(para) => {
+                            let font_mm = para
+                                .runs
+                                .iter()
+                                .map(|r| r.style.font_size_mm())
+                                .fold(3.5_f64, f64::max);
+                            let base_y = font_mm * 0.85;
+                            let p0 = world_xf.transform_point(Point2D::new(0.0, base_y));
+                            let p1 = world_xf.transform_point(Point2D::new(
+                                sanitize_f64(para.frame_size.x, 40.0).max(5.0),
+                                base_y,
+                            ));
+                            let dir = p1 - p0;
+                            let len2 = dir.dot(dir);
+                            if len2 > 1e-9 {
+                                let t = (pt_mm - p0).dot(dir) / len2;
+                                let proj = p0 + dir * t;
+                                let guides = vec![DynamicGuideLine {
+                                    start: p0,
+                                    end: p1,
+                                    kind: DynamicGuideKind::Baseline,
+                                    label: Some("baseline".into()),
+                                }];
+                                try_geom(proj, guides);
+                            }
+                        }
+                        NodePayload::TextOnPath(top) => {
+                            if let Some(hp) = doc.world_path_of(top.path_id) {
+                                if let Some((pt, _)) = hp
+                                    .point_and_tangent_at(sanitize_f64(top.offset_mm, 0.0).max(0.0))
+                                {
+                                    let guides = vec![DynamicGuideLine {
+                                        start: Point2D::new(pt.x - 3.0, pt.y),
+                                        end: Point2D::new(pt.x + 3.0, pt.y),
+                                        kind: DynamicGuideKind::Baseline,
+                                        label: Some("baseline".into()),
+                                    }];
+                                    try_geom(pt, guides);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Also collect world path for Perpendicular / Intersection / non-ellipse Tangent
+                if let Some(wp) = doc.world_path_of(oid) {
+                    let is_full_ellipse = matches!(
+                        obj.payload,
+                        NodePayload::Shape(ParametricShape::Ellipse {
+                            mode: crate::EllipseMode::Full,
+                            ..
+                        })
+                    );
+                    let mut segs = Vec::new();
+                    for poly in wp.flatten(0.02) {
+                        for w in poly.windows(2) {
+                            if w[0].distance_to(w[1]) > 1e-7 {
+                                segs.push((w[0], w[1]));
+                            }
+                        }
+                    }
+                    if !segs.is_empty() {
+                        seg_groups.push((oid, segs));
+                    }
+                    world_paths.push((oid, wp, is_full_ellipse));
+                }
+            }
+
+            // Perpendicular snap from ref_pt_mm onto nearby segments / curves
+            if options.perpendicular {
+                if let Some(ref_pt) = ref_pt_mm.filter(|p| p.is_finite()) {
+                    for (_, wp, _) in &world_paths {
+                        let total = wp.path_length_mm();
+                        if total <= 1e-6 {
+                            continue;
+                        }
+                        // Coarse sample + Newton/golden refinement for < 0.01mm precision
+                        let samples = ((total / 0.5).ceil() as usize).clamp(16, 256);
+                        let step = total / samples as f64;
+                        for i in 0..samples {
+                            let s0 = i as f64 * step;
+                            let s1 = (i + 1) as f64 * step;
+                            let Some((p0, t0)) = wp.point_and_tangent_at(s0) else {
+                                continue;
+                            };
+                            let Some((p1, t1)) = wp.point_and_tangent_at(s1) else {
+                                continue;
+                            };
+                            let f0 = (p0 - ref_pt).dot(t0);
+                            let f1 = (p1 - ref_pt).dot(t1);
+                            let root_s = if f0.abs() < 1e-9 {
+                                Some(s0)
+                            } else if f1.abs() < 1e-9 {
+                                Some(s1)
+                            } else if (f0 < 0.0) != (f1 < 0.0) {
+                                let mut a = s0;
+                                let mut b = s1;
+                                let mut fa = f0;
+                                for _ in 0..24 {
+                                    let m = 0.5 * (a + b);
+                                    let Some((pm, tm)) = wp.point_and_tangent_at(m) else {
+                                        break;
+                                    };
+                                    let fm = (pm - ref_pt).dot(tm);
+                                    if fm.abs() < 1e-9 || (b - a) < 1e-7 {
+                                        a = m;
+                                        b = m;
+                                        break;
+                                    }
+                                    if fa * fm > 0.0 {
+                                        a = m;
+                                        fa = fm;
+                                    } else {
+                                        b = m;
+                                    }
+                                }
+                                Some(0.5 * (a + b))
+                            } else {
+                                None
+                            };
+                            if let Some(sm) = root_s {
+                                if let Some((foot, _)) = wp.point_and_tangent_at(sm) {
+                                    let guides = vec![
+                                        DynamicGuideLine {
+                                            start: ref_pt,
+                                            end: foot,
+                                            kind: DynamicGuideKind::ExtensionRay,
+                                            label: Some("perpendicular".into()),
+                                        },
+                                        DynamicGuideLine {
+                                            start: Point2D::new(foot.x - 2.5, foot.y),
+                                            end: Point2D::new(foot.x + 2.5, foot.y),
+                                            kind: DynamicGuideKind::Perpendicular,
+                                            label: Some("perpendicular".into()),
+                                        },
+                                    ];
+                                    try_geom(foot, guides);
+                                }
+                            }
+                        }
+                    }
+                    // Also exact segment-projection fallback for sharp corners
+                    for (_, segs) in &seg_groups {
+                        for &(a, b) in segs {
+                            let ab = b - a;
+                            let len2 = ab.dot(ab);
+                            if len2 <= 1e-9 {
+                                continue;
+                            }
+                            let t = (ref_pt - a).dot(ab) / len2;
+                            if (0.0..=1.0).contains(&t) {
+                                let foot = a + ab * t;
+                                let guides = vec![
+                                    DynamicGuideLine {
+                                        start: ref_pt,
+                                        end: foot,
+                                        kind: DynamicGuideKind::ExtensionRay,
+                                        label: Some("perpendicular".into()),
+                                    },
+                                    DynamicGuideLine {
+                                        start: Point2D::new(foot.x - 2.5, foot.y),
+                                        end: Point2D::new(foot.x + 2.5, foot.y),
+                                        kind: DynamicGuideKind::Perpendicular,
+                                        label: Some("perpendicular".into()),
+                                    },
+                                ];
+                                try_geom(foot, guides);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // General curve Tangent snap from ref_pt_mm when not already handled analytically by Ellipse
+            if options.tangent {
+                if let Some(ref_pt) = ref_pt_mm.filter(|p| p.is_finite()) {
+                    for (_, wp, is_full_ellipse) in &world_paths {
+                        if *is_full_ellipse {
+                            continue;
+                        }
+                        let total = wp.path_length_mm();
+                        if total <= 1e-6 {
+                            continue;
+                        }
+                        let samples = ((total / 0.5).ceil() as usize).clamp(16, 256);
+                        let step = total / samples as f64;
+                        for i in 0..samples {
+                            let s0 = i as f64 * step;
+                            let s1 = (i + 1) as f64 * step;
+                            let Some((p0, t0)) = wp.point_and_tangent_at(s0) else {
+                                continue;
+                            };
+                            let Some((p1, t1)) = wp.point_and_tangent_at(s1) else {
+                                continue;
+                            };
+                            let c0 = (p0 - ref_pt).cross(t0);
+                            let c1 = (p1 - ref_pt).cross(t1);
+                            let root_s = if c0.abs() < 1e-9 {
+                                Some(s0)
+                            } else if c1.abs() < 1e-9 {
+                                Some(s1)
+                            } else if (c0 < 0.0) != (c1 < 0.0) {
+                                let mut a = s0;
+                                let mut b = s1;
+                                let mut ca = c0;
+                                for _ in 0..24 {
+                                    let m = 0.5 * (a + b);
+                                    let Some((pm, tm)) = wp.point_and_tangent_at(m) else {
+                                        break;
+                                    };
+                                    let cm = (pm - ref_pt).cross(tm);
+                                    if cm.abs() < 1e-9 || (b - a) < 1e-7 {
+                                        a = m;
+                                        b = m;
+                                        break;
+                                    }
+                                    if ca * cm > 0.0 {
+                                        a = m;
+                                        ca = cm;
+                                    } else {
+                                        b = m;
+                                    }
+                                }
+                                Some(0.5 * (a + b))
+                            } else {
+                                None
+                            };
+                            if let Some(sm) = root_s {
+                                if let Some((tp, _)) = wp.point_and_tangent_at(sm) {
+                                    if tp.distance_to(ref_pt) > 0.1 {
+                                        let guides = vec![
+                                            DynamicGuideLine {
+                                                start: ref_pt,
+                                                end: tp,
+                                                kind: DynamicGuideKind::ExtensionRay,
+                                                label: Some("tangent".into()),
+                                            },
+                                            DynamicGuideLine {
+                                                start: Point2D::new(tp.x - 2.5, tp.y),
+                                                end: Point2D::new(tp.x + 2.5, tp.y),
+                                                kind: DynamicGuideKind::Tangent,
+                                                label: Some("tangent".into()),
+                                            },
+                                        ];
+                                        try_geom(tp, guides);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Intersection snap across distinct candidate objects
+            if options.intersection && seg_groups.len() >= 2 {
+                let query_box =
+                    Rect2D::from_xywh(pt_mm.x - tol, pt_mm.y - tol, tol * 2.0, tol * 2.0);
+                for i in 0..seg_groups.len() {
+                    let (_, ref segs_a) = seg_groups[i];
+                    for (_, ref segs_b) in seg_groups.iter().skip(i + 1) {
+                        for &(a1, a2) in segs_a {
+                            if !segment_intersects_rect(a1, a2, query_box) {
+                                continue;
+                            }
+                            for &(b1, b2) in segs_b {
+                                if !segment_intersects_rect(b1, b2, query_box) {
+                                    continue;
+                                }
+                                if let Some(ip) = segment_intersection(a1, a2, b1, b2) {
+                                    let guides = vec![
+                                        DynamicGuideLine {
+                                            start: Point2D::new(ip.x - 3.0, ip.y - 3.0),
+                                            end: Point2D::new(ip.x + 3.0, ip.y + 3.0),
+                                            kind: DynamicGuideKind::Intersection,
+                                            label: Some("intersection".into()),
+                                        },
+                                        DynamicGuideLine {
+                                            start: Point2D::new(ip.x - 3.0, ip.y + 3.0),
+                                            end: Point2D::new(ip.x + 3.0, ip.y - 3.0),
+                                            kind: DynamicGuideKind::Intersection,
+                                            label: None,
+                                        },
+                                    ];
+                                    try_geom(ip, guides);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, g_pt, g_lines)) = geom_best {
+            return (g_pt, g_lines);
         }
 
         // Priority 2: Independent X and Y axis snapping across objects, guidelines, page edges, grid

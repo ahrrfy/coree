@@ -7,7 +7,7 @@
 use crate::cdr_bridge::{inspect_any_file, inspect_in_memory_document, FileInspectionReport};
 use crate::io_bridge::{
     build_import_document_ops_on_layer, export_any_document, open_any_document,
-    resolve_import_target_layer, UniversalExportOptions,
+    open_any_document_with_codepage, resolve_import_target_layer, UniversalExportOptions,
 };
 use crate::printing::{
     list_system_printers, print_document_via_os_spooler, PrintJobConfig, PrinterInfo,
@@ -58,8 +58,8 @@ use coree_render::{
 };
 use coree_storage::{
     DifferentialSnapshotPatch, FontQuery, FontRecord, FontSubstitutionRecord, JobHandle,
-    JobOutcome, JobPool, PanoseClassification, RecentDocumentRecord, StorageDb, UncleanSession,
-    WorkspaceLayoutRecord,
+    JobOutcome, JobPool, PanoseClassification, RecentDocumentRecord, StorageDb, TemplateRecord,
+    UncleanSession, WorkspaceLayoutRecord,
 };
 pub use coree_tools::{
     ActiveDragState, CursorHint, HandleShape, KeyEvent, ModifiersState, NodeDragPart,
@@ -127,6 +127,18 @@ pub struct StudioApp {
     pub show_dockers: bool,
     pub toolbox_two_column: bool,
     pub active_workspace_preset: WorkspacePreset,
+    pub toolbar_config: ToolbarConfig,
+    pub templates: Vec<TemplateRecord>,
+    pub template_category_filter: Option<String>,
+    pub objects_filter: String,
+    pub selected_cdr_chunk_idx: Option<usize>,
+    pub show_navigator_popup: bool,
+    pub swatch_hold_state: Option<(Instant, Color, egui::Pos2)>,
+    pub tint_grid_popup: Option<(Color, egui::Pos2)>,
+    pub print_preview_zoom: f32,
+    pub print_preview_pan: [f32; 2],
+    pub print_preview_plate: Option<usize>,
+    pub print_preview_tex: std::cell::RefCell<Option<(u64, egui::TextureHandle)>>,
 
     // Studio Viewport & Options State
     pub show_options_dialog: bool,
@@ -211,6 +223,8 @@ pub struct StudioApp {
     pub edit_fill_selected_stop: usize,
     pub show_outline_pen_dialog: bool,
     pub outline_pen_draft: OutlineStyle,
+    pub missing_font_dialog: MissingFontPromptState,
+    pub cdr_import_dialog: CdrImportPromptState,
 
     // Feedback
     pub status_message: String,
@@ -387,6 +401,25 @@ impl StudioApp {
             .as_ref()
             .and_then(|db| db.list_unclean_sessions().ok())
             .unwrap_or_default();
+        let mut templates = storage
+            .as_ref()
+            .and_then(|db| db.list_templates(None).ok())
+            .unwrap_or_default();
+        if templates.is_empty() {
+            let defaults = builtin_default_templates();
+            if let Some(ref db) = storage {
+                for tpl in &defaults {
+                    let _ = db.upsert_template(tpl);
+                }
+                templates = db.list_templates(None).unwrap_or(defaults);
+            } else {
+                templates = defaults;
+            }
+        }
+        let saved_toolbar_config = saved_toolbox
+            .as_ref()
+            .map(|t| t.toolbar_config.clone())
+            .unwrap_or_default();
 
         let job_pool = JobPool::default_pool().ok();
 
@@ -421,6 +454,18 @@ impl StudioApp {
             active_workspace_preset: saved_toolbox
                 .as_ref()
                 .map_or(WorkspacePreset::DefaultClassic, |t| t.preset),
+            toolbar_config: saved_toolbar_config,
+            templates,
+            template_category_filter: None,
+            objects_filter: String::new(),
+            selected_cdr_chunk_idx: None,
+            show_navigator_popup: false,
+            swatch_hold_state: None,
+            tint_grid_popup: None,
+            print_preview_zoom: 1.0,
+            print_preview_pan: [0.0, 0.0],
+            print_preview_plate: None,
+            print_preview_tex: std::cell::RefCell::new(None),
             show_options_dialog: false,
             options_tab: 0,
             full_screen_preview: false,
@@ -494,6 +539,8 @@ impl StudioApp {
             edit_fill_selected_stop: 0,
             show_outline_pen_dialog: false,
             outline_pen_draft: OutlineStyle::solid(Color::KEY_BLACK, 0.3),
+            missing_font_dialog: MissingFontPromptState::default(),
+            cdr_import_dialog: CdrImportPromptState::default(),
             status_message: "Ready · 100% Offline Local Studio".to_owned(),
             toasts: Vec::new(),
         };
@@ -586,7 +633,20 @@ impl StudioApp {
 
     /// Opens any supported document file (`.coree`, `.cdr`, `.cdt`, `.cmx`, `.cpt`, `.svg`, raster).
     pub fn open_file_path(&mut self, path: &Path) -> Result<(), String> {
-        let opened = open_any_document(path)?;
+        self.open_file_path_with_codepage(path, None)
+    }
+
+    /// Opens any supported document file with an explicit `.cdr` fallback codepage (`CP1256`/`CP1251`/`UTF-8`).
+    pub fn open_file_path_with_codepage(
+        &mut self,
+        path: &Path,
+        default_codepage: Option<u16>,
+    ) -> Result<(), String> {
+        let opened = if default_codepage.is_some() {
+            open_any_document_with_codepage(path, default_codepage)?
+        } else {
+            open_any_document(path)?
+        };
         let title = opened.document.title().to_owned();
         let page_count = opened.document.pages().len() as u32;
         let color_mode = match opened.document.color_mode() {
@@ -621,6 +681,8 @@ impl StudioApp {
             let _ = db.upsert_recent_document(&rec);
             self.refresh_storage_lists();
         }
+
+        self.check_missing_fonts_on_active_tab(&title);
 
         if opened.warnings.is_empty() {
             self.push_toast(format!("Opened '{title}'"), false);
@@ -679,6 +741,7 @@ impl StudioApp {
             }
             self.checkpoint_wal_snapshot_active();
         }
+        self.check_missing_fonts_on_active_tab(opened.document.title());
         self.push_toast(
             format!("Imported {count} object(s) from {}", path.display()),
             false,
@@ -912,6 +975,7 @@ impl StudioApp {
             treat_all_objects_as_filled: self.treat_all_objects_as_filled,
             object_origin_anchor: self.object_origin_anchor,
             group_active_tools: Some(self.group_active_tools),
+            toolbar_config: self.toolbar_config.clone(),
         };
         let toolbox_json = serde_json::to_string(&toolbox_cfg).unwrap_or_else(|_| "{}".to_owned());
         let shortcuts_json =
@@ -2352,6 +2416,285 @@ impl StudioApp {
             }
         }
     }
+
+    /// Audits the active tab for missing font families (`CRLFOM` modal trigger on open/import)
+    /// and prepares `PANOSE` perceptual fallback suggestions (`REQ-07`).
+    pub fn check_missing_fonts_on_active_tab(&mut self, doc_title: &str) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let rules = PreflightRules {
+            check_rgb_in_cmyk: false,
+            warn_live_text: false,
+            check_missing_fonts: true,
+            check_bleed: false,
+            check_layer_states: false,
+            ..PreflightRules::default()
+        };
+        let report = run_preflight(&tab.document, &rules);
+        let mut missing_families: Vec<String> = Vec::new();
+        for issue in report.issues {
+            if issue.kind == coree_prod::PreflightIssueKind::MissingFont {
+                if let Some(rest) = issue.message.split("references font family '").nth(1) {
+                    if let Some((fam, _)) = rest.split_once('\'') {
+                        let fam = fam.trim();
+                        if !fam.is_empty()
+                            && !missing_families
+                                .iter()
+                                .any(|existing| existing.eq_ignore_ascii_case(fam))
+                        {
+                            missing_families.push(fam.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        if missing_families.is_empty() {
+            return;
+        }
+        if self.font_manager_state.indexed_fonts.is_empty() && self.storage.is_some() {
+            self.refresh_font_manager(true);
+        }
+        let mut entries = Vec::with_capacity(missing_families.len());
+        for fam in missing_families {
+            let stored = self
+                .storage
+                .as_ref()
+                .and_then(|db| db.get_font_substitution(&fam).ok().flatten());
+            let is_arabic = fam.to_ascii_lowercase().contains("arab")
+                || fam.to_ascii_lowercase().contains("naskh")
+                || fam.to_ascii_lowercase().contains("kufi");
+            let panose_match = self.find_best_panose_substitute(
+                &PanoseClassification::default(),
+                400,
+                false,
+                is_arabic,
+            );
+            let fallback = if is_arabic {
+                "Noto Sans Arabic"
+            } else {
+                "Noto Sans"
+            };
+            let suggested = panose_match
+                .as_ref()
+                .map(|(rec, _)| rec.family_name.clone())
+                .unwrap_or_else(|| fallback.to_owned());
+            let selected = stored
+                .map(|s| s.substitute_family)
+                .unwrap_or_else(|| suggested.clone());
+            entries.push(MissingFontPromptEntry {
+                missing_family: fam,
+                suggested_family: suggested,
+                selected_family: selected,
+                panose_distance: panose_match.map(|(_, d)| d),
+            });
+        }
+        self.missing_font_dialog = MissingFontPromptState {
+            open: true,
+            document_title: doc_title.to_owned(),
+            entries,
+            remember_rules: true,
+        };
+    }
+
+    /// Applies the user's `CRLFOM` modal font substitutions to the active document via `CommandOp`
+    /// and optionally persists each rule into SQLite `font_substitutions`.
+    pub fn apply_missing_font_dialog_substitutions(&mut self) -> usize {
+        let entries = self.missing_font_dialog.entries.clone();
+        let remember = self.missing_font_dialog.remember_rules;
+        let mut replaced_total = 0usize;
+        for entry in &entries {
+            let target = entry.selected_family.trim();
+            if target.is_empty() {
+                continue;
+            }
+            if remember && self.storage.is_some() {
+                let _ = self.set_font_substitution(&entry.missing_family, target, None);
+            }
+            let query = FindQuery {
+                scope: FindScope::WholeDocument,
+                object_kind: None,
+                fill_color: None,
+                outline_color: None,
+                outline_width_min_mm: None,
+                outline_width_max_mm: None,
+                is_hairline: None,
+                font_family: Some(entry.missing_family.clone()),
+                text_pattern: None,
+                lens_kind: None,
+                layer_id: None,
+                layer_name: None,
+            };
+            let cmd = CommandOp::FindAndReplace {
+                query,
+                action: ReplaceAction::ReplaceFontFamily {
+                    font_family: target.to_owned(),
+                },
+            };
+            if self.execute_command(cmd).is_ok() {
+                replaced_total += 1;
+            }
+        }
+        self.missing_font_dialog.open = false;
+        if replaced_total > 0 {
+            self.push_toast(
+                format!("Substituted fonts in {replaced_total} missing family rule(s)"),
+                false,
+            );
+        }
+        replaced_total
+    }
+
+    /// Creates a fresh document from a SQLite/built-in template (opening `.cdt` if present on disk,
+    /// otherwise creating a configured `Document` with matching dimensions, bleed, color mode & pages).
+    pub fn create_document_from_template(&mut self, tpl: &TemplateRecord) {
+        if !tpl.template_path.trim().is_empty() {
+            let path = Path::new(&tpl.template_path);
+            if path.is_file() && self.open_file_path(path).is_ok() {
+                return;
+            }
+        }
+        let color_mode = if tpl.color_mode.eq_ignore_ascii_case("rgb") {
+            ColorMode::Rgb
+        } else {
+            ColorMode::Cmyk
+        };
+        let mut doc = Document::new(
+            &tpl.name,
+            tpl.width_mm.max(10.0),
+            tpl.height_mm.max(10.0),
+            color_mode,
+            300.0,
+        );
+        if let Some(p0) = doc.page_mut(0) {
+            p0.bleed_mm = tpl.bleed_mm.max(0.0);
+        }
+        for p_idx in 1..tpl.page_count.max(1) {
+            doc.add_page(
+                format!("Page {}", p_idx + 1),
+                tpl.width_mm.max(10.0),
+                tpl.height_mm.max(10.0),
+                tpl.bleed_mm.max(0.0),
+            );
+        }
+        self.new_document(doc);
+    }
+
+    /// Saves the active document as a `.cdt` template file and registers it in SQLite `templates`.
+    pub fn save_active_as_cdt_template(
+        &mut self,
+        path: &Path,
+        category: &str,
+        description: &str,
+    ) -> Result<(), String> {
+        let tpl_rec = {
+            let tab = self
+                .tabs
+                .get(self.active_tab)
+                .ok_or_else(|| "no active document".to_owned())?;
+            let page0 = tab.document.pages().first();
+            coree_io::save_coree(&tab.document, path).map_err(|e| e.to_string())?;
+            TemplateRecord {
+                id: format!("tpl-{}", Uuid::new_v4()),
+                name: tab.document.title().to_owned(),
+                category: if category.trim().is_empty() {
+                    "custom".to_owned()
+                } else {
+                    category.trim().to_owned()
+                },
+                description: description.trim().to_owned(),
+                template_path: path.to_string_lossy().into_owned(),
+                width_mm: page0.map_or(210.0, |p| p.width_mm),
+                height_mm: page0.map_or(297.0, |p| p.height_mm),
+                bleed_mm: page0.map_or(3.0, |p| p.bleed_mm),
+                page_count: tab.document.pages().len() as u32,
+                color_mode: match tab.document.color_mode() {
+                    ColorMode::Cmyk => "cmyk",
+                    ColorMode::Rgb => "rgb",
+                }
+                .to_owned(),
+                thumbnail_png: None,
+                is_builtin: false,
+                favorite: true,
+            }
+        };
+        if let Some(ref db) = self.storage {
+            db.upsert_template(&tpl_rec).map_err(|e| e.to_string())?;
+            if let Ok(list) = db.list_templates(None) {
+                self.templates = list;
+            }
+        } else {
+            self.templates.push(tpl_rec);
+        }
+        self.push_toast(format!("Saved template '{}'", path.display()), false);
+        Ok(())
+    }
+}
+
+/// Built-in offline production templates seeded into SQLite `templates` on first run (`REQ-12`).
+fn builtin_default_templates() -> Vec<TemplateRecord> {
+    vec![
+        TemplateRecord {
+            id: "builtin-a4-flyer".to_owned(),
+            name: "A4 Print Flyer (CMYK 3mm Bleed)".to_owned(),
+            category: "print".to_owned(),
+            description: "ISO A4 210x297 mm CMYK press-ready layout with 3 mm bleed.".to_owned(),
+            template_path: String::new(),
+            width_mm: 210.0,
+            height_mm: 297.0,
+            bleed_mm: 3.0,
+            page_count: 1,
+            color_mode: "cmyk".to_owned(),
+            thumbnail_png: None,
+            is_builtin: true,
+            favorite: true,
+        },
+        TemplateRecord {
+            id: "builtin-bizcard".to_owned(),
+            name: "Business Card (90x50 mm)".to_owned(),
+            category: "print".to_owned(),
+            description: "Standard 90x50 mm front & back double-sided business card.".to_owned(),
+            template_path: String::new(),
+            width_mm: 90.0,
+            height_mm: 50.0,
+            bleed_mm: 3.0,
+            page_count: 2,
+            color_mode: "cmyk".to_owned(),
+            thumbnail_png: None,
+            is_builtin: true,
+            favorite: false,
+        },
+        TemplateRecord {
+            id: "builtin-fefco-pkg".to_owned(),
+            name: "Packaging Dieline Sheet (450x320 mm)".to_owned(),
+            category: "packaging".to_owned(),
+            description: "SRA3 450x320 mm packaging & CutContour dieline sheet.".to_owned(),
+            template_path: String::new(),
+            width_mm: 450.0,
+            height_mm: 320.0,
+            bleed_mm: 5.0,
+            page_count: 1,
+            color_mode: "cmyk".to_owned(),
+            thumbnail_png: None,
+            is_builtin: true,
+            favorite: false,
+        },
+        TemplateRecord {
+            id: "builtin-social-rgb".to_owned(),
+            name: "Social Square Post (1080px / RGB)".to_owned(),
+            category: "digital".to_owned(),
+            description: "Square sRGB social media graphic preset.".to_owned(),
+            template_path: String::new(),
+            width_mm: 91.44,
+            height_mm: 91.44,
+            bleed_mm: 0.0,
+            page_count: 1,
+            color_mode: "rgb".to_owned(),
+            thumbnail_png: None,
+            is_builtin: true,
+            favorite: false,
+        },
+    ]
 }
 
 fn build_differential_patch_from_tab(

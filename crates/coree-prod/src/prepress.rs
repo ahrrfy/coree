@@ -1033,22 +1033,33 @@ pub fn export_separated_plates_pdf_bytes(
         let encode_path = |path: &BezierPath| -> String {
             let mut ops = String::new();
             let kb = path.to_kurbo();
+            let mut cur_pt = kurbo::Point::ZERO;
+            let mut subpath_start = kurbo::Point::ZERO;
             for el in kb.elements() {
                 match *el {
                     PathEl::MoveTo(p) => {
+                        cur_pt = p;
+                        subpath_start = p;
                         let (x, y) = to_pdf_xy(Point2D::new(p.x, p.y));
                         ops.push_str(&format!("{x:.3} {y:.3} m\n"));
                     }
                     PathEl::LineTo(p) => {
+                        cur_pt = p;
                         let (x, y) = to_pdf_xy(Point2D::new(p.x, p.y));
                         ops.push_str(&format!("{x:.3} {y:.3} l\n"));
                     }
                     PathEl::QuadTo(p1, p2) => {
-                        let (x1, y1) = to_pdf_xy(Point2D::new(p1.x, p1.y));
-                        let (x2, y2) = to_pdf_xy(Point2D::new(p2.x, p2.y));
-                        ops.push_str(&format!("{x1:.3} {y1:.3} {x2:.3} {y2:.3} v\n"));
+                        let cubic = kurbo::QuadBez::new(cur_pt, p1, p2).raise();
+                        cur_pt = p2;
+                        let (x1, y1) = to_pdf_xy(Point2D::new(cubic.p1.x, cubic.p1.y));
+                        let (x2, y2) = to_pdf_xy(Point2D::new(cubic.p2.x, cubic.p2.y));
+                        let (x3, y3) = to_pdf_xy(Point2D::new(cubic.p3.x, cubic.p3.y));
+                        ops.push_str(&format!(
+                            "{x1:.3} {y1:.3} {x2:.3} {y2:.3} {x3:.3} {y3:.3} c\n"
+                        ));
                     }
                     PathEl::CurveTo(p1, p2, p3) => {
+                        cur_pt = p3;
                         let (x1, y1) = to_pdf_xy(Point2D::new(p1.x, p1.y));
                         let (x2, y2) = to_pdf_xy(Point2D::new(p2.x, p2.y));
                         let (x3, y3) = to_pdf_xy(Point2D::new(p3.x, p3.y));
@@ -1056,7 +1067,10 @@ pub fn export_separated_plates_pdf_bytes(
                             "{x1:.3} {y1:.3} {x2:.3} {y2:.3} {x3:.3} {y3:.3} c\n"
                         ));
                     }
-                    PathEl::ClosePath => ops.push_str("h\n"),
+                    PathEl::ClosePath => {
+                        cur_pt = subpath_start;
+                        ops.push_str("h\n");
+                    }
                 }
             }
             ops
@@ -1966,14 +1980,16 @@ fn outline_text_path_for_separation(
     if let Some(local_path) = (ctx.text_outliner)(obj, ctx.doc) {
         if local_path.is_finite() {
             if !local_path.is_empty() {
-                return Some(local_path.transformed(world_xf));
+                let warped = apply_obj_perspective_to_local_path(local_path, obj);
+                return Some(warped.transformed(world_xf));
             }
             if !has_non_whitespace {
                 return None;
             }
         }
     }
-    Some(BezierPath::from_rect(fallback_rect).transformed(world_xf))
+    let fb = apply_obj_perspective_to_local_path(BezierPath::from_rect(fallback_rect), obj);
+    Some(fb.transformed(world_xf))
 }
 
 fn paint_vector_object(
@@ -2204,8 +2220,9 @@ fn paint_raster_object(
     let Some(raw_asset) = ctx.doc.asset(raster.asset_id) else {
         return;
     };
-    let filtered = (!raster.filters.is_empty())
-        .then(|| coree_render::apply_raster_filters(raw_asset, &raster.filters));
+    let active_filters = raster.active_filters();
+    let filtered = (!active_filters.is_empty())
+        .then(|| coree_render::apply_raster_filters(raw_asset, &active_filters));
     let asset = filtered.as_ref().unwrap_or(raw_asset);
     if asset.width == 0 || asset.height == 0 || raster.width_mm <= 1e-6 || raster.height_mm <= 1e-6
     {
@@ -5441,6 +5458,7 @@ mod tests {
                         height_mm: 40.0,
                         crop_rect: None,
                         filters,
+                        filter_enabled: Vec::new(),
                     }),
                 )
                 .with_transform(Affine2D::translate(10.0, 10.0)),

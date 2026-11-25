@@ -22,7 +22,7 @@ use crate::math::{
 };
 use crate::style::{BlendMode, Fill, ObjectStyle, OutlineStyle};
 use crate::table::VectorTable;
-use crate::text::{ArtisticText, ParagraphText, TextOnPath};
+use crate::text::{ArtisticText, ParagraphText, TextField, TextOnPath, TextRun};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rstar::{RTree, RTreeObject, AABB};
@@ -843,7 +843,28 @@ pub struct RasterLayerData {
     pub width_mm: f64,
     pub height_mm: f64,
     pub filters: Vec<RasterFilter>,
+    #[serde(default)]
+    pub filter_enabled: Vec<bool>,
     pub crop_rect: Option<Rect2D>,
+}
+
+impl RasterLayerData {
+    /// Returns whether filter at `idx` is enabled (defaults to `true` when `filter_enabled` is shorter).
+    #[must_use]
+    pub fn is_filter_enabled(&self, idx: usize) -> bool {
+        self.filter_enabled.get(idx).copied().unwrap_or(true)
+    }
+
+    /// Returns only the currently enabled filters in stack order.
+    #[must_use]
+    pub fn active_filters(&self) -> Vec<RasterFilter> {
+        self.filters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| self.is_filter_enabled(*idx))
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
 }
 
 /// Lossless passthrough container for unrecognized RIFF / `.cdr` binary chunks.
@@ -941,6 +962,8 @@ pub struct SceneObject {
     pub color_style_slot: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perspective: Option<Perspective3x3>,
+    #[serde(default)]
+    pub clip_even_odd: bool,
     pub unknown_chunks: Vec<UnknownCdrChunk>,
 }
 
@@ -966,6 +989,7 @@ impl SceneObject {
             color_style_id: None,
             color_style_slot: None,
             perspective: None,
+            clip_even_odd: false,
             unknown_chunks: Vec::new(),
         }
     }
@@ -1392,6 +1416,98 @@ impl PerspectiveGridConfig {
     }
 }
 
+/// Engineering drawing scale (`numerator : denominator`, e.g., `1 : 10` means `1 mm` on paper
+/// represents `10 mm` in real-world units).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DrawingScale {
+    pub numerator: f64,
+    pub denominator: f64,
+}
+
+impl Default for DrawingScale {
+    fn default() -> Self {
+        Self {
+            numerator: 1.0,
+            denominator: 1.0,
+        }
+    }
+}
+
+impl DrawingScale {
+    /// Standard architectural/engineering scale presets.
+    pub const PRESETS: &'static [Self] = &[
+        Self {
+            numerator: 1.0,
+            denominator: 1.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 2.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 5.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 10.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 20.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 50.0,
+        },
+        Self {
+            numerator: 1.0,
+            denominator: 100.0,
+        },
+    ];
+
+    /// Creates a validated positive finite drawing scale.
+    #[must_use]
+    pub fn new(numerator: f64, denominator: f64) -> Self {
+        let num = sanitize_f64(numerator, 1.0).max(1e-6);
+        let den = sanitize_f64(denominator, 1.0).max(1e-6);
+        Self {
+            numerator: num,
+            denominator: den,
+        }
+    }
+
+    /// World-to-page multiplier (`denominator / numerator`): `1:10` yields `10.0`.
+    #[must_use]
+    pub fn scale_factor(&self) -> f64 {
+        let num = sanitize_f64(self.numerator, 1.0);
+        let den = sanitize_f64(self.denominator, 1.0);
+        if !num.is_finite() || !den.is_finite() || num <= 1e-9 || den <= 0.0 {
+            1.0
+        } else {
+            den / num
+        }
+    }
+
+    /// Converts a page-space millimeter measurement into scaled world-space millimeters.
+    #[must_use]
+    pub fn scale_length_mm(&self, page_mm: f64) -> f64 {
+        sanitize_f64(page_mm, 0.0) * self.scale_factor()
+    }
+
+    /// Formats the scale as `"1:10"` (or decimal when fractional).
+    #[must_use]
+    pub fn label(&self) -> String {
+        let num = sanitize_f64(self.numerator, 1.0);
+        let den = sanitize_f64(self.denominator, 1.0);
+        if (num - num.round()).abs() < 1e-6 && (den - den.round()).abs() < 1e-6 {
+            format!("{}:{}", num.round() as i64, den.round() as i64)
+        } else {
+            format!("{num:.2}:{den:.2}")
+        }
+    }
+}
+
 /// Single page inside a multipage [`Document`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Page {
@@ -1401,6 +1517,10 @@ pub struct Page {
     pub height_mm: f64,
     pub bleed_mm: f64,
     pub facing_pages: bool,
+    #[serde(default)]
+    pub background_fill: Fill,
+    #[serde(default)]
+    pub printable_background: bool,
     pub layers: Vec<Layer>,
     #[serde(default)]
     pub unknown_chunks: Vec<UnknownCdrChunk>,
@@ -1424,6 +1544,8 @@ impl Page {
             height_mm: sanitize_f64(height_mm, 297.0).max(1.0),
             bleed_mm: sanitize_f64(bleed_mm, 0.0).max(0.0),
             facing_pages: false,
+            background_fill: Fill::None,
+            printable_background: false,
             layers: vec![Layer::new(default_layer_id, "Layer 1")],
             unknown_chunks: Vec::new(),
         }
@@ -1714,6 +1836,8 @@ pub struct Document {
     rendering_intent: RenderingIntent,
     #[serde(default = "default_true_lock")]
     black_point_compensation: bool,
+    #[serde(default)]
+    drawing_scale: DrawingScale,
     next_id: u64,
     #[serde(skip)]
     spatial_revision: RevisionCounter,
@@ -1774,6 +1898,7 @@ impl Document {
             gray_icc_name: None,
             rendering_intent: RenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
+            drawing_scale: DrawingScale::default(),
             next_id,
             spatial_revision: RevisionCounter(1),
         }
@@ -2169,6 +2294,75 @@ impl Document {
         self.touch();
     }
 
+    /// Document engineering drawing scale (e.g. `1:10`, `1:100`).
+    #[must_use]
+    pub const fn drawing_scale(&self) -> DrawingScale {
+        self.drawing_scale
+    }
+
+    /// Updates document engineering drawing scale (`numerator : denominator`).
+    pub fn set_drawing_scale(&mut self, scale: DrawingScale) {
+        self.drawing_scale = DrawingScale::new(scale.numerator, scale.denominator);
+        self.touch();
+    }
+
+    pub(crate) fn set_drawing_scale_raw(&mut self, scale: DrawingScale) {
+        self.drawing_scale = DrawingScale::new(scale.numerator, scale.denominator);
+    }
+
+    /// Resolves dynamic [`TextField`] tokens inside `runs` for `page_index` (0-based).
+    #[must_use]
+    pub fn resolve_text_field_runs(&self, page_index: usize, runs: &[TextRun]) -> Vec<TextRun> {
+        let mut out = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut resolved = run.clone();
+            if let Some(field) = run.field {
+                resolved.text = match field {
+                    TextField::AutoPageNumber => format!("{}", page_index + 1),
+                    TextField::PageCount => format!("{}", self.pages.len().max(1)),
+                    TextField::DocumentTitle => self.title.clone(),
+                    TextField::CurrentDate => {
+                        self.metadata.modified_at.format("%Y-%m-%d").to_string()
+                    }
+                };
+            }
+            out.push(resolved);
+        }
+        out
+    }
+
+    /// Returns a copy of `at` with all [`TextField`] runs resolved for `page_index`.
+    #[must_use]
+    pub fn resolve_artistic_text_fields(
+        &self,
+        page_index: usize,
+        at: &ArtisticText,
+    ) -> ArtisticText {
+        let mut out = at.clone();
+        out.runs = self.resolve_text_field_runs(page_index, &at.runs);
+        out
+    }
+
+    /// Returns a copy of `para` with all [`TextField`] runs resolved for `page_index`.
+    #[must_use]
+    pub fn resolve_paragraph_text_fields(
+        &self,
+        page_index: usize,
+        para: &ParagraphText,
+    ) -> ParagraphText {
+        let mut out = para.clone();
+        out.runs = self.resolve_text_field_runs(page_index, &para.runs);
+        out
+    }
+
+    /// Returns a copy of `top` with all [`TextField`] runs resolved for `page_index`.
+    #[must_use]
+    pub fn resolve_text_on_path_fields(&self, page_index: usize, top: &TextOnPath) -> TextOnPath {
+        let mut out = top.clone();
+        out.text = self.resolve_artistic_text_fields(page_index, &top.text);
+        out
+    }
+
     /// Validates and attaches an RGB ICC profile to the RGB slot.
     pub fn set_rgb_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<IccProfile> {
         let prof = IccProfile::from_bytes(&bytes)?;
@@ -2542,6 +2736,7 @@ impl Document {
         self.gray_icc_name = src.gray_icc_name.clone();
         self.rendering_intent = src.rendering_intent;
         self.black_point_compensation = src.black_point_compensation;
+        self.drawing_scale = src.drawing_scale;
     }
 
     /// Updates `id`'s transform directly (intended for headless builders/imposition helpers).
@@ -7250,7 +7445,24 @@ impl Document {
         visiting_syms: &mut HashSet<SymbolId>,
         pc_space: Option<(&Affine2D, &Affine2D)>,
     ) -> (Option<Rect2D>, usize) {
-        if let Some(persp) = sub.perspective {
+        let has_eff_persp = sub
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Perspective { .. }));
+        let apply_persp_rect = |mut lb: Rect2D| -> Option<Rect2D> {
+            if let Some(persp) = sub.perspective {
+                lb = persp.try_transform_rect(lb)?;
+            }
+            for eff in &sub.effects {
+                if let Effect::Perspective { quad } = eff {
+                    if let Some(h) = Perspective3x3::from_rect_to_quad(lb, quad) {
+                        lb = h.try_transform_rect(lb)?;
+                    }
+                }
+            }
+            Some(lb)
+        };
+        if sub.perspective.is_some() || has_eff_persp {
             let sub_parent_xf = sub
                 .transform
                 .inverse()
@@ -7288,11 +7500,10 @@ impl Document {
                             local_space,
                         );
                         let warped = path_b
-                            .and_then(|lb| persp.try_transform_rect(lb))
+                            .and_then(&apply_persp_rect)
                             .and_then(|wb| sub_parent_xf.try_transform_rect(wb))
                             .or_else(|| {
-                                persp
-                                    .try_transform_rect(top.text.estimated_bounds())
+                                apply_persp_rect(top.text.estimated_bounds())
                                     .and_then(|wb| sub_xf.try_transform_rect(wb))
                             });
                         return (warped, back);
@@ -7302,7 +7513,7 @@ impl Document {
                         .inverse()
                         .and_then(|inv| wp.transformed(&inv).bounding_box());
                     let warped = local_b
-                        .and_then(|lb| persp.try_transform_rect(lb))
+                        .and_then(&apply_persp_rect)
                         .and_then(|wb| sub_parent_xf.try_transform_rect(wb));
                     return (warped, usize::MAX);
                 }
@@ -7324,7 +7535,7 @@ impl Document {
             );
             ctx.sym_space_inv = prev_inv;
             let warped = local_b
-                .and_then(|lb| persp.try_transform_rect(lb))
+                .and_then(&apply_persp_rect)
                 .and_then(|wb| sub_xf.try_transform_rect(wb));
             (warped, back)
         } else {
@@ -8534,6 +8745,39 @@ impl Document {
         Ok(())
     }
 
+    /// Reorders layers on `page_id` to match `layer_ids` (must be an exact permutation).
+    pub fn reorder_layers(&mut self, page_id: PageId, layer_ids: &[LayerId]) -> CoreResult<()> {
+        let page = self
+            .pages
+            .iter_mut()
+            .find(|p| p.id == page_id)
+            .ok_or(CoreError::PageNotFound(page_id))?;
+        if layer_ids.len() != page.layers.len() {
+            return Err(CoreError::InvalidParameter(
+                "reorder_layers length must match existing page layer count".into(),
+            ));
+        }
+        let existing: HashMap<LayerId, Layer> =
+            page.layers.iter().cloned().map(|l| (l.id, l)).collect();
+        let mut seen = HashSet::with_capacity(layer_ids.len());
+        let mut reordered = Vec::with_capacity(layer_ids.len());
+        for &lid in layer_ids {
+            if !seen.insert(lid) {
+                return Err(CoreError::InvalidParameter(format!(
+                    "duplicate layer ID in reorder_layers: {lid}"
+                )));
+            }
+            let l = existing
+                .get(&lid)
+                .cloned()
+                .ok_or(CoreError::LayerNotFound(lid))?;
+            reordered.push(l);
+        }
+        page.layers = reordered;
+        self.touch();
+        Ok(())
+    }
+
     /// Deletes `layer_id` from its owning page (preserving at least one layer per page,
     /// rejecting locked layers or layers containing locked objects, and cleaning up any
     /// objects/descendants and relational references on that layer).
@@ -9010,6 +9254,7 @@ mod tests {
                         width_mm: 10.0,
                         height_mm: 10.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     }),
                 ),
@@ -9029,6 +9274,7 @@ mod tests {
                         width_mm: 10.0,
                         height_mm: 10.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     },
                 },
@@ -9047,6 +9293,7 @@ mod tests {
                         width_mm: 10.0,
                         height_mm: 10.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     },
                 },

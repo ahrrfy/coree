@@ -4,6 +4,7 @@
 //! Showcase Sample, Open file across all supported vector/CAD/print/raster formats,
 //! SQLite Recent Documents list, and Crash Recovery Banner when unclean sessions exist.
 
+use crate::i18n::{workspace_i18n_key, I18nKey, ShellLayoutDirections};
 use crate::state::{StudioApp, WorkspacePreset};
 use coree_core::brand::BrandInfo;
 use coree_core::{ColorMode, Document};
@@ -14,6 +15,8 @@ use std::path::PathBuf;
 pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
     let brand = BrandInfo::current();
+    let lang = app.ui_language;
+    let shell_dir = ShellLayoutDirections::from_language(lang);
 
     egui::CentralPanel::default()
         .frame(
@@ -26,32 +29,37 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                 ui.set_max_width(1020.0);
 
                 // Header
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                shell_dir.with_horizontal(ui, |ui| {
+                    shell_dir.with_vertical(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("{} Studio v{}", brand.display_name, brand.version))
-                                .size(28.0)
-                                .strong()
-                                .color(tokens.text),
+                            RichText::new(format!(
+                                "{} v{}",
+                                I18nKey::AppTitle.tr_ui(lang),
+                                brand.version
+                            ))
+                            .size(28.0)
+                            .strong()
+                            .color(tokens.text),
                         );
                         ui.label(
                             RichText::new(format!(
-                                "100% Offline Pure-Rust Vector Graphics, Multipage Layout, Laser & Print Production Suite ({})",
+                                "{} ({})",
+                                I18nKey::WelcomeSuiteSummary.tr_ui(lang),
                                 brand.license
                             ))
                             .size(13.0)
                             .color(tokens.text_muted),
                         );
                         ui.label(
-                            RichText::new(
-                                "Native & Exchange Formats: CDR X6–2025 · CDT · CMX · CPT · PDF/AI · EPS · DXF · PLT · PSD · SVG · G-Code · coree",
-                            )
-                            .size(11.5)
-                            .color(tokens.accent),
+                            RichText::new(I18nKey::WelcomeSupportedFormats.tr_ui(lang))
+                                .size(11.5)
+                                .color(tokens.accent),
                         );
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !app.tabs.is_empty() && ui.button("Return to Canvas →").clicked() {
+                    ui.with_layout(shell_dir.opposite_horizontal_layout(egui::Align::Center), |ui| {
+                        if !app.tabs.is_empty()
+                            && ui.button(I18nKey::ReturnToCanvas.tr_ui(lang)).clicked()
+                        {
                             app.show_welcome = false;
                         }
                     });
@@ -70,7 +78,8 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "⚠ Crash Recovery Available ({} unsaved session(s))",
+                                    "⚠ {} ({})",
+                                    I18nKey::CrashRecoveryBanner.tr_ui(lang),
                                     sessions.len()
                                 ))
                                 .size(15.0)
@@ -86,7 +95,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             );
                             ui.add_space(8.0);
                             for sess in &sessions {
-                                ui.horizontal(|ui| {
+                                shell_dir.with_horizontal(ui, |ui| {
                                     ui.label(
                                         RichText::new(format!(
                                             "{} ({} journal op(s), updated {})",
@@ -98,7 +107,8 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                     );
                                     if ui
                                         .button(
-                                            RichText::new("Restore Session").color(tokens.success),
+                                            RichText::new(I18nKey::RestoreSession.tr_ui(lang))
+                                                .color(tokens.success),
                                         )
                                         .clicked()
                                     {
@@ -110,7 +120,10 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                         }
                                     }
                                     if ui
-                                        .button(RichText::new("Discard").color(tokens.danger))
+                                        .button(
+                                            RichText::new(I18nKey::DiscardSession.tr_ui(lang))
+                                                .color(tokens.danger),
+                                        )
                                         .clicked()
                                     {
                                         app.discard_unclean_session(
@@ -125,12 +138,12 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                 }
 
                 // Quick Actions Row
-                ui.horizontal_wrapped(|ui| {
+                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("＋ New Document...")
+                                RichText::new(format!("＋ {}", I18nKey::NewDocument.tr_ui(lang)))
                                     .size(14.0)
                                     .color(tokens.on_accent),
                             )
@@ -142,7 +155,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                     }
                     if ui
                         .button(
-                            RichText::new("📂 Open File (CDR / PDF / AI / EPS / DXF / PLT / PSD / SVG)")
+                            RichText::new(format!("📂 {}", I18nKey::OpenDocument.tr_ui(lang)))
                                 .size(13.5),
                         )
                         .clicked()
@@ -150,13 +163,19 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                         app.open_file_dialog();
                     }
                     if ui
-                        .button(RichText::new("★ Open Showcase Sample").size(13.5))
+                        .button(
+                            RichText::new(format!("★ {}", I18nKey::OpenSampleShowcase.tr_ui(lang)))
+                                .size(13.5),
+                        )
                         .clicked()
                     {
                         app.new_sample_document();
                     }
                     if ui
-                        .button(RichText::new("⚙ Studio Options (Ctrl+J)").size(13.0))
+                        .button(
+                            RichText::new(format!("⚙ {}", I18nKey::ToolsOptions.tr_ui(lang)))
+                                .size(13.0),
+                        )
                         .clicked()
                     {
                         app.show_options_dialog = true;
@@ -167,18 +186,18 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
 
                 // Quick Workspace Preset Selector Cards
                 ui.label(
-                    RichText::new("Studio Workspaces")
+                    RichText::new(I18nKey::WindowWorkspaces.tr_ui(lang))
                         .size(15.0)
                         .strong()
                         .color(tokens.text),
                 );
                 ui.label(
-                    RichText::new("Pick a classic studio layout tailored to vector illustration, page layout, or laser & sign production:")
+                    RichText::new(I18nKey::AppSubtitle.tr_ui(lang))
                         .size(11.5)
                         .color(tokens.text_muted),
                 );
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
+                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Min), |ui| {
                     for preset in WorkspacePreset::ALL {
                         let active = app.active_workspace_preset == preset;
                         Frame::NONE
@@ -197,7 +216,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                 ui.set_min_width(154.0);
                                 ui.set_max_width(154.0);
                                 ui.label(
-                                    RichText::new(preset.label())
+                                    RichText::new(workspace_i18n_key(preset).tr_ui(lang))
                                         .strong()
                                         .color(if active { tokens.accent } else { tokens.text }),
                                 );
@@ -207,10 +226,12 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                         .color(tokens.text_muted),
                                 );
                                 ui.add_space(4.0);
-                                if ui
-                                    .small_button(if active { "✓ Active" } else { "Select" })
-                                    .clicked()
-                                {
+                                let btn_lbl = if active {
+                                    format!("✓ {}", I18nKey::WelcomeActivePreset.tr_ui(lang))
+                                } else {
+                                    I18nKey::WelcomeSelectPreset.tr_ui(lang)
+                                };
+                                if ui.small_button(btn_lbl).clicked() {
                                     app.apply_workspace_preset(preset);
                                 }
                             });
@@ -219,24 +240,94 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
 
                 ui.add_space(20.0);
 
-                // Quick Document Templates
-                ui.label(
-                    RichText::new("Quick Start Templates")
-                        .size(15.0)
-                        .strong()
-                        .color(tokens.text),
-                );
+                // Quick Document Templates (SQLite `templates` + built-ins + `.cdt`)
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(
+                        RichText::new(I18nKey::QuickStartTemplates.tr_ui(lang))
+                            .size(15.0)
+                            .strong()
+                            .color(tokens.text),
+                    );
+                    ui.add_space(12.0);
+                    for (cat, label) in [
+                        (None, I18nKey::TemplateCategoryAll.tr_ui(lang)),
+                        (Some("print"), I18nKey::TemplateCategoryPrint.tr_ui(lang)),
+                        (
+                            Some("packaging"),
+                            I18nKey::TemplateCategoryPackaging.tr_ui(lang),
+                        ),
+                        (Some("digital"), I18nKey::TemplateCategoryDigital.tr_ui(lang)),
+                        (Some("custom"), I18nKey::TemplateCategoryLaser.tr_ui(lang)),
+                    ] {
+                        let active = app.template_category_filter.as_deref() == cat;
+                        if ui.selectable_label(active, label).clicked() {
+                            app.template_category_filter = cat.map(str::to_owned);
+                        }
+                    }
+                    if ui
+                        .small_button(I18nKey::OpenDocument.tr_ui(lang))
+                        .clicked()
+                    {
+                        app.open_file_dialog();
+                    }
+                });
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    let templates = [
-                        ("A4 Print (CMYK)", 210.0, 297.0, ColorMode::Cmyk, 300.0),
+                let visible_templates: Vec<_> = app
+                    .templates
+                    .iter()
+                    .filter(|t| {
+                        app.template_category_filter
+                            .as_deref()
+                            .is_none_or(|c| t.category.eq_ignore_ascii_case(c))
+                    })
+                    .cloned()
+                    .collect();
+                ui.with_layout(shell_dir.horizontal_wrapped_layout(egui::Align::Min), |ui| {
+                    for tpl in &visible_templates {
+                        Frame::NONE
+                            .fill(tokens.surface)
+                            .stroke(Stroke::new(1.0, tokens.border))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_min_width(172.0);
+                                ui.set_max_width(196.0);
+                                shell_dir.with_horizontal(ui, |ui| {
+                                    ui.label(RichText::new(&tpl.name).strong().color(tokens.text));
+                                    if tpl.favorite {
+                                        ui.label(RichText::new("★").color(tokens.accent));
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.0} × {:.0} mm · {} · {}p",
+                                        tpl.width_mm,
+                                        tpl.height_mm,
+                                        tpl.color_mode.to_uppercase(),
+                                        tpl.page_count
+                                    ))
+                                    .size(11.0)
+                                    .color(tokens.text_muted),
+                                );
+                                ui.label(
+                                    RichText::new(&tpl.description)
+                                        .size(10.0)
+                                        .color(tokens.text_muted),
+                                );
+                                ui.add_space(6.0);
+                                if ui
+                                    .small_button(I18nKey::NewFromTemplate.tr_ui(lang))
+                                    .clicked()
+                                {
+                                    app.create_document_from_template(tpl);
+                                }
+                            });
+                    }
+                    let quick_presets = [
                         ("A3 Poster (CMYK)", 297.0, 420.0, ColorMode::Cmyk, 300.0),
-                        ("Business Card", 85.0, 55.0, ColorMode::Cmyk, 300.0),
                         ("Laser & Vinyl Bed", 300.0, 200.0, ColorMode::Rgb, 300.0),
-                        ("Packaging Box Sheet", 320.0, 450.0, ColorMode::Cmyk, 300.0),
-                        ("Web 1920×1080 (RGB)", 508.0, 285.75, ColorMode::Rgb, 96.0),
                     ];
-                    for (name, w, h, mode, dpi) in templates {
+                    for (name, w, h, mode, dpi) in quick_presets {
                         Frame::NONE
                             .fill(tokens.surface)
                             .stroke(Stroke::new(1.0, tokens.border))
@@ -251,7 +342,10 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                         .color(tokens.text_muted),
                                 );
                                 ui.add_space(6.0);
-                                if ui.small_button("Create").clicked() {
+                                if ui
+                                    .small_button(I18nKey::WelcomeCreateButton.tr_ui(lang))
+                                    .clicked()
+                                {
                                     app.new_document(Document::new(name, w, h, mode, dpi));
                                 }
                             });
@@ -262,7 +356,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
 
                 // Recent Documents from SQLite
                 ui.label(
-                    RichText::new("Recent Documents")
+                    RichText::new(I18nKey::RecentDocuments.tr_ui(lang))
                         .size(15.0)
                         .strong()
                         .color(tokens.text),
@@ -271,7 +365,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                 let recents = app.recent_docs.clone();
                 if recents.is_empty() {
                     ui.label(
-                        RichText::new("No recent local documents yet. Open or save a file to populate this list.")
+                        RichText::new(I18nKey::WelcomeNoRecents.tr_ui(lang))
                             .color(tokens.text_muted),
                     );
                 } else {
@@ -282,7 +376,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             .corner_radius(CornerRadius::same(5))
                             .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                shell_dir.with_horizontal(ui, |ui| {
                                     ui.label(
                                         RichText::new(rec.file_format.to_uppercase())
                                             .size(10.5)
@@ -300,9 +394,14 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                             .color(tokens.text_muted),
                                     );
                                     ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        shell_dir.opposite_horizontal_layout(egui::Align::Center),
                                         |ui| {
-                                            if ui.small_button("Open").clicked() {
+                                            if ui
+                                                .small_button(
+                                                    I18nKey::WelcomeOpenButton.tr_ui(lang),
+                                                )
+                                                .clicked()
+                                            {
                                                 let pb = PathBuf::from(&rec.file_path);
                                                 if let Err(err) = app.open_file_path(&pb) {
                                                     app.push_toast(err, true);

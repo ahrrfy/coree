@@ -10,8 +10,9 @@
 //!   and imported `.gpl`/`.ase`/`.pal` palettes.
 //! - Spot ink swatches display a crisp corner triangle dot for color-blind accessibility.
 
+use crate::i18n::{I18nKey, ShellLayoutDirections};
 use crate::state::StudioApp;
-use crate::theme::{core_color_to_egui, PALETTE_BAR_WIDTH};
+use crate::theme::{core_color_to_egui, ThemeTokens, PALETTE_BAR_WIDTH};
 use coree_core::{
     default_cmyk_palette, default_rgb_palette, Color, ColorMode, ColorPalette, ColorSwatch,
 };
@@ -44,13 +45,19 @@ pub fn laser_and_cut_palette() -> ColorPalette {
 /// Renders the docked right-side Color Palette Swatch Bar.
 pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(app.ui_language);
     let width = if app.palette_show_names {
         176.0
     } else {
         PALETTE_BAR_WIDTH
     };
 
-    egui::Panel::right("coree_palette_bar")
+    let panel = if shell_dir.palette_on_left {
+        egui::Panel::left("coree_palette_bar")
+    } else {
+        egui::Panel::right("coree_palette_bar")
+    };
+    panel
         .exact_size(width)
         .frame(
             Frame::NONE
@@ -59,8 +66,9 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 .stroke(Stroke::new(1.0, tokens.border)),
         )
         .show(ui, |ui| {
+            let lang = app.ui_language;
             // Palette expand toggle + dropdown in named mode
-            ui.horizontal(|ui| {
+            shell_dir.with_horizontal(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 if ui
                     .small_button(if app.palette_show_names { "»" } else { "«" })
@@ -113,7 +121,8 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                         )),
                     )
                     .on_hover_text(format!(
-                        "Active Palette: {active_name}\nLeft-click: Cycle (CMYK / RGB / Document / Laser & Cut / Custom)\nRight-click: Import .gpl / .ase / .pal"
+                        "Active Palette: {active_name}\nLeft-click: Cycle (CMYK / RGB / Document / Laser & Cut / Custom)\nRight-click: {}",
+                        I18nKey::PaletteImportButton.tr_ui(lang)
                     ));
                 if btn_resp.clicked() {
                     app.active_palette_index = (app.active_palette_index + 1) % total.max(1);
@@ -121,7 +130,7 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                     import_palette_dialog(app);
                 }
             } else if ui
-                .small_button("+ Import Palette (.gpl/.ase/.pal)")
+                .small_button(I18nKey::PaletteImportButton.tr_ui(lang))
                 .clicked()
             {
                 import_palette_dialog(app);
@@ -136,7 +145,14 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 vec2(22.0, 22.0)
             };
             let (no_rect, no_resp) = ui.allocate_exact_size(no_size, Sense::click());
-            let box_rect = egui::Rect::from_min_size(no_rect.left_top(), vec2(22.0, 22.0));
+            let box_rect = if shell_dir.palette_on_left && app.palette_show_names {
+                egui::Rect::from_min_size(
+                    pos2(no_rect.right() - 22.0, no_rect.top()),
+                    vec2(22.0, 22.0),
+                )
+            } else {
+                egui::Rect::from_min_size(no_rect.left_top(), vec2(22.0, 22.0))
+            };
             let no_border = if no_resp.hovered() {
                 Stroke::new(1.5, tokens.accent)
             } else {
@@ -166,17 +182,26 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 Stroke::new(1.0, slash_red.gamma_multiply(0.35)),
             );
             if app.palette_show_names {
+                let (txt_pos, txt_align) = if shell_dir.palette_on_left {
+                    (
+                        pos2(box_rect.left() - 6.0, box_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                    )
+                } else {
+                    (
+                        pos2(box_rect.right() + 6.0, box_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                    )
+                };
                 ui.painter().text(
-                    pos2(box_rect.right() + 6.0, box_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    "No Color (L:Fill / R:Line)",
+                    txt_pos,
+                    txt_align,
+                    I18nKey::PaletteNoColorLabel.tr_ui(lang),
                     egui::FontId::proportional(10.5),
                     tokens.text_muted,
                 );
             }
-            let no_resp = no_resp.on_hover_text(
-                "No Color [✕]\nLeft-click: Remove Fill (Fill::None)\nRight-click: Remove Outline (Outline::none)",
-            );
+            let no_resp = no_resp.on_hover_text(I18nKey::PaletteNoColorLabel.tr_ui(lang));
             if no_resp.clicked() {
                 app.remove_fill();
             } else if no_resp.secondary_clicked() {
@@ -185,7 +210,7 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
 
             ui.add_space(3.0);
 
-            // Active palette swatches
+            // Active palette swatches (`Click` = Fill, `Right-click` = Outline, `0.5s Hold` = TintGrid, `Drag` = DragSwatch)
             let palette = resolve_active_palette(app);
             let mut apply_fill: Option<Color> = None;
             let mut apply_outline: Option<Color> = None;
@@ -200,8 +225,16 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                         } else {
                             vec2(22.0, 22.0)
                         };
-                        let (row_rect, resp) = ui.allocate_exact_size(row_size, Sense::click());
-                        let cell = egui::Rect::from_min_size(row_rect.left_top(), vec2(22.0, 22.0));
+                        let (row_rect, resp) =
+                            ui.allocate_exact_size(row_size, Sense::click_and_drag());
+                        let cell = if shell_dir.palette_on_left && app.palette_show_names {
+                            egui::Rect::from_min_size(
+                                pos2(row_rect.right() - 22.0, row_rect.top()),
+                                vec2(22.0, 22.0),
+                            )
+                        } else {
+                            egui::Rect::from_min_size(row_rect.left_top(), vec2(22.0, 22.0))
+                        };
                         let c32 = core_color_to_egui(&sw.color);
                         let stroke = if resp.hovered() {
                             Stroke::new(1.6, tokens.accent)
@@ -237,17 +270,88 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                         }
 
                         if app.palette_show_names {
+                            let (txt_pos, txt_align) = if shell_dir.palette_on_left {
+                                (
+                                    pos2(cell.left() - 6.0, cell.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                )
+                            } else {
+                                (
+                                    pos2(cell.right() + 6.0, cell.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                )
+                            };
                             ui.painter().text(
-                                pos2(cell.right() + 6.0, cell.center().y),
-                                egui::Align2::LEFT_CENTER,
+                                txt_pos,
+                                txt_align,
                                 &sw.name,
                                 egui::FontId::proportional(10.5),
                                 tokens.text,
                             );
                         }
 
-                        let tip = format_swatch_tooltip(&sw.name, &sw.color);
+                        let tip = format!(
+                            "{}\n{}",
+                            format_swatch_tooltip(&sw.name, &sw.color),
+                            I18nKey::PaletteDragSwatchHint.tr_ui(lang)
+                        );
                         let resp = resp.on_hover_text(tip);
+
+                        // DragSwatch: initiate egui Drag-and-Drop payload (`Color`) onto canvas
+                        if resp.drag_started() {
+                            app.swatch_hold_state = None;
+                            egui::DragAndDrop::set_payload(ui.ctx(), sw.color.clone());
+                        }
+                        if resp.dragged() {
+                            if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+                                let preview_rect =
+                                    egui::Rect::from_min_size(pointer + vec2(10.0, 10.0), vec2(18.0, 18.0));
+                                ui.ctx().layer_painter(egui::LayerId::new(
+                                    egui::Order::Tooltip,
+                                    egui::Id::unique("drag_swatch_preview"),
+                                ))
+                                .rect(
+                                    preview_rect,
+                                    CornerRadius::same(3),
+                                    c32,
+                                    Stroke::new(1.2, Color32::WHITE),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                        }
+
+                        // 0.5s long-press TintGrid trigger
+                        if resp.is_pointer_button_down_on()
+                            && ui.input(|i| i.pointer.primary_down())
+                            && !resp.dragged()
+                        {
+                            match &app.swatch_hold_state {
+                                Some((started_at, held_color, _)) if *held_color == sw.color => {
+                                    if started_at.elapsed().as_secs_f32() >= 0.5 {
+                                        app.tint_grid_popup =
+                                            Some((sw.color.clone(), cell.center()));
+                                        app.swatch_hold_state = None;
+                                    } else {
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                                _ => {
+                                    app.swatch_hold_state = Some((
+                                        std::time::Instant::now(),
+                                        sw.color.clone(),
+                                        cell.center(),
+                                    ));
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        } else if app
+                            .swatch_hold_state
+                            .as_ref()
+                            .is_some_and(|(_, held_color, _)| *held_color == sw.color)
+                        {
+                            app.swatch_hold_state = None;
+                        }
+
                         if resp.clicked() {
                             apply_fill = Some(sw.color.clone());
                         } else if resp.secondary_clicked() {
@@ -256,6 +360,9 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                     }
                 });
 
+            // Render floating TintGrid popup (5x5 tints & shades around held swatch)
+            show_tint_grid(ui, app, &tokens, shell_dir, &mut apply_fill, &mut apply_outline);
+
             if let Some(c) = apply_fill {
                 app.apply_fill_color(c);
             }
@@ -263,6 +370,86 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
                 app.apply_outline_color(c);
             }
         });
+}
+
+/// Renders the floating 5x5 Tint Grid popup for long-pressed swatches (`ADD-09`).
+fn show_tint_grid(
+    ui: &Ui,
+    app: &mut StudioApp,
+    tokens: &ThemeTokens,
+    shell_dir: ShellLayoutDirections,
+    apply_fill: &mut Option<Color>,
+    apply_outline: &mut Option<Color>,
+) {
+    let Some((base_color, anchor)) = app.tint_grid_popup.clone() else {
+        return;
+    };
+    let lang = app.ui_language;
+    let mut close_grid = false;
+    let popup_pos = if shell_dir.palette_on_left {
+        pos2(anchor.x + 28.0, (anchor.y - 68.0).max(32.0))
+    } else {
+        pos2((anchor.x - 148.0).max(8.0), (anchor.y - 68.0).max(32.0))
+    };
+    egui::Area::new(egui::Id::unique("tint_grid_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup_pos)
+        .show(ui.ctx(), |ui| {
+            Frame::NONE
+                .fill(tokens.surface_elevated)
+                .stroke(Stroke::new(1.2, tokens.accent))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    shell_dir.with_horizontal(ui, |ui| {
+                        ui.label(
+                            RichText::new(I18nKey::PaletteTintGridTitle.tr_ui(lang))
+                                .size(11.0)
+                                .strong()
+                                .color(tokens.text),
+                        );
+                        if ui.small_button("✕").clicked() {
+                            close_grid = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    let tints = build_tint_grid_colors(&base_color);
+                    for row in tints.chunks(5) {
+                        shell_dir.with_horizontal(ui, |ui| {
+                            ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+                            for c in row {
+                                let (_, sresp) =
+                                    ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+                                let srect = sresp.rect;
+                                ui.painter().rect(
+                                    srect,
+                                    CornerRadius::same(2),
+                                    core_color_to_egui(c),
+                                    Stroke::new(
+                                        if sresp.hovered() { 1.4 } else { 0.8 },
+                                        if sresp.hovered() {
+                                            tokens.accent
+                                        } else {
+                                            tokens.border
+                                        },
+                                    ),
+                                    StrokeKind::Inside,
+                                );
+                                if sresp.clicked() {
+                                    *apply_fill = Some(c.clone());
+                                    close_grid = true;
+                                } else if sresp.secondary_clicked() {
+                                    *apply_outline = Some(c.clone());
+                                    close_grid = true;
+                                }
+                            }
+                        });
+                    }
+                });
+        });
+    if close_grid || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.tint_grid_popup = None;
+    }
 }
 
 fn import_palette_dialog(app: &mut StudioApp) {
@@ -326,4 +513,31 @@ fn format_swatch_tooltip(name: &str, color: &Color) -> String {
         _ => format!("{rgb_str}\n{cmyk_str}"),
     };
     format!("{name}\n{detail}\nLeft-click: Apply Fill · Right-click: Apply Outline")
+}
+
+/// Builds a 5x5 shade/tint grid around `base` for the long-press `TintGrid` popup (`ADD-09`).
+#[must_use]
+pub fn build_tint_grid_colors(base: &Color) -> Vec<Color> {
+    let mut out = Vec::with_capacity(25);
+    for row in 0..5 {
+        let light_t = (row as f32 - 2.0) * 0.28;
+        let row_color = if light_t < 0.0 {
+            base.lerp(&Color::WHITE, (-light_t).clamp(0.0, 0.85))
+        } else {
+            base.lerp(&Color::BLACK, light_t.clamp(0.0, 0.85))
+        };
+        for col in 0..5 {
+            let sat_t = ((col as f32) - 2.0) * 0.14;
+            let [r, g, b, a] = row_color.to_rgba_f32();
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let s_color = Color::rgba(
+                (r + (r - luma) * sat_t).clamp(0.0, 1.0),
+                (g + (g - luma) * sat_t).clamp(0.0, 1.0),
+                (b + (b - luma) * sat_t).clamp(0.0, 1.0),
+                a,
+            );
+            out.push(s_color);
+        }
+    }
+    out
 }

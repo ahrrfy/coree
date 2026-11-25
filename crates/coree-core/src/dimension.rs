@@ -85,18 +85,31 @@ impl DimensionObject {
     /// Computes the numeric measurement value in `unit` (or degrees for `Angular`).
     #[must_use]
     pub fn compute_value(&self, unit: Unit, dpi: f64) -> f64 {
+        self.compute_value_with_scale(unit, dpi, crate::document::DrawingScale::default())
+    }
+
+    /// Computes the numeric measurement value in `unit` (or degrees for `Angular`),
+    /// scaling linear dimensions by `drawing_scale`.
+    #[must_use]
+    pub fn compute_value_with_scale(
+        &self,
+        unit: Unit,
+        dpi: f64,
+        drawing_scale: crate::document::DrawingScale,
+    ) -> f64 {
         let effective_unit = self.unit_override.unwrap_or(unit);
+        let scale_factor = drawing_scale.scale_factor();
         match self.kind {
             DimensionKind::Parallel | DimensionKind::Segment => {
-                let mm = sanitize_f64(self.p1.distance_to(self.p2), 0.0);
+                let mm = sanitize_f64(self.p1.distance_to(self.p2), 0.0) * scale_factor;
                 effective_unit.from_mm(mm, dpi)
             }
             DimensionKind::Horizontal => {
-                let mm = sanitize_f64((self.p2.x - self.p1.x).abs(), 0.0);
+                let mm = sanitize_f64((self.p2.x - self.p1.x).abs(), 0.0) * scale_factor;
                 effective_unit.from_mm(mm, dpi)
             }
             DimensionKind::Vertical => {
-                let mm = sanitize_f64((self.p2.y - self.p1.y).abs(), 0.0);
+                let mm = sanitize_f64((self.p2.y - self.p1.y).abs(), 0.0) * scale_factor;
                 effective_unit.from_mm(mm, dpi)
             }
             DimensionKind::Angular => {
@@ -135,6 +148,17 @@ impl DimensionObject {
     /// Formats the measurement string using `unit` and explicit `dpi`.
     #[must_use]
     pub fn compute_measurement_with_dpi(&self, unit: Unit, dpi: f64) -> String {
+        self.compute_measurement_with_scale(unit, dpi, crate::document::DrawingScale::default())
+    }
+
+    /// Formats the measurement string using `unit`, explicit `dpi`, and engineering `drawing_scale`.
+    #[must_use]
+    pub fn compute_measurement_with_scale(
+        &self,
+        unit: Unit,
+        dpi: f64,
+        drawing_scale: crate::document::DrawingScale,
+    ) -> String {
         if let Some(label) = &self.label_override {
             return label.clone();
         }
@@ -142,7 +166,7 @@ impl DimensionObject {
             return format!("{}{}", self.prefix, self.suffix);
         }
         let prec = self.precision.min(6);
-        let value = self.compute_value(unit, dpi);
+        let value = self.compute_value_with_scale(unit, dpi, drawing_scale);
         let effective_unit = self.unit_override.unwrap_or(unit);
         if self.kind == DimensionKind::Angular {
             format!("{}{value:.prec$}°{}", self.prefix, self.suffix)

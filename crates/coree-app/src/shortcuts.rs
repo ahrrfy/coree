@@ -12,6 +12,7 @@
 //!   `O` Ellipse, `T` Text, `P` Pen, `G` Fill, `Z` Zoom, `H` Pan, `Ctrl+K` Command Palette).
 
 use coree_core::{AlignOp, ZOrderOp};
+use coree_tools::ToolId;
 use egui::{Key, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -58,6 +59,7 @@ pub enum ShortcutAction {
     SelectInteractiveFill,
     SelectMeshFill,
     SelectEyedropper,
+    SelectTool(ToolId),
     OpenEditFill,
     FocusOutlinePen,
 
@@ -557,6 +559,162 @@ impl ShortcutAction {
             ShortcutAction::SelectInteractiveFill,
             "Tool: Interactive Fill",
         ),
+        (ShortcutAction::SelectMeshFill, "Tool: Mesh Fill"),
+        (ShortcutAction::SelectEyedropper, "Tool: Color Eyedropper"),
+        (
+            ShortcutAction::SelectTool(ToolId::FreehandPick),
+            "Tool: Freehand Pick",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::FreeTransform),
+            "Tool: Free Transform",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Smooth), "Tool: Smooth"),
+        (ShortcutAction::SelectTool(ToolId::Smear), "Tool: Smear"),
+        (ShortcutAction::SelectTool(ToolId::Twirl), "Tool: Twirl"),
+        (
+            ShortcutAction::SelectTool(ToolId::AttractRepel),
+            "Tool: Attract & Repel",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Roughen), "Tool: Roughen"),
+        (ShortcutAction::SelectTool(ToolId::Crop), "Tool: Crop"),
+        (ShortcutAction::SelectTool(ToolId::Knife), "Tool: Knife"),
+        (
+            ShortcutAction::SelectTool(ToolId::VirtualSegmentDelete),
+            "Tool: Virtual Segment Delete",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Eraser), "Tool: Eraser"),
+        (ShortcutAction::SelectTool(ToolId::Zoom), "Tool: Zoom"),
+        (ShortcutAction::SelectTool(ToolId::Pan), "Tool: Pan"),
+        (
+            ShortcutAction::SelectTool(ToolId::TwoPointLine),
+            "Tool: 2-Point Line",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Bezier), "Tool: Bezier"),
+        (
+            ShortcutAction::SelectTool(ToolId::BSpline),
+            "Tool: B-Spline",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::Polyline),
+            "Tool: Polyline",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ThreePointCurve),
+            "Tool: 3-Point Curve",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::SmartDrawing),
+            "Tool: Smart Drawing",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::LiveSketch),
+            "Tool: LiveSketch",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ArtisticMedia),
+            "Tool: Artistic Media",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ThreePointRectangle),
+            "Tool: 3-Point Rectangle",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ThreePointEllipse),
+            "Tool: 3-Point Ellipse",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Star), "Tool: Star"),
+        (
+            ShortcutAction::SelectTool(ToolId::ComplexStar),
+            "Tool: Complex Star",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Impact), "Tool: Impact"),
+        (
+            ShortcutAction::SelectTool(ToolId::BasicShapes),
+            "Tool: Basic Shapes",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ParagraphText),
+            "Tool: Paragraph Text",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Table), "Tool: Table"),
+        (
+            ShortcutAction::SelectTool(ToolId::ParallelDimension),
+            "Tool: Parallel Dimension",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::HvDimension),
+            "Tool: H/V Dimension",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::AngularDimension),
+            "Tool: Angular Dimension",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::SegmentDimension),
+            "Tool: Segment Dimension",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::ThreePointCallout),
+            "Tool: 3-Point Callout",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::StraightConnector),
+            "Tool: Straight Connector",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::RightAngleConnector),
+            "Tool: Right-Angle Connector",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::DropShadow),
+            "Tool: Drop Shadow",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::BlockShadow),
+            "Tool: Block Shadow",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Contour), "Tool: Contour"),
+        (ShortcutAction::SelectTool(ToolId::Blend), "Tool: Blend"),
+        (ShortcutAction::SelectTool(ToolId::Distort), "Tool: Distort"),
+        (
+            ShortcutAction::SelectTool(ToolId::Envelope),
+            "Tool: Envelope",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::Extrude25D),
+            "Tool: Extrude",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::Transparency),
+            "Tool: Transparency",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::AttributesEyedropper),
+            "Tool: Attributes Eyedropper",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::SmartFill),
+            "Tool: Smart Fill",
+        ),
+        (ShortcutAction::SelectTool(ToolId::LensTool), "Tool: Lens"),
+        (
+            ShortcutAction::SelectTool(ToolId::BitmapBrush),
+            "Tool: Bitmap Brush",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::BitmapEraser),
+            "Tool: Bitmap Eraser",
+        ),
+        (
+            ShortcutAction::SelectTool(ToolId::CloneStamp),
+            "Tool: Clone Stamp",
+        ),
+        (ShortcutAction::SelectTool(ToolId::Smudge), "Tool: Smudge"),
+        (
+            ShortcutAction::SelectTool(ToolId::MaskSelect),
+            "Tool: Mask Select",
+        ),
     ];
 
     /// Stable identifier used in `shortcuts_json` and `.coreews` exports.
@@ -602,10 +760,87 @@ impl ShortcutAction {
             Self::ToggleFullScreenPreview => "view.fullscreen",
             Self::SelectPick => "tool.pick",
             Self::SelectShapeNode => "tool.shape",
+            Self::SelectZoom => "tool.zoom",
+            Self::SelectOneShotZoom => "tool.zoom_one_shot",
+            Self::SelectPan => "tool.pan",
+            Self::SelectFreehand => "tool.freehand",
+            Self::SelectPen => "tool.pen",
             Self::SelectRectangle => "tool.rectangle",
             Self::SelectEllipse => "tool.ellipse",
+            Self::SelectPolygon => "tool.polygon",
+            Self::SelectSpiral => "tool.spiral",
+            Self::SelectGraphPaper => "tool.graph_paper",
             Self::SelectArtisticText => "tool.text",
             Self::SelectInteractiveFill => "tool.interactive_fill",
+            Self::SelectMeshFill => "tool.mesh_fill",
+            Self::SelectEyedropper => "tool.eyedropper",
+            Self::SelectTool(tool) => match tool {
+                ToolId::Pick => "tool.pick",
+                ToolId::FreehandPick => "tool.freehand_pick",
+                ToolId::FreeTransform => "tool.free_transform",
+                ToolId::ShapeNode => "tool.shape",
+                ToolId::Smooth => "tool.smooth",
+                ToolId::Smear => "tool.smear",
+                ToolId::Twirl => "tool.twirl",
+                ToolId::AttractRepel => "tool.attract_repel",
+                ToolId::Roughen => "tool.roughen",
+                ToolId::Crop => "tool.crop",
+                ToolId::Knife => "tool.knife",
+                ToolId::VirtualSegmentDelete => "tool.virtual_segment_delete",
+                ToolId::Eraser => "tool.eraser",
+                ToolId::Zoom => "tool.zoom",
+                ToolId::Pan => "tool.pan",
+                ToolId::Freehand => "tool.freehand",
+                ToolId::TwoPointLine => "tool.two_point_line",
+                ToolId::Bezier => "tool.bezier",
+                ToolId::Pen => "tool.pen",
+                ToolId::BSpline => "tool.bspline",
+                ToolId::Polyline => "tool.polyline",
+                ToolId::ThreePointCurve => "tool.three_point_curve",
+                ToolId::SmartDrawing => "tool.smart_drawing",
+                ToolId::LiveSketch => "tool.live_sketch",
+                ToolId::ArtisticMedia => "tool.artistic_media",
+                ToolId::Rectangle => "tool.rectangle",
+                ToolId::ThreePointRectangle => "tool.three_point_rectangle",
+                ToolId::Ellipse => "tool.ellipse",
+                ToolId::ThreePointEllipse => "tool.three_point_ellipse",
+                ToolId::Polygon => "tool.polygon",
+                ToolId::Star => "tool.star",
+                ToolId::ComplexStar => "tool.complex_star",
+                ToolId::Spiral => "tool.spiral",
+                ToolId::GraphPaper => "tool.graph_paper",
+                ToolId::Impact => "tool.impact",
+                ToolId::BasicShapes => "tool.basic_shapes",
+                ToolId::ArtisticText => "tool.text",
+                ToolId::ParagraphText => "tool.paragraph_text",
+                ToolId::Table => "tool.table",
+                ToolId::ParallelDimension => "tool.parallel_dimension",
+                ToolId::HvDimension => "tool.hv_dimension",
+                ToolId::AngularDimension => "tool.angular_dimension",
+                ToolId::SegmentDimension => "tool.segment_dimension",
+                ToolId::ThreePointCallout => "tool.three_point_callout",
+                ToolId::StraightConnector => "tool.straight_connector",
+                ToolId::RightAngleConnector => "tool.right_angle_connector",
+                ToolId::DropShadow => "tool.drop_shadow",
+                ToolId::BlockShadow => "tool.block_shadow",
+                ToolId::Contour => "tool.contour",
+                ToolId::Blend => "tool.blend",
+                ToolId::Distort => "tool.distort",
+                ToolId::Envelope => "tool.envelope",
+                ToolId::Extrude25D => "tool.extrude_25d",
+                ToolId::Transparency => "tool.transparency",
+                ToolId::ColorEyedropper => "tool.eyedropper",
+                ToolId::AttributesEyedropper => "tool.attributes_eyedropper",
+                ToolId::InteractiveFill => "tool.interactive_fill",
+                ToolId::MeshFill => "tool.mesh_fill",
+                ToolId::SmartFill => "tool.smart_fill",
+                ToolId::LensTool => "tool.lens",
+                ToolId::BitmapBrush => "tool.bitmap_brush",
+                ToolId::BitmapEraser => "tool.bitmap_eraser",
+                ToolId::CloneStamp => "tool.clone_stamp",
+                ToolId::Smudge => "tool.smudge",
+                ToolId::MaskSelect => "tool.mask_select",
+            },
             _ => return None,
         })
     }
@@ -909,6 +1144,7 @@ pub const fn shortcut_label(profile: ShortcutProfile, action: ShortcutAction) ->
         (ShortcutProfile::StandardVector, ShortcutAction::Align(_)) => "",
         (_, ShortcutAction::Nudge { .. }) => "Arrows",
         (_, ShortcutAction::MicroNudge { .. }) => "Ctrl+Arrows",
+        (_, ShortcutAction::SelectTool(_)) => "",
     }
 }
 

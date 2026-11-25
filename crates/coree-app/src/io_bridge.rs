@@ -4,11 +4,11 @@
 //! `coree-io`, `coree-cdr`, `coree-prod`, and `coree-render`.
 
 use crate::cdr_bridge::{
-    classify_magic_bytes, import_and_inspect_binary_file, is_coree_archive, lower_extension,
-    peek_file_header, write_cdr_file, write_cdt_file, write_cmx_file, FileInspectionReport,
-    MagicKind,
+    classify_magic_bytes, import_and_inspect_binary_file_with_options, is_coree_archive,
+    lower_extension, peek_file_header, write_cdr_file, write_cdt_file, write_cmx_file,
+    write_cpt_file, FileInspectionReport, MagicKind,
 };
-use coree_cdr::CdrWriteVersion;
+use coree_cdr::{CdrReadOptions, CdrWriteVersion};
 use coree_core::math::MM_PER_INCH;
 use coree_core::{
     Affine2D, ColorMode, CommandOp, Document, Effect, Fill, ImageAssetId, LayerId, NodePayload,
@@ -112,6 +112,16 @@ pub struct OpenedDocument {
 /// Uses magic-byte detection FIRST so `.cdr.zip`, `.cdt.zip`, extensionless files, and
 /// misnamed files open reliably without false rejections.
 pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
+    open_any_document_with_codepage(path, None)
+}
+
+/// Opens any supported file format into a [`Document`], applying `default_codepage` fallback
+/// when reading legacy `.cdr`/`.cdt`/`.cmx` strings.
+pub fn open_any_document_with_codepage(
+    path: &Path,
+    default_codepage: Option<u16>,
+) -> Result<OpenedDocument, String> {
+    let cdr_opts = CdrReadOptions { default_codepage };
     let ext = lower_extension(path);
     let stem = path
         .file_stem()
@@ -129,7 +139,7 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
                 match open_coree_doc(path) {
                     Ok(doc) => return Ok(doc),
                     Err(coree_err) => {
-                        if let Ok(cdr) = open_binary_cdr_doc(path) {
+                        if let Ok(cdr) = open_binary_cdr_doc_with_options(path, cdr_opts) {
                             return Ok(cdr);
                         }
                         return Err(coree_err);
@@ -139,7 +149,7 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
             if is_coree_archive(path) {
                 return open_coree_doc(path);
             }
-            match open_binary_cdr_doc(path) {
+            match open_binary_cdr_doc_with_options(path, cdr_opts) {
                 Ok(cdr) => return Ok(cdr),
                 Err(cdr_err) => {
                     if let Ok(doc) = open_coree_doc(path) {
@@ -150,7 +160,7 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
             }
         }
         MagicKind::RiffCdr | MagicKind::Cpt => {
-            return open_binary_cdr_doc(path);
+            return open_binary_cdr_doc_with_options(path, cdr_opts);
         }
         MagicKind::Pdf => {
             return open_pdf_doc(path);
@@ -194,7 +204,7 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
     // 2. Extension-guided fallback (provides accurate format errors on truncated/malformed inputs)
     match ext.as_str() {
         "coree" => open_coree_doc(path),
-        "cdr" | "cdt" | "cmx" | "cpt" => open_binary_cdr_doc(path),
+        "cdr" | "cdt" | "cmx" | "cpt" => open_binary_cdr_doc_with_options(path, cdr_opts),
         "pdf" | "ai" => open_pdf_doc(path),
         "eps" | "ps" => open_eps_doc(path),
         "dxf" => open_dxf_doc(path),
@@ -213,7 +223,7 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
             open_raster_doc(path, &stem, storage_fmt)
         }
         _ => {
-            if let Ok(cdr) = open_binary_cdr_doc(path) {
+            if let Ok(cdr) = open_binary_cdr_doc_with_options(path, cdr_opts) {
                 return Ok(cdr);
             }
             if let Ok(doc) = open_coree_doc(path) {
@@ -238,9 +248,12 @@ fn open_coree_doc(path: &Path) -> Result<OpenedDocument, String> {
     })
 }
 
-fn open_binary_cdr_doc(path: &Path) -> Result<OpenedDocument, String> {
-    let imported =
-        import_and_inspect_binary_file(path).map_err(|e| format!("import failed: {e}"))?;
+fn open_binary_cdr_doc_with_options(
+    path: &Path,
+    options: CdrReadOptions,
+) -> Result<OpenedDocument, String> {
+    let imported = import_and_inspect_binary_file_with_options(path, options)
+        .map_err(|e| format!("import failed: {e}"))?;
     let format_tag = imported.report.detected_format.storage_tag().to_owned();
     let cdr_version = Some(imported.report.format_era.clone());
     let warnings = imported.report.warnings.clone();
@@ -368,6 +381,7 @@ fn open_raster_doc(path: &Path, stem: &str, storage_fmt: &str) -> Result<OpenedD
             width_mm: w_mm,
             height_mm: h_mm,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     )
@@ -1016,6 +1030,11 @@ pub fn export_any_document(
                 .map_err(|e| format!("failed to export .cmx: {e}"))?;
             Ok(format!("Exported .cmx to {}", output_path.display()))
         }
+        "cpt" => {
+            write_cpt_file(doc, output_path)
+                .map_err(|e| format!("failed to export .cpt: {e}"))?;
+            Ok(format!("Exported .cpt to {}", output_path.display()))
+        }
         "svg" => {
             export_svg(doc, page_idx, output_path)
                 .map_err(|e| format!("failed to export .svg: {e}"))?;
@@ -1494,6 +1513,7 @@ mod tests {
                     width_mm: 24.0,
                     height_mm: 24.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),

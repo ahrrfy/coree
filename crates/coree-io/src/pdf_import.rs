@@ -1807,6 +1807,12 @@ fn decode_ascii85(input: &[u8], max_out: usize) -> IoResult<Vec<u8>> {
         for &g in &group {
             val = val * 85 + u64::from(g);
         }
+        if val > u64::from(u32::MAX) {
+            return Err(IoError::InvalidFormat {
+                format: "pdf".into(),
+                message: "PDF ASCII85Decode partial 5-tuple overflows u32".into(),
+            });
+        }
         let bytes = (val as u32).to_be_bytes();
         let rem = count - 1;
         if out.len().saturating_add(rem) > max_out {
@@ -3633,6 +3639,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                 width_mm: w_mm,
                 height_mm: h_mm,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )
@@ -4816,6 +4823,7 @@ mod tests {
                     width_mm: 20.0,
                     height_mm: 20.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )
@@ -5565,5 +5573,15 @@ mod tests {
             coree_render::render_page_to_rgba(&doc_w, 0, 72.0, coree_core::ViewMode::Enhanced)
                 .unwrap();
         assert_eq!(pixel_rgba(&ren_w, 50, 50), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn w5a_ascii85_partial_tuple_overflow_returns_error() {
+        // `uuuu` padded with `'u'` (84) -> `84 * (85^4 + ... + 1)` > u32::MAX (0xFFFF_FFFF)
+        let err = decode_ascii85(b"uuuu~>", 1024).unwrap_err();
+        assert!(
+            matches!(err, IoError::InvalidFormat { .. }),
+            "expected InvalidFormat on partial ASCII85 overflow, got {err:?}"
+        );
     }
 }

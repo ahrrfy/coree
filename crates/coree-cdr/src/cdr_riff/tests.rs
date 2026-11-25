@@ -76,6 +76,7 @@ fn legacy_arrw_vpat_clrs_and_v7_outl_fallbacks_decode_cleanly() {
         budget_remaining: &mut budget,
         endian: RiffEndian::Little,
         version: 1200,
+        default_codepage: None,
         is_zcf: false,
         is_v3_v5: false,
         doc_page_width_mm: 210.0,

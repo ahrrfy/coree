@@ -6,17 +6,21 @@
 //! `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, and `.psd`.
 
 use coree_cdr::cdr_riff::{
-    is_cdr_form_type, is_cdt_form_type, parse_cdr_riff, write_cdr_riff_with_options,
+    is_cdr_form_type, is_cdt_form_type, parse_cdr_riff_with_options, write_cdr_riff_with_options,
     RiffWriteOptions,
 };
-use coree_cdr::cdr_zip::{is_zip_bytes, parse_cdr_zip, write_cdr_zip, CdrZipEra};
-use coree_cdr::cmx::{export_cmx, is_cmx_form_type, parse_cmx_bytes, CmxPrecision};
+use coree_cdr::cdr_zip::{is_zip_bytes, parse_cdr_zip_with_options, write_cdr_zip, CdrZipEra};
+use coree_cdr::cmx::{export_cmx, is_cmx_form_type, parse_cmx_bytes_with_options, CmxPrecision};
 use coree_cdr::coord::color_model_name;
-use coree_cdr::cpt::{detect_cpt_version, parse_cpt_bytes};
+use coree_cdr::cpt::{
+    detect_cpt_version, parse_cpt_bytes, write_cpt_bytes, CptColorModel, CptCompression,
+    CptLayerSpec,
+};
 use coree_cdr::riff::{fourcc_to_string, RiffDocument, RiffNode};
 use coree_cdr::{
-    export_cdr, export_cdt, extract_cdr_preview_png, read_file_bounded, CdrError, CdrResult,
-    CdrWriteVersion, ChunkSummary, CodecLimits, UnknownChunkSummary, ZipEntrySummary,
+    export_cdr, export_cdt, extract_cdr_preview_png, format_hex_ascii_dump, read_file_bounded,
+    CdrError, CdrReadOptions, CdrResult, CdrWriteVersion, ChunkSummary, CodecLimits,
+    UnknownChunkSummary, ZipEntrySummary,
 };
 use coree_core::math::MM_PER_INCH;
 use coree_core::{Document, NodePayload};
@@ -515,16 +519,35 @@ pub fn import_and_inspect_binary_file(path: &Path) -> CdrResult<BinaryImportResu
     import_and_inspect_binary_bytes(&bytes, &limits)
 }
 
-/// Imports and structurally inspects raw `.cdr`/`.cdt`/`.cmx`/`.cpt` bytes under `limits`.
+/// Imports and structurally inspects `.cdr`/`.cdt`/`.cmx`/`.cpt` using default read options.
 pub fn import_and_inspect_binary_bytes(
     bytes: &[u8],
     limits: &CodecLimits,
+) -> CdrResult<BinaryImportResult> {
+    import_and_inspect_binary_bytes_with_options(bytes, limits, CdrReadOptions::default())
+}
+
+/// Imports and structurally inspects `.cdr`/`.cdt`/`.cmx`/`.cpt` from disk with an explicit fallback codepage.
+pub fn import_and_inspect_binary_file_with_options(
+    path: &Path,
+    options: CdrReadOptions,
+) -> CdrResult<BinaryImportResult> {
+    let limits = CodecLimits::default();
+    let bytes = read_file_bounded(path, &limits)?;
+    import_and_inspect_binary_bytes_with_options(&bytes, &limits, options)
+}
+
+/// Imports and structurally inspects raw `.cdr`/`.cdt`/`.cmx`/`.cpt` bytes under `limits` and `options`.
+pub fn import_and_inspect_binary_bytes_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    options: CdrReadOptions,
 ) -> CdrResult<BinaryImportResult> {
     let file_size_bytes = bytes.len() as u64;
 
     // 1. ZIP/OPC CDR X4-X5, CDR X6+, or CDT ZIP
     if is_zip_bytes(bytes) {
-        let parsed = parse_cdr_zip(bytes, limits)?;
+        let parsed = parse_cdr_zip_with_options(bytes, limits, options)?;
         let (detected_format, format_era) = match (parsed.era, parsed.is_template) {
             (CdrZipEra::X4, false) => (ContainerFormat::CdrZipX4, "CDR ZIP/OPC X4-X5".to_owned()),
             (CdrZipEra::X6, false) => (ContainerFormat::CdrZipX6, "CDR ZIP/OPC X6-2025".to_owned()),
@@ -604,7 +627,7 @@ pub fn import_and_inspect_binary_bytes(
     if bytes.len() >= 12 && (&bytes[0..4] == b"RIFF" || &bytes[0..4] == b"RIFX") {
         let form: [u8; 4] = [bytes[8], bytes[9], bytes[10], bytes[11]];
         if is_cmx_form_type(&form) {
-            let parsed = parse_cmx_bytes(bytes, limits)?;
+            let parsed = parse_cmx_bytes_with_options(bytes, limits, options)?;
             let (fmt, era) = match parsed.precision {
                 CmxPrecision::Bit16 => (ContainerFormat::Cmx16, "CMX 16-bit Presentation Exchange"),
                 CmxPrecision::Bit32 => (ContainerFormat::Cmx32, "CMX 32-bit Presentation Exchange"),
@@ -626,7 +649,7 @@ pub fn import_and_inspect_binary_bytes(
             });
         }
         if is_cdr_form_type(&form) || is_cdt_form_type(&form) {
-            let parsed = parse_cdr_riff(bytes, limits, &HashMap::new())?;
+            let parsed = parse_cdr_riff_with_options(bytes, limits, &HashMap::new(), options)?;
             let (fmt, era) = if parsed.is_template {
                 (
                     ContainerFormat::CdtRiff {
@@ -1268,6 +1291,7 @@ fn summarize_riff_tree(tree: &RiffDocument) -> Vec<ChunkSummary> {
         depth: 0,
         is_list: true,
         compressed: false,
+        preview_bytes: Vec::new(),
     });
     for child in &tree.children {
         collect_node_summaries(child, 1, &mut out);
@@ -1297,6 +1321,7 @@ fn collect_node_summaries(node: &RiffNode, depth: usize, out: &mut Vec<ChunkSumm
                 depth,
                 is_list: false,
                 compressed: *compressed,
+                preview_bytes: data[..data.len().min(256)].to_vec(),
             });
         }
         RiffNode::List {
@@ -1310,12 +1335,65 @@ fn collect_node_summaries(node: &RiffNode, depth: usize, out: &mut Vec<ChunkSumm
                 depth,
                 is_list: true,
                 compressed: *compressed,
+                preview_bytes: Vec::new(),
             });
             for ch in children {
                 collect_node_summaries(ch, depth + 1, out);
             }
         }
     }
+}
+
+/// Writes `doc` to a multi-layer `.cpt` file at `output_path`.
+pub fn write_cpt_file(doc: &Document, output_path: &Path) -> Result<(), String> {
+    let page_idx = doc.active_page_index();
+    let dpi = doc.dpi().clamp(72.0, 300.0);
+    let rendered =
+        coree_render::render_page_to_rgba(doc, page_idx, f64::from(dpi), ViewMode::Enhanced)
+            .map_err(|e| format!("failed to render page for .cpt: {e}"))?;
+    let spec = CptLayerSpec {
+        name: doc
+            .page(page_idx)
+            .map_or_else(|| "Background".to_owned(), |p| p.name.clone()),
+        offset_x: 0,
+        offset_y: 0,
+        width: rendered.width,
+        height: rendered.height,
+        opacity: 255,
+        blend_mode: coree_core::BlendMode::Normal,
+        visible: true,
+        locked: false,
+        color_model: CptColorModel::Rgba32,
+        compression: CptCompression::Zlib,
+        raw_pixels: rendered.rgba,
+        alpha_mask: None,
+        rows_per_strip: 0,
+    };
+    let bytes = write_cpt_bytes(
+        9,
+        doc.title(),
+        rendered.width,
+        rendered.height,
+        CptColorModel::Rgba32,
+        dpi,
+        &[spec],
+    )
+    .map_err(|e| format!("failed to encode .cpt: {e}"))?;
+    coree_io::atomic_write_bytes(output_path, &bytes)
+        .map_err(|e| format!("failed to write .cpt: {e}"))
+}
+
+/// Formats bounded hex+ASCII inspection dumps for chunks in `report`.
+#[must_use]
+pub fn format_inspection_hex_dumps(report: &FileInspectionReport) -> String {
+    let mut out = String::new();
+    for ch in &report.chunks {
+        if !ch.preview_bytes.is_empty() {
+            let _ = writeln!(out, "--- Chunk '{}' ({} bytes) ---", ch.fourcc, ch.size);
+            out.push_str(&format_hex_ascii_dump(&ch.preview_bytes, 0));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

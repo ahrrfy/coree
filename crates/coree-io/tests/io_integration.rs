@@ -284,6 +284,7 @@ fn build_all_features_document() -> Document {
             width_mm: 50.0,
             height_mm: 50.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     )
@@ -4394,4 +4395,156 @@ fn w3a_r9_svg_pdf_eps_export_honors_3slot_icc_for_lenses_and_effects() {
                 .success());
         }
     }
+}
+
+#[test]
+fn w5a_autopage_number_page_bg_drawing_scale_even_odd_wmf_emf_and_eps_opacity() {
+    let mut doc = Document::new("W5A IO Spec", 100.0, 100.0, ColorMode::Rgb, 96.0);
+    doc.set_drawing_scale(coree_core::DrawingScale::new(1.0, 10.0));
+    let p0_id = doc.pages()[0].id;
+    if let Some(p0) = doc.page_mut(0) {
+        p0.background_fill = Fill::Solid(Color::rgba8(240, 230, 200, 255));
+        p0.printable_background = true;
+    }
+    let p2_id = doc.add_page("Page 2", 100.0, 100.0, 0.0);
+    let master = doc
+        .add_layer(p0_id, "Running Header", false, MasterLayerScope::AllPages)
+        .unwrap();
+
+    let header = ArtisticText {
+        runs: vec![
+            coree_core::TextRun::new("Page ", TextStyle::default()),
+            coree_core::TextRun::new("#", TextStyle::default())
+                .with_field(coree_core::TextField::AutoPageNumber),
+        ],
+        direction: TextDirection::Ltr,
+        align: coree_core::TextAlign::Left,
+    };
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "HeaderNum", NodePayload::ArtisticText(header))
+            .with_transform(coree_core::Affine2D::translate(15.0, 20.0)),
+        Some(master),
+    )
+    .unwrap();
+
+    // Dimension honoring 1:10 drawing scale (10mm -> 100.0 mm)
+    let mut dim = DimensionObject::linear(
+        DimensionKind::Horizontal,
+        Point2D::new(10.0, 80.0),
+        Point2D::new(20.0, 80.0),
+        5.0,
+    );
+    dim.precision = 1;
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "DimScaled", NodePayload::Dimension(dim)),
+        None,
+    )
+    .unwrap();
+
+    // PowerClip with clip_even_odd = true on Page 2
+    let mut outer = BezierPath::from_rect(Rect2D::from_xywh(10.0, 30.0, 40.0, 40.0));
+    let inner = BezierPath::from_rect(Rect2D::from_xywh(20.0, 40.0, 20.0, 20.0));
+    outer.subpaths.extend(inner.subpaths);
+    let p2_layer = doc.page_by_id(p2_id).unwrap().layers[0].id;
+    let child_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Clipped",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    5.0, 25.0, 50.0, 50.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::rgba8(20, 120, 220, 255))),
+            Some(p2_layer),
+        )
+        .unwrap();
+    let mut clip_obj = SceneObject::new(
+        ObjectId(0),
+        "EvenOddClip",
+        NodePayload::PowerClip {
+            container: Box::new(outer),
+            container_parametric: None,
+            contents: vec![child_id],
+            lock_contents: false,
+        },
+    );
+    clip_obj.clip_even_odd = true;
+    doc.add_object(clip_obj, Some(p2_layer)).unwrap();
+
+    // Semi-transparent vector (#20m EPS opacity) + raster (#20a WMF/EMF DIB)
+    let mut semi = SceneObject::new(
+        ObjectId(0),
+        "SemiRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            60.0, 30.0, 20.0, 20.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(255, 0, 0, 255)));
+    semi.opacity = 0.5;
+    doc.add_object(semi, None).unwrap();
+
+    let aid = doc.register_asset(
+        RasterAsset::new(4, 4, [10u8, 200, 30, 255].repeat(16), 96.0, ColorMode::Rgb).unwrap(),
+    );
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "PhotoWmf",
+            NodePayload::Raster(RasterLayerData {
+                asset_id: aid,
+                width_mm: 20.0,
+                height_mm: 20.0,
+                filters: Vec::new(),
+                filter_enabled: Vec::new(),
+                crop_rect: None,
+            }),
+        )
+        .with_transform(coree_core::Affine2D::translate(60.0, 60.0)),
+        None,
+    )
+    .unwrap();
+
+    // 1. SVG & EPS honor Page.printable_background, PowerClip clip_even_odd, EPS scalar opacity, DrawingScale
+    let svg_p0 = coree_io::export_svg_to_string(&doc, 0).unwrap();
+    assert!(svg_p0.contains("id=\"page-background\""));
+    let svg_p1 = coree_io::export_svg_to_string(&doc, 1).unwrap();
+    assert!(svg_p1.contains("clip-rule=\"evenodd\""));
+    let eps_p0 = coree_io::export_eps_to_string(&doc, 0).unwrap();
+    assert!(!eps_p0.contains("1.0000 0.0000 0.0000 setrgbcolor"));
+    let eps_p1 = coree_io::export_eps_to_string(&doc, 1).unwrap();
+    assert!(eps_p1.contains("eoclip newpath"));
+
+    // 2. PDF resolves AutoPageNumber per page and honors W* n even-odd PowerClip
+    let pdf_bytes = export_pdf_to_bytes(
+        &doc,
+        &PdfExportOptions {
+            compress_streams: false,
+            ..PdfExportOptions::print_ready()
+        },
+    )
+    .unwrap();
+    let pdf_txt = String::from_utf8_lossy(&pdf_bytes);
+    assert!(pdf_txt.contains("W* n"));
+
+    // 3. WMF & EMF roundtrip preserves DrawRaster (#20a) + EMF rclBounds is device pixels (#13)
+    let wmf = coree_io::export_wmf_to_bytes(&doc, 0).unwrap();
+    let wmf_back = coree_io::import_wmf_bytes(&wmf, "WmfBack").unwrap();
+    assert!(wmf_back
+        .objects()
+        .values()
+        .any(|o| matches!(o.payload, NodePayload::Raster(_))));
+
+    let emf = coree_io::encode_clipboard_emf(&doc, 0).unwrap();
+    let rcl_right = i32::from_le_bytes([emf[16], emf[17], emf[18], emf[19]]);
+    let szl_dev_x = i32::from_le_bytes([emf[72], emf[73], emf[74], emf[75]]);
+    assert!(
+        rcl_right <= szl_dev_x + 2,
+        "EMF rclBounds ({rcl_right}) must be in device units <= szlDevice ({szl_dev_x})"
+    );
+    let emf_back = coree_io::decode_clipboard_emf(&emf).unwrap();
+    assert!(emf_back
+        .objects()
+        .values()
+        .any(|o| matches!(o.payload, NodePayload::Raster(_))));
 }

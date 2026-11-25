@@ -424,6 +424,7 @@ fn all_command_variants_undo_redo_and_rhai_macro_roundtrip() {
                 width_mm: 10.0,
                 height_mm: 10.0,
                 filters: vec![RasterFilter::Invert],
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             },
         },
@@ -633,6 +634,7 @@ fn regression_non_finite_bounds_do_not_panic_spatial_index() {
                     width_mm: f64::NAN,
                     height_mm: 10.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),
@@ -649,6 +651,7 @@ fn regression_non_finite_bounds_do_not_panic_spatial_index() {
                     width_mm: 10.0,
                     height_mm: 10.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: Some(Rect2D::new(f64::INFINITY, 0.0, 10.0, 10.0)),
                 }),
             ),
@@ -1081,6 +1084,87 @@ fn autofit_page_to_content_resizes_shifts_and_ignores_hidden_objects() {
 }
 
 #[test]
+fn autofit_page_to_content_multipage_symbol_and_hidden_layer_isolation() {
+    use coree_core::{MasterLayerScope, SymbolDef};
+
+    let mut doc = Document::new_a4("Autofit MultiPage Symbol");
+    let p0_id = doc.pages()[0].id;
+    // Page 0: visible rect [30..50, 40..60] + far-away rect on hidden layer [500..540, 600..640]
+    let p0_vis = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "P0Vis", rect_shape(20.0, 20.0))
+                .with_transform(Affine2D::translate(30.0, 40.0)),
+            None,
+        )
+        .unwrap();
+    let hidden_lid = doc
+        .add_layer(p0_id, "HiddenLayer", false, MasterLayerScope::None)
+        .unwrap();
+    doc.set_layer_flags(hidden_lid, Some(false), None, None, None)
+        .unwrap();
+    let p0_hidden = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "P0Hidden", rect_shape(40.0, 40.0))
+                .with_transform(Affine2D::translate(500.0, 600.0)),
+            Some(hidden_lid),
+        )
+        .unwrap();
+
+    // Page 1: SymbolInstance (20x10 rect offset inside SymbolDef) + Group
+    doc.add_page("Page 2", 210.0, 297.0, 0.0);
+    let p1_lid = doc.pages()[1].layers[0].id;
+    let sym_sub = SceneObject::new(ObjectId(1), "SymSub", rect_shape(20.0, 10.0))
+        .with_transform(Affine2D::translate(10.0, 5.0));
+    let sym_def = SymbolDef::new("BoxSym", vec![sym_sub]);
+    let sym_id = sym_def.id;
+    doc.upsert_symbol(sym_def);
+    let inst_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(50.0, 80.0)),
+            Some(p1_lid),
+        )
+        .unwrap();
+    let g_a = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "GA", rect_shape(15.0, 15.0))
+                .with_transform(Affine2D::translate(95.0, 100.0)),
+            Some(p1_lid),
+        )
+        .unwrap();
+    let grp_id = doc.group_objects(&[g_a], "P1Grp").unwrap();
+
+    // Autofit Page 1 with 10mm margin: sym world [60..80, 85..95] U grp [95..110, 100..115] -> 50x30 -> page 70x50
+    let (w1, h1) = doc.autofit_page_to_content(1, 10.0).unwrap();
+    assert!((w1 - 70.0).abs() < 1e-6, "expected w1=70, got {w1}");
+    assert!((h1 - 50.0).abs() < 1e-6, "expected h1=50, got {h1}");
+    let inst_b = doc.world_object_bounds(inst_id).unwrap();
+    assert!((inst_b.min_x - 10.0).abs() < 1e-6);
+    assert!((inst_b.min_y - 10.0).abs() < 1e-6);
+    let grp_b = doc.world_object_bounds(grp_id).unwrap();
+    assert!((grp_b.max_x - 60.0).abs() < 1e-6);
+    assert!((grp_b.max_y - 40.0).abs() < 1e-6);
+
+    // Page 0 must remain completely untouched (210x297, p0_vis still at 30,40)
+    assert!((doc.pages()[0].width_mm - 210.0).abs() < 1e-6);
+    assert!((doc.pages()[0].height_mm - 297.0).abs() < 1e-6);
+    let p0_b_before = doc.world_object_bounds(p0_vis).unwrap();
+    assert!((p0_b_before.min_x - 30.0).abs() < 1e-6);
+
+    // Autofit Page 0 with 5mm margin: ignores hidden layer object [500..540, 600..640], yields 30x30
+    let (w0, h0) = doc.autofit_page_to_content(0, 5.0).unwrap();
+    assert!((w0 - 30.0).abs() < 1e-6, "expected w0=30, got {w0}");
+    assert!((h0 - 30.0).abs() < 1e-6, "expected h0=30, got {h0}");
+    let p0_b_after = doc.world_object_bounds(p0_vis).unwrap();
+    assert!((p0_b_after.min_x - 5.0).abs() < 1e-6);
+    assert!((p0_b_after.min_y - 5.0).abs() < 1e-6);
+    // Hidden layer object shifted by (-25, -35) to preserve alignment
+    let hidden_b = doc.world_object_bounds(p0_hidden).unwrap();
+    assert!((hidden_b.min_x - 475.0).abs() < 1e-6);
+    assert!((hidden_b.min_y - 565.0).abs() < 1e-6);
+}
+
+#[test]
 fn icc_profiles_gamut_and_postscript_presets_end_to_end() {
     // Display P3 <-> sRGB roundtrip through D50 PCS
     let sample = [0.42_f32, 0.58, 0.71];
@@ -1487,6 +1571,7 @@ fn w1b_all_25_new_command_ops_lossless_execute_undo_redo() {
             clear_gray_icc: false,
             rendering_intent: None,
             black_point_compensation: None,
+            drawing_scale: None,
         },
         "SetDocumentProperties(set)",
     );
@@ -1511,6 +1596,7 @@ fn w1b_all_25_new_command_ops_lossless_execute_undo_redo() {
             clear_gray_icc: false,
             rendering_intent: None,
             black_point_compensation: None,
+            drawing_scale: None,
         },
         "SetDocumentProperties(clear_icc)",
     );
@@ -1526,6 +1612,8 @@ fn w1b_all_25_new_command_ops_lossless_execute_undo_redo() {
             height_mm: Some(260.0),
             bleed_mm: Some(5.0),
             facing_pages: Some(true),
+            background_fill: None,
+            printable_background: None,
         },
         "SetPageProperties",
     );
@@ -1903,6 +1991,7 @@ fn w1b_edit_path_guard_rejects_all_non_path_payloads_and_boolean_preserves_metad
                     width_mm: 10.0,
                     height_mm: 10.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),
@@ -3083,6 +3172,7 @@ fn w1b_r4_edit_shape_delete_layer_register_asset_and_create_detached_object() {
             width_mm: 10.0,
             height_mm: 10.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -3177,6 +3267,7 @@ fn w1b_r5_standalone_register_asset_eviction_and_create_detached_guards() {
             width_mm: 10.0,
             height_mm: 10.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -3212,6 +3303,7 @@ fn w1b_r5_standalone_register_asset_eviction_and_create_detached_guards() {
                 width_mm: 20.0,
                 height_mm: 20.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             },
         },
@@ -3403,6 +3495,7 @@ fn w1b_r6_container_guards_style_finiteness_locked_descendants_and_table_dim_col
                         width_mm: 10.0,
                         height_mm: 10.0,
                         filters: Vec::new(),
+                        filter_enabled: Vec::new(),
                         crop_rect: None,
                     },
                 },
@@ -3480,6 +3573,7 @@ fn w1b_r6_container_guards_style_finiteness_locked_descendants_and_table_dim_col
                     width_mm: f64::NEG_INFINITY,
                     height_mm: 10.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 },
             },
@@ -4374,6 +4468,7 @@ fn w1b_r8_effective_locks_find_replace_nan_validation_and_command_matrix() {
                     width_mm: 10.0,
                     height_mm: 10.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             ),
@@ -4901,6 +4996,7 @@ fn w1b_r8_effective_locks_find_replace_nan_validation_and_command_matrix() {
                 width_mm: 20.0,
                 height_mm: 20.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             },
         },
@@ -12545,4 +12641,579 @@ fn w3_exit_r5_linked_paragraph_frame_targeted_invalidation_edit_unlink_transform
         }
         DocumentInvalidation::All => panic!("Expected Targeted for TextWrapMode obstacle move"),
     }
+}
+
+#[test]
+fn w5a_drawing_scale_page_bg_reorder_layers_and_autofield() {
+    use coree_core::{
+        ArtisticText, CommandHistory, CommandOp, DimensionKind, DimensionObject, Document,
+        DrawingScale, Fill, MasterLayerScope, PageId, TextField, TextRun, TextStyle, Unit,
+    };
+
+    let mut doc = Document::new("W5A Page & Scale", 210.0, 297.0, ColorMode::Cmyk, 300.0);
+    let mut hist = CommandHistory::new(32);
+
+    let dim = DimensionObject::linear(
+        DimensionKind::Horizontal,
+        Point2D::new(20.0, 50.0),
+        Point2D::new(100.0, 50.0),
+        8.0,
+    );
+    assert_eq!(
+        dim.compute_measurement_with_scale(Unit::Millimeter, 300.0, doc.drawing_scale()),
+        "80.00 mm"
+    );
+
+    hist.execute(
+        &mut doc,
+        CommandOp::SetDocumentProperties {
+            title: None,
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
+            drawing_scale: Some(DrawingScale::new(1.0, 10.0)),
+        },
+    )
+    .unwrap();
+    assert_eq!(doc.drawing_scale(), DrawingScale::new(1.0, 10.0));
+    assert_eq!(
+        dim.compute_measurement_with_scale(Unit::Millimeter, 300.0, doc.drawing_scale()),
+        "800.00 mm"
+    );
+    hist.undo(&mut doc).unwrap();
+    assert_eq!(doc.drawing_scale(), DrawingScale::default());
+    hist.redo(&mut doc).unwrap();
+    assert_eq!(doc.drawing_scale(), DrawingScale::new(1.0, 10.0));
+
+    // Page background_fill & printable_background + ReorderLayers
+    let p1_id: PageId = doc.pages()[0].id;
+    let l1_id = doc.pages()[0].layers[0].id;
+    let l2_id = doc
+        .add_layer(p1_id, "Overlay", false, MasterLayerScope::None)
+        .unwrap();
+    let bg = Fill::Solid(Color::rgb(0.2, 0.4, 0.8));
+    hist.execute(
+        &mut doc,
+        CommandOp::SetPageProperties {
+            page_id: p1_id,
+            name: None,
+            width_mm: None,
+            height_mm: None,
+            bleed_mm: None,
+            facing_pages: Some(true),
+            background_fill: Some(bg.clone()),
+            printable_background: Some(true),
+        },
+    )
+    .unwrap();
+    assert!(doc.pages()[0].printable_background);
+    assert_eq!(doc.pages()[0].background_fill, bg);
+
+    hist.execute(
+        &mut doc,
+        CommandOp::ReorderLayers {
+            page_id: p1_id,
+            layer_ids: vec![l2_id, l1_id],
+        },
+    )
+    .unwrap();
+    assert_eq!(doc.pages()[0].layers[0].id, l2_id);
+    hist.undo(&mut doc).unwrap();
+    assert_eq!(doc.pages()[0].layers[0].id, l1_id);
+
+    // AutoPageNumber dynamic text field resolution
+    doc.add_page("Page 2", 210.0, 297.0, 3.0);
+    let at = ArtisticText {
+        runs: vec![
+            TextRun::new("Page ", TextStyle::default()),
+            TextRun::new("#", TextStyle::default()).with_field(TextField::AutoPageNumber),
+            TextRun::new(" / ", TextStyle::default()),
+            TextRun::new("N", TextStyle::default()).with_field(TextField::PageCount),
+        ],
+        ..ArtisticText::default()
+    };
+    assert_eq!(
+        doc.resolve_artistic_text_fields(0, &at).plain_text(),
+        "Page 1 / 2"
+    );
+    assert_eq!(
+        doc.resolve_artistic_text_fields(1, &at).plain_text(),
+        "Page 2 / 2"
+    );
+}
+
+#[test]
+fn w5a_non_aabb_hit_test_and_5_geometric_snaps_precision() {
+    use coree_core::{
+        hit_test_node, hit_test_point, hit_test_point_exact, stroke_to_closed_path, ArtisticText,
+        BSplineCurve, BezierPath, DynamicGuideKind, EllipseMode, OutlineStyle, ParametricShape,
+        SnapEngine, SnapOptions, TextOnPath, TextStyle, VectorTable,
+    };
+
+    let mut doc = Document::new_a4("Precision Hit & Snaps");
+
+    // 1. Unfilled Table: hit border, miss empty cell center
+    let table_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "UnfilledTable",
+                NodePayload::Table(VectorTable::new(2, 2, 20.0, 10.0)),
+            )
+            .with_transform(Affine2D::translate(10.0, 10.0)),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(20.0, 15.0), 0.5),
+        None,
+        "Empty interior of unfilled table cell must NOT hit"
+    );
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(30.0, 15.0), 0.5),
+        Some(table_id),
+        "Table inner vertical border must hit"
+    );
+    assert_eq!(
+        hit_test_point_exact(&doc, 0, Point2D::new(20.0, 15.0), 0.5, true),
+        Some(table_id),
+        "treat_all_filled=true hits table cell interior"
+    );
+
+    // 2. TextOnPath arc-length span: hits start of circle, misses opposite far side
+    let host_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CircleHost",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 40.0,
+                    ry: 40.0,
+                    mode: EllipseMode::Full,
+                    start_deg: 0.0,
+                    end_deg: 360.0,
+                }),
+            )
+            .with_transform(Affine2D::translate(120.0, 120.0)),
+            None,
+        )
+        .unwrap();
+    let top = TextOnPath {
+        text: ArtisticText::from_plain("Hi", TextStyle::default()),
+        path_id: host_id,
+        offset_mm: 0.0,
+        distance_mm: 0.0,
+        flip_vertical: false,
+        flip_horizontal: false,
+    };
+    let top_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "ShortTOP", NodePayload::TextOnPath(top)),
+            None,
+        )
+        .unwrap();
+    // Point on far opposite arc (x=80, y=120) must hit CircleHost (not ShortTOP)
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(80.0, 120.0), 0.5),
+        Some(host_id),
+        "TextOnPath must not claim the entire host path outside text span"
+    );
+    let _ = top_id;
+
+    // 3. Multi-line ArtisticText: miss trailing whitespace on short line 2
+    let at_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "MultiLineText",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "LONG FIRST LINE HERE\nA",
+                    TextStyle::default(),
+                )),
+            )
+            .with_transform(Affine2D::translate(10.0, 200.0)),
+            None,
+        )
+        .unwrap();
+    // Default font_size_pt=24pt -> 8.47mm, line_h ~ 10.16mm -> Line 2 is y ~ 210.2..220.3
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(50.0, 215.0), 0.2),
+        None,
+        "Empty whitespace right of short line 2 must not hit ArtisticText"
+    );
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(11.5, 215.0), 0.2),
+        Some(at_id)
+    );
+
+    // 4. BSpline hit_test_node includes control points
+    let bs = BSplineCurve {
+        control_points: vec![
+            Point2D::new(10.0, 250.0),
+            Point2D::new(30.0, 235.0),
+            Point2D::new(50.0, 250.0),
+        ],
+        degree: 2,
+        knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        closed: false,
+    };
+    let bs_id = doc
+        .add_object(
+            SceneObject::new(ObjectId(0), "BS", NodePayload::BSpline(bs)),
+            None,
+        )
+        .unwrap();
+    let nh = hit_test_node(&doc, &[bs_id], Point2D::new(30.2, 235.1), 1.0)
+        .expect("BSpline control point must be hit-testable");
+    assert!((nh.position_mm.x - 30.0).abs() < 1e-6);
+
+    // 5. All 5 geometric snaps (< 0.01 mm accuracy)
+    let opts = SnapOptions {
+        nodes: false,
+        objects: false,
+        guidelines: false,
+        page_edges: false,
+        grid: false,
+        tangent: true,
+        perpendicular: true,
+        quadrant: true,
+        intersection: true,
+        baseline: true,
+        dynamic_guides: true,
+        tolerance_mm: 5.0,
+    };
+
+    // Quadrant on CircleHost at (120, 120) r=40 -> top quadrant (120, 80)
+    let (q_pt, q_guides) =
+        SnapEngine::snap_point_with_reference(&doc, 0, Point2D::new(121.0, 81.0), None, &[], &opts);
+    assert!(q_pt.distance_to(Point2D::new(120.0, 80.0)) < 0.01);
+    assert!(q_guides
+        .iter()
+        .any(|g| g.kind == DynamicGuideKind::Quadrant));
+
+    // Tangent from external point (120, 40) to CircleHost at (120, 120) r=40
+    // d = 80, r = 40 -> sin(theta)=0.5 -> tangent points at (120 +/- 20*sqrt(3), 100)
+    let expected_tx = 120.0 + 20.0 * 3.0_f64.sqrt();
+    let (t_pt, t_guides) = SnapEngine::snap_point_with_reference(
+        &doc,
+        0,
+        Point2D::new(expected_tx + 0.5, 100.5),
+        Some(Point2D::new(120.0, 40.0)),
+        &[],
+        &opts,
+    );
+    assert!(
+        t_pt.distance_to(Point2D::new(expected_tx, 100.0)) < 0.01,
+        "Tangent error: got {t_pt:?}, expected ({expected_tx}, 100.0)"
+    );
+    assert!(t_guides.iter().any(|g| g.kind == DynamicGuideKind::Tangent));
+
+    // Perpendicular & Intersection on two crossing lines
+    let line_h = BezierPath::from_line(Point2D::new(10.0, 170.0), Point2D::new(70.0, 170.0));
+    let line_v = BezierPath::from_line(Point2D::new(40.0, 140.0), Point2D::new(40.0, 195.0));
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "LH", NodePayload::Path(line_h)),
+        None,
+    )
+    .unwrap();
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "LV", NodePayload::Path(line_v)),
+        None,
+    )
+    .unwrap();
+
+    let (i_pt, i_guides) =
+        SnapEngine::snap_point_with_reference(&doc, 0, Point2D::new(41.0, 171.0), None, &[], &opts);
+    assert!(i_pt.distance_to(Point2D::new(40.0, 170.0)) < 0.01);
+    assert!(i_guides
+        .iter()
+        .any(|g| g.kind == DynamicGuideKind::Intersection));
+
+    let (p_pt, p_guides) = SnapEngine::snap_point_with_reference(
+        &doc,
+        0,
+        Point2D::new(25.5, 170.8),
+        Some(Point2D::new(25.0, 150.0)),
+        &[],
+        &SnapOptions {
+            intersection: false,
+            ..opts
+        },
+    );
+    assert!(
+        p_pt.distance_to(Point2D::new(25.0, 170.0)) < 0.01,
+        "Perp error: {p_pt:?}"
+    );
+    assert!(p_guides
+        .iter()
+        .any(|g| g.kind == DynamicGuideKind::Perpendicular));
+
+    // Baseline on MultiLineText at y = 200 + font_mm * 0.85
+    let (b_pt, b_guides) =
+        SnapEngine::snap_point_with_reference(&doc, 0, Point2D::new(22.0, 203.0), None, &[], &opts);
+    assert!(b_guides
+        .iter()
+        .any(|g| g.kind == DynamicGuideKind::Baseline));
+    assert!((b_pt.y - (200.0 + TextStyle::default().font_size_mm() * 0.85)).abs() < 0.01);
+
+    // 6. Calligraphy closed subpath emits outer + inner hole subpaths (#16)
+    let closed_circle = ParametricShape::Ellipse {
+        rx: 20.0,
+        ry: 20.0,
+        mode: EllipseMode::Full,
+        start_deg: 0.0,
+        end_deg: 360.0,
+    }
+    .to_bezier_path();
+    let mut calli = OutlineStyle::solid(Color::BLACK, 4.0);
+    calli.calligraphy_angle_deg = 45.0;
+    calli.calligraphy_stretch = 0.25;
+    let stroked = stroke_to_closed_path(&closed_circle, &calli, None).unwrap();
+    assert!(
+        stroked.subpaths.len() >= 2,
+        "Closed calligraphy stroke must emit outer + inner hole subpaths, got {}",
+        stroked.subpaths.len()
+    );
+
+    // 7. Unfilled ParagraphText: hits border & wrapped text lines, misses empty frame interior
+    use coree_core::{hit_test_rect, ParagraphText, Perspective3x3};
+    let mut para = ParagraphText::new("Short line", Vec2D::new(80.0, 50.0), TextStyle::default());
+    para.runs[0].style.font_size_pt = 12.0; // ~4.23mm font -> ~5.08mm line height
+    let para_obj = SceneObject::new(
+        ObjectId(0),
+        "UnfilledPara",
+        NodePayload::ParagraphText(para),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(150.0, 10.0));
+    let para_id = doc.add_object(para_obj, None).unwrap();
+
+    // Empty lower region inside [150..230, 10..60] must NOT hit when unfilled
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(190.0, 45.0), 0.3),
+        None,
+        "Unfilled ParagraphText empty lower interior must NOT hit"
+    );
+    assert!(
+        !hit_test_rect(&doc, 0, Rect2D::from_xywh(180.0, 40.0, 15.0, 12.0), false)
+            .contains(&para_id),
+        "Unfilled ParagraphText empty lower marquee must NOT hit"
+    );
+    // Point on wrapped text line at top-left hits
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(155.0, 13.0), 0.3),
+        Some(para_id),
+        "Unfilled ParagraphText wrapped text line must hit"
+    );
+    // Point on frame perimeter border (x=150, y=45) hits
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(150.0, 45.0), 0.3),
+        Some(para_id),
+        "Unfilled ParagraphText frame border must hit"
+    );
+    // treat_all_filled=true hits empty interior
+    assert_eq!(
+        hit_test_point_exact(&doc, 0, Point2D::new(190.0, 45.0), 0.3, true),
+        Some(para_id),
+        "treat_all_filled=true must hit ParagraphText interior"
+    );
+
+    // Unfilled ParagraphText with Effect::Perspective preserves full-frame homography
+    let mut persp_para = ParagraphText::new("Top", Vec2D::new(80.0, 50.0), TextStyle::default());
+    persp_para.runs[0].style.font_size_pt = 12.0;
+    let quad = [
+        Point2D::new(0.0, 0.0),
+        Point2D::new(80.0, 0.0),
+        Point2D::new(80.0, 50.0),
+        Point2D::new(0.0, 50.0),
+    ];
+    let _ = Perspective3x3::from_rect_to_quad(Rect2D::from_xywh(0.0, 0.0, 80.0, 50.0), &quad);
+    let mut p_obj = SceneObject::new(
+        ObjectId(0),
+        "PerspPara",
+        NodePayload::ParagraphText(persp_para),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none())
+    .with_transform(Affine2D::translate(250.0, 10.0));
+    p_obj.effects.push(Effect::Perspective {
+        quad: [
+            Point2D::new(10.0, 0.0),
+            Point2D::new(70.0, 0.0),
+            Point2D::new(80.0, 50.0),
+            Point2D::new(0.0, 50.0),
+        ],
+    });
+    let p_para_id = doc.add_object(p_obj, None).unwrap();
+    // Warped top line center (local ~20..60, y~2 -> world ~262, 12) hits
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(262.0, 12.5), 0.5),
+        Some(p_para_id),
+        "Warped ParagraphText top line must hit under Effect::Perspective"
+    );
+    // Warped lower interior (world ~290, 45) misses when unfilled
+    assert_eq!(
+        hit_test_point(&doc, 0, Point2D::new(290.0, 45.0), 0.3),
+        None,
+        "Warped unfilled ParagraphText lower empty region must NOT hit"
+    );
+}
+
+#[test]
+fn command_set_page_properties_and_reorder_layers_undo_redo_and_guards() {
+    use coree_core::{CommandHistory, CommandOp};
+
+    let mut doc = Document::new_a4("Command Page & Layer Ops");
+    let mut hist = CommandHistory::new(32);
+    let page_id = doc.pages()[0].id;
+    let l1 = doc.pages()[0].layers[0].id;
+    let l2 = doc
+        .add_layer(
+            page_id,
+            "Artwork",
+            false,
+            coree_core::MasterLayerScope::None,
+        )
+        .unwrap();
+    let l3 = doc
+        .add_layer(page_id, "Cut", false, coree_core::MasterLayerScope::None)
+        .unwrap();
+
+    // 1. Guard rejections must fail cleanly without mutating document
+    let bad_w = hist.execute(
+        &mut doc,
+        CommandOp::SetPageProperties {
+            page_id,
+            name: None,
+            width_mm: Some(0.0),
+            height_mm: None,
+            bleed_mm: None,
+            facing_pages: None,
+            background_fill: None,
+            printable_background: None,
+        },
+    );
+    assert!(bad_w.is_err(), "non-positive width_mm must fail");
+
+    let bad_bleed = hist.execute(
+        &mut doc,
+        CommandOp::SetPageProperties {
+            page_id,
+            name: None,
+            width_mm: None,
+            height_mm: None,
+            bleed_mm: Some(-1.0),
+            facing_pages: None,
+            background_fill: None,
+            printable_background: None,
+        },
+    );
+    assert!(bad_bleed.is_err(), "negative bleed_mm must fail");
+
+    let bad_reorder = hist.execute(
+        &mut doc,
+        CommandOp::ReorderLayers {
+            page_id,
+            layer_ids: vec![l1, l1, l3],
+        },
+    );
+    assert!(bad_reorder.is_err(), "duplicate LayerId reorder must fail");
+    assert_eq!(
+        doc.pages()[0]
+            .layers
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>(),
+        vec![l1, l2, l3]
+    );
+
+    // 2. Valid SetPageProperties + Undo/Redo
+    let orig_w = doc.pages()[0].width_mm;
+    let orig_h = doc.pages()[0].height_mm;
+    let orig_facing = doc.pages()[0].facing_pages;
+    let orig_bg = doc.pages()[0].background_fill.clone();
+    let orig_print_bg = doc.pages()[0].printable_background;
+    let bg_cream = Fill::Solid(Color::rgba8(255, 250, 235, 255));
+    hist.execute(
+        &mut doc,
+        CommandOp::SetPageProperties {
+            page_id,
+            name: Some("SpreadCover".to_owned()),
+            width_mm: Some(148.0),
+            height_mm: Some(210.0),
+            bleed_mm: Some(3.0),
+            facing_pages: Some(true),
+            background_fill: Some(bg_cream.clone()),
+            printable_background: Some(true),
+        },
+    )
+    .unwrap();
+    assert_eq!(doc.pages()[0].name, "SpreadCover");
+    assert!((doc.pages()[0].width_mm - 148.0).abs() < 1e-6);
+    assert!((doc.pages()[0].height_mm - 210.0).abs() < 1e-6);
+    assert!((doc.pages()[0].bleed_mm - 3.0).abs() < 1e-6);
+    assert!(doc.pages()[0].facing_pages);
+    assert_eq!(doc.pages()[0].background_fill, bg_cream);
+    assert!(doc.pages()[0].printable_background);
+
+    // 3. Valid ReorderLayers + Undo/Redo
+    hist.execute(
+        &mut doc,
+        CommandOp::ReorderLayers {
+            page_id,
+            layer_ids: vec![l3, l1, l2],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        doc.pages()[0]
+            .layers
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>(),
+        vec![l3, l1, l2]
+    );
+
+    hist.undo(&mut doc).unwrap();
+    assert_eq!(
+        doc.pages()[0]
+            .layers
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>(),
+        vec![l1, l2, l3]
+    );
+    hist.undo(&mut doc).unwrap();
+    assert!((doc.pages()[0].width_mm - orig_w).abs() < 1e-6);
+    assert!((doc.pages()[0].height_mm - orig_h).abs() < 1e-6);
+    assert_eq!(doc.pages()[0].facing_pages, orig_facing);
+    assert_eq!(doc.pages()[0].background_fill, orig_bg);
+    assert_eq!(doc.pages()[0].printable_background, orig_print_bg);
+
+    hist.redo(&mut doc).unwrap();
+    assert_eq!(doc.pages()[0].name, "SpreadCover");
+    assert!(doc.pages()[0].printable_background);
+    hist.redo(&mut doc).unwrap();
+    assert_eq!(
+        doc.pages()[0]
+            .layers
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>(),
+        vec![l3, l1, l2]
+    );
 }

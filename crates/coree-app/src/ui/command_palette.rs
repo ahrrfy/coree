@@ -51,7 +51,9 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut StudioApp) {
         }
     });
 
-    egui::Window::new("Command Palette")
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(app.ui_language);
+    let lang = app.ui_language;
+    egui::Window::new(crate::i18n::I18nKey::CommandPaletteTitle.tr_ui(lang))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
@@ -65,82 +67,88 @@ pub fn show_command_palette(ctx: &egui::Context, app: &mut StudioApp) {
                 .inner_margin(Margin::same(12)),
         )
         .show(ctx, |ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut app.command_palette.query)
-                    .hint_text("Search tools, laser plugins, workspaces, autofit, soft-proof, options, macros...")
-                    .desired_width(f32::INFINITY),
-            );
-            if app.command_palette.just_opened {
-                resp.request_focus();
-                app.command_palette.just_opened = false;
-            }
-            if resp.changed() {
-                app.command_palette.selected_index = 0;
-            }
+            shell_dir.with_vertical(ui, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut app.command_palette.query)
+                        .hint_text(crate::i18n::I18nKey::CommandPaletteSearchHint.tr_ui(lang))
+                        .desired_width(f32::INFINITY),
+                );
+                if app.command_palette.just_opened {
+                    resp.request_focus();
+                    app.command_palette.just_opened = false;
+                }
+                if resp.changed() {
+                    app.command_palette.selected_index = 0;
+                }
 
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("{} command(s) matching", matches.len()))
-                    .size(11.0)
-                    .color(tokens.text_muted),
-            );
-            ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{} command(s) matching", matches.len()))
+                        .size(11.0)
+                        .color(tokens.text_muted),
+                );
+                ui.separator();
 
-            egui::ScrollArea::vertical()
-                .max_height(346.0)
-                .show(ui, |ui| {
-                    if matches.is_empty() {
-                        ui.label(
-                            RichText::new("No commands matched your search.")
+                egui::ScrollArea::vertical()
+                    .max_height(346.0)
+                    .show(ui, |ui| {
+                        if matches.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    crate::i18n::I18nKey::CommandPaletteEmpty.tr_ui(lang),
+                                )
                                 .color(tokens.text_muted),
-                        );
-                    }
-                    for (idx, cmd) in matches.iter().take(60).enumerate() {
-                        let is_sel = idx == app.command_palette.selected_index;
-                        let bg = if is_sel {
-                            tokens.surface
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
-                        let stroke = if is_sel {
-                            Stroke::new(1.0, tokens.accent)
-                        } else {
-                            Stroke::NONE
-                        };
-                        let row = Frame::NONE
-                            .fill(bg)
-                            .stroke(stroke)
-                            .corner_radius(CornerRadius::same(4))
-                            .inner_margin(Margin::symmetric(8, 5))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(&cmd.category)
-                                            .size(10.5)
-                                            .strong()
-                                            .color(tokens.accent),
-                                    );
-                                    ui.label(RichText::new(&cmd.title).color(tokens.text));
-                                    if !cmd.shortcut.is_empty() {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(&cmd.shortcut)
-                                                        .monospace()
-                                                        .size(11.0)
-                                                        .color(tokens.text_muted),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
-                            });
-                        if row.response.interact(egui::Sense::click()).clicked() {
-                            execute_id = Some(cmd.id.clone());
+                            );
                         }
-                    }
-                });
+                        for (idx, cmd) in matches.iter().take(60).enumerate() {
+                            let is_sel = idx == app.command_palette.selected_index;
+                            let bg = if is_sel {
+                                tokens.surface
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            let stroke = if is_sel {
+                                Stroke::new(1.0, tokens.accent)
+                            } else {
+                                Stroke::NONE
+                            };
+                            let row = Frame::NONE
+                                .fill(bg)
+                                .stroke(stroke)
+                                .corner_radius(CornerRadius::same(4))
+                                .inner_margin(Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    shell_dir.with_horizontal(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(&cmd.category)
+                                                .size(10.5)
+                                                .strong()
+                                                .color(tokens.accent),
+                                        );
+                                        ui.label(RichText::new(&cmd.title).color(tokens.text));
+                                        if !cmd.shortcut.is_empty() {
+                                            ui.with_layout(
+                                                shell_dir.opposite_horizontal_layout(
+                                                    egui::Align::Center,
+                                                ),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(&cmd.shortcut)
+                                                            .monospace()
+                                                            .size(11.0)
+                                                            .color(tokens.text_muted),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+                            if row.response.interact(egui::Sense::click()).clicked() {
+                                execute_id = Some(cmd.id.clone());
+                            }
+                        }
+                    });
+            });
         });
 
     if let Some(id) = execute_id {

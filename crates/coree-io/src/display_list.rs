@@ -287,6 +287,34 @@ pub fn build_display_list(
     let mut ops = Vec::with_capacity(64);
     let mut has_transparency = false;
 
+    if page.printable_background && page.background_fill.is_visible() {
+        let bg_rect =
+            BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, page.width_mm, page.height_mm));
+        mark_vector_transparency(
+            &page.background_fill,
+            &OutlineStyle::none(),
+            1.0,
+            BlendMode::Normal,
+            &mut has_transparency,
+        );
+        ops.push(DisplayOp::DrawVector {
+            id: ObjectId(0),
+            id_suffix: "page-background".to_owned(),
+            path: bg_rect.clone(),
+            local_path: bg_rect,
+            fill: page.background_fill.clone(),
+            outline: OutlineStyle::none(),
+            fill_xf: Affine2D::IDENTITY,
+            local_xf: Affine2D::IDENTITY,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            visible: true,
+            is_perspective: false,
+            is_cut_contour: false,
+            emit_arrowheads: false,
+        });
+    }
+
     for layer in ordered_layers {
         ops.push(DisplayOp::PushLayer {
             id: layer.id,
@@ -818,7 +846,11 @@ fn emit_cutcontour_overlays(
                     id_suffix: format!("{id_suffix}-clip"),
                     path: clip_path.clone(),
                     local_path: local_clip.clone(),
-                    fill_rule: FillRule::Winding,
+                    fill_rule: if obj.clip_even_odd {
+                        FillRule::EvenOdd
+                    } else {
+                        FillRule::Winding
+                    },
                     local_xf,
                     opacity,
                     blend_mode: obj.blend_mode,
@@ -1140,6 +1172,8 @@ fn emit_object(
             }
             NodePayload::Clone { .. } => {}
             NodePayload::ArtisticText(text) => {
+                let resolved_text = doc.resolve_artistic_text_fields(page_index, text);
+                let text = &resolved_text;
                 let (shaped_runs, fallback_curves, svg_fallback_curves) = if is_persp {
                     let base = text_engine.layout_artistic_pieces(text);
                     let mut world_pieces = base.clone();
@@ -1211,8 +1245,11 @@ fn emit_object(
                         .is_some_and(|l| !matches!(l, coree_core::ParagraphListStyle::None))
                     || !para.tab_stops_mm.is_empty()
                     || para.runs.iter().any(|r| !r.style.variation_axes.is_empty());
+                let resolved_para = doc.resolve_paragraph_text_fields(page_index, para);
+                let para = &resolved_para;
                 let (shaped_runs, fallback_curves, svg_fallback_curves) = if is_persp {
-                    let base = text_engine.layout_paragraph_in_doc(doc, obj.id, para);
+                    let base =
+                        text_engine.layout_paragraph_in_doc_for_page(doc, obj.id, para, page_index);
                     let mut world_pieces = base.clone();
                     transform_pieces_with_effects(
                         &mut world_pieces,
@@ -1230,12 +1267,13 @@ fn emit_object(
                     );
                     (Vec::new(), world_pieces, svg_pieces)
                 } else if opts.shape_pdf_text_runs {
-                    let (r, c) = text_engine.layout_paragraph_pdf_runs(doc, obj.id, para);
+                    let (r, c) = text_engine
+                        .layout_paragraph_pdf_runs_on_page(doc, obj.id, para, page_index);
                     (r, c, Vec::new())
                 } else {
                     (
                         Vec::new(),
-                        text_engine.layout_paragraph_in_doc(doc, obj.id, para),
+                        text_engine.layout_paragraph_in_doc_for_page(doc, obj.id, para, page_index),
                         Vec::new(),
                     )
                 };
@@ -1269,7 +1307,9 @@ fn emit_object(
                     is_perspective: is_persp,
                 });
             }
-            NodePayload::TextOnPath(top) => {
+            NodePayload::TextOnPath(raw_top) => {
+                let resolved_top = doc.resolve_text_on_path_fields(page_index, raw_top);
+                let top = &resolved_top;
                 if let Some(world_host_path) = resolve_export_world_path(doc, top.path_id, sym_ctx)
                 {
                     let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
@@ -1377,8 +1417,9 @@ fn emit_object(
             }
             NodePayload::Raster(raster) => {
                 if let Some(asset) = doc.asset(raster.asset_id) {
-                    let filtered = (!raster.filters.is_empty())
-                        .then(|| coree_render::apply_raster_filters(asset, &raster.filters));
+                    let active_filters = raster.active_filters();
+                    let filtered = (!active_filters.is_empty())
+                        .then(|| coree_render::apply_raster_filters(asset, &active_filters));
                     let active_asset = filtered.as_ref().unwrap_or(asset);
                     if opacity < 1.0 - 1e-4
                         || obj.blend_mode != BlendMode::Normal
@@ -1566,8 +1607,11 @@ fn emit_object(
                     is_cut_contour: is_cutcontour_color(&eff_outline.color),
                     emit_arrowheads: false,
                 });
-                let label =
-                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+                let label = dim.compute_measurement_with_scale(
+                    doc.default_unit(),
+                    f64::from(doc.dpi()),
+                    doc.drawing_scale(),
+                );
                 let mid = dim.p1.midpoint(dim.p2);
                 let at = ArtisticText::from_plain(label, dim.text_style.clone());
                 let tx = Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0);
@@ -1773,7 +1817,11 @@ fn emit_object(
                     id_suffix: id_suffix.clone(),
                     path: clip_world.clone(),
                     local_path: clip_svg.clone(),
-                    fill_rule: FillRule::Winding,
+                    fill_rule: if obj.clip_even_odd {
+                        FillRule::EvenOdd
+                    } else {
+                        FillRule::Winding
+                    },
                     local_xf,
                     opacity,
                     blend_mode: obj.blend_mode,
@@ -2474,6 +2522,7 @@ mod tests {
                             height_mm: 50.0,
                             crop_rect: None,
                             filters,
+                            filter_enabled: Vec::new(),
                         }),
                     )
                     .with_transform(Affine2D::translate(5.0, 5.0)),
@@ -2596,5 +2645,45 @@ mod tests {
             .expect("imported EPS must contain raster asset")
             .to_rgba8_vec();
         assert_eq!(&eps_px[0..4], &[75, 249, 36, 255]);
+    }
+
+    #[test]
+    fn unattached_text_on_path_resolves_autopagenumber_in_display_list() {
+        let mut doc = Document::new(
+            "UnattachedTop",
+            210.0,
+            297.0,
+            coree_core::ColorMode::Rgb,
+            72.0,
+        );
+        doc.add_page("Page 2", 210.0, 297.0, 0.0);
+        let p2_lid = doc.pages()[1].layers[0].id;
+        let mut at = ArtisticText::from_plain("1", coree_core::TextStyle::default());
+        at.runs[0].field = Some(coree_core::TextField::AutoPageNumber);
+        let top = coree_core::TextOnPath {
+            text: at,
+            path_id: ObjectId(99_999), // unattached / missing host path
+            offset_mm: 0.0,
+            distance_mm: 0.0,
+            flip_vertical: false,
+            flip_horizontal: false,
+        };
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "UnattachedTOP", NodePayload::TextOnPath(top)),
+            Some(p2_lid),
+        )
+        .unwrap();
+
+        let mut te = TextEngine::new();
+        let dl = ExportDisplayList::build(&doc, 1, &DisplayListOptions::pdf(), &mut te).unwrap();
+        let found = dl.ops.iter().find_map(|op| match op {
+            DisplayOp::DrawTextRuns { artistic, .. } => Some(artistic.plain_text()),
+            _ => None,
+        });
+        assert_eq!(
+            found.as_deref(),
+            Some("2"),
+            "Unattached TextOnPath AutoPageNumber on page 2 must resolve to '2'"
+        );
     }
 }

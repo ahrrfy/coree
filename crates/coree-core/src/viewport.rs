@@ -9,7 +9,9 @@ use crate::{Affine2D, Point2D, Rect2D};
 /// Canvas rendering fidelity mode matching professional illustration workflows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ViewMode {
-    /// Vector skeletons and hairline outlines only (no fills or bitmaps).
+    /// Minimal primary vector skeletons only (no effect-generated sub-paths, fills, or bitmaps).
+    SimpleWireframe,
+    /// Vector skeletons and hairline outlines including effect-generated sub-paths (no fills or bitmaps).
     Wireframe,
     /// Standard anti-aliased vector rendering.
     Normal,

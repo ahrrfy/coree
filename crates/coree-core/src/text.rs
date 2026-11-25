@@ -261,11 +261,22 @@ impl TextStyle {
     }
 }
 
+/// Dynamic text field resolved at render/export time (e.g. page numbers, document title).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TextField {
+    AutoPageNumber,
+    PageCount,
+    DocumentTitle,
+    CurrentDate,
+}
+
 /// Styled contiguous span of Unicode text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextRun {
     pub text: String,
     pub style: TextStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<TextField>,
 }
 
 impl TextRun {
@@ -275,7 +286,15 @@ impl TextRun {
         Self {
             text: text.into(),
             style,
+            field: None,
         }
+    }
+
+    /// Attaches a dynamic [`TextField`] marker to this text run.
+    #[must_use]
+    pub fn with_field(mut self, field: TextField) -> Self {
+        self.field = Some(field);
+        self
     }
 }
 

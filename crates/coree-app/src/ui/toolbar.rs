@@ -4,6 +4,7 @@
 //! Laser Quick-Send strip) + Authentic Context-Sensitive Property Bar (`36px`)
 //! adapting live to active tool and selected object(s).
 
+use crate::i18n::I18nKey;
 use crate::shortcuts::ShortcutAction;
 use crate::state::{
     DockerTab, LensDockerState, NodeSmoothness, PropertiesSubTab, RasterBrushOp, StudioApp, ToolId,
@@ -59,6 +60,8 @@ enum StdIcon {
 /// Renders both the Standard Toolbar (Row 1) and the Context-Sensitive Property Bar (Row 2).
 pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
     let tokens = app.theme.tokens();
+    let lang = app.ui_language;
+    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
 
     // Row 1: Standard Studio Toolbar
     egui::Panel::top("coree_standard_toolbar")
@@ -73,61 +76,63 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
             egui::ScrollArea::horizontal()
                 .id_salt("std_toolbar_scroll")
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    shell_dir.with_horizontal(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
 
-                        // File operations with crisp procedural vector icons
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::NewDoc,
-                            "New Document (Ctrl+N)",
-                            true,
-                            false,
-                        ) {
-                            app.new_doc_dialog.open = true;
+                        // File operations with crisp procedural vector icons (`ToolbarConfig`)
+                        if app.toolbar_config.show_file_ops {
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::NewDoc,
+                                &I18nKey::FileNew.tr_ui(lang),
+                                true,
+                                false,
+                            ) {
+                                app.new_doc_dialog.open = true;
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::OpenDoc,
+                                &I18nKey::FileOpen.tr_ui(lang),
+                                true,
+                                false,
+                            ) {
+                                app.open_file_dialog();
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::SaveDoc,
+                                &I18nKey::FileSave.tr_ui(lang),
+                                true,
+                                false,
+                            ) {
+                                app.handle_shortcut(ShortcutAction::SaveDocument);
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::ImportDoc,
+                                &I18nKey::FileImport.tr_ui(lang),
+                                true,
+                                false,
+                            ) {
+                                app.import_file_dialog();
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::ExportDoc,
+                                &I18nKey::FileExport.tr_ui(lang),
+                                true,
+                                false,
+                            ) {
+                                app.export_dialog.open = true;
+                            }
+                            ui.separator();
                         }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::OpenDoc,
-                            "Open File (Ctrl+O)",
-                            true,
-                            false,
-                        ) {
-                            app.open_file_dialog();
-                        }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::SaveDoc,
-                            "Save Document (Ctrl+S)",
-                            true,
-                            false,
-                        ) {
-                            app.handle_shortcut(ShortcutAction::SaveDocument);
-                        }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::ImportDoc,
-                            "Import Artwork (Ctrl+I)",
-                            true,
-                            false,
-                        ) {
-                            app.import_file_dialog();
-                        }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::ExportDoc,
-                            "Export Document (Ctrl+E)",
-                            true,
-                            false,
-                        ) {
-                            app.export_dialog.open = true;
-                        }
-                        ui.separator();
 
                         // History & Clipboard
                         let (can_undo, can_redo, has_sel) =
@@ -138,144 +143,270 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     !t.selection.is_empty(),
                                 )
                             });
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::Undo,
-                            "Undo (Ctrl+Z)",
-                            can_undo,
-                            false,
-                        ) {
-                            let _ = app.undo();
+                        if app.toolbar_config.show_undo_redo {
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::Undo,
+                                &I18nKey::EditUndo.tr_ui(lang),
+                                can_undo,
+                                false,
+                            ) {
+                                let _ = app.undo();
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::Redo,
+                                &I18nKey::EditRedo.tr_ui(lang),
+                                can_redo,
+                                false,
+                            ) {
+                                let _ = app.redo();
+                            }
+                            ui.separator();
                         }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::Redo,
-                            "Redo (Ctrl+Shift+Z)",
-                            can_redo,
-                            false,
-                        ) {
-                            let _ = app.redo();
+                        if app.toolbar_config.show_clipboard {
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::Cut,
+                                &I18nKey::EditCut.tr_ui(lang),
+                                has_sel,
+                                false,
+                            ) {
+                                app.cut_selection();
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::Copy,
+                                &I18nKey::EditCopy.tr_ui(lang),
+                                has_sel,
+                                false,
+                            ) {
+                                app.copy_selection();
+                            }
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::Paste,
+                                &I18nKey::EditPaste.tr_ui(lang),
+                                app.has_clipboard_content(),
+                                false,
+                            ) {
+                                app.paste_clipboard();
+                            }
+                            ui.separator();
                         }
-                        ui.separator();
-                        if std_icon_btn(ui, &tokens, StdIcon::Cut, "Cut (Ctrl+X)", has_sel, false) {
-                            app.cut_selection();
-                        }
-                        if std_icon_btn(ui, &tokens, StdIcon::Copy, "Copy (Ctrl+C)", has_sel, false)
-                        {
-                            app.copy_selection();
-                        }
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::Paste,
-                            "Paste (Ctrl+V)",
-                            app.has_clipboard_content(),
-                            false,
-                        ) {
-                            app.paste_clipboard();
-                        }
-                        ui.separator();
 
                         // Zoom preset combo
-                        let zoom_pct = app
-                            .active_tab()
-                            .map_or(100.0, |t| (t.viewport.zoom * 100.0).round());
-                        ComboBox::from_id_salt("std_zoom_preset")
-                            .width(74.0)
-                            .selected_text(format!("{zoom_pct:.0}%"))
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(false, "To Selected (Shift+F2)")
-                                    .clicked()
-                                {
-                                    app.handle_shortcut(ShortcutAction::ZoomToSelected);
-                                }
-                                if ui.selectable_label(false, "To Page (Shift+F4)").clicked() {
-                                    app.handle_shortcut(ShortcutAction::ZoomToPage);
-                                }
-                                if ui.selectable_label(false, "To All (F4)").clicked() {
-                                    app.handle_shortcut(ShortcutAction::ZoomToAll);
-                                }
-                                ui.separator();
-                                for pct in [25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0] {
-                                    if ui.selectable_label(false, format!("{pct:.0}%")).clicked() {
-                                        if let Some(t) = app.active_tab_mut() {
-                                            t.viewport.zoom = pct / 100.0;
-                                            t.needs_rerender = true;
-                                        }
-                                    }
-                                }
-                            });
-
-                        // F9 Full-Screen Preview toggle
-                        if std_icon_btn(
-                            ui,
-                            &tokens,
-                            StdIcon::PreviewF9,
-                            "Full-Screen Preview (F9)",
-                            true,
-                            app.full_screen_preview,
-                        ) {
-                            app.handle_shortcut(ShortcutAction::ToggleFullScreenPreview);
-                        }
-
-                        // View Mode combo & Snap toggles
-                        let mut pending_multipage: Option<bool> = None;
-                        let mut pending_grid: Option<coree_core::GridConfig> = None;
-                        if let Some(tab) = app.active_tab_mut() {
-                            ComboBox::from_id_salt("std_view_mode")
-                                .width(84.0)
-                                .selected_text(format!("{:?}", tab.view_mode))
+                        if app.toolbar_config.show_zoom {
+                            let zoom_pct = app
+                                .active_tab()
+                                .map_or(100.0, |t| (t.viewport.zoom * 100.0).round());
+                            ComboBox::from_id_salt("std_zoom_preset")
+                                .width(74.0)
+                                .selected_text(format!("{zoom_pct:.0}%"))
                                 .show_ui(ui, |ui| {
-                                    for mode in [
-                                        ViewMode::Wireframe,
-                                        ViewMode::Normal,
-                                        ViewMode::Enhanced,
-                                        ViewMode::Pixels,
-                                    ] {
+                                    if ui
+                                        .selectable_label(false, "To Selected (Shift+F2)")
+                                        .clicked()
+                                    {
+                                        app.handle_shortcut(ShortcutAction::ZoomToSelected);
+                                    }
+                                    if ui.selectable_label(false, "To Page (Shift+F4)").clicked() {
+                                        app.handle_shortcut(ShortcutAction::ZoomToPage);
+                                    }
+                                    if ui.selectable_label(false, "To All (F4)").clicked() {
+                                        app.handle_shortcut(ShortcutAction::ZoomToAll);
+                                    }
+                                    ui.separator();
+                                    for pct in [25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 400.0] {
                                         if ui
-                                            .selectable_value(
-                                                &mut tab.view_mode,
-                                                mode,
-                                                format!("{mode:?}"),
-                                            )
-                                            .changed()
+                                            .selectable_label(false, format!("{pct:.0}%"))
+                                            .clicked()
                                         {
-                                            tab.needs_rerender = true;
+                                            if let Some(t) = app.active_tab_mut() {
+                                                t.viewport.zoom = pct / 100.0;
+                                                t.needs_rerender = true;
+                                            }
                                         }
                                     }
                                 });
 
-                            if ui
-                                .selectable_label(tab.document.multipage_view(), "⊞ Pages")
-                                .on_hover_text("Toggle Multipage View")
-                                .clicked()
-                            {
-                                let next = !tab.document.multipage_view();
-                                pending_multipage = Some(next);
-                                tab.viewport.multipage_view = next;
-                                tab.needs_rerender = true;
-                            }
-
-                            ui.separator();
-                            ui.checkbox(&mut tab.snap_options.objects, "Snap Obj");
-                            ui.checkbox(&mut tab.snap_options.guidelines, "Guides");
-                            ui.checkbox(&mut tab.snap_options.grid, "Grid");
-                            if tab.snap_options.grid != tab.document.grid().snap {
-                                let mut g = tab.document.grid();
-                                g.snap = tab.snap_options.grid;
-                                pending_grid = Some(g);
+                            // F9 Full-Screen Preview toggle
+                            if std_icon_btn(
+                                ui,
+                                &tokens,
+                                StdIcon::PreviewF9,
+                                &I18nKey::ViewFullScreenPreview.tr_ui(lang),
+                                true,
+                                app.full_screen_preview,
+                            ) {
+                                app.handle_shortcut(ShortcutAction::ToggleFullScreenPreview);
                             }
                         }
-                        if let Some(next) = pending_multipage {
+
+                        let tb_cfg = app.toolbar_config.clone();
+                        let mut pending_multipage: Option<bool> = None;
+                        let mut pending_facing: Option<(coree_core::PageId, bool)> = None;
+                        let mut pending_scale: Option<coree_core::DrawingScale> = None;
+                        let mut pending_grid: Option<coree_core::GridConfig> = None;
+                        if let Some(tab) = app.active_tab_mut() {
+                            if tb_cfg.show_view_mode {
+                                ComboBox::from_id_salt("std_view_mode")
+                                    .width(102.0)
+                                    .selected_text(format!("{:?}", tab.view_mode))
+                                    .show_ui(ui, |ui| {
+                                        for (mode, label) in [
+                                            (
+                                                ViewMode::SimpleWireframe,
+                                                I18nKey::ViewSimpleWireframe.tr_ui(lang),
+                                            ),
+                                            (
+                                                ViewMode::Wireframe,
+                                                I18nKey::ViewWireframe.tr_ui(lang),
+                                            ),
+                                            (ViewMode::Normal, I18nKey::ViewNormal.tr_ui(lang)),
+                                            (ViewMode::Enhanced, I18nKey::ViewEnhanced.tr_ui(lang)),
+                                            (ViewMode::Pixels, I18nKey::ViewPixels.tr_ui(lang)),
+                                        ] {
+                                            if ui
+                                                .selectable_value(&mut tab.view_mode, mode, label)
+                                                .changed()
+                                            {
+                                                tab.needs_rerender = true;
+                                            }
+                                        }
+                                    });
+                            }
+
+                            if tb_cfg.show_layout_toggles {
+                                if ui
+                                    .selectable_label(
+                                        tab.document.multipage_view(),
+                                        format!("⊞ {}", I18nKey::ViewMultipage.tr_ui(lang)),
+                                    )
+                                    .on_hover_text(I18nKey::ViewMultipage.tr_ui(lang))
+                                    .clicked()
+                                {
+                                    let next = !tab.document.multipage_view();
+                                    pending_multipage = Some(next);
+                                    tab.viewport.multipage_view = next;
+                                    tab.needs_rerender = true;
+                                }
+                                if let Some(page) = tab.document.active_page() {
+                                    if ui
+                                        .selectable_label(
+                                            page.facing_pages,
+                                            format!(
+                                                "📖 {}",
+                                                I18nKey::LayoutFacingPages.tr_ui(lang)
+                                            ),
+                                        )
+                                        .on_hover_text(I18nKey::LayoutFacingPages.tr_ui(lang))
+                                        .clicked()
+                                    {
+                                        pending_facing = Some((page.id, !page.facing_pages));
+                                        tab.needs_rerender = true;
+                                    }
+                                }
+                            }
+
+                            if tb_cfg.show_drawing_scale {
+                                let cur_scale = tab.document.drawing_scale();
+                                ComboBox::from_id_salt("std_drawing_scale")
+                                    .width(66.0)
+                                    .selected_text(cur_scale.label())
+                                    .show_ui(ui, |ui| {
+                                        for (num, den) in [
+                                            (1.0, 1.0),
+                                            (1.0, 5.0),
+                                            (1.0, 10.0),
+                                            (1.0, 20.0),
+                                            (1.0, 50.0),
+                                            (1.0, 100.0),
+                                            (2.0, 1.0),
+                                        ] {
+                                            let cand = coree_core::DrawingScale::new(num, den);
+                                            if ui
+                                                .selectable_label(cur_scale == cand, cand.label())
+                                                .clicked()
+                                            {
+                                                pending_scale = Some(cand);
+                                                tab.needs_rerender = true;
+                                            }
+                                        }
+                                    });
+                            }
+
+                            if tb_cfg.show_snap_toggles {
+                                ui.separator();
+                                ui.checkbox(
+                                    &mut tab.snap_options.objects,
+                                    I18nKey::ViewSnapObjects.tr_ui(lang),
+                                );
+                                ui.checkbox(
+                                    &mut tab.snap_options.guidelines,
+                                    I18nKey::ViewSnapGuidelines.tr_ui(lang),
+                                );
+                                ui.checkbox(
+                                    &mut tab.snap_options.grid,
+                                    I18nKey::ViewSnapGrid.tr_ui(lang),
+                                );
+                                if tab.snap_options.grid != tab.document.grid().snap {
+                                    let mut g = tab.document.grid();
+                                    g.snap = tab.snap_options.grid;
+                                    pending_grid = Some(g);
+                                }
+                                ui.menu_button(
+                                    format!("{} ▾", I18nKey::ViewSnapTo.tr_ui(lang)),
+                                    |ui| {
+                                        ui.checkbox(
+                                            &mut tab.snap_options.nodes,
+                                            I18nKey::ViewSnapNodes.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.page_edges,
+                                            I18nKey::ViewSnapPageEdges.tr(lang),
+                                        );
+                                        ui.separator();
+                                        ui.checkbox(
+                                            &mut tab.snap_options.tangent,
+                                            I18nKey::ViewSnapTangent.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.perpendicular,
+                                            I18nKey::ViewSnapPerpendicular.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.quadrant,
+                                            I18nKey::ViewSnapQuadrant.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.intersection,
+                                            I18nKey::ViewSnapIntersection.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.baseline,
+                                            I18nKey::ViewSnapBaseline.tr(lang),
+                                        );
+                                        ui.checkbox(
+                                            &mut tab.snap_options.dynamic_guides,
+                                            I18nKey::ViewDynamicGuides.tr(lang),
+                                        );
+                                    },
+                                );
+                            }
+                        }
+                        if pending_multipage.is_some() || pending_scale.is_some() {
                             let _ = app.execute_command(CommandOp::SetDocumentProperties {
                                 title: None,
                                 color_mode: None,
                                 default_unit: None,
                                 dpi: None,
-                                multipage_view: Some(next),
+                                multipage_view: pending_multipage,
                                 active_page_index: None,
                                 metadata: None,
                                 custom_icc_profile: None,
@@ -288,6 +419,19 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                 clear_gray_icc: false,
                                 rendering_intent: None,
                                 black_point_compensation: None,
+                                drawing_scale: pending_scale,
+                            });
+                        }
+                        if let Some((page_id, facing)) = pending_facing {
+                            let _ = app.execute_command(CommandOp::SetPageProperties {
+                                page_id,
+                                name: None,
+                                width_mm: None,
+                                height_mm: None,
+                                bleed_mm: None,
+                                facing_pages: Some(facing),
+                                background_fill: None,
+                                printable_background: None,
                             });
                         }
                         if let Some(config) = pending_grid {
@@ -298,8 +442,11 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
 
                         // CMYK Soft-Proof toggle
                         if ui
-                            .selectable_label(app.soft_proof_cmyk, "Proof CMYK")
-                            .on_hover_text("Toggle CMYK Soft-Proofing (ICC Color Management)")
+                            .selectable_label(
+                                app.soft_proof_cmyk,
+                                I18nKey::ViewSoftProofCmyk.tr_ui(lang),
+                            )
+                            .on_hover_text(I18nKey::ViewSoftProofCmyk.tr_ui(lang))
                             .clicked()
                         {
                             app.soft_proof_cmyk = !app.soft_proof_cmyk;
@@ -370,16 +517,19 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         if recording {
                             if ui
                                 .button(
-                                    RichText::new("■ Stop Macro")
-                                        .size(11.0)
-                                        .color(tokens.accent_secondary),
+                                    RichText::new(format!(
+                                        "■ {}",
+                                        I18nKey::ToolsStopMacro.tr_ui(lang)
+                                    ))
+                                    .size(11.0)
+                                    .color(tokens.accent_secondary),
                                 )
                                 .clicked()
                             {
                                 app.stop_macro_recording();
                             }
                         } else if ui
-                            .small_button("● Rec")
+                            .small_button(format!("● {}", I18nKey::ToolsRecordMacro.tr_ui(lang)))
                             .on_hover_text("Record actions to Rhai script")
                             .clicked()
                         {
@@ -402,7 +552,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
             egui::ScrollArea::horizontal()
                 .id_salt("prop_bar_scroll")
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    shell_dir.with_horizontal(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
                         show_context_property_contents(ui, app);
                     });
@@ -465,6 +615,83 @@ fn show_context_property_contents(ui: &mut Ui, app: &mut StudioApp) {
         ToolId::ArtisticText | ToolId::ParagraphText => {
             show_text_property_bar(ui, app, &tokens);
             return;
+        }
+        ToolId::TwoPointLine => {
+            ui.label(RichText::new("2-Point Line:").color(tokens.accent).strong());
+            ui.add(
+                DragValue::new(&mut app.default_outline.width_mm)
+                    .range(0.0..=50.0)
+                    .speed(0.1)
+                    .prefix("Width: ")
+                    .suffix(" mm"),
+            );
+            ui.checkbox(&mut app.default_outline.is_hairline, "Hairline");
+            ui.label(
+                RichText::new("Hold Ctrl: 15° snap · Drag to draw straight segment")
+                    .size(11.0)
+                    .color(tokens.text_muted),
+            );
+            return;
+        }
+        ToolId::FreeTransform => {
+            ui.label(
+                RichText::new("Free Transform:")
+                    .color(tokens.accent)
+                    .strong(),
+            );
+            ui.checkbox(&mut app.treat_all_objects_as_filled, "Treat All Filled");
+            if ui.small_button("Mirror X").clicked() {
+                if let Some((ids, center)) = app.active_tab().map(|t| {
+                    let c = t
+                        .selection
+                        .bounding_box(&t.document)
+                        .map_or(Point2D::ZERO, |b| b.center());
+                    (t.selection.objects.clone(), c)
+                }) {
+                    if !ids.is_empty() {
+                        app.apply_world_transform_to_selection(
+                            &ids,
+                            Affine2D::scale_about(-1.0, 1.0, center),
+                        );
+                    }
+                }
+            }
+            if ui.small_button("Mirror Y").clicked() {
+                if let Some((ids, center)) = app.active_tab().map(|t| {
+                    let c = t
+                        .selection
+                        .bounding_box(&t.document)
+                        .map_or(Point2D::ZERO, |b| b.center());
+                    (t.selection.objects.clone(), c)
+                }) {
+                    if !ids.is_empty() {
+                        app.apply_world_transform_to_selection(
+                            &ids,
+                            Affine2D::scale_about(1.0, -1.0, center),
+                        );
+                    }
+                }
+            }
+            if app.active_tab().is_some_and(|t| !t.selection.is_empty()) {
+                ui.separator();
+            } else {
+                return;
+            }
+        }
+        ToolId::Pick | ToolId::FreehandPick
+            if app.active_tab().is_some_and(|t| t.selection.is_empty()) =>
+        {
+            ui.label(
+                RichText::new(if app.active_tool == ToolId::FreehandPick {
+                    "Freehand Pick:"
+                } else {
+                    "Pick Tool:"
+                })
+                .color(tokens.accent)
+                .strong(),
+            );
+            ui.checkbox(&mut app.treat_all_objects_as_filled, "Treat All Filled");
+            ui.separator();
         }
         _ => {}
     }
@@ -632,6 +859,19 @@ fn show_sculpt_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeToke
             .speed(0.02)
             .prefix("Rate: "),
     );
+    if app.active_tool == ToolId::AttractRepel {
+        ui.separator();
+        ui.selectable_value(
+            &mut app.tool_settings.sculpt_sub_mode,
+            coree_tools::SculptSubMode::Attract,
+            "Attract",
+        );
+        ui.selectable_value(
+            &mut app.tool_settings.sculpt_sub_mode,
+            coree_tools::SculptSubMode::Repel,
+            "Repel",
+        );
+    }
     if app.active_tool == ToolId::Roughen {
         ui.separator();
         ui.add(
@@ -644,7 +884,10 @@ fn show_sculpt_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeToke
     ui.separator();
     let hint = match app.active_tool {
         ToolId::Twirl => "Drag across path edges · Shift reverses spin",
-        ToolId::AttractRepel => "Drag to Attract · Hold Shift to Repel",
+        ToolId::AttractRepel => match app.tool_settings.sculpt_sub_mode {
+            coree_tools::SculptSubMode::Attract => "Drag to Attract · Hold Shift to Repel",
+            coree_tools::SculptSubMode::Repel => "Drag to Repel · Hold Shift to Attract",
+        },
         ToolId::Roughen => "Drag along outlines to add serrated detail",
         _ => "Drag across vector outlines to sculpt live",
     };
@@ -1642,6 +1885,8 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                                 height_mm: Some(ph),
                                 bleed_mm: None,
                                 facing_pages: None,
+                                background_fill: None,
+                                printable_background: None,
                             });
                         }
                     }
@@ -1673,6 +1918,8 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                     height_mm: Some(h),
                     bleed_mm: None,
                     facing_pages: None,
+                    background_fill: None,
+                    printable_background: None,
                 });
             }
             let is_portrait = cur_h >= cur_w;
@@ -1689,6 +1936,8 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                     height_mm: Some(cur_w),
                     bleed_mm: None,
                     facing_pages: None,
+                    background_fill: None,
+                    printable_background: None,
                 });
             }
             if ui
@@ -1704,6 +1953,61 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                     height_mm: Some(cur_w),
                     bleed_mm: None,
                     facing_pages: None,
+                    background_fill: None,
+                    printable_background: None,
+                });
+            }
+            let mut facing = page.facing_pages;
+            if ui
+                .checkbox(&mut facing, "Facing")
+                .on_hover_text("Toggle Facing Pages / Spreads")
+                .changed()
+            {
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: None,
+                    height_mm: None,
+                    bleed_mm: None,
+                    facing_pages: Some(facing),
+                    background_fill: None,
+                    printable_background: None,
+                });
+            }
+            let mut printable_bg = page.printable_background;
+            if ui
+                .checkbox(&mut printable_bg, "Print Bg")
+                .on_hover_text("Include Page Background in Print/PDF/SVG Export")
+                .changed()
+            {
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: None,
+                    height_mm: None,
+                    bleed_mm: None,
+                    facing_pages: None,
+                    background_fill: Some(page.background_fill.clone()),
+                    printable_background: Some(printable_bg),
+                });
+            }
+            let mut bg_c = page
+                .background_fill
+                .referenced_colors()
+                .into_iter()
+                .next()
+                .map(|c| core_color_to_egui(&c))
+                .unwrap_or(Color32::WHITE);
+            if ui.color_edit_button_srgba(&mut bg_c).changed() {
+                pending_page_cmd = Some(CommandOp::SetPageProperties {
+                    page_id,
+                    name: None,
+                    width_mm: None,
+                    height_mm: None,
+                    bleed_mm: None,
+                    facing_pages: None,
+                    background_fill: Some(Fill::Solid(egui_color_to_core(bg_c))),
+                    printable_background: None,
                 });
             }
         }
@@ -1746,6 +2050,7 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 clear_gray_icc: false,
                 rendering_intent: None,
                 black_point_compensation: None,
+                drawing_scale: None,
             });
         }
         ui.separator();
@@ -2391,7 +2696,7 @@ fn show_selected_objects_property_bar(
                         mut points,
                         outer_radius,
                         mut inner_ratio,
-                        complex,
+                        mut complex,
                     } => {
                         ui.separator();
                         let p_chg = ui
@@ -2405,7 +2710,8 @@ fn show_selected_objects_property_bar(
                                     .prefix("Sharp: "),
                             )
                             .changed();
-                        if p_chg || i_chg {
+                        let c_chg = ui.checkbox(&mut complex, "Complex").changed();
+                        if p_chg || i_chg || c_chg {
                             app.commit_parametric_shape_edit(
                                 single_id,
                                 orig_shape,
@@ -2418,8 +2724,327 @@ fn show_selected_objects_property_bar(
                             );
                         }
                     }
-                    _ => {}
+                    ParametricShape::Spiral {
+                        mut revolutions,
+                        radius,
+                        mut logarithmic,
+                        mut expansion,
+                    } => {
+                        ui.separator();
+                        let mut changed = ui
+                            .add(
+                                DragValue::new(&mut revolutions)
+                                    .range(1.0..=30.0)
+                                    .speed(0.2)
+                                    .prefix("Rev: "),
+                            )
+                            .changed();
+                        changed |= ui.checkbox(&mut logarithmic, "Log").changed();
+                        if logarithmic {
+                            changed |= ui
+                                .add(
+                                    DragValue::new(&mut expansion)
+                                        .range(1.0..=4.0)
+                                        .speed(0.05)
+                                        .prefix("Exp: "),
+                                )
+                                .changed();
+                        }
+                        if changed {
+                            app.commit_parametric_shape_edit(
+                                single_id,
+                                orig_shape,
+                                ParametricShape::Spiral {
+                                    revolutions,
+                                    radius,
+                                    logarithmic,
+                                    expansion,
+                                },
+                            );
+                        }
+                    }
+                    ParametricShape::Impact {
+                        mut rays,
+                        mut inner_radius,
+                        outer_radius,
+                        mut style,
+                    } => {
+                        ui.separator();
+                        let mut changed = ui
+                            .add(DragValue::new(&mut rays).range(4..=120).prefix("Rays: "))
+                            .changed();
+                        changed |= ui
+                            .add(
+                                DragValue::new(&mut inner_radius)
+                                    .range(1.0..=outer_radius.max(2.0))
+                                    .speed(0.5)
+                                    .prefix("Inner: "),
+                            )
+                            .changed();
+                        if ui
+                            .selectable_label(style == ImpactStyle::Radial, "Radial")
+                            .clicked()
+                        {
+                            style = ImpactStyle::Radial;
+                            changed = true;
+                        }
+                        if ui
+                            .selectable_label(style == ImpactStyle::Parallel, "Parallel")
+                            .clicked()
+                        {
+                            style = ImpactStyle::Parallel;
+                            changed = true;
+                        }
+                        if changed {
+                            app.commit_parametric_shape_edit(
+                                single_id,
+                                orig_shape,
+                                ParametricShape::Impact {
+                                    rays,
+                                    inner_radius,
+                                    outer_radius,
+                                    style,
+                                },
+                            );
+                        }
+                    }
+                    ParametricShape::GraphPaper {
+                        mut cols,
+                        mut rows,
+                        width,
+                        height,
+                    } => {
+                        ui.separator();
+                        let c_chg = ui
+                            .add(DragValue::new(&mut cols).range(1..=50).prefix("Cols: "))
+                            .changed();
+                        let r_chg = ui
+                            .add(DragValue::new(&mut rows).range(1..=50).prefix("Rows: "))
+                            .changed();
+                        if c_chg || r_chg {
+                            app.commit_parametric_shape_edit(
+                                single_id,
+                                orig_shape,
+                                ParametricShape::GraphPaper {
+                                    cols,
+                                    rows,
+                                    width,
+                                    height,
+                                },
+                            );
+                        }
+                    }
+                    ParametricShape::BasicShape {
+                        mut kind,
+                        width,
+                        height,
+                    } => {
+                        ui.separator();
+                        let mut changed = false;
+                        ComboBox::from_id_salt("prop_sel_basic_shape")
+                            .width(96.0)
+                            .selected_text(format!("{kind:?}"))
+                            .show_ui(ui, |ui| {
+                                for k in [
+                                    BasicShapeKind::ArrowRight,
+                                    BasicShapeKind::ArrowLeft,
+                                    BasicShapeKind::DoubleArrow,
+                                    BasicShapeKind::Banner,
+                                    BasicShapeKind::Callout,
+                                    BasicShapeKind::Heart,
+                                    BasicShapeKind::Cross,
+                                    BasicShapeKind::Diamond,
+                                    BasicShapeKind::Trapezoid,
+                                ] {
+                                    if ui
+                                        .selectable_value(&mut kind, k, format!("{k:?}"))
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        if changed {
+                            app.commit_parametric_shape_edit(
+                                single_id,
+                                orig_shape,
+                                ParametricShape::BasicShape {
+                                    kind,
+                                    width,
+                                    height,
+                                },
+                            );
+                        }
+                    }
                 },
+                NodePayload::Table(mut table) => {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("Table {}×{}", table.rows, table.cols))
+                            .size(11.0)
+                            .color(tokens.accent),
+                    );
+                    if ui
+                        .add(
+                            DragValue::new(&mut table.border_style.width_mm)
+                                .range(0.05..=10.0)
+                                .speed(0.05)
+                                .prefix("Grid: ")
+                                .suffix(" mm"),
+                        )
+                        .changed()
+                    {
+                        let _ = app.execute_command(CommandOp::EditTable {
+                            id: single_id,
+                            table,
+                        });
+                    }
+                }
+                NodePayload::Dimension(mut dim) => {
+                    ui.separator();
+                    let mut changed = ui
+                        .add(
+                            DragValue::new(&mut dim.precision)
+                                .range(0..=6)
+                                .prefix("Prec: "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut dim.offset_mm)
+                                .range(0.5..=200.0)
+                                .speed(0.5)
+                                .prefix("Off: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut dim.prefix)
+                                .desired_width(36.0)
+                                .hint_text("Pfx"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut dim.suffix)
+                                .desired_width(36.0)
+                                .hint_text("Sfx"),
+                        )
+                        .changed();
+                    if changed {
+                        let _ = app.execute_command(CommandOp::EditDimension {
+                            id: single_id,
+                            dimension: dim,
+                        });
+                    }
+                }
+                NodePayload::Connector(conn) => {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!(
+                            "Connector ({:?}, r={:.1}mm)",
+                            conn.style, conn.corner_radius_mm
+                        ))
+                        .size(11.0)
+                        .color(tokens.accent),
+                    );
+                    if conn.from_obj.is_some() || conn.to_obj.is_some() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} -> {}",
+                                conn.from_obj
+                                    .map_or("Free".to_owned(), |id| format!("#{}", id.0)),
+                                conn.to_obj
+                                    .map_or("Free".to_owned(), |id| format!("#{}", id.0)),
+                            ))
+                            .size(10.5)
+                            .color(tokens.text_muted),
+                        );
+                    }
+                }
+                NodePayload::BSpline(mut bs) => {
+                    ui.separator();
+                    let max_deg = (bs.control_points.len().saturating_sub(1)).clamp(1, 7) as u32;
+                    let d_chg = ui
+                        .add(
+                            DragValue::new(&mut bs.degree)
+                                .range(1..=max_deg)
+                                .prefix("Deg: "),
+                        )
+                        .changed();
+                    let c_chg = ui.checkbox(&mut bs.closed, "Closed").changed();
+                    if d_chg || c_chg {
+                        let rebuilt = coree_core::BSplineCurve::from_control_points(
+                            bs.control_points,
+                            bs.degree,
+                            bs.closed,
+                        );
+                        let _ = app.execute_command(CommandOp::EditBSpline {
+                            id: single_id,
+                            bspline: rebuilt,
+                        });
+                    }
+                }
+                NodePayload::TextOnPath(mut top) => {
+                    ui.separator();
+                    let mut changed = ui
+                        .add(
+                            DragValue::new(&mut top.offset_mm)
+                                .range(0.0..=5000.0)
+                                .speed(0.5)
+                                .prefix("Offset: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            DragValue::new(&mut top.distance_mm)
+                                .range(-100.0..=100.0)
+                                .speed(0.25)
+                                .prefix("Dist: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    changed |= ui.checkbox(&mut top.flip_vertical, "Flip V").changed();
+                    changed |= ui.checkbox(&mut top.flip_horizontal, "Flip H").changed();
+                    if changed {
+                        let _ = app.execute_command(CommandOp::EditText {
+                            id: single_id,
+                            payload: NodePayload::TextOnPath(top),
+                        });
+                    }
+                }
+                NodePayload::PowerClip {
+                    contents,
+                    mut lock_contents,
+                    ..
+                } => {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("PowerClip ({} item(s))", contents.len()))
+                            .size(11.0)
+                            .color(tokens.accent),
+                    );
+                    if ui.small_button("Edit").clicked() {
+                        app.enter_powerclip_edit(single_id);
+                    }
+                    if ui.small_button("Fit").clicked() {
+                        app.fit_powerclip_selection(coree_core::PowerClipFitMode::FitContents);
+                    }
+                    if ui.small_button("Center").clicked() {
+                        app.fit_powerclip_selection(coree_core::PowerClipFitMode::CenterContents);
+                    }
+                    if ui.small_button("Stretch").clicked() {
+                        app.fit_powerclip_selection(coree_core::PowerClipFitMode::StretchToFill);
+                    }
+                    if ui.checkbox(&mut lock_contents, "Lock Contents").changed() {
+                        app.set_powerclip_lock_selected(Some(lock_contents));
+                    }
+                    if ui.small_button("Extract").clicked() {
+                        app.extract_selected_powerclip();
+                    }
+                }
                 NodePayload::ArtisticText(mut art) => {
                     ui.separator();
                     if let Some(run) = art.runs.first_mut() {

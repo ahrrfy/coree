@@ -1120,6 +1120,7 @@ fn cdr_zip_x6_multiple_external_bitmaps_roundtrip() {
                 width_mm: 10.0,
                 height_mm: 10.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         ),
@@ -1134,6 +1135,7 @@ fn cdr_zip_x6_multiple_external_bitmaps_roundtrip() {
                 width_mm: 15.0,
                 height_mm: 10.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         ),
@@ -3245,6 +3247,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
                 width_mm: 18.0,
                 height_mm: 12.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         ))
@@ -3318,6 +3321,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
                 width_mm: 10.0,
                 height_mm: 10.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )],
@@ -3449,6 +3453,7 @@ fn cdr_riff_and_zip_remap_symbol_raster_and_table_cell_bitmap_pattern() {
                 width_mm: 16.0,
                 height_mm: 16.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )],
@@ -3536,6 +3541,7 @@ fn cdr_zip_x6_raster_and_colliding_unknown_0001_dat_both_survive_without_duplica
                 width_mm: 20.0,
                 height_mm: 20.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         ),
@@ -3759,6 +3765,7 @@ fn cmx_roundtrip_preserves_group_transform_and_object_flags_opacity_blend() {
             width_mm: 24.0,
             height_mm: 18.0,
             filters: Vec::new(),
+            filter_enabled: Vec::new(),
             crop_rect: None,
         }),
     );
@@ -4195,4 +4202,100 @@ fn cdr_riff_preserves_non_default_disabled_grid_and_perspective_grid_guid_chunk_
     assert!((rt.document.grid().spacing_x_mm - 17.5).abs() < 1e-6);
     assert!(!rt.document.perspective_grid().enabled);
     assert!((rt.document.perspective_grid().horizon_y_mm - 92.0).abs() < 1e-6);
+}
+
+#[test]
+fn w5a_cdr_read_options_codepage_and_inspector_hex_dump() {
+    use coree_cdr::{
+        format_hex_ascii_dump, import_cdr_bytes_with_options, inspect_cdr_bytes, CdrReadOptions,
+    };
+
+    // 1. S15: legacy CP1256 vs CP1251 fallback via CdrReadOptions::default_codepage
+    // Build a minimal RIFF CDR4 with a legacy v3-5 txsm chunk whose cp field is 0x0000
+    // Bytes [0xE3, 0xD1, 0xCD, 0xC8, 0xC7] = "مرحبا" in Windows-1256, vs "مرحبا" != Cyrillic CP1251
+    let raw_bytes: &[u8] = &[0xE3, 0xD1, 0xCD, 0xC8, 0xC7];
+    let mut txsm = vec![0x03u8, 0x00, 0x00, 0x00, 12, 0];
+    txsm.extend_from_slice(&(raw_bytes.len() as u16).to_le_bytes());
+    txsm.extend_from_slice(raw_bytes);
+
+    // Construct a minimal RIFF CDR4 document wrapping txsm inside LIST page -> LIST layr -> LIST obj -> txsm
+    fn chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + data.len() + (data.len() & 1));
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+    fn list(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::with_capacity(4 + body.len());
+        inner.extend_from_slice(kind);
+        inner.extend_from_slice(body);
+        chunk(b"LIST", &inner)
+    }
+
+    let obj = list(b"obj ", &chunk(b"txsm", &txsm));
+    let layr = list(b"layr", &obj);
+    let page = list(b"page", &layr);
+    let doc_list = list(b"doc ", &page);
+    let mut riff_body = Vec::new();
+    riff_body.extend_from_slice(b"CDR4");
+    riff_body.extend_from_slice(&chunk(b"vrsn", &400u16.to_le_bytes()));
+    riff_body.extend_from_slice(&doc_list);
+    let mut riff = Vec::with_capacity(8 + riff_body.len());
+    riff.extend_from_slice(b"RIFF");
+    riff.extend_from_slice(&(riff_body.len() as u32).to_le_bytes());
+    riff.extend_from_slice(&riff_body);
+
+    let rep_1256 = import_cdr_bytes_with_options(
+        &riff,
+        &CodecLimits::default(),
+        CdrReadOptions {
+            default_codepage: Some(1256),
+        },
+    )
+    .unwrap();
+    let txt_1256 = rep_1256
+        .document
+        .objects()
+        .values()
+        .find_map(|o| match &o.payload {
+            NodePayload::ArtisticText(at) => Some(at.plain_text()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(txt_1256, "مرحبا");
+
+    let rep_1251 = import_cdr_bytes_with_options(
+        &riff,
+        &CodecLimits::default(),
+        CdrReadOptions {
+            default_codepage: Some(1251),
+        },
+    )
+    .unwrap();
+    let txt_1251 = rep_1251
+        .document
+        .objects()
+        .values()
+        .find_map(|o| match &o.payload {
+            NodePayload::ArtisticText(at) => Some(at.plain_text()),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(txt_1251, "مرحبا");
+
+    // 2. S16: inspector ChunkSummary::preview_bytes + format_hex_ascii_dump
+    let insp = inspect_cdr_bytes(&riff).unwrap();
+    let txsm_chunk = insp
+        .chunks
+        .iter()
+        .find(|c| c.fourcc == "txsm")
+        .expect("txsm chunk must appear in inspector");
+    assert_eq!(txsm_chunk.preview_bytes, txsm);
+    let hex_dump = format_hex_ascii_dump(&txsm_chunk.preview_bytes, 0);
+    assert!(hex_dump.contains("00000000: 03 00 00 00 0C 00"));
+    assert!(hex_dump.contains('|'));
 }

@@ -980,6 +980,7 @@ mod tests {
                     width_mm: 20.0,
                     height_mm: 20.0,
                     filters: Vec::new(),
+                    filter_enabled: Vec::new(),
                     crop_rect: None,
                 }),
             )

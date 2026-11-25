@@ -49,10 +49,10 @@ pub use command::{
 pub use dimension::{AnchorPoint, ConnectorObject, ConnectorStyle, DimensionKind, DimensionObject};
 pub use document::{
     decode_base64, encode_base64, AlignOp, ClipMask, CowTile, DistributeOp, Document,
-    DocumentMetadata, GridConfig, Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload,
-    Page, PathMetrics, PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, PixelDepth,
-    PixelLayer, PowerClipFitMode, RasterAsset, RasterLayerData, SceneObject, SpatialIndex,
-    SpatialObjectEntry, SymbolDef, UnknownCdrChunk, ZOrderOp, RASTER_TILE_DIM,
+    DocumentMetadata, DrawingScale, GridConfig, Guide, GuideOrientation, Layer, MasterLayerScope,
+    NodePayload, Page, PathMetrics, PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane,
+    PixelDepth, PixelLayer, PowerClipFitMode, RasterAsset, RasterLayerData, SceneObject,
+    SpatialIndex, SpatialObjectEntry, SymbolDef, UnknownCdrChunk, ZOrderOp, RASTER_TILE_DIM,
 };
 pub use effects::{
     BevelStyle, ContourMode, DistortKind, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
@@ -73,7 +73,8 @@ pub use geometry::{
 };
 pub use hit_test::{
     hit_test_node, hit_test_object_warped_world_bounds, hit_test_object_warped_world_path,
-    hit_test_point, hit_test_powerclip_contents, hit_test_powerclip_contents_rect, hit_test_rect,
+    hit_test_point, hit_test_point_exact, hit_test_powerclip_contents,
+    hit_test_powerclip_contents_exact, hit_test_powerclip_contents_rect, hit_test_rect,
     DynamicGuideKind, DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use icc::{
@@ -100,8 +101,8 @@ pub use stylus::{PressureCurve, StylusSample};
 pub use table::{TableCell, VectorTable};
 pub use text::{
     ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphListStyle, ParagraphTabAlign,
-    ParagraphTabStop, ParagraphText, TextAlign, TextDirection, TextOnPath, TextRun, TextStyle,
-    TextWrapMode,
+    ParagraphTabStop, ParagraphText, TextAlign, TextDirection, TextField, TextOnPath, TextRun,
+    TextStyle, TextWrapMode,
 };
 pub use viewport::{ViewMode, Viewport};
 

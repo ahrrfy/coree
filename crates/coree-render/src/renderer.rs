@@ -15,7 +15,8 @@ use crate::effects_render::{
     apply_deform_point_steps, apply_geometry_effects, apply_geometry_effects_in_bounds,
     apply_transparency_mask, effect_bounds_padding_mm, find_transparency_effect,
     prepare_deform_point_steps, render_overlay_effects, render_underlay_effects,
-    symmetry_effect_transforms, DeformPointStep,
+    render_underlay_effects_with_sym, stroke_wireframe_effects, symmetry_effect_transforms,
+    DeformPointStep,
 };
 use crate::hit_test::resolve_connector_endpoints_with_sym;
 use crate::lens_render::{render_lens_object_with_backdrop, BackdropItem, FrozenLensSnapshot};
@@ -32,6 +33,11 @@ use coree_core::{
     SpatialObjectEntry, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
 };
 use std::sync::Arc;
+
+#[inline]
+pub(crate) fn is_wireframe_like(mode: ViewMode) -> bool {
+    matches!(mode, ViewMode::Wireframe | ViewMode::SimpleWireframe)
+}
 
 #[inline]
 pub(crate) fn icc_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
@@ -312,7 +318,8 @@ impl PageLayout {
     }
 }
 
-/// Computes world-space page placements for single-page or side-by-side Multipage View.
+/// Computes world-space page placements for single-page, side-by-side Multipage View,
+/// or Facing Pages spread layout (`ADD-07`).
 #[must_use]
 pub fn compute_page_layouts(doc: &Document, multipage_view: bool, gap_mm: f64) -> Vec<PageLayout> {
     let pages = doc.pages();
@@ -331,6 +338,50 @@ pub fn compute_page_layouts(doc: &Document, multipage_view: bool, gap_mm: f64) -
     }
 
     let gap = sanitize_f64(gap_mm, 20.0).max(0.0);
+    if pages.iter().any(|p| p.facing_pages) {
+        let spine_x = pages
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| idx % 2 == 1)
+            .map(|(_, p)| p.width_mm)
+            .fold(0.0_f64, f64::max);
+        let mut layouts = Vec::with_capacity(pages.len());
+        let p0 = &pages[0];
+        layouts.push(PageLayout {
+            page_index: 0,
+            origin_mm: Point2D::new(spine_x, 0.0),
+            width_mm: p0.width_mm,
+            height_mm: p0.height_mm,
+        });
+        let mut cursor_y = p0.height_mm + gap;
+        let mut pair_idx = 1usize;
+        while pair_idx < pages.len() {
+            let p_left = &pages[pair_idx];
+            let p_right = pages.get(pair_idx + 1);
+            let spread_h = p_left.height_mm.max(p_right.map_or(0.0, |p| p.height_mm));
+            layouts.push(PageLayout {
+                page_index: pair_idx,
+                origin_mm: Point2D::new(
+                    spine_x - p_left.width_mm,
+                    cursor_y + (spread_h - p_left.height_mm) * 0.5,
+                ),
+                width_mm: p_left.width_mm,
+                height_mm: p_left.height_mm,
+            });
+            if let Some(pr) = p_right {
+                layouts.push(PageLayout {
+                    page_index: pair_idx + 1,
+                    origin_mm: Point2D::new(spine_x, cursor_y + (spread_h - pr.height_mm) * 0.5),
+                    width_mm: pr.width_mm,
+                    height_mm: pr.height_mm,
+                });
+            }
+            cursor_y += spread_h + gap;
+            pair_idx += 2;
+        }
+        return layouts;
+    }
+
     let max_h = pages.iter().map(|p| p.height_mm).fold(0.0_f64, f64::max);
     let mut cursor_x = 0.0_f64;
     let mut layouts = Vec::with_capacity(pages.len());
@@ -451,6 +502,7 @@ pub struct SceneRenderer {
     pub(crate) frozen_scope_stack: Vec<u64>,
     pub(crate) current_sym_root_idx: Option<usize>,
     active_symbols: HashSet<SymbolId>,
+    active_pattern_symbols: HashSet<SymbolId>,
 }
 
 impl Default for SceneRenderer {
@@ -476,6 +528,7 @@ impl SceneRenderer {
             frozen_scope_stack: Vec::new(),
             current_sym_root_idx: None,
             active_symbols: HashSet::new(),
+            active_pattern_symbols: HashSet::new(),
         }
     }
 
@@ -994,7 +1047,7 @@ impl SceneRenderer {
             let page_to_surface = world_to_surface
                 .compose(&Affine2D::translate(layout.origin_mm.x, layout.origin_mm.y));
 
-            // 1. Page drop shadow & paper surface
+            // 1. Page drop shadow, paper surface & optional Page background fill (`REQ-12`)
             render_page_surface(
                 page,
                 page_to_surface,
@@ -1003,6 +1056,38 @@ impl SceneRenderer {
                 &self.active_icc,
                 backend,
             );
+            if !is_wireframe_like(view_mode)
+                && page.background_fill.is_visible()
+                && (options.show_page_shadow || page.printable_background)
+            {
+                let page_path = BezierPath::from_rect(page.trim_rect());
+                self.draw_fill_styled(
+                    doc,
+                    &page_path,
+                    &page.background_fill,
+                    page_to_surface,
+                    1.0,
+                    BlendMode::Normal,
+                    view_mode != ViewMode::Pixels,
+                    backend,
+                    0,
+                );
+                if options.show_page_shadow {
+                    let border = StrokeParams {
+                        color: Color::rgba8(140, 145, 155, 255),
+                        width: (1.0 / px_per_mm.max(1e-3)) as f32,
+                        cap: coree_core::LineCap::Butt,
+                        join: coree_core::LineJoin::Miter,
+                        miter_limit: 4.0,
+                        dash_pattern: Vec::new(),
+                        dash_offset: 0.0,
+                        opacity: 1.0,
+                        blend_mode: BlendMode::Normal,
+                        anti_alias: false,
+                    };
+                    backend.stroke_path(&page_path, &border, page_to_surface);
+                }
+            }
 
             // 2. Collect ordered layers: applicable master layers + page's own layers
             let layers = collect_effective_layers(doc, layout.page_index);
@@ -1141,7 +1226,7 @@ impl SceneRenderer {
         // 4. Optional live ICC CMYK Soft-Proofing, Out-of-Gamut Warning, and OS Display ICC pass
         // over rendered artwork (applied BEFORE page chrome overlays so guides/grids stay crisp).
         let needs_soft_proof =
-            (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe;
+            (options.soft_proof_cmyk || options.gamut_warning) && !is_wireframe_like(view_mode);
         let has_display_icc = options.display_icc_profile.is_some();
         if needs_soft_proof || has_display_icc {
             let mut buf = backend.snapshot_rgba();
@@ -1398,7 +1483,11 @@ impl SceneRenderer {
             return;
         }
         let px_per_mm = estimate_scale(&parent_to_screen);
-        let sym_transforms = symmetry_effect_transforms(&obj.effects);
+        let sym_transforms = if view_mode == ViewMode::SimpleWireframe {
+            vec![Affine2D::IDENTITY]
+        } else {
+            symmetry_effect_transforms(&obj.effects)
+        };
         let parent_world = page_to_surface
             .inverse()
             .map(|inv| inv.compose(&parent_to_screen))
@@ -1456,7 +1545,7 @@ impl SceneRenderer {
             let effective_parent = parent_to_screen.compose(&sym_xf);
 
             // Check if this object uses an Effect::Transparency alpha mask
-            let trans_info = if view_mode != ViewMode::Wireframe {
+            let trans_info = if !is_wireframe_like(view_mode) {
                 find_transparency_effect(&obj.effects)
             } else {
                 None
@@ -1606,26 +1695,28 @@ impl SceneRenderer {
             )
             .transformed(&obj_to_screen)
             .bounding_box(),
-            NodePayload::Clone { .. } => doc
-                .resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
-                .and_then(|(p, f, o)| {
-                    let mut tmp = obj.clone();
-                    tmp.payload = p;
-                    tmp.fill = f;
-                    tmp.outline = o;
-                    Self::compute_object_screen_bounds(
-                        doc,
-                        &tmp,
-                        page_to_surface,
-                        parent_to_screen,
-                        sym_ctx,
-                        ancestor_world_sym,
-                        false,
-                        visited_doc,
-                        visited_syms,
-                        depth + 1,
-                    )
-                }),
+            NodePayload::Clone { .. } => {
+                return doc
+                    .resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+                    .and_then(|(p, f, o)| {
+                        let mut tmp = obj.clone();
+                        tmp.payload = p;
+                        tmp.fill = f;
+                        tmp.outline = o;
+                        Self::compute_object_screen_bounds(
+                            doc,
+                            &tmp,
+                            page_to_surface,
+                            parent_to_screen,
+                            sym_ctx,
+                            ancestor_world_sym,
+                            false,
+                            visited_doc,
+                            visited_syms,
+                            depth + 1,
+                        )
+                    });
+            }
             NodePayload::PowerClip { container, .. } => {
                 apply_geometry_effects(&apply_persp(container), &obj.effects)
                     .transformed(&obj_to_screen)
@@ -2005,7 +2096,7 @@ impl SceneRenderer {
         let Some(clamped) =
             PixelRect::from_f64_rect_clamped(sb, 0, backend.width(), backend.height())
         else {
-            if view_mode != ViewMode::Wireframe
+            if !is_wireframe_like(view_mode)
                 && self.subtree_has_unwarmed_frozen_lens_in_branch(
                     doc,
                     obj,
@@ -2216,9 +2307,12 @@ impl SceneRenderer {
         let obj = stripped_cutcontour_obj.as_deref().unwrap_or(obj);
         let anti_alias = view_mode != ViewMode::Pixels;
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
+        let page_index = page
+            .and_then(|pg| doc.pages().iter().position(|p| p.id == pg.id))
+            .unwrap_or_else(|| doc.active_page_index());
 
         // Handle Lens objects first (all 11 optical & color lenses)
-        if view_mode != ViewMode::Wireframe {
+        if !is_wireframe_like(view_mode) {
             if let Some(lens_cfg) = obj.lens.clone() {
                 if let Some(local_path) = self.extract_lens_local_path(doc, obj, sym_ctx) {
                     let local_persp = if let Some(persp) = obj.perspective {
@@ -2269,6 +2363,7 @@ impl SceneRenderer {
                     path,
                     page_to_surface,
                     parent_to_screen,
+                    sym_ctx,
                     px_per_mm,
                     view_mode,
                     options,
@@ -2284,6 +2379,7 @@ impl SceneRenderer {
                     &path,
                     page_to_surface,
                     parent_to_screen,
+                    sym_ctx,
                     px_per_mm,
                     view_mode,
                     options,
@@ -2299,6 +2395,7 @@ impl SceneRenderer {
                     &path,
                     page_to_surface,
                     parent_to_screen,
+                    sym_ctx,
                     px_per_mm,
                     view_mode,
                     options,
@@ -2314,6 +2411,7 @@ impl SceneRenderer {
                     &path,
                     page_to_surface,
                     parent_to_screen,
+                    sym_ctx,
                     px_per_mm,
                     view_mode,
                     options,
@@ -2351,9 +2449,11 @@ impl SceneRenderer {
                     );
                 }
             }
-            NodePayload::ArtisticText(text) => {
+            NodePayload::ArtisticText(raw_text) => {
+                let resolved_text = doc.resolve_artistic_text_fields(page_index, raw_text);
+                let text = &resolved_text;
                 if (obj.effects.is_empty() && obj.perspective.is_none())
-                    || view_mode == ViewMode::Wireframe
+                    || is_wireframe_like(view_mode)
                 {
                     self.text_engine.render_artistic_text_icc(
                         backend,
@@ -2417,13 +2517,14 @@ impl SceneRenderer {
             }
             NodePayload::ParagraphText(para) => {
                 if (obj.effects.is_empty() && obj.perspective.is_none())
-                    || view_mode == ViewMode::Wireframe
+                    || is_wireframe_like(view_mode)
                 {
-                    self.text_engine.render_paragraph_text_in_doc_icc(
+                    self.text_engine.render_paragraph_text_in_doc_on_page_icc(
                         backend,
                         doc,
                         obj.id,
                         para,
+                        page_index,
                         obj_to_screen,
                         &obj.outline,
                         obj.opacity,
@@ -2433,7 +2534,9 @@ impl SceneRenderer {
                         &self.active_icc,
                     );
                 } else {
-                    let mut pieces = self.text_engine.layout_paragraph_in_doc(doc, obj.id, para);
+                    let mut pieces = self
+                        .text_engine
+                        .layout_paragraph_in_doc_for_page(doc, obj.id, para, page_index);
                     if let Some(persp) = obj.perspective {
                         for piece in &mut pieces {
                             piece.path = persp.transform_bezier_path(&piece.path);
@@ -2471,7 +2574,9 @@ impl SceneRenderer {
                     }
                 }
             }
-            NodePayload::TextOnPath(top) => {
+            NodePayload::TextOnPath(raw_top) => {
+                let resolved_top = doc.resolve_text_on_path_fields(page_index, raw_top);
+                let top = &resolved_top;
                 let delta_xf = if sym_ctx.is_some() {
                     world_sym_xf
                 } else {
@@ -2489,7 +2594,7 @@ impl SceneRenderer {
                         .compose(&doc_parent_world.inverse().unwrap_or(Affine2D::IDENTITY))
                 };
                 if (obj.effects.is_empty() && obj.perspective.is_none())
-                    || view_mode == ViewMode::Wireframe
+                    || is_wireframe_like(view_mode)
                 {
                     if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
                         let text_surface_xf = page_to_surface.compose(&delta_xf);
@@ -2676,21 +2781,38 @@ impl SceneRenderer {
                     depth + 1,
                 );
                 let route = conn.route_path(a, b);
-                let (draw_path, draw_local_xf, draw_parent_to_screen) =
+                let (raw_local_path, draw_path, draw_local_xf, draw_parent_to_screen) =
                     if let Some(inv) = base_world_xf.inverse() {
-                        (
-                            apply_geometry_effects(&route.transformed(&inv), &obj.effects),
-                            obj.transform,
-                            parent_to_screen,
-                        )
+                        let local_r = route.transformed(&inv);
+                        let def = if view_mode == ViewMode::SimpleWireframe {
+                            local_r.clone()
+                        } else {
+                            apply_geometry_effects(&local_r, &obj.effects)
+                        };
+                        (local_r, def, obj.transform, parent_to_screen)
                     } else {
                         (
+                            route.clone(),
                             route,
                             Affine2D::IDENTITY,
                             page_to_surface.compose(&world_sym_xf),
                         )
                     };
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
+                    if view_mode == ViewMode::Wireframe {
+                        stroke_wireframe_effects(
+                            doc,
+                            obj,
+                            &raw_local_path,
+                            draw_local_xf,
+                            draw_parent_to_screen,
+                            page_to_surface,
+                            sym_ctx,
+                            px_per_mm,
+                            &options.wireframe_stroke_color,
+                            backend,
+                        );
+                    }
                     stroke_wireframe(
                         &draw_path,
                         draw_parent_to_screen.compose(&draw_local_xf),
@@ -2700,13 +2822,14 @@ impl SceneRenderer {
                     );
                 } else {
                     if !obj.effects.is_empty() {
-                        render_underlay_effects(
+                        render_underlay_effects_with_sym(
                             doc,
                             obj,
                             &draw_path,
                             draw_local_xf,
                             draw_parent_to_screen,
                             page_to_surface,
+                            sym_ctx,
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -2755,7 +2878,7 @@ impl SceneRenderer {
                             )
                         })
                 });
-                let needs_isolation = view_mode != ViewMode::Wireframe
+                let needs_isolation = !is_wireframe_like(view_mode)
                     && (obj.opacity < 0.999 || obj.blend_mode != BlendMode::Normal);
                 if needs_isolation {
                     let mut visited_doc = HashSet::new();
@@ -2947,9 +3070,26 @@ impl SceneRenderer {
                 let pc_local_bb = pc_has_deform
                     .then(|| persp_container.bounding_box())
                     .flatten();
-                let deformed_container =
-                    apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects);
-                if view_mode == ViewMode::Wireframe {
+                let deformed_container = if view_mode == ViewMode::SimpleWireframe {
+                    persp_container.clone()
+                } else {
+                    apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects)
+                };
+                if is_wireframe_like(view_mode) {
+                    if view_mode == ViewMode::Wireframe {
+                        stroke_wireframe_effects(
+                            doc,
+                            obj,
+                            &deformed_container,
+                            obj.transform,
+                            parent_to_screen,
+                            page_to_surface,
+                            sym_ctx,
+                            px_per_mm,
+                            &options.wireframe_stroke_color,
+                            backend,
+                        );
+                    }
                     stroke_wireframe(
                         &deformed_container,
                         obj_to_screen,
@@ -2957,6 +3097,9 @@ impl SceneRenderer {
                         options,
                         backend,
                     );
+                    if view_mode == ViewMode::SimpleWireframe {
+                        return;
+                    }
                     if pc_has_deform {
                         let frames = [DeformFrame {
                             pre_perspective: obj.perspective,
@@ -3007,13 +3150,14 @@ impl SceneRenderer {
 
                 // Underlay effects on PowerClip container
                 if !obj.effects.is_empty() {
-                    render_underlay_effects(
+                    render_underlay_effects_with_sym(
                         doc,
                         obj,
                         &deformed_container,
                         obj.transform,
                         parent_to_screen,
                         page_to_surface,
+                        sym_ctx,
                         px_per_mm,
                         anti_alias,
                         &self.active_icc,
@@ -3062,7 +3206,15 @@ impl SceneRenderer {
                 }
 
                 // Clip contents strictly to container contour!
-                backend.push_clip(&deformed_container, FillRule::Winding, obj_to_screen);
+                backend.push_clip(
+                    &deformed_container,
+                    if obj.clip_even_odd {
+                        FillRule::EvenOdd
+                    } else {
+                        FillRule::Winding
+                    },
+                    obj_to_screen,
+                );
                 let sym_map = sym_ctx.map(|(m, _, _)| m);
                 let track_pc_lens = contents.iter().any(|&cid| {
                     sym_map
@@ -3233,7 +3385,7 @@ impl SceneRenderer {
                         )
                     });
                     let obj_opacity = sanitize_f32(obj.opacity, 1.0).clamp(0.0, 1.0);
-                    let needs_isolation = view_mode != ViewMode::Wireframe
+                    let needs_isolation = !is_wireframe_like(view_mode)
                         && (obj_opacity < 0.999 || obj.blend_mode != BlendMode::Normal);
                     let parent_sym_root_idx = self.current_sym_root_idx.take();
                     let scope_prev_len = self.frozen_scope_stack.len();
@@ -3712,14 +3864,17 @@ impl SceneRenderer {
         depth: usize,
     ) {
         let anti_alias = view_mode != ViewMode::Pixels;
-        let group_has_deform = obj.perspective.is_some()
-            || obj.effects.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
-                )
-            });
-        let group_has_underlay = view_mode != ViewMode::Wireframe
+        let group_has_deform = view_mode != ViewMode::SimpleWireframe
+            && (obj.perspective.is_some()
+                || obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                }));
+        let group_has_underlay = !is_wireframe_like(view_mode)
             && obj.effects.iter().any(|e| {
                 matches!(
                     e,
@@ -3734,7 +3889,7 @@ impl SceneRenderer {
                         | Effect::Blend { .. }
                 )
             });
-        let group_has_overlay = view_mode != ViewMode::Wireframe
+        let group_has_overlay = !is_wireframe_like(view_mode)
             && obj.effects.iter().any(|e| {
                 matches!(
                     e,
@@ -3955,14 +4110,17 @@ impl SceneRenderer {
     ) {
         let saved_sym_bounds_cache = std::mem::take(&mut self.sym_bounds_cache);
         let anti_alias = view_mode != ViewMode::Pixels;
-        let sym_has_deform = obj.perspective.is_some()
-            || obj.effects.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
-                )
-            });
-        let sym_has_underlay = view_mode != ViewMode::Wireframe
+        let sym_has_deform = view_mode != ViewMode::SimpleWireframe
+            && (obj.perspective.is_some()
+                || obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                }));
+        let sym_has_underlay = !is_wireframe_like(view_mode)
             && obj.effects.iter().any(|e| {
                 matches!(
                     e,
@@ -3977,7 +4135,7 @@ impl SceneRenderer {
                         | Effect::Blend { .. }
                 )
             });
-        let sym_has_overlay = view_mode != ViewMode::Wireframe
+        let sym_has_overlay = !is_wireframe_like(view_mode)
             && obj.effects.iter().any(|e| {
                 matches!(
                     e,
@@ -4718,10 +4876,12 @@ impl SceneRenderer {
             .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
         let c_parent_world = outer_world_xf.compose(&inner_to_outer_rel).compose(&rel_xf);
         let inv_c_parent_world = c_parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
-        for (sym_branch_idx, sym_xf) in symmetry_effect_transforms(&obj.effects)
-            .into_iter()
-            .enumerate()
-        {
+        let sym_branches = if view_mode == ViewMode::SimpleWireframe {
+            vec![Affine2D::IDENTITY]
+        } else {
+            symmetry_effect_transforms(&obj.effects)
+        };
+        for (sym_branch_idx, sym_xf) in sym_branches.into_iter().enumerate() {
             let scope_prev_len = self.frozen_scope_stack.len();
             let own_world_sym_xf = if sym_xf == Affine2D::IDENTITY {
                 Affine2D::IDENTITY
@@ -4759,12 +4919,12 @@ impl SceneRenderer {
             let effective_child_u = branch_underlying.as_deref().unwrap_or(child_u);
             let c_xf = rel_xf.compose(&sym_xf).compose(&obj.transform);
             if c_xf.is_finite() {
-                let trans_info = if view_mode != ViewMode::Wireframe {
+                let trans_info = if !is_wireframe_like(view_mode) {
                     find_transparency_effect(&obj.effects)
                 } else {
                     None
                 };
-                let isolate_child_group = view_mode != ViewMode::Wireframe
+                let isolate_child_group = !is_wireframe_like(view_mode)
                     && trans_info.is_none()
                     && matches!(
                         obj.payload,
@@ -4928,7 +5088,7 @@ impl SceneRenderer {
                                 backend.draw_pixmap(&buf, draw_xf, comp_op, comp_blend, true);
                             }
                         }
-                    } else if view_mode != ViewMode::Wireframe
+                    } else if !is_wireframe_like(view_mode)
                         && self.subtree_has_unwarmed_frozen_lens_in_branch(
                             doc,
                             obj,
@@ -5621,6 +5781,9 @@ impl SceneRenderer {
             };
         let obj = stripped_cutcontour_obj.as_deref().unwrap_or(obj);
         let anti_alias = view_mode != ViewMode::Pixels;
+        let page_index = page
+            .and_then(|pg| doc.pages().iter().position(|p| p.id == pg.id))
+            .unwrap_or_else(|| doc.active_page_index());
         let inner_to_outer_rel = deform_frames
             .iter()
             .skip(1)
@@ -5633,7 +5796,7 @@ impl SceneRenderer {
                 p.clone()
             }
         };
-        if view_mode != ViewMode::Wireframe {
+        if !is_wireframe_like(view_mode) {
             if let Some(lens_cfg) = obj.lens.clone() {
                 if let Some(local_path) = self.extract_lens_local_path(doc, obj, sym_ctx) {
                     let deformed = apply_deform_chain_in_bounds(
@@ -5867,8 +6030,9 @@ impl SceneRenderer {
                     );
                 }
             }
-            NodePayload::ArtisticText(text) => {
-                let mut pieces = self.text_engine.layout_artistic_pieces(text);
+            NodePayload::ArtisticText(raw_text) => {
+                let resolved_text = doc.resolve_artistic_text_fields(page_index, raw_text);
+                let mut pieces = self.text_engine.layout_artistic_pieces(&resolved_text);
                 if let Some(persp) = obj.perspective {
                     for piece in &mut pieces {
                         piece.path = persp.transform_bezier_path(&piece.path);
@@ -5891,7 +6055,9 @@ impl SceneRenderer {
                 );
             }
             NodePayload::ParagraphText(para) => {
-                let mut pieces = self.text_engine.layout_paragraph_in_doc(doc, obj.id, para);
+                let mut pieces = self
+                    .text_engine
+                    .layout_paragraph_in_doc_for_page(doc, obj.id, para, page_index);
                 if let Some(persp) = obj.perspective {
                     for piece in &mut pieces {
                         piece.path = persp.transform_bezier_path(&piece.path);
@@ -5913,7 +6079,9 @@ impl SceneRenderer {
                     depth,
                 );
             }
-            NodePayload::TextOnPath(top) => {
+            NodePayload::TextOnPath(raw_top) => {
+                let resolved_top = doc.resolve_text_on_path_fields(page_index, raw_top);
+                let top = &resolved_top;
                 if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
                     let group_world_xf = page_to_surface
                         .inverse()
@@ -5986,7 +6154,7 @@ impl SceneRenderer {
                     )
                 };
                 let deformed_grid = deform_path(&table.to_grid_paths(), c_xf);
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(&deformed_grid, group_to_screen, px_per_mm, options, backend);
                     return;
                 }
@@ -6122,8 +6290,11 @@ impl SceneRenderer {
                     obj.blend_mode,
                     anti_alias,
                 );
-                let label_text =
-                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+                let label_text = dim.compute_measurement_with_scale(
+                    doc.default_unit(),
+                    f64::from(doc.dpi()),
+                    doc.drawing_scale(),
+                );
                 let mut stroke_paths = Vec::new();
                 let mut arrow_paths = Vec::new();
                 let label_anchor = match dim.kind {
@@ -6225,13 +6396,13 @@ impl SceneRenderer {
                 };
                 for sp in &stroke_paths {
                     let def = deform_path(sp, c_xf);
-                    if view_mode == ViewMode::Wireframe {
+                    if is_wireframe_like(view_mode) {
                         stroke_wireframe(&def, group_to_screen, px_per_mm, options, backend);
                     } else {
                         backend.stroke_path(&def, &stroke, group_to_screen);
                     }
                 }
-                if view_mode != ViewMode::Wireframe {
+                if !is_wireframe_like(view_mode) {
                     let arrow_paint = BackendPaint {
                         shader: PaintShader::Solid(dim_outline.color.clone()),
                         opacity: obj.opacity,
@@ -6261,7 +6432,7 @@ impl SceneRenderer {
                     ));
                     for piece in &pieces {
                         let def = deform_path(&piece.path, label_xf);
-                        if view_mode == ViewMode::Wireframe {
+                        if is_wireframe_like(view_mode) {
                             stroke_wireframe(&def, group_to_screen, px_per_mm, options, backend);
                         } else {
                             let fill = Fill::Solid(piece.fill.clone());
@@ -6304,22 +6475,27 @@ impl SceneRenderer {
                 );
                 let route = conn.route_path(a, b);
                 let route_in_inner = route.transformed(&inv_inner_world);
-                let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&route_in_inner, &obj.effects),
-                    Affine2D::IDENTITY,
-                    deform_frames,
-                );
-                if view_mode == ViewMode::Wireframe {
+                let deformed = if view_mode == ViewMode::SimpleWireframe {
+                    apply_deform_chain_in_bounds(&route_in_inner, Affine2D::IDENTITY, deform_frames)
+                } else {
+                    apply_deform_chain_in_bounds(
+                        &apply_geometry_effects(&route_in_inner, &obj.effects),
+                        Affine2D::IDENTITY,
+                        deform_frames,
+                    )
+                };
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(&deformed, group_to_screen, px_per_mm, options, backend);
                 } else {
                     if !obj.effects.is_empty() {
-                        render_underlay_effects(
+                        render_underlay_effects_with_sym(
                             doc,
                             obj,
                             &deformed,
                             Affine2D::IDENTITY,
                             group_to_screen,
                             page_to_surface,
+                            sym_ctx,
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -6406,7 +6582,7 @@ impl SceneRenderer {
                 } else {
                     (deform_frames, c_xf)
                 };
-                let child_has_underlay = view_mode != ViewMode::Wireframe
+                let child_has_underlay = !is_wireframe_like(view_mode)
                     && obj.effects.iter().any(|e| {
                         matches!(
                             e,
@@ -6421,7 +6597,7 @@ impl SceneRenderer {
                                 | Effect::Blend { .. }
                         )
                     });
-                let child_has_overlay = view_mode != ViewMode::Wireframe
+                let child_has_overlay = !is_wireframe_like(view_mode)
                     && obj.effects.iter().any(|e| {
                         matches!(
                             e,
@@ -6606,7 +6782,7 @@ impl SceneRenderer {
                     v
                 });
                 let pc_u = pc_underlying.as_deref().unwrap_or(child_u);
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(
                         &deformed_container,
                         group_to_screen,
@@ -6614,35 +6790,38 @@ impl SceneRenderer {
                         options,
                         backend,
                     );
-                    self.render_group_deformed_subtree(
-                        doc,
-                        page,
-                        contents,
-                        obj.id,
-                        next_frames,
-                        page_to_surface,
-                        group_to_screen,
-                        next_rel_xf,
-                        sym_ctx,
-                        px_per_mm,
-                        view_mode,
-                        options,
-                        backend,
-                        pc_u,
-                        track_pc_lens,
-                        depth + 1,
-                        visiting,
-                    );
+                    if view_mode != ViewMode::SimpleWireframe {
+                        self.render_group_deformed_subtree(
+                            doc,
+                            page,
+                            contents,
+                            obj.id,
+                            next_frames,
+                            page_to_surface,
+                            group_to_screen,
+                            next_rel_xf,
+                            sym_ctx,
+                            px_per_mm,
+                            view_mode,
+                            options,
+                            backend,
+                            pc_u,
+                            track_pc_lens,
+                            depth + 1,
+                            visiting,
+                        );
+                    }
                     self.current_sym_root_idx = saved_sym_root_idx;
                 } else {
                     if !obj.effects.is_empty() {
-                        render_underlay_effects(
+                        render_underlay_effects_with_sym(
                             doc,
                             obj,
                             &deformed_container,
                             Affine2D::IDENTITY,
                             group_to_screen,
                             page_to_surface,
+                            sym_ctx,
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -6685,7 +6864,15 @@ impl SceneRenderer {
                             mesh_deform.as_ref(),
                         );
                     }
-                    backend.push_clip(&deformed_container, FillRule::Winding, group_to_screen);
+                    backend.push_clip(
+                        &deformed_container,
+                        if obj.clip_even_odd {
+                            FillRule::EvenOdd
+                        } else {
+                            FillRule::Winding
+                        },
+                        group_to_screen,
+                    );
                     self.render_group_deformed_subtree(
                         doc,
                         page,
@@ -6804,7 +6991,7 @@ impl SceneRenderer {
                         } else {
                             (deform_frames, c_xf)
                         };
-                        let child_has_underlay = view_mode != ViewMode::Wireframe
+                        let child_has_underlay = !is_wireframe_like(view_mode)
                             && obj.effects.iter().any(|e| {
                                 matches!(
                                     e,
@@ -6819,7 +7006,7 @@ impl SceneRenderer {
                                         | Effect::Blend { .. }
                                 )
                             });
-                        let child_has_overlay = view_mode != ViewMode::Wireframe
+                        let child_has_overlay = !is_wireframe_like(view_mode)
                             && obj.effects.iter().any(|e| {
                                 matches!(
                                     e,
@@ -7020,7 +7207,7 @@ impl SceneRenderer {
         backend: &mut dyn CanvasBackend,
         depth: usize,
     ) {
-        if view_mode == ViewMode::Wireframe {
+        if is_wireframe_like(view_mode) {
             stroke_wireframe(
                 deformed_in_group,
                 group_to_screen,
@@ -7128,7 +7315,7 @@ impl SceneRenderer {
                 (piece, deformed)
             })
             .collect();
-        if view_mode == ViewMode::Wireframe {
+        if is_wireframe_like(view_mode) {
             for (_, deformed) in &deformed_pieces {
                 stroke_wireframe(deformed, group_to_screen, px_per_mm, options, backend);
             }
@@ -7208,6 +7395,7 @@ impl SceneRenderer {
         local_path: &BezierPath,
         page_to_surface: Affine2D,
         parent_to_screen: Affine2D,
+        sym_ctx: Option<SymRenderCtx<'_>>,
         px_per_mm: f64,
         view_mode: ViewMode,
         options: &RenderOptions,
@@ -7219,24 +7407,43 @@ impl SceneRenderer {
         } else {
             local_path.clone()
         };
-        let deformed = apply_geometry_effects(&persp_path, &obj.effects);
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
         let anti_alias = view_mode != ViewMode::Pixels;
 
-        if view_mode == ViewMode::Wireframe {
-            stroke_wireframe(&deformed, obj_to_screen, px_per_mm, options, backend);
+        if view_mode == ViewMode::SimpleWireframe {
+            stroke_wireframe(&persp_path, obj_to_screen, px_per_mm, options, backend);
             return;
         }
 
-        // Underlay live effects (DropShadow, BlockShadow, Contour::Outside, Extrude25D, Blend)
-        if !obj.effects.is_empty() {
-            render_underlay_effects(
+        let deformed = apply_geometry_effects(&persp_path, &obj.effects);
+
+        if view_mode == ViewMode::Wireframe {
+            stroke_wireframe(&deformed, obj_to_screen, px_per_mm, options, backend);
+            stroke_wireframe_effects(
                 doc,
                 obj,
                 &deformed,
                 obj.transform,
                 parent_to_screen,
                 page_to_surface,
+                sym_ctx,
+                px_per_mm,
+                &options.wireframe_stroke_color,
+                backend,
+            );
+            return;
+        }
+
+        // Underlay live effects (DropShadow, BlockShadow, Contour::Outside, Extrude25D, Blend)
+        if !obj.effects.is_empty() {
+            render_underlay_effects_with_sym(
+                doc,
+                obj,
+                &deformed,
+                obj.transform,
+                parent_to_screen,
+                page_to_surface,
+                sym_ctx,
                 px_per_mm,
                 anti_alias,
                 &self.active_icc,
@@ -7338,7 +7545,7 @@ impl SceneRenderer {
         depth: usize,
     ) {
         let anti_alias = view_mode != ViewMode::Pixels;
-        if view_mode == ViewMode::Wireframe {
+        if is_wireframe_like(view_mode) {
             stroke_wireframe(
                 &table.to_grid_paths(),
                 obj_to_screen,
@@ -7455,7 +7662,11 @@ impl SceneRenderer {
             anti_alias,
         );
 
-        let label_text = dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+        let label_text = dim.compute_measurement_with_scale(
+            doc.default_unit(),
+            f64::from(doc.dpi()),
+            doc.drawing_scale(),
+        );
         let label_anchor = match dim.kind {
             DimensionKind::Parallel
             | DimensionKind::Horizontal
@@ -7494,7 +7705,7 @@ impl SceneRenderer {
                 let ext2 = BezierPath::from_line(dim.p2, d2 + overshoot);
                 let main_line = BezierPath::from_line(d1, d2);
 
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(&ext1, obj_to_screen, px_per_mm, options, backend);
                     stroke_wireframe(&ext2, obj_to_screen, px_per_mm, options, backend);
                     stroke_wireframe(&main_line, obj_to_screen, px_per_mm, options, backend);
@@ -7562,7 +7773,7 @@ impl SceneRenderer {
                     .collect();
                 let arc_path = BezierPath::from_polygon(arc_pts, false);
 
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(&ray1, obj_to_screen, px_per_mm, options, backend);
                     stroke_wireframe(&ray2, obj_to_screen, px_per_mm, options, backend);
                     stroke_wireframe(&arc_path, obj_to_screen, px_per_mm, options, backend);
@@ -7583,7 +7794,7 @@ impl SceneRenderer {
                     dim.p2
                 };
                 let leader = BezierPath::from_polygon(pts, false);
-                if view_mode == ViewMode::Wireframe {
+                if is_wireframe_like(view_mode) {
                     stroke_wireframe(&leader, obj_to_screen, px_per_mm, options, backend);
                 } else {
                     backend.stroke_path(&leader, &stroke, obj_to_screen);
@@ -8087,10 +8298,11 @@ impl SceneRenderer {
         tile_px: u32,
         depth: usize,
     ) -> RgbaBuffer {
-        if depth > MAX_RENDER_DEPTH {
+        if depth > MAX_RENDER_DEPTH || !self.active_pattern_symbols.insert(sym.id) {
             return RgbaBuffer::new_transparent(tile_px, tile_px);
         }
         let Ok(mut sub) = TinySkiaBackend::new(tile_px, tile_px) else {
+            self.active_pattern_symbols.remove(&sym.id);
             return RgbaBuffer::new_transparent(tile_px, tile_px);
         };
         sub.clear(Color::TRANSPARENT);
@@ -8133,6 +8345,7 @@ impl SceneRenderer {
                 depth + 1,
             );
         }
+        self.active_pattern_symbols.remove(&sym.id);
         sub.into_rgba()
     }
 }
@@ -8968,31 +9181,37 @@ fn render_raster_object(
         frame_path = persp.transform_bezier_path(&frame_path);
     }
     let pre_eff_bb = frame_path.bounding_box();
-    let deformed_frame = apply_geometry_effects_in_bounds(&frame_path, pre_eff_bb, &obj.effects);
+    let deformed_frame = if view_mode == ViewMode::SimpleWireframe {
+        frame_path.clone()
+    } else {
+        apply_geometry_effects_in_bounds(&frame_path, pre_eff_bb, &obj.effects)
+    };
 
-    if view_mode == ViewMode::Wireframe {
+    if is_wireframe_like(view_mode) {
         let mut wf = deformed_frame.clone();
-        // Diagonal X indicator for wireframe raster placeholders
-        let mut diag = BezierPath::default();
-        diag.subpaths.push(Subpath::from_points(
-            [
-                Point2D::new(clip_rect.min_x, clip_rect.min_y),
-                Point2D::new(clip_rect.max_x, clip_rect.max_y),
-            ],
-            false,
-        ));
-        diag.subpaths.push(Subpath::from_points(
-            [
-                Point2D::new(clip_rect.max_x, clip_rect.min_y),
-                Point2D::new(clip_rect.min_x, clip_rect.max_y),
-            ],
-            false,
-        ));
-        if let Some(persp) = obj.perspective {
-            diag = persp.transform_bezier_path(&diag);
+        // Diagonal X indicator for standard Wireframe raster placeholders (suppressed in SimpleWireframe)
+        if view_mode == ViewMode::Wireframe {
+            let mut diag = BezierPath::default();
+            diag.subpaths.push(Subpath::from_points(
+                [
+                    Point2D::new(clip_rect.min_x, clip_rect.min_y),
+                    Point2D::new(clip_rect.max_x, clip_rect.max_y),
+                ],
+                false,
+            ));
+            diag.subpaths.push(Subpath::from_points(
+                [
+                    Point2D::new(clip_rect.max_x, clip_rect.min_y),
+                    Point2D::new(clip_rect.min_x, clip_rect.max_y),
+                ],
+                false,
+            ));
+            if let Some(persp) = obj.perspective {
+                diag = persp.transform_bezier_path(&diag);
+            }
+            let diag_def = apply_geometry_effects_in_bounds(&diag, pre_eff_bb, &obj.effects);
+            wf.subpaths.extend(diag_def.subpaths);
         }
-        let diag_def = apply_geometry_effects_in_bounds(&diag, pre_eff_bb, &obj.effects);
-        wf.subpaths.extend(diag_def.subpaths);
         stroke_wireframe(&wf, obj_to_screen, px_per_mm, options, backend);
         return;
     }
@@ -9016,10 +9235,11 @@ fn render_raster_object(
         );
     }
 
-    let filtered = if raster.filters.is_empty() {
+    let active_filters = raster.active_filters();
+    let filtered = if active_filters.is_empty() {
         None
     } else {
-        Some(apply_raster_filters(asset, &raster.filters))
+        Some(apply_raster_filters(asset, &active_filters))
     };
     let active_asset = filtered.as_ref().unwrap_or(asset);
     let smooth = view_mode != ViewMode::Pixels;
@@ -9321,7 +9541,7 @@ fn render_page_overlays(
         let dash_on = hairline_mm * 6.0;
         let dash_off = hairline_mm * 3.0;
         let period_mm = (f64::from(dash_on) + f64::from(dash_off)).max(1e-6);
-        let guide_stroke = StrokeParams {
+        let axis_guide_stroke = StrokeParams {
             color: Color::rgba8(0, 165, 225, 200),
             width: hairline_mm,
             cap: coree_core::LineCap::Butt,
@@ -9332,6 +9552,11 @@ fn render_page_overlays(
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             anti_alias: false,
+        };
+        let angled_guide_stroke = StrokeParams {
+            dash_pattern: Vec::new(),
+            anti_alias: true,
+            ..axis_guide_stroke.clone()
         };
         let surf_rect = Rect2D::from_xywh(
             -4.0,
@@ -9351,7 +9576,10 @@ fn render_page_overlays(
             (start, end)
         };
         let extent = page.width_mm.max(page.height_mm) * 4.0;
-        let mut subpaths = Vec::with_capacity(guides.len());
+        let mut axis_subpaths = Vec::with_capacity(guides.len());
+        let mut angled_dash_subpaths = Vec::new();
+        let mut angled_fallback_subpaths = Vec::new();
+        let dash_on_mm = f64::from(dash_on);
         for guide in guides {
             match guide.orientation {
                 GuideOrientation::Horizontal(y) => {
@@ -9360,12 +9588,12 @@ fn render_page_overlays(
                             continue;
                         }
                         let (x0, x1) = align_span(vis.min_x, vis.max_x);
-                        subpaths.push(Subpath::from_points(
+                        axis_subpaths.push(Subpath::from_points(
                             [Point2D::new(x0, y), Point2D::new(x1, y)],
                             false,
                         ));
                     } else {
-                        subpaths.push(Subpath::from_points(
+                        axis_subpaths.push(Subpath::from_points(
                             [Point2D::new(-extent, y), Point2D::new(extent, y)],
                             false,
                         ));
@@ -9377,12 +9605,12 @@ fn render_page_overlays(
                             continue;
                         }
                         let (y0, y1) = align_span(vis.min_y, vis.max_y);
-                        subpaths.push(Subpath::from_points(
+                        axis_subpaths.push(Subpath::from_points(
                             [Point2D::new(x, y0), Point2D::new(x, y1)],
                             false,
                         ));
                     } else {
-                        subpaths.push(Subpath::from_points(
+                        axis_subpaths.push(Subpath::from_points(
                             [Point2D::new(x, -extent), Point2D::new(x, extent)],
                             false,
                         ));
@@ -9413,20 +9641,62 @@ fn render_page_overlays(
                         {
                             continue;
                         }
-                        let (s0, s1) = align_span(s_min, s_max);
-                        subpaths.push(Subpath::from_points(
-                            [origin + dir * s0, origin + dir * s1],
-                            false,
-                        ));
+                        let k0 = (s_min / period_mm).floor() as i64;
+                        let k1 = (s_max / period_mm).ceil() as i64;
+                        if k1 >= k0 && k1.saturating_sub(k0) <= 4096 {
+                            for k in k0..=k1 {
+                                let d0 = (k as f64) * period_mm;
+                                let d1 = d0 + dash_on_mm;
+                                angled_dash_subpaths.push(Subpath::from_points(
+                                    [origin + dir * d0, origin + dir * d1],
+                                    false,
+                                ));
+                            }
+                        } else {
+                            let (s0, s1) = align_span(s_min, s_max);
+                            angled_fallback_subpaths.push(Subpath::from_points(
+                                [origin + dir * s0, origin + dir * s1],
+                                false,
+                            ));
+                        }
                     } else {
                         let span = dir * extent;
-                        subpaths.push(Subpath::from_points([origin - span, origin + span], false));
+                        angled_fallback_subpaths
+                            .push(Subpath::from_points([origin - span, origin + span], false));
                     }
                 }
             }
         }
-        if !subpaths.is_empty() {
-            backend.stroke_path(&BezierPath { subpaths }, &guide_stroke, page_to_surface);
+        if !axis_subpaths.is_empty() {
+            backend.stroke_path(
+                &BezierPath {
+                    subpaths: axis_subpaths,
+                },
+                &axis_guide_stroke,
+                page_to_surface,
+            );
+        }
+        if !angled_dash_subpaths.is_empty() {
+            backend.stroke_path(
+                &BezierPath {
+                    subpaths: angled_dash_subpaths,
+                },
+                &angled_guide_stroke,
+                page_to_surface,
+            );
+        }
+        if !angled_fallback_subpaths.is_empty() {
+            let angled_fallback_stroke = StrokeParams {
+                anti_alias: true,
+                ..axis_guide_stroke
+            };
+            backend.stroke_path(
+                &BezierPath {
+                    subpaths: angled_fallback_subpaths,
+                },
+                &angled_fallback_stroke,
+                page_to_surface,
+            );
         }
     }
 }
@@ -9568,6 +9838,20 @@ fn object_nonlocal_and_lens_info(
     object_nonlocal_and_lens_info_inner(doc, obj, None, visiting_objs, visiting_syms, depth)
 }
 
+fn runs_have_dynamic_text_field(runs: &[coree_core::TextRun]) -> bool {
+    runs.iter().any(|r| {
+        matches!(
+            r.field,
+            Some(
+                coree_core::TextField::AutoPageNumber
+                    | coree_core::TextField::PageCount
+                    | coree_core::TextField::DocumentTitle
+                    | coree_core::TextField::CurrentDate
+            )
+        )
+    })
+}
+
 fn object_nonlocal_and_lens_info_inner(
     doc: &Document,
     obj: &SceneObject,
@@ -9596,6 +9880,15 @@ fn object_nonlocal_and_lens_info_inner(
     let mut nonlocal = self_nonlocal;
     let mut has_lens = self_lens;
     match &obj.payload {
+        NodePayload::ArtisticText(at) => {
+            nonlocal |= runs_have_dynamic_text_field(&at.runs);
+        }
+        NodePayload::ParagraphText(p) => {
+            nonlocal |= runs_have_dynamic_text_field(&p.runs);
+        }
+        NodePayload::TextOnPath(t) => {
+            nonlocal |= runs_have_dynamic_text_field(&t.text.runs);
+        }
         NodePayload::Group(children) => {
             for &cid in children {
                 if !visiting_objs.insert(cid) {

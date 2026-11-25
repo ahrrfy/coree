@@ -22,10 +22,11 @@ pub mod riff;
 pub mod zcf;
 
 use crate::cdr_riff::{
-    is_cdr_form_type, is_cdt_form_type, parse_cdr_riff, write_cdr_riff, RiffWriteOptions,
+    is_cdr_form_type, is_cdt_form_type, parse_cdr_riff_with_options, write_cdr_riff,
+    RiffWriteOptions,
 };
-use crate::cdr_zip::{is_zip_bytes, parse_cdr_zip, write_cdr_zip, CdrZipEra};
-use crate::cmx::{import_cmx_bytes, is_cmx_form_type};
+use crate::cdr_zip::{is_zip_bytes, parse_cdr_zip_with_options, write_cdr_zip, CdrZipEra};
+use crate::cmx::{import_cmx_bytes_with_options, is_cmx_form_type};
 use crate::cpt::{detect_cpt_version, import_cpt_bytes};
 use coree_core::Document;
 use serde::{Deserialize, Serialize};
@@ -37,9 +38,9 @@ pub use cmx::{export_cmx, export_cmx_bytes, export_cmx_bytes_with_endian, CmxPre
 pub use error::{CdrError, CdrResult};
 pub use fixtures::generate_sample_document;
 pub use inspector::{
-    format_report, inspect_cdr_bytes, inspect_cdr_bytes_with_limits, inspect_cdr_file,
-    inspect_cdr_file_with_limits, CdrInspectionReport, ChunkSummary, UnknownChunkSummary,
-    ZipEntrySummary,
+    format_hex_ascii_dump, format_report, inspect_cdr_bytes, inspect_cdr_bytes_with_limits,
+    inspect_cdr_file, inspect_cdr_file_with_limits, CdrInspectionReport, ChunkSummary,
+    UnknownChunkSummary, ZipEntrySummary,
 };
 pub use limits::{
     read_file_bounded, CodecLimits, MAX_BITMAP_DIM, MAX_CHUNKS, MAX_COMPRESSION_RATIO,
@@ -83,6 +84,14 @@ pub enum CdrWriteVersion {
     ZipX6,
 }
 
+/// Import options for CDR/CDT/CMX container decoding (`S15` codepage override).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdrReadOptions {
+    /// Fallback Windows/UTF codepage (`1256` = Arabic, `1251` = Cyrillic, `1252` = Latin-1,
+    /// `65001` = UTF-8) used when a legacy chunk omits or zeroes its codepage field.
+    pub default_codepage: Option<u16>,
+}
+
 /// Result returned by unified CDR/CDT/CMX/CPT file importers.
 #[derive(Debug, Clone)]
 pub struct ImportReport {
@@ -112,8 +121,18 @@ pub fn import_cdr_bytes(bytes: &[u8]) -> CdrResult<ImportReport> {
 
 /// Imports any supported container format from raw bytes under explicit [`CodecLimits`].
 pub fn import_cdr_bytes_with_limits(bytes: &[u8], limits: &CodecLimits) -> CdrResult<ImportReport> {
+    import_cdr_bytes_with_options(bytes, limits, CdrReadOptions::default())
+}
+
+/// Imports any supported container format from raw bytes under explicit [`CodecLimits`] and
+/// [`CdrReadOptions`] (e.g. legacy single-byte codepage fallback).
+pub fn import_cdr_bytes_with_options(
+    bytes: &[u8],
+    limits: &CodecLimits,
+    opts: CdrReadOptions,
+) -> CdrResult<ImportReport> {
     if is_zip_bytes(bytes) {
-        let parsed = parse_cdr_zip(bytes, limits)?;
+        let parsed = parse_cdr_zip_with_options(bytes, limits, opts)?;
         let detected_format = if parsed.is_template {
             CdrFormat::CdtZip
         } else {
@@ -136,10 +155,10 @@ pub fn import_cdr_bytes_with_limits(bytes: &[u8], limits: &CodecLimits) -> CdrRe
     if bytes.len() >= 12 && (&bytes[0..4] == b"RIFF" || &bytes[0..4] == b"RIFX") {
         let form: [u8; 4] = [bytes[8], bytes[9], bytes[10], bytes[11]];
         if is_cmx_form_type(&form) {
-            return import_cmx_bytes(bytes, limits);
+            return import_cmx_bytes_with_options(bytes, limits, opts);
         }
         if is_cdr_form_type(&form) || is_cdt_form_type(&form) {
-            let parsed = parse_cdr_riff(bytes, limits, &HashMap::new())?;
+            let parsed = parse_cdr_riff_with_options(bytes, limits, &HashMap::new(), opts)?;
             let detected_format = if parsed.is_template {
                 CdrFormat::CdtRiff {
                     version: parsed.version,
@@ -170,8 +189,18 @@ pub fn import_cdr_file(path: &Path) -> CdrResult<ImportReport> {
 /// Imports any supported `.cdr`/`.cdt`/`.cmx`/`.cpt` file from disk under explicit [`CodecLimits`],
 /// enforcing bounded disk reads before parsing.
 pub fn import_cdr_file_with_limits(path: &Path, limits: &CodecLimits) -> CdrResult<ImportReport> {
+    import_cdr_file_with_options(path, limits, CdrReadOptions::default())
+}
+
+/// Imports any supported `.cdr`/`.cdt`/`.cmx`/`.cpt` file from disk under explicit [`CodecLimits`]
+/// and [`CdrReadOptions`].
+pub fn import_cdr_file_with_options(
+    path: &Path,
+    limits: &CodecLimits,
+    opts: CdrReadOptions,
+) -> CdrResult<ImportReport> {
     let bytes = read_file_bounded(path, limits)?;
-    import_cdr_bytes_with_limits(&bytes, limits)
+    import_cdr_bytes_with_options(&bytes, limits, opts)
 }
 
 /// Exports `doc` to `.cdr` bytes in the requested [`CdrWriteVersion`].

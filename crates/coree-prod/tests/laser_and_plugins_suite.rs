@@ -709,6 +709,7 @@ fn audit_edge_cases_empty_docs_nan_inf_arabic_utf8_and_locked_layers() {
                 width_mm: f64::NAN,
                 height_mm: 10.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )

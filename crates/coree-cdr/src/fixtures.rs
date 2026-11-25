@@ -263,6 +263,7 @@ pub fn generate_sample_document() -> Document {
                 width_mm: 24.0,
                 height_mm: 24.0,
                 filters: Vec::new(),
+                filter_enabled: Vec::new(),
                 crop_rect: None,
             }),
         )

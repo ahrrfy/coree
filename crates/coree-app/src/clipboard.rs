@@ -212,6 +212,9 @@ fn fnv1a_bytes(slices: &[&[u8]]) -> u64 {
 
 fn arboard_write_payload(payload: &ClipboardPayload) -> Result<(), String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("arboard init: {e}"))?;
+    // `arboard` overwrites the OS clipboard on each `set_*` call (no multi-format writer);
+    // prefer raster RGBA8 first, then HTML/SVG wrap, then plain text / raw SVG text.
+    let mut wrote_any = false;
     if payload.rgba_width > 0 && payload.rgba_height > 0 && !payload.rgba.is_empty() {
         let img = arboard::ImageData {
             width: payload.rgba_width as usize,
@@ -219,15 +222,26 @@ fn arboard_write_payload(payload: &ClipboardPayload) -> Result<(), String> {
             bytes: Cow::Borrowed(&payload.rgba),
         };
         if cb.set_image(img).is_ok() {
-            return Ok(());
+            wrote_any = true;
         }
     }
-    if let Some(ref txt) = payload.plain_text {
-        cb.set_text(txt.clone())
-            .map_err(|e| format!("arboard set_text: {e}"))?;
-    } else if !payload.svg.is_empty() {
-        cb.set_text(payload.svg.clone())
-            .map_err(|e| format!("arboard set_text svg: {e}"))?;
+    if !wrote_any && !payload.svg.is_empty() {
+        let html_wrap = format!(
+            "<!--StartFragment-->{}<!--EndFragment-->",
+            payload.svg.as_str()
+        );
+        if cb.set_html(&html_wrap, payload.plain_text.as_ref()).is_ok() {
+            wrote_any = true;
+        }
+    }
+    if !wrote_any {
+        if let Some(ref txt) = payload.plain_text {
+            cb.set_text(txt.clone())
+                .map_err(|e| format!("arboard set_text: {e}"))?;
+        } else if !payload.svg.is_empty() {
+            cb.set_text(payload.svg.clone())
+                .map_err(|e| format!("arboard set_text svg: {e}"))?;
+        }
     }
     Ok(())
 }

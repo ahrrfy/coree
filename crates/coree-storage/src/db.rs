@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Current local SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Exact offline-first SQLite DDL from `replica/schema.sql` (all 10 tables,
 /// CHECK constraints, foreign keys, and indexes).
@@ -240,7 +240,7 @@ CREATE INDEX IF NOT EXISTS idx_app_preferences_category
 
 -- 11. User-confirmed PANOSE font substitution overrides (REQ-07)
 CREATE TABLE IF NOT EXISTS font_substitutions (
-    missing_family    TEXT PRIMARY KEY NOT NULL,
+    missing_family    TEXT PRIMARY KEY COLLATE NOCASE NOT NULL,
     substitute_family TEXT NOT NULL,
     panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
@@ -585,6 +585,22 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
                  PRAGMA foreign_keys = ON;",
             )?;
         }
+        if current < 4 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS font_substitutions_v4 (
+                     missing_family    TEXT PRIMARY KEY COLLATE NOCASE NOT NULL,
+                     substitute_family TEXT NOT NULL,
+                     panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
+                     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );
+                 INSERT OR REPLACE INTO font_substitutions_v4 (missing_family, substitute_family, panose_hex, updated_at)
+                 SELECT missing_family, substitute_family, panose_hex, updated_at
+                 FROM font_substitutions
+                 ORDER BY updated_at ASC;
+                 DROP TABLE IF EXISTS font_substitutions;
+                 ALTER TABLE font_substitutions_v4 RENAME TO font_substitutions;",
+            )?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO schema_migrations (version) VALUES (?1)",
             [SCHEMA_VERSION],
@@ -603,7 +619,7 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
             }
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS font_substitutions (
-                     missing_family    TEXT PRIMARY KEY NOT NULL,
+                     missing_family    TEXT PRIMARY KEY COLLATE NOCASE NOT NULL,
                      substitute_family TEXT NOT NULL,
                      panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
                      updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
@@ -636,6 +652,22 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
                  CREATE INDEX IF NOT EXISTS idx_recent_documents_opened ON recent_documents (pinned DESC, last_opened_at DESC);
                  CREATE INDEX IF NOT EXISTS idx_recent_documents_format ON recent_documents (file_format);
                  PRAGMA foreign_keys = ON;",
+            )?;
+        }
+        if current < 4 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS font_substitutions_v4 (
+                     missing_family    TEXT PRIMARY KEY COLLATE NOCASE NOT NULL,
+                     substitute_family TEXT NOT NULL,
+                     panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
+                     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );
+                 INSERT OR REPLACE INTO font_substitutions_v4 (missing_family, substitute_family, panose_hex, updated_at)
+                 SELECT missing_family, substitute_family, panose_hex, updated_at
+                 FROM font_substitutions
+                 ORDER BY updated_at ASC;
+                 DROP TABLE IF EXISTS font_substitutions;
+                 ALTER TABLE font_substitutions_v4 RENAME TO font_substitutions;",
             )?;
         }
         conn.execute(

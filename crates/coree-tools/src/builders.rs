@@ -4,9 +4,10 @@
 
 use crate::context::ToolReadContext;
 use crate::math_helpers::{
-    build_mesh_fill_for_bounds, compute_free_transform_affine, enclosing_layer_of_object,
-    find_nearest_object_anchor_in_doc, is_object_editable_in_doc, point_in_polygon,
-    three_point_arc_path, world_inverse_transform_of, world_transform_of_or_local,
+    apply_draw_in_perspective_to_obj, build_mesh_fill_for_bounds, compute_free_transform_affine,
+    enclosing_layer_of_object, find_nearest_object_anchor_in_doc, is_object_editable_in_doc,
+    point_in_polygon, three_point_arc_path, world_inverse_transform_of,
+    world_transform_of_or_local,
 };
 use crate::output::{ToolActionRequest, ToolOutput};
 use crate::types::ToolId;
@@ -125,6 +126,7 @@ pub fn build_bspline_create_op(
     let mut obj = SceneObject::new(ObjectId(0), "B-Spline", NodePayload::BSpline(bspline))
         .with_fill(fill)
         .with_outline(ctx.default_outline.clone());
+    apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
     if ctx.settings.symmetry_enabled && ctx.settings.symmetry_folds >= 2 {
         let origin = ctx.settings.symmetry_center_mm.unwrap_or_else(|| {
             ctx.document.active_page().map_or(Point2D::ZERO, |p| {
@@ -153,9 +155,46 @@ pub fn build_three_point_curve_op(
     }
     let layer_id = ctx.target_creation_layer_id()?;
     let path = three_point_arc_path(p1, p2, p3);
-    let obj = SceneObject::new(ObjectId(0), "3-Point Curve", NodePayload::Path(path))
+    let mut obj = SceneObject::new(ObjectId(0), "3-Point Curve", NodePayload::Path(path))
         .with_fill(Fill::None)
         .with_outline(ctx.default_outline.clone());
+    apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
+    Some(CommandOp::create_object(obj, Some(layer_id)))
+}
+
+/// Builds a [`CommandOp::CreateObject`] for a 2-stage 3-Point `AngularDimension` or `ThreePointCallout`.
+#[must_use]
+pub fn build_three_point_dimension_op(
+    ctx: &ToolReadContext<'_>,
+    tool: ToolId,
+    p1: Point2D,
+    p2: Point2D,
+    p3: Point2D,
+) -> Option<CommandOp> {
+    if p1.distance_to(p2) < 0.25 {
+        return None;
+    }
+    let layer_id = ctx.target_creation_layer_id()?;
+    let ts = ctx.settings;
+    let dim = if tool == ToolId::AngularDimension {
+        DimensionObject::angular(p1, p2, p3, ts.dimension_offset_mm)
+    } else {
+        let mut d =
+            DimensionObject::linear(DimensionKind::Callout3Pt, p1, p2, ts.dimension_offset_mm);
+        d.p3 = Some(p3);
+        d.label_override = Some("Callout".to_owned());
+        d
+    };
+    let name = if tool == ToolId::AngularDimension {
+        "Angular Dimension"
+    } else {
+        "3-Point Callout"
+    };
+    let bb = dim.bounding_box();
+    let mut obj = SceneObject::new(ObjectId(0), name, NodePayload::Dimension(dim))
+        .with_fill(Fill::None)
+        .with_outline(ctx.default_outline.clone());
+    apply_draw_in_perspective_to_obj(ctx, &mut obj, Some(bb));
     Some(CommandOp::create_object(obj, Some(layer_id)))
 }
 
@@ -212,10 +251,11 @@ pub fn build_three_point_shape_op(
             Affine2D::translate(origin.x, origin.y).compose(&Affine2D::rotate(angle)),
         )
     };
-    let obj = SceneObject::new(ObjectId(0), name, payload)
+    let mut obj = SceneObject::new(ObjectId(0), name, payload)
         .with_fill(ctx.default_fill.clone())
         .with_outline(ctx.default_outline.clone())
         .with_transform(xf);
+    apply_draw_in_perspective_to_obj(ctx, &mut obj, None);
     Some(CommandOp::create_object(obj, Some(layer_id)))
 }
 
@@ -2466,7 +2506,8 @@ pub fn build_sculpt_stroke_output(
                 path.twirl_near(lp, local_radius, angle);
             }
             ToolId::AttractRepel => {
-                path.attract_repel_near(lp, local_radius, strength, !shift_invert);
+                let attract = ctx.settings.sculpt_sub_mode.is_attract(shift_invert);
+                path.attract_repel_near(lp, local_radius, strength, attract);
             }
             ToolId::Roughen => {
                 let amp = (local_radius * 0.18 * strength).max(0.4);
