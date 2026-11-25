@@ -14,9 +14,9 @@ use crate::raster_engine::gaussian_blur_rgba;
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
     apply_boolean_many, offset_polygon, Affine2D, ArtisticMedia, BevelStyle, BezierPath, BlendMode,
-    BooleanOp, Color, ContourMode, Document, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
-    Fill, IccColorPipeline, NodePayload, OutlineStyle, PathNode, Perspective3x3, Point2D,
-    SceneObject, Subpath, TransparencyMode, Vec2D,
+    BooleanOp, Color, ContourMode, DistortKind, Document, Effect, EnvelopeMode, ExtrudeLight,
+    FeatherDirection, Fill, IccColorPipeline, NodePayload, OutlineStyle, PathNode, Perspective3x3,
+    Point2D, SceneObject, Subpath, TransparencyMode, Vec2D,
 };
 
 #[inline]
@@ -1719,6 +1719,74 @@ pub fn apply_envelope_to_path(
     sub
 }
 
+/// Maps a single point through an Envelope bilinear/Coons cage using `bb` as reference bounds.
+#[must_use]
+pub(crate) fn map_envelope_point(
+    p: Point2D,
+    bb: coree_core::Rect2D,
+    mode: EnvelopeMode,
+    cage: &[Point2D],
+) -> Point2D {
+    if cage.len() < 4 || !bb.is_finite() || !p.is_finite() || !cage.iter().all(|c| c.is_finite()) {
+        return p;
+    }
+    let w = bb.width().max(1e-6);
+    let h = bb.height().max(1e-6);
+    let u = ((p.x - bb.min_x) / w).clamp(0.0, 1.0);
+    let v = ((p.y - bb.min_y) / h).clamp(0.0, 1.0);
+    if cage.len() >= 12 {
+        // 12-point 4-curve cubic Bézier Coons patch:
+        // [0:TL, 1:T1, 2:T2, 3:TR, 4:R1, 5:R2, 6:BR, 7:B1, 8:B2, 9:BL, 10:L1, 11:L2]
+        let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
+        if mode == EnvelopeMode::Straight {
+            return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+        }
+        let top = eval_cubic(tl, cage[1], cage[2], tr, u);
+        let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
+        let left = eval_cubic(tl, cage[11], cage[10], bl, v);
+        let right = eval_cubic(tr, cage[4], cage[5], br, v);
+        let ruled_u = top.lerp(bottom, v);
+        let ruled_v = left.lerp(right, u);
+        let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+        Point2D::new(
+            ruled_u.x + ruled_v.x - bilin.x,
+            ruled_u.y + ruled_v.y - bilin.y,
+        )
+    } else if cage.len() >= 8 {
+        // Quadratic Coons patch through 8-point envelope cage [TL, T_mid, TR, R_mid, BR, B_mid, BL, L_mid]
+        let (tl, tr, br, bl) = (cage[0], cage[2], cage[4], cage[6]);
+        if mode == EnvelopeMode::Straight {
+            return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+        }
+        let (tm, rm, bm, lm) = (cage[1], cage[3], cage[5], cage[7]);
+        let top = eval_quad(tl, tm, tr, u);
+        let bottom = eval_quad(bl, bm, br, u);
+        let left = eval_quad(tl, lm, bl, v);
+        let right = eval_quad(tr, rm, br, v);
+        let ruled_u = top.lerp(bottom, v);
+        let ruled_v = left.lerp(right, u);
+        let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+        Point2D::new(
+            ruled_u.x + ruled_v.x - bilin.x,
+            ruled_u.y + ruled_v.y - bilin.y,
+        )
+    } else {
+        let (tl, tr, br, bl) = (cage[0], cage[1], cage[2], cage[3]);
+        let base = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+        match mode {
+            EnvelopeMode::Straight | EnvelopeMode::Unconstrained => base,
+            EnvelopeMode::SingleArc => {
+                let arc = (u * std::f64::consts::PI).sin() * 0.08 * h;
+                Point2D::new(base.x, base.y - arc * (1.0 - 2.0 * v))
+            }
+            EnvelopeMode::DoubleArc => {
+                let wave = (u * std::f64::consts::TAU).sin() * 0.06 * h;
+                Point2D::new(base.x, base.y + wave)
+            }
+        }
+    }
+}
+
 /// Applies Envelope bilinear/Coons cage deformation to `path`.
 fn apply_envelope_to_path_in_bounds(
     path: &BezierPath,
@@ -1735,74 +1803,244 @@ fn apply_envelope_to_path_in_bounds(
     else {
         return path.clone();
     };
-    let w = bb.width().max(1e-6);
-    let h = bb.height().max(1e-6);
-
-    let map_pt = |p: Point2D| -> Point2D {
-        let u = ((p.x - bb.min_x) / w).clamp(0.0, 1.0);
-        let v = ((p.y - bb.min_y) / h).clamp(0.0, 1.0);
-        if cage.len() >= 12 {
-            // 12-point 4-curve cubic Bézier Coons patch:
-            // [0:TL, 1:T1, 2:T2, 3:TR, 4:R1, 5:R2, 6:BR, 7:B1, 8:B2, 9:BL, 10:L1, 11:L2]
-            let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
-            if mode == EnvelopeMode::Straight {
-                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
-            }
-            let top = eval_cubic(tl, cage[1], cage[2], tr, u);
-            let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
-            let left = eval_cubic(tl, cage[11], cage[10], bl, v);
-            let right = eval_cubic(tr, cage[4], cage[5], br, v);
-            let ruled_u = top.lerp(bottom, v);
-            let ruled_v = left.lerp(right, u);
-            let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
-            Point2D::new(
-                ruled_u.x + ruled_v.x - bilin.x,
-                ruled_u.y + ruled_v.y - bilin.y,
-            )
-        } else if cage.len() >= 8 {
-            // Quadratic Coons patch through 8-point envelope cage [TL, T_mid, TR, R_mid, BR, B_mid, BL, L_mid]
-            let (tl, tr, br, bl) = (cage[0], cage[2], cage[4], cage[6]);
-            if mode == EnvelopeMode::Straight {
-                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
-            }
-            let (tm, rm, bm, lm) = (cage[1], cage[3], cage[5], cage[7]);
-            let top = eval_quad(tl, tm, tr, u);
-            let bottom = eval_quad(bl, bm, br, u);
-            let left = eval_quad(tl, lm, bl, v);
-            let right = eval_quad(tr, rm, br, v);
-            let ruled_u = top.lerp(bottom, v);
-            let ruled_v = left.lerp(right, u);
-            let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
-            Point2D::new(
-                ruled_u.x + ruled_v.x - bilin.x,
-                ruled_u.y + ruled_v.y - bilin.y,
-            )
-        } else {
-            let (tl, tr, br, bl) = (cage[0], cage[1], cage[2], cage[3]);
-            let base = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
-            match mode {
-                EnvelopeMode::Straight | EnvelopeMode::Unconstrained => base,
-                EnvelopeMode::SingleArc => {
-                    let arc = (u * std::f64::consts::PI).sin() * 0.08 * h;
-                    Point2D::new(base.x, base.y - arc * (1.0 - 2.0 * v))
-                }
-                EnvelopeMode::DoubleArc => {
-                    let wave = (u * std::f64::consts::TAU).sin() * 0.06 * h;
-                    Point2D::new(base.x, base.y + wave)
-                }
-            }
-        }
-    };
 
     let mut sub = subdivide_for_deformation(path, 2.5);
     for sp in &mut sub.subpaths {
         for node in &mut sp.nodes {
-            node.pos = map_pt(node.pos);
-            node.handle_in = node.handle_in.map(map_pt);
-            node.handle_out = node.handle_out.map(map_pt);
+            node.pos = map_envelope_point(node.pos, bb, mode, cage);
+            node.handle_in = node
+                .handle_in
+                .map(|h| map_envelope_point(h, bb, mode, cage));
+            node.handle_out = node
+                .handle_out
+                .map(|h| map_envelope_point(h, bb, mode, cage));
         }
     }
     sub
+}
+
+#[inline]
+fn map_perspective_point_with_h(
+    p: Point2D,
+    bb: coree_core::Rect2D,
+    quad: &[Point2D; 4],
+    homography: Option<[f64; 8]>,
+) -> Point2D {
+    if !bb.is_finite() || !p.is_finite() || !quad.iter().all(|q| q.is_finite()) {
+        return p;
+    }
+    let w = bb.width().max(1e-6);
+    let h = bb.height().max(1e-6);
+    let u = (p.x - bb.min_x) / w;
+    let v = (p.y - bb.min_y) / h;
+    if let Some(hm) = homography {
+        let denom = hm[6] * u + hm[7] * v + 1.0;
+        if denom.abs() > 1e-6 {
+            let x = (hm[0] * u + hm[1] * v + hm[2]) / denom;
+            let y = (hm[3] * u + hm[4] * v + hm[5]) / denom;
+            if x.is_finite() && y.is_finite() {
+                return Point2D::new(x, y);
+            }
+        }
+    }
+    Effect::map_perspective_uv(quad, u, v)
+}
+
+/// Maps a single point through a 3x3 projective homography onto `quad` `[TL, TR, BR, BL]`.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn map_perspective_point(
+    p: Point2D,
+    bb: coree_core::Rect2D,
+    quad: &[Point2D; 4],
+) -> Point2D {
+    let homography = solve_unit_square_homography(quad);
+    map_perspective_point_with_h(p, bb, quad, homography)
+}
+
+/// Maps a single continuous interior point through `Effect::Distort`.
+#[must_use]
+pub(crate) fn map_distort_point(
+    p: Point2D,
+    kind: DistortKind,
+    amplitude: f64,
+    frequency: f64,
+    center: Point2D,
+) -> Point2D {
+    let amp = sanitize_f64(amplitude, 0.0);
+    let freq = sanitize_f64(frequency, 1.0).max(0.1);
+    if !center.is_finite() || !p.is_finite() || amp.abs() <= 1e-9 {
+        return p;
+    }
+    let rel = p - center;
+    let r = rel.length();
+    if r <= 1e-9 {
+        return p;
+    }
+    match kind {
+        DistortKind::PushPull => {
+            let dir = rel / r;
+            let angle = rel.y.atan2(rel.x);
+            let wave = (angle * freq * 2.0).cos();
+            p + dir * (amp * wave * 0.5)
+        }
+        DistortKind::Zipper => {
+            let dir = rel / r;
+            let angle = rel.y.atan2(rel.x);
+            let wave = (angle * freq * 4.0).sin();
+            p + dir * (amp * wave)
+        }
+        DistortKind::Twister => {
+            let theta = amp.to_radians() * (r / (50.0 / freq).max(1.0));
+            center + rel.rotate(theta)
+        }
+    }
+}
+
+/// Precomputed point-deformation step for fast repeated evaluation across dense `MeshFill` grids.
+#[derive(Debug, Clone)]
+pub(crate) enum DeformPointStep {
+    Distort {
+        kind: DistortKind,
+        amplitude: f64,
+        frequency: f64,
+        center: Point2D,
+    },
+    Envelope {
+        bb: coree_core::Rect2D,
+        mode: EnvelopeMode,
+        cage: Vec<Point2D>,
+    },
+    Perspective {
+        bb: coree_core::Rect2D,
+        quad: [Point2D; 4],
+        homography: Option<[f64; 8]>,
+    },
+}
+
+/// Precomputes chained bounds and projective homographies for `effects` matching
+/// [`apply_geometry_effects_in_bounds`].
+#[must_use]
+pub(crate) fn prepare_deform_point_steps(
+    ref_bounds: Option<coree_core::Rect2D>,
+    effects: &[Effect],
+) -> Vec<DeformPointStep> {
+    let mut steps = Vec::new();
+    let mut cur_ref = ref_bounds.filter(|r| r.is_finite());
+    for (idx, eff) in effects.iter().enumerate() {
+        let has_more_deforms = effects[idx + 1..].iter().any(|next| {
+            matches!(
+                next,
+                Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
+            )
+        });
+        match eff {
+            Effect::Distort {
+                kind,
+                amplitude,
+                frequency,
+                center,
+            } => {
+                steps.push(DeformPointStep::Distort {
+                    kind: *kind,
+                    amplitude: *amplitude,
+                    frequency: *frequency,
+                    center: *center,
+                });
+                if has_more_deforms {
+                    if let Some(rbb) = cur_ref {
+                        let max_seg = (2.5 / sanitize_f64(*frequency, 1.0).clamp(1.0, 20.0).sqrt())
+                            .clamp(0.35, 2.0);
+                        let ref_sub =
+                            subdivide_for_deformation(&BezierPath::from_rect(rbb), max_seg);
+                        cur_ref = Effect::apply_distort_to_path(
+                            &ref_sub, *kind, *amplitude, *frequency, *center,
+                        )
+                        .bounding_box();
+                    }
+                }
+            }
+            Effect::Envelope { mode, cage } => {
+                if let Some(bb) = cur_ref {
+                    steps.push(DeformPointStep::Envelope {
+                        bb,
+                        mode: *mode,
+                        cage: cage.clone(),
+                    });
+                    if has_more_deforms {
+                        cur_ref = apply_envelope_to_path_in_bounds(
+                            &BezierPath::from_rect(bb),
+                            Some(bb),
+                            *mode,
+                            cage,
+                        )
+                        .bounding_box();
+                    }
+                }
+            }
+            Effect::Perspective { quad } => {
+                if let Some(bb) = cur_ref {
+                    steps.push(DeformPointStep::Perspective {
+                        bb,
+                        quad: *quad,
+                        homography: solve_unit_square_homography(quad),
+                    });
+                    if has_more_deforms {
+                        cur_ref = apply_perspective_to_path_in_bounds(
+                            &BezierPath::from_rect(bb),
+                            Some(bb),
+                            quad,
+                        )
+                        .bounding_box();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    steps
+}
+
+/// Evaluates precomputed deformation steps onto a single point `p`.
+#[inline]
+#[must_use]
+pub(crate) fn apply_deform_point_steps(mut p: Point2D, steps: &[DeformPointStep]) -> Point2D {
+    for step in steps {
+        match step {
+            DeformPointStep::Distort {
+                kind,
+                amplitude,
+                frequency,
+                center,
+            } => {
+                p = map_distort_point(p, *kind, *amplitude, *frequency, *center);
+            }
+            DeformPointStep::Envelope { bb, mode, cage } => {
+                p = map_envelope_point(p, *bb, *mode, cage);
+            }
+            DeformPointStep::Perspective {
+                bb,
+                quad,
+                homography,
+            } => {
+                p = map_perspective_point_with_h(p, *bb, quad, *homography);
+            }
+        }
+    }
+    p
+}
+
+/// Applies all path-deforming live effects (`Distort`, `Envelope`, `Perspective`) to a single
+/// point `p` using reference bounding box `ref_bounds` (matching [`apply_geometry_effects_in_bounds`]).
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn deform_point_in_bounds(
+    p: Point2D,
+    ref_bounds: Option<coree_core::Rect2D>,
+    effects: &[Effect],
+) -> Point2D {
+    let steps = prepare_deform_point_steps(ref_bounds, effects);
+    apply_deform_point_steps(p, &steps)
 }
 
 /// Applies true 3x3 projective homography warp onto `quad` `[TL, TR, BR, BL]`.
@@ -1820,32 +2058,18 @@ fn apply_perspective_to_path_in_bounds(
     else {
         return path.clone();
     };
-    let w = bb.width().max(1e-6);
-    let h = bb.height().max(1e-6);
     let homography = solve_unit_square_homography(quad);
-
-    let map_pt = |p: Point2D| -> Point2D {
-        let u = (p.x - bb.min_x) / w;
-        let v = (p.y - bb.min_y) / h;
-        if let Some(hm) = homography {
-            let denom = hm[6] * u + hm[7] * v + 1.0;
-            if denom.abs() > 1e-6 {
-                let x = (hm[0] * u + hm[1] * v + hm[2]) / denom;
-                let y = (hm[3] * u + hm[4] * v + hm[5]) / denom;
-                if x.is_finite() && y.is_finite() {
-                    return Point2D::new(x, y);
-                }
-            }
-        }
-        Effect::map_perspective_uv(quad, u, v)
-    };
 
     let mut sub = subdivide_for_deformation(path, 2.5);
     for sp in &mut sub.subpaths {
         for node in &mut sp.nodes {
-            node.pos = map_pt(node.pos);
-            node.handle_in = node.handle_in.map(map_pt);
-            node.handle_out = node.handle_out.map(map_pt);
+            node.pos = map_perspective_point_with_h(node.pos, bb, quad, homography);
+            node.handle_in = node
+                .handle_in
+                .map(|h| map_perspective_point_with_h(h, bb, quad, homography));
+            node.handle_out = node
+                .handle_out
+                .map(|h| map_perspective_point_with_h(h, bb, quad, homography));
         }
     }
     sub

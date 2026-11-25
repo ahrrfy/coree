@@ -59,15 +59,44 @@ jobs:
       - name: Verify repository invariants (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: python3 scripts/verify_invariants.py
+        run: python3 scripts/verify_invariants.py --strict-no-std-net
 
       - name: Verify repository invariants (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/verify_invariants.py
+          python scripts/verify_invariants.py --strict-no-std-net
           if ($LASTEXITCODE -ne 0) { throw "verify_invariants.py failed" }
+
+      - name: Check & run offline fuzz targets (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --offline --locked --manifest-path fuzz/Cargo.toml
+          for bin in fuzz_cdr fuzz_pdf fuzz_svg fuzz_eps fuzz_psd fuzz_icc; do
+            cargo run --offline --locked --manifest-path fuzz/Cargo.toml --bin "$bin" -- --iters 50
+          done
+
+      - name: Check & run offline fuzz targets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo check --offline --locked --manifest-path fuzz/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "fuzz cargo check failed" }
+          foreach ($bin in @("fuzz_cdr", "fuzz_pdf", "fuzz_svg", "fuzz_eps", "fuzz_psd", "fuzz_icc")) {
+            cargo run --offline --locked --manifest-path fuzz/Cargo.toml --bin $bin -- --iters 50
+            if ($LASTEXITCODE -ne 0) { throw "fuzz target $bin failed" }
+          }
+
+      - name: Build & run offline release benchmarks
+        run: |
+          cargo bench --offline --locked --no-run
+          cargo bench --offline --locked --bench autosave_latency -- --iters 20
+          cargo bench --offline --locked --bench studio_startup_and_drag -- --iters 30
+          cargo bench --offline --locked --bench scene10k_and_raster_cow -- --iters 60
 
       - name: Build release binary
         run: cargo build --release --package coree-app --bins

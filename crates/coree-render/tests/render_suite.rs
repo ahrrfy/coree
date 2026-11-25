@@ -5666,9 +5666,10 @@ fn w1b_r20_symbol_connector_dag_render_and_mutually_recursive_symbols() {
     let t0 = std::time::Instant::now();
     renderer.render_document(&doc, &vp, ViewMode::Enhanced, &opts, &mut backend);
     let elapsed = t0.elapsed();
+    let limit_ms: u128 = if cfg!(debug_assertions) { 500 } else { 50 };
     assert!(
-        elapsed.as_millis() < 50,
-        "SceneRenderer::render_document on N=40 diamond Connector DAG + S1<->S2 cycle must finish in < 50ms, took {elapsed:?}"
+        elapsed.as_millis() < limit_ms,
+        "SceneRenderer::render_document on N=40 diamond Connector DAG + S1<->S2 cycle must finish in < {limit_ms}ms, took {elapsed:?}"
     );
 }
 
@@ -10474,5 +10475,1025 @@ fn w3a_r9_isolated_object_render_matches_page_under_custom_3slot_icc() {
                 "ViewportKey must invalidate DirtyTileCache when document ICC profiles change"
             );
         }
+    }
+}
+
+#[test]
+fn display_icc_transform_shifts_pixels_and_invalidates_tile_cache() {
+    use coree_core::{
+        generate_minimal_display_p3_icc_v2, generate_minimal_srgb_icc_v2, DisplayTransformLut3D,
+    };
+
+    let srgb_bytes = generate_minimal_srgb_icc_v2("sRGB");
+    let srgb_prof = coree_core::IccProfile::from_bytes(&srgb_bytes).unwrap();
+    let srgb_lut = DisplayTransformLut3D::build_from_profile(
+        &srgb_prof,
+        coree_core::RenderingIntent::RelativeColorimetric,
+    )
+    .unwrap();
+    let mut px = [180u8, 90, 45, 255];
+    srgb_lut.apply_rgba(&mut px);
+    assert!(
+        px[0].abs_diff(180) <= 5 && px[1].abs_diff(90) <= 5 && px[2].abs_diff(45) <= 5,
+        "sRGB gamma-2.2 display LUT must closely preserve sRGB values: got {px:?}"
+    );
+
+    let p3_bytes = generate_minimal_display_p3_icc_v2("Display P3");
+    let mut doc = Document::new_a4("DisplayIccRender");
+    let rect = SceneObject::new(
+        ObjectId(0),
+        "Red",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 80.0,
+            height: 80.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 40, 30, 255)))
+    .with_transform(Affine2D::translate(10.0, 10.0));
+    doc.add_object(rect, None).unwrap();
+
+    let vp = Viewport::new(200, 200);
+    let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+    let mut renderer = SceneRenderer::new();
+    let opts_plain = RenderOptions::export();
+    let img_plain =
+        cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts_plain, &mut renderer);
+
+    let mut opts_disp = RenderOptions::export();
+    opts_disp.display_icc_profile = Some(p3_bytes);
+    let rerendered =
+        cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts_disp, &mut renderer);
+    assert!(
+        rerendered > 0,
+        "Changing display_icc_profile must invalidate DirtyTileCache"
+    );
+    let img_disp = cache.composite_to_rgba();
+    assert_ne!(
+        img_plain.get_pixel(60, 60),
+        img_disp.get_pixel(60, 60),
+        "DisplayP3 monitor profile must shift rendered sRGB red into DisplayP3 coordinates"
+    );
+}
+
+#[test]
+fn w3_mesh_fill_with_inward_handles_warps_interior_coons_under_envelope() {
+    use coree_core::{Effect, EnvelopeMode, MeshNode};
+
+    let build_doc = |with_envelope: bool| -> Document {
+        let mut doc = Document::new_a4("MeshEnvelopeWarp");
+        let mesh = Fill::MeshFill {
+            rows: 2,
+            cols: 2,
+            nodes: vec![
+                MeshNode {
+                    row: 0,
+                    col: 0,
+                    pos: Point2D::new(0.0, 0.0),
+                    color: Color::rgb(1.0, 0.0, 0.0),
+                    handle_n: None,
+                    handle_s: Some(Point2D::new(0.0, 20.0)),
+                    handle_e: Some(Point2D::new(20.0, 15.0)),
+                    handle_w: None,
+                    alpha: 1.0,
+                },
+                MeshNode {
+                    row: 0,
+                    col: 1,
+                    pos: Point2D::new(80.0, 0.0),
+                    color: Color::rgb(0.0, 0.0, 1.0),
+                    handle_n: None,
+                    handle_s: Some(Point2D::new(0.0, 20.0)),
+                    handle_e: None,
+                    handle_w: Some(Point2D::new(-20.0, 15.0)),
+                    alpha: 1.0,
+                },
+                MeshNode {
+                    row: 1,
+                    col: 0,
+                    pos: Point2D::new(0.0, 80.0),
+                    color: Color::rgb(0.0, 1.0, 0.0),
+                    handle_n: Some(Point2D::new(0.0, -20.0)),
+                    handle_s: None,
+                    handle_e: Some(Point2D::new(20.0, -15.0)),
+                    handle_w: None,
+                    alpha: 1.0,
+                },
+                MeshNode {
+                    row: 1,
+                    col: 1,
+                    pos: Point2D::new(80.0, 80.0),
+                    color: Color::rgb(1.0, 1.0, 0.0),
+                    handle_n: Some(Point2D::new(0.0, -20.0)),
+                    handle_s: None,
+                    handle_e: None,
+                    handle_w: Some(Point2D::new(-20.0, -15.0)),
+                    alpha: 1.0,
+                },
+            ],
+        };
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            "CoonsMesh",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 80.0,
+                height: 80.0,
+                corner_radii: [4.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(mesh)
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(20.0, 20.0));
+        if with_envelope {
+            obj.effects.push(Effect::Envelope {
+                mode: EnvelopeMode::SingleArc,
+                cage: vec![
+                    Point2D::new(0.0, 0.0),
+                    Point2D::new(80.0, 6.0),
+                    Point2D::new(80.0, 80.0),
+                    Point2D::new(0.0, 74.0),
+                ],
+            });
+        }
+        doc.add_object(obj, None).unwrap();
+        doc
+    };
+
+    let doc_plain = build_doc(false);
+    let doc_env = build_doc(true);
+    let mut vp = Viewport::new(320, 320);
+    vp.fit_rect(Rect2D::from_xywh(10.0, 10.0, 100.0, 100.0), 8.0);
+    let opts = RenderOptions::export();
+
+    let mut b_plain = TinySkiaBackend::new(320, 320).unwrap();
+    let mut b_env = TinySkiaBackend::new(320, 320).unwrap();
+    let mut renderer = SceneRenderer::new();
+    renderer.render_document(&doc_plain, &vp, ViewMode::Enhanced, &opts, &mut b_plain);
+    renderer.render_document(&doc_env, &vp, ViewMode::Enhanced, &opts, &mut b_env);
+    let img_plain = b_plain.into_rgba();
+    let img_env = b_env.into_rgba();
+
+    let sum_abs: u64 = img_plain
+        .rgba
+        .iter()
+        .zip(img_env.rgba.iter())
+        .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+        .sum();
+    let mean_abs = (sum_abs as f64) / (img_plain.rgba.len() as f64);
+    assert!(
+        mean_abs > 1.0,
+        "MeshFill + Envelope must warp interior Coons patch pixels (not just clip mask), got mean_abs_diff={mean_abs:.4}"
+    );
+}
+
+#[test]
+fn w3_deformed_group_clone_mesh_fill_single_perspective() {
+    use coree_core::{Effect, EnvelopeMode, MeshNode, Perspective3x3};
+
+    let persp = Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 80.0, 80.0),
+        &[
+            Point2D::new(8.0, 4.0),
+            Point2D::new(76.0, 12.0),
+            Point2D::new(70.0, 76.0),
+            Point2D::new(12.0, 74.0),
+        ],
+    )
+    .expect("valid perspective quad");
+
+    let mesh = Fill::MeshFill {
+        rows: 2,
+        cols: 2,
+        nodes: vec![
+            MeshNode {
+                row: 0,
+                col: 0,
+                pos: Point2D::new(0.0, 0.0),
+                color: Color::rgb(1.0, 0.0, 0.0),
+                handle_n: None,
+                handle_s: Some(Point2D::new(0.0, 20.0)),
+                handle_e: Some(Point2D::new(20.0, 15.0)),
+                handle_w: None,
+                alpha: 1.0,
+            },
+            MeshNode {
+                row: 0,
+                col: 1,
+                pos: Point2D::new(80.0, 0.0),
+                color: Color::rgb(0.0, 0.0, 1.0),
+                handle_n: None,
+                handle_s: Some(Point2D::new(0.0, 20.0)),
+                handle_e: None,
+                handle_w: Some(Point2D::new(-20.0, 15.0)),
+                alpha: 1.0,
+            },
+            MeshNode {
+                row: 1,
+                col: 0,
+                pos: Point2D::new(0.0, 80.0),
+                color: Color::rgb(0.0, 1.0, 0.0),
+                handle_n: Some(Point2D::new(0.0, -20.0)),
+                handle_s: None,
+                handle_e: Some(Point2D::new(20.0, -15.0)),
+                handle_w: None,
+                alpha: 1.0,
+            },
+            MeshNode {
+                row: 1,
+                col: 1,
+                pos: Point2D::new(80.0, 80.0),
+                color: Color::rgb(1.0, 1.0, 0.0),
+                handle_n: Some(Point2D::new(0.0, -20.0)),
+                handle_s: None,
+                handle_e: None,
+                handle_w: Some(Point2D::new(-20.0, -15.0)),
+                alpha: 1.0,
+            },
+        ],
+    };
+
+    let master_shape = NodePayload::Shape(ParametricShape::Rectangle {
+        width: 80.0,
+        height: 80.0,
+        corner_radii: [4.0; 4],
+        corner_style: CornerStyle::Rounded,
+        lock_corners: true,
+    });
+
+    let build_doc = |use_clone: bool, with_persp: bool| -> Document {
+        let mut doc = Document::new_a4("DeformedCloneMeshPersp");
+        let child_id = if use_clone {
+            let mut master = SceneObject::new(ObjectId(0), "MasterMesh", master_shape.clone())
+                .with_fill(mesh.clone())
+                .with_outline(OutlineStyle::none());
+            master.visible = false;
+            let master_id = doc.add_object(master, None).unwrap();
+
+            let mut clone_obj = SceneObject::new(
+                ObjectId(0),
+                "CloneMesh",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(20.0, 20.0));
+            if with_persp {
+                clone_obj.perspective = Some(persp);
+            }
+            doc.add_object(clone_obj, None).unwrap()
+        } else {
+            let mut direct = SceneObject::new(ObjectId(0), "DirectMesh", master_shape.clone())
+                .with_fill(mesh.clone())
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(20.0, 20.0));
+            if with_persp {
+                direct.perspective = Some(persp);
+            }
+            doc.add_object(direct, None).unwrap()
+        };
+
+        let mut grp = SceneObject::new(
+            ObjectId(0),
+            "DeformedGroup",
+            NodePayload::Group(vec![child_id]),
+        );
+        grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::SingleArc,
+            cage: vec![
+                Point2D::new(20.0, 20.0),
+                Point2D::new(100.0, 28.0),
+                Point2D::new(100.0, 100.0),
+                Point2D::new(20.0, 92.0),
+            ],
+        });
+        doc.add_object(grp, None).unwrap();
+        doc
+    };
+
+    let doc_direct = build_doc(false, true);
+    let doc_clone = build_doc(true, true);
+    let doc_clone_no_persp = build_doc(true, false);
+
+    let mut vp = Viewport::new(320, 320);
+    vp.fit_rect(Rect2D::from_xywh(10.0, 10.0, 100.0, 100.0), 8.0);
+    let opts = RenderOptions::export();
+
+    let mut b_direct = TinySkiaBackend::new(320, 320).unwrap();
+    let mut b_clone = TinySkiaBackend::new(320, 320).unwrap();
+    let mut b_no_persp = TinySkiaBackend::new(320, 320).unwrap();
+    let mut renderer = SceneRenderer::new();
+    renderer.render_document(&doc_direct, &vp, ViewMode::Enhanced, &opts, &mut b_direct);
+    renderer.render_document(&doc_clone, &vp, ViewMode::Enhanced, &opts, &mut b_clone);
+    renderer.render_document(
+        &doc_clone_no_persp,
+        &vp,
+        ViewMode::Enhanced,
+        &opts,
+        &mut b_no_persp,
+    );
+
+    let img_direct = b_direct.into_rgba();
+    let img_clone = b_clone.into_rgba();
+    let img_no_persp = b_no_persp.into_rgba();
+
+    assert_eq!(
+        img_clone.rgba, img_direct.rgba,
+        "Deformed-group Clone with MeshFill+Perspective must match direct render pixel-for-pixel (no double perspective)"
+    );
+
+    let sum_abs: u64 = img_clone
+        .rgba
+        .iter()
+        .zip(img_no_persp.rgba.iter())
+        .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+        .sum();
+    let mean_abs = (sum_abs as f64) / (img_clone.rgba.len() as f64);
+    assert!(
+        mean_abs > 1.0,
+        "Perspective on deformed-group Clone must visibly warp MeshFill, got mean_abs_diff={mean_abs:.4}"
+    );
+}
+
+#[test]
+fn w3_clone_with_lens_and_remove_face_clone_backdrop_render() {
+    use coree_core::{Effect, EnvelopeMode, LensConfig, LensKind};
+
+    let rect_payload = |w: f64, h: f64| {
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: w,
+            height: h,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        })
+    };
+
+    // 1. Standalone Clone carrying Lens::Invert over Red backdrop must match direct Lens::Invert
+    let build_standalone = |use_clone: bool| -> Document {
+        let mut doc = Document::new("CloneLensStandalone", 100.0, 100.0, ColorMode::Rgb, 72.0);
+        doc.add_object(
+            make_rect(10.0, 10.0, 80.0, 80.0, Color::rgba8(255, 0, 0, 255)),
+            None,
+        )
+        .unwrap();
+        let lens_cfg = LensConfig {
+            kind: LensKind::Invert,
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        };
+        let mut lens_obj = if use_clone {
+            let mut master = SceneObject::new(ObjectId(0), "LensMaster", rect_payload(40.0, 40.0))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none());
+            master.visible = false;
+            let master_id = doc.add_object(master, None).unwrap();
+            SceneObject::new(
+                ObjectId(0),
+                "LensClone",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(30.0, 30.0))
+        } else {
+            SceneObject::new(ObjectId(0), "LensDirect", rect_payload(40.0, 40.0))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(30.0, 30.0))
+        };
+        lens_obj.lens = Some(lens_cfg);
+        doc.add_object(lens_obj, None).unwrap();
+        doc
+    };
+
+    let img_sa_direct =
+        render_page_to_rgba(&build_standalone(false), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_sa_clone =
+        render_page_to_rgba(&build_standalone(true), 0, 72.0, ViewMode::Enhanced).unwrap();
+    assert_eq!(
+        img_sa_clone.rgba, img_sa_direct.rgba,
+        "Standalone Clone with Lens::Invert must match direct Lens::Invert pixel-for-pixel"
+    );
+    let px_sa = pixel_at_mm(&img_sa_clone, 50.0, 50.0);
+    assert!(
+        px_sa[0] < 20 && px_sa[1] > 235 && px_sa[2] > 235,
+        "Standalone Clone with Lens::Invert over Red must produce Cyan, got {px_sa:?}"
+    );
+
+    // 2. Deformed Group(Envelope) containing Clone carrying Lens::Invert over Red backdrop
+    let build_deformed = |use_clone: bool| -> Document {
+        let mut doc = Document::new("CloneLensDeformed", 120.0, 120.0, ColorMode::Rgb, 72.0);
+        doc.add_object(
+            make_rect(10.0, 10.0, 100.0, 100.0, Color::rgba8(255, 0, 0, 255)),
+            None,
+        )
+        .unwrap();
+        let lens_cfg = LensConfig {
+            kind: LensKind::Invert,
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        };
+        let mut lens_obj = if use_clone {
+            let mut master = SceneObject::new(ObjectId(0), "LensMaster", rect_payload(40.0, 40.0))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none());
+            master.visible = false;
+            let master_id = doc.add_object(master, None).unwrap();
+            SceneObject::new(
+                ObjectId(0),
+                "LensClone",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(30.0, 30.0))
+        } else {
+            SceneObject::new(ObjectId(0), "LensDirect", rect_payload(40.0, 40.0))
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(30.0, 30.0))
+        };
+        lens_obj.lens = Some(lens_cfg);
+        let child_id = doc.add_object(lens_obj, None).unwrap();
+        let mut grp = SceneObject::new(ObjectId(0), "EnvGroup", NodePayload::Group(vec![child_id]));
+        grp.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: vec![
+                Point2D::new(30.0, 30.0),
+                Point2D::new(90.0, 30.0),
+                Point2D::new(90.0, 90.0),
+                Point2D::new(30.0, 90.0),
+            ],
+        });
+        doc.add_object(grp, None).unwrap();
+        doc
+    };
+
+    let img_df_direct =
+        render_page_to_rgba(&build_deformed(false), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_df_clone =
+        render_page_to_rgba(&build_deformed(true), 0, 72.0, ViewMode::Enhanced).unwrap();
+    assert_eq!(
+        img_df_clone.rgba, img_df_direct.rgba,
+        "Deformed-group Clone with Lens::Invert must match direct Lens::Invert pixel-for-pixel"
+    );
+    let px_df_ext = pixel_at_mm(&img_df_clone, 82.0, 82.0);
+    assert!(
+        px_df_ext[0] < 20 && px_df_ext[1] > 235 && px_df_ext[2] > 235,
+        "Deformed-group Clone with Lens::Invert must warp lens region to cover (82,82)mm, got {px_df_ext:?}"
+    );
+
+    // 3. Lens::Invert(remove_face=true) over a NodePayload::Clone backdrop exercises rasterize_silhouette_payload
+    let mut doc_rf = Document::new(
+        "CloneBackdropRemoveFace",
+        100.0,
+        100.0,
+        ColorMode::Rgb,
+        72.0,
+    );
+    let mut red_master = SceneObject::new(ObjectId(0), "RedMaster", rect_payload(30.0, 60.0))
+        .with_fill(Fill::Solid(Color::rgba8(240, 20, 20, 255)))
+        .with_outline(OutlineStyle::none());
+    red_master.visible = false;
+    let red_master_id = doc_rf.add_object(red_master, None).unwrap();
+    let red_clone = SceneObject::new(
+        ObjectId(0),
+        "RedCloneBackdrop",
+        NodePayload::Clone {
+            master_id: red_master_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_transform(Affine2D::translate(10.0, 20.0));
+    doc_rf.add_object(red_clone, None).unwrap();
+
+    let mut rf_lens = make_rect(25.0, 30.0, 35.0, 40.0, Color::TRANSPARENT);
+    rf_lens.lens = Some(LensConfig {
+        kind: LensKind::Invert,
+        frozen: false,
+        viewpoint: None,
+        remove_face: true,
+        frozen_snapshot: None,
+    });
+    doc_rf.add_object(rf_lens, None).unwrap();
+
+    let img_rf = render_page_to_rgba(&doc_rf, 0, 72.0, ViewMode::Enhanced).unwrap();
+    let over_clone_red = pixel_at_mm(&img_rf, 32.0, 50.0);
+    assert!(
+        over_clone_red[0] < 40 && over_clone_red[1] > 200 && over_clone_red[2] > 200,
+        "remove_face Lens over Clone backdrop must invert Clone Red -> Cyan, got {over_clone_red:?}"
+    );
+    let over_blank = pixel_at_mm(&img_rf, 50.0, 50.0);
+    assert_eq!(
+        over_blank,
+        [255, 255, 255, 255],
+        "remove_face Lens must leave blank page untouched outside Clone backdrop"
+    );
+}
+
+#[test]
+fn w3_deformed_group_clone_of_group_opacity_matches_direct() {
+    let build_doc = |use_clone: bool| -> Document {
+        let mut doc = Document::new(
+            "DeformedCloneGroupOpacity",
+            120.0,
+            120.0,
+            ColorMode::Rgb,
+            72.0,
+        );
+        doc.add_object(
+            make_rect(0.0, 0.0, 120.0, 120.0, Color::rgba8(0, 0, 255, 255)),
+            None,
+        )
+        .unwrap();
+
+        let child_id = if use_clone {
+            let page_id = doc.pages()[0].id;
+            let hidden_lid = doc
+                .add_layer(page_id, "HiddenMasters", false, MasterLayerScope::None)
+                .unwrap();
+            doc.set_layer_flags(hidden_lid, Some(false), None, None, None)
+                .unwrap();
+            let inner_rect = make_rect(0.0, 0.0, 60.0, 60.0, Color::rgba8(255, 0, 0, 255));
+            let inner_id = doc.add_object(inner_rect, Some(hidden_lid)).unwrap();
+            let master_grp =
+                SceneObject::new(ObjectId(0), "MasterGrp", NodePayload::Group(vec![inner_id]));
+            let master_id = doc.add_object(master_grp, Some(hidden_lid)).unwrap();
+            let mut clone_grp = SceneObject::new(
+                ObjectId(0),
+                "CloneGrp",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(20.0, 20.0));
+            clone_grp.opacity = 0.5;
+            doc.add_object(clone_grp, Some(hidden_lid)).unwrap()
+        } else {
+            let page_id = doc.pages()[0].id;
+            let hidden_lid = doc
+                .add_layer(
+                    page_id,
+                    "DetachedChildStorage",
+                    false,
+                    MasterLayerScope::None,
+                )
+                .unwrap();
+            doc.set_layer_flags(hidden_lid, Some(false), None, None, None)
+                .unwrap();
+            let inner_rect = make_rect(0.0, 0.0, 60.0, 60.0, Color::rgba8(255, 0, 0, 255));
+            let inner_id = doc.add_object(inner_rect, Some(hidden_lid)).unwrap();
+            let mut direct_grp =
+                SceneObject::new(ObjectId(0), "DirectGrp", NodePayload::Group(vec![inner_id]))
+                    .with_transform(Affine2D::translate(20.0, 20.0));
+            direct_grp.opacity = 0.5;
+            doc.add_object(direct_grp, Some(hidden_lid)).unwrap()
+        };
+
+        let mut outer = SceneObject::new(
+            ObjectId(0),
+            "DeformedOuter",
+            NodePayload::Group(vec![child_id]),
+        );
+        outer.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::SingleArc,
+            cage: vec![
+                Point2D::new(20.0, 20.0),
+                Point2D::new(100.0, 26.0),
+                Point2D::new(100.0, 100.0),
+                Point2D::new(20.0, 94.0),
+            ],
+        });
+        doc.add_object(outer, None).unwrap();
+        doc
+    };
+
+    let img_direct = render_page_to_rgba(&build_doc(false), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_clone = render_page_to_rgba(&build_doc(true), 0, 72.0, ViewMode::Enhanced).unwrap();
+    assert_eq!(
+        img_clone.rgba, img_direct.rgba,
+        "Deformed Group(Envelope) containing Clone(Group, opacity=0.5) must match direct pixel-for-pixel"
+    );
+    let center = pixel_at_mm(&img_clone, 55.0, 55.0);
+    assert!(
+        (110..=146).contains(&center[0]) && center[1] < 10 && (110..=146).contains(&center[2]),
+        "Expected 50% Red over Blue (~[128, 0, 128, 255]), got {center:?}"
+    );
+}
+
+#[test]
+fn w3_deformed_group_clone_of_text_with_transparency_matches_direct() {
+    let text_style = TextStyle {
+        font_size_pt: 28.0,
+        fill: Color::rgba8(220, 20, 20, 255),
+        ..TextStyle::default()
+    };
+    let build_doc = |use_clone: bool| -> Document {
+        let mut doc = Document::new(
+            "DeformedCloneTextTransparency",
+            120.0,
+            100.0,
+            ColorMode::Rgb,
+            72.0,
+        );
+        let page_id = doc.pages()[0].id;
+        let hidden_lid = doc
+            .add_layer(page_id, "HiddenStorage", false, MasterLayerScope::None)
+            .unwrap();
+        doc.set_layer_flags(hidden_lid, Some(false), None, None, None)
+            .unwrap();
+        let trans = Effect::Transparency {
+            mode: TransparencyMode::Uniform(0.5),
+            blend_mode: BlendMode::Normal,
+        };
+        let child_id = if use_clone {
+            let master_txt = SceneObject::new(
+                ObjectId(0),
+                "MasterText",
+                NodePayload::ArtisticText(ArtisticText::from_plain("COREE", text_style.clone())),
+            );
+            let master_id = doc.add_object(master_txt, Some(hidden_lid)).unwrap();
+            let mut clone_txt = SceneObject::new(
+                ObjectId(0),
+                "CloneText",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(12.0, 25.0));
+            clone_txt.effects.push(trans);
+            doc.add_object(clone_txt, Some(hidden_lid)).unwrap()
+        } else {
+            let mut direct_txt = SceneObject::new(
+                ObjectId(0),
+                "DirectText",
+                NodePayload::ArtisticText(ArtisticText::from_plain("COREE", text_style.clone())),
+            )
+            .with_transform(Affine2D::translate(12.0, 25.0));
+            direct_txt.effects.push(trans);
+            doc.add_object(direct_txt, Some(hidden_lid)).unwrap()
+        };
+
+        let mut outer = SceneObject::new(
+            ObjectId(0),
+            "DeformedOuter",
+            NodePayload::Group(vec![child_id]),
+        );
+        outer.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::SingleArc,
+            cage: vec![
+                Point2D::new(10.0, 15.0),
+                Point2D::new(110.0, 22.0),
+                Point2D::new(110.0, 82.0),
+                Point2D::new(10.0, 75.0),
+            ],
+        });
+        doc.add_object(outer, None).unwrap();
+        doc
+    };
+
+    let img_direct = render_page_to_rgba(&build_doc(false), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_clone = render_page_to_rgba(&build_doc(true), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let non_white = img_clone
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] < 250 || px[1] < 250 || px[2] < 250)
+        .count();
+    assert!(
+        non_white > 100,
+        "Deformed Clone(ArtisticText) with Effect::Transparency must render visible pixels, got {non_white}"
+    );
+    assert_eq!(
+        img_clone.rgba, img_direct.rgba,
+        "Deformed Group(Envelope) containing Clone(ArtisticText) with Effect::Transparency must match direct pixel-for-pixel"
+    );
+}
+
+#[test]
+fn w3_group_dropshadow_containing_clone_of_text_matches_direct() {
+    let text_style = TextStyle {
+        font_size_pt: 28.0,
+        fill: Color::rgba8(20, 60, 220, 255),
+        ..TextStyle::default()
+    };
+    let build_doc = |use_clone: bool| -> Document {
+        let mut doc = Document::new(
+            "GroupDropShadowCloneText",
+            130.0,
+            100.0,
+            ColorMode::Rgb,
+            72.0,
+        );
+        let page_id = doc.pages()[0].id;
+        let hidden_lid = doc
+            .add_layer(page_id, "HiddenStorage", false, MasterLayerScope::None)
+            .unwrap();
+        doc.set_layer_flags(hidden_lid, Some(false), None, None, None)
+            .unwrap();
+        let child_id = if use_clone {
+            let master_txt = SceneObject::new(
+                ObjectId(0),
+                "MasterText",
+                NodePayload::ArtisticText(ArtisticText::from_plain("SHADOW", text_style.clone())),
+            );
+            let master_id = doc.add_object(master_txt, Some(hidden_lid)).unwrap();
+            let clone_txt = SceneObject::new(
+                ObjectId(0),
+                "CloneText",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(15.0, 30.0));
+            doc.add_object(clone_txt, Some(hidden_lid)).unwrap()
+        } else {
+            let direct_txt = SceneObject::new(
+                ObjectId(0),
+                "DirectText",
+                NodePayload::ArtisticText(ArtisticText::from_plain("SHADOW", text_style.clone())),
+            )
+            .with_transform(Affine2D::translate(15.0, 30.0));
+            doc.add_object(direct_txt, Some(hidden_lid)).unwrap()
+        };
+
+        let mut grp = SceneObject::new(
+            ObjectId(0),
+            "ShadowGroup",
+            NodePayload::Group(vec![child_id]),
+        );
+        grp.effects.push(Effect::DropShadow {
+            dx_mm: 6.0,
+            dy_mm: 6.0,
+            blur_mm: 2.0,
+            opacity: 0.8,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Middle,
+        });
+        doc.add_object(grp, None).unwrap();
+        doc
+    };
+
+    let img_direct = render_page_to_rgba(&build_doc(false), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let img_clone = render_page_to_rgba(&build_doc(true), 0, 72.0, ViewMode::Enhanced).unwrap();
+    let dark_shadow = img_clone
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|px| px[0] < 200 && px[1] < 200 && px[2] < 200 && px[2].abs_diff(px[0]) < 20)
+        .count();
+    assert!(
+        dark_shadow > 50,
+        "Group(DropShadow) containing Clone(ArtisticText) must cast visible shadow pixels, got {dark_shadow}"
+    );
+    assert_eq!(
+        img_clone.rgba, img_direct.rgba,
+        "Group(DropShadow) containing Clone(ArtisticText) must cast exact same shadow as direct"
+    );
+}
+
+#[test]
+fn w3_linked_paragraph_frame_dirty_tile_cache_invalidation_matches_direct_render() {
+    use coree_core::{CommandHistory, CommandOp, DocumentInvalidation};
+
+    let apply_inv =
+        |cache: &mut DirtyTileCache, doc: &Document, inv: &DocumentInvalidation| match inv {
+            DocumentInvalidation::All => cache.mark_all_dirty(),
+            DocumentInvalidation::Targeted {
+                object_ids,
+                dirty_rects_mm,
+            } => {
+                for &r in dirty_rects_mm {
+                    cache.mark_dirty(r);
+                }
+                for &id in object_ids {
+                    cache.mark_object_dirty(doc, id);
+                }
+            }
+        };
+
+    // 1. Exact Challenger repro: Frame2 on-screen (5,5), Frame1 off-screen (250,250) -> EditText via CommandHistory
+    {
+        let mut doc = Document::new("ChallengerRepro", 320.0, 320.0, ColorMode::Rgb, 96.0);
+        let style = TextStyle {
+            font_size_pt: 14.0,
+            fill: Color::rgba8(20, 20, 20, 255),
+            ..TextStyle::default()
+        };
+        let f2_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Frame2",
+                    NodePayload::ParagraphText(ParagraphText::new(
+                        "",
+                        Vec2D::new(55.0, 55.0),
+                        style.clone(),
+                    )),
+                )
+                .with_transform(Affine2D::translate(5.0, 5.0)),
+                None,
+            )
+            .unwrap();
+        let mut p1 = ParagraphText::new(
+            "FIRST WORD SECOND THIRD FOURTH FIFTH SIXTH SEVENTH",
+            Vec2D::new(25.0, 12.0),
+            style.clone(),
+        );
+        p1.linked_next_frame = Some(f2_id);
+        let f1_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Frame1", NodePayload::ParagraphText(p1))
+                    .with_transform(Affine2D::translate(250.0, 250.0)),
+                None,
+            )
+            .unwrap();
+
+        let vp = Viewport::for_export(256, 256, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        let mut renderer = SceneRenderer::new();
+        let initial = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        let initial_ink = initial
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] < 240 || px[1] < 240 || px[2] < 240)
+            .count();
+        assert!(
+            initial_ink > 100,
+            "Frame2 must initially display overflow text from Frame1, got {initial_ink}"
+        );
+
+        let mut hist = CommandHistory::default();
+        let mut p1_short = ParagraphText::new("SHORT", Vec2D::new(25.0, 12.0), style);
+        p1_short.linked_next_frame = Some(f2_id);
+        hist.execute(
+            &mut doc,
+            CommandOp::EditText {
+                id: f1_id,
+                payload: NodePayload::ParagraphText(p1_short),
+            },
+        )
+        .unwrap();
+
+        let inv = hist.last_invalidation().clone();
+        match &inv {
+            DocumentInvalidation::Targeted { object_ids, .. } => {
+                assert!(
+                    object_ids.contains(&f1_id) && object_ids.contains(&f2_id),
+                    "Targeted invalidation must include both Frame1 and Frame2: {object_ids:?}"
+                );
+            }
+            DocumentInvalidation::All => panic!("Expected Targeted invalidation"),
+        }
+        apply_inv(&mut cache, &doc, &inv);
+        assert!(
+            cache.dirty_tile_count() >= 1,
+            "dirty_tile_count must be >= 1 after Targeted invalidation"
+        );
+
+        let tiled = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+        let direct = render_page_to_rgba(&doc, 0, 96.0, ViewMode::Enhanced).unwrap();
+        let diff_px = (0..vp.height_px)
+            .flat_map(|y| (0..vp.width_px).map(move |x| (x, y)))
+            .filter(|&(x, y)| tiled.get_pixel(x, y).unwrap() != direct.pixel(x, y))
+            .count();
+        assert_eq!(
+            diff_px, 0,
+            "Edited linked Frame1 must leave 0 stale diff pixels in Frame2 vs direct render"
+        );
+    }
+
+    // 2. 3-frame chain Frame1 (offscreen) -> Frame2 (tile 0,0) -> Frame3 (tile 1,0):
+    //    EditText, Unlink, DeleteObjects, and Undo/Redo all maintain 0 stale diff pixels.
+    {
+        let mut doc = Document::new("Chain3Frame", 320.0, 320.0, ColorMode::Rgb, 96.0);
+        let style = TextStyle {
+            font_size_pt: 14.0,
+            fill: Color::rgba8(10, 40, 160, 255),
+            ..TextStyle::default()
+        };
+        let f3_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "F3",
+                    NodePayload::ParagraphText(ParagraphText::new(
+                        "",
+                        Vec2D::new(50.0, 50.0),
+                        style.clone(),
+                    )),
+                )
+                .with_transform(Affine2D::translate(75.0, 5.0)),
+                None,
+            )
+            .unwrap();
+        let mut p2 = ParagraphText::new("", Vec2D::new(50.0, 50.0), style.clone());
+        p2.linked_next_frame = Some(f3_id);
+        let f2_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "F2", NodePayload::ParagraphText(p2))
+                    .with_transform(Affine2D::translate(5.0, 5.0)),
+                None,
+            )
+            .unwrap();
+        let mut p1 = ParagraphText::new(
+            "ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE TEN ELEVEN TWELVE THIRTEEN FOURTEEN FIFTEEN SIXTEEN SEVENTEEN EIGHTEEN",
+            Vec2D::new(25.0, 12.0),
+            style.clone(),
+        );
+        p1.linked_next_frame = Some(f2_id);
+        let f1_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "F1", NodePayload::ParagraphText(p1))
+                    .with_transform(Affine2D::translate(250.0, 250.0)),
+                None,
+            )
+            .unwrap();
+
+        let vp = Viewport::for_export(512, 256, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        let mut renderer = SceneRenderer::new();
+        let _ = cache.render_viewport(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+
+        let assert_zero_diff = |cache: &mut DirtyTileCache,
+                                renderer: &mut SceneRenderer,
+                                doc: &Document,
+                                label: &str| {
+            let tiled = cache.render_viewport(doc, &vp, ViewMode::Enhanced, &opts, renderer);
+            let mut direct_backend = TinySkiaBackend::new(vp.width_px, vp.height_px).unwrap();
+            renderer.render_document(doc, &vp, ViewMode::Enhanced, &opts, &mut direct_backend);
+            let direct = direct_backend.into_rgba();
+            assert_eq!(
+                count_rgba_diff(&direct, &tiled),
+                0,
+                "[{label}] 3-frame linked invalidation must yield 0 diff pixels"
+            );
+        };
+
+        let mut hist = CommandHistory::default();
+
+        // Unlink F1 -> F2
+        let mut p1_unlinked = ParagraphText::new("ONLY F1", Vec2D::new(25.0, 12.0), style);
+        p1_unlinked.linked_next_frame = None;
+        hist.execute(
+            &mut doc,
+            CommandOp::EditText {
+                id: f1_id,
+                payload: NodePayload::ParagraphText(p1_unlinked),
+            },
+        )
+        .unwrap();
+        apply_inv(&mut cache, &doc, hist.last_invalidation());
+        assert_zero_diff(&mut cache, &mut renderer, &doc, "unlink execute");
+
+        // Undo unlink
+        hist.undo(&mut doc).unwrap();
+        apply_inv(&mut cache, &doc, hist.last_invalidation());
+        assert_zero_diff(&mut cache, &mut renderer, &doc, "unlink undo");
+
+        // Delete F1
+        hist.execute(&mut doc, CommandOp::DeleteObjects { ids: vec![f1_id] })
+            .unwrap();
+        apply_inv(&mut cache, &doc, hist.last_invalidation());
+        assert_zero_diff(&mut cache, &mut renderer, &doc, "delete execute");
+
+        // Undo delete
+        hist.undo(&mut doc).unwrap();
+        apply_inv(&mut cache, &doc, hist.last_invalidation());
+        assert_zero_diff(&mut cache, &mut renderer, &doc, "delete undo");
     }
 }

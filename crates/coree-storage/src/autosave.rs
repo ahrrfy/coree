@@ -1911,9 +1911,10 @@ mod tests {
         let start = std::time::Instant::now();
         let delta_id = db.enqueue_differential_autosave(patch).unwrap();
         let enqueue_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let limit_ms: f64 = if cfg!(debug_assertions) { 25.0 } else { 2.0 };
         assert!(
-            enqueue_ms < 2.0,
-            "UI-thread differential enqueue took {enqueue_ms:.3} ms (expected < 2.0 ms)"
+            enqueue_ms < limit_ms,
+            "UI-thread differential enqueue took {enqueue_ms:.3} ms (expected < {limit_ms:.1} ms)"
         );
         assert!(!delta_id.is_empty());
 

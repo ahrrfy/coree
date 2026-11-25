@@ -22,6 +22,7 @@ pub mod lens;
 pub mod math;
 pub mod selection;
 pub mod style;
+pub mod stylus;
 pub mod table;
 pub mod text;
 pub mod viewport;
@@ -51,7 +52,7 @@ pub use document::{
     DocumentMetadata, GridConfig, Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload,
     Page, PathMetrics, PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, PixelDepth,
     PixelLayer, PowerClipFitMode, RasterAsset, RasterLayerData, SceneObject, SpatialIndex,
-    SymbolDef, UnknownCdrChunk, ZOrderOp, RASTER_TILE_DIM,
+    SpatialObjectEntry, SymbolDef, UnknownCdrChunk, ZOrderOp, RASTER_TILE_DIM,
 };
 pub use effects::{
     BevelStyle, ContourMode, DistortKind, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
@@ -78,11 +79,11 @@ pub use hit_test::{
 pub use icc::{
     adapt_xyz_bradford, apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile,
     bradford_adaptation_matrix, convert_cmyk_to_rgb_icc, convert_rgb_between_builtin_profiles,
-    convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2, generate_minimal_srgb_icc_v2,
-    is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk, BuiltinIccProfile, IccColorPipeline,
-    IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass, IccProfileHeader, IccTagEntry,
-    IccToneCurve, IccV4Lut, RenderingIntent, SoftProofLut3D, BRADFORD_M, BRADFORD_M_INV,
-    MAX_ICC_PROFILE_BYTES,
+    convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2, generate_minimal_display_p3_icc_v2,
+    generate_minimal_srgb_icc_v2, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk,
+    BuiltinIccProfile, DisplayTransformLut3D, IccColorPipeline, IccColorSpace, IccLut, IccPcs,
+    IccProfile, IccProfileClass, IccProfileHeader, IccTagEntry, IccToneCurve, IccV4Lut,
+    RenderingIntent, SoftProofLut3D, BRADFORD_M, BRADFORD_M_INV, MAX_ICC_PROFILE_BYTES,
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
@@ -92,6 +93,7 @@ pub use style::{
     ArrowheadStyle, BlendMode, Fill, GradientStop, LineCap, LineJoin, MeshNode, ObjectStyle,
     OutlineStyle, PostScriptFillPreset, HAIRLINE_WIDTH_MM,
 };
+pub use stylus::{PressureCurve, StylusSample};
 pub use table::{TableCell, VectorTable};
 pub use text::{
     ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphListStyle, ParagraphTabAlign,

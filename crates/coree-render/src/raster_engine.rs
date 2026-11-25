@@ -12,7 +12,7 @@ use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64, MM_PER_INCH};
 use coree_core::{
     Color, ColorMode, CowTile, Document, IccColorPipeline, ObjectId, PixelDepth, Point2D,
-    RasterAsset, RasterFilter, Rect2D, RASTER_TILE_DIM,
+    PressureCurve, RasterAsset, RasterFilter, Rect2D, StylusSample, RASTER_TILE_DIM,
 };
 use image::{imageops::FilterType, ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
@@ -374,6 +374,42 @@ pub fn apply_cutout_background_removal(
     }
 }
 
+/// Stylus dab input point carrying normalized pressure and pen tilt/twist angles (`IMP-03`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StylusPoint {
+    pub pos: Point2D,
+    pub pressure: f32,
+    pub tilt_x_deg: f32,
+    pub tilt_y_deg: f32,
+    pub twist_deg: f32,
+}
+
+impl StylusPoint {
+    /// Creates a neutral full-pressure circular dab point (for mouse / legacy callers).
+    #[must_use]
+    pub const fn uniform(pos: Point2D) -> Self {
+        Self {
+            pos,
+            pressure: 1.0,
+            tilt_x_deg: 0.0,
+            tilt_y_deg: 0.0,
+            twist_deg: 0.0,
+        }
+    }
+
+    /// Converts a [`StylusSample`] through `curve` at raster coordinate `pos`.
+    #[must_use]
+    pub fn from_sample(pos: Point2D, sample: StylusSample, curve: &PressureCurve) -> Self {
+        Self {
+            pos,
+            pressure: sample.mapped_pressure(curve) as f32,
+            tilt_x_deg: sample.tilt_deg[0],
+            tilt_y_deg: sample.tilt_deg[1],
+            twist_deg: sample.twist_deg,
+        }
+    }
+}
+
 /// Paints a soft/hard brush stroke along `points` (in pixel coordinates) onto `asset`.
 pub fn paint_brush_stroke(
     asset: &mut RasterAsset,
@@ -396,6 +432,20 @@ pub fn paint_brush_stroke_masked(
     opacity: f32,
     mask: Option<&RasterMask>,
 ) {
+    let sp: Vec<StylusPoint> = points.iter().copied().map(StylusPoint::uniform).collect();
+    paint_brush_stroke_stylus(asset, &sp, radius_px, hardness, color, opacity, mask);
+}
+
+/// Paints a pressure- & tilt/twist-sensitive brush stroke optionally restricted by a [`RasterMask`].
+pub fn paint_brush_stroke_stylus(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+    color: Color,
+    opacity: f32,
+    mask: Option<&RasterMask>,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.8).clamp(0.0, 1.0);
     let op = sanitize_f32(opacity, 1.0).clamp(0.0, 1.0);
@@ -403,15 +453,17 @@ pub fn paint_brush_stroke_masked(
         return;
     }
     let [sr, sg, sb, sa] = color.to_rgba_f32();
-    let base_alpha = sa * op;
-    let dabs = sample_stroke_dabs(points, (r * 0.25).max(1.0));
+    let dabs = sample_stylus_dabs(points, (r * 0.25).max(1.0));
 
     for dab in dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+        let base_alpha = sa * op * (0.2 + 0.8 * p);
+        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, asset.width, asset.height);
         for y in y0..y1 {
             for x in x0..x1 {
-                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
-                let falloff = brush_hardness_falloff(d, r, hard);
+                let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
+                let falloff = brush_hardness_falloff(d, dab_r, hard);
                 if falloff <= 1e-5 {
                     continue;
                 }
@@ -428,18 +480,32 @@ pub fn paint_brush_stroke_masked(
 
 /// Erases pixel alpha smoothly along `points` onto `asset` (CoW-tile aware).
 pub fn erase_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32, hardness: f32) {
+    let sp: Vec<StylusPoint> = points.iter().copied().map(StylusPoint::uniform).collect();
+    erase_stroke_stylus(asset, &sp, radius_px, hardness);
+}
+
+/// Erases pixel alpha along pressure- & tilt-sensitive [`StylusPoint`]s onto `asset`.
+pub fn erase_stroke_stylus(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.8).clamp(0.0, 1.0);
     if points.is_empty() || !is_valid_raster_asset(asset) {
         return;
     }
-    let dabs = sample_stroke_dabs(points, (r * 0.25).max(1.0));
+    let dabs = sample_stylus_dabs(points, (r * 0.25).max(1.0));
     for dab in dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+        let op_scale = 0.2 + 0.8 * p;
+        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, asset.width, asset.height);
         for y in y0..y1 {
             for x in x0..x1 {
-                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
-                let falloff = brush_hardness_falloff(d, r, hard);
+                let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
+                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale;
                 if falloff <= 1e-5 {
                     continue;
                 }
@@ -460,26 +526,45 @@ pub fn clone_stamp_stroke(
     radius_px: f32,
     hardness: f32,
 ) {
+    let sp: Vec<StylusPoint> = dst_points
+        .iter()
+        .copied()
+        .map(StylusPoint::uniform)
+        .collect();
+    clone_stamp_stroke_stylus(asset, src_origin, &sp, radius_px, hardness);
+}
+
+/// Pressure- & tilt-sensitive Clone Stamp brush along [`StylusPoint`]s onto `asset`.
+pub fn clone_stamp_stroke_stylus(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.8).clamp(0.0, 1.0);
     if !src_origin.is_finite() || dst_points.is_empty() || !is_valid_raster_asset(asset) {
         return;
     }
-    let dabs = sample_stroke_dabs(dst_points, (r * 0.25).max(1.0));
+    let dabs = sample_stylus_dabs(dst_points, (r * 0.25).max(1.0));
     let Some(first_dab) = dabs.first().copied() else {
         return;
     };
     let snapshot = asset.clone();
-    let offset = src_origin - first_dab;
+    let offset = src_origin - first_dab.pos;
     let w = asset.width;
     let h = asset.height;
 
     for dab in dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, w, h);
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+        let op_scale = 0.2 + 0.8 * p;
+        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, w, h);
         for y in y0..y1 {
             for x in x0..x1 {
-                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
-                let falloff = brush_hardness_falloff(d, r, hard);
+                let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
+                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale;
                 if falloff <= 1e-5 {
                     continue;
                 }
@@ -501,12 +586,23 @@ pub fn clone_stamp_stroke(
 
 /// Smudges existing pixel colors along `points` carrying a paint pickup buffer (CoW-tile + 16-bit).
 pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32, strength: f32) {
+    let sp: Vec<StylusPoint> = points.iter().copied().map(StylusPoint::uniform).collect();
+    smudge_stroke_stylus(asset, &sp, radius_px, strength);
+}
+
+/// Pressure-sensitive Smudge brush along [`StylusPoint`]s onto `asset`.
+pub fn smudge_stroke_stylus(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    strength: f32,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, 128.0);
     let str_f = sanitize_f32(strength, 0.5).clamp(0.0, 1.0);
     if points.len() < 2 || str_f <= 1e-5 || !is_valid_raster_asset(asset) {
         return;
     }
-    let dabs = sample_stroke_dabs(points, (r * 0.25).max(1.0));
+    let dabs = sample_stylus_dabs(points, (r * 0.25).max(1.0));
     if dabs.len() < 2 {
         return;
     }
@@ -517,8 +613,7 @@ pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32
     let w_i64 = i64::from(asset.width);
     let h_i64 = i64::from(asset.height);
 
-    // Seed pickup from first dab position
-    let seed = dabs[0];
+    let seed = dabs[0].pos;
     let seed_x = seed.x.round().clamp(-1e9, 1e9) as i64;
     let seed_y = seed.y.round().clamp(-1e9, 1e9) as i64;
     for dy in -rad_i..=rad_i {
@@ -532,8 +627,11 @@ pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32
     }
 
     for dab in dabs.iter().skip(1) {
-        let cx = dab.x.round().clamp(-1e9, 1e9) as i64;
-        let cy = dab.y.round().clamp(-1e9, 1e9) as i64;
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, 128.0);
+        let eff_str = str_f * (0.2 + 0.8 * p);
+        let cx = dab.pos.x.round().clamp(-1e9, 1e9) as i64;
+        let cy = dab.pos.y.round().clamp(-1e9, 1e9) as i64;
         if cx + rad_i64 < 0 || cx - rad_i64 >= w_i64 || cy + rad_i64 < 0 || cy - rad_i64 >= h_i64 {
             continue;
         }
@@ -548,7 +646,7 @@ pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32
                     continue;
                 }
                 let dist = ((dx * dx + dy * dy) as f32).sqrt();
-                let w = brush_hardness_falloff(dist, r, 0.25) * str_f;
+                let w = brush_hardness_falloff(dist, dab_r, 0.25) * eff_str;
                 if w <= 1e-5 {
                     continue;
                 }
@@ -559,7 +657,7 @@ pub fn smudge_stroke(asset: &mut RasterAsset, points: &[Point2D], radius_px: f32
                 let mut next = [0.0_f32; 4];
                 for c in 0..4 {
                     next[c] = (cur[c] * (1.0 - w) + pickup[k][c] * w).clamp(0.0, 1.0);
-                    pickup[k][c] = pickup[k][c] * str_f + cur[c] * (1.0 - str_f);
+                    pickup[k][c] = pickup[k][c] * eff_str + cur[c] * (1.0 - eff_str);
                 }
                 asset.write_pixel_f32(px_i as u32, py as u32, next);
             }
@@ -719,6 +817,53 @@ pub fn apply_healing_stroke(
             }
         }
     }
+}
+
+/// Seamless Poisson Healing Brush along pressure-sensitive [`StylusPoint`]s.
+pub fn apply_healing_stroke_stylus(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+) {
+    let avg_p = if dst_points.is_empty() {
+        1.0
+    } else {
+        dst_points
+            .iter()
+            .map(|p| sanitize_f32(p.pressure, 1.0).clamp(0.0, 1.0))
+            .sum::<f32>()
+            / (dst_points.len() as f32)
+    };
+    let pts: Vec<Point2D> = dst_points.iter().map(|p| p.pos).collect();
+    let eff_r = (radius_px * (0.25 + 0.75 * avg_p)).clamp(1.0, MAX_BRUSH_RADIUS_PX);
+    apply_healing_stroke(asset, src_origin, &pts, eff_r, hardness);
+}
+
+/// Pressure-sensitive Dodge or Burn stroke along [`StylusPoint`]s.
+pub fn apply_dodge_burn_stroke_stylus(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+    mode: DodgeBurnMode,
+    range: ToneRange,
+    exposure: f32,
+) {
+    let avg_p = if points.is_empty() {
+        1.0
+    } else {
+        points
+            .iter()
+            .map(|p| sanitize_f32(p.pressure, 1.0).clamp(0.0, 1.0))
+            .sum::<f32>()
+            / (points.len() as f32)
+    };
+    let pts: Vec<Point2D> = points.iter().map(|p| p.pos).collect();
+    let eff_r = (radius_px * (0.25 + 0.75 * avg_p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+    let eff_exp = (exposure * (0.2 + 0.8 * avg_p)).clamp(0.0, 1.0);
+    apply_dodge_burn_stroke(asset, &pts, eff_r, hardness, mode, range, eff_exp);
 }
 
 /// Applies photographic Dodge (lighten) or Burn (darken) exposure adjustment along `points`,
@@ -2087,6 +2232,68 @@ fn brush_hardness_falloff(dist: f32, radius: f32, hardness: f32) -> f32 {
     }
 }
 
+fn dab_elliptical_dist(px_x: f64, px_y: f64, dab: &StylusPoint) -> f32 {
+    let dx = (px_x - dab.pos.x) as f32;
+    let dy = (px_y - dab.pos.y) as f32;
+    let tx = sanitize_f32(dab.tilt_x_deg, 0.0).clamp(-85.0, 85.0);
+    let ty = sanitize_f32(dab.tilt_y_deg, 0.0).clamp(-85.0, 85.0);
+    let tilt_mag = tx.hypot(ty).clamp(0.0, 85.0);
+    let twist = sanitize_f32(dab.twist_deg, 0.0);
+    if tilt_mag <= 1.0 && twist.abs() <= 1e-3 {
+        return dx.hypot(dy);
+    }
+    let angle = ty.atan2(tx) + twist.to_radians();
+    let (s, c) = angle.sin_cos();
+    let lx = dx * c + dy * s;
+    let ly = -dx * s + dy * c;
+    let aspect = 1.0 + tilt_mag / 60.0;
+    (lx / aspect).hypot(ly)
+}
+
+fn sample_stylus_dabs(points: &[StylusPoint], step: f32) -> Vec<StylusPoint> {
+    let finite: Vec<StylusPoint> = points
+        .iter()
+        .copied()
+        .filter(|p| p.pos.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return Vec::new();
+    }
+    let step_f64 = f64::from(step.max(0.5));
+    let mut dabs = Vec::with_capacity(finite.len());
+    dabs.push(finite[0]);
+    for win in finite.windows(2) {
+        if dabs.len() >= MAX_STROKE_DABS {
+            break;
+        }
+        let a = win[0];
+        let b = win[1];
+        let dist = a.pos.distance_to(b.pos);
+        if !dist.is_finite() || dist <= 1e-6 {
+            continue;
+        }
+        let remaining = MAX_STROKE_DABS.saturating_sub(dabs.len());
+        let raw_steps = (dist / step_f64).ceil();
+        let steps = if !raw_steps.is_finite() || raw_steps >= remaining as f64 {
+            remaining.max(1)
+        } else {
+            (raw_steps as usize).max(1)
+        };
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let tf = t as f32;
+            dabs.push(StylusPoint {
+                pos: a.pos.lerp(b.pos, t),
+                pressure: a.pressure + (b.pressure - a.pressure) * tf,
+                tilt_x_deg: a.tilt_x_deg + (b.tilt_x_deg - a.tilt_x_deg) * tf,
+                tilt_y_deg: a.tilt_y_deg + (b.tilt_y_deg - a.tilt_y_deg) * tf,
+                twist_deg: a.twist_deg + (b.twist_deg - a.twist_deg) * tf,
+            });
+        }
+    }
+    dabs
+}
+
 fn sample_stroke_dabs(points: &[Point2D], step: f32) -> Vec<Point2D> {
     let finite: Vec<Point2D> = points.iter().copied().filter(|p| p.is_finite()).collect();
     if finite.is_empty() {
@@ -2321,6 +2528,63 @@ mod tests {
         assert_ne!(
             got, naive,
             "convert_raster_color_mode must route via pipeline.srgb_to_cmyk, not naive to_cmyk()"
+        );
+    }
+
+    #[test]
+    fn stylus_brush_stroke_modulates_radius_opacity_and_tilt() {
+        let mut light =
+            RasterAsset::new(128, 128, vec![0u8; 128 * 128 * 4], 96.0, ColorMode::Rgb).unwrap();
+        let mut heavy = light.clone();
+
+        paint_brush_stroke_stylus(
+            &mut light,
+            &[StylusPoint {
+                pos: Point2D::new(64.0, 64.0),
+                pressure: 0.2,
+                tilt_x_deg: 0.0,
+                tilt_y_deg: 0.0,
+                twist_deg: 0.0,
+            }],
+            20.0,
+            0.8,
+            Color::rgba8(220, 40, 20, 255),
+            1.0,
+            None,
+        );
+        paint_brush_stroke_stylus(
+            &mut heavy,
+            &[StylusPoint {
+                pos: Point2D::new(64.0, 64.0),
+                pressure: 1.0,
+                tilt_x_deg: 45.0,
+                tilt_y_deg: 0.0,
+                twist_deg: 0.0,
+            }],
+            20.0,
+            0.8,
+            Color::rgba8(220, 40, 20, 255),
+            1.0,
+            None,
+        );
+
+        let count_painted = |a: &RasterAsset| -> usize {
+            a.to_rgba8_vec()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|px| px[3] > 0)
+                .count()
+        };
+        let light_px = count_painted(&light);
+        let heavy_px = count_painted(&heavy);
+        assert!(
+            heavy_px > light_px * 2,
+            "Higher pressure + tilt must cover significantly more pixels (light={light_px}, heavy={heavy_px})"
+        );
+        assert!(
+            heavy.read_pixel_rgba8(64, 64).unwrap()[3] > light.read_pixel_rgba8(64, 64).unwrap()[3],
+            "Higher pressure must yield higher center alpha"
         );
     }
 }

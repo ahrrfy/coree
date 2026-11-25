@@ -35,8 +35,8 @@ use coree_core::{
     hit_test_node, hit_test_powerclip_contents_rect, hit_test_rect, Affine2D, ArtisticMedia,
     ArtisticMediaStyle, BSplineCurve, BezierPath, CommandOp, DynamicGuideLine, Effect, Fill,
     GuideOrientation, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, ParametricShape,
-    PathNode, Point2D, Rect2D, SceneObject, SnapEngine, Subpath, TransformMode, TransparencyMode,
-    Vec2D,
+    PathNode, Point2D, PressureCurve, Rect2D, SceneObject, SnapEngine, StylusSample, Subpath,
+    TransformMode, TransparencyMode, Vec2D,
 };
 
 /// Trait implemented by modular tool state machines.
@@ -234,6 +234,7 @@ pub enum ActiveDragState {
     },
     DrawingStroke {
         points_mm: Vec<Point2D>,
+        samples: Vec<StylusSample>,
     },
     DraggingRulerGuide {
         horizontal: bool,
@@ -579,6 +580,15 @@ impl ToolCore {
                     }
                 }
             }
+            ToolId::Zoom => {
+                let local = ctx.viewport.world_to_screen(pt);
+                let factor = if ev.modifiers.shift { 0.8 } else { 1.25 };
+                return ToolOutput::actions(vec![ToolActionRequest::ZoomAtScreen {
+                    screen_px: local,
+                    factor,
+                    one_shot_complete: true,
+                }]);
+            }
             ToolId::ShapeNode => {
                 if let Some((nref, part, _)) = hit_editable_bezier_node_or_handle_world(
                     ctx.document,
@@ -736,7 +746,7 @@ impl ToolCore {
             let local = ctx.viewport.world_to_screen(pt);
             return ToolOutput::actions(vec![ToolActionRequest::ZoomAtScreen {
                 screen_px: local,
-                factor: 1.0 / 1.5,
+                factor: 0.8,
                 one_shot_complete: true,
             }]);
         }
@@ -1628,6 +1638,7 @@ impl ToolCore {
                 }
                 self.drag_state = ActiveDragState::DrawingStroke {
                     points_mm: vec![pt],
+                    samples: vec![ev.stylus],
                 };
             }
             _ => {
@@ -1952,22 +1963,27 @@ impl ToolCore {
                     let local_r = sculpt_radius * scale_est;
                     let lp = inv.transform_point(pt);
                     let prev_lp = inv.transform_point(*last_mm);
+                    let p_scale = if ev.stylus.has_pressure {
+                        let curve = PressureCurve::from_json(&ctx.settings.pressure_curve_json);
+                        ev.stylus.mapped_pressure(&curve).clamp(0.1, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let eff_strength = (sculpt_strength * p_scale).clamp(0.01, 1.0);
                     match active_tool {
-                        ToolId::Smooth => draft_path.smooth_near(lp, local_r, sculpt_strength),
-                        ToolId::Smear => draft_path.smear_near(lp, lp - prev_lp, local_r),
+                        ToolId::Smooth => draft_path.smooth_near(lp, local_r, eff_strength),
+                        ToolId::Smear => {
+                            draft_path.smear_near(lp, (lp - prev_lp) * p_scale, local_r)
+                        }
                         ToolId::Twirl => {
                             let sign = if shift { -1.0 } else { 1.0 };
-                            draft_path.twirl_near(
-                                lp,
-                                local_r,
-                                sign * (0.25 * sculpt_strength + 0.08),
-                            );
+                            draft_path.twirl_near(lp, local_r, sign * (0.25 * eff_strength + 0.08));
                         }
                         ToolId::AttractRepel => {
-                            draft_path.attract_repel_near(lp, local_r, sculpt_strength, !shift);
+                            draft_path.attract_repel_near(lp, local_r, eff_strength, !shift);
                         }
                         ToolId::Roughen => {
-                            let amp = (local_r * 0.16 * sculpt_strength).max(0.35);
+                            let amp = (local_r * 0.16 * eff_strength).max(0.35);
                             draft_path.roughen_near(
                                 lp,
                                 local_r,
@@ -2258,7 +2274,7 @@ impl ToolCore {
                 *d_ctrl = ctrl;
                 *d_shift = shift;
             }
-            ActiveDragState::DrawingStroke { points_mm } => {
+            ActiveDragState::DrawingStroke { points_mm, samples } => {
                 let next_pt =
                     if active_tool == ToolId::TwoPointLine && ctrl && !points_mm.is_empty() {
                         constrain_line_15deg(points_mm[0], pt)
@@ -2267,11 +2283,15 @@ impl ToolCore {
                     };
                 if active_tool == ToolId::TwoPointLine && points_mm.len() >= 2 {
                     *points_mm.last_mut().expect("len >= 2") = next_pt;
+                    if let Some(last_s) = samples.last_mut() {
+                        *last_s = ev.stylus;
+                    }
                 } else if points_mm
                     .last()
                     .is_none_or(|last| last.distance_to(next_pt) > 0.35)
                 {
                     points_mm.push(next_pt);
+                    samples.push(ev.stylus);
                 }
             }
             ActiveDragState::Idle | ActiveDragState::DraggingRulerGuide { .. } => {}
@@ -2411,7 +2431,8 @@ impl ToolCore {
                 current_mm,
             } => {
                 let rect = Rect2D::from_points(start_mm, current_mm);
-                if rect.width() >= 1.0 && rect.height() >= 1.0 {
+                let px_per_mm = ctx.viewport.logical_px_per_mm();
+                if rect.width() * px_per_mm >= 6.0 && rect.height() * px_per_mm >= 6.0 {
                     ToolOutput::actions(vec![ToolActionRequest::ZoomFitRect {
                         rect_mm: rect,
                         margin_px: 12.0,
@@ -2419,7 +2440,7 @@ impl ToolCore {
                     }])
                 } else {
                     let local = ctx.viewport.world_to_screen(pt);
-                    let factor = if shift { 1.0 / 1.5 } else { 1.5 };
+                    let factor = if shift { 0.8 } else { 1.25 };
                     ToolOutput::actions(vec![ToolActionRequest::ZoomAtScreen {
                         screen_px: local,
                         factor,
@@ -2787,8 +2808,8 @@ impl ToolCore {
                 current_mm,
                 ..
             } => self.finish_drawn_box(ctx, active_tool, start_mm, current_mm, ctrl, shift),
-            ActiveDragState::DrawingStroke { points_mm } => {
-                self.finish_drawn_stroke(ctx, active_tool, points_mm, shift)
+            ActiveDragState::DrawingStroke { points_mm, samples } => {
+                self.finish_drawn_stroke(ctx, active_tool, points_mm, samples, shift)
             }
             ActiveDragState::Idle | ActiveDragState::DraggingRulerGuide { .. } => {
                 self.handle_zero_drag_click(ctx, pt, shift)
@@ -3054,11 +3075,43 @@ impl ToolCore {
         ctx: &ToolReadContext<'_>,
         tool: ToolId,
         points: Vec<Point2D>,
+        mut samples: Vec<StylusSample>,
         shift: bool,
     ) -> ToolOutput {
+        if samples.len() != points.len() {
+            samples.resize(points.len(), StylusSample::DEFAULT);
+        }
+        let curve = PressureCurve::from_json(&ctx.settings.pressure_curve_json);
+        let any_pressure = samples.iter().any(|s| s.has_pressure);
+        let eraser_tip = samples.iter().any(|s| s.is_eraser);
+        let effective_tool = if eraser_tip {
+            match tool {
+                ToolId::Freehand
+                | ToolId::ArtisticMedia
+                | ToolId::LiveSketch
+                | ToolId::SmartDrawing => ToolId::Eraser,
+                ToolId::BitmapBrush | ToolId::CloneStamp | ToolId::Smudge => ToolId::BitmapEraser,
+                _ => tool,
+            }
+        } else {
+            tool
+        };
+        let mapped_samples: Vec<StylusSample> = samples
+            .iter()
+            .map(|&s| {
+                if s.has_pressure {
+                    let mut out = s;
+                    out.pressure = s.mapped_pressure(&curve) as f32;
+                    out
+                } else {
+                    s
+                }
+            })
+            .collect();
+
         if points.len() < 2 {
             if points.len() == 1 {
-                match tool {
+                match effective_tool {
                     ToolId::VirtualSegmentDelete => {
                         let ops = build_virtual_segment_delete_stroke_ops(ctx, &points);
                         if !ops.is_empty() {
@@ -3074,8 +3127,9 @@ impl ToolCore {
                     | ToolId::CloneStamp
                     | ToolId::Smudge => {
                         return ToolOutput::actions(vec![ToolActionRequest::ApplyRasterStroke {
-                            tool,
+                            tool: effective_tool,
                             points_mm: points,
+                            samples,
                         }]);
                     }
                     _ => {}
@@ -3083,7 +3137,7 @@ impl ToolCore {
             }
             return ToolOutput::noop();
         }
-        match tool {
+        match effective_tool {
             ToolId::TwoPointLine => {
                 let Some(layer_id) = ctx.target_creation_layer_id() else {
                     return ToolOutput::noop();
@@ -3102,15 +3156,50 @@ impl ToolCore {
                 let Some(layer_id) = ctx.target_creation_layer_id() else {
                     return ToolOutput::noop();
                 };
-                let mut path = BezierPath::from_polygon(points, false);
-                path.reduce_nodes(0.15);
-                let obj = SceneObject::new(ObjectId(0), "Freehand Curve", NodePayload::Path(path))
-                    .with_fill(Fill::None)
-                    .with_outline(ctx.default_outline.clone());
-                ToolOutput::Commit {
-                    ops: vec![CommandOp::create_object(obj, Some(layer_id))],
-                    clear_overlay: true,
-                    post_actions: Vec::new(),
+                if any_pressure {
+                    let centerline = BezierPath::from_polygon(points, false);
+                    let pressures: Vec<f64> = mapped_samples
+                        .iter()
+                        .map(|s| f64::from(s.pressure).clamp(0.0, 1.0))
+                        .collect();
+                    let min_w = (ctx.settings.artistic_media_width_mm * 0.15).max(0.1);
+                    let max_w = ctx.settings.artistic_media_width_mm.max(min_w);
+                    let fill = if ctx.default_fill.is_visible() {
+                        ctx.default_fill.clone()
+                    } else {
+                        Fill::Solid(ctx.default_outline.color.clone())
+                    };
+                    let obj = SceneObject::new(
+                        ObjectId(0),
+                        "Freehand Pressure Stroke",
+                        NodePayload::ArtisticMedia {
+                            spine: centerline,
+                            style: ArtisticMediaStyle::Expression {
+                                min_width_mm: min_w,
+                                max_width_mm: max_w,
+                                pressures,
+                            },
+                        },
+                    )
+                    .with_fill(fill)
+                    .with_outline(OutlineStyle::none());
+                    ToolOutput::Commit {
+                        ops: vec![CommandOp::create_object(obj, Some(layer_id))],
+                        clear_overlay: true,
+                        post_actions: Vec::new(),
+                    }
+                } else {
+                    let mut path = BezierPath::from_polygon(points, false);
+                    path.reduce_nodes(0.15);
+                    let obj =
+                        SceneObject::new(ObjectId(0), "Freehand Curve", NodePayload::Path(path))
+                            .with_fill(Fill::None)
+                            .with_outline(ctx.default_outline.clone());
+                    ToolOutput::Commit {
+                        ops: vec![CommandOp::create_object(obj, Some(layer_id))],
+                        clear_overlay: true,
+                        post_actions: Vec::new(),
+                    }
                 }
             }
             ToolId::SmartDrawing => {
@@ -3221,9 +3310,23 @@ impl ToolCore {
                     return ToolOutput::noop();
                 };
                 let centerline = BezierPath::from_polygon(points, false);
-                let style = ArtisticMediaStyle::Preset {
-                    max_width_mm: ctx.settings.artistic_media_width_mm,
-                    profile: ctx.settings.artistic_media_profile.clone(),
+                let style = if any_pressure {
+                    let min_w = (ctx.settings.artistic_media_width_mm * 0.15).max(0.1);
+                    let max_w = ctx.settings.artistic_media_width_mm.max(min_w);
+                    let pressures: Vec<f64> = mapped_samples
+                        .iter()
+                        .map(|s| f64::from(s.pressure).clamp(0.0, 1.0))
+                        .collect();
+                    ArtisticMediaStyle::Expression {
+                        min_width_mm: min_w,
+                        max_width_mm: max_w,
+                        pressures,
+                    }
+                } else {
+                    ArtisticMediaStyle::Preset {
+                        max_width_mm: ctx.settings.artistic_media_width_mm,
+                        profile: ctx.settings.artistic_media_profile.clone(),
+                    }
                 };
                 let mut obj = SceneObject::new(
                     ObjectId(0),
@@ -3321,8 +3424,9 @@ impl ToolCore {
             ToolId::BitmapBrush | ToolId::BitmapEraser | ToolId::CloneStamp | ToolId::Smudge => {
                 let _ = shift;
                 ToolOutput::actions(vec![ToolActionRequest::ApplyRasterStroke {
-                    tool,
+                    tool: effective_tool,
                     points_mm: points,
+                    samples,
                 }])
             }
             _ => ToolOutput::noop(),
@@ -3909,17 +4013,37 @@ impl ToolCore {
                     }
                 }
             }
-            ActiveDragState::DrawingStroke { points_mm } => {
+            ActiveDragState::DrawingStroke { points_mm, samples } => {
                 if points_mm.len() >= 2 {
                     let kind = if self.active_tool == ToolId::Knife {
                         OverlayStrokeKind::Danger
                     } else {
                         OverlayStrokeKind::Accent
                     };
-                    preview_paths.push(OverlayPath::stroke(
-                        BezierPath::from_polygon(points_mm.clone(), false),
-                        kind,
-                    ));
+                    if matches!(self.active_tool, ToolId::ArtisticMedia | ToolId::Freehand)
+                        && samples.iter().any(|s| s.has_pressure)
+                    {
+                        let curve = PressureCurve::from_json(&ctx.settings.pressure_curve_json);
+                        let min_w = (ctx.settings.artistic_media_width_mm * 0.15).max(0.1);
+                        let max_w = ctx.settings.artistic_media_width_mm.max(min_w);
+                        let pressures: Vec<f64> =
+                            samples.iter().map(|s| s.mapped_pressure(&curve)).collect();
+                        let spine = BezierPath::from_polygon(points_mm.clone(), false);
+                        let expanded = ArtisticMedia::expand_stroke(
+                            &spine,
+                            &ArtisticMediaStyle::Expression {
+                                min_width_mm: min_w,
+                                max_width_mm: max_w,
+                                pressures,
+                            },
+                        );
+                        preview_paths.push(OverlayPath::stroke(expanded, kind));
+                    } else {
+                        preview_paths.push(OverlayPath::stroke(
+                            BezierPath::from_polygon(points_mm.clone(), false),
+                            kind,
+                        ));
+                    }
                 }
             }
             ActiveDragState::DraggingRulerGuide {
@@ -4155,4 +4279,240 @@ fn hit_test_canvas_point_opt_tol(
         world_pt,
         tol_mm,
     )
+}
+
+#[cfg(test)]
+mod stylus_and_zoom_tests {
+    use super::*;
+    use crate::types::ToolSettingsSnapshot;
+    use coree_core::{
+        Color, Document, LensConfig, LensKind, SelectionState, SnapOptions, TextStyle, Viewport,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_ctx<'a>(
+        doc: &'a Document,
+        sel: &'a SelectionState,
+        snap: &'a SnapEngine,
+        vp: &'a Viewport,
+        snap_opts: &'a SnapOptions,
+        fill: &'a Fill,
+        outline: &'a OutlineStyle,
+        ts: &'a TextStyle,
+        lens: &'a coree_core::LensConfig,
+        settings: &'a ToolSettingsSnapshot,
+    ) -> ToolReadContext<'a> {
+        ToolReadContext {
+            document: doc,
+            selection: sel,
+            snap_engine: snap,
+            viewport: vp,
+            snap_options: snap_opts,
+            active_layer_id: None,
+            creation_layer_id: None,
+            powerclip_edit_id: None,
+            treat_all_objects_as_filled: false,
+            default_fill: fill,
+            default_outline: outline,
+            default_text_style: ts,
+            default_lens: lens,
+            settings,
+        }
+    }
+
+    #[test]
+    fn stylus_artistic_media_freehand_sculpt_and_eraser_tip_routing() {
+        let mut doc = Document::new_a4("StylusTools");
+        let path_obj = SceneObject::new(
+            ObjectId(0),
+            "Target",
+            NodePayload::Path(BezierPath::from_polygon(
+                vec![
+                    Point2D::new(20.0, 20.0),
+                    Point2D::new(40.0, 20.0),
+                    Point2D::new(60.0, 20.0),
+                ],
+                false,
+            )),
+        )
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.5));
+        let target_id = doc.add_object(path_obj, None).unwrap();
+
+        let sel = SelectionState::default();
+        let snap = SnapEngine;
+        let vp = Viewport::new(800, 600);
+        let snap_opts = SnapOptions::default();
+        let fill = Fill::Solid(Color::BLACK);
+        let outline = OutlineStyle::solid(Color::BLACK, 0.5);
+        let ts = TextStyle::default();
+        let lens = LensConfig::new(LensKind::Invert);
+        let settings = ToolSettingsSnapshot {
+            pressure_curve_json: "[[0.0,0.2],[1.0,1.0]]".to_owned(),
+            ..ToolSettingsSnapshot::default()
+        };
+        let ctx = make_ctx(
+            &doc, &sel, &snap, &vp, &snap_opts, &fill, &outline, &ts, &lens, &settings,
+        );
+
+        // 1) ArtisticMedia with pressure -> ArtisticMediaStyle::Expression with mapped pressures
+        let mut core = ToolCore::new(ToolId::ArtisticMedia);
+        let p0 = PointerEvent::primary(Point2D::new(10.0, 10.0), [38.0, 38.0])
+            .with_stylus(StylusSample::with_pressure(0.0));
+        let p1 = PointerEvent::primary(Point2D::new(50.0, 10.0), [189.0, 38.0])
+            .with_stylus(StylusSample::with_pressure(1.0));
+        core.on_pointer_down(&ctx, &p0);
+        core.on_pointer_move(&ctx, &p1);
+        let out = core.on_pointer_up(&ctx, &p1);
+        match out {
+            ToolOutput::Commit { ops, .. } => match &ops[0] {
+                CommandOp::CreateObject { object, .. } => match &object.payload {
+                    NodePayload::ArtisticMedia {
+                        style: ArtisticMediaStyle::Expression { pressures, .. },
+                        ..
+                    } => {
+                        assert_eq!(pressures.len(), 2);
+                        assert!((pressures[0] - 0.2).abs() < 1e-5);
+                        assert!((pressures[1] - 1.0).abs() < 1e-5);
+                    }
+                    other => panic!("expected ArtisticMedia::Expression, got {other:?}"),
+                },
+                other => panic!("expected CreateObject, got {other:?}"),
+            },
+            other => panic!("expected Commit, got {other:?}"),
+        }
+
+        // 2) Freehand with pressure -> ArtisticMedia::Expression
+        core.set_active_tool(ToolId::Freehand);
+        core.on_pointer_down(&ctx, &p0);
+        core.on_pointer_move(&ctx, &p1);
+        let fh_out = core.on_pointer_up(&ctx, &p1);
+        assert!(matches!(
+            fh_out,
+            ToolOutput::Commit { ref ops, .. }
+            if matches!(ops.first(), Some(CommandOp::CreateObject { object, .. }) if matches!(object.payload, NodePayload::ArtisticMedia { style: ArtisticMediaStyle::Expression { .. }, .. }))
+        ));
+
+        // 3) Eraser tip on Freehand routes to Eraser over target_id
+        let mut eraser_s = StylusSample::with_pressure(0.8);
+        eraser_s.is_eraser = true;
+        let e0 =
+            PointerEvent::primary(Point2D::new(35.0, 15.0), [132.0, 56.0]).with_stylus(eraser_s);
+        let e1 =
+            PointerEvent::primary(Point2D::new(45.0, 25.0), [170.0, 94.0]).with_stylus(eraser_s);
+        core.on_pointer_down(&ctx, &e0);
+        core.on_pointer_move(&ctx, &e1);
+        let er_out = core.on_pointer_up(&ctx, &e1);
+        assert!(matches!(er_out, ToolOutput::Commit { .. }));
+        let _ = target_id;
+
+        // 4) ToolId::Zoom click uses smooth 1.25 / 0.8 and <6px drag does not marquee fit
+        core.set_active_tool(ToolId::Zoom);
+        let mut small_vp = vp;
+        small_vp.zoom = 0.05; // 1 mm = ~0.189 px -> 2 mm drag is < 1 px!
+        let zctx = make_ctx(
+            &doc, &sel, &snap, &small_vp, &snap_opts, &fill, &outline, &ts, &lens, &settings,
+        );
+        let zp0 = PointerEvent::primary(Point2D::new(10.0, 10.0), [10.0, 10.0]);
+        let zp1 = PointerEvent::primary(Point2D::new(12.0, 12.0), [10.4, 10.4]);
+        core.on_pointer_down(&zctx, &zp0);
+        core.on_pointer_move(&zctx, &zp1);
+        let zout = core.on_pointer_up(&zctx, &zp1);
+        match zout {
+            ToolOutput::Consumed { actions, .. } => match actions.first() {
+                Some(ToolActionRequest::ZoomAtScreen { factor, .. }) => {
+                    assert!((*factor - 1.25).abs() < 1e-6);
+                }
+                other => panic!("expected smooth ZoomAtScreen(1.25), got {other:?}"),
+            },
+            other => panic!("expected Consumed ZoomAtScreen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raster_brush_forwards_raw_stylus_samples_without_double_curve() {
+        let doc = Document::new_a4("RasterRawSamples");
+        let sel = SelectionState::default();
+        let snap = SnapEngine;
+        let vp = Viewport::new(800, 600);
+        let snap_opts = SnapOptions::default();
+        let fill = Fill::Solid(Color::BLACK);
+        let outline = OutlineStyle::solid(Color::BLACK, 0.5);
+        let ts = TextStyle::default();
+        let lens = LensConfig::new(LensKind::Invert);
+        let settings = ToolSettingsSnapshot {
+            // "Soft" curve: raw 0.0 -> 0.2; double-evaluated 0.2 -> 0.42.
+            pressure_curve_json: "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]".to_owned(),
+            ..ToolSettingsSnapshot::default()
+        };
+        let ctx = make_ctx(
+            &doc, &sel, &snap, &vp, &snap_opts, &fill, &outline, &ts, &lens, &settings,
+        );
+
+        let mut core = ToolCore::new(ToolId::BitmapBrush);
+        let p0 = PointerEvent::primary(Point2D::new(30.0, 30.0), [100.0, 100.0])
+            .with_stylus(StylusSample::with_pressure(0.0));
+        core.on_pointer_down(&ctx, &p0);
+        match core.on_pointer_up(&ctx, &p0) {
+            ToolOutput::Consumed { actions, .. } => match actions.first() {
+                Some(ToolActionRequest::ApplyRasterStroke {
+                    tool,
+                    points_mm,
+                    samples,
+                }) => {
+                    assert_eq!(*tool, ToolId::BitmapBrush);
+                    assert_eq!(points_mm.len(), 1);
+                    assert_eq!(samples.len(), 1);
+                    assert!(samples[0].has_pressure);
+                    assert!(
+                        samples[0].pressure.abs() < 1e-6,
+                        "single-point ApplyRasterStroke must forward raw pressure 0.0 (got {})",
+                        samples[0].pressure
+                    );
+                }
+                other => panic!("expected ApplyRasterStroke, got {other:?}"),
+            },
+            other => panic!("expected Consumed ApplyRasterStroke, got {other:?}"),
+        }
+
+        let p1 = PointerEvent::primary(Point2D::new(50.0, 30.0), [180.0, 100.0])
+            .with_stylus(StylusSample::with_pressure(0.0));
+        core.on_pointer_down(&ctx, &p0);
+        core.on_pointer_move(&ctx, &p1);
+        match core.on_pointer_up(&ctx, &p1) {
+            ToolOutput::Consumed { actions, .. } => match actions.first() {
+                Some(ToolActionRequest::ApplyRasterStroke {
+                    tool,
+                    points_mm,
+                    samples,
+                }) => {
+                    assert_eq!(*tool, ToolId::BitmapBrush);
+                    assert_eq!(points_mm.len(), 2);
+                    assert_eq!(samples.len(), 2);
+                    assert!(
+                        samples.iter().all(|s| s.has_pressure && s.pressure.abs() < 1e-6),
+                        "multi-point ApplyRasterStroke must forward raw pressure 0.0 (got {samples:?})"
+                    );
+                }
+                other => panic!("expected ApplyRasterStroke, got {other:?}"),
+            },
+            other => panic!("expected Consumed ApplyRasterStroke, got {other:?}"),
+        }
+
+        let mut eraser_sample = StylusSample::with_pressure(0.0);
+        eraser_sample.is_eraser = true;
+        let e0 = PointerEvent::primary(Point2D::new(30.0, 30.0), [100.0, 100.0])
+            .with_stylus(eraser_sample);
+        core.on_pointer_down(&ctx, &e0);
+        match core.on_pointer_up(&ctx, &e0) {
+            ToolOutput::Consumed { actions, .. } => match actions.first() {
+                Some(ToolActionRequest::ApplyRasterStroke { tool, samples, .. }) => {
+                    assert_eq!(*tool, ToolId::BitmapEraser);
+                    assert!(samples[0].is_eraser);
+                    assert!(samples[0].pressure.abs() < 1e-6);
+                }
+                other => panic!("expected ApplyRasterStroke, got {other:?}"),
+            },
+            other => panic!("expected Consumed ApplyRasterStroke, got {other:?}"),
+        }
+    }
 }

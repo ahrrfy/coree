@@ -5,7 +5,7 @@
 use crate::types::ToolSettingsSnapshot;
 use coree_core::{
     Document, Fill, LayerId, LensConfig, ObjectId, OutlineStyle, Point2D, SelectionState,
-    SnapEngine, SnapOptions, TextStyle, Viewport,
+    SnapEngine, SnapOptions, StylusSample, TextStyle, Viewport,
 };
 
 /// Keyboard modifier state at the moment an event occurs.
@@ -34,6 +34,8 @@ pub struct PointerEvent {
     pub modifiers: ModifiersState,
     /// `1` = single press/click, `2` = double-click.
     pub click_count: u8,
+    /// Hardware stylus pressure/tilt/twist/eraser sample (`StylusSample::DEFAULT` for mouse).
+    pub stylus: StylusSample,
 }
 
 impl PointerEvent {
@@ -50,6 +52,7 @@ impl PointerEvent {
                 alt: false,
             },
             click_count: 1,
+            stylus: StylusSample::DEFAULT,
         }
     }
 
@@ -66,7 +69,15 @@ impl PointerEvent {
             button: PointerButton::Primary,
             modifiers,
             click_count: 1,
+            stylus: StylusSample::DEFAULT,
         }
+    }
+
+    /// Attaches a hardware [`StylusSample`] to this pointer event.
+    #[must_use]
+    pub const fn with_stylus(mut self, stylus: StylusSample) -> Self {
+        self.stylus = stylus;
+        self
     }
 }
 

@@ -3808,8 +3808,125 @@ impl CommandHistory {
             );
         }
 
+        let mut linked_frontier: Vec<ObjectId> = affected_set.iter().copied().collect();
+        let mut checked_linked: HashSet<ObjectId> = HashSet::new();
+        let mut wrap_check_frontier: Vec<ObjectId> = Vec::new();
+        let mut checked_wrap: HashSet<ObjectId> = HashSet::new();
+        let mut wrap_frame_ids: Vec<ObjectId> = Vec::new();
+        for (&oid, obj) in after_doc.objects() {
+            if let NodePayload::ParagraphText(p) = &obj.payload {
+                if p.wrap_mode != crate::text::TextWrapMode::None {
+                    wrap_frame_ids.push(oid);
+                }
+            }
+        }
+        for d in &delta.objects {
+            if let Some(ref before_obj) = d.before {
+                if let NodePayload::ParagraphText(p) = &before_obj.payload {
+                    if p.wrap_mode != crate::text::TextWrapMode::None
+                        && !wrap_frame_ids.contains(&d.id)
+                    {
+                        wrap_frame_ids.push(d.id);
+                    }
+                }
+            }
+        }
+        let wrap_frames: Vec<(ObjectId, Option<Rect2D>, Option<Rect2D>)> =
+            if wrap_frame_ids.is_empty() {
+                Vec::new()
+            } else {
+                wrap_check_frontier = affected_set.iter().copied().collect();
+                wrap_frame_ids
+                    .into_iter()
+                    .map(|fid| {
+                        let after_bb = after_doc.world_object_bounds(fid);
+                        let mut v_objs = HashSet::new();
+                        let mut v_syms = HashSet::new();
+                        let before_bb = match Self::before_object_geometric_world_bounds(
+                            fid,
+                            delta,
+                            after_doc,
+                            0,
+                            &mut v_objs,
+                            &mut v_syms,
+                        ) {
+                            BeforeBounds::Rect(r) => Some(r),
+                            _ => None,
+                        };
+                        (fid, after_bb, before_bb)
+                    })
+                    .collect()
+            };
+
         loop {
             let mut newly_added = Vec::new();
+            for aid in std::mem::take(&mut linked_frontier) {
+                if !checked_linked.insert(aid) {
+                    continue;
+                }
+                let after_opt = after_doc.object(aid);
+                let before_opt = Self::before_object_of(aid, delta, after_doc);
+                for obj in [after_opt, before_opt].into_iter().flatten() {
+                    if let NodePayload::ParagraphText(p) = &obj.payload {
+                        if let Some(next_id) = p.linked_next_frame {
+                            if next_id.0 != 0
+                                && (after_doc.object(next_id).is_some()
+                                    || Self::before_object_of(next_id, delta, after_doc).is_some())
+                                && affected_set.insert(next_id)
+                            {
+                                if object_id_set.insert(next_id) {
+                                    object_ids.push(next_id);
+                                }
+                                newly_added.push(next_id);
+                            }
+                        }
+                    }
+                }
+            }
+            if !wrap_frames.is_empty() {
+                for aid in std::mem::take(&mut wrap_check_frontier) {
+                    if !checked_wrap.insert(aid) {
+                        continue;
+                    }
+                    let is_non_para = after_doc
+                        .object(aid)
+                        .is_some_and(|o| !matches!(o.payload, NodePayload::ParagraphText(_)))
+                        || Self::before_object_of(aid, delta, after_doc)
+                            .is_some_and(|o| !matches!(o.payload, NodePayload::ParagraphText(_)));
+                    if !is_non_para {
+                        continue;
+                    }
+                    let after_obs = after_doc.world_object_bounds(aid);
+                    let mut v_objs = HashSet::new();
+                    let mut v_syms = HashSet::new();
+                    let before_obs = match Self::before_object_geometric_world_bounds(
+                        aid,
+                        delta,
+                        after_doc,
+                        0,
+                        &mut v_objs,
+                        &mut v_syms,
+                    ) {
+                        BeforeBounds::Rect(r) => Some(r),
+                        _ => None,
+                    };
+                    for &(fid, f_after, f_before) in &wrap_frames {
+                        if affected_set.contains(&fid) {
+                            continue;
+                        }
+                        let hit = matches!((after_obs, f_after), (Some(a), Some(b)) if a.intersects(b))
+                            || matches!((before_obs, f_before), (Some(a), Some(b)) if a.intersects(b))
+                            || matches!((after_obs, f_before), (Some(a), Some(b)) if a.intersects(b))
+                            || matches!((before_obs, f_after), (Some(a), Some(b)) if a.intersects(b));
+                        if hit && affected_set.insert(fid) {
+                            if object_id_set.insert(fid) {
+                                object_ids.push(fid);
+                            }
+                            newly_added.push(fid);
+                        }
+                    }
+                }
+            }
             for (&oid, obj) in after_doc.objects() {
                 if !affected_set.contains(&oid) {
                     let mut visiting_syms = HashSet::new();
@@ -3852,6 +3969,12 @@ impl CommandHistory {
                 break;
             }
             for dep_id in newly_added {
+                if !checked_linked.contains(&dep_id) {
+                    linked_frontier.push(dep_id);
+                }
+                if !wrap_frames.is_empty() && !checked_wrap.contains(&dep_id) {
+                    wrap_check_frontier.push(dep_id);
+                }
                 walk_upward_ancestors(
                     dep_id,
                     &mut affected_set,

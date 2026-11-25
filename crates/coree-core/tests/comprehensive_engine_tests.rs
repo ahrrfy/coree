@@ -12286,3 +12286,263 @@ fn w2_exit_r8_symbol_group_top_persp_connector_and_zero_id_group_ancestors() {
         );
     }
 }
+
+#[test]
+fn w3_exit_r5_linked_paragraph_frame_targeted_invalidation_edit_unlink_transform_delete_cycle() {
+    use coree_core::{
+        CommandHistory, CommandOp, DocumentInvalidation, MasterLayerScope, ParagraphText,
+        TextStyle, TextWrapMode, Vec2D,
+    };
+
+    let mut doc = Document::new("W3ExitR5LinkedPara", 320.0, 320.0, ColorMode::Rgb, 96.0);
+    let page_id = doc.pages()[0].id;
+    let lid1 = doc.pages()[0].layers[0].id;
+    let lid2 = doc
+        .add_layer(page_id, "Layer2", true, MasterLayerScope::None)
+        .unwrap();
+    let mut hist = CommandHistory::default();
+
+    let style = TextStyle {
+        font_size_pt: 14.0,
+        fill: Color::rgba8(10, 20, 30, 255),
+        ..TextStyle::default()
+    };
+
+    // Frame3 on Layer2 inside a Group, Frame2 on Layer2, Frame1 on Layer1 -> Frame2 -> Frame3
+    let f3 = SceneObject::new(
+        ObjectId(0),
+        "Frame3",
+        NodePayload::ParagraphText(ParagraphText::new(
+            "",
+            Vec2D::new(50.0, 50.0),
+            style.clone(),
+        )),
+    )
+    .with_transform(Affine2D::translate(80.0, 10.0));
+    hist.execute(&mut doc, CommandOp::create_object(f3, Some(lid2)))
+        .unwrap();
+    let f3_id = *doc.objects().keys().max().unwrap();
+
+    let sib = SceneObject::new(ObjectId(0), "Sib", rect_shape(5.0, 5.0))
+        .with_transform(Affine2D::translate(80.0, 70.0));
+    hist.execute(&mut doc, CommandOp::create_object(sib, Some(lid2)))
+        .unwrap();
+    let sib_id = *doc.objects().keys().max().unwrap();
+
+    hist.execute(
+        &mut doc,
+        CommandOp::Group {
+            ids: vec![f3_id, sib_id],
+            name: "Frame3Grp".to_owned(),
+        },
+    )
+    .unwrap();
+    let grp3_id = *doc.objects().keys().max().unwrap();
+
+    let mut p2 = ParagraphText::new("", Vec2D::new(50.0, 50.0), style.clone());
+    p2.linked_next_frame = Some(f3_id);
+    let f2 = SceneObject::new(ObjectId(0), "Frame2", NodePayload::ParagraphText(p2))
+        .with_transform(Affine2D::translate(10.0, 10.0));
+    hist.execute(&mut doc, CommandOp::create_object(f2, Some(lid2)))
+        .unwrap();
+    let f2_id = *doc.objects().keys().max().unwrap();
+
+    let mut p1 = ParagraphText::new(
+        "FIRST WORD SECOND THIRD FOURTH FIFTH SIXTH SEVENTH",
+        Vec2D::new(25.0, 12.0),
+        style.clone(),
+    );
+    p1.linked_next_frame = Some(f2_id);
+    let f1 = SceneObject::new(
+        ObjectId(0),
+        "Frame1",
+        NodePayload::ParagraphText(p1.clone()),
+    )
+    .with_transform(Affine2D::translate(250.0, 250.0));
+    hist.execute(&mut doc, CommandOp::create_object(f1, Some(lid1)))
+        .unwrap();
+    let f1_id = *doc.objects().keys().max().unwrap();
+
+    let assert_chain_targeted = |inv: &DocumentInvalidation, expect_f1: bool, phase: &str| match inv
+    {
+        DocumentInvalidation::Targeted {
+            object_ids,
+            dirty_rects_mm,
+        } => {
+            if expect_f1 {
+                assert!(
+                    object_ids.contains(&f1_id),
+                    "[{phase}] missing Frame1 {f1_id:?} in {object_ids:?}"
+                );
+            }
+            assert!(
+                object_ids.contains(&f2_id),
+                "[{phase}] missing Frame2 {f2_id:?} in {object_ids:?}"
+            );
+            assert!(
+                object_ids.contains(&f3_id),
+                "[{phase}] missing Frame3 {f3_id:?} in {object_ids:?}"
+            );
+            assert!(
+                object_ids.contains(&grp3_id),
+                "[{phase}] missing enclosing Group {grp3_id:?} in {object_ids:?}"
+            );
+            let f2_bb = Rect2D::from_xywh(10.0, 10.0, 50.0, 50.0);
+            let f3_bb = Rect2D::from_xywh(80.0, 10.0, 50.0, 50.0);
+            assert!(
+                dirty_rects_mm.iter().any(|r| r.contains_rect(f2_bb)),
+                "[{phase}] missing Frame2 dirty rect {f2_bb:?}: {dirty_rects_mm:?}"
+            );
+            assert!(
+                dirty_rects_mm.iter().any(|r| r.contains_rect(f3_bb)),
+                "[{phase}] missing Frame3 dirty rect {f3_bb:?}: {dirty_rects_mm:?}"
+            );
+        }
+        DocumentInvalidation::All => panic!("[{phase}] Expected Targeted invalidation"),
+    };
+
+    // 1. EditText on Frame1 (execute + undo + redo)
+    let mut p1_short = ParagraphText::new("SHORT", Vec2D::new(25.0, 12.0), style.clone());
+    p1_short.linked_next_frame = Some(f2_id);
+    hist.execute(
+        &mut doc,
+        CommandOp::EditText {
+            id: f1_id,
+            payload: NodePayload::ParagraphText(p1_short.clone()),
+        },
+    )
+    .unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "EditText execute");
+    hist.undo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "EditText undo");
+    hist.redo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "EditText redo");
+
+    // 2. TransformObjects on Frame1 (execute + undo + redo)
+    hist.execute(
+        &mut doc,
+        CommandOp::TransformObjects {
+            ids: vec![f1_id],
+            affine: Affine2D::translate(5.0, 5.0),
+        },
+    )
+    .unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Transform execute");
+    hist.undo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Transform undo");
+    hist.redo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Transform redo");
+
+    // 3. Unlink Frame1 (linked_next_frame: Some(f2_id) -> None) (execute + undo + redo)
+    let mut p1_unlinked = p1_short;
+    p1_unlinked.linked_next_frame = None;
+    hist.execute(
+        &mut doc,
+        CommandOp::EditText {
+            id: f1_id,
+            payload: NodePayload::ParagraphText(p1_unlinked),
+        },
+    )
+    .unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Unlink execute");
+    hist.undo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Unlink undo");
+
+    // 4. DeleteObjects on Frame1 (now linked again after undo) (execute + undo + redo)
+    hist.execute(&mut doc, CommandOp::DeleteObjects { ids: vec![f1_id] })
+        .unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Delete execute");
+    hist.undo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Delete undo");
+    hist.redo(&mut doc).unwrap();
+    assert_chain_targeted(hist.last_invalidation(), true, "Delete redo");
+
+    // 5. Cycle FrameA -> FrameB -> FrameA terminates cleanly without infinite loop
+    let fa = SceneObject::new(
+        ObjectId(0),
+        "CycleA",
+        NodePayload::ParagraphText(ParagraphText::new(
+            "CYCLE A",
+            Vec2D::new(30.0, 20.0),
+            style.clone(),
+        )),
+    );
+    hist.execute(&mut doc, CommandOp::create_object(fa, Some(lid1)))
+        .unwrap();
+    let fa_id = *doc.objects().keys().max().unwrap();
+    let mut pb = ParagraphText::new("CYCLE B", Vec2D::new(30.0, 20.0), style.clone());
+    pb.linked_next_frame = Some(fa_id);
+    let fb = SceneObject::new(ObjectId(0), "CycleB", NodePayload::ParagraphText(pb))
+        .with_transform(Affine2D::translate(40.0, 0.0));
+    hist.execute(&mut doc, CommandOp::create_object(fb, Some(lid1)))
+        .unwrap();
+    let fb_id = *doc.objects().keys().max().unwrap();
+    let mut pa_cycled = ParagraphText::new("CYCLE A2", Vec2D::new(30.0, 20.0), style.clone());
+    pa_cycled.linked_next_frame = Some(fb_id);
+    hist.execute(
+        &mut doc,
+        CommandOp::EditText {
+            id: fa_id,
+            payload: NodePayload::ParagraphText(pa_cycled),
+        },
+    )
+    .unwrap();
+    match hist.last_invalidation() {
+        DocumentInvalidation::Targeted { object_ids, .. } => {
+            assert!(object_ids.contains(&fa_id) && object_ids.contains(&fb_id));
+        }
+        DocumentInvalidation::All => panic!("Expected Targeted for linked cycle"),
+    }
+
+    // 6. TextWrapMode obstacle moving over FrameW1 -> invalidates FrameW1 AND linked FrameW2
+    let fw2 = SceneObject::new(
+        ObjectId(0),
+        "WrapF2",
+        NodePayload::ParagraphText(ParagraphText::new(
+            "",
+            Vec2D::new(40.0, 40.0),
+            style.clone(),
+        )),
+    )
+    .with_transform(Affine2D::translate(180.0, 120.0));
+    hist.execute(&mut doc, CommandOp::create_object(fw2, Some(lid2)))
+        .unwrap();
+    let fw2_id = *doc.objects().keys().max().unwrap();
+
+    let mut pw1 = ParagraphText::new(
+        "WRAP TEXT OVERFLOW INTO SECOND FRAME",
+        Vec2D::new(40.0, 40.0),
+        style,
+    );
+    pw1.wrap_mode = TextWrapMode::SquareBoth;
+    pw1.linked_next_frame = Some(fw2_id);
+    let fw1 = SceneObject::new(ObjectId(0), "WrapF1", NodePayload::ParagraphText(pw1))
+        .with_transform(Affine2D::translate(120.0, 120.0));
+    hist.execute(&mut doc, CommandOp::create_object(fw1, Some(lid1)))
+        .unwrap();
+    let fw1_id = *doc.objects().keys().max().unwrap();
+
+    let obs = SceneObject::new(ObjectId(0), "Obstacle", rect_shape(15.0, 15.0))
+        .with_transform(Affine2D::translate(125.0, 125.0));
+    hist.execute(&mut doc, CommandOp::create_object(obs, Some(lid1)))
+        .unwrap();
+    let obs_id = *doc.objects().keys().max().unwrap();
+
+    hist.execute(
+        &mut doc,
+        CommandOp::TransformObjects {
+            ids: vec![obs_id],
+            affine: Affine2D::translate(5.0, 5.0),
+        },
+    )
+    .unwrap();
+    match hist.last_invalidation() {
+        DocumentInvalidation::Targeted { object_ids, .. } => {
+            assert!(
+                object_ids.contains(&fw1_id) && object_ids.contains(&fw2_id),
+                "Obstacle move must invalidate WrapF1 and linked WrapF2: {object_ids:?}"
+            );
+        }
+        DocumentInvalidation::All => panic!("Expected Targeted for TextWrapMode obstacle move"),
+    }
+}

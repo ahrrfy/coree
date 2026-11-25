@@ -25,9 +25,9 @@ use coree_core::{
     DocumentInvalidation, Effect, EllipseMode, EnvelopeMode, FeatherDirection, Fill,
     GuideOrientation, ImageAssetId, ImpactStyle, LayerId, LensConfig, LensKind, MasterLayerScope,
     NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape, PathNode,
-    Point2D, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent, SceneObject,
-    SelectionState, SnapEngine, Subpath, SymbolId, TextOnPath, TextStyle, TransparencyMode, Unit,
-    Vec2D, VectorTable, ZOrderOp,
+    Point2D, PressureCurve, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent,
+    SceneObject, SelectionState, SnapEngine, StylusSample, Subpath, SymbolId, TextOnPath,
+    TextStyle, TransparencyMode, Unit, Vec2D, VectorTable, ZOrderOp,
 };
 use coree_io::import_palette_file;
 use coree_prod::{
@@ -44,16 +44,17 @@ use coree_prod::{
     TextMatchMode,
 };
 use coree_render::{
-    apply_dodge_burn_stroke, apply_healing_stroke, clone_stamp_stroke, compute_page_layouts,
-    convert_object_to_bitmap_with_bounds, create_smart_fill_object, erase_stroke, hit_test_point,
-    lower_effects_to_primitives, paint_brush_stroke, paint_brush_stroke_masked, raster_flood_fill,
-    smudge_stroke, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
-    GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer, SnapOptions,
-    TextEngine, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
+    apply_dodge_burn_stroke_stylus, apply_healing_stroke_stylus, clone_stamp_stroke_stylus,
+    compute_page_layouts, convert_object_to_bitmap_with_bounds, create_smart_fill_object,
+    erase_stroke_stylus, hit_test_point, lower_effects_to_primitives, paint_brush_stroke_stylus,
+    raster_flood_fill, smudge_stroke_stylus, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode,
+    DynamicGuideLine, GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer,
+    SnapOptions, StylusPoint, TextEngine, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
 };
 use coree_storage::{
-    DifferentialSnapshotPatch, FontQuery, FontRecord, JobHandle, JobOutcome, JobPool,
-    RecentDocumentRecord, StorageDb, UncleanSession, WorkspaceLayoutRecord,
+    DifferentialSnapshotPatch, FontQuery, FontRecord, FontSubstitutionRecord, JobHandle,
+    JobOutcome, JobPool, PanoseClassification, RecentDocumentRecord, StorageDb, UncleanSession,
+    WorkspaceLayoutRecord,
 };
 pub use coree_tools::{
     ActiveDragState, CursorHint, HandleShape, KeyEvent, ModifiersState, NodeDragPart,
@@ -129,11 +130,19 @@ pub struct StudioApp {
     pub treat_all_objects_as_filled: bool,
     pub object_origin_anchor: (u8, u8),
 
-    // ICC Soft-Proofing & Gamut Warning
+    // ICC Soft-Proofing, Gamut Warning & OS Display ICC Calibration
     pub soft_proof_cmyk: bool,
     pub gamut_warning: bool,
     pub proof_profile: BuiltinIccProfile,
     pub proof_intent: RenderingIntent,
+    pub use_display_icc: bool,
+    pub display_icc_info: Option<crate::display_icc::DisplayIccInfo>,
+    pub display_icc_intent: RenderingIntent,
+
+    // Hardware Stylus & Display ICC Providers
+    pub(crate) stylus_provider: Box<dyn crate::stylus::StylusProvider>,
+    pub last_stylus_sample: StylusSample,
+    pub(crate) display_icc_provider: Box<dyn crate::display_icc::DisplayIccProvider>,
 
     // Laser / Engraving / Plotter & Plugin Bridge
     pub laser_config: LaserJobConfig,
@@ -212,6 +221,8 @@ impl StudioApp {
             Vec::new(),
             false,
             Box::new(crate::clipboard::MemoryClipboardBackend::new()),
+            Box::new(crate::stylus::NullStylusProvider),
+            Box::new(crate::display_icc::NullDisplayIccProvider),
         )
     }
 
@@ -223,6 +234,8 @@ impl StudioApp {
             Vec::new(),
             false,
             Box::new(crate::clipboard::MemoryClipboardBackend::new()),
+            Box::new(crate::stylus::NullStylusProvider),
+            Box::new(crate::display_icc::NullDisplayIccProvider),
         )
     }
 
@@ -242,6 +255,8 @@ impl StudioApp {
             initial_files,
             true,
             Box::new(crate::clipboard::OsClipboardBackend::new()),
+            crate::stylus::platform_stylus_provider(),
+            Box::new(crate::display_icc::OsDisplayIccProvider),
         );
         if let Some(bak) = quarantined_backup {
             let msg = format!(
@@ -264,6 +279,34 @@ impl StudioApp {
         self.clipboard_backend = backend;
     }
 
+    /// Replaces the active stylus provider (useful for hardware/mock stylus tests).
+    pub fn set_stylus_provider(&mut self, provider: Box<dyn crate::stylus::StylusProvider>) {
+        self.stylus_provider = provider;
+    }
+
+    /// Replaces the active display ICC provider and refreshes the cached display profile.
+    pub fn set_display_icc_provider(
+        &mut self,
+        provider: Box<dyn crate::display_icc::DisplayIccProvider>,
+    ) {
+        self.display_icc_provider = provider;
+        self.detect_os_display_icc();
+    }
+
+    /// Queries [`DisplayIccProvider::load_display_icc`] and activates it if valid.
+    pub fn detect_os_display_icc(&mut self) -> bool {
+        if let Some(info) = self.display_icc_provider.load_display_icc() {
+            self.display_icc_info = Some(info);
+            self.use_display_icc = true;
+            if let Some(tab) = self.active_tab_mut() {
+                tab.needs_rerender = true;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns `true` if either the internal studio clipboard or the OS clipboard holds supported content.
     #[must_use]
     pub fn has_clipboard_content(&self) -> bool {
@@ -277,6 +320,8 @@ impl StudioApp {
         initial_files: Vec<PathBuf>,
         open_welcome_when_empty: bool,
         clipboard_backend: Box<dyn crate::clipboard::ClipboardBackend>,
+        stylus_provider: Box<dyn crate::stylus::StylusProvider>,
+        display_icc_provider: Box<dyn crate::display_icc::DisplayIccProvider>,
     ) -> Self {
         let mut group_active_tools = [ToolId::Pick; 15];
         for (i, group) in TOOL_GROUPS.iter().enumerate() {
@@ -338,6 +383,9 @@ impl StudioApp {
 
         let job_pool = JobPool::default_pool().ok();
 
+        let initial_display_icc = display_icc_provider.load_display_icc();
+        let initial_use_display_icc = initial_display_icc.is_some();
+
         let mut app = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -382,6 +430,12 @@ impl StudioApp {
             gamut_warning: false,
             proof_profile: BuiltinIccProfile::default(),
             proof_intent: RenderingIntent::default(),
+            use_display_icc: initial_use_display_icc,
+            display_icc_info: initial_display_icc,
+            display_icc_intent: RenderingIntent::RelativeColorimetric,
+            stylus_provider,
+            last_stylus_sample: StylusSample::DEFAULT,
+            display_icc_provider,
             laser_config: LaserJobConfig::default(),
             plugin_registry: PluginRegistry::with_builtins(),
             plugin_exec_overrides: BTreeMap::new(),
@@ -2054,8 +2108,12 @@ impl StudioApp {
             } => {
                 self.eyedropper_click(pt_mm, attributes_mode, force_sample);
             }
-            ToolActionRequest::ApplyRasterStroke { tool, points_mm } => {
-                let _ = self.apply_raster_tool_stroke(tool, &points_mm);
+            ToolActionRequest::ApplyRasterStroke {
+                tool,
+                points_mm,
+                samples,
+            } => {
+                let _ = self.apply_raster_tool_stroke_with_stylus(tool, &points_mm, &samples);
             }
             ToolActionRequest::SetCloneSource(pt) => {
                 self.tool_settings.clone_source_mm = Some(pt);

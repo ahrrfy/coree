@@ -393,6 +393,7 @@ pub struct ToolSettingsSnapshot {
     pub symmetry_mirror: bool,
     pub symmetry_center_mm: Option<Point2D>,
     pub draw_in_perspective: bool,
+    pub pressure_curve_json: String,
 }
 
 impl Default for ToolSettingsSnapshot {
@@ -445,6 +446,7 @@ impl Default for ToolSettingsSnapshot {
             symmetry_mirror: true,
             symmetry_center_mm: None,
             draw_in_perspective: false,
+            pressure_curve_json: "[[0.0,0.0],[1.0,1.0]]".to_owned(),
         }
     }
 }

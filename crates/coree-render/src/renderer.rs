@@ -12,9 +12,10 @@ use crate::backend::{
     TinySkiaBackend, MAX_SURFACE_DIM_PX, MAX_SURFACE_PIXELS,
 };
 use crate::effects_render::{
-    apply_geometry_effects, apply_geometry_effects_in_bounds, apply_transparency_mask,
-    effect_bounds_padding_mm, find_transparency_effect, render_overlay_effects,
-    render_underlay_effects, symmetry_effect_transforms,
+    apply_deform_point_steps, apply_geometry_effects, apply_geometry_effects_in_bounds,
+    apply_transparency_mask, effect_bounds_padding_mm, find_transparency_effect,
+    prepare_deform_point_steps, render_overlay_effects, render_underlay_effects,
+    symmetry_effect_transforms, DeformPointStep,
 };
 use crate::hit_test::resolve_connector_endpoints_with_sym;
 use crate::lens_render::{render_lens_object_with_backdrop, BackdropItem, FrozenLensSnapshot};
@@ -24,12 +25,13 @@ use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
     Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, BuiltinIccProfile, Color,
-    DimensionKind, DimensionObject, Document, Effect, Fill, GradientStop, GuideOrientation,
-    IccColorPipeline, IccProfile, Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId,
-    OutlineStyle, Page, Perspective3x3, PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D,
-    RenderingIntent, SceneObject, SoftProofLut3D, SpatialIndex, Subpath, SymbolDef, SymbolId,
-    Vec2D, VectorTable,
+    DimensionKind, DimensionObject, DisplayTransformLut3D, Document, Effect, Fill, GradientStop,
+    GuideOrientation, IccColorPipeline, IccProfile, Layer, MasterLayerScope, MeshNode, NodePayload,
+    ObjectId, OutlineStyle, Page, Perspective3x3, PerspectiveGridMode, Point2D,
+    PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject, SoftProofLut3D, SpatialIndex,
+    SpatialObjectEntry, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
 };
+use std::sync::Arc;
 
 #[inline]
 pub(crate) fn icc_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
@@ -60,6 +62,16 @@ pub(crate) struct DeformFrame<'a> {
     pub(crate) group_local_bb: Option<Rect2D>,
     pub(crate) group_effects: &'a [Effect],
     pub(crate) rel_to_outer: Affine2D,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MeshDeformCtx<'a> {
+    pub(crate) raw_local_bb: Option<Rect2D>,
+    pub(crate) pre_perspective: Option<Perspective3x3>,
+    pub(crate) pre_effect_bb: Option<Rect2D>,
+    pub(crate) effects: &'a [Effect],
+    pub(crate) c_xf: Affine2D,
+    pub(crate) deform_frames: &'a [DeformFrame<'a>],
 }
 
 #[inline]
@@ -204,6 +216,10 @@ pub struct RenderOptions {
     pub proof_profile: BuiltinIccProfile,
     /// ICC rendering intent used when `soft_proof_cmyk` is enabled.
     pub proof_intent: RenderingIntent,
+    /// Optional OS monitor/display RGB ICC profile bytes (`DisplayTransformLut3D`).
+    pub display_icc_profile: Option<Vec<u8>>,
+    /// ICC rendering intent used when applying `display_icc_profile`.
+    pub display_icc_intent: RenderingIntent,
 }
 
 impl Default for RenderOptions {
@@ -232,6 +248,8 @@ impl RenderOptions {
             gamut_warning: false,
             proof_profile: BuiltinIccProfile::IsoCoatedV2Cmyk,
             proof_intent: RenderingIntent::RelativeColorimetric,
+            display_icc_profile: None,
+            display_icc_intent: RenderingIntent::RelativeColorimetric,
         }
     }
 
@@ -254,6 +272,8 @@ impl RenderOptions {
             gamut_warning: false,
             proof_profile: BuiltinIccProfile::IsoCoatedV2Cmyk,
             proof_intent: RenderingIntent::RelativeColorimetric,
+            display_icc_profile: None,
+            display_icc_intent: RenderingIntent::RelativeColorimetric,
         }
     }
 }
@@ -351,16 +371,68 @@ pub(crate) fn compute_frozen_scope_hash(stack: &[u64], sym_root_idx: Option<usiz
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PageCullCacheKey {
+    doc_id: [u8; 16],
+    spatial_revision: u64,
+    objects_len: usize,
+    symbols_len: usize,
+    pages_len: usize,
+    page_index: usize,
+    layers_sig_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PageCullMeta {
+    max_effect_pad: f64,
+    page_has_lens: bool,
+    /// Strictly ordered ascending by `z_order` matching `Document::build_spatial_index`.
+    always_include: Vec<(usize, ObjectId)>,
+    always_include_set: HashSet<ObjectId>,
+}
+
+fn compute_layers_sig_hash(layers: &[&Layer]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mix = |h: &mut u64, v: u64| {
+        *h ^= v;
+        *h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    mix(&mut h, layers.len() as u64);
+    for layer in layers {
+        mix(&mut h, layer.id.0);
+        mix(&mut h, u64::from(layer.visible));
+        mix(&mut h, u64::from(layer.is_desktop_layer));
+        let scope_code = match layer.master_scope {
+            MasterLayerScope::None => 0u64,
+            MasterLayerScope::AllPages => 1,
+            MasterLayerScope::OddPages => 2,
+            MasterLayerScope::EvenPages => 3,
+        };
+        mix(&mut h, scope_code);
+        mix(&mut h, layer.objects.len() as u64);
+        if let Some(&first) = layer.objects.first() {
+            mix(&mut h, first.0);
+        }
+        if let Some(&last) = layer.objects.last() {
+            mix(&mut h, last.0);
+        }
+    }
+    h
+}
+
 /// Stateful Pure-Rust 2D scene renderer caching typography, soft-proof LUTs, and frozen lens snapshots.
 pub struct SceneRenderer {
     text_engine: TextEngine,
     frozen_lenses: HashMap<FrozenLensKey, FrozenLensSnapshot>,
+    page_cull_cache: HashMap<PageCullCacheKey, Arc<PageCullMeta>>,
+    sym_bounds_cache: HashMap<ObjectId, Option<Rect2D>>,
     soft_proof_cache: Option<(
         Option<u64>,
         BuiltinIccProfile,
         RenderingIntent,
         SoftProofLut3D,
     )>,
+    display_lut_cache: Option<(u64, RenderingIntent, Option<DisplayTransformLut3D>)>,
     pub(crate) active_icc: IccColorPipeline,
     pub(crate) force_offscreen_lens_backdrop: bool,
     pub(crate) parent_xf_override: Option<(ObjectId, Affine2D)>,
@@ -382,7 +454,10 @@ impl SceneRenderer {
         Self {
             text_engine: TextEngine::new(),
             frozen_lenses: HashMap::new(),
+            page_cull_cache: HashMap::new(),
+            sym_bounds_cache: HashMap::new(),
             soft_proof_cache: None,
+            display_lut_cache: None,
             active_icc: IccColorPipeline::default(),
             force_offscreen_lens_backdrop: false,
             parent_xf_override: None,
@@ -394,9 +469,99 @@ impl SceneRenderer {
 
     pub(crate) fn copy_frozen_lenses_from(&mut self, other: &Self) {
         self.frozen_lenses = other.frozen_lenses.clone();
+        self.page_cull_cache = other.page_cull_cache.clone();
         self.active_icc = other.active_icc.clone();
         self.force_offscreen_lens_backdrop = other.force_offscreen_lens_backdrop;
         self.parent_xf_override = other.parent_xf_override;
+    }
+
+    pub(crate) fn warm_page_cull_cache(&mut self, doc: &Document, layouts: &[PageLayout]) {
+        for layout in layouts {
+            let layers = collect_effective_layers(doc, layout.page_index);
+            let _ = self.get_or_build_page_cull_meta(doc, layout.page_index, &layers);
+        }
+    }
+
+    fn get_or_build_page_cull_meta(
+        &mut self,
+        doc: &Document,
+        page_index: usize,
+        layers: &[&Layer],
+    ) -> Arc<PageCullMeta> {
+        let key = PageCullCacheKey {
+            doc_id: *doc.id().as_bytes(),
+            spatial_revision: doc.spatial_revision(),
+            objects_len: doc.objects().len(),
+            symbols_len: doc.symbols().len(),
+            pages_len: doc.pages().len(),
+            page_index,
+            layers_sig_hash: compute_layers_sig_hash(layers),
+        };
+        if let Some(meta) = self.page_cull_cache.get(&key) {
+            return Arc::clone(meta);
+        }
+
+        let mut max_effect_pad = 0.0_f64;
+        let mut page_has_lens = false;
+        let mut always_include = Vec::new();
+        let mut always_include_set = HashSet::new();
+        let mut visiting_objs = HashSet::new();
+        let mut visiting_syms = HashSet::new();
+        let mut z = 0usize;
+
+        for layer in layers {
+            if !layer.visible {
+                continue;
+            }
+            let is_master = layer.is_desktop_layer || layer.master_scope != MasterLayerScope::None;
+            for &oid in &layer.objects {
+                if let Some(obj) = doc.object(oid) {
+                    visiting_objs.clear();
+                    visiting_objs.insert(oid);
+                    visiting_syms.clear();
+                    max_effect_pad = max_effect_pad.max(max_object_effect_padding_inner(
+                        doc,
+                        obj,
+                        Affine2D::IDENTITY,
+                        None,
+                        &mut visiting_objs,
+                        &mut visiting_syms,
+                        0,
+                    ));
+
+                    visiting_objs.clear();
+                    visiting_objs.insert(oid);
+                    visiting_syms.clear();
+                    let (nonlocal, has_lens) = object_nonlocal_and_lens_info(
+                        doc,
+                        obj,
+                        &mut visiting_objs,
+                        &mut visiting_syms,
+                        0,
+                    );
+                    if has_lens {
+                        page_has_lens = true;
+                    }
+                    if is_master || nonlocal {
+                        always_include.push((z, oid));
+                        always_include_set.insert(oid);
+                    }
+                }
+                z += 1;
+            }
+        }
+
+        let meta = Arc::new(PageCullMeta {
+            max_effect_pad,
+            page_has_lens,
+            always_include,
+            always_include_set,
+        });
+        if self.page_cull_cache.len() >= 64 {
+            self.page_cull_cache.clear();
+        }
+        self.page_cull_cache.insert(key, Arc::clone(&meta));
+        meta
     }
 
     pub(crate) fn get_or_build_soft_proof_lut(
@@ -417,6 +582,25 @@ impl SceneRenderer {
             self.soft_proof_cache = Some((profile_hash, fallback, intent, lut));
         }
         &self.soft_proof_cache.as_ref().expect("populated").3
+    }
+
+    pub(crate) fn get_or_build_display_lut(
+        &mut self,
+        display_profile_bytes: &[u8],
+        intent: RenderingIntent,
+    ) -> Option<&DisplayTransformLut3D> {
+        let profile_hash = fnv1a_64(display_profile_bytes);
+        let cache_hit = self
+            .display_lut_cache
+            .as_ref()
+            .is_some_and(|(h, i, _)| *h == profile_hash && *i == intent);
+        if !cache_hit {
+            let lut = IccProfile::from_bytes(display_profile_bytes)
+                .ok()
+                .and_then(|prof| DisplayTransformLut3D::build_from_profile(&prof, intent));
+            self.display_lut_cache = Some((profile_hash, intent, lut));
+        }
+        self.display_lut_cache.as_ref().and_then(|c| c.2.as_ref())
     }
 
     /// Mutable access to the internal [`TextEngine`].
@@ -499,6 +683,20 @@ impl SceneRenderer {
         if depth > MAX_RENDER_DEPTH || !obj.visible || obj_opacity <= 1e-6 {
             return false;
         }
+        let resolved_clone;
+        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
+            let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) else {
+                return false;
+            };
+            let mut tmp = obj.clone();
+            tmp.payload = p;
+            tmp.fill = f;
+            tmp.outline = o;
+            resolved_clone = tmp;
+            &resolved_clone
+        } else {
+            obj
+        };
         let sym_count = if expand_own_sym {
             symmetry_effect_transforms(&obj.effects).len()
         } else {
@@ -797,50 +995,119 @@ impl SceneRenderer {
             // 2. Collect ordered layers: applicable master layers + page's own layers
             let layers = collect_effective_layers(doc, layout.page_index);
 
-            // Optional R-Tree frustum culling candidate set (expanded by max effect padding)
-            let culled_set: Option<HashSet<ObjectId>> = cull_world_rect.and_then(|cull_world| {
-                let index = page_spatial_indices?.get(&layout.page_index)?;
+            // Fast R-Tree frustum-culled path (cached PageCullMeta + zero 10k scan when no lenses)
+            if let (Some(cull_world), Some(index)) = (
+                cull_world_rect,
+                page_spatial_indices.and_then(|m| m.get(&layout.page_index)),
+            ) {
+                let meta = self.get_or_build_page_cull_meta(doc, layout.page_index, &layers);
                 let local_cull =
                     cull_world.translate(Vec2D::new(-layout.origin_mm.x, -layout.origin_mm.y));
-                let max_pad = compute_page_max_effect_padding(doc, &layers);
-                let expanded = local_cull.expand(max_pad + 4.0);
-                let mut set: HashSet<ObjectId> = index.query_rect(expanded).into_iter().collect();
-                // Always include master-layer objects & objects with Blend/Lens/Viewpoint/Symmetry
-                for layer in &layers {
-                    let is_master =
-                        layer.is_desktop_layer || layer.master_scope != MasterLayerScope::None;
-                    for &oid in &layer.objects {
-                        if is_master {
-                            set.insert(oid);
-                        } else if let Some(obj) = doc.object(oid) {
-                            let mut visiting_objs = HashSet::from([oid]);
-                            let mut visiting_syms = HashSet::new();
-                            if object_has_nonlocal_effect_or_lens(
-                                doc,
-                                obj,
-                                &mut visiting_objs,
-                                &mut visiting_syms,
-                                0,
-                            ) {
-                                set.insert(oid);
-                            }
-                        }
-                    }
-                }
-                Some(set)
-            });
+                let expanded = local_cull.expand(meta.max_effect_pad + 4.0);
 
-            // 3. Render objects in strict back-to-front z-order, tracking underlying objects for Lenses
-            let mut rendered_so_far: Vec<BackdropItem> = Vec::new();
-            for layer in &layers {
-                if !layer.visible {
+                if !meta.page_has_lens {
+                    let hits: Vec<SpatialObjectEntry> =
+                        index.query_rect_entries_back_to_front(expanded);
+                    let mut hi = 0usize;
+                    let mut ai = 0usize;
+                    while hi < hits.len() && ai < meta.always_include.len() {
+                        let hz = hits[hi].z_order;
+                        let (az, aoid) = meta.always_include[ai];
+                        let oid = if hz < az {
+                            let id = hits[hi].id;
+                            hi += 1;
+                            id
+                        } else if az < hz {
+                            ai += 1;
+                            aoid
+                        } else {
+                            hi += 1;
+                            ai += 1;
+                            aoid
+                        };
+                        self.render_object_by_id_with_backdrop(
+                            doc,
+                            Some(page),
+                            oid,
+                            page_to_surface,
+                            page_to_surface,
+                            view_mode,
+                            options,
+                            backend,
+                            &[],
+                            0,
+                        );
+                    }
+                    while hi < hits.len() {
+                        let oid = hits[hi].id;
+                        hi += 1;
+                        self.render_object_by_id_with_backdrop(
+                            doc,
+                            Some(page),
+                            oid,
+                            page_to_surface,
+                            page_to_surface,
+                            view_mode,
+                            options,
+                            backend,
+                            &[],
+                            0,
+                        );
+                    }
+                    while ai < meta.always_include.len() {
+                        let oid = meta.always_include[ai].1;
+                        ai += 1;
+                        self.render_object_by_id_with_backdrop(
+                            doc,
+                            Some(page),
+                            oid,
+                            page_to_surface,
+                            page_to_surface,
+                            view_mode,
+                            options,
+                            backend,
+                            &[],
+                            0,
+                        );
+                    }
                     continue;
                 }
-                for &oid in &layer.objects {
-                    let should_draw = culled_set
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(&oid));
-                    if should_draw {
+
+                let mut culled_set: HashSet<ObjectId> =
+                    index.query_rect(expanded).into_iter().collect();
+                culled_set.extend(meta.always_include_set.iter().copied());
+
+                let mut rendered_so_far: Vec<BackdropItem> = Vec::new();
+                for layer in &layers {
+                    if !layer.visible {
+                        continue;
+                    }
+                    for &oid in &layer.objects {
+                        if culled_set.contains(&oid) {
+                            self.render_object_by_id_with_backdrop(
+                                doc,
+                                Some(page),
+                                oid,
+                                page_to_surface,
+                                page_to_surface,
+                                view_mode,
+                                options,
+                                backend,
+                                &rendered_so_far,
+                                0,
+                            );
+                        }
+                        rendered_so_far.push(BackdropItem::Object(oid));
+                    }
+                }
+            } else {
+                // 3. Full-page render in strict back-to-front z-order, tracking underlying objects for Lenses
+                let mut rendered_so_far: Vec<BackdropItem> = Vec::new();
+                for layer in &layers {
+                    if !layer.visible {
+                        continue;
+                    }
+                    for &oid in &layer.objects {
                         self.render_object_by_id_with_backdrop(
                             doc,
                             Some(page),
@@ -853,27 +1120,39 @@ impl SceneRenderer {
                             &rendered_so_far,
                             0,
                         );
+                        rendered_so_far.push(BackdropItem::Object(oid));
                     }
-                    rendered_so_far.push(BackdropItem::Object(oid));
                 }
             }
         }
 
-        // 4. Optional live ICC CMYK Soft-Proofing & Out-of-Gamut Warning pass over rendered artwork
-        // (applied BEFORE page chrome overlays so guides/grids stay crisp and never false-flag).
-        if (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe {
+        // 4. Optional live ICC CMYK Soft-Proofing, Out-of-Gamut Warning, and OS Display ICC pass
+        // over rendered artwork (applied BEFORE page chrome overlays so guides/grids stay crisp).
+        let needs_soft_proof =
+            (options.soft_proof_cmyk || options.gamut_warning) && view_mode != ViewMode::Wireframe;
+        let has_display_icc = options.display_icc_profile.is_some();
+        if needs_soft_proof || has_display_icc {
             let mut buf = backend.snapshot_rgba();
             if !buf.is_empty() {
-                let lut = self.get_or_build_soft_proof_lut(
-                    doc.cmyk_icc_profile().or(doc.custom_icc_profile()),
-                    options.proof_profile,
-                    options.proof_intent,
-                );
-                lut.apply_rgba(
-                    &mut buf.rgba,
-                    options.soft_proof_cmyk,
-                    options.gamut_warning,
-                );
+                if needs_soft_proof {
+                    let lut = self.get_or_build_soft_proof_lut(
+                        doc.cmyk_icc_profile().or(doc.custom_icc_profile()),
+                        options.proof_profile,
+                        options.proof_intent,
+                    );
+                    lut.apply_rgba(
+                        &mut buf.rgba,
+                        options.soft_proof_cmyk,
+                        options.gamut_warning,
+                    );
+                }
+                if let Some(ref disp_bytes) = options.display_icc_profile {
+                    if let Some(disp_lut) =
+                        self.get_or_build_display_lut(disp_bytes, options.display_icc_intent)
+                    {
+                        disp_lut.apply_rgba(&mut buf.rgba);
+                    }
+                }
                 backend.clear(Color::TRANSPARENT);
                 backend.composite_region(
                     PixelRect::new(0, 0, buf.width, buf.height),
@@ -1141,8 +1420,14 @@ impl SceneRenderer {
             .unwrap_or(Affine2D::IDENTITY);
         let inv_parent_world = parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
 
+        let resolved_clone = if matches!(obj.payload, NodePayload::Clone { .. }) {
+            doc.resolve_clone_payload_and_style(obj)
+        } else {
+            None
+        };
+        let eff_payload = resolved_clone.as_ref().map_or(&obj.payload, |(p, _, _)| p);
         let is_container = matches!(
-            obj.payload,
+            eff_payload,
             NodePayload::Group(_) | NodePayload::PowerClip { .. } | NodePayload::SymbolInstance(_)
         );
         for (sym_branch_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
@@ -1164,7 +1449,7 @@ impl SceneRenderer {
                     sym_branch_idx as u64,
                 ]);
                 is_container.then(|| {
-                    let branch_world_xf = if matches!(obj.payload, NodePayload::SymbolInstance(_)) {
+                    let branch_world_xf = if matches!(eff_payload, NodePayload::SymbolInstance(_)) {
                         None
                     } else {
                         Some(own_world_sym_xf)
@@ -1308,21 +1593,6 @@ impl SceneRenderer {
             .filter(|m| m.is_finite())
             .unwrap_or(obj.transform);
 
-        let resolved_clone_sb;
-        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-                let mut c = obj.clone();
-                c.payload = p;
-                c.fill = f;
-                c.outline = o;
-                resolved_clone_sb = c;
-                &resolved_clone_sb
-            } else {
-                obj
-            }
-        } else {
-            obj
-        };
         let apply_persp = |p: &BezierPath| -> BezierPath {
             if let Some(persp) = obj.perspective {
                 persp.transform_bezier_path(p)
@@ -1350,7 +1620,27 @@ impl SceneRenderer {
             )
             .transformed(&obj_to_screen)
             .bounding_box(),
-            NodePayload::Clone { .. } => None,
+            NodePayload::Clone { .. } => {
+                doc.resolve_clone_payload_and_style(obj)
+                    .and_then(|(p, f, o)| {
+                        let mut tmp = obj.clone();
+                        tmp.payload = p;
+                        tmp.fill = f;
+                        tmp.outline = o;
+                        Self::compute_object_screen_bounds(
+                            doc,
+                            &tmp,
+                            page_to_surface,
+                            parent_to_screen,
+                            sym_ctx,
+                            ancestor_world_sym,
+                            false,
+                            visited_doc,
+                            visited_syms,
+                            depth + 1,
+                        )
+                    })
+            }
             NodePayload::PowerClip { container, .. } => {
                 apply_geometry_effects(&apply_persp(container), &obj.effects)
                     .transformed(&obj_to_screen)
@@ -1904,21 +2194,9 @@ impl SceneRenderer {
         underlying: &[BackdropItem],
         depth: usize,
     ) {
-        let resolved_clone;
-        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-                let mut c = obj.clone();
-                c.payload = p;
-                c.fill = f;
-                c.outline = o;
-                resolved_clone = c;
-                &resolved_clone
-            } else {
-                return;
-            }
-        } else {
-            obj
-        };
+        if depth > MAX_RENDER_DEPTH {
+            return;
+        }
         let anti_alias = view_mode != ViewMode::Pixels;
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
 
@@ -2026,7 +2304,29 @@ impl SceneRenderer {
                     depth,
                 );
             }
-            NodePayload::Clone { .. } => {}
+            NodePayload::Clone { .. } => {
+                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                    let mut resolved = obj.clone();
+                    resolved.payload = p;
+                    resolved.fill = f;
+                    resolved.outline = o;
+                    self.render_scene_object_core(
+                        doc,
+                        page,
+                        &resolved,
+                        page_to_surface,
+                        parent_to_screen,
+                        sym_ctx,
+                        world_sym_xf,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        backend,
+                        underlying,
+                        depth + 1,
+                    );
+                }
+            }
             NodePayload::ArtisticText(text) => {
                 if (obj.effects.is_empty() && obj.perspective.is_none())
                     || view_mode == ViewMode::Wireframe
@@ -2332,7 +2632,12 @@ impl SceneRenderer {
                     .unwrap_or(page_world_xf);
                 let mut sym_visiting = HashMap::new();
                 let mut sym_visited_syms = HashSet::new();
-                let mut sym_cache = HashMap::new();
+                let mut local_cache = HashMap::new();
+                let cache_ref = if sym_ctx.is_some() {
+                    &mut self.sym_bounds_cache
+                } else {
+                    &mut local_cache
+                };
                 let ((a, b), _) = resolve_connector_endpoints_with_sym(
                     doc,
                     conn,
@@ -2340,7 +2645,7 @@ impl SceneRenderer {
                     sym_ctx.map(|(m, _, xf)| (m, xf)),
                     &mut sym_visiting,
                     &mut sym_visited_syms,
-                    &mut sym_cache,
+                    cache_ref,
                     depth + 1,
                 );
                 let route = conn.route_path(a, b);
@@ -2707,7 +3012,15 @@ impl SceneRenderer {
 
                 // Container background fill
                 if obj.fill.is_visible() {
-                    self.draw_fill_styled(
+                    let mesh_deform = pc_has_deform.then(|| MeshDeformCtx {
+                        raw_local_bb: container.bounding_box(),
+                        pre_perspective: obj.perspective,
+                        pre_effect_bb: pc_local_bb,
+                        effects: &obj.effects,
+                        c_xf: Affine2D::IDENTITY,
+                        deform_frames: &[],
+                    });
+                    self.draw_fill_styled_with_deform(
                         doc,
                         &deformed_container,
                         &obj.fill,
@@ -2717,6 +3030,7 @@ impl SceneRenderer {
                         anti_alias,
                         backend,
                         depth,
+                        mesh_deform.as_ref(),
                     );
                 }
 
@@ -3612,6 +3926,7 @@ impl SceneRenderer {
         underlying: &[BackdropItem],
         depth: usize,
     ) {
+        let saved_sym_bounds_cache = std::mem::take(&mut self.sym_bounds_cache);
         let anti_alias = view_mode != ViewMode::Pixels;
         let sym_has_deform = obj.perspective.is_some()
             || obj.effects.iter().any(|e| {
@@ -3798,6 +4113,7 @@ impl SceneRenderer {
         if let Some(ref mut u) = sym_underlying {
             u.push(BackdropItem::ExitSymbolInstance);
         }
+        self.sym_bounds_cache = saved_sym_bounds_cache;
 
         if sym_has_overlay {
             if let (Some(proxy), Some(deformed_sil)) = (&proxy_holder, &deformed_sil_holder) {
@@ -4063,15 +4379,7 @@ impl SceneRenderer {
                             depth + 1,
                             visiting,
                         ),
-                        NodePayload::Clone { .. } => cobj.and_then(|co| {
-                            doc.resolve_clone_payload_and_style(co)
-                                .and_then(|(p, _, _)| {
-                                    let mut tmp = co.clone();
-                                    tmp.payload = p;
-                                    crate::effects_render::extract_local_geometry_path(&tmp)
-                                        .and_then(|path| path.transformed(&c_xf).bounding_box())
-                                })
-                        }),
+                        NodePayload::Clone { .. } => None,
                     };
                     if let Some(r) = cb {
                         acc = Some(match acc {
@@ -4097,6 +4405,23 @@ impl SceneRenderer {
     ) -> BezierPath {
         let mut out = BezierPath::default();
         if depth > MAX_RENDER_DEPTH || !obj.visible || !rel_xf.is_finite() {
+            return out;
+        }
+        if matches!(obj.payload, NodePayload::Clone { .. }) {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                return self.collect_single_object_local_silhouette(
+                    doc,
+                    &tmp,
+                    sym_ctx,
+                    rel_xf,
+                    depth + 1,
+                    visiting,
+                );
+            }
             return out;
         }
         let apply_own_persp = |bp: BezierPath| -> BezierPath {
@@ -4133,18 +4458,6 @@ impl SceneRenderer {
                     )
                     .transformed(&c_xf);
                     out.subpaths.extend(def.subpaths);
-                }
-                NodePayload::Clone { .. } => {
-                    if let Some((p, _, _)) = doc.resolve_clone_payload_and_style(obj) {
-                        let mut tmp = obj.clone();
-                        tmp.payload = p;
-                        if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp)
-                        {
-                            let def =
-                                apply_geometry_effects(&geom, &obj.effects).transformed(&c_xf);
-                            out.subpaths.extend(def.subpaths);
-                        }
-                    }
                 }
                 NodePayload::PowerClip { container, .. } => {
                     let def = apply_geometry_effects(
@@ -4338,6 +4651,20 @@ impl SceneRenderer {
         if !obj.visible || obj_opacity <= 1e-6 || !obj.transform.is_finite() {
             return;
         }
+        let resolved_clone;
+        let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
+            let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) else {
+                return;
+            };
+            let mut tmp = obj.clone();
+            tmp.payload = p;
+            tmp.fill = f;
+            tmp.outline = o;
+            resolved_clone = tmp;
+            &resolved_clone
+        } else {
+            obj
+        };
         let is_container = matches!(
             obj.payload,
             NodePayload::Group(_) | NodePayload::PowerClip { .. } | NodePayload::SymbolInstance(_)
@@ -4800,18 +5127,28 @@ impl SceneRenderer {
                 deformed.transformed(&group_to_screen).bounding_box()
             }
             NodePayload::Clone { .. } => {
-                doc.resolve_clone_payload_and_style(obj)
-                    .and_then(|(p, _, _)| {
+                return doc
+                    .resolve_clone_payload_and_style(obj)
+                    .and_then(|(p, f, o)| {
                         let mut tmp = obj.clone();
                         tmp.payload = p;
-                        let geom = crate::effects_render::extract_local_geometry_path(&tmp)?;
-                        let deformed = apply_deform_chain_in_bounds(
-                            &apply_geometry_effects(&geom, &obj.effects),
-                            c_xf,
+                        tmp.fill = f;
+                        tmp.outline = o;
+                        self.compute_deformed_child_screen_bounds_inner(
+                            doc,
+                            &tmp,
                             deform_frames,
-                        );
-                        deformed.transformed(&group_to_screen).bounding_box()
-                    })
+                            page_to_surface,
+                            group_to_screen,
+                            rel_xf,
+                            sym_xf,
+                            c_xf,
+                            sym_ctx,
+                            depth + 1,
+                            visiting_bounds,
+                            visiting_syms,
+                        )
+                    });
             }
             NodePayload::PowerClip { container, .. } => {
                 let deformed = apply_deform_chain_in_bounds(
@@ -5233,6 +5570,9 @@ impl SceneRenderer {
         depth: usize,
         visiting: &mut HashSet<ObjectId>,
     ) {
+        if depth > MAX_RENDER_DEPTH {
+            return;
+        }
         let anti_alias = view_mode != ViewMode::Pixels;
         let inner_to_outer_rel = deform_frames
             .iter()
@@ -5323,15 +5663,25 @@ impl SceneRenderer {
         };
         match &obj.payload {
             NodePayload::Path(p) => {
+                let persp_path = apply_own_persp(p);
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&apply_own_persp(p), &obj.effects),
+                    &apply_geometry_effects(&persp_path, &obj.effects),
                     c_xf,
                     deform_frames,
                 );
+                let mesh_deform = MeshDeformCtx {
+                    raw_local_bb: p.bounding_box(),
+                    pre_perspective: obj.perspective,
+                    pre_effect_bb: persp_path.bounding_box(),
+                    effects: &obj.effects,
+                    c_xf,
+                    deform_frames,
+                };
                 self.render_deformed_leaf(
                     doc,
                     obj,
                     &deformed,
+                    Some(&mesh_deform),
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5343,15 +5693,26 @@ impl SceneRenderer {
                 );
             }
             NodePayload::Shape(s) => {
+                let raw_path = s.to_bezier_path();
+                let persp_path = apply_own_persp(&raw_path);
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&apply_own_persp(&s.to_bezier_path()), &obj.effects),
+                    &apply_geometry_effects(&persp_path, &obj.effects),
                     c_xf,
                     deform_frames,
                 );
+                let mesh_deform = MeshDeformCtx {
+                    raw_local_bb: raw_path.bounding_box(),
+                    pre_perspective: obj.perspective,
+                    pre_effect_bb: persp_path.bounding_box(),
+                    effects: &obj.effects,
+                    c_xf,
+                    deform_frames,
+                };
                 self.render_deformed_leaf(
                     doc,
                     obj,
                     &deformed,
+                    Some(&mesh_deform),
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5363,15 +5724,26 @@ impl SceneRenderer {
                 );
             }
             NodePayload::BSpline(bs) => {
+                let raw_path = bs.to_bezier_path();
+                let persp_path = apply_own_persp(&raw_path);
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(&apply_own_persp(&bs.to_bezier_path()), &obj.effects),
+                    &apply_geometry_effects(&persp_path, &obj.effects),
                     c_xf,
                     deform_frames,
                 );
+                let mesh_deform = MeshDeformCtx {
+                    raw_local_bb: raw_path.bounding_box(),
+                    pre_perspective: obj.perspective,
+                    pre_effect_bb: persp_path.bounding_box(),
+                    effects: &obj.effects,
+                    c_xf,
+                    deform_frames,
+                };
                 self.render_deformed_leaf(
                     doc,
                     obj,
                     &deformed,
+                    Some(&mesh_deform),
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5383,18 +5755,26 @@ impl SceneRenderer {
                 );
             }
             NodePayload::ArtisticMedia { spine, style } => {
+                let raw_path = coree_core::ArtisticMedia::expand_stroke(spine, style);
+                let persp_path = apply_own_persp(&raw_path);
                 let deformed = apply_deform_chain_in_bounds(
-                    &apply_geometry_effects(
-                        &apply_own_persp(&coree_core::ArtisticMedia::expand_stroke(spine, style)),
-                        &obj.effects,
-                    ),
+                    &apply_geometry_effects(&persp_path, &obj.effects),
                     c_xf,
                     deform_frames,
                 );
+                let mesh_deform = MeshDeformCtx {
+                    raw_local_bb: raw_path.bounding_box(),
+                    pre_perspective: obj.perspective,
+                    pre_effect_bb: persp_path.bounding_box(),
+                    effects: &obj.effects,
+                    c_xf,
+                    deform_frames,
+                };
                 self.render_deformed_leaf(
                     doc,
                     obj,
                     &deformed,
+                    Some(&mesh_deform),
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5411,26 +5791,26 @@ impl SceneRenderer {
                     tmp.payload = p;
                     tmp.fill = f;
                     tmp.outline = o;
-                    if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp) {
-                        let deformed = apply_deform_chain_in_bounds(
-                            &apply_geometry_effects(&geom, &tmp.effects),
-                            c_xf,
-                            deform_frames,
-                        );
-                        self.render_deformed_leaf(
-                            doc,
-                            &tmp,
-                            &deformed,
-                            page_to_surface,
-                            group_to_screen,
-                            px_per_mm,
-                            view_mode,
-                            options,
-                            anti_alias,
-                            backend,
-                            depth,
-                        );
-                    }
+                    self.render_deformed_child_core(
+                        doc,
+                        page,
+                        &tmp,
+                        deform_frames,
+                        page_to_surface,
+                        group_to_screen,
+                        rel_xf,
+                        sym_xf,
+                        c_xf,
+                        sym_ctx,
+                        px_per_mm,
+                        view_mode,
+                        options,
+                        backend,
+                        child_u,
+                        track_child_lens,
+                        depth + 1,
+                        visiting,
+                    );
                 }
             }
             NodePayload::ArtisticText(text) => {
@@ -6230,7 +6610,15 @@ impl SceneRenderer {
                         );
                     }
                     if obj.fill.is_visible() {
-                        self.draw_fill_styled(
+                        let mesh_deform = Some(MeshDeformCtx {
+                            raw_local_bb: container.bounding_box(),
+                            pre_perspective: obj.perspective,
+                            pre_effect_bb: pc_local_bb,
+                            effects: &obj.effects,
+                            c_xf,
+                            deform_frames,
+                        });
+                        self.draw_fill_styled_with_deform(
                             doc,
                             &deformed_container,
                             &obj.fill,
@@ -6240,6 +6628,7 @@ impl SceneRenderer {
                             anti_alias,
                             backend,
                             depth,
+                            mesh_deform.as_ref(),
                         );
                     }
                     backend.push_clip(&deformed_container, FillRule::Winding, group_to_screen);
@@ -6567,6 +6956,7 @@ impl SceneRenderer {
         doc: &Document,
         obj: &SceneObject,
         deformed_in_group: &BezierPath,
+        mesh_deform: Option<&MeshDeformCtx<'_>>,
         page_to_surface: Affine2D,
         group_to_screen: Affine2D,
         px_per_mm: f64,
@@ -6615,7 +7005,7 @@ impl SceneRenderer {
             );
         }
         if obj.fill.is_visible() {
-            self.draw_fill_styled(
+            self.draw_fill_styled_with_deform(
                 doc,
                 deformed_in_group,
                 &obj.fill,
@@ -6625,6 +7015,7 @@ impl SceneRenderer {
                 anti_alias,
                 backend,
                 depth,
+                mesh_deform,
             );
         }
         if !obj.effects.is_empty() {
@@ -6817,7 +7208,24 @@ impl SceneRenderer {
 
         // Fill (all 11 Fill variants!)
         if obj.fill.is_visible() {
-            self.draw_fill_styled(
+            let has_deform = obj.perspective.is_some()
+                || obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Distort { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Perspective { .. }
+                    )
+                });
+            let mesh_deform = has_deform.then(|| MeshDeformCtx {
+                raw_local_bb: local_path.bounding_box(),
+                pre_perspective: obj.perspective,
+                pre_effect_bb: persp_path.bounding_box(),
+                effects: &obj.effects,
+                c_xf: Affine2D::IDENTITY,
+                deform_frames: &[],
+            });
+            self.draw_fill_styled_with_deform(
                 doc,
                 &deformed,
                 &obj.fill,
@@ -6827,6 +7235,7 @@ impl SceneRenderer {
                 anti_alias,
                 backend,
                 depth,
+                mesh_deform.as_ref(),
             );
         }
 
@@ -7264,8 +7673,9 @@ impl SceneRenderer {
         );
     }
 
-    /// Renders all 11 [`Fill`] variants onto `backend`, reusing `self` for `VectorPattern`
-    /// symbol tile rasterization with recursion depth tracking.
+    /// Deformation context passed down to `render_mesh_fill` so Coons patch control points
+    /// and interior `(u, v)` samples warp accurately under `Perspective3x3`, `Effect::{Envelope, Perspective, Distort}`,
+    /// and enclosing `Group`/`PowerClip`/`SymbolInstance` `DeformFrame`s.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_fill_styled(
         &mut self,
@@ -7278,6 +7688,35 @@ impl SceneRenderer {
         anti_alias: bool,
         backend: &mut dyn CanvasBackend,
         depth: usize,
+    ) {
+        self.draw_fill_styled_with_deform(
+            doc,
+            local_path,
+            fill,
+            local_to_screen,
+            opacity,
+            blend_mode,
+            anti_alias,
+            backend,
+            depth,
+            None,
+        );
+    }
+
+    /// Renders all 11 [`Fill`] variants onto `backend` with optional live deformation context for `MeshFill`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_fill_styled_with_deform(
+        &mut self,
+        doc: &Document,
+        local_path: &BezierPath,
+        fill: &Fill,
+        local_to_screen: Affine2D,
+        opacity: f32,
+        blend_mode: BlendMode,
+        anti_alias: bool,
+        backend: &mut dyn CanvasBackend,
+        depth: usize,
+        mesh_deform: Option<&MeshDeformCtx<'_>>,
     ) {
         let op = sanitize_f32(opacity, 1.0).clamp(0.0, 1.0);
         if op <= 1e-6 || local_path.is_empty() {
@@ -7579,6 +8018,7 @@ impl SceneRenderer {
                     blend_mode,
                     &self.active_icc,
                     backend,
+                    mesh_deform,
                 );
             }
         }
@@ -7662,7 +8102,8 @@ fn render_pixel_shader_fill<F>(
 }
 
 /// True bicubic Coons-patch subdivided MeshFill rasterizer with tangent handles, per-node alpha,
-/// CMYK/Lab color interpolation, `1x1` guard, adaptive subdivision, and seam-free triangle coverage.
+/// CMYK/Lab color interpolation, `1x1` guard, adaptive subdivision, seam-free triangle coverage,
+/// and live `Perspective3x3` / `Envelope` / `Perspective` / `Distort` / `DeformFrame` warping.
 #[allow(clippy::too_many_arguments)]
 fn render_mesh_fill(
     local_path: &BezierPath,
@@ -7674,6 +8115,7 @@ fn render_mesh_fill(
     blend_mode: BlendMode,
     icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
+    mesh_deform: Option<&MeshDeformCtx<'_>>,
 ) {
     let Some(lb) = local_path.bounding_box() else {
         return;
@@ -7703,6 +8145,15 @@ fn render_mesh_fill(
 
     let r_cnt = rows.clamp(2, 32);
     let c_cnt = cols.clamp(2, 32);
+    let raw_lb = mesh_deform
+        .and_then(|d| d.raw_local_bb)
+        .filter(|r| r.is_finite())
+        .or_else(|| {
+            mesh_deform
+                .and_then(|d| d.pre_effect_bb)
+                .filter(|r| r.is_finite())
+        })
+        .unwrap_or(lb);
 
     let mut grid_pos = vec![vec![Point2D::ZERO; c_cnt]; r_cnt];
     let mut grid_handles: Vec<Vec<[Option<Point2D>; 4]>> = vec![vec![[None; 4]; c_cnt]; r_cnt];
@@ -7714,15 +8165,18 @@ fn render_mesh_fill(
         let v = r as f64 / (r_cnt - 1) as f64;
         for (c, slot) in pos_row.iter_mut().enumerate() {
             let u = c as f64 / (c_cnt - 1) as f64;
-            *slot = Point2D::new(lb.min_x + u * lb.width(), lb.min_y + v * lb.height());
+            *slot = Point2D::new(
+                raw_lb.min_x + u * raw_lb.width(),
+                raw_lb.min_y + v * raw_lb.height(),
+            );
         }
     }
-    let margin = lb.width().max(lb.height()).max(1.0) * 4.0;
+    let margin = raw_lb.width().max(raw_lb.height()).max(1.0) * 4.0;
     let clamp_pt = |p: Point2D| -> Option<Point2D> {
         p.is_finite().then(|| {
             Point2D::new(
-                p.x.clamp(lb.min_x - margin, lb.max_x + margin),
-                p.y.clamp(lb.min_y - margin, lb.max_y + margin),
+                p.x.clamp(raw_lb.min_x - margin, raw_lb.max_x + margin),
+                p.y.clamp(raw_lb.min_y - margin, raw_lb.max_y + margin),
             )
         })
     };
@@ -7732,7 +8186,7 @@ fn render_mesh_fill(
         if node.row < r_cnt && node.col < c_cnt {
             let base = clamp_pt(node.pos).unwrap_or(grid_pos[r_idx][c_idx]);
             grid_pos[r_idx][c_idx] = base;
-            // Relative tangent offsets [N, S, E, W] -> absolute control points in local space.
+            // Relative tangent offsets [N, S, E, W] -> absolute control points in pre-deformation local space.
             let abs_handle = |h: Point2D| -> Option<Point2D> {
                 h.is_finite()
                     .then(|| Point2D::new(base.x + h.x, base.y + h.y))
@@ -7775,18 +8229,68 @@ fn render_mesh_fill(
         }
     }
 
+    let prepared_obj_steps: Vec<DeformPointStep> = mesh_deform
+        .map(|d| prepare_deform_point_steps(d.pre_effect_bb.or(Some(raw_lb)), d.effects))
+        .unwrap_or_default();
+    let prepared_frames: Vec<(Option<Perspective3x3>, Vec<DeformPointStep>, Affine2D)> =
+        mesh_deform
+            .map(|d| {
+                d.deform_frames
+                    .iter()
+                    .rev()
+                    .map(|frame| {
+                        (
+                            frame.pre_perspective,
+                            prepare_deform_point_steps(frame.group_local_bb, frame.group_effects),
+                            frame.rel_to_outer,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let pre_perspective = mesh_deform.and_then(|d| d.pre_perspective);
+    let c_xf = mesh_deform.map_or(Affine2D::IDENTITY, |d| d.c_xf);
+    let has_mesh_deform = pre_perspective.is_some()
+        || !prepared_obj_steps.is_empty()
+        || c_xf != Affine2D::IDENTITY
+        || !prepared_frames.is_empty();
+
+    let deform_local_pt = |mut p: Point2D| -> Point2D {
+        if !has_mesh_deform {
+            return p;
+        }
+        if let Some(persp) = pre_perspective {
+            if let Some(tp) = persp.transform_point(p) {
+                p = tp;
+            }
+        }
+        if !prepared_obj_steps.is_empty() {
+            p = apply_deform_point_steps(p, &prepared_obj_steps);
+        }
+        if c_xf != Affine2D::IDENTITY {
+            p = c_xf.transform_point(p);
+        }
+        for (frame_persp, frame_steps, rel_to_outer) in &prepared_frames {
+            if let Some(fp) = frame_persp {
+                if let Some(tp) = fp.transform_point(p) {
+                    p = tp;
+                }
+            }
+            if !frame_steps.is_empty() {
+                p = apply_deform_point_steps(p, frame_steps);
+            }
+            if *rel_to_outer != Affine2D::IDENTITY {
+                p = rel_to_outer.transform_point(p);
+            }
+        }
+        p
+    };
+
     let mut buf = RgbaBuffer::new_transparent(clamped.width, clamped.height);
     let to_buf_px = |p: Point2D| -> Point2D {
         let s = local_to_screen.transform_point(p);
         Point2D::new(s.x - f64::from(clamped.x), s.y - f64::from(clamped.y))
     };
-
-    let mut px_pos = vec![vec![Point2D::ZERO; c_cnt]; r_cnt];
-    for r in 0..r_cnt {
-        for c in 0..c_cnt {
-            px_pos[r][c] = to_buf_px(grid_pos[r][c]);
-        }
-    }
 
     let eval_cubic_pt = |c0: Point2D, c1: Point2D, c2: Point2D, c3: Point2D, t: f64| -> Point2D {
         let it = 1.0 - t;
@@ -7806,84 +8310,80 @@ fn render_mesh_fill(
 
     for r in 0..(r_cnt - 1) {
         for c in 0..(c_cnt - 1) {
-            let p00 = px_pos[r][c];
-            let p10 = px_pos[r][c + 1];
-            let p01 = px_pos[r + 1][c];
-            let p11 = px_pos[r + 1][c + 1];
+            let p00 = grid_pos[r][c];
+            let p10 = grid_pos[r][c + 1];
+            let p01 = grid_pos[r + 1][c];
+            let p11 = grid_pos[r + 1][c + 1];
 
-            // Neighbor Catmull-Rom chords in pixel space when explicit handles are absent
-            let p_l0 = px_pos[r][c.saturating_sub(1)];
-            let p_r0 = px_pos[r][(c + 2).min(c_cnt - 1)];
-            let p_l1 = px_pos[r + 1][c.saturating_sub(1)];
-            let p_r1 = px_pos[r + 1][(c + 2).min(c_cnt - 1)];
-            let p_u0 = px_pos[r.saturating_sub(1)][c];
-            let p_d0 = px_pos[(r + 2).min(r_cnt - 1)][c];
-            let p_u1 = px_pos[r.saturating_sub(1)][c + 1];
-            let p_d1 = px_pos[(r + 2).min(r_cnt - 1)][c + 1];
+            // Neighbor Catmull-Rom chords in pre-deformation local space when explicit handles are absent
+            let p_l0 = grid_pos[r][c.saturating_sub(1)];
+            let p_r0 = grid_pos[r][(c + 2).min(c_cnt - 1)];
+            let p_l1 = grid_pos[r + 1][c.saturating_sub(1)];
+            let p_r1 = grid_pos[r + 1][(c + 2).min(c_cnt - 1)];
+            let p_u0 = grid_pos[r.saturating_sub(1)][c];
+            let p_d0 = grid_pos[(r + 2).min(r_cnt - 1)][c];
+            let p_u1 = grid_pos[r.saturating_sub(1)][c + 1];
+            let p_d1 = grid_pos[(r + 2).min(r_cnt - 1)][c + 1];
 
             // Edge cubic control points: [N:0, S:1, E:2, W:3].
             // Boundary endpoints use 1/3 chord for uniform straight parameterization;
             // interior endpoints use Catmull-Rom (next - prev) / 6 for C1 continuity.
-            let t_c1 = grid_handles[r][c][2].map(to_buf_px).unwrap_or_else(|| {
+            let t_c1 = grid_handles[r][c][2].unwrap_or_else(|| {
                 if c > 0 {
                     p00 + catmull_tangent(p_l0, p10)
                 } else {
                     p00 + (p10 - p00) * (1.0 / 3.0)
                 }
             });
-            let t_c2 = grid_handles[r][c + 1][3].map(to_buf_px).unwrap_or_else(|| {
+            let t_c2 = grid_handles[r][c + 1][3].unwrap_or_else(|| {
                 if c + 2 < c_cnt {
                     p10 - catmull_tangent(p00, p_r0)
                 } else {
                     p10 - (p10 - p00) * (1.0 / 3.0)
                 }
             });
-            let b_c1 = grid_handles[r + 1][c][2].map(to_buf_px).unwrap_or_else(|| {
+            let b_c1 = grid_handles[r + 1][c][2].unwrap_or_else(|| {
                 if c > 0 {
                     p01 + catmull_tangent(p_l1, p11)
                 } else {
                     p01 + (p11 - p01) * (1.0 / 3.0)
                 }
             });
-            let b_c2 = grid_handles[r + 1][c + 1][3]
-                .map(to_buf_px)
-                .unwrap_or_else(|| {
-                    if c + 2 < c_cnt {
-                        p11 - catmull_tangent(p01, p_r1)
-                    } else {
-                        p11 - (p11 - p01) * (1.0 / 3.0)
-                    }
-                });
-            let l_c1 = grid_handles[r][c][1].map(to_buf_px).unwrap_or_else(|| {
+            let b_c2 = grid_handles[r + 1][c + 1][3].unwrap_or_else(|| {
+                if c + 2 < c_cnt {
+                    p11 - catmull_tangent(p01, p_r1)
+                } else {
+                    p11 - (p11 - p01) * (1.0 / 3.0)
+                }
+            });
+            let l_c1 = grid_handles[r][c][1].unwrap_or_else(|| {
                 if r > 0 {
                     p00 + catmull_tangent(p_u0, p01)
                 } else {
                     p00 + (p01 - p00) * (1.0 / 3.0)
                 }
             });
-            let l_c2 = grid_handles[r + 1][c][0].map(to_buf_px).unwrap_or_else(|| {
+            let l_c2 = grid_handles[r + 1][c][0].unwrap_or_else(|| {
                 if r + 2 < r_cnt {
                     p01 - catmull_tangent(p00, p_d0)
                 } else {
                     p01 - (p01 - p00) * (1.0 / 3.0)
                 }
             });
-            let r_c1 = grid_handles[r][c + 1][1].map(to_buf_px).unwrap_or_else(|| {
+            let r_c1 = grid_handles[r][c + 1][1].unwrap_or_else(|| {
                 if r > 0 {
                     p10 + catmull_tangent(p_u1, p11)
                 } else {
                     p10 + (p11 - p10) * (1.0 / 3.0)
                 }
             });
-            let r_c2 = grid_handles[r + 1][c + 1][0]
-                .map(to_buf_px)
-                .unwrap_or_else(|| {
-                    if r + 2 < r_cnt {
-                        p11 - catmull_tangent(p10, p_d1)
-                    } else {
-                        p11 - (p11 - p10) * (1.0 / 3.0)
-                    }
-                });
+            let r_c2 = grid_handles[r + 1][c + 1][0].unwrap_or_else(|| {
+                if r + 2 < r_cnt {
+                    p11 - catmull_tangent(p10, p_d1)
+                } else {
+                    p11 - (p11 - p10) * (1.0 / 3.0)
+                }
+            });
 
             let eval_pos = |u: f64, v: f64| -> Point2D {
                 let top = eval_cubic_pt(p00, t_c1, t_c2, p10, u);
@@ -7894,10 +8394,11 @@ fn render_mesh_fill(
                 let ruled_v = left.lerp(right, u);
                 let bilin = p00.lerp(p10, u).lerp(p01.lerp(p11, u), v);
                 let coons = |a: f64, b: f64, c: f64| a + b - c;
-                Point2D::new(
+                let local_pt = Point2D::new(
                     coons(ruled_u.x, ruled_v.x, bilin.x),
                     coons(ruled_u.y, ruled_v.y, bilin.y),
-                )
+                );
+                to_buf_px(deform_local_pt(local_pt))
             };
 
             let col00 = &grid_color[r][c];
@@ -8030,11 +8531,19 @@ fn render_mesh_fill(
                 ]
             };
 
-            let patch_px_span = p00
-                .distance_to(p10)
-                .max(p01.distance_to(p11))
-                .max(p00.distance_to(p01))
-                .max(p10.distance_to(p11));
+            let q00 = eval_pos(0.0, 0.0);
+            let q10 = eval_pos(1.0, 0.0);
+            let q01 = eval_pos(0.0, 1.0);
+            let q11 = eval_pos(1.0, 1.0);
+            let qm0 = eval_pos(0.5, 0.0);
+            let qm1 = eval_pos(0.5, 1.0);
+            let patch_px_span = q00
+                .distance_to(q10)
+                .max(q01.distance_to(q11))
+                .max(q00.distance_to(q01))
+                .max(q10.distance_to(q11))
+                .max(q00.distance_to(qm0) + qm0.distance_to(q10))
+                .max(q01.distance_to(qm1) + qm1.distance_to(q11));
             let sub_divs = (patch_px_span / 4.0).ceil().clamp(10.0, 24.0) as usize;
 
             for sv in 0..sub_divs {
@@ -8608,44 +9117,119 @@ fn render_page_overlays(
         );
     }
 
-    // 4. Guidelines
+    // 4. Guidelines (clipped to visible surface bounds and phase-anchored to integer multiples of period_mm)
     let guides = doc.guides();
     if options.show_guidelines && !guides.is_empty() {
+        let dash_on = hairline_mm * 6.0;
+        let dash_off = hairline_mm * 3.0;
+        let period_mm = (f64::from(dash_on) + f64::from(dash_off)).max(1e-6);
         let guide_stroke = StrokeParams {
             color: Color::rgba8(0, 165, 225, 200),
             width: hairline_mm,
             cap: coree_core::LineCap::Butt,
             join: coree_core::LineJoin::Miter,
             miter_limit: 4.0,
-            dash_pattern: vec![hairline_mm * 6.0, hairline_mm * 3.0],
+            dash_pattern: vec![dash_on, dash_off],
             dash_offset: 0.0,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             anti_alias: false,
+        };
+        let surf_rect = Rect2D::from_xywh(
+            -4.0,
+            -4.0,
+            f64::from(backend.width()) + 8.0,
+            f64::from(backend.height()) + 8.0,
+        );
+        let vis_page = page_to_surface
+            .inverse()
+            .filter(|m| m.is_finite())
+            .map(|inv| inv.transform_rect(surf_rect))
+            .filter(|r| r.is_finite());
+        let align_span = |min_s: f64, max_s: f64| -> (f64, f64) {
+            let k0 = (min_s / period_mm).floor();
+            let start = k0 * period_mm;
+            let end = max_s.max(start + period_mm);
+            (start, end)
         };
         let extent = page.width_mm.max(page.height_mm) * 4.0;
         let mut subpaths = Vec::with_capacity(guides.len());
         for guide in guides {
             match guide.orientation {
                 GuideOrientation::Horizontal(y) => {
-                    subpaths.push(Subpath::from_points(
-                        [Point2D::new(-extent, y), Point2D::new(extent, y)],
-                        false,
-                    ));
+                    if let Some(vis) = vis_page {
+                        if y < vis.min_y || y > vis.max_y {
+                            continue;
+                        }
+                        let (x0, x1) = align_span(vis.min_x, vis.max_x);
+                        subpaths.push(Subpath::from_points(
+                            [Point2D::new(x0, y), Point2D::new(x1, y)],
+                            false,
+                        ));
+                    } else {
+                        subpaths.push(Subpath::from_points(
+                            [Point2D::new(-extent, y), Point2D::new(extent, y)],
+                            false,
+                        ));
+                    }
                 }
                 GuideOrientation::Vertical(x) => {
-                    subpaths.push(Subpath::from_points(
-                        [Point2D::new(x, -extent), Point2D::new(x, extent)],
-                        false,
-                    ));
+                    if let Some(vis) = vis_page {
+                        if x < vis.min_x || x > vis.max_x {
+                            continue;
+                        }
+                        let (y0, y1) = align_span(vis.min_y, vis.max_y);
+                        subpaths.push(Subpath::from_points(
+                            [Point2D::new(x, y0), Point2D::new(x, y1)],
+                            false,
+                        ));
+                    } else {
+                        subpaths.push(Subpath::from_points(
+                            [Point2D::new(x, -extent), Point2D::new(x, extent)],
+                            false,
+                        ));
+                    }
                 }
                 GuideOrientation::Angled { origin, angle_deg } => {
-                    let dir = Vec2D::from_angle(angle_deg.to_radians()) * extent;
-                    subpaths.push(Subpath::from_points([origin - dir, origin + dir], false));
+                    let dir = Vec2D::from_angle(angle_deg.to_radians());
+                    if let Some(vis) = vis_page {
+                        let mut s_min = f64::NEG_INFINITY;
+                        let mut s_max = f64::INFINITY;
+                        let mut clip_slab =
+                            |orig_c: f64, dir_c: f64, min_c: f64, max_c: f64| -> bool {
+                                if dir_c.abs() <= 1e-12 {
+                                    orig_c >= min_c && orig_c <= max_c
+                                } else {
+                                    let t0 = (min_c - orig_c) / dir_c;
+                                    let t1 = (max_c - orig_c) / dir_c;
+                                    let (lo, hi) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+                                    s_min = s_min.max(lo);
+                                    s_max = s_max.min(hi);
+                                    s_min <= s_max
+                                }
+                            };
+                        if !clip_slab(origin.x, dir.x, vis.min_x, vis.max_x)
+                            || !clip_slab(origin.y, dir.y, vis.min_y, vis.max_y)
+                            || !s_min.is_finite()
+                            || !s_max.is_finite()
+                        {
+                            continue;
+                        }
+                        let (s0, s1) = align_span(s_min, s_max);
+                        subpaths.push(Subpath::from_points(
+                            [origin + dir * s0, origin + dir * s1],
+                            false,
+                        ));
+                    } else {
+                        let span = dir * extent;
+                        subpaths.push(Subpath::from_points([origin - span, origin + span], false));
+                    }
                 }
             }
         }
-        backend.stroke_path(&BezierPath { subpaths }, &guide_stroke, page_to_surface);
+        if !subpaths.is_empty() {
+            backend.stroke_path(&BezierPath { subpaths }, &guide_stroke, page_to_surface);
+        }
     }
 }
 
@@ -8776,71 +9360,121 @@ pub(crate) fn collect_effective_layers(doc: &Document, page_index: usize) -> Vec
     out
 }
 
-fn object_has_nonlocal_effect_or_lens(
+fn object_nonlocal_and_lens_info(
     doc: &Document,
     obj: &SceneObject,
     visiting_objs: &mut HashSet<ObjectId>,
     visiting_syms: &mut HashSet<SymbolId>,
     depth: usize,
-) -> bool {
+) -> (bool, bool) {
     if depth > MAX_RENDER_DEPTH {
-        return false;
+        return (false, false);
     }
-    if obj.lens.is_some()
-        || obj.effects.iter().any(|e| {
-            matches!(
-                e,
-                coree_core::Effect::Blend { .. }
-                    | coree_core::Effect::Symmetry { .. }
-                    | coree_core::Effect::Perspective { .. }
-                    | coree_core::Effect::Envelope { .. }
-                    | coree_core::Effect::Distort { .. }
-            )
-        })
-    {
-        return true;
-    }
+    let self_lens = obj.lens.is_some();
+    let self_nonlocal = self_lens || obj.effects.iter().any(|e| {
+        matches!(
+            e,
+            coree_core::Effect::Blend { .. }
+                | coree_core::Effect::Symmetry { .. }
+                | coree_core::Effect::Perspective { .. }
+                | coree_core::Effect::Envelope { .. }
+                | coree_core::Effect::Distort { .. }
+        ) || matches!(
+            e,
+            coree_core::Effect::Extrude25D { vanishing_point, .. } if !vanishing_point.is_finite()
+        )
+    });
+    let mut nonlocal = self_nonlocal;
+    let mut has_lens = self_lens;
     match &obj.payload {
-        NodePayload::Group(children) => children.iter().any(|&cid| {
-            if !visiting_objs.insert(cid) {
-                return false;
+        NodePayload::Group(children) => {
+            for &cid in children {
+                if !visiting_objs.insert(cid) {
+                    continue;
+                }
+                if let Some(c) = doc.object(cid) {
+                    let (cn, cl) = object_nonlocal_and_lens_info(
+                        doc,
+                        c,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    );
+                    nonlocal |= cn;
+                    has_lens |= cl;
+                }
+                visiting_objs.remove(&cid);
+                if nonlocal && has_lens {
+                    break;
+                }
             }
-            let hit = doc.object(cid).is_some_and(|c| {
-                object_has_nonlocal_effect_or_lens(doc, c, visiting_objs, visiting_syms, depth + 1)
-            });
-            visiting_objs.remove(&cid);
-            hit
-        }),
-        NodePayload::PowerClip { contents, .. } => contents.iter().any(|&cid| {
-            if !visiting_objs.insert(cid) {
-                return false;
+        }
+        NodePayload::PowerClip { contents, .. } => {
+            for &cid in contents {
+                if !visiting_objs.insert(cid) {
+                    continue;
+                }
+                if let Some(c) = doc.object(cid) {
+                    let (cn, cl) = object_nonlocal_and_lens_info(
+                        doc,
+                        c,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    );
+                    nonlocal |= cn;
+                    has_lens |= cl;
+                }
+                visiting_objs.remove(&cid);
+                if nonlocal && has_lens {
+                    break;
+                }
             }
-            let hit = doc.object(cid).is_some_and(|c| {
-                object_has_nonlocal_effect_or_lens(doc, c, visiting_objs, visiting_syms, depth + 1)
-            });
-            visiting_objs.remove(&cid);
-            hit
-        }),
-        NodePayload::SymbolInstance(sym_id) => {
-            if !visiting_syms.insert(*sym_id) {
-                return false;
+        }
+        NodePayload::Clone { master_id, .. } => {
+            if visiting_objs.insert(*master_id) {
+                if let Some(m) = doc.object(*master_id) {
+                    let (mn, ml) = object_nonlocal_and_lens_info(
+                        doc,
+                        m,
+                        visiting_objs,
+                        visiting_syms,
+                        depth + 1,
+                    );
+                    nonlocal |= mn;
+                    has_lens |= ml;
+                }
+                visiting_objs.remove(master_id);
             }
-            let hit = doc.symbol(*sym_id).is_some_and(|sym| {
-                sym.objects.iter().any(|sub| {
-                    object_has_nonlocal_effect_or_lens(
+        }
+        NodePayload::SymbolInstance(sym_id) if visiting_syms.insert(*sym_id) => {
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let saved_objs = std::mem::take(visiting_objs);
+                for sub in &sym.objects {
+                    let inserted = sub.id.0 != 0 && visiting_objs.insert(sub.id);
+                    let (sn, sl) = object_nonlocal_and_lens_info(
                         doc,
                         sub,
                         visiting_objs,
                         visiting_syms,
                         depth + 1,
-                    )
-                })
-            });
+                    );
+                    if inserted {
+                        visiting_objs.remove(&sub.id);
+                    }
+                    nonlocal |= sn;
+                    has_lens |= sl;
+                    if nonlocal && has_lens {
+                        break;
+                    }
+                }
+                *visiting_objs = saved_objs;
+            }
             visiting_syms.remove(sym_id);
-            hit
         }
-        _ => false,
+        _ => {}
     }
+    (nonlocal, has_lens)
 }
 
 pub(crate) fn max_object_effect_padding_mm(
@@ -9017,6 +9651,23 @@ fn max_object_effect_padding_inner(
             }
             visiting_syms.remove(sym_id);
         }
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                max_pad = max_pad.max(max_object_effect_padding_inner(
+                    doc,
+                    &tmp,
+                    parent_xf,
+                    sym_map,
+                    visiting_objs,
+                    visiting_syms,
+                    depth + 1,
+                ));
+            }
+        }
         _ => {}
     }
     if max_pad.is_finite() {
@@ -9024,21 +9675,6 @@ fn max_object_effect_padding_inner(
     } else {
         0.0
     }
-}
-
-fn compute_page_max_effect_padding(doc: &Document, layers: &[&Layer]) -> f64 {
-    let mut max_pad = 0.0_f64;
-    for layer in layers {
-        if !layer.visible {
-            continue;
-        }
-        for &oid in &layer.objects {
-            if let Some(obj) = doc.object(oid) {
-                max_pad = max_pad.max(max_object_effect_padding_mm(doc, obj, Affine2D::IDENTITY));
-            }
-        }
-    }
-    max_pad
 }
 
 fn estimate_scale(xf: &Affine2D) -> f64 {

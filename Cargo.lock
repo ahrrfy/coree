@@ -569,6 +569,8 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-bidi",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -577,10 +579,12 @@ dependencies = [
 name = "coree-bench"
 version = "0.3.1"
 dependencies = [
+ "coree-app",
  "coree-core",
  "coree-render",
  "coree-storage",
  "coree-tools",
+ "egui",
  "tempfile",
 ]
 
@@ -657,10 +661,12 @@ dependencies = [
 name = "coree-render"
 version = "0.3.1"
 dependencies = [
+ "bytemuck",
  "coree-core",
  "cosmic-text",
  "image",
  "kurbo",
+ "pollster",
  "rayon",
  "resvg",
  "rstar",
@@ -668,6 +674,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tiny-skia",
  "usvg",
+ "wgpu",
 ]
 
 [[package]]
@@ -3862,6 +3869,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "js-sys",
  "log",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",

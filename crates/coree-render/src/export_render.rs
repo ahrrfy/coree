@@ -2,7 +2,10 @@
 
 //! Headless high-DPI page export & visual regression rendering entry points.
 
-use crate::backend::{validate_surface_dimensions, CanvasBackend, RgbaBuffer, TinySkiaBackend};
+use crate::backend::{
+    validate_surface_dimensions, CanvasBackend, RenderBackend, RenderBackendKind, RgbaBuffer,
+    TinySkiaBackend,
+};
 use crate::error::{RenderError, RenderResult};
 use crate::renderer::{RenderOptions, SceneRenderer};
 use crate::viewport::{ViewMode, Viewport};
@@ -76,6 +79,25 @@ pub fn render_page_to_rgba_with_options(
     view_mode: ViewMode,
     options: &RenderOptions,
 ) -> RenderResult<RenderedImage> {
+    render_page_to_rgba_with_backend(
+        doc,
+        page_idx,
+        dpi,
+        view_mode,
+        options,
+        RenderBackendKind::from_env(),
+    )
+}
+
+/// Renders page `page_idx` headlessly with custom [`RenderOptions`] and an explicit [`RenderBackendKind`].
+pub fn render_page_to_rgba_with_backend(
+    doc: &Document,
+    page_idx: usize,
+    dpi: f64,
+    view_mode: ViewMode,
+    options: &RenderOptions,
+    backend_kind: RenderBackendKind,
+) -> RenderResult<RenderedImage> {
     let pages = doc.pages();
     if page_idx >= pages.len() {
         return Err(RenderError::PageOutOfRange {
@@ -94,7 +116,7 @@ pub fn render_page_to_rgba_with_options(
     let width = (page.width_mm * px_per_mm).round().max(1.0) as u32;
     let height = (page.height_mm * px_per_mm).round().max(1.0) as u32;
 
-    let mut backend = TinySkiaBackend::new(width, height)?;
+    let mut backend = RenderBackend::new_for_kind(backend_kind, width, height)?;
     let viewport = Viewport::for_export(width, height, safe_dpi);
 
     // Clone only active_page_index / multipage flag onto a lightweight render call
@@ -436,6 +458,22 @@ pub(crate) fn object_or_subtree_has_lens_with_sym(
             visiting_syms.remove(sym_id);
             hit
         }
+        coree_core::NodePayload::Clone { .. } => doc
+            .resolve_clone_payload_and_style(obj)
+            .is_some_and(|(p, f, o)| {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                object_or_subtree_has_lens_with_sym(
+                    doc,
+                    &tmp,
+                    sym_map,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                )
+            }),
         _ => false,
     }
 }

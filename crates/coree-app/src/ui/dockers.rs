@@ -3081,6 +3081,12 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
         {
             need_refresh = true;
         }
+        if ui
+            .checkbox(&mut app.font_manager_state.favorites_only, "★ Favorites")
+            .changed()
+        {
+            need_refresh = true;
+        }
     });
 
     if need_refresh {
@@ -3127,6 +3133,14 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
     let fonts = app.font_manager_state.indexed_fonts.clone();
     for f in fonts.iter().take(80) {
         ui.horizontal(|ui| {
+            let star = if f.favorite { "★" } else { "☆" };
+            if ui
+                .small_button(star)
+                .on_hover_text("Toggle favorite font")
+                .clicked()
+            {
+                app.toggle_font_favorite(&f.id, !f.favorite);
+            }
             let ar = if f.supports_arabic_rtl { " [AR]" } else { "" };
             let var = if f.is_variable { " [Var]" } else { "" };
             let pan = if f.panose.family_type() != 0 {
@@ -3187,6 +3201,104 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         });
     }
+
+    ui.separator();
+    egui::CollapsingHeader::new(
+        RichText::new("⇄ PANOSE Missing-Font Substitution")
+            .strong()
+            .color(tokens.accent),
+    )
+    .id_salt("font_mgr_panose_sub")
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Missing:");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.font_manager_state.missing_family_input)
+                    .hint_text("Missing family...")
+                    .desired_width(110.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Substitute:");
+            ui.add(
+                egui::TextEdit::singleline(&mut app.font_manager_state.substitute_family_input)
+                    .hint_text("Local family...")
+                    .desired_width(110.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("PANOSE Match").clicked() {
+                let target_panose = app
+                    .font_manager_state
+                    .indexed_fonts
+                    .iter()
+                    .find(|f| {
+                        f.family_name.eq_ignore_ascii_case(
+                            app.font_manager_state.missing_family_input.trim(),
+                        )
+                    })
+                    .map_or(
+                        coree_storage::PanoseClassification([2, 0, 5, 3, 0, 0, 0, 0, 0, 0]),
+                        |f| f.panose,
+                    );
+                let _ = app.find_best_panose_substitute(
+                    &target_panose,
+                    400,
+                    false,
+                    app.font_manager_state.arabic_only,
+                );
+            }
+            if ui.small_button("Save Rule").clicked() {
+                let missing = app.font_manager_state.missing_family_input.clone();
+                let sub = app.font_manager_state.substitute_family_input.clone();
+                let pan = app
+                    .font_manager_state
+                    .panose_suggestion
+                    .as_ref()
+                    .map(|(r, _)| r.panose);
+                if let Err(err) = app.set_font_substitution(&missing, &sub, pan.as_ref()) {
+                    app.push_toast(format!("Substitution error: {err}"), true);
+                }
+            }
+            if ui.small_button("Apply to Doc").clicked() {
+                let missing = app.font_manager_state.missing_family_input.clone();
+                let sub = app.font_manager_state.substitute_family_input.clone();
+                let _ = app.apply_font_substitution_to_active_document(&missing, &sub);
+            }
+        });
+        if let Some((ref best, score)) = app.font_manager_state.panose_suggestion {
+            ui.label(
+                RichText::new(format!(
+                    "Best PANOSE match: {} (dist {score})",
+                    best.family_name
+                ))
+                .size(10.5)
+                .color(tokens.text_muted),
+            );
+        }
+        let saved_subs = app.font_manager_state.substitutions.clone();
+        for sub in &saved_subs {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} → {}",
+                        sub.missing_family, sub.substitute_family
+                    ))
+                    .size(10.5),
+                );
+                if ui.small_button("Apply").clicked() {
+                    let _ = app.apply_font_substitution_to_active_document(
+                        &sub.missing_family,
+                        &sub.substitute_family,
+                    );
+                }
+                if ui.small_button("✕").clicked() {
+                    app.remove_font_substitution(&sub.missing_family);
+                }
+            });
+        }
+    });
 
     ui.separator();
     ui_glyphs_browser(ui, app, "font_mgr_glyphs");
@@ -4185,5 +4297,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&plugin_dir);
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn font_manager_ui_renders_favorites_panose_and_glyphs_headlessly() {
+        let db = coree_storage::StorageDb::open_in_memory().expect("open in-memory storage");
+        let mut app = StudioApp::new_with_storage(db);
+        app.font_manager_state.scanned_once = true;
+        app.font_manager_state.missing_family_input = "MissingFont".into();
+        app.font_manager_state.substitute_family_input = "Noto Sans".into();
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui_font_manager_docker(ui, &mut app);
+        });
+        out.textures_delta.clear();
+        assert!(!out.shapes.is_empty());
     }
 }

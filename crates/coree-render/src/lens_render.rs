@@ -2541,29 +2541,14 @@ fn rasterize_silhouette_payload(
     if depth > 64 || !obj.visible || obj_opacity <= 1e-6 || !world_xf.is_finite() {
         return;
     }
-    let resolved_clone;
-    let obj_eff = if matches!(obj.payload, NodePayload::Clone { .. }) {
-        if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-            let mut c = obj.clone();
-            c.payload = p;
-            c.fill = f;
-            c.outline = o;
-            resolved_clone = c;
-            &resolved_clone
-        } else {
-            obj
-        }
-    } else {
-        obj
-    };
     macro_rules! fill_geom {
         ($base_path:expr) => {{
-            let persp_geom = if let Some(persp) = obj_eff.perspective {
+            let persp_geom = if let Some(persp) = obj.perspective {
                 persp.transform_bezier_path($base_path)
             } else {
                 ($base_path).clone()
             };
-            let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
+            let local_geom = apply_geometry_effects(&persp_geom, &obj.effects);
             if deform_frames.is_empty() {
                 backend.fill_path(&local_geom, paint, FillRule::EvenOdd, world_xf);
             } else {
@@ -2574,12 +2559,12 @@ fn rasterize_silhouette_payload(
     }
     macro_rules! fill_winding {
         ($base_path:expr) => {{
-            let persp_geom = if let Some(persp) = obj_eff.perspective {
+            let persp_geom = if let Some(persp) = obj.perspective {
                 persp.transform_bezier_path($base_path)
             } else {
                 ($base_path).clone()
             };
-            let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
+            let local_geom = apply_geometry_effects(&persp_geom, &obj.effects);
             if deform_frames.is_empty() {
                 backend.fill_path(&local_geom, paint, FillRule::Winding, world_xf);
             } else {
@@ -2588,10 +2573,10 @@ fn rasterize_silhouette_payload(
             }
         }};
     }
-    let own_fill_or_outline = fill_is_visible(&obj_eff.fill)
-        || obj_eff.outline.is_visible()
-        || obj_eff.lens.as_ref().is_some_and(|l| !l.remove_face);
-    match &obj_eff.payload {
+    let own_fill_or_outline = fill_is_visible(&obj.fill)
+        || obj.outline.is_visible()
+        || obj.lens.as_ref().is_some_and(|l| !l.remove_face);
+    match &obj.payload {
         NodePayload::Path(p) => {
             if own_fill_or_outline {
                 fill_geom!(p);
@@ -2612,7 +2597,27 @@ fn rasterize_silhouette_payload(
                 fill_geom!(&coree_core::ArtisticMedia::expand_stroke(spine, style));
             }
         }
-        NodePayload::Clone { .. } => {}
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                rasterize_silhouette_payload(
+                    doc,
+                    text_engine,
+                    &tmp,
+                    world_xf,
+                    obj_world_xf,
+                    deform_frames,
+                    outer_to_sub,
+                    sym_ctx,
+                    paint,
+                    backend,
+                    depth + 1,
+                );
+            }
+        }
         NodePayload::PowerClip {
             container,
             contents,
@@ -2621,8 +2626,8 @@ fn rasterize_silhouette_payload(
             if own_fill_or_outline {
                 fill_geom!(&**container);
             } else if !contents.is_empty() {
-                let pc_has_deform = obj_eff.perspective.is_some()
-                    || obj_eff.effects.iter().any(|e| {
+                let pc_has_deform = obj.perspective.is_some()
+                    || obj.effects.iter().any(|e| {
                         matches!(
                             e,
                             Effect::Distort { .. }
@@ -2630,7 +2635,7 @@ fn rasterize_silhouette_payload(
                                 | Effect::Perspective { .. }
                         )
                     });
-                let persp_container = if let Some(persp) = obj_eff.perspective {
+                let persp_container = if let Some(persp) = obj.perspective {
                     persp.transform_bezier_path(container)
                 } else {
                     (**container).clone()
@@ -2638,11 +2643,8 @@ fn rasterize_silhouette_payload(
                 let pc_local_bb = pc_has_deform
                     .then(|| persp_container.bounding_box())
                     .flatten();
-                let local_geom = apply_geometry_effects_in_bounds(
-                    &persp_container,
-                    pc_local_bb,
-                    &obj_eff.effects,
-                );
+                let local_geom =
+                    apply_geometry_effects_in_bounds(&persp_container, pc_local_bb, &obj.effects);
                 if deform_frames.is_empty() {
                     backend.push_clip(&local_geom, FillRule::Winding, world_xf);
                 } else {
@@ -2659,9 +2661,9 @@ fn rasterize_silhouette_payload(
                     let mut extended = Vec::with_capacity(deform_frames.len() + 1);
                     extended.extend_from_slice(deform_frames);
                     extended.push(DeformFrame {
-                        pre_perspective: obj_eff.perspective,
+                        pre_perspective: obj.perspective,
                         group_local_bb: pc_local_bb,
-                        group_effects: &obj_eff.effects,
+                        group_effects: &obj.effects,
                         rel_to_outer,
                     });
                     for &cid in contents {
@@ -2751,7 +2753,7 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::Table(t) => {
-            let obj_fill_vis = fill_is_visible(&obj_eff.fill);
+            let obj_fill_vis = fill_is_visible(&obj.fill);
             let border_vis = t.border_style.is_visible();
             let stroke_w = t.border_style.effective_width_mm().max(0.2) as f32;
             let border_st = StrokeParams::from_outline(
@@ -2773,7 +2775,7 @@ fn rasterize_silhouette_payload(
                         fill_geom!(&BezierPath::from_rect(rect));
                     } else if border_vis {
                         let cell_path = BezierPath::from_rect(rect);
-                        let local_geom = apply_geometry_effects(&cell_path, &obj_eff.effects);
+                        let local_geom = apply_geometry_effects(&cell_path, &obj.effects);
                         if deform_frames.is_empty() {
                             backend.stroke_path(&local_geom, &border_st, world_xf);
                         } else {
@@ -2796,8 +2798,8 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::Dimension(d) => {
-            let dim_outline = if obj_eff.outline.is_visible() {
-                obj_eff.outline.clone()
+            let dim_outline = if obj.outline.is_visible() {
+                obj.outline.clone()
             } else {
                 OutlineStyle::solid(Color::WHITE, 0.25)
             };
@@ -2900,10 +2902,10 @@ fn rasterize_silhouette_payload(
                 }
             };
             for sp in stroke_paths {
-                let persp = obj_eff
+                let persp = obj
                     .perspective
                     .map_or_else(|| sp.clone(), |p| p.transform_bezier_path(&sp));
-                let local_geom = apply_geometry_effects(&persp, &obj_eff.effects);
+                let local_geom = apply_geometry_effects(&persp, &obj.effects);
                 if deform_frames.is_empty() {
                     backend.stroke_path(&local_geom, &st, world_xf);
                 } else {
@@ -2916,7 +2918,7 @@ fn rasterize_silhouette_payload(
                 if filled {
                     fill_winding!(&ap);
                 } else {
-                    let local_geom = apply_geometry_effects(&ap, &obj_eff.effects);
+                    let local_geom = apply_geometry_effects(&ap, &obj.effects);
                     if deform_frames.is_empty() {
                         backend.stroke_path(&local_geom, &st, world_xf);
                     } else {
@@ -2993,8 +2995,8 @@ fn rasterize_silhouette_payload(
         }
         NodePayload::ArtisticText(t) => {
             if !t.plain_text().trim().is_empty()
-                && (obj_eff.outline.is_visible()
-                    || fill_is_visible(&obj_eff.fill)
+                && (obj.outline.is_visible()
+                    || fill_is_visible(&obj.fill)
                     || t.runs
                         .iter()
                         .any(|r| !r.text.trim().is_empty() && r.style.fill.alpha() > 1e-6))
@@ -3005,17 +3007,17 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::ParagraphText(t) => {
-            if obj_eff.outline.is_visible()
-                || fill_is_visible(&obj_eff.fill)
+            if obj.outline.is_visible()
+                || fill_is_visible(&obj.fill)
                 || t.linked_next_frame.is_some()
                 || !t.plain_text().trim().is_empty()
             {
                 let frame_rect = BezierPath::from_rect(t.bounding_box());
-                let persp_frame = obj_eff.perspective.map_or_else(
+                let persp_frame = obj.perspective.map_or_else(
                     || frame_rect.clone(),
                     |p| p.transform_bezier_path(&frame_rect),
                 );
-                let clip_geom = apply_geometry_effects(&persp_frame, &obj_eff.effects);
+                let clip_geom = apply_geometry_effects(&persp_frame, &obj.effects);
                 if deform_frames.is_empty() {
                     backend.push_clip(&clip_geom, FillRule::Winding, world_xf);
                 } else {
@@ -3023,7 +3025,7 @@ fn rasterize_silhouette_payload(
                         apply_deform_chain_in_bounds(&clip_geom, world_xf, deform_frames);
                     backend.push_clip(&deformed_clip, FillRule::Winding, outer_to_sub);
                 }
-                for piece in text_engine.layout_paragraph_in_doc(doc, obj_eff.id, t) {
+                for piece in text_engine.layout_paragraph_in_doc(doc, obj.id, t) {
                     fill_winding!(&piece.path);
                 }
                 backend.pop_clip();
@@ -3044,7 +3046,7 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::Connector(conn) => {
-            let stroke_w = obj_eff.outline.effective_width_mm().max(0.25) as f32;
+            let stroke_w = obj.outline.effective_width_mm().max(0.25) as f32;
             let st = StrokeParams::from_outline(
                 &OutlineStyle::solid(Color::WHITE, f64::from(stroke_w)),
                 stroke_w,
@@ -3067,8 +3069,7 @@ fn rasterize_silhouette_payload(
             );
             let route = conn.route_path(a, b);
             let inv_world = obj_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-            let local_route =
-                apply_geometry_effects(&route.transformed(&inv_world), &obj_eff.effects);
+            let local_route = apply_geometry_effects(&route.transformed(&inv_world), &obj.effects);
             if deform_frames.is_empty() {
                 backend.stroke_path(&local_route, &st, world_xf);
             } else {

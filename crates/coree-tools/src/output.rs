@@ -4,7 +4,7 @@
 
 use crate::overlay::TransientOverlay;
 use crate::types::ToolId;
-use coree_core::{Affine2D, CommandOp, NodeRef, ObjectId, Point2D, Rect2D, Vec2D};
+use coree_core::{Affine2D, CommandOp, NodeRef, ObjectId, Point2D, Rect2D, StylusSample, Vec2D};
 
 /// Non-`CommandOp` / `coree-render`-dependent / UI-shell side-effect requested by [`ToolCore`](crate::ToolCore).
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +63,7 @@ pub enum ToolActionRequest {
     ApplyRasterStroke {
         tool: ToolId,
         points_mm: Vec<Point2D>,
+        samples: Vec<StylusSample>,
     },
     SetCloneSource(Point2D),
     StampDuplicateDuringDrag {

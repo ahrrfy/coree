@@ -1556,6 +1556,22 @@ impl SpatialIndex {
         hits.into_iter().map(|e| e.id).collect()
     }
 
+    /// Returns all spatial entries whose bounding box intersects `rect`, ordered back-to-front (ascending `z_order`).
+    #[must_use]
+    pub fn query_rect_entries_back_to_front(&self, rect: Rect2D) -> Vec<SpatialObjectEntry> {
+        if !rect.is_finite() {
+            return Vec::new();
+        }
+        let env = AABB::from_corners([rect.min_x, rect.min_y], [rect.max_x, rect.max_y]);
+        let mut hits: Vec<SpatialObjectEntry> = self
+            .tree
+            .locate_in_envelope_intersecting(env)
+            .copied()
+            .collect();
+        hits.sort_by_key(|a| a.z_order);
+        hits
+    }
+
     /// Returns all object IDs whose bounding box is within `tolerance_mm` of `pt`, frontmost first.
     #[must_use]
     pub fn query_point(&self, pt: Point2D, tolerance_mm: f64) -> Vec<ObjectId> {
@@ -1642,6 +1658,18 @@ const fn default_rendering_intent() -> RenderingIntent {
 }
 
 /// Root headless document model for `coree`.
+/// Non-serialized monotonic counter that compares equal across snapshots/clones
+/// so [`Document`] equality (`PartialEq`) stays structural.
+#[derive(Debug, Clone, Copy, Default)]
+struct RevisionCounter(u64);
+
+impl PartialEq for RevisionCounter {
+    #[inline]
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     id: Uuid,
@@ -1687,6 +1715,8 @@ pub struct Document {
     #[serde(default = "default_true_lock")]
     black_point_compensation: bool,
     next_id: u64,
+    #[serde(skip)]
+    spatial_revision: RevisionCounter,
 }
 
 impl Default for Document {
@@ -1745,6 +1775,7 @@ impl Document {
             rendering_intent: RenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             next_id,
+            spatial_revision: RevisionCounter(1),
         }
     }
 
@@ -1772,9 +1803,16 @@ impl Document {
         ObjectId(self.alloc_id())
     }
 
-    /// Touches `metadata.modified_at`.
+    /// Touches `metadata.modified_at` and advances the spatial revision counter.
     pub fn touch(&mut self) {
         self.metadata.modified_at = Utc::now();
+        self.spatial_revision.0 = self.spatial_revision.0.wrapping_add(1);
+    }
+
+    /// Monotonic structural/object revision counter for avoiding redundant R-Tree rebuilds.
+    #[must_use]
+    pub fn spatial_revision(&self) -> u64 {
+        self.spatial_revision.0
     }
 
     // -------------------------------------------------------------------------
@@ -2365,23 +2403,27 @@ impl Document {
 
     /// Mutable access to an object during document load reference remapping.
     pub fn object_mut_for_load(&mut self, id: ObjectId) -> Option<&mut SceneObject> {
+        self.spatial_revision.0 = self.spatial_revision.0.wrapping_add(1);
         self.objects.get_mut(&id)
     }
 
     /// Inserts `object` into `self.objects` only if its `ObjectId` is not already present.
     pub fn insert_snapshot_object_if_absent(&mut self, object: SceneObject) {
         self.next_id = self.next_id.max(object.id.0.saturating_add(1));
+        self.spatial_revision.0 = self.spatial_revision.0.wrapping_add(1);
         self.objects.entry(object.id).or_insert(object);
     }
 
     /// Inserts or replaces `object` in `self.objects` during snapshot/delta recovery.
     pub fn upsert_snapshot_object(&mut self, object: SceneObject) {
         self.next_id = self.next_id.max(object.id.0.saturating_add(1));
+        self.spatial_revision.0 = self.spatial_revision.0.wrapping_add(1);
         self.objects.insert(object.id, object);
     }
 
     /// Removes `id` directly from `self.objects` during differential snapshot recovery.
     pub fn remove_snapshot_object(&mut self, id: ObjectId) -> Option<SceneObject> {
+        self.spatial_revision.0 = self.spatial_revision.0.wrapping_add(1);
         self.objects.remove(&id)
     }
 
@@ -2470,6 +2512,7 @@ impl Document {
     /// Inserts or updates a symbol definition in `self.symbols`.
     pub fn insert_symbol(&mut self, symbol: SymbolDef) {
         self.symbols.insert(symbol.id, symbol);
+        self.touch();
     }
 
     /// Copies document-level configuration/resources (settings, assets, palettes, styles,

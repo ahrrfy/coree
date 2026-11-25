@@ -1546,6 +1546,90 @@ fn show_options_color_management(
         }
     });
 
+    ui.add_space(8.0);
+    ui.label(RichText::new("Monitor / Display ICC Profile").strong());
+    let mut use_disp = app.use_display_icc;
+    if ui
+        .checkbox(&mut use_disp, "Apply OS Display Monitor ICC Transform")
+        .changed()
+    {
+        app.use_display_icc = use_disp;
+        if let Some(tab) = app.active_tab_mut() {
+            tab.needs_rerender = true;
+        }
+    }
+    let disp_summary = app.display_icc_info.as_ref().map_or_else(
+        || "None (Direct sRGB output)".to_owned(),
+        |info| {
+            format!(
+                "{} ({}, {:.1} KiB)",
+                info.description,
+                info.source,
+                info.bytes.len() as f64 / 1024.0
+            )
+        },
+    );
+    ui.label(
+        RichText::new(disp_summary)
+            .size(11.0)
+            .color(tokens.text_muted),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Detect OS Display ICC").clicked() {
+            if !app.detect_os_display_icc() {
+                app.push_toast("No OS Display ICC profile detected", false);
+            } else {
+                app.push_toast("Loaded OS Display ICC profile", false);
+            }
+        }
+        if ui.button("Load Display ICC...").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Load Display Monitor ICC Profile")
+                .add_filter("ICC Profiles", &["icc", "ICC", "icm", "ICM"])
+                .pick_file()
+            {
+                if let Some(info) = crate::display_icc::load_display_icc_from_path(&path, "File") {
+                    app.display_icc_info = Some(info);
+                    app.use_display_icc = true;
+                    if let Some(tab) = app.active_tab_mut() {
+                        tab.needs_rerender = true;
+                    }
+                } else {
+                    app.push_toast("Selected file is not a valid RGB Display ICC profile", true);
+                }
+            }
+        }
+        if app.display_icc_info.is_some() && ui.small_button("Clear").clicked() {
+            app.display_icc_info = None;
+            app.use_display_icc = false;
+            if let Some(tab) = app.active_tab_mut() {
+                tab.needs_rerender = true;
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Stylus & Pen Input").strong());
+    ui.label(
+        RichText::new(format!("Device: {}", app.stylus_provider.device_summary()))
+            .size(11.0)
+            .color(tokens.text_muted),
+    );
+    ui.horizontal(|ui| {
+        ui.label("Pressure Curve:");
+        for (lbl, json) in [
+            ("Linear", "[[0.0,0.0],[1.0,1.0]]"),
+            ("Soft", "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]"),
+            ("Firm", "[[0.0,0.0],[0.5,0.25],[1.0,1.0]]"),
+        ] {
+            ui.selectable_value(
+                &mut app.tool_settings.pressure_curve_json,
+                json.to_owned(),
+                lbl,
+            );
+        }
+    });
+
     ui.add_space(6.0);
     ui.label(RichText::new("Legacy Custom ICC Profile (.icc / .icm)").strong());
     let custom_desc = app

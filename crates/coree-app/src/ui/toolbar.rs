@@ -722,6 +722,23 @@ fn show_raster_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeToke
         _ => {}
     }
 
+    ComboBox::from_id_salt("prop_raster_pressure_curve")
+        .width(86.0)
+        .selected_text(pressure_curve_label(&app.tool_settings.pressure_curve_json))
+        .show_ui(ui, |ui| {
+            for (lbl, json) in [
+                ("Linear", "[[0.0,0.0],[1.0,1.0]]"),
+                ("Soft", "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]"),
+                ("Firm", "[[0.0,0.0],[0.5,0.25],[1.0,1.0]]"),
+            ] {
+                ui.selectable_value(
+                    &mut app.tool_settings.pressure_curve_json,
+                    json.to_owned(),
+                    lbl,
+                );
+            }
+        });
+
     if app.active_tool == ToolId::MaskSelect
         || app
             .active_tab()
@@ -1885,6 +1902,22 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                     profile_changed.then(|| app.tool_settings.artistic_media_profile.clone()),
                 );
             }
+            ComboBox::from_id_salt("prop_artistic_pressure_curve")
+                .width(86.0)
+                .selected_text(pressure_curve_label(&app.tool_settings.pressure_curve_json))
+                .show_ui(ui, |ui| {
+                    for (lbl, json) in [
+                        ("Linear", "[[0.0,0.0],[1.0,1.0]]"),
+                        ("Soft", "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]"),
+                        ("Firm", "[[0.0,0.0],[0.5,0.25],[1.0,1.0]]"),
+                    ] {
+                        ui.selectable_value(
+                            &mut app.tool_settings.pressure_curve_json,
+                            json.to_owned(),
+                            lbl,
+                        );
+                    }
+                });
         }
         ToolId::Freehand
         | ToolId::BSpline
@@ -2788,6 +2821,18 @@ fn paint_std_icon(painter: &egui::Painter, r: Rect, icon: StdIcon, color: Color3
                 thin,
             );
         }
+    }
+}
+
+fn pressure_curve_label(json: &str) -> &'static str {
+    if json.contains("0.75") {
+        "Soft"
+    } else if json.contains("0.25") {
+        "Firm"
+    } else if json == "[[0.0,0.0],[1.0,1.0]]" {
+        "Linear"
+    } else {
+        "Custom"
     }
 }
 

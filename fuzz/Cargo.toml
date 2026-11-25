@@ -51,3 +51,10 @@ path = "fuzz_targets/fuzz_psd.rs"
 doc = false
 test = false
 bench = false
+
+[[bin]]
+name = "fuzz_icc"
+path = "fuzz_targets/fuzz_icc.rs"
+doc = false
+test = false
+bench = false

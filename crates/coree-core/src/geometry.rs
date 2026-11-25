@@ -4130,6 +4130,67 @@ mod tests {
     }
 
     #[test]
+    fn sculpting_brushes_zero_radius_repel_smooth_and_determinism() {
+        let base = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 40.0, 40.0));
+
+        // 1. Zero/negative/non-finite radius or amplitude must be an exact no-op
+        let mut noop = base.clone();
+        noop.smear_near(Point2D::new(20.0, 0.0), Vec2D::new(5.0, 5.0), 0.0);
+        noop.twirl_near(Point2D::new(20.0, 20.0), -2.0, 1.0);
+        noop.attract_repel_near(Point2D::new(20.0, 20.0), f64::NAN, 0.8, false);
+        noop.roughen_near(Point2D::new(20.0, 20.0), 15.0, 0.0, 7);
+        noop.smooth_near(Point2D::new(20.0, 20.0), 0.0, 0.5);
+        assert_eq!(noop, base);
+
+        // 2. Repel moves affected edge nodes farther from center; attract moves them closer
+        let center = Point2D::new(20.0, 5.0);
+        let mut repelled = base.clone();
+        repelled.attract_repel_near(center, 15.0, 0.6, false);
+        let mut attracted = base.clone();
+        attracted.attract_repel_near(center, 15.0, 0.6, true);
+        let min_y_repelled = repelled.subpaths[0]
+            .nodes
+            .iter()
+            .map(|n| n.pos.y)
+            .fold(f64::INFINITY, f64::min);
+        let min_y_attracted = attracted.subpaths[0]
+            .nodes
+            .iter()
+            .map(|n| n.pos.y)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            min_y_repelled < 0.0,
+            "repel from (20,5) must push top edge outward (y < 0), got {min_y_repelled}"
+        );
+        assert!(
+            min_y_attracted >= 0.0
+                && attracted.subpaths[0]
+                    .nodes
+                    .iter()
+                    .any(|n| n.pos.y > 0.5 && n.pos.y < 10.0),
+            "attract toward (20,5) must pull top edge inward"
+        );
+
+        // 3. Roughen determinism with same seed vs different seed + smooth_near flattening
+        let mut r_a1 = base.clone();
+        let mut r_a2 = base.clone();
+        let mut r_b = base.clone();
+        r_a1.roughen_near(Point2D::new(20.0, 0.0), 16.0, 2.5, 101);
+        r_a2.roughen_near(Point2D::new(20.0, 0.0), 16.0, 2.5, 101);
+        r_b.roughen_near(Point2D::new(20.0, 0.0), 16.0, 2.5, 202);
+        assert_eq!(r_a1, r_a2);
+        assert_ne!(r_a1, r_b);
+
+        let before_smooth_len = r_a1.path_length_mm();
+        r_a1.smooth_near(Point2D::new(20.0, 0.0), 16.0, 0.8);
+        assert!(r_a1.is_finite());
+        assert!(
+            r_a1.path_length_mm() <= before_smooth_len + 1e-6,
+            "smooth_near should reduce or preserve roughened perimeter length"
+        );
+    }
+
+    #[test]
     fn knife_virtual_segment_delete_and_erase_circle() {
         let square = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0));
 

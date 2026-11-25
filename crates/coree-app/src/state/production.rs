@@ -1257,12 +1257,172 @@ impl StudioApp {
             arabic_only: self.font_manager_state.arabic_only,
             kashida_only: self.font_manager_state.kashida_only,
             favorites_only: self.font_manager_state.favorites_only,
-            collection_tag: None,
+            collection_tag: self.font_manager_state.active_collection_tag.clone(),
             limit: Some(200),
         };
         if let Ok(fonts) = db.search_fonts(&query) {
             self.font_manager_state.indexed_fonts = fonts;
         }
+        if let Ok(subs) = db.list_font_substitutions() {
+            self.font_manager_state.substitutions = subs;
+        }
+    }
+
+    /// Toggles the favorite flag on an indexed font face in SQLite and refreshes the list.
+    pub fn toggle_font_favorite(&mut self, font_id: &str, favorite: bool) -> bool {
+        let updated = self
+            .storage
+            .as_ref()
+            .and_then(|db| db.set_font_favorite(font_id, favorite).ok())
+            .unwrap_or(false);
+        if updated {
+            self.refresh_font_manager(false);
+        }
+        updated
+    }
+
+    /// Finds the closest PANOSE perceptual substitute in `font_index` and caches it in `FontManagerState`.
+    pub fn find_best_panose_substitute(
+        &mut self,
+        target_panose: &PanoseClassification,
+        target_weight: u16,
+        target_italic: bool,
+        require_arabic: bool,
+    ) -> Option<(FontRecord, u32)> {
+        let best = self
+            .storage
+            .as_ref()
+            .and_then(|db| {
+                db.find_best_panose_substitute(
+                    target_panose,
+                    target_weight,
+                    target_italic,
+                    require_arabic,
+                )
+                .ok()
+            })
+            .flatten();
+        if let Some((ref rec, _)) = best {
+            self.font_manager_state.substitute_family_input = rec.family_name.clone();
+        }
+        self.font_manager_state.panose_suggestion = best.clone();
+        best
+    }
+
+    /// Persists a missing-font substitution rule in SQLite `font_substitutions` and refreshes state.
+    pub fn set_font_substitution(
+        &mut self,
+        missing_family: &str,
+        substitute_family: &str,
+        panose: Option<&PanoseClassification>,
+    ) -> Result<(), String> {
+        let Some(ref db) = self.storage else {
+            return Err("No SQLite storage database open".into());
+        };
+        db.set_font_substitution(missing_family, substitute_family, panose)
+            .map_err(|e| e.to_string())?;
+        self.refresh_font_manager(false);
+        self.push_toast(
+            format!(
+                "Saved font substitution '{}' -> '{}'",
+                missing_family.trim(),
+                substitute_family.trim()
+            ),
+            false,
+        );
+        Ok(())
+    }
+
+    /// Lists all persisted font substitution rules from SQLite `font_substitutions`.
+    #[must_use]
+    pub fn list_font_substitutions(&self) -> Vec<FontSubstitutionRecord> {
+        self.storage
+            .as_ref()
+            .and_then(|db| db.list_font_substitutions().ok())
+            .unwrap_or_default()
+    }
+
+    /// Deletes a persisted font substitution rule and refreshes `FontManagerState`.
+    pub fn remove_font_substitution(&mut self, missing_family: &str) -> bool {
+        let removed = self
+            .storage
+            .as_ref()
+            .and_then(|db| db.remove_font_substitution(missing_family).ok())
+            .unwrap_or(false);
+        if removed {
+            self.refresh_font_manager(false);
+        }
+        removed
+    }
+
+    /// Replaces `missing_family` (case-insensitive) with `substitute_family` across text objects
+    /// in the active document via undoable, WAL-journaled `CommandOp::EditText` operations.
+    pub fn apply_font_substitution_to_active_document(
+        &mut self,
+        missing_family: &str,
+        substitute_family: &str,
+    ) -> usize {
+        let missing = missing_family.trim();
+        let substitute = substitute_family.trim();
+        if missing.is_empty() || substitute.is_empty() {
+            return 0;
+        }
+        let ops: Vec<CommandOp> = self
+            .active_tab()
+            .map(|tab| {
+                let mut collected = Vec::new();
+                for (&oid, obj) in tab.document.objects() {
+                    let mut payload = obj.payload.clone();
+                    let mut changed = false;
+                    match &mut payload {
+                        NodePayload::ArtisticText(t) => {
+                            for run in &mut t.runs {
+                                if run.style.font_family.trim().eq_ignore_ascii_case(missing) {
+                                    run.style.font_family = substitute.to_owned();
+                                    changed = true;
+                                }
+                            }
+                        }
+                        NodePayload::ParagraphText(p) => {
+                            for run in &mut p.runs {
+                                if run.style.font_family.trim().eq_ignore_ascii_case(missing) {
+                                    run.style.font_family = substitute.to_owned();
+                                    changed = true;
+                                }
+                            }
+                        }
+                        NodePayload::TextOnPath(top) => {
+                            for run in &mut top.text.runs {
+                                if run.style.font_family.trim().eq_ignore_ascii_case(missing) {
+                                    run.style.font_family = substitute.to_owned();
+                                    changed = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if changed {
+                        collected.push(CommandOp::EditText { id: oid, payload });
+                    }
+                }
+                collected
+            })
+            .unwrap_or_default();
+        let count = ops.len();
+        if count == 1 {
+            if let Some(op) = ops.into_iter().next() {
+                let _ = self.execute_command(op);
+            }
+        } else if count > 1 {
+            let _ = self.execute_command(CommandOp::Batch(ops));
+        }
+        if count > 0 {
+            self.push_toast(
+                format!("Substituted '{missing}' -> '{substitute}' in {count} text object(s)"),
+                false,
+            );
+        }
+        count
     }
 
     /// Imports a `.gpl`, `.ase`, or `.pal` palette file into `custom_palettes`.

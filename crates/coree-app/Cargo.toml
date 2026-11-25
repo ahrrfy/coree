@@ -38,6 +38,8 @@ unicode-bidi = "0.3.18"
 uuid.workspace = true
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dependencies]
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 wl-clipboard-rs.workspace = true
 x11rb.workspace = true
 

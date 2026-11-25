@@ -27,8 +27,9 @@ use coree_prod::{
     PreflightRules, PrintMergeOptions, PrintMergeTable,
 };
 use coree_render::{
-    compute_page_layouts, render_page_to_rgba, trace_raster_to_mm, CanvasBackend, OutlinePreset,
-    RenderOptions, SceneRenderer, TinySkiaBackend, TraceConfig, TraceMode, ViewMode, Viewport,
+    compute_page_layouts, render_page_to_rgba, render_page_to_rgba_with_backend,
+    trace_raster_to_mm, CanvasBackend, OutlinePreset, RenderBackend, RenderBackendKind,
+    RenderOptions, SceneRenderer, TraceConfig, TraceMode, ViewMode, Viewport,
 };
 use coree_storage::StorageDb;
 use std::collections::BTreeMap;
@@ -169,6 +170,27 @@ pub enum GcodeDialectArg {
     Ruida,
 }
 
+/// 2D canvas rendering backend for `coree-cli render --backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum RenderBackendArg {
+    #[default]
+    Auto,
+    #[value(alias = "cpu")]
+    Tinyskia,
+    #[value(alias = "gpu")]
+    Wgpu,
+}
+
+impl From<RenderBackendArg> for RenderBackendKind {
+    fn from(arg: RenderBackendArg) -> Self {
+        match arg {
+            RenderBackendArg::Auto => Self::from_env(),
+            RenderBackendArg::Tinyskia => Self::TinySkia,
+            RenderBackendArg::Wgpu => Self::Wgpu,
+        }
+    }
+}
+
 impl From<GcodeDialectArg> for GcodeDialect {
     fn from(value: GcodeDialectArg) -> Self {
         match value {
@@ -235,6 +257,12 @@ pub enum Commands {
         /// Render all pages side-by-side in Multipage View.
         #[arg(long)]
         multipage: bool,
+        /// 2D rasterization backend (`auto`, `tinyskia`/`cpu`, or `wgpu`/`gpu`).
+        #[arg(long, value_enum, default_value_t = RenderBackendArg::Auto)]
+        backend: RenderBackendArg,
+        /// Optional monitor / display RGB ICC profile path (`.icc` / `.icm`).
+        #[arg(long)]
+        display_icc: Option<PathBuf>,
     },
     /// Fast, bounded OS thumbnail generator (used by desktop file managers for `.cdr`, `.coree`, `.svg`, `.pdf`, etc.).
     Thumbnail {
@@ -485,17 +513,31 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             dpi,
             view,
             multipage,
+            backend,
+            display_icc,
         } => {
             if !dpi.is_finite() || *dpi <= 0.0 {
                 return Err(format!("invalid DPI value: {dpi} (must be finite and > 0)"));
             }
             let opened = open_any_document(input_path)?;
             let view_mode: ViewMode = (*view).into();
+            let backend_kind: RenderBackendKind = (*backend).into();
+            let display_icc_bytes = if let Some(ref icc_path) = display_icc {
+                let info = crate::display_icc::load_display_icc_from_path(icc_path, "cli")
+                    .ok_or_else(|| {
+                        format!("invalid display ICC profile: {}", icc_path.display())
+                    })?;
+                Some(info.bytes)
+            } else {
+                None
+            };
+            let mut opts = RenderOptions::export();
+            opts.display_icc_profile = display_icc_bytes;
+
             if *multipage {
                 let mut doc = opened.document;
                 doc.set_multipage_view(true);
                 let safe_dpi = dpi.clamp(1.0, 2400.0);
-                let opts = RenderOptions::export();
                 let layouts = compute_page_layouts(&doc, true, opts.multipage_gap_mm);
                 let total_w_mm = layouts
                     .iter()
@@ -513,13 +555,13 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
                 let px_per_mm = effective_dpi / MM_PER_INCH;
                 let width = (total_w_mm * px_per_mm).ceil().clamp(1.0, max_dim_px) as u32;
                 let height = (total_h_mm * px_per_mm).ceil().clamp(1.0, max_dim_px) as u32;
-                let mut backend = TinySkiaBackend::new(width, height)
+                let mut surface = RenderBackend::new_for_kind(backend_kind, width, height)
                     .map_err(|e| format!("multipage surface failed: {e}"))?;
                 let mut vp = Viewport::for_export(width, height, effective_dpi);
                 vp.multipage_view = true;
                 let mut renderer = SceneRenderer::new();
-                renderer.render_document(&doc, &vp, view_mode, &opts, &mut backend);
-                let rgba = backend.into_rgba();
+                renderer.render_document(&doc, &vp, view_mode, &opts, &mut surface);
+                let rgba = surface.into_rgba();
                 coree_io::export_raster(
                     rgba.width,
                     rgba.height,
@@ -538,8 +580,15 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
                     output_png.display()
                 )))
             } else {
-                let rendered = render_page_to_rgba(&opened.document, *page, *dpi, view_mode)
-                    .map_err(|e| format!("render failed: {e}"))?;
+                let rendered = render_page_to_rgba_with_backend(
+                    &opened.document,
+                    *page,
+                    *dpi,
+                    view_mode,
+                    &opts,
+                    backend_kind,
+                )
+                .map_err(|e| format!("render failed: {e}"))?;
                 coree_io::export_raster(
                     rendered.width,
                     rendered.height,

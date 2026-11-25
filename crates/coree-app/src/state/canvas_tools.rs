@@ -3070,6 +3070,16 @@ impl StudioApp {
     /// [`CommandOp::UpdateRaster`] so `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo every
     /// raster stroke cleanly, and safely rejects degenerate `0x0` assets.
     pub fn apply_raster_tool_stroke(&mut self, tool: ToolId, points: &[Point2D]) -> bool {
+        self.apply_raster_tool_stroke_with_stylus(tool, points, &[])
+    }
+
+    /// Applies a pressure-, tilt-, and twist-sensitive raster brush stroke (`IMP-03`).
+    pub fn apply_raster_tool_stroke_with_stylus(
+        &mut self,
+        tool: ToolId,
+        points: &[Point2D],
+        samples: &[StylusSample],
+    ) -> bool {
         if points.is_empty() {
             return false;
         }
@@ -3077,11 +3087,20 @@ impl StudioApp {
             return false;
         };
 
-        let op = match tool {
-            ToolId::BitmapEraser => RasterBrushOp::Eraser,
-            ToolId::CloneStamp => RasterBrushOp::CloneStamp,
-            ToolId::Smudge => RasterBrushOp::Smudge,
-            _ => self.tool_settings.raster_op,
+        let eraser_tip = samples.iter().any(|s| s.is_eraser);
+        let op = if eraser_tip
+            && matches!(
+                tool,
+                ToolId::BitmapBrush | ToolId::CloneStamp | ToolId::Smudge
+            ) {
+            RasterBrushOp::Eraser
+        } else {
+            match tool {
+                ToolId::BitmapEraser => RasterBrushOp::Eraser,
+                ToolId::CloneStamp => RasterBrushOp::CloneStamp,
+                ToolId::Smudge => RasterBrushOp::Smudge,
+                _ => self.tool_settings.raster_op,
+            }
         };
         let r_px = self.tool_settings.brush_radius_px;
         let hard = self.tool_settings.brush_hardness;
@@ -3091,6 +3110,7 @@ impl StudioApp {
         let db_exp = self.tool_settings.dodge_burn_exposure;
         let flood_tol = self.tool_settings.flood_tolerance;
         let clone_src_world = self.tool_settings.clone_source_mm;
+        let curve = PressureCurve::from_json(&self.tool_settings.pressure_curve_json);
 
         let prepared = self.active_tab().and_then(|tab| {
             if !is_object_editable_in_doc(&tab.document, oid) {
@@ -3128,6 +3148,16 @@ impl StudioApp {
             Point2D::new((lp.x / w_mm) * aw, (lp.y / h_mm) * ah)
         };
         let px_pts: Vec<Point2D> = points.iter().copied().map(to_px).collect();
+        let stylus_pts: Vec<StylusPoint> = px_pts
+            .iter()
+            .enumerate()
+            .map(|(i, &pos)| {
+                samples.get(i).copied().map_or_else(
+                    || StylusPoint::uniform(pos),
+                    |s| StylusPoint::from_sample(pos, s, &curve),
+                )
+            })
+            .collect();
         let src_origin = clone_src_world
             .map(to_px)
             .or_else(|| {
@@ -3147,36 +3177,32 @@ impl StudioApp {
 
         match op {
             RasterBrushOp::Paint => {
-                if let Some(ref mask) = active_mask {
-                    paint_brush_stroke_masked(
-                        &mut new_asset,
-                        &px_pts,
-                        r_px,
-                        hard,
-                        col,
-                        1.0,
-                        Some(mask),
-                    );
-                } else {
-                    paint_brush_stroke(&mut new_asset, &px_pts, r_px, hard, col, 1.0);
-                }
+                paint_brush_stroke_stylus(
+                    &mut new_asset,
+                    &stylus_pts,
+                    r_px,
+                    hard,
+                    col,
+                    1.0,
+                    active_mask.as_ref(),
+                );
             }
             RasterBrushOp::Eraser => {
-                erase_stroke(&mut new_asset, &px_pts, r_px, hard);
+                erase_stroke_stylus(&mut new_asset, &stylus_pts, r_px, hard);
             }
             RasterBrushOp::CloneStamp => {
-                clone_stamp_stroke(&mut new_asset, src_origin, &px_pts, r_px, hard);
+                clone_stamp_stroke_stylus(&mut new_asset, src_origin, &stylus_pts, r_px, hard);
             }
             RasterBrushOp::Smudge => {
-                smudge_stroke(&mut new_asset, &px_pts, r_px, smudge_str);
+                smudge_stroke_stylus(&mut new_asset, &stylus_pts, r_px, smudge_str);
             }
             RasterBrushOp::Healing => {
-                apply_healing_stroke(&mut new_asset, src_origin, &px_pts, r_px, hard);
+                apply_healing_stroke_stylus(&mut new_asset, src_origin, &stylus_pts, r_px, hard);
             }
             RasterBrushOp::Dodge => {
-                apply_dodge_burn_stroke(
+                apply_dodge_burn_stroke_stylus(
                     &mut new_asset,
-                    &px_pts,
+                    &stylus_pts,
                     r_px,
                     hard,
                     DodgeBurnMode::Dodge,
@@ -3185,9 +3211,9 @@ impl StudioApp {
                 );
             }
             RasterBrushOp::Burn => {
-                apply_dodge_burn_stroke(
+                apply_dodge_burn_stroke_stylus(
                     &mut new_asset,
-                    &px_pts,
+                    &stylus_pts,
                     r_px,
                     hard,
                     DodgeBurnMode::Burn,

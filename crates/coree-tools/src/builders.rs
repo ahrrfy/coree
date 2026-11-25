@@ -2032,6 +2032,7 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
             return ToolOutput::actions(vec![ToolActionRequest::ApplyRasterStroke {
                 tool,
                 points_mm: vec![rect.min(), rect.max()],
+                samples: vec![coree_core::StylusSample::DEFAULT; 2],
             }]);
         }
         ToolId::MaskSelect => {

@@ -2657,6 +2657,167 @@ impl SoftProofLut3D {
     }
 }
 
+/// Cached `17 × 17 × 17` 3D tetrahedral output LUT mapping working `sRGB` pixels through `D50 XYZ`
+/// into an OS monitor / display RGB ICC profile (`DisplayTransformLut3D`).
+#[derive(Debug, Clone)]
+pub struct DisplayTransformLut3D {
+    grid: usize,
+    data: Vec<[f32; 3]>,
+}
+
+impl DisplayTransformLut3D {
+    /// Builds a 3D output transform LUT targeting an RGB `display_profile` under `intent`.
+    #[must_use]
+    pub fn build_from_profile(
+        display_profile: &IccProfile,
+        intent: RenderingIntent,
+    ) -> Option<Self> {
+        if display_profile.header.color_space != IccColorSpace::Rgb {
+            return None;
+        }
+        let has_bwd = display_profile.select_b2a(intent).is_some()
+            || display_profile.select_v4_b2a(intent).is_some()
+            || display_profile.rgb_to_xyz_matrix.is_some();
+        if !has_bwd {
+            return None;
+        }
+        let g = SOFT_PROOF_LUT_GRID;
+        let mut data = Vec::with_capacity(g * g * g);
+        let denom = (g - 1) as f64;
+        for ir in 0..g {
+            let r = (ir as f64) / denom;
+            for ig in 0..g {
+                let gv = (ig as f64) / denom;
+                for ib in 0..g {
+                    let b = (ib as f64) / denom;
+                    let xyz = srgb_to_xyz_d50([r, gv, b]);
+                    let disp = display_profile.pcs_xyz_to_rgb_impl(xyz, intent, true)?;
+                    data.push([
+                        disp[0].clamp(0.0, 1.0) as f32,
+                        disp[1].clamp(0.0, 1.0) as f32,
+                        disp[2].clamp(0.0, 1.0) as f32,
+                    ]);
+                }
+            }
+        }
+        Some(Self { grid: g, data })
+    }
+
+    /// Applies the precomputed display ICC output LUT in-place to straight RGBA8 pixels.
+    pub fn apply_rgba(&self, rgba: &mut [u8]) {
+        for px in rgba.as_chunks_mut::<4>().0 {
+            if px[3] == 0 {
+                continue;
+            }
+            let rf = f32::from(px[0]) / 255.0;
+            let gf = f32::from(px[1]) / 255.0;
+            let bf = f32::from(px[2]) / 255.0;
+            let [dr, dg, db] = self.sample_tetrahedral(rf, gf, bf);
+            px[0] = (dr * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[1] = (dg * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[2] = (db * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    #[inline]
+    fn sample_tetrahedral(&self, r: f32, g_ch: f32, b: f32) -> [f32; 3] {
+        let g = self.grid;
+        let scale = (g - 1) as f32;
+        let sr = r.clamp(0.0, 1.0) * scale;
+        let sg = g_ch.clamp(0.0, 1.0) * scale;
+        let sb = b.clamp(0.0, 1.0) * scale;
+        let ir0 = (sr.floor() as usize).min(g - 1);
+        let ig0 = (sg.floor() as usize).min(g - 1);
+        let ib0 = (sb.floor() as usize).min(g - 1);
+        let ir1 = (ir0 + 1).min(g - 1);
+        let ig1 = (ig0 + 1).min(g - 1);
+        let ib1 = (ib0 + 1).min(g - 1);
+        let fx = sr - ir0 as f32;
+        let fy = sg - ig0 as f32;
+        let fz = sb - ib0 as f32;
+
+        let at = |ir: usize, ig: usize, ib: usize| self.data[(ir * g + ig) * g + ib];
+        let c000 = at(ir0, ig0, ib0);
+        let c111 = at(ir1, ig1, ib1);
+
+        let (wa, ca, wb, cb, wc, cc, wd, cd) = if fx >= fy {
+            if fy >= fz {
+                (
+                    1.0 - fx,
+                    c000,
+                    fx - fy,
+                    at(ir1, ig0, ib0),
+                    fy - fz,
+                    at(ir1, ig1, ib0),
+                    fz,
+                    c111,
+                )
+            } else if fx >= fz {
+                (
+                    1.0 - fx,
+                    c000,
+                    fx - fz,
+                    at(ir1, ig0, ib0),
+                    fz - fy,
+                    at(ir1, ig0, ib1),
+                    fy,
+                    c111,
+                )
+            } else {
+                (
+                    1.0 - fz,
+                    c000,
+                    fz - fx,
+                    at(ir0, ig0, ib1),
+                    fx - fy,
+                    at(ir1, ig0, ib1),
+                    fy,
+                    c111,
+                )
+            }
+        } else if fz >= fy {
+            (
+                1.0 - fz,
+                c000,
+                fz - fy,
+                at(ir0, ig0, ib1),
+                fy - fx,
+                at(ir0, ig1, ib1),
+                fx,
+                c111,
+            )
+        } else if fz >= fx {
+            (
+                1.0 - fy,
+                c000,
+                fy - fz,
+                at(ir0, ig1, ib0),
+                fz - fx,
+                at(ir0, ig1, ib1),
+                fx,
+                c111,
+            )
+        } else {
+            (
+                1.0 - fy,
+                c000,
+                fy - fx,
+                at(ir0, ig1, ib0),
+                fx - fz,
+                at(ir1, ig1, ib0),
+                fz,
+                c111,
+            )
+        };
+
+        [
+            wa * ca[0] + wb * cb[0] + wc * cc[0] + wd * cd[0],
+            wa * ca[1] + wb * cb[1] + wc * cc[1] + wd * cd[1],
+            wa * ca[2] + wb * cb[2] + wc * cc[2] + wd * cd[2],
+        ]
+    }
+}
+
 fn cached_soft_proof_lut(press: CmykPressKind, intent: RenderingIntent) -> &'static SoftProofLut3D {
     static LUTS: [OnceLock<SoftProofLut3D>; 8] = [
         OnceLock::new(),
@@ -4048,6 +4209,49 @@ pub fn generate_minimal_srgb_icc_v2(description: &str) -> Vec<u8> {
                     SRGB_TO_XYZ_D50[0][2],
                     SRGB_TO_XYZ_D50[1][2],
                     SRGB_TO_XYZ_D50[2][2],
+                ]),
+            ),
+            (b"rTRC", encode_curv_gamma_tag(2.2)),
+            (b"gTRC", encode_curv_gamma_tag(2.2)),
+            (b"bTRC", encode_curv_gamma_tag(2.2)),
+        ],
+    )
+}
+
+/// Generates a compact standards-compliant ICC v2 Matrix+TRC Display P3 RGB profile.
+#[must_use]
+pub fn generate_minimal_display_p3_icc_v2(description: &str) -> Vec<u8> {
+    encode_icc_profile_bytes(
+        2,
+        b"mntr",
+        b"RGB ",
+        b"XYZ ",
+        0,
+        &[
+            (b"desc", encode_desc_tag(description)),
+            (b"wtpt", encode_xyz_tag(D65_WHITE)),
+            (
+                b"rXYZ",
+                encode_xyz_tag([
+                    DISPLAY_P3_TO_XYZ_D50[0][0],
+                    DISPLAY_P3_TO_XYZ_D50[1][0],
+                    DISPLAY_P3_TO_XYZ_D50[2][0],
+                ]),
+            ),
+            (
+                b"gXYZ",
+                encode_xyz_tag([
+                    DISPLAY_P3_TO_XYZ_D50[0][1],
+                    DISPLAY_P3_TO_XYZ_D50[1][1],
+                    DISPLAY_P3_TO_XYZ_D50[2][1],
+                ]),
+            ),
+            (
+                b"bXYZ",
+                encode_xyz_tag([
+                    DISPLAY_P3_TO_XYZ_D50[0][2],
+                    DISPLAY_P3_TO_XYZ_D50[1][2],
+                    DISPLAY_P3_TO_XYZ_D50[2][2],
                 ]),
             ),
             (b"rTRC", encode_curv_gamma_tag(2.2)),

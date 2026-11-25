@@ -26,14 +26,14 @@ pub const CRATE_NAME: &str = "coree-render";
 
 // Ergonomic top-level re-exports for downstream crates (`coree-app`, `coree-io`, `coree-prod`)
 pub use backend::{
-    BackendPaint, CanvasBackend, FillRule, PaintShader, PixelRect, RgbaBuffer, StrokeParams,
-    TinySkiaBackend,
+    BackendPaint, CanvasBackend, FillRule, PaintShader, PixelRect, RenderBackend,
+    RenderBackendKind, RgbaBuffer, StrokeParams, TinySkiaBackend, WgpuBackend,
 };
 pub use effects_render::lower_effects_to_primitives;
 pub use error::{RenderError, RenderResult};
 pub use export_render::{
-    render_isolated_object_to_rgba, render_page_to_rgba, render_page_to_rgba_with_options,
-    render_svg_to_rgba, RenderedImage,
+    render_isolated_object_to_rgba, render_page_to_rgba, render_page_to_rgba_with_backend,
+    render_page_to_rgba_with_options, render_svg_to_rgba, RenderedImage,
 };
 pub use hit_test::{
     hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
@@ -41,12 +41,14 @@ pub use hit_test::{
 };
 pub use lens_render::capture_frozen_lens_snapshot;
 pub use raster_engine::{
-    apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,
-    apply_raster_filter, apply_raster_filters, clone_stamp_stroke, compute_histogram,
-    convert_object_to_bitmap, convert_object_to_bitmap_with_bounds, convert_raster_color_mode,
-    convert_raster_depth, erase_stroke, paint_brush_stroke, paint_brush_stroke_masked,
-    raster_flood_fill, resample, resample_with_algorithm, smudge_stroke, DodgeBurnMode,
-    RasterHistogram, RasterMask, ResampleAlgorithm, ToneRange,
+    apply_cutout_background_removal, apply_dodge_burn_stroke, apply_dodge_burn_stroke_stylus,
+    apply_healing_stroke, apply_healing_stroke_stylus, apply_raster_filter, apply_raster_filters,
+    clone_stamp_stroke, clone_stamp_stroke_stylus, compute_histogram, convert_object_to_bitmap,
+    convert_object_to_bitmap_with_bounds, convert_raster_color_mode, convert_raster_depth,
+    erase_stroke, erase_stroke_stylus, paint_brush_stroke, paint_brush_stroke_masked,
+    paint_brush_stroke_stylus, raster_flood_fill, resample, resample_with_algorithm, smudge_stroke,
+    smudge_stroke_stylus, DodgeBurnMode, RasterHistogram, RasterMask, ResampleAlgorithm,
+    StylusPoint, ToneRange,
 };
 pub use renderer::{
     arrowhead_geometry, compute_page_layouts, outline_arrowhead_geometries, PageLayout,
@@ -58,7 +60,9 @@ pub use text_layout::{
     text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, ShapedGlyphDraw,
     TextEngine,
 };
-pub use tile_cache::{object_visual_world_bounds, CachedTile, DirtyTileCache, TILE_SIZE_PX};
+pub use tile_cache::{
+    object_visual_world_bounds, CachedTile, DirtyTileCache, WorldTileKey, TILE_SIZE_PX,
+};
 pub use trace::{trace_raster, trace_raster_to_mm, OutlinePreset, TraceConfig, TraceMode};
 pub use viewport::{ViewMode, Viewport};
 

@@ -632,11 +632,17 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                 .clamp(32.0, max_tex_side) as u32;
             let target_dpi = coree_core::math::DEFAULT_DPI * f64::from(eff_ppp);
 
-            // Sync soft-proofing & gamut-warning options into active tab's RenderOptions
+            // Sync soft-proofing, gamut-warning & OS Display ICC options into active tab's RenderOptions
             let soft_proof = app.soft_proof_cmyk;
             let gamut_warn = app.gamut_warning;
             let proof_prof = app.proof_profile;
             let proof_int = app.proof_intent;
+            let disp_icc_bytes = if app.use_display_icc {
+                app.display_icc_info.as_ref().map(|i| i.bytes.clone())
+            } else {
+                None
+            };
+            let disp_icc_int = app.display_icc_intent;
 
             {
                 let Some(tab) = app.active_tab_mut() else {
@@ -652,11 +658,15 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                     || tab.render_options.gamut_warning != gamut_warn
                     || tab.render_options.proof_profile != proof_prof
                     || tab.render_options.proof_intent != proof_int
+                    || tab.render_options.display_icc_profile != disp_icc_bytes
+                    || tab.render_options.display_icc_intent != disp_icc_int
                 {
                     tab.render_options.soft_proof_cmyk = soft_proof;
                     tab.render_options.gamut_warning = gamut_warn;
                     tab.render_options.proof_profile = proof_prof;
                     tab.render_options.proof_intent = proof_int;
+                    tab.render_options.display_icc_profile = disp_icc_bytes;
+                    tab.render_options.display_icc_intent = disp_icc_int;
                     tab.tile_cache.mark_all_dirty();
                     tab.needs_rerender = true;
                 }
@@ -943,6 +953,7 @@ fn make_pointer_event(
     button: PointerButton,
     modifiers: ModifiersState,
     click_count: u8,
+    stylus: coree_core::StylusSample,
 ) -> PointerEvent {
     let world_pt_mm = screen_to_world(canvas_rect, tab, pos);
     let local = screen_to_viewport_local(canvas_rect, tab, pos);
@@ -952,6 +963,7 @@ fn make_pointer_event(
         button,
         modifiers,
         click_count,
+        stylus,
     }
 }
 
@@ -1042,16 +1054,25 @@ fn handle_canvas_interaction(
     canvas_rect: Rect,
     resp: &egui::Response,
 ) {
-    // 1. Live cursor tracking & cursor-centered mouse wheel zoom
+    let stylus_sample = app.stylus_provider.sample_for_frame(ui.ctx());
+    app.last_stylus_sample = stylus_sample;
+
+    // 1. Live cursor tracking & proportional, smooth, bounded cursor-centered wheel/pinch zoom
     if let Some(hover) = resp.hover_pos() {
         if let Some(tab) = app.active_tab_mut() {
             tab.cursor_world_mm = screen_to_world(canvas_rect, tab, hover);
         }
-        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_y.abs() > 0.5 {
+        let (scroll_y, pinch_zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let factor = if scroll_y.abs() > 0.05 {
+            (f64::from(scroll_y) * 0.0022).exp().clamp(0.88, 1.14)
+        } else if (pinch_zoom - 1.0).abs() > 1e-4 {
+            f64::from(pinch_zoom).powf(0.55).clamp(0.88, 1.14)
+        } else {
+            1.0
+        };
+        if (factor - 1.0).abs() > 1e-6 {
             if let Some(tab) = app.active_tab_mut() {
                 let local = screen_to_viewport_local(canvas_rect, tab, hover);
-                let factor = if scroll_y > 0.0 { 1.12 } else { 1.0 / 1.12 };
                 tab.viewport.zoom_at_screen_point(local, factor);
                 tab.needs_rerender = true;
             }
@@ -1126,7 +1147,15 @@ fn handle_canvas_interaction(
                 tab.cancel_active_drag();
             }
             if let Some(ev) = app.active_tab().map(|tab| {
-                make_pointer_event(tab, canvas_rect, pos, PointerButton::Primary, modifiers, 2)
+                make_pointer_event(
+                    tab,
+                    canvas_rect,
+                    pos,
+                    PointerButton::Primary,
+                    modifiers,
+                    2,
+                    stylus_sample,
+                )
             }) {
                 app.run_tool_pointer_down(&ev);
                 return;
@@ -1148,6 +1177,7 @@ fn handle_canvas_interaction(
                     PointerButton::Secondary,
                     modifiers,
                     1,
+                    stylus_sample,
                 )
             }) {
                 app.run_tool_pointer_down(&ev);
@@ -1166,7 +1196,15 @@ fn handle_canvas_interaction(
         }
         if let Some(pos) = resp.interact_pointer_pos().or(pointer_pos) {
             if let Some(ev) = app.active_tab().map(|tab| {
-                make_pointer_event(tab, canvas_rect, pos, PointerButton::Primary, modifiers, 1)
+                make_pointer_event(
+                    tab,
+                    canvas_rect,
+                    pos,
+                    PointerButton::Primary,
+                    modifiers,
+                    1,
+                    stylus_sample,
+                )
             }) {
                 app.run_tool_pointer_down(&ev);
             }
@@ -1186,7 +1224,15 @@ fn handle_canvas_interaction(
         {
             if let Some(pos) = resp.interact_pointer_pos().or(pointer_pos) {
                 if let Some(ev) = app.active_tab().map(|tab| {
-                    make_pointer_event(tab, canvas_rect, pos, PointerButton::Primary, modifiers, 1)
+                    make_pointer_event(
+                        tab,
+                        canvas_rect,
+                        pos,
+                        PointerButton::Primary,
+                        modifiers,
+                        1,
+                        stylus_sample,
+                    )
                 }) {
                     app.run_tool_pointer_move(&ev);
                 }
@@ -1198,7 +1244,15 @@ fn handle_canvas_interaction(
                 .or(pointer_pos)
                 .unwrap_or_else(|| canvas_rect.center());
             if let Some(ev) = app.active_tab().map(|tab| {
-                make_pointer_event(tab, canvas_rect, pos, PointerButton::Primary, modifiers, 1)
+                make_pointer_event(
+                    tab,
+                    canvas_rect,
+                    pos,
+                    PointerButton::Primary,
+                    modifiers,
+                    1,
+                    stylus_sample,
+                )
             }) {
                 app.run_tool_pointer_up(&ev);
             }
@@ -1206,7 +1260,15 @@ fn handle_canvas_interaction(
     } else if primary_released && resp.clicked() && !has_inline_edit {
         if let Some(pos) = resp.interact_pointer_pos().or(pointer_pos) {
             if let Some(ev) = app.active_tab().map(|tab| {
-                make_pointer_event(tab, canvas_rect, pos, PointerButton::Primary, modifiers, 1)
+                make_pointer_event(
+                    tab,
+                    canvas_rect,
+                    pos,
+                    PointerButton::Primary,
+                    modifiers,
+                    1,
+                    stylus_sample,
+                )
             }) {
                 app.run_tool_pointer_up(&ev);
             }
@@ -1226,6 +1288,7 @@ fn handle_canvas_interaction(
                     PointerButton::Primary,
                     modifiers,
                     1,
+                    stylus_sample,
                 )
             }) {
                 app.run_tool_pointer_move(&ev);

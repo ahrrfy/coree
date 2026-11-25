@@ -9855,3 +9855,274 @@ fn w3a_r9_wal_targeted_undo_next_id_rollback_recovers_new_object_journal() {
     live_doc.metadata_mut().modified_at = recovered.metadata().modified_at;
     assert_eq!(live_doc, recovered);
 }
+
+fn build_test_sfnt_with_panose(
+    family: &str,
+    subfamily: &str,
+    weight: u16,
+    arabic: bool,
+    kashida: bool,
+    panose: [u8; 10],
+) -> Vec<u8> {
+    let fam_u16: Vec<u8> = family.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let sub_u16: Vec<u8> = subfamily
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect();
+    let mut name_tbl = Vec::new();
+    name_tbl.extend_from_slice(&0u16.to_be_bytes());
+    name_tbl.extend_from_slice(&2u16.to_be_bytes());
+    let str_off = 6u16 + 2 * 12;
+    name_tbl.extend_from_slice(&str_off.to_be_bytes());
+    for v in [3u16, 1, 0x0409, 1, fam_u16.len() as u16, 0] {
+        name_tbl.extend_from_slice(&v.to_be_bytes());
+    }
+    for v in [
+        3u16,
+        1,
+        0x0409,
+        2,
+        sub_u16.len() as u16,
+        fam_u16.len() as u16,
+    ] {
+        name_tbl.extend_from_slice(&v.to_be_bytes());
+    }
+    name_tbl.extend_from_slice(&fam_u16);
+    name_tbl.extend_from_slice(&sub_u16);
+
+    let mut os2_tbl = vec![0u8; 78];
+    os2_tbl[4..6].copy_from_slice(&weight.to_be_bytes());
+    os2_tbl[32..42].copy_from_slice(&panose);
+    let ur1: u32 = if arabic { 1 << 13 } else { 1 };
+    os2_tbl[42..46].copy_from_slice(&ur1.to_be_bytes());
+    os2_tbl[62..64].copy_from_slice(&0x40u16.to_be_bytes());
+
+    let mut groups: Vec<(u32, u32, u32)> = vec![(0x0041, 0x005A, 1)];
+    if arabic {
+        groups.push((0x0627, 0x063A, 30));
+    }
+    if kashida {
+        groups.push((0x0640, 0x0640, 60));
+    }
+    let mut fmt12 = Vec::new();
+    fmt12.extend_from_slice(&12u16.to_be_bytes());
+    fmt12.extend_from_slice(&0u16.to_be_bytes());
+    let fmt12_len = (16 + groups.len() * 12) as u32;
+    fmt12.extend_from_slice(&fmt12_len.to_be_bytes());
+    fmt12.extend_from_slice(&0u32.to_be_bytes());
+    fmt12.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    for (s, e, g) in groups {
+        fmt12.extend_from_slice(&s.to_be_bytes());
+        fmt12.extend_from_slice(&e.to_be_bytes());
+        fmt12.extend_from_slice(&g.to_be_bytes());
+    }
+    let mut cmap_tbl = Vec::new();
+    cmap_tbl.extend_from_slice(&0u16.to_be_bytes());
+    cmap_tbl.extend_from_slice(&1u16.to_be_bytes());
+    cmap_tbl.extend_from_slice(&3u16.to_be_bytes());
+    cmap_tbl.extend_from_slice(&10u16.to_be_bytes());
+    cmap_tbl.extend_from_slice(&12u32.to_be_bytes());
+    cmap_tbl.extend_from_slice(&fmt12);
+
+    let tables: [(&[u8; 4], Vec<u8>); 3] =
+        [(b"OS/2", os2_tbl), (b"cmap", cmap_tbl), (b"name", name_tbl)];
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+    out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+    out.extend_from_slice(&32u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&16u16.to_be_bytes());
+    let mut data_offset = 12 + tables.len() * 16;
+    for (tag, data) in &tables {
+        out.extend_from_slice(*tag);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(data_offset as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        data_offset += data.len();
+    }
+    for (_, data) in tables {
+        out.extend_from_slice(&data);
+    }
+    out
+}
+
+#[test]
+fn font_manager_docker_glyphs_quarantine_and_panose_substitution() {
+    use coree_storage::PanoseClassification;
+
+    let tmp = TempTestDir::new("font-mgr");
+    let sans_panose = [2, 11, 6, 3, 2, 2, 2, 2, 2, 4];
+    let serif_panose = [2, 2, 5, 3, 5, 4, 5, 2, 3, 4];
+
+    std::fs::write(
+        tmp.path().join("clean_sans.ttf"),
+        build_test_sfnt_with_panose("CleanSans", "Regular", 400, false, false, sans_panose),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("arab_serif.ttf"),
+        build_test_sfnt_with_panose("ArabSerif", "Regular", 400, true, true, serif_panose),
+    )
+    .unwrap();
+    // Corrupt truncated font -> must be quarantined safely
+    std::fs::write(tmp.path().join("broken_font.ttf"), b"NOT_A_VALID_TTF").unwrap();
+
+    let db = StorageDb::open_in_memory().expect("open in-memory db");
+    let scan_rep = db
+        .scan_font_directories(&[tmp.path().to_path_buf()], "custom")
+        .expect("scan temp font dir");
+    assert_eq!(scan_rep.faces_indexed, 2);
+    assert_eq!(scan_rep.files_failed, 1);
+    assert!(
+        scan_rep
+            .quarantined_files
+            .iter()
+            .any(|p| p.contains("broken_font.ttf")),
+        "corrupt font file must be quarantined"
+    );
+
+    let mut app = StudioApp::new_with_storage(db);
+    app.font_manager_state.scanned_once = true;
+    app.font_manager_state.quarantined_files = scan_rep.quarantined_files;
+    app.refresh_font_manager(false);
+    assert_eq!(app.font_manager_state.indexed_fonts.len(), 2);
+
+    // Filter Arabic + Kashida
+    app.font_manager_state.arabic_only = true;
+    app.font_manager_state.kashida_only = true;
+    app.refresh_font_manager(false);
+    assert_eq!(app.font_manager_state.indexed_fonts.len(), 1);
+    assert_eq!(
+        app.font_manager_state.indexed_fonts[0].family_name,
+        "ArabSerif"
+    );
+
+    // Reset filters and toggle favorite on CleanSans
+    app.font_manager_state.arabic_only = false;
+    app.font_manager_state.kashida_only = false;
+    app.refresh_font_manager(false);
+    let sans_id = app
+        .font_manager_state
+        .indexed_fonts
+        .iter()
+        .find(|f| f.family_name == "CleanSans")
+        .expect("CleanSans indexed")
+        .id
+        .clone();
+    assert!(app.toggle_font_favorite(&sans_id, true));
+    app.font_manager_state.favorites_only = true;
+    app.refresh_font_manager(false);
+    assert_eq!(app.font_manager_state.indexed_fonts.len(), 1);
+    assert_eq!(
+        app.font_manager_state.indexed_fonts[0].family_name,
+        "CleanSans"
+    );
+    app.font_manager_state.favorites_only = false;
+    app.refresh_font_manager(false);
+
+    // PANOSE similarity matching -> must pick CleanSans for sans target
+    let target = PanoseClassification(sans_panose);
+    let (best, dist) = app
+        .find_best_panose_substitute(&target, 400, false, false)
+        .expect("PANOSE match must succeed");
+    assert_eq!(best.family_name, "CleanSans");
+    assert_eq!(dist, 0);
+
+    // Persist substitution rule + apply to active document via CommandOp::EditText + Undo/Redo
+    app.set_font_substitution("MissingBrandSans", &best.family_name, Some(&target))
+        .expect("persist font substitution");
+    assert_eq!(app.list_font_substitutions().len(), 1);
+
+    let missing_text = SceneObject::new(
+        ObjectId(0),
+        "Headline",
+        NodePayload::ArtisticText(ArtisticText::from_plain(
+            "Hello",
+            TextStyle {
+                font_family: "MissingBrandSans".into(),
+                ..TextStyle::default()
+            },
+        )),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(missing_text),
+        layer_id: None,
+    })
+    .unwrap();
+    let text_id = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .copied()
+        .next()
+        .unwrap();
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, text_id);
+    }
+
+    let replaced = app.apply_font_substitution_to_active_document("MissingBrandSans", "CleanSans");
+    assert_eq!(replaced, 1);
+    let font_after = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(text_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticText(t) => t.runs[0].style.font_family.clone(),
+        _ => panic!("expected ArtisticText"),
+    };
+    assert_eq!(font_after, "CleanSans");
+
+    app.undo().unwrap();
+    let font_undone = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(text_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticText(t) => t.runs[0].style.font_family.clone(),
+        _ => panic!("expected ArtisticText"),
+    };
+    assert_eq!(font_undone, "MissingBrandSans");
+    app.redo().unwrap();
+
+    // Glyph insertion into selected ArtisticText
+    app.insert_glyph_at_selection("Ω");
+    let text_with_glyph = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(text_id)
+        .unwrap()
+        .payload
+    {
+        NodePayload::ArtisticText(t) => t.plain_text(),
+        _ => panic!("expected ArtisticText"),
+    };
+    assert!(text_with_glyph.contains('Ω'));
+
+    // Remove persisted substitution rule
+    assert!(app.remove_font_substitution("MissingBrandSans"));
+    assert!(app.list_font_substitutions().is_empty());
+
+    // Headless egui frame rendering DockerTab::FontManager (includes Glyphs browser)
+    app.dock_state = egui_dock::DockState::new(vec![DockerTab::FontManager]);
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut full_out = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    full_out.textures_delta.clear();
+    assert!(!full_out.shapes.is_empty());
+}

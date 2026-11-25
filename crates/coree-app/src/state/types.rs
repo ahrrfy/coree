@@ -303,6 +303,7 @@ pub struct ToolSettings {
     pub symmetry_folds: u32,
     pub symmetry_mirror: bool,
     pub draw_in_perspective: bool,
+    pub pressure_curve_json: String,
 }
 
 impl Default for ToolSettings {
@@ -346,6 +347,7 @@ impl Default for ToolSettings {
             symmetry_folds: 4,
             symmetry_mirror: true,
             draw_in_perspective: false,
+            pressure_curve_json: "[[0.0,0.0],[1.0,1.0]]".to_owned(),
         }
     }
 }
@@ -406,6 +408,7 @@ impl ToolSettings {
             symmetry_mirror: self.symmetry_mirror,
             symmetry_center_mm: None,
             draw_in_perspective: self.draw_in_perspective,
+            pressure_curve_json: self.pressure_curve_json.clone(),
         }
     }
 }
@@ -1064,6 +1067,11 @@ pub struct FontManagerState {
     pub indexed_fonts: Vec<FontRecord>,
     pub quarantined_files: Vec<String>,
     pub scanned_once: bool,
+    pub missing_family_input: String,
+    pub substitute_family_input: String,
+    pub panose_suggestion: Option<(FontRecord, u32)>,
+    pub substitutions: Vec<FontSubstitutionRecord>,
+    pub active_collection_tag: Option<String>,
 }
 
 /// Macro Studio Docker state (`S17`).

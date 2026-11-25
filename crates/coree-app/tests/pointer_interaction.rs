@@ -1833,3 +1833,439 @@ fn w1c_r17_interactive_fill_and_eraser_on_group_pixel_parity() {
         "Ctrl+Z must restore exact pre-erase RGBA bytes"
     );
 }
+
+#[test]
+fn wheel_zoom_multi_frame_smooth_scroll_is_bounded_and_proportional() {
+    let mut d = UiDriver::new();
+    let hover = d.world_to_pos2(Point2D::new(105.0, 148.5));
+    d.step(vec![Event::PointerMoved(hover)], Modifiers::NONE);
+
+    let z0 = d.app.active_tab().unwrap().viewport.zoom;
+    let anchor_before = d
+        .app
+        .active_tab()
+        .unwrap()
+        .viewport
+        .screen_to_world(Point2D::new(
+            f64::from(hover.x - d.app.active_tab().unwrap().last_canvas_rect.unwrap()[0]),
+            f64::from(hover.y - d.app.active_tab().unwrap().last_canvas_rect.unwrap()[1]),
+        ));
+
+    d.step(
+        vec![Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+
+    let mut prev_z = d.app.active_tab().unwrap().viewport.zoom;
+    let first_step = prev_z / z0;
+    assert!(
+        (1.0..=1.14).contains(&first_step),
+        "Single frame zoom step must be <= 1.14 (got {first_step})"
+    );
+
+    for _ in 0..15 {
+        d.step(Vec::new(), Modifiers::NONE);
+        let cur_z = d.app.active_tab().unwrap().viewport.zoom;
+        let ratio = cur_z / prev_z;
+        assert!(
+            (1.0 - 1e-6..=1.14).contains(&ratio),
+            "Per-frame smoothed wheel zoom ratio must stay bounded <= 1.14 (got {ratio})"
+        );
+        prev_z = cur_z;
+    }
+
+    let final_ratio = prev_z / z0;
+    assert!(
+        (1.04..=1.18).contains(&final_ratio),
+        "Single wheel notch over 15 smoothed frames must remain bounded ~1.09x, NOT compound to 3.9x (got {final_ratio})"
+    );
+
+    let tab = d.app.active_tab().unwrap();
+    let rect = tab.last_canvas_rect.unwrap();
+    let anchor_after = tab.viewport.screen_to_world(Point2D::new(
+        f64::from(hover.x - rect[0]),
+        f64::from(hover.y - rect[1]),
+    ));
+    assert!(
+        anchor_before.distance_to(anchor_after) < 0.25,
+        "Cursor world anchor shifted too far during wheel zoom: before={anchor_before:?} after={anchor_after:?}"
+    );
+}
+
+#[test]
+fn wheel_zoom_in_then_out_is_symmetric_and_pinch_ctrl_scroll_bounded() {
+    let mut d = UiDriver::new();
+    let hover = d.world_to_pos2(Point2D::new(105.0, 148.5));
+    d.step(vec![Event::PointerMoved(hover)], Modifiers::NONE);
+    let z0 = d.app.active_tab().unwrap().viewport.zoom;
+
+    d.step(
+        vec![Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    for _ in 0..15 {
+        d.step(Vec::new(), Modifiers::NONE);
+    }
+
+    d.step(
+        vec![Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    for _ in 0..15 {
+        d.step(Vec::new(), Modifiers::NONE);
+    }
+    let z_returned = d.app.active_tab().unwrap().viewport.zoom;
+    assert!(
+        ((z_returned / z0) - 1.0).abs() < 0.03,
+        "Equal +1/-1 wheel notches must be symmetric within 3% (z0={z0}, z_returned={z_returned})"
+    );
+
+    // Ctrl+Scroll / Pinch zoom must also remain smoothly bounded
+    d.step(
+        vec![Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::CTRL,
+        }],
+        Modifiers::CTRL,
+    );
+    for _ in 0..15 {
+        d.step(Vec::new(), Modifiers::CTRL);
+    }
+    let z_pinch = d.app.active_tab().unwrap().viewport.zoom;
+    let pinch_ratio = z_pinch / z_returned;
+    assert!(
+        (1.03..=1.22).contains(&pinch_ratio),
+        "Ctrl+Scroll pinch zoom over 15 frames must be smooth and bounded (got {pinch_ratio})"
+    );
+}
+
+#[test]
+fn zoom_tool_click_and_micro_drag_are_smooth_and_bounded() {
+    let mut d = UiDriver::new();
+    d.app.select_tool(ToolId::Zoom);
+    let p = d.world_to_pos2(Point2D::new(105.0, 148.5));
+    let z0 = d.app.active_tab().unwrap().viewport.zoom;
+
+    // Primary click -> 1.25x
+    d.step(
+        vec![
+            Event::PointerMoved(p),
+            Event::PointerButton {
+                pos: p,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![Event::PointerButton {
+            pos: p,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    let z1 = d.app.active_tab().unwrap().viewport.zoom;
+    assert!(
+        ((z1 / z0) - 1.25).abs() < 1e-4,
+        "Zoom tool primary click must apply 1.25x (got {})",
+        z1 / z0
+    );
+
+    // Micro-drag (< 6 px) even at low zoom must NOT jump to 256x marquee fit
+    d.app.select_tool(ToolId::Zoom);
+    d.app.active_tab_mut().unwrap().viewport.zoom = 0.05;
+    let z_low = d.app.active_tab().unwrap().viewport.zoom;
+    let p2 = pos2(p.x + 2.0, p.y + 2.0);
+    d.step(
+        vec![
+            Event::PointerMoved(p),
+            Event::PointerButton {
+                pos: p,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![
+            Event::PointerMoved(p2),
+            Event::PointerButton {
+                pos: p2,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    let z_after_micro = d.app.active_tab().unwrap().viewport.zoom;
+    assert!(
+        ((z_after_micro / z_low) - 1.25).abs() < 1e-4,
+        "Micro-drag (<6px) at low zoom must click-zoom 1.25x, not marquee fit (got {})",
+        z_after_micro / z_low
+    );
+}
+
+#[test]
+fn stylus_touch_force_in_pointer_interaction_creates_expression_stroke() {
+    let mut d = UiDriver::new();
+    d.app.select_tool(ToolId::ArtisticMedia);
+    d.app.tool_settings.pressure_curve_json = "[[0.0,0.2],[1.0,1.0]]".to_owned();
+    let p0 = d.world_to_pos2(Point2D::new(30.0, 50.0));
+    let p1 = d.world_to_pos2(Point2D::new(90.0, 50.0));
+
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Start,
+                pos: p0,
+                force: Some(0.0),
+            },
+            Event::PointerMoved(p0),
+            Event::PointerButton {
+                pos: p0,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Move,
+                pos: p1,
+                force: Some(1.0),
+            },
+            Event::PointerMoved(p1),
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![Event::PointerButton {
+            pos: p1,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+
+    let tab = d.app.active_tab().unwrap();
+    let has_expr = tab.document.objects().values().any(|o| {
+        matches!(
+            o.payload,
+            NodePayload::ArtisticMedia {
+                style: coree_core::ArtisticMediaStyle::Expression { .. },
+                ..
+            }
+        )
+    });
+    assert!(
+        has_expr,
+        "Stylus touch force through egui RawInput must create ArtisticMediaStyle::Expression"
+    );
+}
+
+#[test]
+fn bitmap_brush_stylus_soft_pressure_curve_evaluates_once() {
+    let mut d = UiDriver::new();
+    d.app.select_tool(ToolId::BitmapBrush);
+    d.app.tool_settings.brush_radius_px = 40.0;
+    d.app.tool_settings.brush_hardness = 1.0;
+    d.app.tool_settings.brush_color = Color::rgba(1.0, 0.0, 0.0, 1.0);
+    // "Soft" curve: raw 0.0 -> 0.20 (single eval), whereas double eval would yield 0.42.
+    // At radius = 40 px:
+    //   p = 0.20 -> dab_r = 40 * (0.25 + 0.75 * 0.20) = 16.0 px, alpha = 0.2 + 0.8 * 0.20 = 0.36
+    //   p = 0.42 -> dab_r = 40 * (0.25 + 0.75 * 0.42) = 22.6 px, alpha = 0.2 + 0.8 * 0.42 = 0.536
+    d.app.tool_settings.pressure_curve_json = "[[0.0,0.2],[0.5,0.75],[1.0,1.0]]".to_owned();
+
+    // 1) Single-point dab at page center (exercises state.rs single-point ApplyRasterStroke path)
+    let center_mm = Point2D::new(105.0, 148.5);
+    let p_center = d.world_to_pos2(center_mm);
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Start,
+                pos: p_center,
+                force: Some(0.0),
+            },
+            Event::PointerMoved(p_center),
+            Event::PointerButton {
+                pos: p_center,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::End,
+                pos: p_center,
+                force: Some(0.0),
+            },
+            Event::PointerButton {
+                pos: p_center,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+
+    let (cx, cy, center_alpha, inner_alpha, outer_alpha) = {
+        let tab = d.app.active_tab().unwrap();
+        let raster_data = tab
+            .document
+            .objects()
+            .values()
+            .find_map(|o| match &o.payload {
+                NodePayload::Raster(r) => Some(r),
+                _ => None,
+            })
+            .expect("BitmapBrush stroke must create a raster layer");
+        let asset = tab
+            .document
+            .asset(raster_data.asset_id)
+            .expect("raster asset must exist");
+        let cx = ((center_mm.x / raster_data.width_mm) * f64::from(asset.width)).floor() as u32;
+        let cy = ((center_mm.y / raster_data.height_mm) * f64::from(asset.height)).floor() as u32;
+        let center_px = asset.read_pixel_f32(cx, cy).unwrap();
+        let inner_px = asset.read_pixel_f32(cx + 12, cy).unwrap();
+        let outer_px = asset.read_pixel_f32(cx + 19, cy).unwrap();
+        (cx, cy, center_px[3], inner_px[3], outer_px[3])
+    };
+    assert!(
+        (center_alpha - 0.36).abs() < 0.02,
+        "Single-point dab at ({cx}, {cy}) must have single-evaluated alpha ~0.36 (not double-evaluated 0.536), got {center_alpha}"
+    );
+    assert!(
+        (inner_alpha - 0.36).abs() < 0.02,
+        "Pixel within single-evaluated 16.0px radius (dx=+12) must have alpha ~0.36, got {inner_alpha}"
+    );
+    assert!(
+        outer_alpha <= 1e-4,
+        "Pixel outside 16.0px radius (dx=+19, inside buggy 22.6px radius) must remain transparent, got {outer_alpha}"
+    );
+
+    // 2) Multi-point stroke (exercises state.rs multi-point ApplyRasterStroke path)
+    let p0_mm = Point2D::new(45.0, 70.0);
+    let p1_mm = Point2D::new(95.0, 70.0);
+    let p0 = d.world_to_pos2(p0_mm);
+    let p1 = d.world_to_pos2(p1_mm);
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Start,
+                pos: p0,
+                force: Some(0.0),
+            },
+            Event::PointerMoved(p0),
+            Event::PointerButton {
+                pos: p0,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Move,
+                pos: p1,
+                force: Some(0.0),
+            },
+            Event::PointerMoved(p1),
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::End,
+                pos: p1,
+                force: Some(0.0),
+            },
+            Event::PointerButton {
+                pos: p1,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+
+    let tab = d.app.active_tab().unwrap();
+    let raster_data = tab
+        .document
+        .objects()
+        .values()
+        .find_map(|o| match &o.payload {
+            NodePayload::Raster(r) => Some(r),
+            _ => None,
+        })
+        .expect("raster layer must still exist");
+    let asset = tab.document.asset(raster_data.asset_id).unwrap();
+    let mx = (((p0_mm.x + p1_mm.x) * 0.5 / raster_data.width_mm) * f64::from(asset.width)).floor()
+        as u32;
+    let my = ((p0_mm.y / raster_data.height_mm) * f64::from(asset.height)).floor() as u32;
+    let stroke_inner_alpha = asset.read_pixel_f32(mx, my + 12).unwrap()[3];
+    let stroke_outer_alpha = asset.read_pixel_f32(mx, my + 19).unwrap()[3];
+    assert!(
+        stroke_inner_alpha >= 0.34,
+        "Multi-point stroke pixel within 16.0px half-width (dy=+12) must be painted, got {stroke_inner_alpha}"
+    );
+    assert!(
+        stroke_outer_alpha <= 1e-4,
+        "Multi-point stroke pixel outside 16.0px half-width (dy=+19, inside buggy 22.6px) must remain transparent, got {stroke_outer_alpha}"
+    );
+}
