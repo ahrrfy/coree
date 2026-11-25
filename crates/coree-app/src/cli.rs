@@ -20,9 +20,10 @@ use coree_core::{ColorMode, Document, Fill, NodePayload, ObjectId, OutlineStyle,
 use coree_io::{atomic_write_bytes, import_raster};
 use coree_prod::{
     apply_print_merge, collect_for_output, default_plugin_dirs, detect_executable,
-    export_for_plugin, export_laser_dxf_r12, export_laser_eps, export_laser_gcode,
-    export_laser_plt, export_laser_svg, find_builtin_macro, launch_external_bridge,
-    plan_laser_toolpath, run_macro, run_preflight, CollectOptions, GcodeDialect, LaserJobConfig,
+    evaluate_cql_query, export_for_plugin, export_laser_dxf_r12, export_laser_eps,
+    export_laser_gcode, export_laser_plt, export_laser_svg, find_builtin_macro,
+    launch_external_bridge, plan_laser_toolpath, run_macro, run_preflight,
+    stream_print_merge_csv_to_pdf, CollectOptions, FindScope, GcodeDialect, LaserJobConfig,
     LaserOperationKind, LaserToolpathPlan, MacroSandboxConfig, PluginKind, PluginRegistry,
     PreflightRules, PrintMergeOptions, PrintMergeTable,
 };
@@ -119,6 +120,30 @@ pub enum TraceModeArg {
     Quick,
     Outline,
     Centerline,
+}
+
+/// Outline vectorization preset for `coree trace --preset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutlinePresetArg {
+    Logo,
+    LineArt,
+    DetailedLogo,
+    Clipart,
+    LowQuality,
+    HighQuality,
+}
+
+impl From<OutlinePresetArg> for OutlinePreset {
+    fn from(value: OutlinePresetArg) -> Self {
+        match value {
+            OutlinePresetArg::Logo => Self::Logo,
+            OutlinePresetArg::LineArt => Self::LineArt,
+            OutlinePresetArg::DetailedLogo => Self::DetailedLogo,
+            OutlinePresetArg::Clipart => Self::Clipart,
+            OutlinePresetArg::LowQuality => Self::LowQualityImage,
+            OutlinePresetArg::HighQuality => Self::HighQualityImage,
+        }
+    }
 }
 
 /// Output format for `coree laser --format`.
@@ -353,9 +378,41 @@ pub enum Commands {
         /// Vectorization mode.
         #[arg(long, value_enum, default_value_t = TraceModeArg::Outline)]
         mode: TraceModeArg,
+        /// Outline preset (`logo`, `line-art`, `detailed-logo`, `clipart`, `low-quality`, `high-quality`).
+        #[arg(long, value_enum, default_value_t = OutlinePresetArg::Logo)]
+        preset: OutlinePresetArg,
         /// Maximum quantized color regions (2..=64).
         #[arg(long, default_value_t = 8)]
         colors: usize,
+        /// Detail preservation factor (0..=100).
+        #[arg(long, default_value_t = 75.0)]
+        detail: f32,
+        /// Curve smoothing strength (0..=100).
+        #[arg(long, default_value_t = 25.0)]
+        smoothing: f32,
+        /// Corner sharpness threshold (0..=100).
+        #[arg(long, default_value_t = 20.0)]
+        corner_threshold: f32,
+        /// Remove solid border background color during trace.
+        #[arg(long)]
+        remove_background: bool,
+        /// Minimum contiguous region pixel area before merging speckles into neighbors.
+        #[arg(long, default_value_t = 4)]
+        speckle_size: usize,
+    },
+    /// Query document objects using `coree` CQL (`@type == 'curve' and @color == 'CutContour'`).
+    Cql {
+        /// Input document path.
+        input_path: PathBuf,
+        /// CQL query string via `--query`.
+        #[arg(long, conflicts_with = "query_pos")]
+        query: Option<String>,
+        /// Optional positional CQL query string.
+        #[arg(value_name = "QUERY")]
+        query_pos: Option<String>,
+        /// Emit structured JSON output.
+        #[arg(long)]
+        json: bool,
     },
     /// Execute a sandboxed Rhai automation macro (file path or built-in ID such as `recolor-cmyk`).
     RunMacro {
@@ -693,19 +750,39 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             output_path,
         } => {
             let opened = open_any_document(template_path)?;
-            let csv_text = read_text_file_bounded(csv_path, MAX_TEXT_READ_BYTES)
-                .map_err(|e| format!("failed to read CSV: {e}"))?;
-            let table = PrintMergeTable::from_csv(&csv_text)
-                .map_err(|e| format!("CSV parse failed: {e}"))?;
-            let merged = apply_print_merge(&opened.document, &table, &PrintMergeOptions::default())
-                .map_err(|e| format!("print merge failed: {e}"))?;
-            let msg =
-                export_any_document(&merged, output_path, &UniversalExportOptions::default())?;
-            Ok(CliOutcome::Printed(format!(
-                "Merged {} record(s) into {} page(s). {msg}",
-                table.rows.len(),
-                merged.pages().len()
-            )))
+            let is_pdf = output_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+            if is_pdf {
+                let row_count = stream_print_merge_csv_to_pdf(
+                    &opened.document,
+                    csv_path,
+                    output_path,
+                    &PrintMergeOptions::default(),
+                )
+                .map_err(|e| format!("streaming print merge to PDF failed: {e}"))?;
+                Ok(CliOutcome::Printed(format!(
+                    "Streamed {row_count} record(s) into {} page(s) at {}",
+                    row_count,
+                    output_path.display()
+                )))
+            } else {
+                let csv_text = read_text_file_bounded(csv_path, MAX_TEXT_READ_BYTES)
+                    .map_err(|e| format!("failed to read CSV: {e}"))?;
+                let table = PrintMergeTable::from_csv(&csv_text)
+                    .map_err(|e| format!("CSV parse failed: {e}"))?;
+                let merged =
+                    apply_print_merge(&opened.document, &table, &PrintMergeOptions::default())
+                        .map_err(|e| format!("print merge failed: {e}"))?;
+                let msg =
+                    export_any_document(&merged, output_path, &UniversalExportOptions::default())?;
+                Ok(CliOutcome::Printed(format!(
+                    "Merged {} record(s) into {} page(s). {msg}",
+                    table.rows.len(),
+                    merged.pages().len()
+                )))
+            }
         }
         Commands::Collect {
             input_path,
@@ -727,7 +804,13 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             input_image,
             output_path,
             mode,
+            preset,
             colors,
+            detail,
+            smoothing,
+            corner_threshold,
+            remove_background,
+            speckle_size,
         } => {
             let asset = import_raster(input_image)
                 .map_err(|e| format!("failed to load raster '{}': {e}", input_image.display()))?;
@@ -736,13 +819,27 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             let h_mm = (f64::from(asset.height) / dpi * MM_PER_INCH).max(10.0);
             let trace_mode = match mode {
                 TraceModeArg::Quick => TraceMode::QuickTrace,
-                TraceModeArg::Outline => TraceMode::OutlineTrace(OutlinePreset::Logo),
+                TraceModeArg::Outline => TraceMode::OutlineTrace((*preset).into()),
                 TraceModeArg::Centerline => TraceMode::CenterlineTrace,
             };
             let cfg = TraceConfig {
                 mode: trace_mode,
                 max_colors: (*colors).clamp(2, 64),
-                ..TraceConfig::default()
+                detail: if *detail > 1.0 {
+                    f64::from(*detail) / 100.0
+                } else {
+                    f64::from(*detail)
+                }
+                .clamp(0.0, 1.0),
+                smoothing: if *smoothing > 1.0 {
+                    f64::from(*smoothing) / 100.0
+                } else {
+                    f64::from(*smoothing)
+                }
+                .clamp(0.0, 1.0),
+                corner_threshold: f64::from(*corner_threshold).clamp(0.0, 180.0),
+                remove_background: *remove_background,
+                speckle_size: (*speckle_size).min(4096),
             };
             let traced = trace_raster_to_mm(&asset, w_mm, h_mm, &cfg);
             let stem = input_image
@@ -771,6 +868,58 @@ pub fn execute_cli(cli: &Cli) -> Result<CliOutcome, String> {
             Ok(CliOutcome::Printed(format!(
                 "Traced {count} vector curve(s) ({mode:?}). {msg}"
             )))
+        }
+        Commands::Cql {
+            input_path,
+            query,
+            query_pos,
+            json,
+        } => {
+            let q = query
+                .as_deref()
+                .or(query_pos.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "missing CQL query (pass `--query '...'` or positional QUERY)".to_owned()
+                })?;
+            let opened = open_any_document(input_path)?;
+            let matched = evaluate_cql_query(&opened.document, FindScope::WholeDocument, q)
+                .map_err(|e| format!("CQL query error: {e}"))?;
+            if *json {
+                let items: Vec<serde_json::Value> = matched
+                    .iter()
+                    .map(|oid| {
+                        let name = opened
+                            .document
+                            .object(*oid)
+                            .map(|o| o.name.as_str())
+                            .unwrap_or("");
+                        serde_json::json!({ "id": oid.0, "name": name })
+                    })
+                    .collect();
+                let payload = serde_json::json!({
+                    "query": q,
+                    "count": items.len(),
+                    "matches": items,
+                });
+                let s = serde_json::to_string_pretty(&payload)
+                    .map_err(|e| format!("CQL JSON failed: {e}"))?;
+                Ok(CliOutcome::Printed(s))
+            } else if matched.is_empty() {
+                Ok(CliOutcome::Printed("0 objects matched.".to_owned()))
+            } else {
+                let mut lines = Vec::with_capacity(matched.len());
+                for oid in matched {
+                    let name = opened
+                        .document
+                        .object(oid)
+                        .map(|o| o.name.as_str())
+                        .unwrap_or("Object");
+                    lines.push(format!("{}: {name}", oid.0));
+                }
+                Ok(CliOutcome::Printed(lines.join("\n")))
+            }
         }
         Commands::RunMacro {
             input_path,

@@ -22,11 +22,34 @@ use std::sync::{Mutex, OnceLock};
 use swash::scale::ScaleContext;
 use swash::zeno::PathData as _;
 
-fn shared_base_font_db() -> &'static (String, cosmic_text::fontdb::Database) {
-    static BASE_DB: OnceLock<(String, cosmic_text::fontdb::Database)> = OnceLock::new();
+fn shared_base_font_db() -> &'static (
+    String,
+    cosmic_text::fontdb::Database,
+    HashSet<String>,
+    usize,
+) {
+    static BASE_DB: OnceLock<(
+        String,
+        cosmic_text::fontdb::Database,
+        HashSet<String>,
+        usize,
+    )> = OnceLock::new();
     BASE_DB.get_or_init(|| {
         let fs = FontSystem::new();
-        (fs.locale().to_owned(), fs.db().clone())
+        let mut families = HashSet::new();
+        let mut face_count = 0usize;
+        for face in fs.db().faces() {
+            face_count += 1;
+            for (name, _) in &face.families {
+                families.insert(name.to_ascii_lowercase());
+            }
+        }
+        (
+            fs.locale().to_owned(),
+            fs.db().clone(),
+            families,
+            face_count,
+        )
     })
 }
 
@@ -74,6 +97,8 @@ pub struct TextEngine {
     var_scale_ctx: ScaleContext,
     arabic_fallback_family: Option<String>,
     font_blob_cache: HashMap<(cosmic_text::fontdb::ID, u16), Option<PdfFontBlobEntry>>,
+    base_families_lower: &'static HashSet<String>,
+    base_face_count: usize,
 }
 
 impl Default for TextEngine {
@@ -86,7 +111,7 @@ impl TextEngine {
     /// Initializes the text engine reusing the cached OS font catalog (sub-millisecond per tab/worker).
     #[must_use]
     pub fn new() -> Self {
-        let (locale, db) = shared_base_font_db();
+        let (locale, db, base_families_lower, base_face_count) = shared_base_font_db();
         let font_system = FontSystem::new_with_locale_and_db(locale.clone(), db.clone());
         let arabic_fallback_family = detect_arabic_font_family(&font_system);
         Self {
@@ -95,6 +120,8 @@ impl TextEngine {
             var_scale_ctx: ScaleContext::new(),
             arabic_fallback_family,
             font_blob_cache: HashMap::new(),
+            base_families_lower,
+            base_face_count: *base_face_count,
         }
     }
 
@@ -333,6 +360,11 @@ impl TextEngine {
     }
 
     fn has_family(&self, family: &str) -> bool {
+        if self.font_system.db().len() == self.base_face_count {
+            return self
+                .base_families_lower
+                .contains(&family.to_ascii_lowercase());
+        }
         self.font_system.db().faces().any(|face| {
             face.families
                 .iter()

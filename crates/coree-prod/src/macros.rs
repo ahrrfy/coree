@@ -10,9 +10,10 @@
 
 use crate::cut_packaging::generate_cut_contour;
 use crate::error::{ProdError, ProdResult};
+use crate::find_replace::{evaluate_cql_query, FindScope};
 use coree_core::{
-    apply_command, rhai_array_to_ids, Affine2D, AlignOp, Color, CommandHistory, CommandOp,
-    Document, Fill, LayerId, NodePayload, ObjectId, OutlineStyle, Point2D,
+    rhai_array_to_ids, Affine2D, AlignOp, ArtisticText, Color, CommandHistory, CommandOp, Document,
+    Effect, Fill, LayerId, LensKind, NodePayload, ObjectId, OutlineStyle, Point2D,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use std::rc::Rc;
 /// Strict sandbox resource limits protecting the host application from runaway scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacroSandboxConfig {
-    /// Maximum Rhai VM operations allowed before forcibly terminating execution (default: `100_000`).
+    /// Maximum Rhai VM operations allowed before forcibly terminating execution (default: `500_000`).
     pub max_operations: u64,
     /// Maximum expression nesting depth (default: `32`).
     pub max_expr_depth: usize,
@@ -31,21 +32,40 @@ pub struct MacroSandboxConfig {
     pub max_call_levels: usize,
     /// Maximum string byte length (default: `1 MiB`).
     pub max_string_size: usize,
-    /// Maximum array element count (default: `10_000`).
+    /// Maximum array element count (default: `65_536`).
     pub max_array_size: usize,
-    /// Maximum object-map entry count (default: `1_000`).
+    /// Maximum object-map entry count (default: `4_096`).
     pub max_map_size: usize,
 }
 
 impl Default for MacroSandboxConfig {
     fn default() -> Self {
         Self {
-            max_operations: 100_000,
+            max_operations: 500_000,
             max_expr_depth: 32,
             max_call_levels: 32,
             max_string_size: 1_048_576,
-            max_array_size: 10_000,
-            max_map_size: 1_000,
+            max_array_size: 65_536,
+            max_map_size: 4_096,
+        }
+    }
+}
+
+/// Lifecycle hook event kinds for automated Rhai macro listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MacroEventHook {
+    OnOpen,
+    OnBeforeExport,
+    OnSelectionChange,
+}
+
+impl MacroEventHook {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnOpen => "on_open",
+            Self::OnBeforeExport => "on_before_export",
+            Self::OnSelectionChange => "on_selection_change",
         }
     }
 }
@@ -186,15 +206,27 @@ fn dyn_to_f64(v: Dynamic, field: &str) -> Result<f64, Box<EvalAltResult>> {
 }
 
 /// Plans a production Rhai automation script against `doc` inside a strict sandbox,
-/// returning the execution result and the exact replayable [`CommandOp`] sequence without
-/// mutating `doc`.
+/// Plans a Rhai automation script against `doc` without mutating it, returning the execution
+/// result and the exact replayable [`CommandOp`] sequence.
 pub fn plan_macro_ops(
     doc: &Document,
     script: &str,
     vars: &BTreeMap<String, MacroValue>,
     config: &MacroSandboxConfig,
 ) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
-    let (_new_doc, result, ops) = run_macro_inner(doc, script, vars, config)?;
+    plan_macro_ops_with_selection(doc, script, vars, config, &[])
+}
+
+/// Variant of [`plan_macro_ops`] seeding `doc.selection` from `initial_selection`.
+pub fn plan_macro_ops_with_selection(
+    doc: &Document,
+    script: &str,
+    vars: &BTreeMap<String, MacroValue>,
+    config: &MacroSandboxConfig,
+    initial_selection: &[ObjectId],
+) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
+    let (_new_doc, result, ops) =
+        run_macro_inner_with_selection(doc, script, vars, config, initial_selection)?;
     Ok((result, ops))
 }
 
@@ -209,26 +241,58 @@ pub fn run_macro_with_ops(
     vars: &BTreeMap<String, MacroValue>,
     config: &MacroSandboxConfig,
 ) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
-    let (new_doc, result, ops) = run_macro_inner(doc, script, vars, config)?;
+    run_macro_with_ops_and_selection(doc, script, vars, config, &[])
+}
+
+/// Variant of [`run_macro_with_ops`] seeding `doc.selection` from `initial_selection`.
+pub fn run_macro_with_ops_and_selection(
+    doc: &mut Document,
+    script: &str,
+    vars: &BTreeMap<String, MacroValue>,
+    config: &MacroSandboxConfig,
+    initial_selection: &[ObjectId],
+) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
+    let (new_doc, result, ops) =
+        run_macro_inner_with_selection(doc, script, vars, config, initial_selection)?;
     *doc = new_doc;
     Ok((result, ops))
 }
 
-fn run_macro_inner(
+fn run_macro_inner_with_selection(
     doc: &Document,
     script: &str,
     vars: &BTreeMap<String, MacroValue>,
     config: &MacroSandboxConfig,
+    initial_selection: &[ObjectId],
 ) -> ProdResult<(Document, MacroExecutionResult, Vec<CommandOp>)> {
     let work_doc = Rc::new(RefCell::new(doc.clone()));
+    let history = Rc::new(RefCell::new(CommandHistory::new(256)));
     let logs = Rc::new(RefCell::new(Vec::<String>::new()));
     let ops_count = Rc::new(RefCell::new(0usize));
     let recorded_ops = Rc::new(RefCell::new(Vec::<CommandOp>::new()));
+    let selection = Rc::new(RefCell::new(initial_selection.to_vec()));
 
     let mut engine = new_sandboxed_engine(config);
-    register_production_api(&mut engine, &work_doc, &logs, &ops_count, &recorded_ops);
+    register_production_api(
+        &mut engine,
+        &work_doc,
+        &history,
+        &logs,
+        &ops_count,
+        &recorded_ops,
+    );
+    let dom_doc = register_hierarchical_scene_dom(
+        &mut engine,
+        &work_doc,
+        &history,
+        &logs,
+        &ops_count,
+        &recorded_ops,
+        &selection,
+    );
 
     let mut scope = Scope::new();
+    scope.push("doc", dom_doc);
     for (k, v) in vars {
         scope.push_dynamic(k.clone(), v.clone().into_dynamic());
     }
@@ -244,6 +308,44 @@ fn run_macro_inner(
         logs: logs.borrow().clone(),
     };
     Ok((new_doc, result, ops))
+}
+
+/// Runs a lifecycle hook script (`on_open`, `on_before_export`, `on_selection_change`) against `doc`.
+pub fn run_macro_event_hook(
+    doc: &mut Document,
+    hook: MacroEventHook,
+    script: &str,
+    vars: &BTreeMap<String, MacroValue>,
+    config: &MacroSandboxConfig,
+) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
+    run_macro_event_hook_with_selection(doc, hook, script, vars, config, &[])
+}
+
+/// Variant of [`run_macro_event_hook`] seeding `doc.selection` from `initial_selection`.
+pub fn run_macro_event_hook_with_selection(
+    doc: &mut Document,
+    hook: MacroEventHook,
+    script: &str,
+    vars: &BTreeMap<String, MacroValue>,
+    config: &MacroSandboxConfig,
+    initial_selection: &[ObjectId],
+) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
+    let mut hook_vars = vars.clone();
+    hook_vars.insert(
+        "hook_event".to_owned(),
+        MacroValue::String(hook.as_str().to_owned()),
+    );
+    run_macro_with_ops_and_selection(doc, script, &hook_vars, config, initial_selection)
+}
+
+/// Convenience dispatcher for the [`MacroEventHook::OnBeforeExport`] lifecycle hook.
+pub fn on_before_export(
+    doc: &mut Document,
+    script: &str,
+    vars: &BTreeMap<String, MacroValue>,
+    config: &MacroSandboxConfig,
+) -> ProdResult<(MacroExecutionResult, Vec<CommandOp>)> {
+    run_macro_event_hook(doc, MacroEventHook::OnBeforeExport, script, vars, config)
 }
 
 /// Runs a production Rhai automation script against `doc` inside a strict sandbox.
@@ -473,6 +575,7 @@ fn parse_align_mode(mode: &str) -> Result<AlignOp, Box<EvalAltResult>> {
 fn register_production_api(
     engine: &mut Engine,
     doc: &Rc<RefCell<Document>>,
+    history: &Rc<RefCell<CommandHistory>>,
     logs: &Rc<RefCell<Vec<String>>>,
     ops_count: &Rc<RefCell<usize>>,
     recorded_ops: &Rc<RefCell<Vec<CommandOp>>>,
@@ -537,6 +640,7 @@ fn register_production_api(
     // Standard command API (compatible with recorded Rhai macros)
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -561,7 +665,8 @@ fn register_production_api(
                     ids: obj_ids,
                     affine: Affine2D { m: coeffs },
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -571,6 +676,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -586,7 +692,8 @@ fn register_production_api(
                     ids: obj_ids,
                     fill: Fill::Solid(color),
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -596,6 +703,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -610,7 +718,8 @@ fn register_production_api(
                     ids: obj_ids,
                     op: align,
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -620,6 +729,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -630,7 +740,8 @@ fn register_production_api(
                     return Ok(());
                 }
                 let op = CommandOp::DeleteObjects { ids: obj_ids };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -640,6 +751,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -649,7 +761,8 @@ fn register_production_api(
                     ids: rhai_array_to_ids(ids),
                     name: name.to_owned(),
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -659,6 +772,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -670,7 +784,8 @@ fn register_production_api(
                 let op = CommandOp::ConvertToCurves {
                     id: ObjectId(id as u64),
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -680,17 +795,18 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
             "add_page",
             move |name: &str,
                   w: Dynamic,
-                  h: Dynamic,
+                  h_val: Dynamic,
                   b: Dynamic|
                   -> Result<(), Box<EvalAltResult>> {
                 let width_mm = dyn_to_f64(w, "width_mm")?;
-                let height_mm = dyn_to_f64(h, "height_mm")?;
+                let height_mm = dyn_to_f64(h_val, "height_mm")?;
                 let bleed_mm = dyn_to_f64(b, "bleed_mm")?;
                 if !width_mm.is_finite()
                     || width_mm <= 0.0
@@ -710,7 +826,8 @@ fn register_production_api(
                     height_mm,
                     bleed_mm,
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -720,6 +837,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -727,7 +845,8 @@ fn register_production_api(
             move |json: &str| -> Result<(), Box<EvalAltResult>> {
                 let op: CommandOp = serde_json::from_str(json)
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -739,6 +858,7 @@ fn register_production_api(
     // Production automation host primitives
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -757,7 +877,7 @@ fn register_production_api(
                     return Err("resize_objects requires positive finite dimensions".into());
                 }
                 let obj_ids = rhai_array_to_ids(ids);
-                let mut resized = 0i64;
+                let mut ops = Vec::new();
                 let mut doc_mut = d.borrow_mut();
                 let locked_ids = collect_locked_object_ids(&doc_mut);
                 for oid in obj_ids {
@@ -795,16 +915,18 @@ fn register_production_api(
                     } else {
                         scale_xf
                     };
-                    let op = CommandOp::TransformObjects {
+                    ops.push(CommandOp::TransformObjects {
                         ids: vec![oid],
                         affine: local_xf,
-                    };
-                    if apply_command(&mut doc_mut, &op).is_ok() {
-                        rec.borrow_mut().push(op);
-                        resized += 1;
-                    }
+                    });
                 }
-                if resized > 0 {
+                let resized = ops.len() as i64;
+                if !ops.is_empty() {
+                    let batch = CommandOp::Batch(ops);
+                    h.borrow_mut()
+                        .execute(&mut doc_mut, batch.clone())
+                        .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                    rec.borrow_mut().push(batch);
                     *c.borrow_mut() += 1;
                 }
                 Ok(resized)
@@ -813,6 +935,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -850,13 +973,13 @@ fn register_production_api(
                         ids: obj_ids,
                         affine: world_xf,
                     };
-                    apply_command(&mut doc_mut, &op)
+                    h.borrow_mut()
+                        .execute(&mut doc_mut, op.clone())
                         .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                     rec.borrow_mut().push(op);
                     *c.borrow_mut() += 1;
                     return Ok(count);
                 }
-                let mut count = 0i64;
                 let mut ops = Vec::with_capacity(obj_ids.len());
                 for oid in obj_ids {
                     let local_xf = if let Some(pid) = doc_mut.parent_container_of(oid) {
@@ -879,13 +1002,13 @@ fn register_production_api(
                         affine: local_xf,
                     });
                 }
-                for op in ops {
-                    apply_command(&mut doc_mut, &op)
+                let count = ops.len() as i64;
+                if !ops.is_empty() {
+                    let batch = CommandOp::Batch(ops);
+                    h.borrow_mut()
+                        .execute(&mut doc_mut, batch.clone())
                         .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
-                    rec.borrow_mut().push(op);
-                    count += 1;
-                }
-                if count > 0 {
+                    rec.borrow_mut().push(batch);
                     *c.borrow_mut() += 1;
                 }
                 Ok(count)
@@ -894,6 +1017,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -905,21 +1029,30 @@ fn register_production_api(
                 let offset_mm = dyn_to_f64(offset_dyn, "offset_mm")?;
                 let obj_ids = rhai_array_to_ids(ids);
                 let mut doc_mut = d.borrow_mut();
+                let mut hist_mut = h.borrow_mut();
                 let existing_layers: HashSet<LayerId> = doc_mut
                     .pages()
                     .iter()
                     .flat_map(|p| p.layers.iter().map(|l| l.id))
                     .collect();
-                let res = generate_cut_contour(&mut doc_mut, &obj_ids, offset_mm, spot_name)
+                hist_mut
+                    .begin_transaction(&doc_mut, "Generate Cut Contour")
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                let res = match generate_cut_contour(&mut doc_mut, &obj_ids, offset_mm, spot_name) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = hist_mut.cancel_transaction(&mut doc_mut);
+                        return Err(e.to_string().into());
+                    }
+                };
                 let owner_page_id = doc_mut
                     .pages()
                     .iter()
                     .find(|p| p.layers.iter().any(|l| l.id == res.layer_id))
                     .map(|p| p.id);
-                let mut rec_mut = rec.borrow_mut();
+                let mut batch_ops = Vec::new();
                 if existing_layers.contains(&res.layer_id) {
-                    rec_mut.push(CommandOp::SetLayerFlags {
+                    batch_ops.push(CommandOp::SetLayerFlags {
                         layer_id: res.layer_id,
                         visible: Some(true),
                         locked: None,
@@ -929,7 +1062,7 @@ fn register_production_api(
                 } else if let (Some(page_id), Some(layer)) =
                     (owner_page_id, doc_mut.find_layer(res.layer_id))
                 {
-                    rec_mut.push(CommandOp::AddLayer {
+                    batch_ops.push(CommandOp::AddLayer {
                         page_id,
                         name: layer.name.clone(),
                         is_cut_layer: layer.is_cut_layer,
@@ -937,11 +1070,17 @@ fn register_production_api(
                     });
                 }
                 if let Some(created_obj) = doc_mut.object(res.object_id) {
-                    rec_mut.push(CommandOp::create_object(
+                    batch_ops.push(CommandOp::create_object(
                         created_obj.clone(),
                         Some(res.layer_id),
                     ));
                 }
+                let _ = hist_mut.cancel_transaction(&mut doc_mut);
+                let batch = CommandOp::Batch(batch_ops);
+                hist_mut
+                    .execute(&mut doc_mut, batch.clone())
+                    .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                rec.borrow_mut().push(batch);
                 *c.borrow_mut() += 1;
                 Ok(res.object_id.0 as i64)
             },
@@ -949,6 +1088,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -997,7 +1137,7 @@ fn register_production_api(
                         valid.push((oid, bb));
                     }
                 }
-                let mut moved = 0i64;
+                let mut ops = Vec::new();
                 for (idx, (oid, bb)) in valid.into_iter().enumerate() {
                     let row = idx / cols_usize;
                     let col = idx % cols_usize;
@@ -1027,16 +1167,18 @@ fn register_production_api(
                     } else {
                         world_xf
                     };
-                    let op = CommandOp::TransformObjects {
+                    ops.push(CommandOp::TransformObjects {
                         ids: vec![oid],
                         affine: local_xf,
-                    };
-                    if apply_command(&mut doc_mut, &op).is_ok() {
-                        rec.borrow_mut().push(op);
-                        moved += 1;
-                    }
+                    });
                 }
-                if moved > 0 {
+                let moved = ops.len() as i64;
+                if !ops.is_empty() {
+                    let batch = CommandOp::Batch(ops);
+                    h.borrow_mut()
+                        .execute(&mut doc_mut, batch.clone())
+                        .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                    rec.borrow_mut().push(batch);
                     *c.borrow_mut() += 1;
                 }
                 Ok(moved)
@@ -1045,6 +1187,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn("recolor_all_to_cmyk", move || -> i64 {
@@ -1165,11 +1308,65 @@ fn register_production_api(
                     }
                     _ => {}
                 }
+
+                if let Some(lens) = &obj.lens {
+                    let mut lens2 = lens.clone();
+                    let lens_hits = map_lens_to_cmyk(&mut lens2);
+                    if lens_hits > 0 {
+                        converted += lens_hits;
+                        ops.push(CommandOp::SetLens {
+                            ids: vec![oid],
+                            lens: Some(lens2),
+                        });
+                    }
+                }
+
+                if !obj.effects.is_empty() {
+                    let mut changed_effects: Vec<(usize, Effect)> = Vec::new();
+                    for (idx, eff) in obj.effects.iter().enumerate() {
+                        let mut eff2 = eff.clone();
+                        let hits = map_effect_to_cmyk(&mut eff2);
+                        if hits > 0 {
+                            converted += hits;
+                            changed_effects.push((idx, eff2));
+                        }
+                    }
+                    if !changed_effects.is_empty() {
+                        for &(idx, _) in changed_effects.iter().rev() {
+                            ops.push(CommandOp::RemoveEffect {
+                                id: oid,
+                                effect_index: idx,
+                            });
+                        }
+                        for (_, eff2) in changed_effects {
+                            ops.push(CommandOp::AddEffect {
+                                id: oid,
+                                effect: eff2,
+                            });
+                        }
+                    }
+                }
             }
-            let mut rec_mut = rec.borrow_mut();
-            for op in ops {
-                if apply_command(&mut doc_mut, &op).is_ok() {
-                    rec_mut.push(op);
+            let sym_ids: Vec<coree_core::SymbolId> = doc_mut.symbols().keys().copied().collect();
+            for sym_id in sym_ids {
+                if let Some(mut sym) = doc_mut.symbol(sym_id).cloned() {
+                    let mut sym_hits = 0usize;
+                    for sub in &mut sym.objects {
+                        if sub.locked {
+                            continue;
+                        }
+                        sym_hits += map_scene_object_fields_to_cmyk(sub);
+                    }
+                    if sym_hits > 0 {
+                        converted += sym_hits;
+                        ops.push(CommandOp::UpsertSymbol { symbol: sym });
+                    }
+                }
+            }
+            if !ops.is_empty() {
+                let batch = CommandOp::Batch(ops);
+                if h.borrow_mut().execute(&mut doc_mut, batch.clone()).is_ok() {
+                    rec.borrow_mut().push(batch);
                 }
             }
             if converted > 0 {
@@ -1180,6 +1377,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn("clean_empty_layers", move || -> i64 {
@@ -1194,23 +1392,24 @@ fn register_production_api(
                     }
                 }
             }
-            let mut removed = 0i64;
-            let mut rec_mut = rec.borrow_mut();
-            for layer_id in to_delete {
-                let op = CommandOp::DeleteLayer { layer_id };
-                if apply_command(&mut doc_mut, &op).is_ok() {
-                    rec_mut.push(op);
-                    removed += 1;
+            let ops: Vec<CommandOp> = to_delete
+                .into_iter()
+                .map(|layer_id| CommandOp::DeleteLayer { layer_id })
+                .collect();
+            let removed = ops.len() as i64;
+            if !ops.is_empty() {
+                let batch = CommandOp::Batch(ops);
+                if h.borrow_mut().execute(&mut doc_mut, batch.clone()).is_ok() {
+                    rec.borrow_mut().push(batch);
+                    *c.borrow_mut() += 1;
                 }
-            }
-            if removed > 0 {
-                *c.borrow_mut() += 1;
             }
             removed
         });
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -1237,7 +1436,8 @@ fn register_production_api(
                     ids: obj_ids,
                     fill: Fill::Solid(color),
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -1247,6 +1447,7 @@ fn register_production_api(
     }
     {
         let d = Rc::clone(doc);
+        let h = Rc::clone(history);
         let c = Rc::clone(ops_count);
         let rec = Rc::clone(recorded_ops);
         engine.register_fn(
@@ -1266,7 +1467,8 @@ fn register_production_api(
                     ids: obj_ids,
                     outline: OutlineStyle::solid(Color::KEY_BLACK, w),
                 };
-                apply_command(&mut d.borrow_mut(), &op)
+                h.borrow_mut()
+                    .execute(&mut d.borrow_mut(), op.clone())
                     .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
                 rec.borrow_mut().push(op);
                 *c.borrow_mut() += 1;
@@ -1274,6 +1476,709 @@ fn register_production_api(
             },
         );
     }
+}
+
+// =============================================================================
+// Rhai Hierarchical Scene DOM (`doc` -> `pages` -> `layers` -> `shapes`)
+// =============================================================================
+
+#[derive(Clone)]
+struct DomContext {
+    doc: Rc<RefCell<Document>>,
+    history: Rc<RefCell<CommandHistory>>,
+    logs: Rc<RefCell<Vec<String>>>,
+    ops_count: Rc<RefCell<usize>>,
+    recorded_ops: Rc<RefCell<Vec<CommandOp>>>,
+    selection: Rc<RefCell<Vec<ObjectId>>>,
+}
+
+impl DomContext {
+    fn apply_op(&self, op: CommandOp) -> Result<(), Box<EvalAltResult>> {
+        self.history
+            .borrow_mut()
+            .execute(&mut self.doc.borrow_mut(), op.clone())
+            .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+        self.recorded_ops.borrow_mut().push(op);
+        *self.ops_count.borrow_mut() += 1;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct DomDocument {
+    ctx: DomContext,
+}
+
+#[derive(Clone)]
+struct DomPage {
+    ctx: DomContext,
+    page_idx: usize,
+}
+
+#[derive(Clone)]
+struct DomLayer {
+    ctx: DomContext,
+    page_idx: usize,
+    layer_id: LayerId,
+}
+
+#[derive(Clone)]
+struct DomShape {
+    ctx: DomContext,
+    object_id: ObjectId,
+}
+
+#[derive(Clone)]
+struct DomStyles {
+    ctx: DomContext,
+}
+
+#[derive(Clone)]
+struct DomSelection {
+    ctx: DomContext,
+}
+
+fn shape_type_label(payload: &NodePayload) -> &'static str {
+    match payload {
+        NodePayload::Path(_) => "curve",
+        NodePayload::Shape(_) => "shape",
+        NodePayload::BSpline(_) => "bspline",
+        NodePayload::ArtisticMedia { .. } => "artistic_media",
+        NodePayload::ArtisticText(_) => "artistic_text",
+        NodePayload::ParagraphText(_) => "paragraph_text",
+        NodePayload::TextOnPath(_) => "text_on_path",
+        NodePayload::Raster(_) => "raster",
+        NodePayload::Group(_) => "group",
+        NodePayload::PowerClip { .. } => "powerclip",
+        NodePayload::SymbolInstance { .. } => "symbol_instance",
+        NodePayload::Clone { .. } => "clone",
+        NodePayload::Connector(_) => "connector",
+        NodePayload::Table(_) => "table",
+        NodePayload::Dimension(_) => "dimension",
+    }
+}
+
+fn register_hierarchical_scene_dom(
+    engine: &mut Engine,
+    doc: &Rc<RefCell<Document>>,
+    history: &Rc<RefCell<CommandHistory>>,
+    logs: &Rc<RefCell<Vec<String>>>,
+    ops_count: &Rc<RefCell<usize>>,
+    recorded_ops: &Rc<RefCell<Vec<CommandOp>>>,
+    selection: &Rc<RefCell<Vec<ObjectId>>>,
+) -> DomDocument {
+    let ctx = DomContext {
+        doc: Rc::clone(doc),
+        history: Rc::clone(history),
+        logs: Rc::clone(logs),
+        ops_count: Rc::clone(ops_count),
+        recorded_ops: Rc::clone(recorded_ops),
+        selection: Rc::clone(selection),
+    };
+
+    engine
+        .register_type_with_name::<DomDocument>("DomDocument")
+        .register_type_with_name::<DomPage>("DomPage")
+        .register_type_with_name::<DomLayer>("DomLayer")
+        .register_type_with_name::<DomShape>("DomShape")
+        .register_type_with_name::<DomStyles>("DomStyles")
+        .register_type_with_name::<DomSelection>("DomSelection");
+
+    // Top-level helpers
+    {
+        let root = DomDocument { ctx: ctx.clone() };
+        engine.register_fn("doc", move || root.clone());
+    }
+    {
+        let d = Rc::clone(doc);
+        engine.register_fn(
+            "cql",
+            move |query: &str| -> Result<rhai::Array, Box<EvalAltResult>> {
+                let ids = evaluate_cql_query(&d.borrow(), FindScope::WholeDocument, query)
+                    .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                Ok(ids
+                    .into_iter()
+                    .map(|id| Dynamic::from(id.0 as i64))
+                    .collect())
+            },
+        );
+    }
+    {
+        let c = ctx.clone();
+        engine.register_fn(
+            "cql_shapes",
+            move |query: &str| -> Result<rhai::Array, Box<EvalAltResult>> {
+                let ids = evaluate_cql_query(&c.doc.borrow(), FindScope::WholeDocument, query)
+                    .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                Ok(ids
+                    .into_iter()
+                    .map(|oid| {
+                        Dynamic::from(DomShape {
+                            ctx: c.clone(),
+                            object_id: oid,
+                        })
+                    })
+                    .collect())
+            },
+        );
+    }
+    engine.register_fn(
+        "cancel_export",
+        |reason: &str| -> Result<(), Box<EvalAltResult>> {
+            Err(format!("export cancelled by hook: {reason}").into())
+        },
+    );
+    engine.register_fn(
+        "abort_export",
+        |reason: &str| -> Result<(), Box<EvalAltResult>> {
+            Err(format!("export aborted by hook: {reason}").into())
+        },
+    );
+
+    // DomDocument API
+    engine.register_get("title", |d: &mut DomDocument| -> String {
+        d.ctx.doc.borrow().title().to_owned()
+    });
+    engine.register_get("color_mode", |d: &mut DomDocument| -> String {
+        format!("{:?}", d.ctx.doc.borrow().color_mode())
+    });
+    engine.register_get("pages", |d: &mut DomDocument| -> rhai::Array {
+        let count = d.ctx.doc.borrow().pages().len();
+        (0..count)
+            .map(|page_idx| {
+                Dynamic::from(DomPage {
+                    ctx: d.ctx.clone(),
+                    page_idx,
+                })
+            })
+            .collect()
+    });
+    engine.register_get("active_page", |d: &mut DomDocument| -> DomPage {
+        let page_idx = d.ctx.doc.borrow().active_page_index();
+        DomPage {
+            ctx: d.ctx.clone(),
+            page_idx,
+        }
+    });
+    engine.register_get("styles", |d: &mut DomDocument| -> DomStyles {
+        DomStyles { ctx: d.ctx.clone() }
+    });
+    engine.register_get("selection", |d: &mut DomDocument| -> DomSelection {
+        DomSelection { ctx: d.ctx.clone() }
+    });
+    engine.register_fn(
+        "cql",
+        |d: &mut DomDocument, query: &str| -> Result<rhai::Array, Box<EvalAltResult>> {
+            let ids = evaluate_cql_query(&d.ctx.doc.borrow(), FindScope::WholeDocument, query)
+                .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+            Ok(ids
+                .into_iter()
+                .map(|oid| {
+                    Dynamic::from(DomShape {
+                        ctx: d.ctx.clone(),
+                        object_id: oid,
+                    })
+                })
+                .collect())
+        },
+    );
+    engine.register_fn("undo", |d: &mut DomDocument| -> bool {
+        let mut doc_mut = d.ctx.doc.borrow_mut();
+        if d.ctx.history.borrow_mut().undo(&mut doc_mut).is_ok() {
+            d.ctx.recorded_ops.borrow_mut().pop();
+            let mut cnt = d.ctx.ops_count.borrow_mut();
+            *cnt = cnt.saturating_sub(1);
+            d.ctx
+                .logs
+                .borrow_mut()
+                .push("dom.undo() reverted".to_owned());
+            true
+        } else {
+            false
+        }
+    });
+    engine.register_fn(
+        "export",
+        |d: &mut DomDocument, format: &str| -> Result<String, Box<EvalAltResult>> {
+            let doc_ref = d.ctx.doc.borrow();
+            match format.trim().to_ascii_lowercase().as_str() {
+                "svg" => {
+                    let svg = coree_io::svg::export_svg_to_string(&doc_ref, 0)
+                        .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                    Ok(svg)
+                }
+                "dxf" => {
+                    let plan = crate::laser_plugin::plan_laser_toolpath(
+                        &doc_ref,
+                        0,
+                        None,
+                        &crate::laser_plugin::LaserJobConfig::default(),
+                    )
+                    .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                    Ok(crate::laser_plugin::export_laser_dxf_r12(&plan))
+                }
+                "gcode" => {
+                    let cfg = crate::laser_plugin::LaserJobConfig::default();
+                    let plan = crate::laser_plugin::plan_laser_toolpath(&doc_ref, 0, None, &cfg)
+                        .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+                    Ok(crate::laser_plugin::export_laser_gcode(&plan, &cfg))
+                }
+                other => Err(format!("unsupported dom.export format '{other}'").into()),
+            }
+        },
+    );
+
+    // DomStyles API
+    engine.register_get("count", |s: &mut DomStyles| -> i64 {
+        s.ctx.doc.borrow().palettes().len() as i64
+    });
+    engine.register_fn("palette_names", |s: &mut DomStyles| -> rhai::Array {
+        s.ctx
+            .doc
+            .borrow()
+            .palettes()
+            .iter()
+            .map(|p| Dynamic::from(p.name.clone()))
+            .collect()
+    });
+
+    // DomSelection API
+    engine.register_get("count", |sel: &mut DomSelection| -> i64 {
+        sel.ctx.selection.borrow().len() as i64
+    });
+    engine.register_get("ids", |sel: &mut DomSelection| -> rhai::Array {
+        sel.ctx
+            .selection
+            .borrow()
+            .iter()
+            .map(|id| Dynamic::from(id.0 as i64))
+            .collect()
+    });
+    engine.register_get("shapes", |sel: &mut DomSelection| -> rhai::Array {
+        sel.ctx
+            .selection
+            .borrow()
+            .iter()
+            .map(|&oid| {
+                Dynamic::from(DomShape {
+                    ctx: sel.ctx.clone(),
+                    object_id: oid,
+                })
+            })
+            .collect()
+    });
+    engine.register_fn("clear", |sel: &mut DomSelection| {
+        sel.ctx.selection.borrow_mut().clear();
+    });
+    engine.register_fn("select", |sel: &mut DomSelection, ids: rhai::Array| {
+        *sel.ctx.selection.borrow_mut() = rhai_array_to_ids(ids);
+    });
+
+    // DomPage API
+    engine.register_get("index", |p: &mut DomPage| -> i64 { p.page_idx as i64 });
+    engine.register_get("name", |p: &mut DomPage| -> String {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map(|pg| pg.name.clone())
+            .unwrap_or_default()
+    });
+    engine.register_get("width_mm", |p: &mut DomPage| -> f64 {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map_or(0.0, |pg| pg.width_mm)
+    });
+    engine.register_get("height_mm", |p: &mut DomPage| -> f64 {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map_or(0.0, |pg| pg.height_mm)
+    });
+    engine.register_get("bleed_mm", |p: &mut DomPage| -> f64 {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map_or(0.0, |pg| pg.bleed_mm)
+    });
+    engine.register_get("layers", |p: &mut DomPage| -> rhai::Array {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map(|pg| {
+                pg.layers
+                    .iter()
+                    .map(|l| {
+                        Dynamic::from(DomLayer {
+                            ctx: p.ctx.clone(),
+                            page_idx: p.page_idx,
+                            layer_id: l.id,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let page_shapes_fn = |p: &mut DomPage| -> rhai::Array {
+        p.ctx
+            .doc
+            .borrow()
+            .page(p.page_idx)
+            .map(|pg| {
+                pg.layers
+                    .iter()
+                    .flat_map(|l| l.objects.iter())
+                    .map(|&oid| {
+                        Dynamic::from(DomShape {
+                            ctx: p.ctx.clone(),
+                            object_id: oid,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    engine.register_get("shapes", page_shapes_fn);
+    engine.register_get("objects", page_shapes_fn);
+
+    // DomLayer API
+    engine.register_get("id", |l: &mut DomLayer| -> i64 { l.layer_id.0 as i64 });
+    engine.register_get("name", |l: &mut DomLayer| -> String {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .map(|ly| ly.name.clone())
+            .unwrap_or_default()
+    });
+    engine.register_get("visible", |l: &mut DomLayer| -> bool {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .is_some_and(|ly| ly.visible)
+    });
+    engine.register_set(
+        "visible",
+        |l: &mut DomLayer, v: bool| -> Result<(), Box<EvalAltResult>> {
+            l.ctx.apply_op(CommandOp::SetLayerFlags {
+                layer_id: l.layer_id,
+                visible: Some(v),
+                locked: None,
+                printable: None,
+                is_cut_layer: None,
+            })
+        },
+    );
+    engine.register_get("locked", |l: &mut DomLayer| -> bool {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .is_some_and(|ly| ly.locked)
+    });
+    engine.register_set(
+        "locked",
+        |l: &mut DomLayer, v: bool| -> Result<(), Box<EvalAltResult>> {
+            l.ctx.apply_op(CommandOp::SetLayerFlags {
+                layer_id: l.layer_id,
+                visible: None,
+                locked: Some(v),
+                printable: None,
+                is_cut_layer: None,
+            })
+        },
+    );
+    engine.register_get("printable", |l: &mut DomLayer| -> bool {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .is_some_and(|ly| ly.printable)
+    });
+    engine.register_get("is_cut_layer", |l: &mut DomLayer| -> bool {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .is_some_and(|ly| ly.is_cut_layer)
+    });
+    let layer_shapes_fn = |l: &mut DomLayer| -> rhai::Array {
+        l.ctx
+            .doc
+            .borrow()
+            .page(l.page_idx)
+            .and_then(|pg| pg.layers.iter().find(|ly| ly.id == l.layer_id))
+            .map(|ly| {
+                ly.objects
+                    .iter()
+                    .map(|&oid| {
+                        Dynamic::from(DomShape {
+                            ctx: l.ctx.clone(),
+                            object_id: oid,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    engine.register_get("shapes", layer_shapes_fn);
+    engine.register_get("objects", layer_shapes_fn);
+
+    // DomShape API
+    engine.register_get("id", |s: &mut DomShape| -> i64 { s.object_id.0 as i64 });
+    engine.register_get("name", |s: &mut DomShape| -> String {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .map(|o| o.name.clone())
+            .unwrap_or_default()
+    });
+    engine.register_set(
+        "name",
+        |s: &mut DomShape, name: String| -> Result<(), Box<EvalAltResult>> {
+            s.ctx.apply_op(CommandOp::RenameObject {
+                id: s.object_id,
+                new_name: name,
+            })
+        },
+    );
+    let shape_type_fn = |s: &mut DomShape| -> String {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .map(|o| shape_type_label(&o.payload).to_owned())
+            .unwrap_or_default()
+    };
+    engine.register_get("type", shape_type_fn);
+    engine.register_get("kind", shape_type_fn);
+    engine.register_get("visible", |s: &mut DomShape| -> bool {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .is_some_and(|o| o.visible)
+    });
+    engine.register_set(
+        "visible",
+        |s: &mut DomShape, visible: bool| -> Result<(), Box<EvalAltResult>> {
+            s.ctx.apply_op(CommandOp::SetObjectVisibility {
+                ids: vec![s.object_id],
+                visible,
+            })
+        },
+    );
+    engine.register_get("locked", |s: &mut DomShape| -> bool {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .is_some_and(|o| o.locked)
+    });
+    engine.register_set(
+        "locked",
+        |s: &mut DomShape, locked: bool| -> Result<(), Box<EvalAltResult>> {
+            s.ctx.apply_op(CommandOp::SetObjectLocked {
+                ids: vec![s.object_id],
+                locked,
+            })
+        },
+    );
+    engine.register_get("x", |s: &mut DomShape| -> f64 {
+        s.ctx
+            .doc
+            .borrow()
+            .world_object_bounds(s.object_id)
+            .map_or(0.0, |b| b.min_x)
+    });
+    engine.register_get("y", |s: &mut DomShape| -> f64 {
+        s.ctx
+            .doc
+            .borrow()
+            .world_object_bounds(s.object_id)
+            .map_or(0.0, |b| b.min_y)
+    });
+    engine.register_get("width", |s: &mut DomShape| -> f64 {
+        s.ctx
+            .doc
+            .borrow()
+            .world_object_bounds(s.object_id)
+            .map_or(0.0, |b| b.width())
+    });
+    engine.register_get("height", |s: &mut DomShape| -> f64 {
+        s.ctx
+            .doc
+            .borrow()
+            .world_object_bounds(s.object_id)
+            .map_or(0.0, |b| b.height())
+    });
+    engine.register_get("fill_hex", |s: &mut DomShape| -> String {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .and_then(|o| match &o.fill {
+                Fill::Solid(c) => Some(c.to_hex_rgba()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    });
+    engine.register_set(
+        "fill_hex",
+        |s: &mut DomShape, hex: String| -> Result<(), Box<EvalAltResult>> {
+            let color = Color::from_hex(&hex)
+                .map_err(|e| -> Box<EvalAltResult> { e.to_string().into() })?;
+            s.ctx.apply_op(CommandOp::SetFill {
+                ids: vec![s.object_id],
+                fill: Fill::Solid(color),
+            })
+        },
+    );
+    engine.register_get("outline_mm", |s: &mut DomShape| -> f64 {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .map_or(0.0, |o| o.outline.effective_width_mm())
+    });
+    engine.register_set(
+        "outline_mm",
+        |s: &mut DomShape, w: Dynamic| -> Result<(), Box<EvalAltResult>> {
+            let width = dyn_to_f64(w, "outline_mm")?;
+            if !width.is_finite() || width < 0.0 {
+                return Err("outline_mm must be finite and >= 0".into());
+            }
+            s.ctx.apply_op(CommandOp::SetOutline {
+                ids: vec![s.object_id],
+                outline: OutlineStyle::solid(Color::KEY_BLACK, width),
+            })
+        },
+    );
+    engine.register_get("text", |s: &mut DomShape| -> String {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .and_then(|o| coree_core::extract_searchable_text(&o.payload))
+            .unwrap_or_default()
+    });
+    engine.register_set(
+        "text",
+        |s: &mut DomShape, new_text: String| -> Result<(), Box<EvalAltResult>> {
+            let maybe_payload =
+                s.ctx
+                    .doc
+                    .borrow()
+                    .object(s.object_id)
+                    .and_then(|o| match &o.payload {
+                        NodePayload::ArtisticText(at) => {
+                            let style =
+                                at.runs.first().map(|r| r.style.clone()).unwrap_or_default();
+                            Some(NodePayload::ArtisticText(ArtisticText::from_plain(
+                                new_text.clone(),
+                                style,
+                            )))
+                        }
+                        NodePayload::ParagraphText(pt) => {
+                            let mut next = pt.clone();
+                            if let Some(first) = next.runs.first_mut() {
+                                first.text = new_text.clone();
+                                next.runs.truncate(1);
+                            }
+                            Some(NodePayload::ParagraphText(next))
+                        }
+                        _ => None,
+                    });
+            if let Some(payload) = maybe_payload {
+                s.ctx.apply_op(CommandOp::EditText {
+                    id: s.object_id,
+                    payload,
+                })
+            } else {
+                Err("object is not editable text".into())
+            }
+        },
+    );
+    engine.register_get("children", |s: &mut DomShape| -> rhai::Array {
+        s.ctx
+            .doc
+            .borrow()
+            .object(s.object_id)
+            .map(|o| match &o.payload {
+                NodePayload::Group(kids) | NodePayload::PowerClip { contents: kids, .. } => kids
+                    .iter()
+                    .map(|&cid| {
+                        Dynamic::from(DomShape {
+                            ctx: s.ctx.clone(),
+                            object_id: cid,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
+    });
+    engine.register_fn(
+        "move_by",
+        |s: &mut DomShape, dx: Dynamic, dy: Dynamic| -> Result<(), Box<EvalAltResult>> {
+            let dxv = dyn_to_f64(dx, "dx")?;
+            let dyv = dyn_to_f64(dy, "dy")?;
+            if !dxv.is_finite() || !dyv.is_finite() {
+                return Err("move_by requires finite deltas".into());
+            }
+            s.ctx.apply_op(CommandOp::TransformObjects {
+                ids: vec![s.object_id],
+                affine: Affine2D::translate(dxv, dyv),
+            })
+        },
+    );
+    engine.register_fn(
+        "set_cmyk_fill",
+        |s: &mut DomShape,
+         c: Dynamic,
+         m: Dynamic,
+         y: Dynamic,
+         k: Dynamic|
+         -> Result<(), Box<EvalAltResult>> {
+            let cv = dyn_to_f64(c, "c")?;
+            let mv = dyn_to_f64(m, "m")?;
+            let yv = dyn_to_f64(y, "y")?;
+            let kv = dyn_to_f64(k, "k")?;
+            s.ctx.apply_op(CommandOp::SetFill {
+                ids: vec![s.object_id],
+                fill: Fill::Solid(Color::cmyk(cv as f32, mv as f32, yv as f32, kv as f32)),
+            })
+        },
+    );
+    engine.register_fn(
+        "convert_to_curves",
+        |s: &mut DomShape| -> Result<(), Box<EvalAltResult>> {
+            s.ctx
+                .apply_op(CommandOp::ConvertToCurves { id: s.object_id })
+        },
+    );
+    engine.register_fn(
+        "delete",
+        |s: &mut DomShape| -> Result<(), Box<EvalAltResult>> {
+            s.ctx.apply_op(CommandOp::DeleteObjects {
+                ids: vec![s.object_id],
+            })
+        },
+    );
+
+    DomDocument { ctx }
 }
 
 fn collect_locked_object_ids(doc: &Document) -> HashSet<ObjectId> {
@@ -1363,6 +2268,153 @@ fn map_fill_to_cmyk(fill: &mut Fill) -> usize {
         Fill::None | Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => {}
     }
     hits
+}
+
+fn map_lens_to_cmyk(lens: &mut coree_core::LensConfig) -> usize {
+    let mut hits = 0usize;
+    match &mut lens.kind {
+        LensKind::TintedGrayscale { tint } => {
+            if convert_color_to_cmyk(tint) {
+                hits += 1;
+            }
+        }
+        LensKind::ColorAdd { color, .. }
+        | LensKind::ColorLimit { color, .. }
+        | LensKind::Transparency { color, .. } => {
+            if convert_color_to_cmyk(color) {
+                hits += 1;
+            }
+        }
+        LensKind::CustomColorMap {
+            from_color,
+            to_color,
+            ..
+        } => {
+            if convert_color_to_cmyk(from_color) {
+                hits += 1;
+            }
+            if convert_color_to_cmyk(to_color) {
+                hits += 1;
+            }
+        }
+        LensKind::Wireframe {
+            override_outline,
+            override_fill,
+        } => {
+            if let Some(c) = override_outline {
+                if convert_color_to_cmyk(c) {
+                    hits += 1;
+                }
+            }
+            if let Some(c) = override_fill {
+                if convert_color_to_cmyk(c) {
+                    hits += 1;
+                }
+            }
+        }
+        _ => {}
+    }
+    hits
+}
+
+fn map_effect_to_cmyk(eff: &mut Effect) -> usize {
+    let mut hits = 0usize;
+    match eff {
+        Effect::DropShadow { color, .. }
+        | Effect::InnerShadow { color, .. }
+        | Effect::BlockShadow { color, .. } => {
+            if convert_color_to_cmyk(color) {
+                hits += 1;
+            }
+        }
+        Effect::Contour {
+            fill_color,
+            outline_color,
+            ..
+        } => {
+            if convert_color_to_cmyk(fill_color) {
+                hits += 1;
+            }
+            if convert_color_to_cmyk(outline_color) {
+                hits += 1;
+            }
+        }
+        Effect::Bevel {
+            highlight_color,
+            shadow_color,
+            ..
+        } => {
+            if convert_color_to_cmyk(highlight_color) {
+                hits += 1;
+            }
+            if convert_color_to_cmyk(shadow_color) {
+                hits += 1;
+            }
+        }
+        Effect::Extrude25D { shade_color, .. } | Effect::Extrude3D { shade_color, .. } => {
+            if convert_color_to_cmyk(shade_color) {
+                hits += 1;
+            }
+        }
+        _ => {}
+    }
+    hits
+}
+
+fn map_scene_object_fields_to_cmyk(obj: &mut coree_core::SceneObject) -> usize {
+    let mut converted = map_fill_to_cmyk(&mut obj.fill);
+    if obj.outline.is_visible() && convert_color_to_cmyk(&mut obj.outline.color) {
+        converted += 1;
+    }
+    match &mut obj.payload {
+        NodePayload::ArtisticText(t) => {
+            for r in &mut t.runs {
+                if convert_color_to_cmyk(&mut r.style.fill) {
+                    converted += 1;
+                }
+            }
+        }
+        NodePayload::ParagraphText(t) => {
+            for r in &mut t.runs {
+                if convert_color_to_cmyk(&mut r.style.fill) {
+                    converted += 1;
+                }
+            }
+        }
+        NodePayload::TextOnPath(top) => {
+            for r in &mut top.text.runs {
+                if convert_color_to_cmyk(&mut r.style.fill) {
+                    converted += 1;
+                }
+            }
+        }
+        NodePayload::Table(table) => {
+            for cell in &mut table.cells {
+                converted += map_fill_to_cmyk(&mut cell.fill);
+                if convert_color_to_cmyk(&mut cell.text_style.fill) {
+                    converted += 1;
+                }
+            }
+            if table.border_style.is_visible()
+                && convert_color_to_cmyk(&mut table.border_style.color)
+            {
+                converted += 1;
+            }
+        }
+        NodePayload::Dimension(dim) => {
+            if convert_color_to_cmyk(&mut dim.text_style.fill) {
+                converted += 1;
+            }
+        }
+        _ => {}
+    }
+    if let Some(lens) = &mut obj.lens {
+        converted += map_lens_to_cmyk(lens);
+    }
+    for eff in &mut obj.effects {
+        converted += map_effect_to_cmyk(eff);
+    }
+    converted
 }
 
 fn convert_color_to_cmyk(color: &mut Color) -> bool {
@@ -1862,5 +2914,310 @@ mod tests {
         let mut replayed = init_doc;
         CommandHistory::replay_log(&mut replayed, &hist.command_log()).unwrap();
         assert_eq!(replayed.objects(), post_doc.objects());
+    }
+
+    #[test]
+    fn rhai_hierarchical_scene_dom_traverses_and_mutates() {
+        let mut doc = Document::new_a4("DOM Test");
+        let id = doc
+            .add_object(
+                rect_obj(10.0, 20.0, 30.0, 40.0, Color::rgb(1.0, 0.0, 0.0)),
+                None,
+            )
+            .unwrap();
+        let script = r#"
+            let p = doc.pages[0];
+            let l = p.layers[0];
+            let count = l.shapes.len();
+            let s = p.shapes[0];
+            s.name = "RenamedByDom";
+            s.move_by(5.0, 10.0);
+            s.set_cmyk_fill(0.0, 1.0, 1.0, 0.0);
+            let hits = doc.cql("@name == 'RenamedByDom'");
+            log("count=" + count + ",hits=" + hits.len());
+        "#;
+        let res = run_macro(
+            &mut doc,
+            script,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap();
+        assert!(res.logs.iter().any(|l| l == "count=1,hits=1"));
+        assert_eq!(doc.object(id).unwrap().name, "RenamedByDom");
+        let bb = doc.object_bounds(id).unwrap();
+        assert!((bb.min_x - 15.0).abs() < 1e-4);
+        assert!((bb.min_y - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn on_before_export_hook_can_inspect_modify_and_abort() {
+        let mut doc = Document::new_a4("Hook Test");
+        doc.add_object(
+            rect_obj(10.0, 10.0, 20.0, 20.0, Color::rgb(0.2, 0.4, 0.8)),
+            None,
+        )
+        .unwrap();
+
+        let (res, ops) = run_macro_event_hook(
+            &mut doc,
+            MacroEventHook::OnBeforeExport,
+            r#"
+                if hook_event == "on_before_export" {
+                    recolor_all_to_cmyk();
+                    log("hooked:" + doc.title);
+                }
+            "#,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap();
+        assert!(!ops.is_empty());
+        assert!(res.logs.iter().any(|l| l == "hooked:Hook Test"));
+
+        // Abort export hook leaves document untouched
+        let err = run_macro_event_hook(
+            &mut doc,
+            MacroEventHook::OnBeforeExport,
+            r#"cancel_export("missing bleed");"#,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing bleed"));
+    }
+
+    #[test]
+    fn recolor_cmyk_converts_effects_and_lens_losslessly() {
+        use coree_core::{FeatherDirection, LensConfig};
+
+        let mut doc = Document::new_a4("EffectLensCmyk");
+        let mut obj =
+            rect_obj(10.0, 10.0, 25.0, 25.0, Color::CYAN).with_outline(OutlineStyle::none());
+        obj.lens = Some(LensConfig::new(LensKind::TintedGrayscale {
+            tint: Color::rgb(0.8, 0.2, 0.1),
+        }));
+        obj.effects.push(Effect::DropShadow {
+            dx_mm: 2.0,
+            dy_mm: 2.0,
+            blur_mm: 3.0,
+            opacity: 0.7,
+            color: Color::rgb(0.1, 0.2, 0.9),
+            feather_direction: FeatherDirection::Outside,
+        });
+        let id = doc.add_object(obj, None).unwrap();
+
+        run_macro(
+            &mut doc,
+            find_builtin_macro("recolor-cmyk").unwrap().script,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap();
+
+        let updated = doc.object(id).unwrap();
+        if let Some(lens) = &updated.lens {
+            match &lens.kind {
+                LensKind::TintedGrayscale { tint } => {
+                    assert!(matches!(tint, Color::Cmyk { .. }));
+                }
+                other => panic!("unexpected lens {other:?}"),
+            }
+        } else {
+            panic!("expected lens");
+        }
+        match updated.effects.last() {
+            Some(Effect::DropShadow { color, .. }) => {
+                assert!(matches!(color, Color::Cmyk { .. }));
+            }
+            other => panic!("expected DropShadow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dom_undo_reverts_document_and_keeps_plan_macro_ops_in_sync() {
+        let mut doc = Document::new_a4("UndoDomTest");
+        let id = doc
+            .add_object(
+                rect_obj(
+                    10.0,
+                    10.0,
+                    20.0,
+                    20.0,
+                    Color::from_hex("#e61a1aff").unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+        let script = r##"
+            let s = doc.pages[0].layers[0].shapes[0];
+            let before = s.fill_hex;
+            s.fill_hex = "#112233";
+            let mid = doc.pages[0].layers[0].shapes[0].fill_hex;
+            let ok = doc.undo();
+            let after = doc.pages[0].layers[0].shapes[0].fill_hex;
+            log(before + "|" + mid + "|" + ok + "|" + after);
+        "##;
+        let (exec, ops) = plan_macro_ops(
+            &doc,
+            script,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            ops.is_empty(),
+            "plan_macro_ops must emit 0 ops after doc.undo()"
+        );
+        assert_eq!(exec.commands_executed, 0);
+        assert!(
+            exec.logs
+                .iter()
+                .any(|l| l == "#e61a1aff|#112233ff|true|#e61a1aff"),
+            "unexpected logs: {:?}",
+            exec.logs
+        );
+
+        let mut live_doc = doc.clone();
+        run_macro(
+            &mut live_doc,
+            script,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            live_doc.object(id).unwrap().fill,
+            doc.object(id).unwrap().fill
+        );
+    }
+
+    #[test]
+    fn recolor_cmyk_converts_symbol_defs_and_inner_bevel_extrude3d_effects() {
+        use coree_core::{BevelStyle, ColorMode, ExtrudeLight, FeatherDirection, SymbolDef};
+
+        let mut doc = Document::new("SymCmyk", 100.0, 100.0, ColorMode::Cmyk, 300.0);
+        let sym_rect = SceneObject::new(
+            ObjectId(901),
+            "SymRgbRect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 20.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgb(0.9, 0.1, 0.1)))
+        .with_outline(OutlineStyle::none());
+        let sym = SymbolDef::new("RgbSym", vec![sym_rect]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id)),
+            None,
+        )
+        .unwrap();
+
+        let mut fx_obj =
+            rect_obj(30.0, 30.0, 20.0, 20.0, Color::CYAN).with_outline(OutlineStyle::none());
+        fx_obj.effects.push(Effect::InnerShadow {
+            dx_mm: 1.0,
+            dy_mm: 1.0,
+            blur_mm: 2.0,
+            opacity: 0.6,
+            color: Color::rgb(0.8, 0.1, 0.1),
+            feather_direction: FeatherDirection::Inside,
+        });
+        fx_obj.effects.push(Effect::Bevel {
+            style: BevelStyle::SoftEdge,
+            distance_mm: 2.0,
+            softness_mm: 1.0,
+            light_angle_deg: 45.0,
+            altitude_deg: 30.0,
+            highlight_color: Color::rgb(1.0, 0.9, 0.8),
+            shadow_color: Color::rgb(0.1, 0.1, 0.2),
+            intensity: 0.7,
+        });
+        fx_obj.effects.push(Effect::Extrude3D {
+            vanishing_point: Point2D::new(80.0, 80.0),
+            depth: 10.0,
+            bevel_depth: 1.0,
+            shade_color: Color::rgb(0.2, 0.3, 0.4),
+            rotation_3d: [0.0; 3],
+            lights: vec![ExtrudeLight {
+                dir: [0.0, 0.0, 1.0],
+                intensity: 1.0,
+            }],
+        });
+        let fx_id = doc.add_object(fx_obj, None).unwrap();
+
+        let cfg = MacroSandboxConfig::default();
+        let (_exec, ops) = plan_macro_ops(
+            &doc,
+            find_builtin_macro("recolor-cmyk").unwrap().script,
+            &BTreeMap::new(),
+            &cfg,
+        )
+        .unwrap();
+        let mut hist = CommandHistory::default();
+        hist.execute(&mut doc, CommandOp::Batch(ops)).unwrap();
+
+        let preflight =
+            crate::preflight::run_preflight(&doc, &crate::preflight::PreflightRules::default());
+        assert!(
+            !preflight
+                .issues
+                .iter()
+                .any(|i| i.kind == crate::preflight::PreflightIssueKind::RgbInCmykDocument),
+            "Expected 0 RgbInCmykDocument issues after recolor-cmyk, got: {:?}",
+            preflight.issues
+        );
+        for eff in &doc.object(fx_id).unwrap().effects {
+            match eff {
+                Effect::InnerShadow { color, .. } => assert!(matches!(color, Color::Cmyk { .. })),
+                Effect::Bevel {
+                    highlight_color,
+                    shadow_color,
+                    ..
+                } => {
+                    assert!(matches!(highlight_color, Color::Cmyk { .. }));
+                    assert!(matches!(shadow_color, Color::Cmyk { .. }));
+                }
+                Effect::Extrude3D { shade_color, .. } => {
+                    assert!(matches!(shade_color, Color::Cmyk { .. }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn selection_seeded_macro_and_event_hook_expose_doc_selection() {
+        let mut doc = Document::new_a4("SelMacro");
+        let id1 = doc
+            .add_object(rect_obj(10.0, 10.0, 20.0, 20.0, Color::CYAN), None)
+            .unwrap();
+        let _id2 = doc
+            .add_object(rect_obj(40.0, 10.0, 20.0, 20.0, Color::MAGENTA), None)
+            .unwrap();
+
+        let (res, ops) = run_macro_event_hook_with_selection(
+            &mut doc,
+            MacroEventHook::OnSelectionChange,
+            r#"
+                log("cnt=" + doc.selection.count + "|ids=" + doc.selection.ids.len());
+                for sh in doc.selection.shapes {
+                    sh.name = "Selected_" + sh.id;
+                }
+            "#,
+            &BTreeMap::new(),
+            &MacroSandboxConfig::default(),
+            &[id1],
+        )
+        .unwrap();
+        assert!(res.logs.iter().any(|l| l == "cnt=1|ids=1"));
+        assert!(!ops.is_empty());
+        assert_eq!(doc.object(id1).unwrap().name, format!("Selected_{}", id1.0));
     }
 }

@@ -12,8 +12,8 @@ use crate::theme::{core_color_to_egui, egui_color_to_core, ThemeTokens, PROPERTY
 use coree_core::{
     Affine2D, AlignOp, ArtisticMediaStyle, ArtisticWidthProfile, BasicShapeKind, BlendMode,
     BooleanOp, CommandOp, ContourMode, CornerStyle, DistortKind, EllipseMode, EnvelopeMode, Fill,
-    GradientStop, ImpactStyle, NodePayload, ParametricShape, Point2D, Rect2D, TextAlign,
-    TextDirection, Unit, ZOrderOp,
+    GradientStop, ImpactStyle, NodePayload, ParametricShape, Point2D, RasterMaskMode, Rect2D,
+    TextAlign, TextDirection, Unit, ZOrderOp,
 };
 use coree_render::{ToneRange, ViewMode};
 use egui::{
@@ -739,26 +739,76 @@ fn show_raster_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeToke
             }
         });
 
-    if app.active_tool == ToolId::MaskSelect
-        || app
-            .active_tab()
-            .is_some_and(|t| t.raster_mask_rect_mm.is_some())
-    {
+    let has_mask = app
+        .active_tab()
+        .is_some_and(|t| t.raster_mask.is_some() || t.raster_mask_rect_mm.is_some());
+    if app.active_tool == ToolId::MaskSelect || has_mask {
         ui.separator();
+        ComboBox::from_id_salt("prop_mask_mode")
+            .width(100.0)
+            .selected_text(app.tool_settings.mask_mode.label())
+            .show_ui(ui, |ui| {
+                for m in [
+                    RasterMaskMode::Rectangle,
+                    RasterMaskMode::Ellipse,
+                    RasterMaskMode::Lasso,
+                    RasterMaskMode::MagicWand,
+                ] {
+                    ui.selectable_value(&mut app.tool_settings.mask_mode, m, m.label());
+                }
+            });
+        let feather_changed = ui
+            .add(
+                DragValue::new(&mut app.tool_settings.mask_feather_px)
+                    .range(0.0..=32.0)
+                    .speed(0.2)
+                    .prefix("Feather: ")
+                    .suffix("px"),
+            )
+            .changed();
+        if app.tool_settings.mask_mode == RasterMaskMode::MagicWand {
+            ui.add(
+                DragValue::new(&mut app.tool_settings.magic_wand_tolerance)
+                    .range(1.0..=150.0)
+                    .prefix("Tol: "),
+            );
+            ui.checkbox(&mut app.tool_settings.magic_wand_contiguous, "Contig");
+        }
+        let inv_changed = ui
+            .checkbox(&mut app.tool_settings.mask_inverted, "Invert")
+            .changed();
+        if feather_changed || inv_changed {
+            let fpx = app.tool_settings.mask_feather_px.max(0.0);
+            let inv = app.tool_settings.mask_inverted;
+            if let Some(tab) = app.active_tab_mut() {
+                if let Some(ref mut sel) = tab.raster_mask {
+                    sel.feather_px = fpx;
+                    sel.inverted = inv;
+                }
+            }
+        }
         if let Some(mask) = app.active_tab().and_then(|t| t.raster_mask_rect_mm) {
             ui.label(
                 RichText::new(format!("Mask: {:.1}×{:.1} mm", mask.width(), mask.height()))
                     .size(11.0)
                     .color(tokens.text_muted),
             );
+        }
+        if has_mask {
+            if ui.small_button("Cutout Lab").clicked() {
+                app.run_cutout_lab_active();
+            }
             if ui.small_button("Clear Mask").clicked() {
                 if let Some(tab) = app.active_tab_mut() {
+                    tab.raster_mask = None;
                     tab.raster_mask_rect_mm = None;
+                    tab.tool_core.raster_mask_rect_mm = None;
+                    tab.needs_rerender = true;
                 }
             }
         } else {
             ui.label(
-                RichText::new("Drag on canvas to define pixel selection mask")
+                RichText::new("Drag or click on canvas to define pixel selection mask")
                     .size(11.0)
                     .color(tokens.text_muted),
             );

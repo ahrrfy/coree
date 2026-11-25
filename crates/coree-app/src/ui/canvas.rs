@@ -14,7 +14,8 @@ use crate::state::{
 use crate::theme::{core_color_to_egui, PAGE_TABS_HEIGHT, RULER_THICKNESS, STATUS_BAR_HEIGHT};
 use coree_core::{
     Affine2D, BooleanOp, Color, CommandOp, Effect, Fill, GradientStop, GuideOrientation, NodeKind,
-    NodePayload, NodeRef, Point2D, Rect2D, TransformMode, TransparencyMode, ZOrderOp,
+    NodePayload, NodeRef, Point2D, RasterMaskShape, Rect2D, TransformMode, TransparencyMode,
+    ZOrderOp,
 };
 use coree_prod::{simulate_overprint_rgba, LaserOperationKind};
 use coree_tools::{
@@ -2325,8 +2326,63 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
         );
     }
 
-    // 6. Active Bitmap Mask Selection Rectangle (`MaskSelect`)
-    if let Some(mrect) = tab.raster_mask_rect_mm {
+    // 6. Active Bitmap Mask Selection Overlay (`MaskSelect` — Rect, Ellipse, Lasso, Magic Wand)
+    if let Some(ref mask) = tab.raster_mask {
+        let stroke = Stroke::new(1.4, Color32::WHITE);
+        match &mask.shape {
+            RasterMaskShape::Rectangle(mrect) => {
+                let a = world_to_screen(canvas_rect, tab, mrect.min());
+                let b = world_to_screen(canvas_rect, tab, mrect.max());
+                let r = Rect::from_two_pos(a, b);
+                paint_dashed_line(&painter, r.left_top(), r.right_top(), 5.0, 4.0, stroke);
+                paint_dashed_line(&painter, r.right_top(), r.right_bottom(), 5.0, 4.0, stroke);
+                paint_dashed_line(
+                    &painter,
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    5.0,
+                    4.0,
+                    stroke,
+                );
+                paint_dashed_line(&painter, r.left_bottom(), r.left_top(), 5.0, 4.0, stroke);
+            }
+            RasterMaskShape::Ellipse(mrect) => {
+                let c = mrect.center();
+                let rx = mrect.width() * 0.5;
+                let ry = mrect.height() * 0.5;
+                let steps = 36usize;
+                for i in 0..steps {
+                    let t0 = (i as f64 / steps as f64) * std::f64::consts::TAU;
+                    let t1 = ((i + 1) as f64 / steps as f64) * std::f64::consts::TAU;
+                    let p0 = world_to_screen(
+                        canvas_rect,
+                        tab,
+                        Point2D::new(c.x + rx * t0.cos(), c.y + ry * t0.sin()),
+                    );
+                    let p1 = world_to_screen(
+                        canvas_rect,
+                        tab,
+                        Point2D::new(c.x + rx * t1.cos(), c.y + ry * t1.sin()),
+                    );
+                    paint_dashed_line(&painter, p0, p1, 4.0, 3.0, stroke);
+                }
+            }
+            RasterMaskShape::Lasso(pts) if pts.len() >= 2 => {
+                for i in 0..pts.len() {
+                    let p0 = world_to_screen(canvas_rect, tab, pts[i]);
+                    let p1 = world_to_screen(canvas_rect, tab, pts[(i + 1) % pts.len()]);
+                    paint_dashed_line(&painter, p0, p1, 4.0, 3.0, stroke);
+                }
+            }
+            RasterMaskShape::MagicWand { seed_mm, .. } => {
+                let sp = world_to_screen(canvas_rect, tab, *seed_mm);
+                painter.circle_stroke(sp, 6.0, stroke);
+                painter.line_segment([pos2(sp.x - 8.0, sp.y), pos2(sp.x + 8.0, sp.y)], stroke);
+                painter.line_segment([pos2(sp.x, sp.y - 8.0), pos2(sp.x, sp.y + 8.0)], stroke);
+            }
+            _ => {}
+        }
+    } else if let Some(mrect) = tab.raster_mask_rect_mm {
         let a = world_to_screen(canvas_rect, tab, mrect.min());
         let b = world_to_screen(canvas_rect, tab, mrect.max());
         let r = Rect::from_two_pos(a, b);

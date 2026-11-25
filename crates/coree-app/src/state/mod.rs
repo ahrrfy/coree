@@ -25,29 +25,34 @@ use coree_core::{
     DocumentInvalidation, Effect, EllipseMode, EnvelopeMode, FeatherDirection, Fill,
     GuideOrientation, ImageAssetId, ImpactStyle, LayerId, LensConfig, LensKind, MasterLayerScope,
     NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape, PathNode,
-    Point2D, PressureCurve, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent,
-    SceneObject, SelectionState, SnapEngine, StylusSample, Subpath, SymbolId, TextOnPath,
-    TextStyle, TransparencyMode, Unit, Vec2D, VectorTable, ZOrderOp,
+    Point2D, PressureCurve, RasterAsset, RasterFilter, RasterLayerData, RasterMaskMode,
+    RasterMaskSelection, RasterMaskShape, Rect2D, RenderingIntent, SceneObject, SelectionState,
+    SnapEngine, StylusSample, Subpath, SymbolId, TextOnPath, TextStyle, TransparencyMode, Unit,
+    Vec2D, VectorTable, ZOrderOp,
 };
 use coree_io::import_palette_file;
 use coree_prod::{
-    add_barcode_to_document, add_qr_code_to_document, apply_print_merge, builtin_macros,
-    collect_for_output, compute_production_metrics, compute_separations_with_text_outliner,
-    detect_executable, evaluate_cql_query, export_for_plugin, find_objects, generate_cut_contour,
-    generate_dieline, generate_print_marks, impose_document, launch_external_bridge,
-    plan_laser_toolpath, plan_macro_ops, plan_recorded_macro_ops, run_preflight, BarcodeOptions,
-    BarcodeSymbology, CollectOptions, DielineKind, FindQuery, FindReplaceReport, FindScope,
-    ImpositionMode, LaserJobConfig, LaserToolpathPlan, LensKindFilter, MacroSandboxConfig,
-    ObjectKindFilter, PluginExportOutcome, PluginKind, PluginRegistry, PreflightReport,
-    PreflightRules, PrintMarksOptions, PrintMergeOptions, PrintMergeTable, ProductionMetrics,
-    QrCodeOptions, QrErrorCorrection, ReplaceAction, SeparationOptions, SeparationResult,
-    TextMatchMode,
+    add_barcode_to_document, add_qr_code_to_document, apply_print_merge, apply_trapping,
+    builtin_macros, collect_for_output, compute_production_metrics,
+    compute_separations_with_text_outliner, detect_executable, evaluate_cql_query,
+    export_for_plugin, export_separated_plates_pdf, find_objects, frame_open_laser_protocol,
+    generate_cut_contour, generate_dieline, generate_halftone_preview, generate_print_marks,
+    impose_document, launch_external_bridge, plan_laser_toolpath, plan_macro_ops_with_selection,
+    plan_recorded_macro_ops, run_macro_event_hook_with_selection, run_preflight, BarcodeOptions,
+    BarcodeSymbology, Code128Mode, CollectOptions, DielineKind, FefcoCode, FindQuery,
+    FindReplaceReport, FindScope, FluteType, HalftoneDotShape, HalftoneSettings, ImpositionMode,
+    LaserJobConfig, LaserToolpathPlan, LensKindFilter, MacroEventHook, MacroSandboxConfig,
+    ObjectKindFilter, OpenLaserProtocol, PluginExportOutcome, PluginKind, PluginRegistry,
+    PreflightReport, PreflightRules, PrintMarksOptions, PrintMergeOptions, PrintMergeTable,
+    ProductionMetrics, QrCodeOptions, QrErrorCorrection, ReplaceAction, SeparationOptions,
+    SeparationResult, TextMatchMode, TrapPlacement, TrappingSettings,
 };
 use coree_render::{
-    apply_dodge_burn_stroke_stylus, apply_healing_stroke_stylus, clone_stamp_stroke_stylus,
-    compute_page_layouts, convert_object_to_bitmap_with_bounds, create_smart_fill_object,
-    erase_stroke_stylus, hit_test_point, lower_effects_to_primitives, paint_brush_stroke_stylus,
-    raster_flood_fill, smudge_stroke_stylus, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode,
+    apply_dodge_burn_stroke_stylus_masked, apply_healing_stroke_stylus_masked,
+    clone_stamp_stroke_stylus_masked, compute_page_layouts, convert_object_to_bitmap_with_bounds,
+    create_smart_fill_object, cutout_lab, erase_stroke_stylus_masked, hit_test_point,
+    lower_effects_to_primitives, paint_brush_stroke_stylus, raster_flood_fill_masked,
+    smudge_stroke_stylus_masked, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode,
     DynamicGuideLine, GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer,
     SnapOptions, StylusPoint, TextEngine, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
 };
@@ -193,6 +198,8 @@ pub struct StudioApp {
     pub find_replace_state: FindReplaceState,
     pub font_manager_state: FontManagerState,
     pub macro_state: MacroDockerState,
+    pub macro_hooks: Vec<(MacroEventHook, String)>,
+    pub macro_hook_in_flight: bool,
     pub new_doc_dialog: NewDocDialogState,
     pub export_dialog: ExportDialogState,
     pub command_palette: CommandPaletteState,
@@ -474,6 +481,8 @@ impl StudioApp {
             find_replace_state: FindReplaceState::default(),
             font_manager_state: FontManagerState::default(),
             macro_state: MacroDockerState::default(),
+            macro_hooks: Vec::new(),
+            macro_hook_in_flight: false,
             new_doc_dialog: NewDocDialogState::default(),
             export_dialog: ExportDialogState::default(),
             command_palette: CommandPaletteState::default(),
@@ -621,6 +630,7 @@ impl StudioApp {
                 false,
             );
         }
+        let _ = self.fire_macro_hook(MacroEventHook::OnOpen);
         Ok(())
     }
 
@@ -762,12 +772,78 @@ impl StudioApp {
         Ok(())
     }
 
+    /// Registers a Rhai lifecycle hook (`OnOpen`, `OnBeforeExport`, `OnSelectionChange`).
+    pub fn register_macro_hook(&mut self, hook: MacroEventHook, script: impl Into<String>) {
+        self.macro_hooks.push((hook, script.into()));
+    }
+
+    /// Executes all registered Rhai scripts matching `hook` on the active document via `CommandHistory`.
+    pub fn fire_macro_hook(&mut self, hook: MacroEventHook) -> Result<(), String> {
+        if self.macro_hook_in_flight {
+            return Ok(());
+        }
+        let scripts: Vec<String> = self
+            .macro_hooks
+            .iter()
+            .filter(|(h, _)| *h == hook)
+            .map(|(_, s)| s.clone())
+            .collect();
+        if scripts.is_empty() {
+            return Ok(());
+        }
+        self.macro_hook_in_flight = true;
+        let result = (|| -> Result<(), String> {
+            let mut ops_to_apply: Vec<CommandOp> = Vec::new();
+            {
+                let Some(tab) = self.tabs.get(self.active_tab) else {
+                    return Ok(());
+                };
+                let mut preview_doc = tab.document.clone();
+                let active_sel = tab.selection.objects.clone();
+                let sandbox = MacroSandboxConfig::default();
+                for script in &scripts {
+                    let (_res, ops) = run_macro_event_hook_with_selection(
+                        &mut preview_doc,
+                        hook,
+                        script,
+                        &BTreeMap::new(),
+                        &sandbox,
+                        &active_sel,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    ops_to_apply.extend(ops);
+                }
+            }
+            if !ops_to_apply.is_empty() {
+                self.execute_command(CommandOp::Batch(ops_to_apply))?;
+            }
+            Ok(())
+        })();
+        self.macro_hook_in_flight = false;
+        result
+    }
+
+    /// Fires [`MacroEventHook::OnSelectionChange`] if any hooks are registered and active selection changed.
+    pub(crate) fn maybe_fire_selection_change(&mut self, before_ids: &[ObjectId]) {
+        if self.macro_hooks.is_empty() || self.macro_hook_in_flight {
+            return;
+        }
+        let changed = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|t| t.selection.objects.as_slice() != before_ids);
+        if changed {
+            let _ = self.fire_macro_hook(MacroEventHook::OnSelectionChange);
+        }
+    }
+
     /// Exports the active document using explicit [`UniversalExportOptions`].
     pub fn export_active(
         &mut self,
         output_path: &Path,
         opts: &UniversalExportOptions,
     ) -> Result<String, String> {
+        self.fire_macro_hook(MacroEventHook::OnBeforeExport)?;
         let doc = self
             .active_tab()
             .ok_or_else(|| "no active document".to_owned())?
@@ -780,6 +856,10 @@ impl StudioApp {
 
     /// Exports the active document asynchronously on `JobPool` so the GUI stays at 60fps.
     pub fn export_active_async(&mut self, output_path: PathBuf, opts: UniversalExportOptions) {
+        if let Err(err) = self.fire_macro_hook(MacroEventHook::OnBeforeExport) {
+            self.push_toast(err, true);
+            return;
+        }
         let Some(doc) = self.active_tab().map(|t| t.document.clone()) else {
             return;
         };
@@ -1148,6 +1228,87 @@ impl StudioApp {
                         }
                         Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
                     },
+                    "app.get_selection" => {
+                        let ids: Vec<u64> = self
+                            .active_tab()
+                            .map(|t| t.selection.objects.iter().map(|oid| oid.0).collect())
+                            .unwrap_or_default();
+                        JsonRpcResponse::ok(id, serde_json::json!({ "selected_ids": ids }))
+                    }
+                    "app.set_selection" => {
+                        let raw_ids = req
+                            .params
+                            .get("ids")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let ids: Vec<ObjectId> = raw_ids
+                            .iter()
+                            .filter_map(serde_json::Value::as_u64)
+                            .map(ObjectId)
+                            .collect();
+                        let applied_ids: Vec<u64> =
+                            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                                tab.selection.select_many(&tab.document, &ids);
+                                tab.selection.objects.iter().map(|oid| oid.0).collect()
+                            } else {
+                                Vec::new()
+                            };
+                        let _ = self.fire_macro_hook(MacroEventHook::OnSelectionChange);
+                        JsonRpcResponse::ok(id, serde_json::json!({ "selected_ids": applied_ids }))
+                    }
+                    "scene.run_macro" => {
+                        let script = req
+                            .params
+                            .get("script")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if script.trim().is_empty() {
+                            JsonRpcResponse::err(
+                                id,
+                                JSONRPC_INVALID_PARAMS,
+                                "missing params.script",
+                            )
+                        } else if let Some(tab) = self.tabs.get(self.active_tab) {
+                            let sandbox = MacroSandboxConfig::default();
+                            match plan_macro_ops_with_selection(
+                                &tab.document,
+                                script,
+                                &BTreeMap::new(),
+                                &sandbox,
+                                &tab.selection.objects,
+                            ) {
+                                Ok((res, ops)) => {
+                                    let apply_res = if ops.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        self.execute_command(CommandOp::Batch(ops))
+                                    };
+                                    match apply_res {
+                                        Ok(()) => {
+                                            let obj_count = self
+                                                .active_tab()
+                                                .map_or(0, |t| t.document.objects().len());
+                                            JsonRpcResponse::ok(
+                                                id,
+                                                serde_json::json!({
+                                                    "commands_executed": res.commands_executed,
+                                                    "logs": res.logs,
+                                                    "object_count": obj_count,
+                                                }),
+                                            )
+                                        }
+                                        Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                                    }
+                                }
+                                Err(e) => {
+                                    JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e.to_string())
+                                }
+                            }
+                        } else {
+                            JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, "no active document tab")
+                        }
+                    }
                     _ => match self.tabs.get_mut(self.active_tab) {
                         Some(tab) => {
                             dispatch_jsonrpc_on_session(&req, &mut tab.document, &mut tab.history)
@@ -1875,12 +2036,21 @@ impl StudioApp {
                         return;
                     }
                     if has_create && !has_explicit_select {
+                        let before_sel = self
+                            .active_tab()
+                            .map(|t| t.selection.objects.clone())
+                            .unwrap_or_default();
+                        let mut updated = false;
                         if let Some(tab) = self.active_tab_mut() {
                             if let Some(created_id) = tab.document.objects().keys().last().copied()
                             {
                                 tab.selection.select_single(&tab.document, created_id);
                                 tab.metrics_dirty = true;
+                                updated = true;
                             }
+                        }
+                        if updated {
+                            self.maybe_fire_selection_change(&before_sel);
                         }
                     }
                 }
@@ -1916,6 +2086,10 @@ impl StudioApp {
                 toggle,
             } => {
                 let active_tool = self.active_tool;
+                let before_sel = self
+                    .active_tab()
+                    .map(|t| t.selection.objects.clone())
+                    .unwrap_or_default();
                 if let Some(tab) = self.active_tab_mut() {
                     if ids.is_empty() {
                         if !additive && !toggle {
@@ -1943,13 +2117,19 @@ impl StudioApp {
                     tab.metrics_dirty = true;
                     tab.last_duplicate_batch = None;
                 }
+                self.maybe_fire_selection_change(&before_sel);
             }
             ToolActionRequest::ClearSelection => {
+                let before_sel = self
+                    .active_tab()
+                    .map(|t| t.selection.objects.clone())
+                    .unwrap_or_default();
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selection.clear();
                     tab.metrics_dirty = true;
                     tab.last_duplicate_batch = None;
                 }
+                self.maybe_fire_selection_change(&before_sel);
             }
             ToolActionRequest::ToggleTransformMode => {
                 if let Some(tab) = self.active_tab_mut() {
@@ -2035,6 +2215,26 @@ impl StudioApp {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.raster_mask_rect_mm = rect;
                     tab.tool_core.raster_mask_rect_mm = rect;
+                }
+            }
+            ToolActionRequest::SetRasterMask(sel) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(ref s) = sel {
+                        if let Some(bb) = s.world_bounds() {
+                            tab.raster_mask_rect_mm = Some(bb);
+                            tab.tool_core.raster_mask_rect_mm = Some(bb);
+                        }
+                    }
+                    tab.raster_mask = sel;
+                    tab.needs_rerender = true;
+                }
+            }
+            ToolActionRequest::ClearRasterMask => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.raster_mask = None;
+                    tab.raster_mask_rect_mm = None;
+                    tab.tool_core.raster_mask_rect_mm = None;
+                    tab.needs_rerender = true;
                 }
             }
             ToolActionRequest::SetSelectedGuide(gid) => {

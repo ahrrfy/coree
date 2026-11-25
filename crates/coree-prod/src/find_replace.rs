@@ -10,7 +10,7 @@
 use crate::scene_helpers::visit_layer_objects;
 use coree_core::{
     extract_searchable_text, scoped_page_indices, text_runs_ref, Color, Document, Fill,
-    NodePayload, ObjectId, SceneObject,
+    NodePayload, ObjectId, SceneObject, SymbolId,
 };
 pub use coree_core::{
     find_and_replace, find_objects, ColorMatch, FindQuery, FindReplaceReport, FindScope,
@@ -84,11 +84,43 @@ pub fn parse_cql_query(input: &str) -> crate::error::ProdResult<CqlExpr> {
 /// Evaluates a parsed [`CqlExpr`] against a single [`SceneObject`].
 #[must_use]
 pub fn cql_matches_object(obj: &SceneObject, expr: &CqlExpr) -> bool {
+    cql_matches_object_inner(None, &obj.payload, obj, expr)
+}
+
+fn cql_matches_object_in_doc(doc: &Document, obj: &SceneObject, expr: &CqlExpr) -> bool {
+    if matches!(obj.payload, NodePayload::Clone { .. }) {
+        if let Some((payload, fill, outline, _)) =
+            doc.resolve_clone_payload_and_style_with_sym_scope(obj, None)
+        {
+            let mut tmp = obj.clone();
+            tmp.payload = payload;
+            tmp.fill = fill;
+            tmp.outline = outline;
+            return cql_matches_object_inner(Some(doc), &obj.payload, &tmp, expr);
+        }
+    }
+    cql_matches_object_inner(Some(doc), &obj.payload, obj, expr)
+}
+
+fn cql_matches_object_inner(
+    doc: Option<&Document>,
+    orig_payload: &NodePayload,
+    obj: &SceneObject,
+    expr: &CqlExpr,
+) -> bool {
     match expr {
-        CqlExpr::And(a, b) => cql_matches_object(obj, a) && cql_matches_object(obj, b),
-        CqlExpr::Or(a, b) => cql_matches_object(obj, a) || cql_matches_object(obj, b),
-        CqlExpr::Not(inner) => !cql_matches_object(obj, inner),
-        CqlExpr::Predicate { field, op, value } => evaluate_cql_predicate(obj, field, *op, value),
+        CqlExpr::And(a, b) => {
+            cql_matches_object_inner(doc, orig_payload, obj, a)
+                && cql_matches_object_inner(doc, orig_payload, obj, b)
+        }
+        CqlExpr::Or(a, b) => {
+            cql_matches_object_inner(doc, orig_payload, obj, a)
+                || cql_matches_object_inner(doc, orig_payload, obj, b)
+        }
+        CqlExpr::Not(inner) => !cql_matches_object_inner(doc, orig_payload, obj, inner),
+        CqlExpr::Predicate { field, op, value } => {
+            evaluate_cql_predicate_inner(doc, orig_payload, obj, field, *op, value)
+        }
     }
 }
 
@@ -104,7 +136,10 @@ pub fn find_objects_cql(doc: &Document, scope: FindScope, expr: &CqlExpr) -> Vec
         for layer in &pages[p_idx].layers {
             if Document::layer_applies_to_page(layer, p_idx, p_idx) {
                 visit_layer_objects(doc, layer, &mut |oid, obj, _| {
-                    if seen.insert(oid) && cql_matches_object(obj, expr) {
+                    if !seen.insert(oid) {
+                        return;
+                    }
+                    if cql_matches_object_in_doc(doc, obj, expr) {
                         matched.push(oid);
                     }
                 });
@@ -117,7 +152,10 @@ pub fn find_objects_cql(doc: &Document, scope: FindScope, expr: &CqlExpr) -> Vec
             for layer in &owner_page.layers {
                 if Document::layer_applies_to_page(layer, owner_idx, p_idx) {
                     visit_layer_objects(doc, layer, &mut |oid, obj, _| {
-                        if seen.insert(oid) && cql_matches_object(obj, expr) {
+                        if !seen.insert(oid) {
+                            return;
+                        }
+                        if cql_matches_object_in_doc(doc, obj, expr) {
                             matched.push(oid);
                         }
                     });
@@ -455,13 +493,16 @@ impl<'a> CqlParser<'a> {
                             )))
                         }
                     };
+                    validate_cql_predicate(&field, op, &value)?;
                     Ok(CqlExpr::Predicate { field, op, value })
                 } else {
                     // Unary property flag shorthand e.g. `@outline.hairline` or `@locked`
+                    let value = CqlLiteral::Bool(true);
+                    validate_cql_predicate(&field, CqlCompareOp::Eq, &value)?;
                     Ok(CqlExpr::Predicate {
                         field,
                         op: CqlCompareOp::Eq,
-                        value: CqlLiteral::Bool(true),
+                        value,
                     })
                 }
             }
@@ -550,10 +591,69 @@ fn cql_fill_type_aliases(fill: &Fill) -> &'static [&'static str] {
     }
 }
 
+fn validate_cql_predicate(
+    field: &str,
+    op: CqlCompareOp,
+    value: &CqlLiteral,
+) -> crate::error::ProdResult<()> {
+    match field {
+        "type" | "kind" | "fill.type" | "fill.model" | "outline.model" | "color" | "font"
+        | "text.font" | "name" | "text" => {
+            if !matches!(value, CqlLiteral::Str(_)) {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL field '@{field}' requires a string literal value"
+                )));
+            }
+            if matches!(field, "type" | "kind" | "fill.type")
+                && !matches!(
+                    op,
+                    CqlCompareOp::Eq | CqlCompareOp::Ne | CqlCompareOp::Contains
+                )
+            {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL field '@{field}' does not support ordering operator {op:?}"
+                )));
+            }
+            Ok(())
+        }
+        "visible" | "locked" | "printable" | "has_lens" | "lens" | "fill.overprint"
+        | "outline.hairline" | "hairline" | "outline.overprint" | "overprint" => {
+            if !matches!(value, CqlLiteral::Bool(_)) {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL field '@{field}' requires a boolean literal (true/false)"
+                )));
+            }
+            if !matches!(op, CqlCompareOp::Eq | CqlCompareOp::Ne) {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL boolean field '@{field}' only supports '==' or '!='"
+                )));
+            }
+            Ok(())
+        }
+        "opacity" | "outline.width" | "text.len" | "text.count" => {
+            if !matches!(value, CqlLiteral::Number { .. }) {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL numeric field '@{field}' requires a numeric literal"
+                )));
+            }
+            if op == CqlCompareOp::Contains {
+                return Err(crate::error::ProdError::InvalidParameter(format!(
+                    "CQL numeric field '@{field}' does not support 'contains'"
+                )));
+            }
+            Ok(())
+        }
+        other => Err(crate::error::ProdError::InvalidParameter(format!(
+            "unknown CQL field '@{other}'"
+        ))),
+    }
+}
+
 fn cql_cmp_str(actual: &str, op: CqlCompareOp, lit: &CqlLiteral) -> bool {
-    let CqlLiteral::Str(ref s) = lit else {
+    let CqlLiteral::Str(ref raw_s) = lit else {
         return false;
     };
+    let s = raw_s.trim();
     match op {
         CqlCompareOp::Eq => actual.eq_ignore_ascii_case(s),
         CqlCompareOp::Ne => !actual.eq_ignore_ascii_case(s),
@@ -608,7 +708,50 @@ fn effective_outline(obj: &SceneObject) -> &coree_core::OutlineStyle {
     }
 }
 
-fn evaluate_cql_predicate(
+fn collect_symbol_descendants(
+    doc: &Document,
+    sym_id: SymbolId,
+    visiting_syms: &mut HashSet<SymbolId>,
+    out: &mut Vec<SceneObject>,
+) {
+    if !visiting_syms.insert(sym_id) {
+        return;
+    }
+    if let Some(sym) = doc.symbol(sym_id) {
+        let mut sym_map = std::collections::HashMap::new();
+        for sub in &sym.objects {
+            if sub.id.0 != 0 {
+                sym_map.insert(sub.id, sub);
+            }
+        }
+        for sub in &sym.objects {
+            if matches!(sub.payload, NodePayload::Clone { .. }) {
+                if let Some((p, f, o, _)) =
+                    doc.resolve_clone_payload_and_style_with_sym_scope(sub, Some(&sym_map))
+                {
+                    let mut tmp = sub.clone();
+                    tmp.payload = p;
+                    tmp.fill = f;
+                    tmp.outline = o;
+                    if let NodePayload::SymbolInstance(nested_id) = tmp.payload {
+                        collect_symbol_descendants(doc, nested_id, visiting_syms, out);
+                    }
+                    out.push(tmp);
+                    continue;
+                }
+            }
+            if let NodePayload::SymbolInstance(nested_id) = sub.payload {
+                collect_symbol_descendants(doc, nested_id, visiting_syms, out);
+            }
+            out.push(sub.clone());
+        }
+    }
+    visiting_syms.remove(&sym_id);
+}
+
+fn evaluate_cql_predicate_inner(
+    doc: Option<&Document>,
+    orig_payload: &NodePayload,
     obj: &SceneObject,
     field: &str,
     op: CqlCompareOp,
@@ -616,15 +759,17 @@ fn evaluate_cql_predicate(
 ) -> bool {
     match field {
         "type" | "kind" => {
-            let CqlLiteral::Str(ref s) = value else {
+            let CqlLiteral::Str(ref raw_s) = value else {
                 return false;
             };
-            let aliases = cql_type_aliases(&obj.payload);
+            let s = raw_s.trim();
+            let aliases = cql_type_aliases(orig_payload);
             match op {
                 CqlCompareOp::Eq => aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
                 CqlCompareOp::Ne => !aliases.iter().any(|a| a.eq_ignore_ascii_case(s)),
                 CqlCompareOp::Contains => {
-                    aliases.iter().any(|a| a.contains(&s.to_ascii_lowercase()))
+                    let needle = s.to_ascii_lowercase();
+                    aliases.iter().any(|a| a.contains(&needle))
                 }
                 _ => false,
             }
@@ -636,21 +781,24 @@ fn evaluate_cql_predicate(
         "has_lens" | "lens" => cql_cmp_bool(obj.lens.is_some(), op, value),
         "opacity" => cql_cmp_num(f64::from(obj.opacity), op, value, false),
         "fill.type" => {
-            let CqlLiteral::Str(ref s) = value else {
+            let CqlLiteral::Str(ref raw_s) = value else {
                 return false;
             };
+            let s = raw_s.trim();
             let mut aliases: Vec<&'static str> = Vec::new();
-            if obj.fill.is_visible() {
+            if obj.fill.is_visible() && !matches!(&obj.fill, Fill::Solid(c) if c.alpha() <= 1e-6) {
                 aliases.extend_from_slice(cql_fill_type_aliases(&obj.fill));
             }
             for run in text_runs_ref(&obj.payload) {
-                if run.style.fill.alpha() > 1e-6 {
+                if !run.text.is_empty() && run.style.fill.alpha() > 1e-6 {
                     aliases.extend_from_slice(&["solid", "uniform"]);
                 }
             }
             if let NodePayload::Table(ref table) = obj.payload {
                 for cell in &table.cells {
-                    if cell.fill.is_visible() {
+                    if cell.fill.is_visible()
+                        && !matches!(&cell.fill, Fill::Solid(c) if c.alpha() <= 1e-6)
+                    {
                         aliases.extend_from_slice(cql_fill_type_aliases(&cell.fill));
                     }
                     if !cell.text.is_empty() && cell.text_style.fill.alpha() > 1e-6 {
@@ -672,19 +820,27 @@ fn evaluate_cql_predicate(
             }
         }
         "fill.model" => {
-            let mut models: Vec<&'static str> = obj
-                .fill
-                .referenced_colors()
-                .iter()
-                .map(cql_color_model)
-                .collect();
+            let mut models: Vec<&'static str> = if matches!(&obj.fill, Fill::Solid(c) if c.alpha() <= 1e-6)
+            {
+                Vec::new()
+            } else {
+                obj.fill
+                    .referenced_colors()
+                    .iter()
+                    .map(cql_color_model)
+                    .collect()
+            };
             for run in text_runs_ref(&obj.payload) {
-                models.push(cql_color_model(&run.style.fill));
+                if !run.text.is_empty() && run.style.fill.alpha() > 1e-6 {
+                    models.push(cql_color_model(&run.style.fill));
+                }
             }
             if let NodePayload::Table(ref table) = obj.payload {
                 for cell in &table.cells {
-                    models.extend(cell.fill.referenced_colors().iter().map(cql_color_model));
-                    if !cell.text.is_empty() {
+                    if !matches!(&cell.fill, Fill::Solid(c) if c.alpha() <= 1e-6) {
+                        models.extend(cell.fill.referenced_colors().iter().map(cql_color_model));
+                    }
+                    if !cell.text.is_empty() && cell.text_style.fill.alpha() > 1e-6 {
                         models.push(cql_color_model(&cell.text_style.fill));
                     }
                 }
@@ -728,24 +884,43 @@ fn evaluate_cql_predicate(
             cql_cmp_str(model, op, value)
         }
         "color" => {
-            let CqlLiteral::Str(ref s) = value else {
+            let CqlLiteral::Str(ref raw_s) = value else {
                 return false;
             };
-            let mut colors = obj.fill.referenced_colors();
-            for run in text_runs_ref(&obj.payload) {
-                colors.push(run.style.fill.clone());
-            }
-            if let NodePayload::Table(ref table) = obj.payload {
-                for cell in &table.cells {
-                    colors.extend(cell.fill.referenced_colors());
-                    if !cell.text.is_empty() {
-                        colors.push(cell.text_style.fill.clone());
+            let s = raw_s.trim();
+            let mut colors: Vec<Color> = Vec::new();
+            let mut collect_colors = |target: &SceneObject| {
+                if !matches!(&target.fill, Fill::Solid(c) if c.alpha() <= 1e-6) {
+                    colors.extend(target.fill.referenced_colors());
+                }
+                for run in text_runs_ref(&target.payload) {
+                    if !run.text.is_empty() && run.style.fill.alpha() > 1e-6 {
+                        colors.push(run.style.fill.clone());
                     }
                 }
-            }
-            let outline = effective_outline(obj);
-            if outline.is_visible() {
-                colors.push(outline.color.clone());
+                if let NodePayload::Table(ref table) = target.payload {
+                    for cell in &table.cells {
+                        if !matches!(&cell.fill, Fill::Solid(c) if c.alpha() <= 1e-6) {
+                            colors.extend(cell.fill.referenced_colors());
+                        }
+                        if !cell.text.is_empty() && cell.text_style.fill.alpha() > 1e-6 {
+                            colors.push(cell.text_style.fill.clone());
+                        }
+                    }
+                }
+                let outline = effective_outline(target);
+                if outline.is_visible() {
+                    colors.push(outline.color.clone());
+                }
+            };
+            collect_colors(obj);
+            if let (Some(d), NodePayload::SymbolInstance(sym_id)) = (doc, &obj.payload) {
+                let mut sym_objs = Vec::new();
+                let mut vs = HashSet::new();
+                collect_symbol_descendants(d, *sym_id, &mut vs, &mut sym_objs);
+                for sub in &sym_objs {
+                    collect_colors(sub);
+                }
             }
             if op == CqlCompareOp::Ne {
                 !colors
@@ -756,23 +931,65 @@ fn evaluate_cql_predicate(
             }
         }
         "text" => {
-            let txt = extract_searchable_text(&obj.payload).unwrap_or_default();
+            let mut txt = extract_searchable_text(&obj.payload).unwrap_or_default();
+            if txt.is_empty() {
+                if let (Some(d), NodePayload::SymbolInstance(sym_id)) = (doc, &obj.payload) {
+                    let mut sym_objs = Vec::new();
+                    let mut vs = HashSet::new();
+                    collect_symbol_descendants(d, *sym_id, &mut vs, &mut sym_objs);
+                    let parts: Vec<String> = sym_objs
+                        .iter()
+                        .filter_map(|sub| extract_searchable_text(&sub.payload))
+                        .collect();
+                    if !parts.is_empty() {
+                        txt = parts.join(" ");
+                    }
+                }
+            }
             cql_cmp_str(&txt, op, value)
         }
         "text.len" | "text.count" => {
-            let len = extract_searchable_text(&obj.payload).map_or(0, |s| s.chars().count());
+            let mut txt = extract_searchable_text(&obj.payload);
+            if txt.is_none() {
+                if let (Some(d), NodePayload::SymbolInstance(sym_id)) = (doc, &obj.payload) {
+                    let mut sym_objs = Vec::new();
+                    let mut vs = HashSet::new();
+                    collect_symbol_descendants(d, *sym_id, &mut vs, &mut sym_objs);
+                    let parts: Vec<String> = sym_objs
+                        .iter()
+                        .filter_map(|sub| extract_searchable_text(&sub.payload))
+                        .collect();
+                    if !parts.is_empty() {
+                        txt = Some(parts.join(" "));
+                    }
+                }
+            }
+            let len = txt.map_or(0, |s| s.chars().count());
             cql_cmp_num(len as f64, op, value, false)
         }
         "font" | "text.font" => {
-            let mut fonts: Vec<&str> = text_runs_ref(&obj.payload)
-                .iter()
-                .map(|r| r.style.font_family.trim())
-                .collect();
-            if let NodePayload::Table(ref table) = obj.payload {
-                for cell in &table.cells {
-                    if !cell.text.is_empty() {
-                        fonts.push(cell.text_style.font_family.trim());
+            let mut fonts: Vec<String> = Vec::new();
+            let mut collect_fonts = |target: &SceneObject| {
+                for r in text_runs_ref(&target.payload) {
+                    if !r.text.is_empty() {
+                        fonts.push(r.style.font_family.trim().to_owned());
                     }
+                }
+                if let NodePayload::Table(ref table) = target.payload {
+                    for cell in &table.cells {
+                        if !cell.text.is_empty() {
+                            fonts.push(cell.text_style.font_family.trim().to_owned());
+                        }
+                    }
+                }
+            };
+            collect_fonts(obj);
+            if let (Some(d), NodePayload::SymbolInstance(sym_id)) = (doc, &obj.payload) {
+                let mut sym_objs = Vec::new();
+                let mut vs = HashSet::new();
+                collect_symbol_descendants(d, *sym_id, &mut vs, &mut sym_objs);
+                for sub in &sym_objs {
+                    collect_fonts(sub);
                 }
             }
             if fonts.is_empty() {
@@ -1060,5 +1277,145 @@ mod tests {
             vec![t1]
         );
         assert!(parse_cql_query("@type == 'unclosed").is_err());
+    }
+
+    #[test]
+    fn cql_validates_strict_field_and_literal_types() {
+        assert!(parse_cql_query("fill == 12345").is_err());
+        assert!(parse_cql_query("@unknown_prop == 'abc'").is_err());
+        assert!(parse_cql_query("@name == 42").is_err());
+        assert!(parse_cql_query("@opacity == 'red'").is_err());
+        assert!(parse_cql_query("@locked > true").is_err());
+        assert!(parse_cql_query("@name").is_err());
+        assert!(parse_cql_query("@locked").is_ok());
+    }
+
+    #[test]
+    fn cql_handles_transparent_solid_fill_empty_runs_whitespace_and_clones() {
+        let mut doc = Document::new_a4("CQL Carryover 5");
+        let transp = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Transparent Shape",
+                    NodePayload::Shape(coree_core::ParametricShape::Rectangle {
+                        width: 20.0,
+                        height: 20.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: coree_core::CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::TRANSPARENT))
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+
+        let empty_text = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Empty Text",
+                    NodePayload::ArtisticText(ArtisticText::from_plain(
+                        "",
+                        TextStyle {
+                            font_family: "GhostFont".to_owned(),
+                            fill: Color::CYAN,
+                            ..TextStyle::default()
+                        },
+                    )),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+
+        let src = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Source Box",
+                    NodePayload::Shape(coree_core::ParametricShape::Rectangle {
+                        width: 15.0,
+                        height: 15.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: coree_core::CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::MAGENTA)),
+                None,
+            )
+            .unwrap();
+        let clone_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Clone Box",
+                    NodePayload::Clone {
+                        master_id: src,
+                        link_fill: true,
+                        link_outline: true,
+                        link_shape: true,
+                    },
+                )
+                .with_transform(coree_core::Affine2D::translate(30.0, 0.0)),
+                None,
+            )
+            .unwrap();
+
+        let none_hits =
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.type == ' none '").unwrap();
+        assert!(none_hits.contains(&transp));
+        assert!(none_hits.contains(&empty_text));
+        assert!(
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@font == 'GhostFont'")
+                .unwrap()
+                .is_empty()
+        );
+
+        let mag_hits =
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@fill.model == ' cmyk '").unwrap();
+        assert!(mag_hits.contains(&src));
+        assert!(mag_hits.contains(&clone_id));
+
+        // Live Clone (`link_shape: true`) MUST still match `@type == 'clone'`
+        let clone_type_hits =
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@type == ' clone '").unwrap();
+        assert_eq!(clone_type_hits, vec![clone_id]);
+
+        // SymbolInstance font and color search
+        let sym_txt = SceneObject::new(
+            ObjectId(1),
+            "SymText",
+            NodePayload::ArtisticText(ArtisticText::from_plain(
+                "Badge",
+                TextStyle {
+                    font_family: "MissingSymFont".to_owned(),
+                    fill: Color::cut_contour_spot(),
+                    ..TextStyle::default()
+                },
+            )),
+        );
+        let sym = coree_core::SymbolDef::new("BadgeSym", vec![sym_txt]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        let sym_inst = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@font == 'MissingSymFont'")
+                .unwrap(),
+            vec![sym_inst]
+        );
+        assert_eq!(
+            evaluate_cql_query(&doc, FindScope::WholeDocument, "@color == 'CutContour'").unwrap(),
+            vec![sym_inst]
+        );
     }
 }

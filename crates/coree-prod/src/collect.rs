@@ -60,12 +60,25 @@ pub struct CollectedImageInfo {
     pub color_mode: ColorMode,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Metadata for a font family referenced by the document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectedFontInfo {
     pub family: String,
     /// Relative path inside the bundle if a matching font file was found and copied.
     pub copied_relative_path: Option<String>,
+    /// Raw SFNT `OS/2` `fsType` embedding flags, if present in the matched font file.
+    #[serde(default)]
+    pub fs_type: Option<u16>,
+    /// Whether the font's `OS/2` `fsType` license permits copying/embedding (`false` for `0x0002` Restricted License).
+    #[serde(default = "default_true")]
+    pub embedding_allowed: bool,
+    /// Human-readable embedding status / restriction summary.
+    #[serde(default)]
+    pub embedding_status: String,
 }
 
 /// Page dimension summary stored in `manifest.json`.
@@ -89,6 +102,10 @@ pub struct ProductionManifest {
     pub total_objects: usize,
     pub spot_inks: Vec<String>,
     pub used_fonts: Vec<CollectedFontInfo>,
+    #[serde(default)]
+    pub restricted_fonts: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub extracted_images: Vec<CollectedImageInfo>,
     pub production_metrics: ProductionMetrics,
     pub preflight_passed: Option<bool>,
@@ -107,6 +124,10 @@ pub struct CollectReport {
     pub preflight_json_path: Option<PathBuf>,
     pub extracted_images: Vec<CollectedImageInfo>,
     pub used_fonts: Vec<CollectedFontInfo>,
+    #[serde(default)]
+    pub restricted_fonts: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub spot_inks: Vec<String>,
     pub preflight_report: Option<PreflightReport>,
     pub production_metrics: ProductionMetrics,
@@ -177,6 +198,8 @@ pub fn collect_for_output(
     // 3. Collect used fonts & optionally copy matched font files into `fonts/`
     let used_families = collect_used_font_families(doc);
     let mut used_fonts = Vec::with_capacity(used_families.len());
+    let mut restricted_fonts: Vec<String> = Vec::new();
+    let mut collect_warnings: Vec<String> = Vec::new();
 
     if options.collect_fonts {
         let fonts_dir = output_dir.join("fonts");
@@ -198,9 +221,29 @@ pub fn collect_for_output(
 
         for family in &used_families {
             let mut copied_rel = None;
+            let mut fs_type = None;
+            let mut embedding_allowed = true;
+            let mut embedding_status = "not checked".to_owned();
+
             if options.copy_system_fonts {
                 if let Some(src_path) = match_font_file(family, &font_index) {
-                    if let Some(existing_rel) = copied_sources.get(&src_path) {
+                    let fstype = read_sfnt_os2_fs_type(&src_path);
+                    fs_type = fstype;
+                    if let Some(ft) = fstype {
+                        embedding_allowed = fs_type_allows_embedding(ft);
+                        embedding_status = fs_type_label(ft).to_owned();
+                    } else {
+                        embedding_status = "Installable / No OS/2 fsType".to_owned();
+                    }
+
+                    if !embedding_allowed {
+                        let ft_val = fs_type.unwrap_or(0x0002);
+                        let warn = format!(
+                            "Font '{family}' has Restricted License embedding (OS/2 fsType=0x{ft_val:04X}); font file copy blocked"
+                        );
+                        collect_warnings.push(warn);
+                        restricted_fonts.push(family.clone());
+                    } else if let Some(existing_rel) = copied_sources.get(&src_path) {
                         copied_rel = Some(existing_rel.clone());
                     } else if let Some(fname) = src_path.file_name().and_then(|s| s.to_str()) {
                         let unique_fname = allocate_unique_font_filename(
@@ -217,11 +260,16 @@ pub fn collect_for_output(
                             copied_rel = Some(rel);
                         }
                     }
+                } else {
+                    embedding_status = "missing from system font directories".to_owned();
                 }
             }
             used_fonts.push(CollectedFontInfo {
                 family: family.clone(),
                 copied_relative_path: copied_rel,
+                fs_type,
+                embedding_allowed,
+                embedding_status,
             });
         }
 
@@ -231,9 +279,22 @@ pub fn collect_for_output(
             fonts_txt.push_str("(No live text fonts referenced)\n");
         } else {
             for f in &used_fonts {
-                match &f.copied_relative_path {
-                    Some(rel) => fonts_txt.push_str(&format!("- {} [copied -> {rel}]\n", f.family)),
-                    None => fonts_txt.push_str(&format!("- {} [not copied]\n", f.family)),
+                match (&f.copied_relative_path, f.embedding_allowed) {
+                    (Some(rel), true) => {
+                        fonts_txt.push_str(&format!("- {} [copied -> {rel}]\n", f.family));
+                    }
+                    (_, false) => {
+                        fonts_txt.push_str(&format!(
+                            "- {} [BLOCKED: {}]\n",
+                            f.family, f.embedding_status
+                        ));
+                    }
+                    (None, true) => {
+                        fonts_txt.push_str(&format!(
+                            "- {} [not copied: {}]\n",
+                            f.family, f.embedding_status
+                        ));
+                    }
                 }
             }
         }
@@ -248,6 +309,9 @@ pub fn collect_for_output(
             used_fonts.push(CollectedFontInfo {
                 family,
                 copied_relative_path: None,
+                fs_type: None,
+                embedding_allowed: true,
+                embedding_status: "collection skipped".to_owned(),
             });
         }
     }
@@ -306,6 +370,8 @@ pub fn collect_for_output(
         total_objects: doc.object_count(),
         spot_inks: spot_inks.clone(),
         used_fonts: used_fonts.clone(),
+        restricted_fonts: restricted_fonts.clone(),
+        warnings: collect_warnings.clone(),
         extracted_images: extracted_images.clone(),
         production_metrics: production_metrics.clone(),
         preflight_passed: preflight_report.as_ref().map(PreflightReport::passed),
@@ -329,6 +395,8 @@ pub fn collect_for_output(
         preflight_json_path,
         extracted_images,
         used_fonts,
+        restricted_fonts,
+        warnings: collect_warnings,
         spot_inks,
         preflight_report,
         production_metrics,
@@ -726,6 +794,87 @@ fn match_font_file(family: &str, index: &BTreeMap<String, PathBuf>) -> Option<Pa
         .find_map(|(k, p)| k.starts_with(&key).then(|| p.clone()))
 }
 
+/// Shared SFNT font scanner reused by [`crate::preflight::run_preflight`].
+#[must_use]
+pub(crate) fn scan_system_font_index(extra_dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
+    let dirs = build_font_search_dirs(extra_dirs);
+    index_font_files(&dirs)
+}
+
+/// Returns `true` if `family` resolves to any local/system SFNT font in `index`.
+#[must_use]
+pub(crate) fn font_index_contains(index: &BTreeMap<String, PathBuf>, family: &str) -> bool {
+    match_font_file(family, index).is_some()
+}
+
+/// Returns `false` if OpenType `OS/2` `fsType` bits `0x000F` specify `0x0002` (Restricted License).
+#[must_use]
+pub fn fs_type_allows_embedding(fs_type: u16) -> bool {
+    (fs_type & 0x000F) != 0x0002
+}
+
+/// Human-readable OpenType `OS/2` `fsType` license summary.
+#[must_use]
+pub fn fs_type_label(fs_type: u16) -> &'static str {
+    let low = fs_type & 0x000F;
+    if low == 0x0002 {
+        "Restricted License embedding (OS/2 fsType=0x0002)"
+    } else if (fs_type & 0x0200) != 0 {
+        "Bitmap embedding only (OS/2 fsType=0x0200)"
+    } else if (low & 0x0008) != 0 {
+        "Editable embedding allowed"
+    } else if (low & 0x0004) != 0 {
+        "Preview & Print embedding allowed"
+    } else {
+        "Installable embedding allowed"
+    }
+}
+
+/// Reads the OpenType/TrueType `OS/2` table `fsType` field from a font file (supports `.ttf/.otf/.ttc`).
+#[must_use]
+pub fn read_sfnt_os2_fs_type(path: &Path) -> Option<u16> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 12 {
+        return None;
+    }
+    if let Ok(face) = ttf_parser::Face::parse(&bytes, 0) {
+        if let Some(os2_bytes) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"OS/2")) {
+            if os2_bytes.len() >= 10 {
+                return Some(u16::from_be_bytes([os2_bytes[8], os2_bytes[9]]));
+            }
+        }
+    }
+    // Direct SFNT `OS/2` table offset lookup (handles single-table/minimal font binaries).
+    let face_off = if &bytes[0..4] == b"ttcf" && bytes.len() >= 16 {
+        u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize
+    } else {
+        0usize
+    };
+    if face_off + 12 > bytes.len() {
+        return None;
+    }
+    let num_tables = usize::from(u16::from_be_bytes([
+        bytes[face_off + 4],
+        bytes[face_off + 5],
+    ]))
+    .min(128);
+    let dir_start = face_off + 12;
+    let dir_end = dir_start.checked_add(num_tables * 16)?;
+    if dir_end > bytes.len() {
+        return None;
+    }
+    for rec in bytes[dir_start..dir_end].as_chunks::<16>().0 {
+        if &rec[0..4] == b"OS/2" {
+            let off = u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]) as usize;
+            let len = u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
+            if len >= 10 && off + 10 <= bytes.len() {
+                return Some(u16::from_be_bytes([bytes[off + 8], bytes[off + 9]]));
+            }
+        }
+    }
+    None
+}
+
 fn sanitize_filename(raw: &str, fallback: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -957,5 +1106,78 @@ mod tests {
 
         let matched_arabic = match_font_file("أميري", &index).unwrap();
         assert_eq!(matched_arabic.file_name().unwrap(), "ar_01.otf");
+    }
+
+    #[test]
+    fn collect_blocks_restricted_license_fstype_font() {
+        let tmp = tempfile::tempdir().unwrap();
+        let font_vault = tmp.path().join("restricted_fonts");
+        fs::create_dir_all(&font_vault).unwrap();
+
+        // Build minimal SFNT with both `name` ("LockedSerif") and `OS/2` (fsType = 0x0002).
+        let name_only = build_mock_sfnt_with_names(&[(1, "LockedSerif"), (2, "Regular")]);
+        let name_table = &name_only[12 + 16..];
+        let mut os2_table = vec![0u8; 78];
+        os2_table[8..10].copy_from_slice(&0x0002u16.to_be_bytes()); // fsType = Restricted License
+
+        let dir_size = 2 * 16u32;
+        let name_off = 12 + dir_size;
+        let os2_off = name_off + (name_table.len() as u32);
+        let mut sfnt = Vec::new();
+        sfnt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        sfnt.extend_from_slice(&2u16.to_be_bytes());
+        sfnt.extend_from_slice(&[0u8; 6]);
+        // name record
+        sfnt.extend_from_slice(b"name");
+        sfnt.extend_from_slice(&0u32.to_be_bytes());
+        sfnt.extend_from_slice(&name_off.to_be_bytes());
+        sfnt.extend_from_slice(&(name_table.len() as u32).to_be_bytes());
+        // OS/2 record
+        sfnt.extend_from_slice(b"OS/2");
+        sfnt.extend_from_slice(&0u32.to_be_bytes());
+        sfnt.extend_from_slice(&os2_off.to_be_bytes());
+        sfnt.extend_from_slice(&(os2_table.len() as u32).to_be_bytes());
+        sfnt.extend_from_slice(name_table);
+        sfnt.extend_from_slice(&os2_table);
+
+        let font_file = font_vault.join("locked_serif.ttf");
+        fs::write(&font_file, &sfnt).unwrap();
+        assert_eq!(read_sfnt_os2_fs_type(&font_file), Some(0x0002));
+        assert!(!fs_type_allows_embedding(0x0002));
+
+        let mut doc = Document::new_a4("Restricted Font Test");
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Title",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "Restricted",
+                    TextStyle {
+                        font_family: "LockedSerif".to_owned(),
+                        fill: Color::KEY_BLACK,
+                        ..TextStyle::default()
+                    },
+                )),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let bundle = tmp.path().join("bundle");
+        let report = collect_for_output(
+            &doc,
+            &bundle,
+            &CollectOptions {
+                extra_font_search_dirs: vec![font_vault],
+                ..CollectOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.used_fonts[0].copied_relative_path, None);
+        assert!(!report.used_fonts[0].embedding_allowed);
+        assert_eq!(report.used_fonts[0].fs_type, Some(0x0002));
+        assert!(report.restricted_fonts.contains(&"LockedSerif".to_owned()));
+        assert!(!report.warnings.is_empty());
+        assert!(!bundle.join("fonts/locked_serif.ttf").exists());
     }
 }

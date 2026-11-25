@@ -2773,3 +2773,84 @@ fn e2e_deterministic_rendering_byte_and_pixel_identical() {
     let pkg_b = render_page_to_rgba(&packaging_doc, 0, 72.0, ViewMode::Enhanced).unwrap();
     assert_eq!(pkg_a.rgba, pkg_b.rgba);
 }
+
+#[test]
+fn w4b_r2_apply_trapping_active_undo_redo_and_on_selection_change_hook() {
+    let mut app = StudioApp::new_headless();
+    let yellow = Color::cmyk(0.0, 0.0, 1.0, 0.0);
+    let black = Color::cmyk(0.0, 0.0, 0.0, 1.0);
+    let rect_shape = |w: f64, h: f64| {
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: w,
+            height: h,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        })
+    };
+    app.execute_command(CommandOp::create_object(
+        SceneObject::new(ObjectId(0), "YellowBox", rect_shape(40.0, 40.0))
+            .with_fill(Fill::Solid(yellow))
+            .with_outline(OutlineStyle::none()),
+        None,
+    ))
+    .unwrap();
+    let tab = app.active_tab().unwrap();
+    let yellow_obj_id = *tab.document.objects().keys().next().unwrap();
+    app.execute_command(CommandOp::create_object(
+        SceneObject::new(ObjectId(0), "BlackBox", rect_shape(40.0, 40.0))
+            .with_fill(Fill::Solid(black))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(40.0, 0.0)),
+        None,
+    ))
+    .unwrap();
+
+    // 1. S12 Trapping via apply_trapping_active must be Undo/Redo-able
+    let pre_obj_count = app.active_tab().unwrap().document.objects().len();
+    let pre_layer_count = app.active_tab().unwrap().document.pages()[0].layers.len();
+    app.apply_trapping_active();
+    assert!(app.active_tab().unwrap().document.objects().len() > pre_obj_count);
+    assert!(app.active_tab().unwrap().document.pages()[0].layers.len() > pre_layer_count);
+
+    app.undo().expect("undo trapping");
+    assert_eq!(
+        app.active_tab().unwrap().document.objects().len(),
+        pre_obj_count
+    );
+    assert_eq!(
+        app.active_tab().unwrap().document.pages()[0].layers.len(),
+        pre_layer_count
+    );
+
+    app.redo().expect("redo trapping");
+    assert!(app.active_tab().unwrap().document.objects().len() > pre_obj_count);
+
+    // 2. MacroEventHook::OnSelectionChange must fire on tool selection changes with seeded doc.selection
+    app.register_macro_hook(
+        coree_prod::MacroEventHook::OnSelectionChange,
+        r#"
+            for sh in doc.selection.shapes {
+                sh.name = "HookSelected_" + doc.selection.count;
+            }
+        "#,
+    );
+    app.handle_tool_action(coree_tools::ToolActionRequest::SelectObjects {
+        ids: vec![yellow_obj_id],
+        additive: false,
+        toggle: false,
+    });
+    assert_eq!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(yellow_obj_id)
+            .unwrap()
+            .name,
+        "HookSelected_1"
+    );
+
+    // Clearing selection must fire hook without error and without renaming anything when empty
+    app.handle_tool_action(coree_tools::ToolActionRequest::ClearSelection);
+    assert!(app.active_tab().unwrap().selection.objects.is_empty());
+}

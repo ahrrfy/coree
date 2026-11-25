@@ -580,7 +580,7 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
 
             ui.separator();
             ui.label(RichText::new("Prepress Sheet & Separation Studio").strong());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut app.production_state.imposition_kind, 0, "N-Up Grid");
                 ui.selectable_value(
                     &mut app.production_state.imposition_kind,
@@ -591,6 +591,11 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                     &mut app.production_state.imposition_kind,
                     2,
                     "Large-Format Tiling",
+                );
+                ui.selectable_value(
+                    &mut app.production_state.imposition_kind,
+                    3,
+                    "Perfect-Bound Signatures",
                 );
             });
             let lang = app.ui_language;
@@ -617,7 +622,7 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                 .strong(),
             );
             draw_print_preview_thumbnail(ui, app, &tokens);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .button(lang.tr_ui("Generate Imposed Press Sheets", "توليد ألواح المونتاج"))
                     .clicked()
@@ -637,6 +642,30 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                     .clicked()
                 {
                     app.compute_separations_active();
+                }
+                if ui
+                    .button(lang.tr_ui("Export Plates PDF...", "تصدير ألواح PDF..."))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PDF", &["pdf"])
+                        .set_file_name("separations_plates.pdf")
+                        .save_file()
+                    {
+                        app.export_separated_plates_pdf_active(&path);
+                    }
+                }
+                if ui
+                    .button(lang.tr_ui("Apply Trapping", "تطبيق التداخل الطباعي"))
+                    .clicked()
+                {
+                    app.apply_trapping_active();
+                }
+                if ui
+                    .button(lang.tr_ui("Halftone Preview", "معاينة الهافتون"))
+                    .clicked()
+                {
+                    app.apply_halftone_preview_active();
                 }
             });
             if let Some(sep) = app
@@ -827,8 +856,8 @@ fn draw_print_preview_thumbnail(
     };
 
     match app.production_state.imposition_kind {
-        1 => {
-            // 2-Up Booklet spread
+        1 | 3 => {
+            // 2-Up Booklet / Perfect-Bound signature spread
             let margin_px = (6.0 * scale).clamp(3.0, 12.0);
             let work = sheet_rect.shrink(margin_px);
             let half_w = (work.width() * 0.5).max(4.0);

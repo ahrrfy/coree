@@ -169,6 +169,212 @@ fn find_page_index_of_object(doc: &Document, target_id: ObjectId) -> Option<usiz
 // Parametric Packaging Dieline Generator
 // =============================================================================
 
+/// Corrugated board flute grade controlling material thickness (`caliper_mm`) fold allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum FluteType {
+    #[default]
+    None,
+    E,
+    B,
+    C,
+    Bc,
+}
+
+impl FluteType {
+    /// Standard single/double-wall corrugated board caliper in millimeters.
+    #[must_use]
+    pub const fn caliper_mm(self) -> f64 {
+        match self {
+            Self::None => 0.0,
+            Self::E => 1.5,
+            Self::B => 3.0,
+            Self::C => 4.0,
+            Self::Bc => 6.5,
+        }
+    }
+
+    /// Display label for UI & CLI.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "Folding Carton (0.0 mm)",
+            Self::E => "E-Flute (1.5 mm)",
+            Self::B => "B-Flute (3.0 mm)",
+            Self::C => "C-Flute (4.0 mm)",
+            Self::Bc => "BC Double-Wall (6.5 mm)",
+        }
+    }
+}
+
+/// Parametric FEFCO international corrugated packaging code (`34` distinct templates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum FefcoCode {
+    Fefco0200,
+    #[default]
+    Fefco0201,
+    Fefco0202,
+    Fefco0203,
+    Fefco0204,
+    Fefco0205,
+    Fefco0206,
+    Fefco0209,
+    Fefco0210,
+    Fefco0211,
+    Fefco0212,
+    Fefco0215,
+    Fefco0216,
+    Fefco0218,
+    Fefco0300,
+    Fefco0301,
+    Fefco0302,
+    Fefco0303,
+    Fefco0306,
+    Fefco0312,
+    Fefco0401,
+    Fefco0402,
+    Fefco0403,
+    Fefco0409,
+    Fefco0410,
+    Fefco0415,
+    Fefco0421,
+    Fefco0422,
+    Fefco0426,
+    Fefco0427,
+    Fefco0501,
+    Fefco0502,
+    Fefco0711,
+    Fefco0713,
+}
+
+impl FefcoCode {
+    /// Complete list of all 34 supported parametric FEFCO packaging codes.
+    pub const ALL: [Self; 34] = [
+        Self::Fefco0200,
+        Self::Fefco0201,
+        Self::Fefco0202,
+        Self::Fefco0203,
+        Self::Fefco0204,
+        Self::Fefco0205,
+        Self::Fefco0206,
+        Self::Fefco0209,
+        Self::Fefco0210,
+        Self::Fefco0211,
+        Self::Fefco0212,
+        Self::Fefco0215,
+        Self::Fefco0216,
+        Self::Fefco0218,
+        Self::Fefco0300,
+        Self::Fefco0301,
+        Self::Fefco0302,
+        Self::Fefco0303,
+        Self::Fefco0306,
+        Self::Fefco0312,
+        Self::Fefco0401,
+        Self::Fefco0402,
+        Self::Fefco0403,
+        Self::Fefco0409,
+        Self::Fefco0410,
+        Self::Fefco0415,
+        Self::Fefco0421,
+        Self::Fefco0422,
+        Self::Fefco0426,
+        Self::Fefco0427,
+        Self::Fefco0501,
+        Self::Fefco0502,
+        Self::Fefco0711,
+        Self::Fefco0713,
+    ];
+
+    /// Canonical 4-digit FEFCO code string (e.g. `"0201"`).
+    #[must_use]
+    pub const fn code_str(self) -> &'static str {
+        match self {
+            Self::Fefco0200 => "0200",
+            Self::Fefco0201 => "0201",
+            Self::Fefco0202 => "0202",
+            Self::Fefco0203 => "0203",
+            Self::Fefco0204 => "0204",
+            Self::Fefco0205 => "0205",
+            Self::Fefco0206 => "0206",
+            Self::Fefco0209 => "0209",
+            Self::Fefco0210 => "0210",
+            Self::Fefco0211 => "0211",
+            Self::Fefco0212 => "0212",
+            Self::Fefco0215 => "0215",
+            Self::Fefco0216 => "0216",
+            Self::Fefco0218 => "0218",
+            Self::Fefco0300 => "0300",
+            Self::Fefco0301 => "0301",
+            Self::Fefco0302 => "0302",
+            Self::Fefco0303 => "0303",
+            Self::Fefco0306 => "0306",
+            Self::Fefco0312 => "0312",
+            Self::Fefco0401 => "0401",
+            Self::Fefco0402 => "0402",
+            Self::Fefco0403 => "0403",
+            Self::Fefco0409 => "0409",
+            Self::Fefco0410 => "0410",
+            Self::Fefco0415 => "0415",
+            Self::Fefco0421 => "0421",
+            Self::Fefco0422 => "0422",
+            Self::Fefco0426 => "0426",
+            Self::Fefco0427 => "0427",
+            Self::Fefco0501 => "0501",
+            Self::Fefco0502 => "0502",
+            Self::Fefco0711 => "0711",
+            Self::Fefco0713 => "0713",
+        }
+    }
+
+    /// Descriptive FEFCO template name.
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Fefco0200 => "0200 Half Slotted Carton (HSC)",
+            Self::Fefco0201 => "0201 Regular Slotted Carton (RSC)",
+            Self::Fefco0202 => "0202 Overlap Slotted Carton",
+            Self::Fefco0203 => "0203 Full Overlap Slotted (FOL)",
+            Self::Fefco0204 => "0204 Center Special Slotted (CSSC)",
+            Self::Fefco0205 => "0205 Center Special Overlap (CSO)",
+            Self::Fefco0206 => "0206 Center Special Full Overlap",
+            Self::Fefco0209 => "0209 Short-Flap Slotted Carton",
+            Self::Fefco0210 => "0210 Tuck-Top Half-Slotted",
+            Self::Fefco0211 => "0211 Reverse-Tuck Slotted Carton",
+            Self::Fefco0212 => "0212 Tuck-Top Snap-Lock Base",
+            Self::Fefco0215 => "0215 Tuck-Top Crash-Lock Base",
+            Self::Fefco0216 => "0216 Lock-Tab Bottom Slotted",
+            Self::Fefco0218 => "0218 Display Slotted Carton",
+            Self::Fefco0300 => "0300 Telescoping Tray + Lid",
+            Self::Fefco0301 => "0301 Full-Depth Telescoping Box",
+            Self::Fefco0302 => "0302 Slotted Lid + Corner-Cut Tray",
+            Self::Fefco0303 => "0303 Shallow Cap Telescoping Box",
+            Self::Fefco0306 => "0306 Two-Piece Sleeve & Tray",
+            Self::Fefco0312 => "0312 Locking-Tab Telescoping Box",
+            Self::Fefco0401 => "0401 One-Piece Folder",
+            Self::Fefco0402 => "0402 Wrap-Around Book Folder",
+            Self::Fefco0403 => "0403 Five-Panel Folder",
+            Self::Fefco0409 => "0409 Scored Roll-End Folder",
+            Self::Fefco0410 => "0410 Book-Wrap Mailer",
+            Self::Fefco0415 => "0415 Self-Locking Die-Cut Folder",
+            Self::Fefco0421 => "0421 Roll-End Tuck-Top Tray",
+            Self::Fefco0422 => "0422 Front-Lock Mailer Box",
+            Self::Fefco0426 => "0426 Pizza / Tab-Lock Mailer",
+            Self::Fefco0427 => "0427 Ear-Lock Mailer Box",
+            Self::Fefco0501 => "0501 Single-Wall Slide Sleeve",
+            Self::Fefco0502 => "0502 Double-Slide Sleeve Box",
+            Self::Fefco0711 => "0711 Pre-Glued Crash-Lock Carton",
+            Self::Fefco0713 => "0713 Pre-Glued Tuck Crash-Lock",
+        }
+    }
+
+    /// Parses a FEFCO code string such as `"0201"` or `"FEFCO-0427"`.
+    #[must_use]
+    pub fn parse_code(raw: &str) -> Option<Self> {
+        let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+        Self::ALL.iter().copied().find(|c| c.code_str() == digits)
+    }
+}
+
 /// Supported parametric packaging dieline templates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DielineKind {
@@ -218,6 +424,15 @@ pub enum DielineKind {
         cols: u32,
         rows: u32,
         gap_mm: f64,
+    },
+    /// Parametric FEFCO corrugated/carton packaging template with board-thickness (`FluteType`) compensation.
+    Fefco {
+        code: FefcoCode,
+        length_mm: f64,
+        width_mm: f64,
+        height_mm: f64,
+        flute: FluteType,
+        custom_caliper_mm: Option<f64>,
     },
 }
 
@@ -320,6 +535,21 @@ pub fn generate_dieline(
             rows,
             gap_mm,
         } => build_sticker_sheet(label_w_mm, label_h_mm, corner_r_mm, cols, rows, gap_mm)?,
+        DielineKind::Fefco {
+            code,
+            length_mm,
+            width_mm,
+            height_mm,
+            flute,
+            custom_caliper_mm,
+        } => generate_fefco_dieline(
+            code,
+            length_mm,
+            width_mm,
+            height_mm,
+            flute,
+            custom_caliper_mm,
+        )?,
     };
 
     let cut_layer_id = find_or_create_layer(doc, page_index, "Cut", true)?;
@@ -809,6 +1039,447 @@ fn build_sticker_sheet(
     Ok((cut_paths, crease_paths))
 }
 
+/// Parametric FEFCO dieline generator supporting 34 FEFCO codes (`0200`..`0713`) with
+/// board-thickness (`caliper_mm`) fold allowance compensation for `E`/`B`/`C`/`BC` flutes.
+pub fn generate_fefco_dieline(
+    code: FefcoCode,
+    length_mm: f64,
+    width_mm: f64,
+    height_mm: f64,
+    flute: FluteType,
+    custom_caliper_mm: Option<f64>,
+) -> ProdResult<DielinePaths> {
+    check_pos("length_mm", length_mm)?;
+    check_pos("width_mm", width_mm)?;
+    check_pos("height_mm", height_mm)?;
+    let caliper = custom_caliper_mm.unwrap_or_else(|| flute.caliper_mm());
+    check_non_neg("caliper_mm", caliper)?;
+
+    // Board thickness compensation: inside-to-score fold allowances
+    let l_eff = length_mm + caliper * 1.5;
+    let w_eff = width_mm + caliper * 1.5;
+    let h_eff = height_mm + caliper * 2.0;
+    let slot_w = (caliper.max(1.0) * 1.1).clamp(1.0, 12.0);
+    let glue_tab = (w_eff * 0.25).clamp(25.0, 45.0);
+
+    let build_slotted_box = |top_flap: f64,
+                             bot_flap: f64,
+                             inner_top: f64,
+                             inner_bot: f64,
+                             has_tuck_top: bool,
+                             has_lock_bot: bool,
+                             cutout_display: bool|
+     -> DielinePaths {
+        let x0 = 0.0;
+        let x1 = glue_tab;
+        let x2 = x1 + l_eff;
+        let x3 = x2 + w_eff;
+        let x4 = x3 + l_eff;
+        let x5 = x4 + w_eff;
+        let y_top = 0.0;
+        let y1 = top_flap.max(inner_top);
+        let y2 = y1 + h_eff;
+        let y_bot = y2 + bot_flap.max(inner_bot);
+
+        let mut pts = Vec::new();
+        pts.push(Point2D::new(x0, y1 + 4.0));
+        pts.push(Point2D::new(x1, y1));
+        // Top flaps across 4 panels (with slot notches)
+        let panels = [
+            (x1, x2, top_flap),
+            (x2, x3, inner_top),
+            (x3, x4, top_flap),
+            (x4, x5, inner_top),
+        ];
+        for (idx, &(pa, pb, fl)) in panels.iter().enumerate() {
+            if fl > 0.0 {
+                let fy = y1 - fl;
+                let sl = if idx > 0 { slot_w * 0.5 } else { 0.0 };
+                let sr = if idx < 3 { slot_w * 0.5 } else { 0.0 };
+                pts.push(Point2D::new(pa + sl, y1));
+                pts.push(Point2D::new(pa + sl, fy));
+                if has_tuck_top && idx == 2 {
+                    let tuck_h = (w_eff * 0.22).clamp(10.0, 24.0);
+                    pts.push(Point2D::new(pa + sl + 3.0, fy - tuck_h));
+                    pts.push(Point2D::new(pb - sr - 3.0, fy - tuck_h));
+                }
+                pts.push(Point2D::new(pb - sr, fy));
+                pts.push(Point2D::new(pb - sr, y1));
+            } else {
+                pts.push(Point2D::new(pa, y1));
+                pts.push(Point2D::new(pb, y1));
+            }
+        }
+        // Bottom flaps across 4 panels
+        let bpanels = [
+            (x4, x5, inner_bot),
+            (x3, x4, bot_flap),
+            (x2, x3, inner_bot),
+            (x1, x2, bot_flap),
+        ];
+        for (idx, &(pa, pb, fl)) in bpanels.iter().enumerate() {
+            if fl > 0.0 {
+                let fy = y2 + fl;
+                let sl = if idx > 0 { slot_w * 0.5 } else { 0.0 };
+                let sr = if idx < 3 { slot_w * 0.5 } else { 0.0 };
+                pts.push(Point2D::new(pb - sr, y2));
+                let lock_ext = if has_lock_bot && idx == 1 { 6.0 } else { 0.0 };
+                pts.push(Point2D::new(pb - sr, fy + lock_ext));
+                pts.push(Point2D::new(pa + sl, fy + lock_ext));
+                pts.push(Point2D::new(pa + sl, y2));
+            } else {
+                pts.push(Point2D::new(pb, y2));
+                pts.push(Point2D::new(pa, y2));
+            }
+        }
+        pts.push(Point2D::new(x1, y2));
+        pts.push(Point2D::new(x0, y2 - 4.0));
+        let _ = (y_top, y_bot);
+
+        let mut cuts = vec![(
+            format!("FEFCO {} Outer Cut", code.code_str()),
+            BezierPath::from_polygon(pts, true),
+        )];
+        if cutout_display {
+            let win = Rect2D::from_xywh(
+                x1 + l_eff * 0.15,
+                y1 + h_eff * 0.15,
+                l_eff * 0.7,
+                h_eff * 0.45,
+            );
+            cuts.push((
+                format!("FEFCO {} Display Window", code.code_str()),
+                BezierPath::from_rect(win),
+            ));
+        }
+
+        let mut creases = vec![
+            (
+                "Crease Glue".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y1), Point2D::new(x1, y2)),
+            ),
+            (
+                "Crease Fold 1".to_owned(),
+                BezierPath::from_line(Point2D::new(x2, y1), Point2D::new(x2, y2)),
+            ),
+            (
+                "Crease Fold 2".to_owned(),
+                BezierPath::from_line(Point2D::new(x3, y1), Point2D::new(x3, y2)),
+            ),
+            (
+                "Crease Fold 3".to_owned(),
+                BezierPath::from_line(Point2D::new(x4, y1), Point2D::new(x4, y2)),
+            ),
+        ];
+        if top_flap.max(inner_top) > 0.0 {
+            creases.push((
+                "Crease Top Score".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y1), Point2D::new(x5, y1)),
+            ));
+        }
+        if bot_flap.max(inner_bot) > 0.0 {
+            creases.push((
+                "Crease Bottom Score".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y2), Point2D::new(x5, y2)),
+            ));
+        }
+        (cuts, creases)
+    };
+
+    let build_tray_or_folder =
+        |wall_h: f64, lid_l: f64, ear_w: f64, double_piece: bool| -> DielinePaths {
+            let wall = wall_h + caliper;
+            let x0 = 0.0;
+            let x1 = wall;
+            let x2 = x1 + l_eff;
+            let x3 = x2 + wall;
+            let y0 = 0.0;
+            let y1 = wall;
+            let y2 = y1 + w_eff;
+            let y3 = y2 + wall;
+            let y4 = y3 + lid_l;
+
+            let mut cuts = Vec::new();
+            let mut creases = Vec::new();
+
+            let tray_pts = vec![
+                Point2D::new(x1, y0),
+                Point2D::new(x2, y0),
+                Point2D::new(x2, y1 - ear_w),
+                Point2D::new(x3, y1),
+                Point2D::new(x3, y2),
+                Point2D::new(x2 + ear_w, y2),
+                Point2D::new(x2, y4),
+                Point2D::new(x1, y4),
+                Point2D::new(x1 - ear_w, y2),
+                Point2D::new(x0, y2),
+                Point2D::new(x0, y1),
+                Point2D::new(x1, y1 - ear_w),
+            ];
+            cuts.push((
+                format!("FEFCO {} Base Cut", code.code_str()),
+                BezierPath::from_polygon(tray_pts, true),
+            ));
+            creases.push((
+                "Tray Top Fold".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y1), Point2D::new(x2, y1)),
+            ));
+            creases.push((
+                "Tray Bottom Fold".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y2), Point2D::new(x2, y2)),
+            ));
+            creases.push((
+                "Tray Left Fold".to_owned(),
+                BezierPath::from_line(Point2D::new(x1, y1), Point2D::new(x1, y2)),
+            ));
+            creases.push((
+                "Tray Right Fold".to_owned(),
+                BezierPath::from_line(Point2D::new(x2, y1), Point2D::new(x2, y2)),
+            ));
+            if lid_l > 1.0 {
+                creases.push((
+                    "Tray Lid Fold".to_owned(),
+                    BezierPath::from_line(Point2D::new(x1, y3), Point2D::new(x2, y3)),
+                ));
+            }
+
+            if double_piece {
+                let lid_off_x = x3 + 20.0;
+                let lid_l_out = l_eff + caliper * 3.0;
+                let lid_w_out = w_eff + caliper * 3.0;
+                let lx0 = lid_off_x;
+                let lx1 = lx0 + wall;
+                let lx2 = lx1 + lid_l_out;
+                let lx3 = lx2 + wall;
+                let lid_pts = vec![
+                    Point2D::new(lx1, y0),
+                    Point2D::new(lx2, y0),
+                    Point2D::new(lx2, y1),
+                    Point2D::new(lx3, y1),
+                    Point2D::new(lx3, y1 + lid_w_out),
+                    Point2D::new(lx2, y1 + lid_w_out),
+                    Point2D::new(lx2, y1 + lid_w_out + wall),
+                    Point2D::new(lx1, y1 + lid_w_out + wall),
+                    Point2D::new(lx1, y1 + lid_w_out),
+                    Point2D::new(lx0, y1 + lid_w_out),
+                    Point2D::new(lx0, y1),
+                    Point2D::new(lx1, y1),
+                ];
+                cuts.push((
+                    format!("FEFCO {} Lid Cut", code.code_str()),
+                    BezierPath::from_polygon(lid_pts, true),
+                ));
+                creases.push((
+                    "Lid Fold Top".to_owned(),
+                    BezierPath::from_line(Point2D::new(lx1, y1), Point2D::new(lx2, y1)),
+                ));
+                creases.push((
+                    "Lid Fold Bot".to_owned(),
+                    BezierPath::from_line(
+                        Point2D::new(lx1, y1 + lid_w_out),
+                        Point2D::new(lx2, y1 + lid_w_out),
+                    ),
+                ));
+                creases.push((
+                    "Lid Fold Left".to_owned(),
+                    BezierPath::from_line(Point2D::new(lx1, y1), Point2D::new(lx1, y1 + lid_w_out)),
+                ));
+                creases.push((
+                    "Lid Fold Right".to_owned(),
+                    BezierPath::from_line(Point2D::new(lx2, y1), Point2D::new(lx2, y1 + lid_w_out)),
+                ));
+            }
+            (cuts, creases)
+        };
+
+    let build_slide_or_crash = |panels: usize, has_crash_diag: bool| -> DielinePaths {
+        let total_w = glue_tab + 2.0 * l_eff + 2.0 * w_eff;
+        let top_h = if panels >= 5 { w_eff } else { w_eff * 0.55 };
+        let bot_h = if has_crash_diag { w_eff * 0.65 } else { 0.0 };
+        let total_h = top_h + h_eff + bot_h;
+        let cuts = vec![(
+            format!("FEFCO {} Shell Cut", code.code_str()),
+            BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, total_w, total_h)),
+        )];
+        let mut creases = vec![
+            (
+                "Crease G".to_owned(),
+                BezierPath::from_line(Point2D::new(glue_tab, 0.0), Point2D::new(glue_tab, total_h)),
+            ),
+            (
+                "Crease L1".to_owned(),
+                BezierPath::from_line(
+                    Point2D::new(glue_tab + l_eff, 0.0),
+                    Point2D::new(glue_tab + l_eff, total_h),
+                ),
+            ),
+            (
+                "Crease W1".to_owned(),
+                BezierPath::from_line(
+                    Point2D::new(glue_tab + l_eff + w_eff, 0.0),
+                    Point2D::new(glue_tab + l_eff + w_eff, total_h),
+                ),
+            ),
+            (
+                "Crease L2".to_owned(),
+                BezierPath::from_line(
+                    Point2D::new(glue_tab + 2.0 * l_eff + w_eff, 0.0),
+                    Point2D::new(glue_tab + 2.0 * l_eff + w_eff, total_h),
+                ),
+            ),
+            (
+                "Crease Top".to_owned(),
+                BezierPath::from_line(Point2D::new(0.0, top_h), Point2D::new(total_w, top_h)),
+            ),
+        ];
+        if bot_h > 0.0 {
+            let yb = top_h + h_eff;
+            creases.push((
+                "Crease Bot".to_owned(),
+                BezierPath::from_line(Point2D::new(0.0, yb), Point2D::new(total_w, yb)),
+            ));
+            if has_crash_diag {
+                creases.push((
+                    "CrashLock Diag".to_owned(),
+                    BezierPath::from_line(
+                        Point2D::new(glue_tab, yb),
+                        Point2D::new(glue_tab + w_eff * 0.5, total_h),
+                    ),
+                ));
+            }
+        }
+        (cuts, creases)
+    };
+
+    let (cuts, creases) = match code {
+        FefcoCode::Fefco0200 => {
+            build_slotted_box(0.0, w_eff * 0.5, 0.0, w_eff * 0.5, false, false, false)
+        }
+        FefcoCode::Fefco0201 => build_slotted_box(
+            w_eff * 0.5,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            false,
+            false,
+            false,
+        ),
+        FefcoCode::Fefco0202 => build_slotted_box(
+            w_eff * 0.65,
+            w_eff * 0.65,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            false,
+            false,
+            false,
+        ),
+        FefcoCode::Fefco0203 => {
+            build_slotted_box(w_eff, w_eff, w_eff * 0.5, w_eff * 0.5, false, false, false)
+        }
+        FefcoCode::Fefco0204 => build_slotted_box(
+            w_eff * 0.5,
+            w_eff * 0.5,
+            l_eff * 0.5,
+            l_eff * 0.5,
+            false,
+            false,
+            false,
+        ),
+        FefcoCode::Fefco0205 => build_slotted_box(
+            w_eff * 0.65,
+            w_eff * 0.65,
+            l_eff * 0.5,
+            l_eff * 0.5,
+            false,
+            false,
+            false,
+        ),
+        FefcoCode::Fefco0206 => {
+            build_slotted_box(w_eff, w_eff, l_eff * 0.5, l_eff * 0.5, false, false, false)
+        }
+        FefcoCode::Fefco0209 => build_slotted_box(
+            w_eff * 0.35,
+            w_eff * 0.5,
+            w_eff * 0.35,
+            w_eff * 0.5,
+            false,
+            false,
+            false,
+        ),
+        FefcoCode::Fefco0210 => {
+            build_slotted_box(w_eff * 0.85, 0.0, w_eff * 0.45, 0.0, true, false, false)
+        }
+        FefcoCode::Fefco0211 => {
+            build_slotted_box(w_eff, w_eff, w_eff * 0.45, w_eff * 0.45, true, false, false)
+        }
+        FefcoCode::Fefco0212 => build_slotted_box(
+            w_eff,
+            w_eff * 0.6,
+            w_eff * 0.45,
+            w_eff * 0.5,
+            true,
+            true,
+            false,
+        ),
+        FefcoCode::Fefco0215 => build_slotted_box(
+            w_eff,
+            w_eff * 0.65,
+            w_eff * 0.45,
+            w_eff * 0.65,
+            true,
+            true,
+            false,
+        ),
+        FefcoCode::Fefco0216 => build_slotted_box(
+            w_eff * 0.5,
+            w_eff * 0.7,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            false,
+            true,
+            false,
+        ),
+        FefcoCode::Fefco0218 => build_slotted_box(
+            w_eff * 0.5,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            w_eff * 0.5,
+            false,
+            false,
+            true,
+        ),
+        FefcoCode::Fefco0300 => build_tray_or_folder(h_eff, 0.0, (h_eff * 0.3).min(20.0), true),
+        FefcoCode::Fefco0301 => build_tray_or_folder(h_eff, 0.0, (h_eff * 0.2).min(15.0), true),
+        FefcoCode::Fefco0302 => {
+            build_tray_or_folder(h_eff * 0.85, 0.0, (h_eff * 0.35).min(22.0), true)
+        }
+        FefcoCode::Fefco0303 => {
+            build_tray_or_folder(h_eff * 0.45, 0.0, (h_eff * 0.25).min(15.0), true)
+        }
+        FefcoCode::Fefco0306 => {
+            build_tray_or_folder(h_eff * 0.9, w_eff * 0.5, (h_eff * 0.25).min(16.0), true)
+        }
+        FefcoCode::Fefco0312 => {
+            build_tray_or_folder(h_eff * 0.75, 0.0, (h_eff * 0.4).min(25.0), true)
+        }
+        FefcoCode::Fefco0401 => build_tray_or_folder(h_eff, w_eff * 0.5, 0.0, false),
+        FefcoCode::Fefco0402 => build_tray_or_folder(h_eff, w_eff, 0.0, false),
+        FefcoCode::Fefco0403 => build_slide_or_crash(5, false),
+        FefcoCode::Fefco0409 => build_tray_or_folder(h_eff * 0.8, w_eff * 0.8, 8.0, false),
+        FefcoCode::Fefco0410 => build_tray_or_folder(h_eff * 0.65, w_eff * 0.9, 10.0, false),
+        FefcoCode::Fefco0415 => build_tray_or_folder(h_eff, w_eff * 0.95, 12.0, false),
+        FefcoCode::Fefco0421 => build_tray_or_folder(h_eff, w_eff + 18.0, 14.0, false),
+        FefcoCode::Fefco0422 => build_tray_or_folder(h_eff, w_eff + 22.0, 16.0, false),
+        FefcoCode::Fefco0426 => build_tray_or_folder(h_eff * 0.9, w_eff + 15.0, 15.0, false),
+        FefcoCode::Fefco0427 => build_tray_or_folder(h_eff, w_eff + 24.0, 18.0, false),
+        FefcoCode::Fefco0501 => build_slide_or_crash(4, false),
+        FefcoCode::Fefco0502 => build_slide_or_crash(5, false),
+        FefcoCode::Fefco0711 => build_slide_or_crash(4, true),
+        FefcoCode::Fefco0713 => build_slide_or_crash(5, true),
+    };
+    Ok((cuts, creases))
+}
+
 // =============================================================================
 // Path Length & Area Meter
 // =============================================================================
@@ -1078,8 +1749,12 @@ fn compose_prod_parent_persp(
     }
 }
 
-fn container_own_persp(doc: &Document, obj: &SceneObject) -> Option<Perspective3x3> {
-    crate::scene_helpers::container_own_persp(doc, obj, None)
+fn container_own_persp(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+) -> Option<Perspective3x3> {
+    crate::scene_helpers::container_own_persp(doc, obj, sym_ctx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1151,8 +1826,8 @@ fn accumulate_scene_object_metrics(
 
     match &obj.payload {
         NodePayload::Clone { .. } => {
-            if let Some((eff_payload, eff_fill, eff_outline)) =
-                doc.resolve_clone_payload_and_style(obj)
+            if let Some((eff_payload, eff_fill, eff_outline, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
             {
                 let mut tmp = obj.clone();
                 tmp.payload = eff_payload;
@@ -1167,7 +1842,7 @@ fn accumulate_scene_object_metrics(
                     parent_persp,
                     clip_bounds,
                     depth + 1,
-                    sym_ctx,
+                    if in_sym { sym_ctx } else { None },
                     visited,
                     visiting_syms,
                     metrics,
@@ -1177,7 +1852,7 @@ fn accumulate_scene_object_metrics(
             return;
         }
         NodePayload::Group(children) => {
-            let own_persp = container_own_persp(doc, obj);
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
             let child_persp =
                 compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in children {
@@ -1214,7 +1889,7 @@ fn accumulate_scene_object_metrics(
                 (None, None) => None,
             };
             record_path_metrics(obj, layer, &path, clip_bounds, metrics, cut_subpaths);
-            let own_persp = container_own_persp(doc, obj);
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
             let child_persp =
                 compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in contents {
@@ -1239,7 +1914,7 @@ fn accumulate_scene_object_metrics(
             if !visiting_syms.insert(*sym_id) {
                 return;
             }
-            let own_persp = container_own_persp(doc, obj);
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
             let child_persp =
                 compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             if let Some(sym) = doc.symbol(*sym_id) {
@@ -1709,5 +2384,71 @@ mod tests {
         assert!((m.material_utilization_pct - 100.0).abs() < 1e-2);
         assert!(m.estimated_laser_time_sec > 0.0);
         assert!(m.estimated_vinyl_time_sec > 0.0);
+    }
+
+    #[test]
+    fn fefco_templates_and_flute_compensation_generate_distinct_cut_and_crease_geometry() {
+        assert!(FefcoCode::ALL.len() >= 30);
+        let mut widths = HashSet::new();
+        for &code in &FefcoCode::ALL {
+            let mut doc = Document::new_a4("FEFCO");
+            let res = generate_dieline(
+                &mut doc,
+                0,
+                &DielineKind::Fefco {
+                    code,
+                    length_mm: 120.0,
+                    width_mm: 80.0,
+                    height_mm: 60.0,
+                    flute: FluteType::B,
+                    custom_caliper_mm: None,
+                },
+                Point2D::new(10.0, 10.0),
+            )
+            .unwrap();
+            assert!(!res.cut_object_ids.is_empty(), "{code:?} missing cut");
+            assert!(!res.crease_object_ids.is_empty(), "{code:?} missing crease");
+            assert!(res.cut_length_mm > 50.0);
+            assert!(res.crease_length_mm > 20.0);
+            widths.insert((
+                res.flat_bounds.width().round() as i64,
+                res.flat_bounds.height().round() as i64,
+            ));
+        }
+        assert!(widths.len() >= 10);
+
+        // Verify flute caliper thickness expands panel dimensions cleanly
+        let mut doc_e = Document::new_a4("E-Flute");
+        let res_e = generate_dieline(
+            &mut doc_e,
+            0,
+            &DielineKind::Fefco {
+                code: FefcoCode::Fefco0201,
+                length_mm: 120.0,
+                width_mm: 80.0,
+                height_mm: 60.0,
+                flute: FluteType::E,
+                custom_caliper_mm: None,
+            },
+            Point2D::ZERO,
+        )
+        .unwrap();
+        let mut doc_bc = Document::new_a4("BC-Flute");
+        let res_bc = generate_dieline(
+            &mut doc_bc,
+            0,
+            &DielineKind::Fefco {
+                code: FefcoCode::Fefco0201,
+                length_mm: 120.0,
+                width_mm: 80.0,
+                height_mm: 60.0,
+                flute: FluteType::Bc,
+                custom_caliper_mm: None,
+            },
+            Point2D::ZERO,
+        )
+        .unwrap();
+        assert!(res_bc.flat_bounds.width() > res_e.flat_bounds.width());
+        assert!(res_bc.flat_bounds.height() > res_e.flat_bounds.height());
     }
 }

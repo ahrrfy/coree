@@ -27,9 +27,10 @@ use coree_core::{
 use coree_prod::{
     builtin_macros, default_laser_layer_rules, export_laser_dxf_r12, export_laser_gcode,
     export_laser_plt, export_laser_svg, plan_laser_toolpath, plan_rhai_plugin_ops,
-    BarcodeSymbology, FindScope, GcodeDialect, LaserLayerRule, LaserOperationKind, LaserOrigin,
-    LensKindFilter, MacroSandboxConfig, ObjectKindFilter, PluginKind, PluginManifest,
-    PreflightSeverity, QrErrorCorrection, ReplaceAction,
+    BarcodeSymbology, Code128Mode, FefcoCode, FindScope, FluteType, GcodeDialect, HalftoneDotShape,
+    LaserLayerRule, LaserOperationKind, LaserOrigin, LensKindFilter, MacroSandboxConfig,
+    ObjectKindFilter, OpenLaserProtocol, PluginKind, PluginManifest, PreflightSeverity,
+    QrErrorCorrection, ReplaceAction, TrapPlacement,
 };
 use coree_render::{list_glyphs_for_block, GlyphBlockFilter, OutlinePreset, ToneRange};
 use egui::{
@@ -2127,6 +2128,12 @@ fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
     ui.add(egui::Slider::new(&mut tr.detail, 0.1..=1.0).text("Detail"));
     ui.add(egui::Slider::new(&mut tr.smoothing, 0.0..=1.0).text("Smoothing"));
     ui.add(egui::Slider::new(&mut tr.corner_threshold, 10.0..=160.0).text("Corner°"));
+    ui.add(
+        DragValue::new(&mut tr.speckle_size)
+            .range(0..=1024)
+            .prefix("Despeckle: ")
+            .suffix(" px"),
+    );
     ui.checkbox(&mut tr.remove_background, "Remove Background");
 
     ui.add_space(6.0);
@@ -2292,6 +2299,25 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
             app.convert_selected_bitmap_color_mode(coree_core::ColorMode::Rgb);
         }
     });
+    ui.separator();
+    ui.label(RichText::new("Cutout Lab (Alpha Matting)").strong());
+    ui.horizontal(|ui| {
+        ui.add(
+            DragValue::new(&mut app.bitmap_state.cutout_bg_threshold)
+                .range(1.0..=150.0)
+                .prefix("BG Tol: "),
+        );
+        ui.add(
+            DragValue::new(&mut app.bitmap_state.cutout_feather_px)
+                .range(0.0..=24.0)
+                .speed(0.1)
+                .prefix("Feather: ")
+                .suffix("px"),
+        );
+        if ui.button("Cutout Lab").clicked() {
+            app.run_cutout_lab_active();
+        }
+    });
     if let Some(hist) = app.selected_bitmap_histogram(16) {
         ui.label(
             RichText::new(format!(
@@ -2402,6 +2428,15 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                 if ui.button("Compute Separations").clicked() {
                     app.compute_separations_active();
                 }
+                if ui.button("Export Plates PDF...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PDF", &["pdf"])
+                        .set_file_name("separations_plates.pdf")
+                        .save_file()
+                    {
+                        app.export_separated_plates_pdf_active(&path);
+                    }
+                }
                 if let Some(tab) = app.active_tab_mut() {
                     if ui
                         .checkbox(&mut tab.overprint_preview, "Overprint")
@@ -2409,6 +2444,62 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                     {
                         tab.needs_rerender = true;
                     }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(&mut app.production_state.trap_width_mm)
+                        .range(0.01..=3.0)
+                        .speed(0.01)
+                        .prefix("Trap: ")
+                        .suffix(" mm"),
+                );
+                ComboBox::from_id_salt("trap_place_combo")
+                    .width(96.0)
+                    .selected_text(format!("{:?}", app.production_state.trap_placement))
+                    .show_ui(ui, |ui| {
+                        for p in [
+                            TrapPlacement::Centerline,
+                            TrapPlacement::Spread,
+                            TrapPlacement::Choke,
+                        ] {
+                            ui.selectable_value(
+                                &mut app.production_state.trap_placement,
+                                p,
+                                format!("{p:?}"),
+                            );
+                        }
+                    });
+                if ui.button("Apply Trapping").clicked() {
+                    app.apply_trapping_active();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(&mut app.production_state.halftone_lpi)
+                        .range(10.0..=300.0)
+                        .prefix("LPI: "),
+                );
+                ComboBox::from_id_salt("halftone_shape_combo")
+                    .width(92.0)
+                    .selected_text(format!("{:?}", app.production_state.halftone_shape))
+                    .show_ui(ui, |ui| {
+                        for sh in [
+                            HalftoneDotShape::Round,
+                            HalftoneDotShape::Elliptical,
+                            HalftoneDotShape::Diamond,
+                            HalftoneDotShape::Square,
+                            HalftoneDotShape::Line,
+                        ] {
+                            ui.selectable_value(
+                                &mut app.production_state.halftone_shape,
+                                sh,
+                                format!("{sh:?}"),
+                            );
+                        }
+                    });
+                if ui.button("Halftone Screen").clicked() {
+                    app.apply_halftone_preview_active();
                 }
             });
             if let Some(sep) = app
@@ -2425,11 +2516,49 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
             ui.separator();
             ui.label(RichText::new("Imposition").strong());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut app.production_state.imposition_kind, 0, "N-Up");
                 ui.selectable_value(&mut app.production_state.imposition_kind, 1, "Booklet");
                 ui.selectable_value(&mut app.production_state.imposition_kind, 2, "Tiling");
+                ui.selectable_value(
+                    &mut app.production_state.imposition_kind,
+                    3,
+                    "Perfect-Bound",
+                );
             });
+            if app.production_state.imposition_kind == 3 {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        DragValue::new(&mut app.production_state.imposition_signature_pages)
+                            .range(4..=64)
+                            .prefix("Sig: ")
+                            .suffix(" pp"),
+                    );
+                    ui.add(
+                        DragValue::new(&mut app.production_state.spine_thickness_mm)
+                            .range(0.0..=80.0)
+                            .speed(0.2)
+                            .prefix("Spine: ")
+                            .suffix(" mm"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        DragValue::new(&mut app.production_state.creep_mm)
+                            .range(0.0..=10.0)
+                            .speed(0.1)
+                            .prefix("Creep: ")
+                            .suffix(" mm"),
+                    );
+                    ui.add(
+                        DragValue::new(&mut app.production_state.milling_allowance_mm)
+                            .range(0.0..=10.0)
+                            .speed(0.1)
+                            .prefix("Mill: ")
+                            .suffix(" mm"),
+                    );
+                });
+            }
             ui.horizontal(|ui| {
                 ui.add(
                     DragValue::new(&mut app.production_state.nup_cols)
@@ -2479,7 +2608,42 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                 ui.selectable_value(&mut app.production_state.dieline_type, 1, "Envelope");
                 ui.selectable_value(&mut app.production_state.dieline_type, 2, "Bag");
                 ui.selectable_value(&mut app.production_state.dieline_type, 3, "Stickers");
+                ui.selectable_value(&mut app.production_state.dieline_type, 4, "FEFCO");
             });
+            if app.production_state.dieline_type == 4 {
+                ui.horizontal(|ui| {
+                    ComboBox::from_id_salt("fefco_code_combo")
+                        .width(120.0)
+                        .selected_text(format!("{:?}", app.production_state.fefco_code))
+                        .show_ui(ui, |ui| {
+                            for code in FefcoCode::ALL {
+                                ui.selectable_value(
+                                    &mut app.production_state.fefco_code,
+                                    code,
+                                    format!("{code:?}"),
+                                );
+                            }
+                        });
+                    ComboBox::from_id_salt("flute_type_combo")
+                        .width(80.0)
+                        .selected_text(format!("{:?}", app.production_state.flute_type))
+                        .show_ui(ui, |ui| {
+                            for f in [
+                                FluteType::None,
+                                FluteType::E,
+                                FluteType::B,
+                                FluteType::C,
+                                FluteType::Bc,
+                            ] {
+                                ui.selectable_value(
+                                    &mut app.production_state.flute_type,
+                                    f,
+                                    format!("{f:?}"),
+                                );
+                            }
+                        });
+                });
+            }
             ui.horizontal(|ui| {
                 ui.add(
                     DragValue::new(&mut app.production_state.box_l_mm)
@@ -2519,8 +2683,8 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         }
         3 => {
-            // Vector Barcode & QR Generator
-            ui.label(RichText::new("1D Vector Barcode").strong());
+            // Vector 1D / 2D Barcode & QR Generator
+            ui.label(RichText::new("1D / 2D Vector Barcode").strong());
             ComboBox::from_id_salt("barcode_sym_combo")
                 .selected_text(format!("{:?}", app.production_state.barcode_symbology))
                 .show_ui(ui, |ui| {
@@ -2530,6 +2694,10 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                         BarcodeSymbology::UpcA,
                         BarcodeSymbology::Code128,
                         BarcodeSymbology::Code39,
+                        BarcodeSymbology::Gs1128,
+                        BarcodeSymbology::DataMatrix,
+                        BarcodeSymbology::Pdf417,
+                        BarcodeSymbology::Aztec,
                     ] {
                         ui.selectable_value(
                             &mut app.production_state.barcode_symbology,
@@ -2538,6 +2706,37 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                         );
                     }
                 });
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(&mut app.production_state.barcode_bwr_mm)
+                        .range(0.0..=0.5)
+                        .speed(0.005)
+                        .prefix("BWR: ")
+                        .suffix(" mm"),
+                );
+                if matches!(
+                    app.production_state.barcode_symbology,
+                    BarcodeSymbology::Code128 | BarcodeSymbology::Gs1128
+                ) {
+                    ComboBox::from_id_salt("code128_mode_combo")
+                        .width(88.0)
+                        .selected_text(format!("{:?}", app.production_state.code128_mode))
+                        .show_ui(ui, |ui| {
+                            for m in [
+                                Code128Mode::Auto,
+                                Code128Mode::SubsetA,
+                                Code128Mode::SubsetB,
+                                Code128Mode::SubsetC,
+                            ] {
+                                ui.selectable_value(
+                                    &mut app.production_state.code128_mode,
+                                    m,
+                                    format!("{m:?}"),
+                                );
+                            }
+                        });
+                }
+            });
             ui.text_edit_singleline(&mut app.production_state.barcode_payload);
             if ui.button("Insert Vector Barcode").clicked() {
                 app.insert_barcode_active();
@@ -2612,6 +2811,38 @@ fn ui_production_docker(ui: &mut Ui, app: &mut StudioApp) {
                 if ui.button("Collect Bundle").clicked() {
                     let dir = PathBuf::from(app.production_state.collect_dir_text.trim());
                     app.run_collect_for_output(&dir);
+                }
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Open Laser Controller Stream").strong());
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("open_laser_proto_combo")
+                    .width(140.0)
+                    .selected_text(format!("{:?}", app.production_state.laser_protocol))
+                    .show_ui(ui, |ui| {
+                        for proto in [
+                            OpenLaserProtocol::GrblStream,
+                            OpenLaserProtocol::MarlinStream,
+                            OpenLaserProtocol::RuidaRdPacket,
+                            OpenLaserProtocol::LightBurnLbrn2,
+                            OpenLaserProtocol::K40M2NanoEgv,
+                            OpenLaserProtocol::HpglStream,
+                        ] {
+                            ui.selectable_value(
+                                &mut app.production_state.laser_protocol,
+                                proto,
+                                format!("{proto:?}"),
+                            );
+                        }
+                    });
+                if ui.button("Export Laser Stream...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("laser_job.stream")
+                        .save_file()
+                    {
+                        app.export_laser_protocol_active(&path);
+                    }
                 }
             });
         }

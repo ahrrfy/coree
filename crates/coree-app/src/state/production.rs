@@ -53,6 +53,209 @@ impl StudioApp {
         }
     }
 
+    /// Exports vector CMYK + Spot color separation plates as a multi-page PDF.
+    pub fn export_separated_plates_pdf_active(&mut self, out_path: &Path) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let page_idx = tab.document.active_page_index();
+        match export_separated_plates_pdf(
+            &tab.document,
+            page_idx,
+            &SeparationOptions::default(),
+            out_path,
+        ) {
+            Ok(plates) => {
+                self.push_toast(
+                    format!(
+                        "Exported {} separated PDF plate(s) to {}",
+                        plates.len(),
+                        out_path.display()
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.push_toast(format!("Separated PDF failed: {e}"), true),
+        }
+    }
+
+    /// Applies prepress color trapping (`apply_trapping`) on the active page via `CommandHistory`.
+    pub fn apply_trapping_active(&mut self) {
+        let ps = &self.production_state;
+        let settings = TrappingSettings {
+            trap_width_mm: ps.trap_width_mm.clamp(0.01, 5.0),
+            placement: ps.trap_placement,
+            ..TrappingSettings::default()
+        };
+        let plan: Result<(Vec<CommandOp>, usize), String> = (|| {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let page_idx = tab.document.active_page_index();
+            let page_id = tab
+                .document
+                .page(page_idx)
+                .map(|p| p.id)
+                .ok_or_else(|| "active page out of range".to_owned())?;
+            let existing_layers: HashSet<LayerId> = tab
+                .document
+                .pages()
+                .iter()
+                .flat_map(|p| p.layers.iter().map(|l| l.id))
+                .collect();
+            let existing_obj_ids: HashSet<ObjectId> =
+                tab.document.objects().keys().copied().collect();
+
+            tab.history
+                .begin_transaction(&tab.document, "Prepress Trapping")
+                .map_err(|e| e.to_string())?;
+            let res = match apply_trapping(&mut tab.document, page_idx, &settings) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tab.history.cancel_transaction(&mut tab.document);
+                    return Err(e.to_string());
+                }
+            };
+
+            let mut ops = Vec::new();
+            if !res.traps.is_empty() {
+                if let Some(trap_layer) = tab.document.page(page_idx).and_then(|p| {
+                    p.layers
+                        .iter()
+                        .find(|l| l.name.eq_ignore_ascii_case("Prepress Traps"))
+                }) {
+                    let trap_layer_id = trap_layer.id;
+                    let trap_layer_name = trap_layer.name.clone();
+                    let trap_layer_cut = trap_layer.is_cut_layer;
+                    let trap_layer_scope = trap_layer.master_scope;
+                    let trap_obj_ids: Vec<ObjectId> = trap_layer
+                        .objects
+                        .iter()
+                        .copied()
+                        .filter(|oid| !existing_obj_ids.contains(oid))
+                        .collect();
+                    if !existing_layers.contains(&trap_layer_id) {
+                        ops.push(CommandOp::AddLayer {
+                            page_id,
+                            name: trap_layer_name,
+                            is_cut_layer: trap_layer_cut,
+                            master_scope: trap_layer_scope,
+                        });
+                    }
+                    for oid in trap_obj_ids {
+                        if let Some(obj) = tab.document.object(oid) {
+                            ops.push(CommandOp::create_object(obj.clone(), Some(trap_layer_id)));
+                        }
+                    }
+                }
+            }
+            let n = res.traps.len();
+            let _ = tab.history.cancel_transaction(&mut tab.document);
+            Ok((ops, n))
+        })();
+
+        match plan {
+            Ok((ops, n)) => {
+                if !ops.is_empty() {
+                    if let Err(e) = self.execute_command(CommandOp::Batch(ops)) {
+                        self.push_toast(format!("Trapping failed: {e}"), true);
+                        return;
+                    }
+                    self.checkpoint_wal_snapshot_active();
+                }
+                self.push_toast(format!("Generated {n} prepress trap zone(s)"), false);
+            }
+            Err(e) => {
+                if e != "no active document" {
+                    self.push_toast(format!("Trapping failed: {e}"), true);
+                }
+            }
+        }
+    }
+
+    /// Generates halftone screen preview across active separation plates.
+    pub fn apply_halftone_preview_active(&mut self) {
+        let ps = &self.production_state;
+        let lpi = ps.halftone_lpi.clamp(10.0, 400.0);
+        let shape = ps.halftone_shape;
+        let mut hs = HalftoneSettings::default();
+        hs.cyan.lpi = lpi;
+        hs.cyan.dot_shape = shape;
+        hs.magenta.lpi = lpi;
+        hs.magenta.dot_shape = shape;
+        hs.yellow.lpi = lpi;
+        hs.yellow.dot_shape = shape;
+        hs.black.lpi = lpi;
+        hs.black.dot_shape = shape;
+
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let page_idx = tab.document.active_page_index();
+        let sep = match tab.separations_preview.clone() {
+            Some(s) => s,
+            None => {
+                let mut te = TextEngine::new();
+                match compute_separations_with_text_outliner(
+                    &tab.document,
+                    page_idx,
+                    &SeparationOptions::default(),
+                    |obj, doc| outline_text_object_with_engine(&mut te, obj, doc),
+                ) {
+                    Ok(s) => {
+                        tab.separations_preview = Some(s.clone());
+                        s
+                    }
+                    Err(e) => {
+                        self.push_toast(format!("Halftone separations failed: {e}"), true);
+                        return;
+                    }
+                }
+            }
+        };
+        match generate_halftone_preview(&sep, &hs) {
+            Ok(plates) => {
+                self.push_toast(
+                    format!(
+                        "Halftone screened {} plate(s) at {:.0} LPI ({shape:?})",
+                        plates.len(),
+                        lpi
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.push_toast(format!("Halftone screening failed: {e}"), true),
+        }
+    }
+
+    /// Plans laser toolpaths and exports framed controller stream (`Grbl`/`Marlin`/`Ruida`/`LightBurn`/`EGV`).
+    pub fn export_laser_protocol_active(&mut self, out_path: &Path) {
+        let protocol = self.production_state.laser_protocol;
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let page_idx = tab.document.active_page_index();
+        let cfg = LaserJobConfig::default();
+        match plan_laser_toolpath(&tab.document, page_idx, None, &cfg) {
+            Ok(plan) => match frame_open_laser_protocol(&plan, &cfg, protocol) {
+                Ok(frame) => match std::fs::write(out_path, &frame.payload) {
+                    Ok(()) => self.push_toast(
+                        format!(
+                            "Exported {:?} ({} bytes) to {}",
+                            protocol,
+                            frame.payload.len(),
+                            out_path.display()
+                        ),
+                        false,
+                    ),
+                    Err(e) => self.push_toast(format!("Write failed: {e}"), true),
+                },
+                Err(e) => self.push_toast(format!("Laser framing failed: {e}"), true),
+            },
+            Err(e) => self.push_toast(format!("Laser toolpath failed: {e}"), true),
+        }
+    }
+
     /// One-click welded `CutContour` spot hairline around selected (or all) objects.
     pub fn generate_cut_contour_active(&mut self) {
         let offset = self.production_state.cut_offset_mm;
@@ -181,6 +384,14 @@ impl StudioApp {
                 rows: ps.sticker_rows.clamp(1, 20),
                 gap_mm: 4.0,
             },
+            4 => DielineKind::Fefco {
+                code: ps.fefco_code,
+                length_mm: ps.box_l_mm.max(20.0),
+                width_mm: ps.box_w_mm.max(15.0),
+                height_mm: ps.box_h_mm.max(20.0),
+                flute: ps.flute_type,
+                custom_caliper_mm: None,
+            },
             _ => DielineKind::TuckEndBox {
                 length_mm: ps.box_l_mm.max(20.0),
                 width_mm: ps.box_w_mm.max(15.0),
@@ -296,6 +507,11 @@ impl StudioApp {
         };
         let sym = self.production_state.barcode_symbology;
         let payload = self.production_state.barcode_payload.clone();
+        let bc_opts = BarcodeOptions {
+            bar_width_reduction_mm: self.production_state.barcode_bwr_mm.max(0.0),
+            code128_mode: self.production_state.code128_mode,
+            ..BarcodeOptions::default()
+        };
         let plan: Result<(Vec<CommandOp>, ObjectId), String> = (|| {
             let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                 return Err("no active document".to_owned());
@@ -308,7 +524,7 @@ impl StudioApp {
                 sym,
                 &payload,
                 Point2D::new(20.0, 20.0),
-                &BarcodeOptions::default(),
+                &bc_opts,
                 layer_id,
             ) {
                 Ok(oid) => oid,
@@ -544,6 +760,14 @@ impl StudioApp {
                 tile_h_mm: ps.tile_h_mm.max(30.0),
                 overlap_mm: ps.tile_overlap_mm.max(0.0),
             },
+            3 => ImpositionMode::PerfectBound {
+                sheet_w_mm: ps.sheet_w_mm.max(50.0),
+                sheet_h_mm: ps.sheet_h_mm.max(50.0),
+                signature_pages: ps.imposition_signature_pages.max(4) as usize,
+                spine_thickness_mm: ps.spine_thickness_mm.max(0.0),
+                creep_mm: ps.creep_mm.max(0.0),
+                milling_allowance_mm: ps.milling_allowance_mm.max(0.0),
+            },
             _ => ImpositionMode::NUp {
                 cols: ps.nup_cols.clamp(1, 20),
                 rows: ps.nup_rows.clamp(1, 20),
@@ -618,24 +842,31 @@ impl StudioApp {
                 .get(self.active_tab)
                 .ok_or_else(|| "no active document".to_owned())?;
 
-            // Find selected raster object (or first raster on active page)
+            // Find selected raster object (or Clone of raster, or first raster on active page)
+            let is_raster_or_clone = |id: ObjectId| -> bool {
+                let Some(obj) = tab.document.object(id) else {
+                    return false;
+                };
+                if matches!(obj.payload, NodePayload::Raster(_)) {
+                    return true;
+                }
+                tab.document
+                    .resolve_clone_payload_and_style_with_sym_scope(obj, None)
+                    .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_)))
+            };
             let target_id = tab
                 .selection
                 .objects
                 .iter()
                 .copied()
-                .find(|id| {
-                    tab.document
-                        .object(*id)
-                        .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
-                })
+                .find(|id| is_raster_or_clone(*id))
                 .or_else(|| {
                     let active_page_idx = tab.document.active_page_index();
                     tab.document
                         .objects()
                         .iter()
-                        .find(|(&id, o)| {
-                            matches!(o.payload, NodePayload::Raster(_))
+                        .find(|(&id, _)| {
+                            is_raster_or_clone(id)
                                 && is_object_editable_in_doc(&tab.document, id)
                                 && enclosing_layer_of_object(&tab.document, id).is_some_and(|lid| {
                                     tab.document.pages().iter().enumerate().any(|(p_idx, p)| {
@@ -654,12 +885,22 @@ impl StudioApp {
                 })
                 .ok_or_else(|| "select a raster bitmap object to run Vector Trace".to_owned())?;
 
-            let (asset, filters, crop_rect, w_mm, h_mm, xf) = {
+            let (asset, filters, crop_rect, w_mm, h_mm, xf, persp) = {
                 let obj = tab
                     .document
                     .object(target_id)
                     .ok_or_else(|| "raster object missing".to_owned())?;
-                let NodePayload::Raster(ref r) = obj.payload else {
+                let resolved_payload = if let NodePayload::Raster(ref r) = obj.payload {
+                    Some(r.clone())
+                } else {
+                    tab.document
+                        .resolve_clone_payload_and_style_with_sym_scope(obj, None)
+                        .and_then(|(p, _, _, _)| match p {
+                            NodePayload::Raster(r) => Some(r),
+                            _ => None,
+                        })
+                };
+                let Some(r) = resolved_payload else {
                     return Err("object is not a raster".to_owned());
                 };
                 let asset = tab
@@ -673,11 +914,12 @@ impl StudioApp {
                     .unwrap_or(obj.transform);
                 (
                     asset,
-                    r.filters.clone(),
+                    r.filters,
                     r.crop_rect,
                     r.width_mm,
                     r.height_mm,
                     xf,
+                    obj.perspective,
                 )
             };
 
@@ -774,6 +1016,9 @@ impl StudioApp {
             for (idx, (mut path, color)) in traced.into_iter().enumerate() {
                 if offset_x_mm.abs() > 1e-9 || offset_y_mm.abs() > 1e-9 {
                     path.transform(&Affine2D::translate(offset_x_mm, offset_y_mm));
+                }
+                if let Some(p) = persp {
+                    path = p.transform_bezier_path(&path);
                 }
                 let oid = ObjectId(next_id);
                 next_id = next_id.saturating_add(1);
@@ -1034,20 +1279,200 @@ impl StudioApp {
         }
     }
 
-    /// Computes a live histogram for the currently selected raster bitmap.
+    /// Computes a live histogram for the currently selected raster bitmap (resolving `Clone`,
+    /// applying active `filters` and `crop_rect`, and caching by content signature).
     #[must_use]
     pub fn selected_bitmap_histogram(&self, bins: usize) -> Option<coree_render::RasterHistogram> {
         let tab = self.active_tab()?;
-        let id = tab.selection.objects.iter().copied().find(|id| {
+        let (id, data) = tab.selection.objects.iter().copied().find_map(|oid| {
+            let obj = tab.document.object(oid)?;
+            if let NodePayload::Raster(ref r) = obj.payload {
+                return Some((oid, r.clone()));
+            }
             tab.document
-                .object(*id)
-                .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+                .resolve_clone_payload_and_style_with_sym_scope(obj, None)
+                .and_then(|(p, _, _, _)| match p {
+                    NodePayload::Raster(r) => Some((oid, r)),
+                    _ => None,
+                })
         })?;
-        let NodePayload::Raster(ref data) = tab.document.object(id)?.payload else {
-            return None;
-        };
         let asset = tab.document.asset(data.asset_id)?;
-        Some(coree_render::compute_histogram(asset, bins))
+
+        // Compute FNV-1a cache key covering object, asset, bins, filters, and crop rect
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        mix(id.0);
+        mix(data.asset_id.0.as_u128() as u64);
+        mix((data.asset_id.0.as_u128() >> 64) as u64);
+        mix(bins as u64);
+        mix(data.filters.len() as u64);
+        for b in format!("{:?}", data.filters).as_bytes() {
+            mix(u64::from(*b));
+        }
+        if let Some(cr) = data.crop_rect {
+            mix(1);
+            mix(cr.min_x.to_bits());
+            mix(cr.min_y.to_bits());
+            mix(cr.max_x.to_bits());
+            mix(cr.max_y.to_bits());
+        } else {
+            mix(0);
+        }
+        if let Some((cached_key, ref cached_hist)) = *self.bitmap_state.histogram_cache.borrow() {
+            if cached_key == h {
+                return Some(cached_hist.clone());
+            }
+        }
+
+        let filtered;
+        let filtered_ref = if data.filters.is_empty() {
+            asset
+        } else {
+            filtered = coree_render::apply_raster_filters(asset, &data.filters);
+            &filtered
+        };
+
+        let hist = if let Some(cr) = data.crop_rect.filter(|c| c.is_finite()) {
+            let w_mm = data.width_mm.max(1e-6);
+            let h_mm = data.height_mm.max(1e-6);
+            let aw = filtered_ref.width;
+            let ah = filtered_ref.height;
+            if aw > 0 && ah > 0 {
+                let px_per_mm_x = f64::from(aw) / w_mm;
+                let px_per_mm_y = f64::from(ah) / h_mm;
+                let x0 = (cr.min_x.max(0.0) * px_per_mm_x)
+                    .floor()
+                    .clamp(0.0, (aw - 1) as f64) as u32;
+                let y0 = (cr.min_y.max(0.0) * px_per_mm_y)
+                    .floor()
+                    .clamp(0.0, (ah - 1) as f64) as u32;
+                let x1 = (cr.max_x.min(w_mm) * px_per_mm_x)
+                    .ceil()
+                    .clamp((x0 + 1) as f64, aw as f64) as u32;
+                let y1 = (cr.max_y.min(h_mm) * px_per_mm_y)
+                    .ceil()
+                    .clamp((y0 + 1) as f64, ah as f64) as u32;
+                let cw = (x1 - x0).max(1);
+                let ch = (y1 - y0).max(1);
+                let rgba = filtered_ref.to_rgba8_vec();
+                let mut cropped_bytes = Vec::with_capacity((cw * ch * 4) as usize);
+                for row in y0..y1 {
+                    let s = ((row * aw + x0) * 4) as usize;
+                    let e = ((row * aw + x1) * 4) as usize;
+                    cropped_bytes.extend_from_slice(&rgba[s..e]);
+                }
+                if let Ok(cropped) = RasterAsset::new(
+                    cw,
+                    ch,
+                    cropped_bytes,
+                    filtered_ref.source_dpi,
+                    filtered_ref.color_mode,
+                ) {
+                    coree_render::compute_histogram(&cropped, bins)
+                } else {
+                    coree_render::compute_histogram(filtered_ref, bins)
+                }
+            } else {
+                coree_render::compute_histogram(filtered_ref, bins)
+            }
+        } else {
+            coree_render::compute_histogram(filtered_ref, bins)
+        };
+        *self.bitmap_state.histogram_cache.borrow_mut() = Some((h, hist.clone()));
+        Some(hist)
+    }
+
+    /// Runs Cutout Lab background removal on the selected raster bitmap using the active
+    /// selection mask (or automatic corner-seeded foreground extraction when no mask is active).
+    pub fn run_cutout_lab_active(&mut self) {
+        let feather_px = self.bitmap_state.cutout_feather_px.max(0.0);
+        let bg_tol = self.bitmap_state.cutout_bg_threshold.max(1.0);
+        let default_feather = self.tool_settings.mask_feather_px;
+        let default_inverted = self.tool_settings.mask_inverted;
+        let plan: Result<CommandOp, String> = (|| {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return Err("no active document".to_owned());
+            };
+            let oid = tab
+                .selection
+                .objects
+                .iter()
+                .copied()
+                .find(|id| {
+                    tab.document
+                        .object(*id)
+                        .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+                })
+                .ok_or_else(|| "Select a raster bitmap for Cutout Lab".to_owned())?;
+            let obj = tab
+                .document
+                .object(oid)
+                .ok_or_else(|| "raster object missing".to_owned())?;
+            let NodePayload::Raster(ref r) = obj.payload else {
+                return Err("object is not a raster".to_owned());
+            };
+            let orig = tab
+                .document
+                .asset(r.asset_id)
+                .ok_or_else(|| "raster asset missing".to_owned())?;
+            if orig.width == 0 || orig.height == 0 {
+                return Err("raster asset is empty".to_owned());
+            }
+            let mut new_asset = orig.clone();
+            new_asset.id = ImageAssetId::new();
+            let mut updated_data = r.clone();
+            updated_data.asset_id = new_asset.id;
+
+            let aw = f64::from(new_asset.width);
+            let ah = f64::from(new_asset.height);
+            let w_mm = r.width_mm.max(1e-3);
+            let h_mm = r.height_mm.max(1e-3);
+            let inv_xf = world_inverse_transform_of(&tab.document, oid);
+            let inv_persp = obj.perspective.and_then(|p| p.inverse());
+            let to_px = |p: Point2D| {
+                let mut lp = inv_xf.transform_point(p);
+                if let Some(ref ih) = inv_persp {
+                    lp = ih.transform_point_or(lp);
+                }
+                Point2D::new((lp.x / w_mm) * aw, (lp.y / h_mm) * ah)
+            };
+
+            let fg_mask = Self::build_raster_mask_for_asset(
+                &new_asset,
+                tab.raster_mask.as_ref(),
+                tab.raster_mask_rect_mm,
+                &to_px,
+                default_feather,
+                default_inverted,
+            )
+            .unwrap_or_else(|| {
+                let mut bg = RasterMask::from_magic_wand(&new_asset, 0, 0, bg_tol, true);
+                bg.invert();
+                bg
+            });
+            cutout_lab(&mut new_asset, &fg_mask, feather_px);
+            Ok(CommandOp::Batch(vec![
+                CommandOp::RegisterAsset { asset: new_asset },
+                CommandOp::UpdateRaster {
+                    id: oid,
+                    data: updated_data,
+                },
+            ]))
+        })();
+
+        match plan {
+            Ok(cmd) => match self.execute_command(cmd) {
+                Ok(()) => {
+                    self.checkpoint_wal_snapshot_active();
+                    self.push_toast("Applied Cutout Lab alpha matting", false);
+                }
+                Err(e) => self.push_toast(format!("Cutout Lab failed: {e}"), true),
+            },
+            Err(err) => self.push_toast(err, true),
+        }
     }
 
     /// Builds a [`FindQuery`] from [`FindReplaceState`].
@@ -1081,18 +1506,26 @@ impl StudioApp {
     /// Finds matching objects and selects them on the active document.
     pub fn run_find_select(&mut self) -> Vec<ObjectId> {
         let query = self.build_find_query();
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return Vec::new();
+        let before_sel = self
+            .active_tab()
+            .map(|t| t.selection.objects.clone())
+            .unwrap_or_default();
+        let ids = {
+            let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+                return Vec::new();
+            };
+            let ids = find_objects(&tab.document, &query);
+            tab.selection.select_many(&tab.document, &ids);
+            tab.metrics_dirty = true;
+            ids
         };
-        let ids = find_objects(&tab.document, &query);
-        tab.selection.select_many(&tab.document, &ids);
-        tab.metrics_dirty = true;
         self.find_replace_state.last_report = Some(FindReplaceReport {
             matched_ids: ids.clone(),
             modified_ids: Vec::new(),
             replacements_applied: 0,
         });
         self.push_toast(format!("Found {} matching object(s)", ids.len()), false);
+        self.maybe_fire_selection_change(&before_sel);
         ids
     }
 
@@ -1100,6 +1533,10 @@ impl StudioApp {
     pub fn run_cql_select(&mut self) -> Result<Vec<ObjectId>, String> {
         let scope = self.find_replace_state.scope;
         let query = self.find_replace_state.cql_query.clone();
+        let before_sel = self
+            .active_tab()
+            .map(|t| t.selection.objects.clone())
+            .unwrap_or_default();
         let res = {
             let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                 return Err("No active document".to_owned());
@@ -1117,12 +1554,17 @@ impl StudioApp {
             replacements_applied: 0,
         });
         self.push_toast(format!("CQL matched {} object(s)", res.len()), false);
+        self.maybe_fire_selection_change(&before_sel);
         Ok(res)
     }
 
     /// Runs `coree_prod::find_and_replace` via [`CommandOp::FindAndReplace`] with explicit `action`.
     pub fn run_find_and_replace_action(&mut self, action: ReplaceAction) -> FindReplaceReport {
         let query = self.build_find_query();
+        let before_sel = self
+            .active_tab()
+            .map(|t| t.selection.objects.clone())
+            .unwrap_or_default();
         let rep = {
             let Some(tab) = self.tabs.get(self.active_tab) else {
                 return FindReplaceReport::default();
@@ -1166,6 +1608,7 @@ impl StudioApp {
             ),
             false,
         );
+        self.maybe_fire_selection_change(&before_sel);
         rep
     }
 
@@ -1201,7 +1644,13 @@ impl StudioApp {
             if script.contains("// coree recorded macro") {
                 plan_recorded_macro_ops(script, &cfg)
             } else {
-                plan_macro_ops(&tab.document, script, &BTreeMap::new(), &cfg)
+                plan_macro_ops_with_selection(
+                    &tab.document,
+                    script,
+                    &BTreeMap::new(),
+                    &cfg,
+                    &tab.selection.objects,
+                )
             }
         };
         match planned {
@@ -2427,11 +2876,13 @@ impl StudioApp {
                 } else if let Some(tab) = self.active_tab_mut() {
                     let cleared_draft = tab.tool_core.has_active_draft_or_drag()
                         || tab.pending_crop_rect.is_some()
-                        || tab.raster_mask_rect_mm.is_some();
+                        || tab.raster_mask_rect_mm.is_some()
+                        || tab.raster_mask.is_some();
                     tab.cancel_active_drag();
                     let _ = tab.tool_core.cancel_all();
                     tab.pending_crop_rect = None;
                     tab.raster_mask_rect_mm = None;
+                    tab.raster_mask = None;
                     if !cleared_draft {
                         if !tab.selection.is_empty() {
                             tab.selection.clear();

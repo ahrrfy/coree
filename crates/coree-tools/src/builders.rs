@@ -17,7 +17,8 @@ use coree_core::{
     ConnectorObject, ConnectorStyle, ContourMode, DimensionKind, DimensionObject, Document, Effect,
     EllipseMode, FeatherDirection, Fill, GradientStop, LayerId, LiveSketch, NodeKind, NodePayload,
     ObjectId, OutlineStyle, ParagraphText, ParametricShape, PathNode, Perspective3x3, Point2D,
-    Rect2D, SceneObject, SmartDrawing, Subpath, TransparencyMode, Vec2D, VectorTable,
+    RasterMaskMode, RasterMaskSelection, RasterMaskShape, Rect2D, SceneObject, SmartDrawing,
+    Subpath, TransparencyMode, Vec2D, VectorTable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -2036,11 +2037,21 @@ pub fn build_drawn_box_output(ctx: &ToolReadContext<'_>, tool: ToolId, rect: Rec
             }]);
         }
         ToolId::MaskSelect => {
+            let (shape, label) = match ctx.settings.mask_mode {
+                RasterMaskMode::Ellipse => (RasterMaskShape::Ellipse(rect), "ellipse"),
+                _ => (RasterMaskShape::Rectangle(rect), "rectangle"),
+            };
+            let sel = RasterMaskSelection {
+                shape,
+                feather_px: ctx.settings.mask_feather_px,
+                inverted: ctx.settings.mask_inverted,
+            };
             return ToolOutput::actions(vec![
                 ToolActionRequest::SetRasterMaskRect(Some(rect)),
+                ToolActionRequest::SetRasterMask(Some(sel)),
                 ToolActionRequest::Toast {
                     message: format!(
-                        "Set bitmap mask ({:.1} × {:.1} mm)",
+                        "Set {label} bitmap mask ({:.1} × {:.1} mm)",
                         rect.width(),
                         rect.height()
                     ),

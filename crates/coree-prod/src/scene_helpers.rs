@@ -355,29 +355,6 @@ pub(crate) fn sym_world_transform_of(
     Some(xf)
 }
 
-/// Computes the world-space axis-aligned bounding box of `obj` given its composed `world_xf`
-/// (unlike [`Document::object_bounds`], this properly incorporates ancestor `Group` / `PowerClip`
-/// transforms when inspecting descendant nodes).
-pub(crate) fn world_bounds_with_xf(
-    doc: &Document,
-    id: ObjectId,
-    obj: &SceneObject,
-    world_xf: &Affine2D,
-) -> Option<Rect2D> {
-    let mut visiting = HashSet::new();
-    let mut visiting_syms = HashSet::new();
-    world_bounds_with_xf_inner(
-        doc,
-        id,
-        obj,
-        world_xf,
-        None,
-        0,
-        &mut visiting,
-        &mut visiting_syms,
-    )
-}
-
 pub(crate) fn world_bounds_with_sym_xf(
     doc: &Document,
     id: ObjectId,
@@ -415,61 +392,50 @@ fn world_bounds_with_xf_inner(
     }
     let bounds = match &obj.payload {
         NodePayload::Path(p) => {
-            let bp = if let Some(persp) = obj.perspective {
-                persp.transform_bezier_path(p)
-            } else {
-                p.clone()
-            };
+            let bp = apply_obj_perspective_to_local_path(p.clone(), obj);
             bp.transformed(world_xf).bounding_box()
         }
         NodePayload::Shape(s) => {
-            let p = s.to_bezier_path();
-            let bp = if let Some(persp) = obj.perspective {
-                persp.transform_bezier_path(&p)
-            } else {
-                p
-            };
+            let bp = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
             bp.transformed(world_xf).bounding_box()
         }
         NodePayload::BSpline(bs) => {
-            let p = bs.to_bezier_path();
-            let bp = if let Some(persp) = obj.perspective {
-                persp.transform_bezier_path(&p)
-            } else {
-                p
-            };
+            let bp = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
             bp.transformed(world_xf).bounding_box()
         }
         NodePayload::ArtisticMedia { spine, style } => {
             let p = coree_core::ArtisticMedia::expand_stroke(spine, style);
-            let bp = if let Some(persp) = obj.perspective {
-                persp.transform_bezier_path(&p)
-            } else {
-                p
-            };
+            let bp = apply_obj_perspective_to_local_path(p, obj);
             bp.transformed(world_xf).bounding_box()
         }
-        NodePayload::Clone { .. } => {
-            doc.resolve_clone_payload_and_style(obj)
-                .and_then(|(p, f, o)| {
-                    let mut tmp = obj.clone();
-                    tmp.payload = p;
-                    tmp.fill = f;
-                    tmp.outline = o;
-                    world_bounds_with_xf_inner(
-                        doc,
-                        tmp.id,
-                        &tmp,
-                        world_xf,
-                        sym_ctx,
-                        depth + 1,
-                        visiting,
-                        visiting_syms,
-                    )
-                })
+        NodePayload::Clone { .. } => doc
+            .resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+            .and_then(|(p, f, o, in_sym)| {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                world_bounds_with_xf_inner(
+                    doc,
+                    tmp.id,
+                    &tmp,
+                    world_xf,
+                    if in_sym { sym_ctx } else { None },
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                )
+            }),
+        NodePayload::ArtisticText(t) => {
+            apply_obj_perspective_to_local_path(BezierPath::from_rect(t.estimated_bounds()), obj)
+                .transformed(world_xf)
+                .bounding_box()
         }
-        NodePayload::ArtisticText(t) => world_xf.try_transform_rect(t.estimated_bounds()),
-        NodePayload::ParagraphText(t) => world_xf.try_transform_rect(t.bounding_box()),
+        NodePayload::ParagraphText(t) => {
+            apply_obj_perspective_to_local_path(BezierPath::from_rect(t.bounding_box()), obj)
+                .transformed(world_xf)
+                .bounding_box()
+        }
         NodePayload::TextOnPath(top) => {
             if let Some(ctx) = sym_ctx {
                 if let Some(path_obj) = ctx.sym_map.get(&top.path_id).copied() {
@@ -481,10 +447,55 @@ fn world_bounds_with_xf_inner(
                         ctx.sym_parent_map,
                     )
                     .and_then(|p_xf| match &path_obj.payload {
-                        NodePayload::Path(p) => p.transformed(&p_xf).bounding_box(),
-                        NodePayload::Shape(s) => {
-                            s.to_bezier_path().transformed(&p_xf).bounding_box()
+                        NodePayload::Path(p) => {
+                            apply_obj_perspective_to_local_path(p.clone(), path_obj)
+                                .transformed(&p_xf)
+                                .bounding_box()
                         }
+                        NodePayload::Shape(s) => {
+                            apply_obj_perspective_to_local_path(s.to_bezier_path(), path_obj)
+                                .transformed(&p_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::BSpline(bs) => {
+                            apply_obj_perspective_to_local_path(bs.to_bezier_path(), path_obj)
+                                .transformed(&p_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            apply_obj_perspective_to_local_path(
+                                coree_core::ArtisticMedia::expand_stroke(spine, style),
+                                path_obj,
+                            )
+                            .transformed(&p_xf)
+                            .bounding_box()
+                        }
+                        NodePayload::PowerClip { container, .. } => {
+                            apply_obj_perspective_to_local_path((**container).clone(), path_obj)
+                                .transformed(&p_xf)
+                                .bounding_box()
+                        }
+                        NodePayload::Clone { .. } => doc
+                            .resolve_clone_payload_and_style_with_sym_scope(
+                                path_obj,
+                                Some(ctx.sym_map),
+                            )
+                            .and_then(|(cp, cf, co, in_sym)| {
+                                let mut tmp = path_obj.clone();
+                                tmp.payload = cp;
+                                tmp.fill = cf;
+                                tmp.outline = co;
+                                world_bounds_with_xf_inner(
+                                    doc,
+                                    top.path_id,
+                                    &tmp,
+                                    &p_xf,
+                                    in_sym.then_some(ctx),
+                                    depth + 1,
+                                    visiting,
+                                    visiting_syms,
+                                )
+                            }),
                         _ => {
                             if !visiting.insert(top.path_id) {
                                 return None;
@@ -522,10 +533,22 @@ fn world_bounds_with_xf_inner(
                 }
                 None => None,
             };
-            rect.and_then(|rc| world_xf.try_transform_rect(rc))
+            rect.and_then(|rc| {
+                apply_obj_perspective_to_local_path(BezierPath::from_rect(rc), obj)
+                    .transformed(world_xf)
+                    .bounding_box()
+            })
         }
-        NodePayload::Table(t) => world_xf.try_transform_rect(t.to_bounding_box()),
-        NodePayload::Dimension(d) => world_xf.try_transform_rect(d.bounding_box()),
+        NodePayload::Table(t) => {
+            apply_obj_perspective_to_local_path(BezierPath::from_rect(t.to_bounding_box()), obj)
+                .transformed(world_xf)
+                .bounding_box()
+        }
+        NodePayload::Dimension(d) => {
+            apply_obj_perspective_to_local_path(BezierPath::from_rect(d.bounding_box()), obj)
+                .transformed(world_xf)
+                .bounding_box()
+        }
         NodePayload::Connector(c) => {
             if let Some(ctx) = sym_ctx {
                 let mut resolve_sym_endpoint =
@@ -576,7 +599,11 @@ fn world_bounds_with_xf_inner(
                 c.route_path(a, b).bounding_box()
             }
         }
-        NodePayload::PowerClip { container, .. } => container.transformed(world_xf).bounding_box(),
+        NodePayload::PowerClip { container, .. } => {
+            apply_obj_perspective_to_local_path((**container).clone(), obj)
+                .transformed(world_xf)
+                .bounding_box()
+        }
         NodePayload::SymbolInstance(sym_id) => {
             if !visiting_syms.insert(*sym_id) {
                 return None;
@@ -688,7 +715,47 @@ fn world_bounds_with_xf_inner(
             acc
         }
     };
-    bounds.filter(|r| r.is_finite())
+    let eff_pad = if !obj.effects.is_empty() {
+        let mut p = Effect::effects_bounds_padding_mm(&obj.effects);
+        for eff in &obj.effects {
+            match eff {
+                Effect::Contour {
+                    mode: coree_core::ContourMode::Outside,
+                    steps,
+                    offset_mm,
+                    ..
+                } => {
+                    p = p.max(f64::from((*steps).clamp(1, 512)) * offset_mm.abs());
+                }
+                Effect::DropShadow {
+                    dx_mm,
+                    dy_mm,
+                    blur_mm,
+                    ..
+                } => {
+                    p = p.max(dx_mm.abs().max(dy_mm.abs()) + blur_mm.abs() * 2.0);
+                }
+                Effect::BlockShadow { dx_mm, dy_mm, .. } => {
+                    p = p.max(dx_mm.abs().max(dy_mm.abs()));
+                }
+                Effect::Extrude25D {
+                    depth, bevel_depth, ..
+                }
+                | Effect::Extrude3D {
+                    depth, bevel_depth, ..
+                } => {
+                    p = p.max(depth.abs() * 2.0 + bevel_depth.abs() + 2.0);
+                }
+                _ => {}
+            }
+        }
+        p
+    } else {
+        0.0
+    };
+    bounds
+        .filter(|r| r.is_finite())
+        .map(|r| if eff_pad > 0.0 { r.expand(eff_pad) } else { r })
 }
 
 /// Converts a `coree_core::BezierPath` in millimeters into a `tiny_skia::Path` scaled to pixels.
@@ -745,12 +812,15 @@ pub(crate) fn apply_obj_perspective_to_local_path(
     } else {
         local
     };
-    for eff in &obj.effects {
-        if let Effect::Perspective { quad } = eff {
-            if let Some(bb) = cur.bounding_box() {
-                if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
-                    cur = h.transform_bezier_path(&cur);
-                }
+    if !obj.effects.is_empty() {
+        let bb = cur.bounding_box();
+        cur =
+            coree_render::effects_render::apply_geometry_effects_in_bounds(&cur, bb, &obj.effects);
+        let sym_xfs = Effect::symmetry_transforms_for(&obj.effects);
+        if sym_xfs.len() > 1 {
+            let base = cur.clone();
+            for xf in sym_xfs.into_iter().skip(1) {
+                cur.subpaths.extend(base.transformed(&xf).subpaths);
             }
         }
     }
@@ -1020,7 +1090,9 @@ fn collect_silhouette_paths_obj(
             }
         }
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+            {
                 let mut tmp = obj.clone();
                 tmp.payload = p;
                 tmp.fill = f;
@@ -1031,7 +1103,7 @@ fn collect_silhouette_paths_obj(
                     &tmp,
                     parent_xf,
                     parent_persp,
-                    sym_ctx,
+                    if in_sym { sym_ctx } else { None },
                     depth + 1,
                     visiting,
                     visiting_syms,
@@ -1207,6 +1279,21 @@ fn collect_silhouette_paths_obj(
                                 Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
                             }
                             NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+                            NodePayload::Clone { .. } => doc
+                                .resolve_clone_payload_and_style_with_sym_scope(
+                                    path_obj,
+                                    Some(ctx.sym_map),
+                                )
+                                .and_then(|(cp, _, _, _)| match cp {
+                                    NodePayload::Path(p) => Some(p),
+                                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                                    NodePayload::ArtisticMedia { spine, style } => Some(
+                                        coree_core::ArtisticMedia::expand_stroke(&spine, &style),
+                                    ),
+                                    NodePayload::PowerClip { container, .. } => Some(*container),
+                                    _ => None,
+                                }),
                             _ => None,
                         };
                         if let Some(local) = local_opt {
@@ -1301,6 +1388,20 @@ fn collect_silhouette_paths_obj(
                 }
             }
         }
-        NodePayload::Dimension(_) | NodePayload::Connector(_) => {}
+        NodePayload::Dimension(d) => {
+            let local =
+                apply_obj_perspective_to_local_path(BezierPath::from_rect(d.bounding_box()), obj);
+            let p = warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+            if !p.is_empty() {
+                out.push(p);
+            }
+        }
+        NodePayload::Connector(c) => {
+            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
+            let route = c.route_path(a, b);
+            if !route.is_empty() {
+                out.push(route);
+            }
+        }
     }
 }

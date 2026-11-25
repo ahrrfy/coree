@@ -9,6 +9,9 @@ description = "Prepress imposition, preflight, CutContour, parametric dielines, 
 
 [dependencies]
 coree-core.workspace = true
+coree-io.workspace = true
+coree-render.workspace = true
+flate2.workspace = true
 i_overlay.workspace = true
 image.workspace = true
 kurbo.workspace = true
@@ -19,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+ttf-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

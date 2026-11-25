@@ -6,17 +6,32 @@
 
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{
-    bezier_to_skia_path, clone_document_shell, clone_page_contents_into, collect_effective_layers,
-    find_or_create_layer, get_page, MAX_SCENE_DEPTH,
+    apply_obj_perspective_to_local_path, bezier_to_skia_path, clone_document_shell,
+    clone_page_contents_into, collect_effective_layers, compose_prod_parent_persp,
+    container_own_persp, find_or_create_layer, get_page, warp_local_to_world, SymBoundsCtx,
+    SymParentRef, MAX_SCENE_DEPTH,
 };
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, BlendMode, Color, Document, EllipseMode, Fill, LayerId,
-    LineCap, LineJoin, NodePayload, ObjectId, OutlineStyle, PageId, ParametricShape, Point2D,
-    Rect2D, SceneObject, TextStyle,
+    apply_boolean, Affine2D, ArtisticText, BezierPath, BlendMode, BooleanOp, Color, Document,
+    Effect, EllipseMode, Fill, LayerId, LineCap, LineJoin, NodePayload, ObjectId, OutlineStyle,
+    PageId, ParametricShape, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId, TextStyle,
 };
+use coree_io::display_list::{DisplayListOptions, DisplayOp, ExportDisplayList};
+use coree_render::{render_isolated_object_to_rgba_with_options, TextEngine};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use kurbo::PathEl;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write as _;
+use std::path::Path;
+
+/// Type alias for prepress trapping configuration.
+pub type Trapping = TrappingSettings;
+
+/// Type alias for prepress halftone screening configuration.
+pub type Halftone = HalftoneSettings;
 
 /// Standard layer name used by [`generate_print_marks`].
 pub const PRINT_MARKS_LAYER_NAME: &str = "Print Marks";
@@ -75,7 +90,40 @@ impl Default for SeparationOptions {
     }
 }
 
-/// A single ink separation plate with grayscale density map and coverage statistics.
+/// Vector geometry primitive on a single separated ink plate (from `ExportDisplayList`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorPlatePrimitive {
+    pub path: BezierPath,
+    pub fill_density: Option<f32>,
+    pub stroke_density: Option<f32>,
+    pub stroke_width_mm: f64,
+    pub overprint: bool,
+    #[serde(default)]
+    pub clip_paths: Vec<BezierPath>,
+    #[serde(default)]
+    pub z_order: usize,
+}
+
+/// Raster image / isolated composite primitive on a single separated ink plate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterPlatePrimitive {
+    pub width: u32,
+    pub height: u32,
+    /// Per-pixel ink density `0..=255` (`0` = no ink, `255` = 100% ink) for this plate.
+    pub ink_channel: Vec<u8>,
+    /// Optional per-pixel alpha mask `0..=255` (`255` = opaque). Empty when fully opaque.
+    pub alpha_mask: Vec<u8>,
+    pub bl: Point2D,
+    pub br: Point2D,
+    pub tl: Point2D,
+    pub overprint: bool,
+    #[serde(default)]
+    pub clip_paths: Vec<BezierPath>,
+    #[serde(default)]
+    pub z_order: usize,
+}
+
+/// A single ink separation plate with vector plate ops, grayscale density map, and coverage stats.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeparationPlate {
     pub channel: SeparationChannel,
@@ -84,6 +132,12 @@ pub struct SeparationPlate {
     pub height: u32,
     /// Grayscale plate map (`0` = no ink / blank paper, `255` = 100% solid ink).
     pub ink_map: Vec<u8>,
+    /// Crisp resolution-independent vector primitives for this ink channel.
+    #[serde(default)]
+    pub vector_ops: Vec<VectorPlatePrimitive>,
+    /// Separated raster / isolated composite primitives for this ink channel.
+    #[serde(default)]
+    pub raster_ops: Vec<RasterPlatePrimitive>,
     /// Mean ink coverage across the entire page (`0.0..=100.0`%).
     pub average_coverage_pct: f64,
     /// Peak ink coverage observed at any pixel (`0.0..=100.0`%).
@@ -156,26 +210,38 @@ where
             "separation DPI must be positive and finite".into(),
         ));
     }
-    let max_dim = options.max_dimension_px.clamp(8, 4096);
     let raw_w = (page.width_mm / 25.4 * options.dpi).round().max(1.0);
     let raw_h = (page.height_mm / 25.4 * options.dpi).round().max(1.0);
-    let downscale = (f64::from(max_dim) / raw_w.max(raw_h)).min(1.0);
+    let downscale = if options.max_dimension_px == 0 {
+        1.0
+    } else {
+        let max_dim = options.max_dimension_px.max(8);
+        (f64::from(max_dim) / raw_w.max(raw_h)).min(1.0)
+    };
     let width = ((raw_w * downscale).round() as u32).max(1);
     let height = ((raw_h * downscale).round() as u32).max(1);
     let scale_x = (f64::from(width) / page.width_mm) as f32;
     let scale_y = (f64::from(height) / page.height_mm) as f32;
 
+    let vector_plates = compute_vector_separations(doc, page_index, options.include_cut_layers)?;
     let effective_layers = collect_effective_layers(doc, page_index);
 
     // Pass 1: discover all named Spot inks used on visible/printable layers of this page.
     let mut spot_fallbacks: BTreeMap<String, [f32; 4]> = BTreeMap::new();
+    for vp in &vector_plates {
+        if let SeparationChannel::Spot(ref name) = vp.channel {
+            if let Some(fb) = vp.spot_fallback_cmyk {
+                spot_fallbacks.entry(name.clone()).or_insert(fb);
+            }
+        }
+    }
     for layer in &effective_layers {
         if !layer_included_in_separation(layer, options.include_cut_layers) {
             continue;
         }
         let mut visiting = HashSet::new();
         for &oid in &layer.objects {
-            collect_spots_recursive(doc, oid, 0, &mut visiting, &mut spot_fallbacks);
+            collect_spots_recursive(doc, oid, None, 0, &mut visiting, &mut spot_fallbacks);
         }
     }
 
@@ -192,6 +258,7 @@ where
     // Pass 2: rasterize objects in z-order into ink separation buffers.
     let mut ctx = SeparationRasterCtx {
         doc,
+        page_index,
         width,
         height,
         scale_x,
@@ -245,17 +312,22 @@ where
         SeparationChannel::Black,
     ];
     for (idx, chan) in process_channels.into_iter().enumerate() {
-        plates.push(build_plate(chan, width, height, &buffers[idx], None));
+        let mut plate = build_plate(chan.clone(), width, height, &buffers[idx], None);
+        if let Some(vp) = vector_plates.iter().find(|v| v.channel == chan) {
+            plate.vector_ops = vp.vector_ops.clone();
+            plate.raster_ops = vp.raster_ops.clone();
+        }
+        plates.push(plate);
     }
     for (i, spot_name) in spot_names.into_iter().enumerate() {
         let fallback = spot_fallbacks.get(&spot_name).copied();
-        plates.push(build_plate(
-            SeparationChannel::Spot(spot_name),
-            width,
-            height,
-            &buffers[4 + i],
-            fallback,
-        ));
+        let chan = SeparationChannel::Spot(spot_name);
+        let mut plate = build_plate(chan.clone(), width, height, &buffers[4 + i], fallback);
+        if let Some(vp) = vector_plates.iter().find(|v| v.channel == chan) {
+            plate.vector_ops = vp.vector_ops.clone();
+            plate.raster_ops = vp.raster_ops.clone();
+        }
+        plates.push(plate);
     }
 
     Ok(SeparationResult {
@@ -267,6 +339,976 @@ where
         mean_tac_pct,
         over_tac_300_pct,
     })
+}
+
+fn collect_symbol_spots(
+    doc: &Document,
+    sym_id: SymbolId,
+    spots: &mut BTreeMap<String, [f32; 4]>,
+    visiting_syms: &mut HashSet<SymbolId>,
+) {
+    if !visiting_syms.insert(sym_id) {
+        return;
+    }
+    if let Some(sym) = doc.symbol(sym_id) {
+        for sub in &sym.objects {
+            for c in sub.fill.referenced_colors() {
+                register_spot_color(&c, spots);
+            }
+            if sub.outline.is_visible() {
+                register_spot_color(&sub.outline.color, spots);
+            }
+            if let Fill::VectorPattern { symbol_id, .. } = &sub.fill {
+                collect_symbol_spots(doc, *symbol_id, spots, visiting_syms);
+            }
+            if let NodePayload::SymbolInstance(nested_id) = &sub.payload {
+                collect_symbol_spots(doc, *nested_id, spots, visiting_syms);
+            }
+        }
+    }
+    visiting_syms.remove(&sym_id);
+}
+
+fn sample_pattern_representative_color(doc: &Document, fill: &Fill) -> Option<Color> {
+    match fill {
+        Fill::VectorPattern { symbol_id, .. } => {
+            let sym = doc.symbol(*symbol_id)?;
+            for sub in &sym.objects {
+                if !sub.visible {
+                    continue;
+                }
+                if let Some(c) = sub.fill.referenced_colors().into_iter().next() {
+                    return Some(c);
+                }
+                if sub.outline.is_visible() {
+                    return Some(sub.outline.color.clone());
+                }
+            }
+            None
+        }
+        Fill::BitmapPattern { image_id, .. } => {
+            let asset = doc.asset(*image_id)?;
+            let rgba = asset.to_rgba8_vec();
+            let mut sum_r = 0u64;
+            let mut sum_g = 0u64;
+            let mut sum_b = 0u64;
+            let mut count = 0u64;
+            for px in rgba.as_chunks::<4>().0 {
+                if px[3] > 0 {
+                    sum_r += u64::from(px[0]);
+                    sum_g += u64::from(px[1]);
+                    sum_b += u64::from(px[2]);
+                    count += 1;
+                }
+            }
+            sum_r
+                .checked_div(count)
+                .map(|r| Color::rgba8(r as u8, (sum_g / count) as u8, (sum_b / count) as u8, 255))
+        }
+        _ => None,
+    }
+}
+
+/// Computes resolution-independent **vector** CMYK + Spot separation plates by lowering
+/// the full scene graph through `ExportDisplayList` (`CdrPsi`) without any pixel cap.
+pub fn compute_vector_separations(
+    doc: &Document,
+    page_index: usize,
+    include_cut_layers: bool,
+) -> ProdResult<Vec<SeparationPlate>> {
+    let page = get_page(doc, page_index)?;
+    validate_positive("page.width_mm", page.width_mm)?;
+    validate_positive("page.height_mm", page.height_mm)?;
+    let mut text_engine = TextEngine::new();
+    let dl_opts = DisplayListOptions {
+        shape_pdf_text_runs: false,
+        ..DisplayListOptions::pdf()
+    };
+    let dl = ExportDisplayList::build(doc, page_index, &dl_opts, &mut text_engine)
+        .map_err(|e| ProdError::InvalidParameter(format!("display list build failed: {e}")))?;
+
+    let mut spots: BTreeMap<String, [f32; 4]> = BTreeMap::new();
+    let mut ops_by_channel: BTreeMap<SeparationChannel, Vec<VectorPlatePrimitive>> =
+        BTreeMap::new();
+    let mut raster_ops_by_channel: BTreeMap<SeparationChannel, Vec<RasterPlatePrimitive>> =
+        BTreeMap::new();
+    let mut plate_has_content: BTreeMap<SeparationChannel, bool> = BTreeMap::new();
+    for ch in [
+        SeparationChannel::Cyan,
+        SeparationChannel::Magenta,
+        SeparationChannel::Yellow,
+        SeparationChannel::Black,
+    ] {
+        ops_by_channel.insert(ch.clone(), Vec::new());
+        raster_ops_by_channel.insert(ch.clone(), Vec::new());
+        plate_has_content.insert(ch, false);
+    }
+
+    let mut layer_active_stack: Vec<bool> = Vec::new();
+    let mut active_ops: Vec<&DisplayOp> = Vec::new();
+    for op in &dl.ops {
+        match op {
+            DisplayOp::PushLayer {
+                visible,
+                printable,
+                is_cut_layer,
+                ..
+            } => {
+                let inc = *visible
+                    && if *is_cut_layer {
+                        include_cut_layers
+                    } else {
+                        *printable
+                    };
+                layer_active_stack.push(inc);
+            }
+            DisplayOp::PopLayer => {
+                layer_active_stack.pop();
+            }
+            other => {
+                if layer_active_stack.last().copied().unwrap_or(true) {
+                    active_ops.push(other);
+                }
+            }
+        }
+    }
+
+    for op in &active_ops {
+        match op {
+            DisplayOp::DrawVector { fill, outline, .. } => {
+                for c in fill.referenced_colors() {
+                    register_spot_color(&c, &mut spots);
+                }
+                if let Fill::VectorPattern { symbol_id, .. } = fill {
+                    let mut vs = HashSet::new();
+                    collect_symbol_spots(doc, *symbol_id, &mut spots, &mut vs);
+                }
+                if outline.is_visible() {
+                    register_spot_color(&outline.color, &mut spots);
+                }
+            }
+            DisplayOp::DrawTextRuns {
+                shaped_runs,
+                fallback_curves,
+                artistic,
+                outline,
+                ..
+            } => {
+                for gd in fallback_curves {
+                    register_spot_color(&gd.fill, &mut spots);
+                }
+                for run in shaped_runs {
+                    register_spot_color(&run.fill, &mut spots);
+                }
+                for run in &artistic.runs {
+                    register_spot_color(&run.style.fill, &mut spots);
+                }
+                if outline.is_visible() {
+                    register_spot_color(&outline.color, &mut spots);
+                }
+            }
+            _ => {}
+        }
+    }
+    for name in spots.keys() {
+        let ch = SeparationChannel::Spot(name.clone());
+        ops_by_channel.entry(ch.clone()).or_default();
+        raster_ops_by_channel.entry(ch.clone()).or_default();
+        plate_has_content.entry(ch).or_insert(false);
+    }
+
+    let mut next_z = 0usize;
+    let emit_color_prim =
+        |ops_by_channel: &mut BTreeMap<SeparationChannel, Vec<VectorPlatePrimitive>>,
+         plate_has_content: &mut BTreeMap<SeparationChannel, bool>,
+         next_z: &mut usize,
+         path: &BezierPath,
+         fill_col: Option<&Color>,
+         stroke_col: Option<(&Color, f64)>,
+         opacity: f32,
+         overprint: bool,
+         clip_stack: &[BezierPath]| {
+            if path.is_empty() {
+                return;
+            }
+            let z = *next_z;
+            *next_z += 1;
+            let mut fill_densities: BTreeMap<SeparationChannel, f32> = BTreeMap::new();
+            if let Some(fc) = fill_col {
+                accumulate_channel_densities(fc, opacity, &mut fill_densities);
+            }
+            let mut stroke_densities: BTreeMap<SeparationChannel, f32> = BTreeMap::new();
+            let stroke_w = if let Some((sc, w_mm)) = stroke_col {
+                accumulate_channel_densities(sc, opacity, &mut stroke_densities);
+                w_mm
+            } else {
+                0.0
+            };
+            let opaque_fill_ko = !overprint
+                && fill_col.is_some_and(|fc| (opacity * fc.alpha()).clamp(0.0, 1.0) >= 0.99);
+            let opaque_stroke_ko = !overprint
+                && stroke_col.is_some_and(|(sc, _)| (opacity * sc.alpha()).clamp(0.0, 1.0) >= 0.99);
+
+            let mut touched: HashSet<SeparationChannel> = fill_densities.keys().cloned().collect();
+            touched.extend(stroke_densities.keys().cloned());
+            let all_channels: Vec<SeparationChannel> = ops_by_channel.keys().cloned().collect();
+            for ch in all_channels {
+                let fd = fill_densities.get(&ch).copied().filter(|&v| v > 1e-4);
+                let sd = stroke_densities.get(&ch).copied().filter(|&v| v > 1e-4);
+                if fd.is_some() || sd.is_some() {
+                    ops_by_channel
+                        .entry(ch.clone())
+                        .or_default()
+                        .push(VectorPlatePrimitive {
+                            path: path.clone(),
+                            fill_density: fd,
+                            stroke_density: sd,
+                            stroke_width_mm: stroke_w,
+                            overprint,
+                            clip_paths: clip_stack.to_vec(),
+                            z_order: z,
+                        });
+                    plate_has_content.insert(ch, true);
+                } else if !overprint
+                    && plate_has_content.get(&ch).copied().unwrap_or(false)
+                    && !touched.is_empty()
+                    && (opaque_fill_ko || opaque_stroke_ko)
+                {
+                    let ko_fd = opaque_fill_ko.then_some(0.0);
+                    let ko_sd = opaque_stroke_ko.then_some(0.0);
+                    ops_by_channel
+                        .entry(ch)
+                        .or_default()
+                        .push(VectorPlatePrimitive {
+                            path: path.clone(),
+                            fill_density: ko_fd,
+                            stroke_density: ko_sd,
+                            stroke_width_mm: stroke_w,
+                            overprint: false,
+                            clip_paths: clip_stack.to_vec(),
+                            z_order: z,
+                        });
+                }
+            }
+        };
+
+    let icc = doc.icc_pipeline();
+    let mut clip_stack: Vec<BezierPath> = Vec::new();
+    let mut clip_pushed_stack: Vec<bool> = Vec::new();
+
+    for op in &active_ops {
+        match op {
+            DisplayOp::PushClip { path, visible, .. } => {
+                if *visible && !path.is_empty() {
+                    clip_stack.push(path.clone());
+                    clip_pushed_stack.push(true);
+                } else {
+                    clip_pushed_stack.push(false);
+                }
+            }
+            DisplayOp::PopClip => {
+                if clip_pushed_stack.pop().unwrap_or(false) {
+                    clip_stack.pop();
+                }
+            }
+            DisplayOp::DrawVector {
+                path,
+                fill,
+                outline,
+                opacity,
+                blend_mode,
+                visible,
+                ..
+            } => {
+                if !*visible || *opacity <= 1e-5 {
+                    continue;
+                }
+                let fill_col = match fill {
+                    Fill::None => None,
+                    Fill::Solid(c) => Some(c.clone()),
+                    Fill::LinearGradient { stops, .. }
+                    | Fill::RadialGradient { stops, .. }
+                    | Fill::ConicalGradient { stops, .. }
+                    | Fill::SquareGradient { stops, .. } => Some(Fill::sample_stops(stops, 0.5)),
+                    Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } => {
+                        Some(fg.clone())
+                    }
+                    Fill::MeshFill { nodes, .. } => nodes.first().map(|n| n.color.clone()),
+                    Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => {
+                        sample_pattern_representative_color(doc, fill)
+                    }
+                };
+                let stroke_col = outline
+                    .is_visible()
+                    .then(|| (&outline.color, outline.effective_width_mm()));
+                let overprint = *blend_mode == BlendMode::Multiply || outline.overprint;
+                emit_color_prim(
+                    &mut ops_by_channel,
+                    &mut plate_has_content,
+                    &mut next_z,
+                    path,
+                    fill_col.as_ref(),
+                    stroke_col,
+                    *opacity,
+                    overprint,
+                    &clip_stack,
+                );
+            }
+            DisplayOp::DrawTextRuns {
+                fallback_curves,
+                outline,
+                world_xf,
+                opacity,
+                blend_mode,
+                visible,
+                is_perspective,
+                ..
+            } => {
+                if !*visible || *opacity <= 1e-5 {
+                    continue;
+                }
+                let overprint = *blend_mode == BlendMode::Multiply || outline.overprint;
+                let stroke_col = outline
+                    .is_visible()
+                    .then(|| (&outline.color, outline.effective_width_mm()));
+                let curve_xf = if *is_perspective {
+                    Affine2D::IDENTITY
+                } else {
+                    *world_xf
+                };
+                for gd in fallback_curves {
+                    let wp = gd.path.transformed(&curve_xf);
+                    emit_color_prim(
+                        &mut ops_by_channel,
+                        &mut plate_has_content,
+                        &mut next_z,
+                        &wp,
+                        Some(&gd.fill),
+                        stroke_col,
+                        *opacity,
+                        overprint,
+                        &clip_stack,
+                    );
+                }
+            }
+            DisplayOp::DrawRaster {
+                asset_id,
+                inline_rgba,
+                bl,
+                br,
+                tl,
+                opacity,
+                blend_mode,
+                visible,
+                ..
+            } => {
+                if !*visible || *opacity <= 1e-5 {
+                    continue;
+                }
+                let owned_rgba;
+                let (rw, rh, rgba_slice): (u32, u32, &[u8]) =
+                    if let Some(ref arc_rgba) = inline_rgba {
+                        (arc_rgba.0, arc_rgba.1, &arc_rgba.2)
+                    } else if let Some(aid) = asset_id {
+                        let Some(asset) = doc.asset(*aid) else {
+                            continue;
+                        };
+                        owned_rgba = asset.to_rgba8_vec();
+                        (asset.width, asset.height, &owned_rgba)
+                    } else {
+                        continue;
+                    };
+                let Some(px_count) = (rw as usize).checked_mul(rh as usize) else {
+                    continue;
+                };
+                if px_count == 0 || rgba_slice.len() < px_count * 4 {
+                    continue;
+                }
+                let mut c_buf = vec![0u8; px_count];
+                let mut m_buf = vec![0u8; px_count];
+                let mut y_buf = vec![0u8; px_count];
+                let mut k_buf = vec![0u8; px_count];
+                let mut a_buf = vec![0u8; px_count];
+                let mut has_c = false;
+                let mut has_m = false;
+                let mut has_y = false;
+                let mut has_k = false;
+                let mut has_alpha = false;
+                let mut has_any_visible = false;
+                for (i, px) in rgba_slice[..px_count * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    let eff_a = ((f32::from(px[3]) / 255.0) * *opacity).clamp(0.0, 1.0);
+                    let a_u8 = (eff_a * 255.0).round() as u8;
+                    a_buf[i] = a_u8;
+                    if a_u8 < 255 {
+                        has_alpha = true;
+                    }
+                    if a_u8 > 0 {
+                        has_any_visible = true;
+                        let cmyk = icc.srgb_to_cmyk([
+                            f32::from(px[0]) / 255.0,
+                            f32::from(px[1]) / 255.0,
+                            f32::from(px[2]) / 255.0,
+                        ]);
+                        let cb = (cmyk[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let mb = (cmyk[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let yb = (cmyk[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let kb = (cmyk[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        c_buf[i] = cb;
+                        m_buf[i] = mb;
+                        y_buf[i] = yb;
+                        k_buf[i] = kb;
+                        has_c |= cb > 0;
+                        has_m |= mb > 0;
+                        has_y |= yb > 0;
+                        has_k |= kb > 0;
+                    }
+                }
+                if !has_any_visible {
+                    continue;
+                }
+                let overprint = *blend_mode == BlendMode::Multiply;
+                let alpha_mask = if has_alpha { a_buf } else { Vec::new() };
+                let z = next_z;
+                next_z += 1;
+                let process_bufs = [
+                    (SeparationChannel::Cyan, has_c, c_buf),
+                    (SeparationChannel::Magenta, has_m, m_buf),
+                    (SeparationChannel::Yellow, has_y, y_buf),
+                    (SeparationChannel::Black, has_k, k_buf),
+                ];
+                for (ch, has_ink, buf) in process_bufs {
+                    let needs_ko =
+                        !overprint && plate_has_content.get(&ch).copied().unwrap_or(false);
+                    if has_ink || needs_ko {
+                        raster_ops_by_channel.entry(ch.clone()).or_default().push(
+                            RasterPlatePrimitive {
+                                width: rw,
+                                height: rh,
+                                ink_channel: buf,
+                                alpha_mask: alpha_mask.clone(),
+                                bl: *bl,
+                                br: *br,
+                                tl: *tl,
+                                overprint,
+                                clip_paths: clip_stack.clone(),
+                                z_order: z,
+                            },
+                        );
+                        if has_ink {
+                            plate_has_content.insert(ch, true);
+                        }
+                    }
+                }
+                if !overprint {
+                    for spot_name in spots.keys() {
+                        let ch = SeparationChannel::Spot(spot_name.clone());
+                        if plate_has_content.get(&ch).copied().unwrap_or(false) {
+                            raster_ops_by_channel.entry(ch).or_default().push(
+                                RasterPlatePrimitive {
+                                    width: rw,
+                                    height: rh,
+                                    ink_channel: vec![0u8; px_count],
+                                    alpha_mask: alpha_mask.clone(),
+                                    bl: *bl,
+                                    br: *br,
+                                    tl: *tl,
+                                    overprint: false,
+                                    clip_paths: clip_stack.clone(),
+                                    z_order: z,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut plates = Vec::with_capacity(ops_by_channel.len());
+    for (chan, vops) in ops_by_channel {
+        let fb = match &chan {
+            SeparationChannel::Spot(n) => spots.get(n).copied(),
+            _ => None,
+        };
+        let rops = raster_ops_by_channel.remove(&chan).unwrap_or_default();
+        let name = chan.display_name();
+        plates.push(SeparationPlate {
+            channel: chan,
+            name,
+            width: 0,
+            height: 0,
+            ink_map: Vec::new(),
+            vector_ops: vops,
+            raster_ops: rops,
+            average_coverage_pct: 0.0,
+            max_coverage_pct: 0.0,
+            inked_area_pct: 0.0,
+            spot_fallback_cmyk: fb,
+        });
+    }
+    Ok(plates)
+}
+
+fn accumulate_channel_densities(
+    color: &Color,
+    opacity: f32,
+    out: &mut BTreeMap<SeparationChannel, f32>,
+) {
+    let a = (opacity * color.alpha()).clamp(0.0, 1.0);
+    if a <= 1e-5 {
+        return;
+    }
+    match color {
+        Color::Spot { name, tint, .. } => {
+            let t = (tint.clamp(0.0, 1.0) * a).clamp(0.0, 1.0);
+            if name.eq_ignore_ascii_case("Registration") {
+                for ch in [
+                    SeparationChannel::Cyan,
+                    SeparationChannel::Magenta,
+                    SeparationChannel::Yellow,
+                    SeparationChannel::Black,
+                ] {
+                    out.entry(ch).and_modify(|v| *v = (*v).max(t)).or_insert(t);
+                }
+            } else if t > 1e-4 {
+                out.entry(SeparationChannel::Spot(name.clone()))
+                    .and_modify(|v| *v = (*v).max(t))
+                    .or_insert(t);
+            }
+        }
+        other => {
+            let cmyk = other.to_cmyk();
+            let chans = [
+                SeparationChannel::Cyan,
+                SeparationChannel::Magenta,
+                SeparationChannel::Yellow,
+                SeparationChannel::Black,
+            ];
+            for (ch, val) in chans.into_iter().zip(cmyk) {
+                let d = (val * a).clamp(0.0, 1.0);
+                if d > 1e-4 {
+                    out.entry(ch).and_modify(|v| *v = (*v).max(d)).or_insert(d);
+                }
+            }
+        }
+    }
+}
+
+/// Exports vector-separated CMYK + Spot ink plates to a multi-page PDF file where each
+/// plate page carries pure vector artwork, `/Separation` / `/DeviceCMYK` colorants,
+/// registration/crop marks, and plate name slugs verifiable by `gs -sDEVICE=tiffsep` and `pdftotext`.
+pub fn export_separated_plates_pdf(
+    doc: &Document,
+    page_index: usize,
+    options: &SeparationOptions,
+    out_path: &Path,
+) -> ProdResult<Vec<String>> {
+    let (bytes, names) = export_separated_plates_pdf_bytes(doc, page_index, options)?;
+    std::fs::write(out_path, &bytes).map_err(|e| {
+        ProdError::InvalidParameter(format!(
+            "failed to write separated plates PDF '{}': {e}",
+            out_path.display()
+        ))
+    })?;
+    Ok(names)
+}
+
+/// Exports vector-separated CMYK + Spot plates into an in-memory multi-page PDF byte buffer.
+pub fn export_separated_plates_pdf_bytes(
+    doc: &Document,
+    page_index: usize,
+    options: &SeparationOptions,
+) -> ProdResult<(Vec<u8>, Vec<String>)> {
+    let page = get_page(doc, page_index)?;
+    validate_positive("page.width_mm", page.width_mm)?;
+    validate_positive("page.height_mm", page.height_mm)?;
+    let plates = compute_vector_separations(doc, page_index, options.include_cut_layers)?;
+
+    const MM_TO_PT: f64 = 72.0 / 25.4;
+    let margin_mm = 12.0;
+    let w_pt = (page.width_mm + 2.0 * margin_mm) * MM_TO_PT;
+    let h_pt = (page.height_mm + 2.0 * margin_mm) * MM_TO_PT;
+    let mx_pt = margin_mm * MM_TO_PT;
+    let my_pt = margin_mm * MM_TO_PT;
+
+    let mut pdf = Vec::<u8>::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    let mut offsets: Vec<usize> = Vec::new();
+    let push_obj = |pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| -> usize {
+        offsets.push(pdf.len());
+        let obj_num = offsets.len();
+        pdf.extend_from_slice(format!("{obj_num} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+        obj_num
+    };
+
+    // Object 1: Helvetica font for plate slugs
+    let font_obj = push_obj(
+        &mut pdf,
+        &mut offsets,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    let gs_op_obj = push_obj(
+        &mut pdf,
+        &mut offsets,
+        b"<< /Type /ExtGState /op true /OP true /OPM 1 >>",
+    );
+    let gs_ko_obj = push_obj(
+        &mut pdf,
+        &mut offsets,
+        b"<< /Type /ExtGState /op false /OP false /OPM 0 >>",
+    );
+
+    let mut plate_names = Vec::with_capacity(plates.len());
+    let mut page_objs = Vec::with_capacity(plates.len());
+
+    for plate in &plates {
+        plate_names.push(plate.name.clone());
+        let mut cs_dict = String::new();
+        let cs_name = "CSInk";
+        if let SeparationChannel::Spot(sname) = &plate.channel {
+            let fb = plate.spot_fallback_cmyk.unwrap_or([0.0, 1.0, 0.0, 0.0]);
+            let esc = sname.replace(' ', "#20");
+            let spot_fn_obj = push_obj(
+                &mut pdf,
+                &mut offsets,
+                format!(
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [{:.4} {:.4} {:.4} {:.4}] /N 1 >>",
+                    fb[0], fb[1], fb[2], fb[3]
+                )
+                .as_bytes(),
+            );
+            let cs_obj = push_obj(
+                &mut pdf,
+                &mut offsets,
+                format!("[/Separation /{esc} /DeviceCMYK {spot_fn_obj} 0 R]").as_bytes(),
+            );
+            cs_dict = format!("/ColorSpace << /{cs_name} {cs_obj} 0 R >> ");
+        }
+
+        let mut xobject_entries: Vec<String> = Vec::new();
+        let mut stream = String::new();
+        let slug = format!(
+            "coree Separation Plate: {} ({:.1}x{:.1} mm)",
+            plate.name, page.width_mm, page.height_mm
+        );
+        let safe_slug = slug.replace('(', "\\(").replace(')', "\\)");
+        stream.push_str("q\n");
+        stream.push_str(&format!(
+            "BT /F1 8 Tf 0 0 0 1 k {mx_pt:.3} {:.3} Td ({safe_slug}) Tj ET\n",
+            my_pt - 9.0
+        ));
+        // Crop marks around page trim box
+        let trim_r = mx_pt + page.width_mm * MM_TO_PT;
+        let trim_t = my_pt + page.height_mm * MM_TO_PT;
+        stream.push_str("0.25 w 0 0 0 1 K\n");
+        for (x, y, dx, dy) in [
+            (mx_pt, my_pt, -8.0, -8.0),
+            (trim_r, my_pt, 8.0, -8.0),
+            (mx_pt, trim_t, -8.0, 8.0),
+            (trim_r, trim_t, 8.0, 8.0),
+        ] {
+            stream.push_str(&format!(
+                "{:.3} {y:.3} m {:.3} {y:.3} l S\n{x:.3} {:.3} m {x:.3} {:.3} l S\n",
+                x + dx * 0.25,
+                x + dx,
+                y + dy * 0.25,
+                y + dy
+            ));
+        }
+
+        let to_pdf_xy = |p: Point2D| -> (f64, f64) {
+            (
+                mx_pt + p.x * MM_TO_PT,
+                my_pt + (page.height_mm - p.y) * MM_TO_PT,
+            )
+        };
+        let encode_path = |path: &BezierPath| -> String {
+            let mut ops = String::new();
+            let kb = path.to_kurbo();
+            for el in kb.elements() {
+                match *el {
+                    PathEl::MoveTo(p) => {
+                        let (x, y) = to_pdf_xy(Point2D::new(p.x, p.y));
+                        ops.push_str(&format!("{x:.3} {y:.3} m\n"));
+                    }
+                    PathEl::LineTo(p) => {
+                        let (x, y) = to_pdf_xy(Point2D::new(p.x, p.y));
+                        ops.push_str(&format!("{x:.3} {y:.3} l\n"));
+                    }
+                    PathEl::QuadTo(p1, p2) => {
+                        let (x1, y1) = to_pdf_xy(Point2D::new(p1.x, p1.y));
+                        let (x2, y2) = to_pdf_xy(Point2D::new(p2.x, p2.y));
+                        ops.push_str(&format!("{x1:.3} {y1:.3} {x2:.3} {y2:.3} v\n"));
+                    }
+                    PathEl::CurveTo(p1, p2, p3) => {
+                        let (x1, y1) = to_pdf_xy(Point2D::new(p1.x, p1.y));
+                        let (x2, y2) = to_pdf_xy(Point2D::new(p2.x, p2.y));
+                        let (x3, y3) = to_pdf_xy(Point2D::new(p3.x, p3.y));
+                        ops.push_str(&format!(
+                            "{x1:.3} {y1:.3} {x2:.3} {y2:.3} {x3:.3} {y3:.3} c\n"
+                        ));
+                    }
+                    PathEl::ClosePath => ops.push_str("h\n"),
+                }
+            }
+            ops
+        };
+        let emit_ink_cmd = |density: f32, stroke: bool| -> String {
+            let d = density.clamp(0.0, 1.0);
+            match &plate.channel {
+                SeparationChannel::Cyan => {
+                    format!("{d:.4} 0 0 0 {}", if stroke { "K" } else { "k" })
+                }
+                SeparationChannel::Magenta => {
+                    format!("0 {d:.4} 0 0 {}", if stroke { "K" } else { "k" })
+                }
+                SeparationChannel::Yellow => {
+                    format!("0 0 {d:.4} 0 {}", if stroke { "K" } else { "k" })
+                }
+                SeparationChannel::Black => {
+                    format!("0 0 0 {d:.4} {}", if stroke { "K" } else { "k" })
+                }
+                SeparationChannel::Spot(_) => {
+                    format!(
+                        "/{cs_name} {} {d:.4} {}",
+                        if stroke { "CS" } else { "cs" },
+                        if stroke { "SCN" } else { "scn" }
+                    )
+                }
+            }
+        };
+
+        #[derive(Clone, Copy)]
+        enum PlateDrawItem {
+            Vec(usize, usize),
+            Ras(usize, usize),
+        }
+        let mut draw_order: Vec<PlateDrawItem> =
+            Vec::with_capacity(plate.vector_ops.len() + plate.raster_ops.len());
+        for (i, v) in plate.vector_ops.iter().enumerate() {
+            draw_order.push(PlateDrawItem::Vec(v.z_order, i));
+        }
+        for (i, r) in plate.raster_ops.iter().enumerate() {
+            draw_order.push(PlateDrawItem::Ras(r.z_order, i));
+        }
+        draw_order.sort_by_key(|item| match *item {
+            PlateDrawItem::Vec(z, i) => (z, 0u8, i),
+            PlateDrawItem::Ras(z, i) => (z, 1u8, i),
+        });
+
+        for item in draw_order {
+            match item {
+                PlateDrawItem::Vec(_, idx) => {
+                    let prim = &plate.vector_ops[idx];
+                    let path_ops = encode_path(&prim.path);
+                    if path_ops.is_empty() {
+                        continue;
+                    }
+                    stream.push_str("q\n");
+                    for cp in &prim.clip_paths {
+                        let cp_ops = encode_path(cp);
+                        if !cp_ops.is_empty() {
+                            stream.push_str(&cp_ops);
+                            stream.push_str("W* n\n");
+                        }
+                    }
+                    stream.push_str(if prim.overprint {
+                        "/GSop gs\n"
+                    } else {
+                        "/GSko gs\n"
+                    });
+                    if let Some(fd) = prim.fill_density {
+                        stream.push_str(&emit_ink_cmd(fd, false));
+                        stream.push('\n');
+                        stream.push_str(&path_ops);
+                        stream.push_str("f*\n");
+                    }
+                    if let Some(sd) = prim.stroke_density {
+                        let lw = (prim.stroke_width_mm * MM_TO_PT).max(0.25);
+                        stream.push_str(&format!("{lw:.3} w\n"));
+                        stream.push_str(&emit_ink_cmd(sd, true));
+                        stream.push('\n');
+                        stream.push_str(&path_ops);
+                        stream.push_str("S\n");
+                    }
+                    stream.push_str("Q\n");
+                }
+                PlateDrawItem::Ras(_, idx) => {
+                    let rprim = &plate.raster_ops[idx];
+                    let px_count = (rprim.width as usize).saturating_mul(rprim.height as usize);
+                    if px_count == 0 || rprim.ink_channel.len() < px_count {
+                        continue;
+                    }
+                    let smask_ref = if rprim.alpha_mask.len() >= px_count {
+                        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+                        enc.write_all(&rprim.alpha_mask[..px_count]).map_err(|e| {
+                            ProdError::InvalidParameter(format!("zlib compress smask failed: {e}"))
+                        })?;
+                        let comp = enc.finish().map_err(|e| {
+                            ProdError::InvalidParameter(format!("zlib finish smask failed: {e}"))
+                        })?;
+                        let mut sb = format!(
+                            "<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+                             /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
+                            rprim.width,
+                            rprim.height,
+                            comp.len()
+                        )
+                        .into_bytes();
+                        sb.extend_from_slice(&comp);
+                        sb.extend_from_slice(b"\nendstream");
+                        let sm_id = push_obj(&mut pdf, &mut offsets, &sb);
+                        format!(" /SMask {sm_id} 0 R")
+                    } else {
+                        String::new()
+                    };
+                    let mut cmyk_bytes = Vec::with_capacity(px_count * 4);
+                    let ch_slot = match &plate.channel {
+                        SeparationChannel::Cyan => Some(0usize),
+                        SeparationChannel::Magenta => Some(1usize),
+                        SeparationChannel::Yellow => Some(2usize),
+                        SeparationChannel::Black => Some(3usize),
+                        SeparationChannel::Spot(_) => None,
+                    };
+                    for &v in &rprim.ink_channel[..px_count] {
+                        let mut px = [0u8; 4];
+                        if let Some(s) = ch_slot {
+                            px[s] = v;
+                        }
+                        cmyk_bytes.extend_from_slice(&px);
+                    }
+                    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+                    enc.write_all(&cmyk_bytes).map_err(|e| {
+                        ProdError::InvalidParameter(format!(
+                            "zlib compress raster plate failed: {e}"
+                        ))
+                    })?;
+                    let comp = enc.finish().map_err(|e| {
+                        ProdError::InvalidParameter(format!("zlib finish raster plate failed: {e}"))
+                    })?;
+                    let mut ib = format!(
+                        "<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+                         /ColorSpace /DeviceCMYK /BitsPerComponent 8{smask_ref} /Filter /FlateDecode /Length {} >>\nstream\n",
+                        rprim.width,
+                        rprim.height,
+                        comp.len()
+                    )
+                    .into_bytes();
+                    ib.extend_from_slice(&comp);
+                    ib.extend_from_slice(b"\nendstream");
+                    let im_id = push_obj(&mut pdf, &mut offsets, &ib);
+                    let im_name = format!("Im{}", xobject_entries.len() + 1);
+                    xobject_entries.push(format!("/{im_name} {im_id} 0 R"));
+
+                    let (x0, y0) = to_pdf_xy(rprim.bl);
+                    let (x1, y1) = to_pdf_xy(rprim.br);
+                    let (x2, y2) = to_pdf_xy(rprim.tl);
+                    stream.push_str("q\n");
+                    for cp in &rprim.clip_paths {
+                        let cp_ops = encode_path(cp);
+                        if !cp_ops.is_empty() {
+                            stream.push_str(&cp_ops);
+                            stream.push_str("W* n\n");
+                        }
+                    }
+                    stream.push_str(if rprim.overprint {
+                        "/GSop gs\n"
+                    } else {
+                        "/GSko gs\n"
+                    });
+                    stream.push_str(&format!(
+                        "{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do\nQ\n",
+                        x1 - x0,
+                        y1 - y0,
+                        x2 - x0,
+                        y2 - y0,
+                        x0,
+                        y0
+                    ));
+                }
+            }
+        }
+        stream.push_str("Q\n");
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(stream.as_bytes()).map_err(|e| {
+            ProdError::InvalidParameter(format!("zlib compress separation plate failed: {e}"))
+        })?;
+        let compressed = enc.finish().map_err(|e| {
+            ProdError::InvalidParameter(format!("zlib finish separation plate failed: {e}"))
+        })?;
+        let mut s_body = format!(
+            "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            compressed.len()
+        )
+        .into_bytes();
+        s_body.extend_from_slice(&compressed);
+        s_body.extend_from_slice(b"\nendstream");
+        let content_obj = push_obj(&mut pdf, &mut offsets, &s_body);
+
+        let xobj_dict = if xobject_entries.is_empty() {
+            String::new()
+        } else {
+            format!("/XObject << {} >> ", xobject_entries.join(" "))
+        };
+        let gs_dict = format!("/ExtGState << /GSop {gs_op_obj} 0 R /GSko {gs_ko_obj} 0 R >> ");
+        let page_body = format!(
+            "<< /Type /Page /Parent {{PAGES_REF}} /MediaBox [0 0 {w_pt:.3} {h_pt:.3}] \
+             /Resources << /Font << /F1 {font_obj} 0 R >> {gs_dict}{cs_dict}{xobj_dict}>> /Contents {content_obj} 0 R >>"
+        );
+        page_objs.push((offsets.len(), page_body));
+        offsets.push(0); // placeholder for page object
+    }
+
+    let pages_obj_num = offsets.len() + 1;
+    let kids: String = (0..page_objs.len())
+        .map(|i| format!("{} 0 R", page_objs[i].0 + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (slot_idx, raw_body) in page_objs {
+        offsets[slot_idx] = pdf.len();
+        let obj_num = slot_idx + 1;
+        let resolved = raw_body.replace("{PAGES_REF}", &format!("{pages_obj_num} 0 R"));
+        pdf.extend_from_slice(format!("{obj_num} 0 obj\n{resolved}\nendobj\n").as_bytes());
+    }
+    let pages_obj = push_obj(
+        &mut pdf,
+        &mut offsets,
+        format!(
+            "<< /Type /Pages /Count {} /Kids [{kids}] >>",
+            plate_names.len()
+        )
+        .as_bytes(),
+    );
+    let catalog_obj = push_obj(
+        &mut pdf,
+        &mut offsets,
+        format!("<< /Type /Catalog /Pages {pages_obj} 0 R >>").as_bytes(),
+    );
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for off in &offsets {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root {catalog_obj} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    Ok((pdf, plate_names))
 }
 
 fn layer_included_in_separation(layer: &coree_core::Layer, include_cut_layers: bool) -> bool {
@@ -282,98 +1324,193 @@ fn layer_included_in_separation(layer: &coree_core::Layer, include_cut_layers: b
 fn collect_spots_recursive(
     doc: &Document,
     id: ObjectId,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
     spots: &mut BTreeMap<String, [f32; 4]>,
 ) {
-    if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
+    if depth > MAX_SCENE_DEPTH || (id.0 != 0 && !visiting.insert(id)) {
         return;
     }
-    if let Some(obj) = doc.object(id) {
-        if obj.visible && obj.printable {
-            for c in obj.fill.referenced_colors() {
-                register_spot_color(&c, spots);
+    let obj_opt = sym_ctx
+        .and_then(|c| c.sym_map.get(&id).copied())
+        .or_else(|| doc.object(id));
+    if let Some(obj) = obj_opt {
+        collect_spots_for_obj(doc, obj, sym_ctx, depth, visiting, spots);
+    }
+    if id.0 != 0 {
+        visiting.remove(&id);
+    }
+}
+
+fn collect_spots_for_obj(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    spots: &mut BTreeMap<String, [f32; 4]>,
+) {
+    if depth > MAX_SCENE_DEPTH || !obj.visible || !obj.printable {
+        return;
+    }
+    for c in obj.fill.referenced_colors() {
+        register_spot_color(&c, spots);
+    }
+    if obj.outline.is_visible() {
+        register_spot_color(&obj.outline.color, spots);
+    }
+    for eff in &obj.effects {
+        match eff {
+            Effect::DropShadow { color, .. }
+            | Effect::InnerShadow { color, .. }
+            | Effect::BlockShadow { color, .. } => register_spot_color(color, spots),
+            Effect::Contour {
+                fill_color,
+                outline_color,
+                ..
+            } => {
+                register_spot_color(fill_color, spots);
+                register_spot_color(outline_color, spots);
             }
-            if obj.outline.is_visible() {
-                register_spot_color(&obj.outline.color, spots);
+            Effect::Bevel {
+                highlight_color,
+                shadow_color,
+                ..
+            } => {
+                register_spot_color(highlight_color, spots);
+                register_spot_color(shadow_color, spots);
             }
-            match &obj.payload {
-                NodePayload::ArtisticText(t) => {
-                    for run in &t.runs {
-                        register_spot_color(&run.style.fill, spots);
-                    }
-                }
-                NodePayload::ParagraphText(t) => {
-                    for run in &t.runs {
-                        register_spot_color(&run.style.fill, spots);
-                    }
-                }
-                NodePayload::TextOnPath(top) => {
-                    for run in &top.text.runs {
-                        register_spot_color(&run.style.fill, spots);
-                    }
-                }
-                NodePayload::Group(children) => {
-                    for &cid in children {
-                        collect_spots_recursive(doc, cid, depth + 1, visiting, spots);
-                    }
-                }
-                NodePayload::PowerClip { contents, .. } => {
-                    for &cid in contents {
-                        collect_spots_recursive(doc, cid, depth + 1, visiting, spots);
-                    }
-                }
-                NodePayload::SymbolInstance(sym_id) => {
-                    if let Some(sym) = doc.symbol(*sym_id) {
-                        for sub in &sym.objects {
-                            if !sub.visible || !sub.printable {
-                                continue;
-                            }
-                            for c in sub.fill.referenced_colors() {
-                                register_spot_color(&c, spots);
-                            }
-                            if sub.outline.is_visible() {
-                                register_spot_color(&sub.outline.color, spots);
-                            }
-                            match &sub.payload {
-                                NodePayload::ArtisticText(t) => {
-                                    for run in &t.runs {
-                                        register_spot_color(&run.style.fill, spots);
-                                    }
-                                }
-                                NodePayload::ParagraphText(t) => {
-                                    for run in &t.runs {
-                                        register_spot_color(&run.style.fill, spots);
-                                    }
-                                }
-                                NodePayload::TextOnPath(top) => {
-                                    for run in &top.text.runs {
-                                        register_spot_color(&run.style.fill, spots);
-                                    }
-                                }
-                                NodePayload::Table(table) => {
-                                    if table.border_style.is_visible() {
-                                        register_spot_color(&table.border_style.color, spots);
-                                    }
-                                    for cell in &table.cells {
-                                        if !cell.is_covered() {
-                                            for c in cell.fill.referenced_colors() {
-                                                register_spot_color(&c, spots);
-                                            }
-                                            register_spot_color(&cell.text_style.fill, spots);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            Effect::Extrude25D { shade_color, .. } | Effect::Extrude3D { shade_color, .. } => {
+                register_spot_color(shade_color, spots);
             }
+            _ => {}
         }
     }
-    visiting.remove(&id);
+    match &obj.payload {
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+            {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                collect_spots_for_obj(
+                    doc,
+                    &tmp,
+                    if in_sym { sym_ctx } else { None },
+                    depth + 1,
+                    visiting,
+                    spots,
+                );
+            }
+        }
+        NodePayload::ArtisticText(t) => {
+            for run in &t.runs {
+                register_spot_color(&run.style.fill, spots);
+            }
+        }
+        NodePayload::ParagraphText(t) => {
+            for run in &t.runs {
+                register_spot_color(&run.style.fill, spots);
+            }
+        }
+        NodePayload::TextOnPath(top) => {
+            for run in &top.text.runs {
+                register_spot_color(&run.style.fill, spots);
+            }
+        }
+        NodePayload::Table(table) => {
+            if table.border_style.is_visible() {
+                register_spot_color(&table.border_style.color, spots);
+            }
+            for cell in &table.cells {
+                if !cell.is_covered() {
+                    for c in cell.fill.referenced_colors() {
+                        register_spot_color(&c, spots);
+                    }
+                    register_spot_color(&cell.text_style.fill, spots);
+                }
+            }
+        }
+        NodePayload::Dimension(d) => {
+            register_spot_color(&d.text_style.fill, spots);
+        }
+        NodePayload::Group(children) => {
+            for &cid in children {
+                collect_spots_recursive(doc, cid, sym_ctx, depth + 1, visiting, spots);
+            }
+        }
+        NodePayload::PowerClip { contents, .. } => {
+            for &cid in contents {
+                collect_spots_recursive(doc, cid, sym_ctx, depth + 1, visiting, spots);
+            }
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
+                    }
+                    let pref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
+                    };
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let ctx = SymBoundsCtx {
+                    root_xf: &Affine2D::IDENTITY,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                let mut sym_visiting = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_visiting.insert(sub.id) {
+                        continue;
+                    }
+                    collect_spots_for_obj(
+                        doc,
+                        sub,
+                        Some(&ctx),
+                        depth + 1,
+                        &mut sym_visiting,
+                        spots,
+                    );
+                    if sub.id.0 != 0 {
+                        sym_visiting.remove(&sub.id);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn register_spot_color(color: &Color, spots: &mut BTreeMap<String, [f32; 4]>) {
@@ -391,6 +1528,7 @@ fn register_spot_color(color: &Color, spots: &mut BTreeMap<String, [f32; 4]>) {
 
 struct SeparationRasterCtx<'a> {
     doc: &'a Document,
+    page_index: usize,
     width: u32,
     height: u32,
     scale_x: f32,
@@ -408,29 +1546,122 @@ fn rasterize_object_separation(
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
 ) {
-    if depth > MAX_SCENE_DEPTH || !visiting.insert(id) {
+    rasterize_object_separation_sym(ctx, id, parent_xf, None, clip_mask, depth, visiting);
+}
+
+fn rasterize_object_separation_sym(
+    ctx: &mut SeparationRasterCtx<'_>,
+    id: ObjectId,
+    parent_xf: Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    clip_mask: Option<&[f32]>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+) {
+    if depth > MAX_SCENE_DEPTH || (id.0 != 0 && !visiting.insert(id)) {
         return;
     }
-    let Some(obj) = ctx.doc.object(id) else {
+    let obj_opt = sym_ctx
+        .and_then(|c| c.sym_map.get(&id).copied())
+        .or_else(|| ctx.doc.object(id));
+    if let Some(obj) = obj_opt {
+        rasterize_scene_obj_separation(ctx, obj, parent_xf, sym_ctx, clip_mask, depth, visiting);
+    }
+    if id.0 != 0 {
         visiting.remove(&id);
-        return;
-    };
-    if !obj.visible || !obj.printable || !obj.opacity.is_finite() || obj.opacity <= 1e-6 {
-        visiting.remove(&id);
+    }
+}
+
+fn rasterize_scene_obj_separation(
+    ctx: &mut SeparationRasterCtx<'_>,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    clip_mask: Option<&[f32]>,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+) {
+    if depth > MAX_SCENE_DEPTH
+        || !obj.visible
+        || !obj.printable
+        || !obj.opacity.is_finite()
+        || obj.opacity <= 1e-6
+    {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
     if !world_xf.is_finite() {
-        visiting.remove(&id);
         return;
     }
 
+    let needs_isolated_raster = obj.lens.is_some()
+        || !obj.effects.is_empty()
+        || matches!(
+            obj.fill,
+            Fill::VectorPattern { .. }
+                | Fill::BitmapPattern { .. }
+                | Fill::ConicalGradient { .. }
+                | Fill::SquareGradient { .. }
+                | Fill::TwoColorPattern { .. }
+                | Fill::TextureFill { .. }
+                | Fill::MeshFill { .. }
+        );
+    if needs_isolated_raster {
+        let dpi = (f64::from(ctx.scale_x) * 25.4).max(12.0);
+        let iso_res = if sym_ctx.is_none() && obj.id.0 != 0 && ctx.doc.object(obj.id).is_some() {
+            render_isolated_object_to_rgba_with_options(
+                ctx.doc,
+                ctx.page_index,
+                obj.id,
+                parent_xf,
+                dpi,
+                false,
+            )
+            .ok()
+            .flatten()
+        } else {
+            render_isolated_sym_object_to_rgba(ctx, obj, parent_xf, sym_ctx, dpi)
+        };
+        if let Some((bb, buf)) = iso_res {
+            paint_rgba_quad_into_buffers(ctx, &buf.rgba, buf.width, buf.height, bb, clip_mask);
+            return;
+        }
+    }
+
     match &obj.payload {
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o, in_sym)) = ctx
+                .doc
+                .resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+            {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                rasterize_scene_obj_separation(
+                    ctx,
+                    &tmp,
+                    parent_xf,
+                    if in_sym { sym_ctx } else { None },
+                    clip_mask,
+                    depth + 1,
+                    visiting,
+                );
+            }
+            return;
+        }
         NodePayload::Group(children) => {
             for &cid in children {
-                rasterize_object_separation(ctx, cid, world_xf, clip_mask, depth + 1, visiting);
+                rasterize_object_separation_sym(
+                    ctx,
+                    cid,
+                    world_xf,
+                    sym_ctx,
+                    clip_mask,
+                    depth + 1,
+                    visiting,
+                );
             }
-            visiting.remove(&id);
             return;
         }
         NodePayload::PowerClip {
@@ -438,10 +1669,9 @@ fn rasterize_object_separation(
             contents,
             ..
         } => {
-            let world_container = container.transformed(&world_xf);
-            // Paint container fill/stroke first if any
+            let local_c = apply_obj_perspective_to_local_path((**container).clone(), obj);
+            let world_container = local_c.transformed(&world_xf);
             paint_vector_object(ctx, obj, &world_container, &world_xf, clip_mask);
-            // Build combined clip mask for clipped contents
             if let Some(container_mask) = rasterize_fill_mask(
                 &world_container,
                 ctx.width,
@@ -458,80 +1688,153 @@ fn rasterize_object_separation(
                     None => container_mask,
                 };
                 for &cid in contents {
-                    rasterize_object_separation(
+                    rasterize_object_separation_sym(
                         ctx,
                         cid,
                         world_xf,
+                        sym_ctx,
                         Some(&combined_mask),
                         depth + 1,
                         visiting,
                     );
                 }
             }
-            visiting.remove(&id);
             return;
         }
         NodePayload::Raster(raster) => {
             paint_raster_object(ctx, obj, raster, &world_xf, clip_mask);
-            visiting.remove(&id);
+            return;
+        }
+        NodePayload::Table(table) => {
+            let overprint = obj.blend_mode == BlendMode::Multiply;
+            for r in 0..table.rows {
+                for c in 0..table.cols {
+                    let Some(cell) = table.cell(r, c) else {
+                        continue;
+                    };
+                    if cell.is_covered() || !cell.fill.is_visible() {
+                        continue;
+                    }
+                    if let Some(cr) = table.cell_rect(r, c) {
+                        let cell_path =
+                            apply_obj_perspective_to_local_path(BezierPath::from_rect(cr), obj)
+                                .transformed(&world_xf);
+                        paint_fill(
+                            ctx,
+                            &cell_path,
+                            &world_xf,
+                            &cell.fill,
+                            obj.opacity,
+                            overprint,
+                            clip_mask,
+                        );
+                    }
+                }
+            }
+            let grid_path = apply_obj_perspective_to_local_path(table.to_grid_paths(), obj)
+                .transformed(&world_xf);
+            if table.border_style.is_visible() {
+                paint_stroke(
+                    ctx,
+                    &grid_path,
+                    &table.border_style,
+                    obj.opacity,
+                    table.border_style.overprint || overprint,
+                    clip_mask,
+                );
+            } else if obj.outline.is_visible() {
+                paint_stroke(
+                    ctx,
+                    &grid_path,
+                    &obj.outline,
+                    obj.opacity,
+                    obj.outline.overprint || overprint,
+                    clip_mask,
+                );
+            }
             return;
         }
         NodePayload::SymbolInstance(sym_id) => {
             if let Some(sym) = ctx.doc.symbol(*sym_id) {
-                for sub in &sym.objects {
-                    if !sub.visible
-                        || !sub.printable
-                        || !sub.opacity.is_finite()
-                        || sub.opacity <= 1e-6
-                    {
-                        continue;
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
                     }
-                    let sub_xf = world_xf.compose(&sub.transform);
-                    if !sub_xf.is_finite() {
-                        continue;
-                    }
-                    let sub_path = match &sub.payload {
-                        NodePayload::Path(p) => Some(p.transformed(&sub_xf)),
-                        NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&sub_xf)),
-                        NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&sub_xf)),
-                        NodePayload::ArtisticText(t) => outline_text_path_for_separation(
-                            ctx,
-                            sub,
-                            &sub_xf,
-                            t.estimated_bounds(),
-                            !t.plain_text().trim().is_empty(),
-                        ),
-                        NodePayload::ParagraphText(t) => outline_text_path_for_separation(
-                            ctx,
-                            sub,
-                            &sub_xf,
-                            t.bounding_box(),
-                            !t.plain_text().trim().is_empty(),
-                        ),
-                        NodePayload::TextOnPath(top) => outline_text_path_for_separation(
-                            ctx,
-                            sub,
-                            &sub_xf,
-                            top.text.estimated_bounds(),
-                            !top.text.plain_text().trim().is_empty(),
-                        ),
-                        _ => None,
+                    let pref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
                     };
-                    if let Some(path) = sub_path {
-                        paint_vector_object(ctx, sub, &path, &sub_xf, clip_mask);
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let s_ctx = SymBoundsCtx {
+                    root_xf: &world_xf,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                let mut sym_vis = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_vis.insert(sub.id) {
+                        continue;
+                    }
+                    rasterize_scene_obj_separation(
+                        ctx,
+                        sub,
+                        world_xf,
+                        Some(&s_ctx),
+                        clip_mask,
+                        depth + 1,
+                        &mut sym_vis,
+                    );
+                    if sub.id.0 != 0 {
+                        sym_vis.remove(&sub.id);
                     }
                 }
             }
-            visiting.remove(&id);
             return;
         }
         _ => {}
     }
 
     let world_path = match &obj.payload {
-        NodePayload::Path(p) => Some(p.transformed(&world_xf)),
-        NodePayload::Shape(s) => Some(s.to_bezier_path().transformed(&world_xf)),
-        NodePayload::Table(t) => Some(t.to_grid_paths().transformed(&world_xf)),
+        NodePayload::Path(p) => {
+            Some(apply_obj_perspective_to_local_path(p.clone(), obj).transformed(&world_xf))
+        }
+        NodePayload::Shape(s) => Some(
+            apply_obj_perspective_to_local_path(s.to_bezier_path(), obj).transformed(&world_xf),
+        ),
+        NodePayload::BSpline(bs) => Some(
+            apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj).transformed(&world_xf),
+        ),
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            Some(apply_obj_perspective_to_local_path(expanded, obj).transformed(&world_xf))
+        }
         NodePayload::ArtisticText(t) => outline_text_path_for_separation(
             ctx,
             obj,
@@ -553,9 +1856,10 @@ fn rasterize_object_separation(
             top.text.estimated_bounds(),
             !top.text.plain_text().trim().is_empty(),
         ),
-        NodePayload::Dimension(d) => {
-            Some(BezierPath::from_rect(d.bounding_box()).transformed(&world_xf))
-        }
+        NodePayload::Dimension(d) => Some(
+            apply_obj_perspective_to_local_path(BezierPath::from_rect(d.bounding_box()), obj)
+                .transformed(&world_xf),
+        ),
         NodePayload::Connector(c) => {
             let (a, b) = ctx
                 .doc
@@ -568,8 +1872,88 @@ fn rasterize_object_separation(
     if let Some(path) = world_path {
         paint_vector_object(ctx, obj, &path, &world_xf, clip_mask);
     }
+}
 
-    visiting.remove(&id);
+fn paint_rgba_quad_into_buffers(
+    ctx: &mut SeparationRasterCtx<'_>,
+    rgba: &[u8],
+    rw: u32,
+    rh: u32,
+    world_bb: Rect2D,
+    clip_mask: Option<&[f32]>,
+) {
+    if rw == 0
+        || rh == 0
+        || !world_bb.is_finite()
+        || world_bb.width() <= 1e-6
+        || world_bb.height() <= 1e-6
+    {
+        return;
+    }
+    let px0 = ((world_bb.min_x * f64::from(ctx.scale_x)).floor() as i64)
+        .clamp(0, i64::from(ctx.width)) as u32;
+    let py0 = ((world_bb.min_y * f64::from(ctx.scale_y)).floor() as i64)
+        .clamp(0, i64::from(ctx.height)) as u32;
+    let px1 = ((world_bb.max_x * f64::from(ctx.scale_x)).ceil() as i64)
+        .clamp(0, i64::from(ctx.width)) as u32;
+    let py1 = ((world_bb.max_y * f64::from(ctx.scale_y)).ceil() as i64)
+        .clamp(0, i64::from(ctx.height)) as u32;
+    let inv_sx = 1.0 / f64::from(ctx.scale_x);
+    let inv_sy = 1.0 / f64::from(ctx.scale_y);
+    for py in py0..py1 {
+        let y_mm = (f64::from(py) + 0.5) * inv_sy;
+        let v = (((y_mm - world_bb.min_y) / world_bb.height()) * f64::from(rh))
+            .floor()
+            .clamp(0.0, f64::from(rh - 1)) as usize;
+        for px in px0..px1 {
+            let idx = (py as usize) * (ctx.width as usize) + (px as usize);
+            let clip_a = clip_mask.map_or(1.0, |cm| cm[idx]);
+            if clip_a <= 1e-5 {
+                continue;
+            }
+            let x_mm = (f64::from(px) + 0.5) * inv_sx;
+            let u = (((x_mm - world_bb.min_x) / world_bb.width()) * f64::from(rw))
+                .floor()
+                .clamp(0.0, f64::from(rw - 1)) as usize;
+            let si = (v * (rw as usize) + u) * 4;
+            if si + 3 < rgba.len() && rgba[si + 3] > 0 {
+                let col = Color::rgba8(rgba[si], rgba[si + 1], rgba[si + 2], rgba[si + 3]);
+                composite_pixel_color(ctx.buffers, ctx.spot_index, idx, &col, clip_a, false);
+            }
+        }
+    }
+}
+
+fn render_isolated_sym_object_to_rgba(
+    ctx: &SeparationRasterCtx<'_>,
+    obj: &SceneObject,
+    parent_xf: Affine2D,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    dpi: f64,
+) -> Option<(Rect2D, coree_render::RgbaBuffer)> {
+    let page = ctx.doc.page(ctx.page_index)?;
+    let mut tmp_doc = clone_document_shell(ctx.doc, "SepSymIso");
+    let p_id = tmp_doc.add_page("P1", page.width_mm, page.height_mm, page.bleed_mm);
+    let l_id = tmp_doc.page_by_id(p_id)?.layers[0].id;
+    if let Some(sc) = sym_ctx {
+        for sub in sc.sym_objects {
+            if sub.id.0 != 0 {
+                let _ = tmp_doc.insert_loaded_object(sub.clone());
+            }
+        }
+    }
+    let mut obj_copy = obj.clone();
+    if obj_copy.id.0 == 0 {
+        obj_copy.id = tmp_doc.alloc_object_id();
+    }
+    let target_id = obj_copy.id;
+    let _ = tmp_doc.insert_loaded_object(obj_copy);
+    if let Some(layer) = tmp_doc.find_layer_mut(l_id) {
+        layer.objects.push(target_id);
+    }
+    render_isolated_object_to_rgba_with_options(&tmp_doc, 0, target_id, parent_xf, dpi, false)
+        .ok()
+        .flatten()
 }
 
 fn outline_text_path_for_separation(
@@ -817,9 +2201,12 @@ fn paint_raster_object(
     world_xf: &Affine2D,
     clip_mask: Option<&[f32]>,
 ) {
-    let Some(asset) = ctx.doc.asset(raster.asset_id) else {
+    let Some(raw_asset) = ctx.doc.asset(raster.asset_id) else {
         return;
     };
+    let filtered = (!raster.filters.is_empty())
+        .then(|| coree_render::apply_raster_filters(raw_asset, &raster.filters));
+    let asset = filtered.as_ref().unwrap_or(raw_asset);
     if asset.width == 0 || asset.height == 0 || raster.width_mm <= 1e-6 || raster.height_mm <= 1e-6
     {
         return;
@@ -1080,6 +2467,8 @@ fn build_plate(
         width,
         height,
         ink_map,
+        vector_ops: Vec::new(),
+        raster_ops: Vec::new(),
         average_coverage_pct: (sum / n) * 100.0,
         max_coverage_pct: max_val * 100.0,
         inked_area_pct: (inked as f64 / n) * 100.0,
@@ -1189,6 +2578,16 @@ pub enum ImpositionMode {
         tile_h_mm: f64,
         overlap_mm: f64,
     },
+    /// Perfect-bound book signature imposition (`signature_pages` pages per folded signature,
+    /// progressive spine/creep & milling allowance compensation).
+    PerfectBound {
+        sheet_w_mm: f64,
+        sheet_h_mm: f64,
+        signature_pages: usize,
+        spine_thickness_mm: f64,
+        creep_mm: f64,
+        milling_allowance_mm: f64,
+    },
 }
 
 /// Computes the 0-based `(left_page, right_page)` spread sequence for saddle-stitch booklet
@@ -1253,6 +2652,22 @@ pub fn impose_document(doc: &Document, mode: &ImpositionMode) -> ProdResult<Docu
             tile_h_mm,
             overlap_mm,
         } => impose_tiling(doc, tile_w_mm, tile_h_mm, overlap_mm),
+        ImpositionMode::PerfectBound {
+            sheet_w_mm,
+            sheet_h_mm,
+            signature_pages,
+            spine_thickness_mm,
+            creep_mm,
+            milling_allowance_mm,
+        } => impose_perfect_bound(
+            doc,
+            sheet_w_mm,
+            sheet_h_mm,
+            signature_pages,
+            spine_thickness_mm,
+            creep_mm,
+            milling_allowance_mm,
+        ),
     }
 }
 
@@ -1520,6 +2935,1022 @@ fn impose_tiling(
         }
     }
 
+    Ok(out)
+}
+
+fn impose_perfect_bound(
+    doc: &Document,
+    sheet_w_mm: f64,
+    sheet_h_mm: f64,
+    signature_pages: usize,
+    spine_thickness_mm: f64,
+    creep_mm: f64,
+    milling_allowance_mm: f64,
+) -> ProdResult<Document> {
+    validate_positive("sheet_w_mm", sheet_w_mm)?;
+    validate_positive("sheet_h_mm", sheet_h_mm)?;
+    validate_non_negative("spine_thickness_mm", spine_thickness_mm)?;
+    validate_non_negative("creep_mm", creep_mm)?;
+    validate_non_negative("milling_allowance_mm", milling_allowance_mm)?;
+    if signature_pages < 4 || !signature_pages.is_multiple_of(4) {
+        return Err(ProdError::InvalidParameter(
+            "perfect_bound signature_pages must be a multiple of 4 (>= 4)".into(),
+        ));
+    }
+    for p in doc.pages() {
+        validate_positive("page.width_mm", p.width_mm)?;
+        validate_positive("page.height_mm", p.height_mm)?;
+    }
+
+    let total_pages = doc.pages().len();
+    let num_sigs = total_pages.div_ceil(signature_pages);
+    let half_w = sheet_w_mm * 0.5;
+    let gutter_half = (milling_allowance_mm * 0.5).max(0.0);
+    let mut out = clone_document_shell(doc, format!("{} (PerfectBound)", doc.title()));
+
+    for sig_idx in 0..num_sigs {
+        let sig_start = sig_idx * signature_pages;
+        let sig_end = (sig_start + signature_pages).min(total_pages);
+        let sig_count = sig_end - sig_start;
+        let spreads = booklet_signature_order(sig_count);
+        let sig_sheets = spreads.len() / 2;
+
+        for (spread_idx, (left_opt, right_opt)) in spreads.iter().enumerate() {
+            if out.pages().len() >= MAX_IMPOSITION_PAGES {
+                return Err(ProdError::InvalidParameter(format!(
+                    "perfect_bound imposition exceeds cap {MAX_IMPOSITION_PAGES}"
+                )));
+            }
+            let sheet_in_sig = spread_idx / 2;
+            let side = if spread_idx % 2 == 0 { "Front" } else { "Back" };
+            let creep_shift = if sig_sheets > 1 {
+                creep_mm * (sheet_in_sig as f64 / (sig_sheets - 1) as f64)
+            } else {
+                0.0
+            };
+            let spine_offset = gutter_half + creep_shift * 0.5;
+            let page_name = format!(
+                "Sig {} Sheet {} {} (spine={:.2}mm)",
+                sig_idx + 1,
+                sheet_in_sig + 1,
+                side,
+                spine_thickness_mm
+            );
+            out.add_page(page_name, sheet_w_mm, sheet_h_mm, 0.0);
+            let dst_page_idx = out.pages().len() - 1;
+
+            if let Some(rel_idx) = *left_opt {
+                let src_idx = sig_start + rel_idx;
+                let p = &doc.pages()[src_idx];
+                let scale = ((half_w - spine_offset).max(1.0) / p.width_mm)
+                    .min(sheet_h_mm / p.height_mm)
+                    .min(1.0);
+                let placed_w = p.width_mm * scale;
+                let placed_h = p.height_mm * scale;
+                let tx = half_w - spine_offset - placed_w;
+                let ty = (sheet_h_mm - placed_h) * 0.5;
+                let xf = Affine2D::translate(tx, ty).compose(&Affine2D::scale_uniform(scale));
+                clone_page_contents_into(doc, src_idx, &mut out, dst_page_idx, xf, None)?;
+            }
+            if let Some(rel_idx) = *right_opt {
+                let src_idx = sig_start + rel_idx;
+                let p = &doc.pages()[src_idx];
+                let scale = ((half_w - spine_offset).max(1.0) / p.width_mm)
+                    .min(sheet_h_mm / p.height_mm)
+                    .min(1.0);
+                let placed_h = p.height_mm * scale;
+                let tx = half_w + spine_offset;
+                let ty = (sheet_h_mm - placed_h) * 0.5;
+                let xf = Affine2D::translate(tx, ty).compose(&Affine2D::scale_uniform(scale));
+                clone_page_contents_into(doc, src_idx, &mut out, dst_page_idx, xf, None)?;
+            }
+
+            // Emit spine fold & milling guide marks on Print Marks layer
+            let marks_layer =
+                find_or_create_layer(&mut out, dst_page_idx, PRINT_MARKS_LAYER_NAME, false)?;
+            let fold_line =
+                BezierPath::from_line(Point2D::new(half_w, 0.0), Point2D::new(half_w, 5.0));
+            out.add_object(
+                SceneObject::new(ObjectId(0), "Spine Fold Top", NodePayload::Path(fold_line))
+                    .with_fill(Fill::None)
+                    .with_outline(OutlineStyle::solid(Color::cmyk(1.0, 1.0, 1.0, 1.0), 0.15)),
+                Some(marks_layer),
+            )?;
+        }
+    }
+    Ok(out)
+}
+
+// =============================================================================
+// Prepress Trapping (Spread / Choke) & Halftone Screening
+// =============================================================================
+
+/// Trap placement strategy for adjacent contrasting ink boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TrapPlacement {
+    #[default]
+    Spread,
+    Choke,
+    Centerline,
+}
+
+/// Configuration for automatic prepress spread/choke color trapping.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrappingSettings {
+    /// Trap overlap width in millimeters (default: `0.15` mm).
+    pub trap_width_mm: f64,
+    /// Minimum neutral density difference required to generate a trap (default: `0.10`).
+    pub step_limit: f64,
+    /// Density threshold above which dark/black regions act as chokes (default: `0.85`).
+    pub black_color_limit: f64,
+    pub placement: TrapPlacement,
+    pub ignore_bitmaps: bool,
+}
+
+impl Default for TrappingSettings {
+    fn default() -> Self {
+        Self {
+            trap_width_mm: 0.15,
+            step_limit: 0.10,
+            black_color_limit: 0.85,
+            placement: TrapPlacement::Spread,
+            ignore_bitmaps: true,
+        }
+    }
+}
+
+/// Generated trap geometry between two overlapping/abutting objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrapZone {
+    pub source_id: ObjectId,
+    pub target_id: ObjectId,
+    pub spread_object_id: ObjectId,
+    pub trap_path: BezierPath,
+    pub trap_color: Color,
+    pub trap_width_mm: f64,
+    pub is_choke: bool,
+}
+
+/// Summary of computed or applied prepress traps for a page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrappingResult {
+    pub traps: Vec<TrapZone>,
+    pub warnings: Vec<String>,
+}
+
+fn color_neutral_density(c: &Color) -> f64 {
+    let [cy, mg, yl, bk] = c.to_cmyk();
+    // Industry neutral density approximation (K heaviest, Y lightest)
+    (0.61 * f64::from(cy) + 0.76 * f64::from(mg) + 0.16 * f64::from(yl) + 1.70 * f64::from(bk))
+        .clamp(0.0, 2.5)
+}
+
+fn trappable_fill_color(obj: &SceneObject) -> Option<Color> {
+    let col = match &obj.fill {
+        Fill::Solid(c) if c.alpha() > 1e-4 => Some(c.clone()),
+        Fill::LinearGradient { stops, .. }
+        | Fill::RadialGradient { stops, .. }
+        | Fill::ConicalGradient { stops, .. }
+        | Fill::SquareGradient { stops, .. } => {
+            (!stops.is_empty()).then(|| Fill::sample_stops(stops, 0.5))
+        }
+        Fill::TwoColorPattern { fg, .. } | Fill::TextureFill { fg, .. } if fg.alpha() > 1e-4 => {
+            Some(fg.clone())
+        }
+        Fill::MeshFill { nodes, .. } => nodes.first().map(|n| n.color.clone()),
+        _ => None,
+    };
+    if col.is_some() {
+        return col;
+    }
+    match &obj.payload {
+        NodePayload::ArtisticText(t) => t
+            .runs
+            .first()
+            .filter(|r| r.style.fill.alpha() > 1e-4)
+            .map(|r| r.style.fill.clone()),
+        NodePayload::ParagraphText(t) => t
+            .runs
+            .first()
+            .filter(|r| r.style.fill.alpha() > 1e-4)
+            .map(|r| r.style.fill.clone()),
+        NodePayload::TextOnPath(top) => top
+            .text
+            .runs
+            .first()
+            .filter(|r| r.style.fill.alpha() > 1e-4)
+            .map(|r| r.style.fill.clone()),
+        _ => None,
+    }
+}
+
+struct TrapLeafEntry {
+    leaf_uid: usize,
+    report_id: ObjectId,
+    path: BezierPath,
+    bb: Rect2D,
+    color: Color,
+    nd: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trapping_entries_by_id(
+    doc: &Document,
+    id: ObjectId,
+    fallback_owner_id: ObjectId,
+    parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    settings: &TrappingSettings,
+    text_engine: &mut TextEngine,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    next_uid: &mut usize,
+    entries: &mut Vec<TrapLeafEntry>,
+) {
+    if depth > MAX_SCENE_DEPTH || (id.0 != 0 && !visiting.insert(id)) {
+        return;
+    }
+    let obj_opt = sym_ctx
+        .and_then(|c| c.sym_map.get(&id).copied())
+        .or_else(|| doc.object(id));
+    if let Some(obj) = obj_opt {
+        collect_trapping_entries_obj(
+            doc,
+            obj,
+            fallback_owner_id,
+            parent_xf,
+            parent_persp,
+            sym_ctx,
+            settings,
+            text_engine,
+            depth,
+            visiting,
+            visiting_syms,
+            next_uid,
+            entries,
+        );
+    }
+    if id.0 != 0 {
+        visiting.remove(&id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trapping_entries_obj(
+    doc: &Document,
+    obj: &SceneObject,
+    fallback_owner_id: ObjectId,
+    parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+    settings: &TrappingSettings,
+    text_engine: &mut TextEngine,
+    depth: usize,
+    visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    next_uid: &mut usize,
+    entries: &mut Vec<TrapLeafEntry>,
+) {
+    if depth > MAX_SCENE_DEPTH
+        || !obj.visible
+        || !obj.printable
+        || !obj.opacity.is_finite()
+        || obj.opacity <= 1e-5
+    {
+        return;
+    }
+    let world_xf = parent_xf.compose(&obj.transform);
+    if !world_xf.is_finite() {
+        return;
+    }
+    let report_id = if obj.id.0 != 0 {
+        obj.id
+    } else {
+        fallback_owner_id
+    };
+
+    match &obj.payload {
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+            {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                collect_trapping_entries_obj(
+                    doc,
+                    &tmp,
+                    report_id,
+                    parent_xf,
+                    parent_persp,
+                    if in_sym { sym_ctx } else { None },
+                    settings,
+                    text_engine,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    next_uid,
+                    entries,
+                );
+            }
+            return;
+        }
+        NodePayload::Group(children) => {
+            let own = container_own_persp(doc, obj, sym_ctx);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own);
+            for &cid in children {
+                collect_trapping_entries_by_id(
+                    doc,
+                    cid,
+                    report_id,
+                    world_xf,
+                    child_persp,
+                    sym_ctx,
+                    settings,
+                    text_engine,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    next_uid,
+                    entries,
+                );
+            }
+            return;
+        }
+        NodePayload::PowerClip {
+            container,
+            contents,
+            ..
+        } => {
+            let local_c = apply_obj_perspective_to_local_path((**container).clone(), obj);
+            let world_container =
+                warp_local_to_world(&local_c, &world_xf, &obj.transform, parent_persp);
+            if let Some(col) = trappable_fill_color(obj) {
+                if let Some(bb) = world_container.bounding_box() {
+                    let uid = *next_uid;
+                    *next_uid += 1;
+                    let nd = color_neutral_density(&col);
+                    entries.push(TrapLeafEntry {
+                        leaf_uid: uid,
+                        report_id,
+                        path: world_container.clone(),
+                        bb,
+                        color: col,
+                        nd,
+                    });
+                }
+            }
+            let own = container_own_persp(doc, obj, sym_ctx);
+            let child_persp =
+                compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own);
+            let start_len = entries.len();
+            for &cid in contents {
+                collect_trapping_entries_by_id(
+                    doc,
+                    cid,
+                    report_id,
+                    world_xf,
+                    child_persp,
+                    sym_ctx,
+                    settings,
+                    text_engine,
+                    depth + 1,
+                    visiting,
+                    visiting_syms,
+                    next_uid,
+                    entries,
+                );
+            }
+            if !world_container.is_empty() {
+                let mut clipped = Vec::with_capacity(entries.len() - start_len);
+                for mut e in entries.drain(start_len..) {
+                    if let Ok(parts) =
+                        apply_boolean(BooleanOp::Intersect, &e.path, &world_container)
+                    {
+                        let cp = BezierPath {
+                            subpaths: parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                        };
+                        if let Some(bb) = cp.bounding_box() {
+                            if !cp.is_empty() {
+                                e.path = cp;
+                                e.bb = bb;
+                                clipped.push(e);
+                            }
+                        }
+                    }
+                }
+                entries.extend(clipped);
+            }
+            return;
+        }
+        NodePayload::SymbolInstance(sym_id) => {
+            if !visiting_syms.insert(*sym_id) {
+                return;
+            }
+            if let Some(sym) = doc.symbol(*sym_id) {
+                let mut local_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut sym_parent_map: HashMap<ObjectId, SymParentRef> = HashMap::new();
+                let mut referenced: HashSet<ObjectId> = HashSet::new();
+                for (idx, sub) in sym.objects.iter().enumerate() {
+                    if sub.id.0 != 0 {
+                        local_map.insert(sub.id, sub);
+                    }
+                    let pref = if sub.id.0 != 0 {
+                        SymParentRef::Id(sub.id)
+                    } else {
+                        SymParentRef::RootIndex(idx)
+                    };
+                    match &sub.payload {
+                        NodePayload::Group(c) => {
+                            for &cid in c {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        NodePayload::PowerClip { contents, .. } => {
+                            for &cid in contents {
+                                referenced.insert(cid);
+                                if cid.0 != 0 {
+                                    sym_parent_map.entry(cid).or_insert(pref);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let s_ctx = SymBoundsCtx {
+                    root_xf: &world_xf,
+                    sym_objects: &sym.objects,
+                    sym_map: &local_map,
+                    sym_parent_map: &sym_parent_map,
+                };
+                let own = container_own_persp(doc, obj, sym_ctx);
+                let child_persp =
+                    compose_prod_parent_persp(parent_persp, &parent_xf, &obj.transform, own);
+                let mut sym_vis = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_vis.insert(sub.id) {
+                        continue;
+                    }
+                    collect_trapping_entries_obj(
+                        doc,
+                        sub,
+                        report_id,
+                        world_xf,
+                        child_persp,
+                        Some(&s_ctx),
+                        settings,
+                        text_engine,
+                        depth + 1,
+                        &mut sym_vis,
+                        visiting_syms,
+                        next_uid,
+                        entries,
+                    );
+                    if sub.id.0 != 0 {
+                        sym_vis.remove(&sub.id);
+                    }
+                }
+            }
+            visiting_syms.remove(sym_id);
+            return;
+        }
+        NodePayload::Table(table) => {
+            for r in 0..table.rows {
+                for c in 0..table.cols {
+                    let Some(cell) = table.cell(r, c) else {
+                        continue;
+                    };
+                    if cell.is_covered() {
+                        continue;
+                    }
+                    let cell_col = match &cell.fill {
+                        Fill::Solid(cl) if cl.alpha() > 1e-4 => Some(cl.clone()),
+                        Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. }
+                            if !stops.is_empty() =>
+                        {
+                            Some(Fill::sample_stops(stops, 0.5))
+                        }
+                        _ => None,
+                    };
+                    if let (Some(col), Some(cr)) = (cell_col, table.cell_rect(r, c)) {
+                        let local =
+                            apply_obj_perspective_to_local_path(BezierPath::from_rect(cr), obj);
+                        let wp =
+                            warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp);
+                        if let Some(bb) = wp.bounding_box() {
+                            let uid = *next_uid;
+                            *next_uid += 1;
+                            let nd = color_neutral_density(&col);
+                            entries.push(TrapLeafEntry {
+                                leaf_uid: uid,
+                                report_id,
+                                path: wp,
+                                bb,
+                                color: col,
+                                nd,
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    if settings.ignore_bitmaps && matches!(obj.payload, NodePayload::Raster(_)) {
+        return;
+    }
+    let Some(col) = trappable_fill_color(obj) else {
+        return;
+    };
+    let uid = *next_uid;
+    *next_uid += 1;
+    let nd = color_neutral_density(&col);
+    let mut paths: Vec<BezierPath> = Vec::new();
+    match &obj.payload {
+        NodePayload::Path(p) => {
+            if !p.is_empty() {
+                let local = apply_obj_perspective_to_local_path(p.clone(), obj);
+                paths.push(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ));
+            }
+        }
+        NodePayload::Shape(s) => {
+            let local = apply_obj_perspective_to_local_path(s.to_bezier_path(), obj);
+            paths.push(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ));
+        }
+        NodePayload::BSpline(bs) => {
+            let local = apply_obj_perspective_to_local_path(bs.to_bezier_path(), obj);
+            paths.push(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ));
+        }
+        NodePayload::ArtisticMedia { spine, style } => {
+            let expanded = coree_core::ArtisticMedia::expand_stroke(spine, style);
+            let local = apply_obj_perspective_to_local_path(expanded, obj);
+            paths.push(warp_local_to_world(
+                &local,
+                &world_xf,
+                &obj.transform,
+                parent_persp,
+            ));
+        }
+        NodePayload::ArtisticText(t) => {
+            let pieces = text_engine.layout_artistic_pieces(t);
+            let combined = BezierPath {
+                subpaths: pieces.into_iter().flat_map(|g| g.path.subpaths).collect(),
+            };
+            if !combined.is_empty() {
+                let local = apply_obj_perspective_to_local_path(combined, obj);
+                paths.push(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ));
+            }
+        }
+        NodePayload::ParagraphText(t) => {
+            let pieces = text_engine.layout_paragraph_in_doc(doc, obj.id, t);
+            let combined = BezierPath {
+                subpaths: pieces.into_iter().flat_map(|g| g.path.subpaths).collect(),
+            };
+            if !combined.is_empty() {
+                let local = apply_obj_perspective_to_local_path(combined, obj);
+                paths.push(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ));
+            }
+        }
+        NodePayload::Raster(r) => {
+            let rect = match r.crop_rect {
+                Some(cr) if cr.is_finite() => Some(cr),
+                Some(_) => None,
+                None if r.width_mm.is_finite()
+                    && r.width_mm > 0.0
+                    && r.height_mm.is_finite()
+                    && r.height_mm > 0.0 =>
+                {
+                    Some(Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm))
+                }
+                None => None,
+            };
+            if let Some(rc) = rect {
+                let local = apply_obj_perspective_to_local_path(BezierPath::from_rect(rc), obj);
+                paths.push(warp_local_to_world(
+                    &local,
+                    &world_xf,
+                    &obj.transform,
+                    parent_persp,
+                ));
+            }
+        }
+        _ => {
+            let mut visit = HashSet::new();
+            crate::scene_helpers::collect_silhouette_paths(
+                doc,
+                obj.id,
+                parent_xf,
+                parent_persp,
+                depth,
+                &mut visit,
+                &mut paths,
+            );
+        }
+    }
+    for p in paths {
+        if let Some(bb) = p.bounding_box() {
+            if !p.is_empty() {
+                entries.push(TrapLeafEntry {
+                    leaf_uid: uid,
+                    report_id,
+                    path: p,
+                    bb,
+                    color: col.clone(),
+                    nd,
+                });
+            }
+        }
+    }
+}
+
+/// Computes spread/choke trap zones between abutting or overlapping contrasting fills on `page_index`.
+pub fn compute_trapping(
+    doc: &Document,
+    page_index: usize,
+    settings: &TrappingSettings,
+) -> ProdResult<TrappingResult> {
+    let _page = get_page(doc, page_index)?;
+    validate_positive("trap_width_mm", settings.trap_width_mm)?;
+    let trap_w = settings.trap_width_mm.clamp(0.01, 5.0);
+
+    let mut entries: Vec<TrapLeafEntry> = Vec::new();
+    let mut text_engine = TextEngine::new();
+    let mut next_uid = 1usize;
+    let layers = collect_effective_layers(doc, page_index);
+    for layer in &layers {
+        if !layer.visible || !layer.printable || layer.is_cut_layer {
+            continue;
+        }
+        let mut visit = HashSet::new();
+        let mut visit_syms = HashSet::new();
+        for &oid in &layer.objects {
+            collect_trapping_entries_by_id(
+                doc,
+                oid,
+                oid,
+                Affine2D::IDENTITY,
+                None,
+                None,
+                settings,
+                &mut text_engine,
+                0,
+                &mut visit,
+                &mut visit_syms,
+                &mut next_uid,
+                &mut entries,
+            );
+        }
+    }
+
+    let mut traps = Vec::new();
+    let mut warnings = Vec::new();
+    for i in 0..entries.len() {
+        for j in (i + 1)..entries.len() {
+            let a = &entries[i];
+            let b = &entries[j];
+            if a.leaf_uid == b.leaf_uid {
+                continue;
+            }
+            if (a.nd - b.nd).abs() < settings.step_limit {
+                continue;
+            }
+            if a.bb.expand(trap_w * 2.0).intersection(b.bb).is_none() {
+                continue;
+            }
+            let (light, dark) = if a.nd < b.nd { (a, b) } else { (b, a) };
+
+            match settings.placement {
+                TrapPlacement::Choke => {
+                    let dark_rim = match coree_core::offset_polygon(&dark.path, -trap_w) {
+                        Ok(shrunk) if !shrunk.is_empty() => {
+                            match apply_boolean(BooleanOp::Trim, &dark.path, &shrunk) {
+                                Ok(parts) => BezierPath {
+                                    subpaths: parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                                },
+                                Err(_) => continue,
+                            }
+                        }
+                        _ => dark.path.clone(),
+                    };
+                    if dark_rim.is_empty() {
+                        continue;
+                    }
+                    let overlap_trap = apply_boolean(BooleanOp::Intersect, &dark_rim, &light.path)
+                        .ok()
+                        .map(|parts| BezierPath {
+                            subpaths: parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                        })
+                        .filter(|p| !p.is_empty());
+                    let trap_only = if let Some(ov) = overlap_trap {
+                        Some(ov)
+                    } else if let Ok(expanded_light) =
+                        coree_core::offset_polygon(&light.path, trap_w)
+                    {
+                        apply_boolean(BooleanOp::Intersect, &dark_rim, &expanded_light)
+                            .ok()
+                            .map(|parts| BezierPath {
+                                subpaths: parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                            })
+                            .filter(|p| !p.is_empty())
+                    } else {
+                        None
+                    };
+                    if let Some(trap_path) = trap_only {
+                        traps.push(TrapZone {
+                            source_id: light.report_id,
+                            target_id: dark.report_id,
+                            spread_object_id: dark.report_id,
+                            trap_path,
+                            trap_color: light.color.clone(),
+                            trap_width_mm: trap_w,
+                            is_choke: true,
+                        });
+                    }
+                }
+                TrapPlacement::Centerline => {
+                    let half = (trap_w * 0.5).max(0.005);
+                    let (Ok(exp_l), Ok(exp_d)) = (
+                        coree_core::offset_polygon(&light.path, half),
+                        coree_core::offset_polygon(&dark.path, half),
+                    ) else {
+                        continue;
+                    };
+                    if let Ok(parts) = apply_boolean(BooleanOp::Intersect, &exp_l, &exp_d) {
+                        let trap_only = BezierPath {
+                            subpaths: parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                        };
+                        if !trap_only.is_empty() {
+                            traps.push(TrapZone {
+                                source_id: light.report_id,
+                                target_id: dark.report_id,
+                                spread_object_id: light.report_id,
+                                trap_path: trap_only,
+                                trap_color: light.color.clone(),
+                                trap_width_mm: trap_w,
+                                is_choke: false,
+                            });
+                        }
+                    }
+                }
+                TrapPlacement::Spread => {
+                    let is_choke = dark.nd >= settings.black_color_limit;
+                    let expanded = match coree_core::offset_polygon(&light.path, trap_w) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if let Ok(band_parts) =
+                        apply_boolean(BooleanOp::Intersect, &expanded, &dark.path)
+                    {
+                        let band = BezierPath {
+                            subpaths: band_parts.into_iter().flat_map(|p| p.subpaths).collect(),
+                        };
+                        if !band.is_empty() {
+                            if let Ok(trap_parts) =
+                                apply_boolean(BooleanOp::Trim, &band, &light.path)
+                            {
+                                let trap_only = BezierPath {
+                                    subpaths: trap_parts
+                                        .into_iter()
+                                        .flat_map(|p| p.subpaths)
+                                        .collect(),
+                                };
+                                if !trap_only.is_empty() {
+                                    traps.push(TrapZone {
+                                        source_id: light.report_id,
+                                        target_id: dark.report_id,
+                                        spread_object_id: light.report_id,
+                                        trap_path: trap_only,
+                                        trap_color: light.color.clone(),
+                                        trap_width_mm: trap_w,
+                                        is_choke,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if traps.is_empty() && entries.len() >= 2 {
+        warnings.push("No contrasting abutting ink pairs exceeded step_limit".to_owned());
+    }
+    Ok(TrappingResult { traps, warnings })
+}
+
+/// Computes and inserts overprint trap objects onto a dedicated `Prepress Traps` layer.
+pub fn apply_trapping(
+    doc: &mut Document,
+    page_index: usize,
+    settings: &TrappingSettings,
+) -> ProdResult<TrappingResult> {
+    let result = compute_trapping(doc, page_index, settings)?;
+    if !result.traps.is_empty() {
+        let layer_id = find_or_create_layer(doc, page_index, "Prepress Traps", false)?;
+        for (idx, z) in result.traps.iter().enumerate() {
+            let mut obj = SceneObject::new(
+                ObjectId(0),
+                format!("Trap_{}_{}", idx + 1, z.spread_object_id.0),
+                NodePayload::Path(z.trap_path.clone()),
+            )
+            .with_fill(Fill::Solid(z.trap_color.clone()))
+            .with_outline(OutlineStyle::none());
+            obj.blend_mode = BlendMode::Multiply;
+            doc.add_object(obj, Some(layer_id))?;
+        }
+    }
+    Ok(result)
+}
+
+/// Halftone dot cell geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum HalftoneDotShape {
+    #[default]
+    Round,
+    Elliptical,
+    Line,
+    Square,
+    Diamond,
+}
+
+/// Per-plate AM halftone screen frequency, rosette angle, and dot shape.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HalftoneScreen {
+    pub lpi: f64,
+    pub angle_deg: f64,
+    pub dot_shape: HalftoneDotShape,
+}
+
+/// Full CMYK + Spot rosette halftone screen configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HalftoneSettings {
+    pub dpi: f64,
+    pub cyan: HalftoneScreen,
+    pub magenta: HalftoneScreen,
+    pub yellow: HalftoneScreen,
+    pub black: HalftoneScreen,
+    pub spot_base_angle_deg: f64,
+}
+
+impl Default for HalftoneSettings {
+    fn default() -> Self {
+        Self {
+            dpi: 300.0,
+            cyan: HalftoneScreen {
+                lpi: 133.0,
+                angle_deg: 15.0,
+                dot_shape: HalftoneDotShape::Round,
+            },
+            magenta: HalftoneScreen {
+                lpi: 133.0,
+                angle_deg: 75.0,
+                dot_shape: HalftoneDotShape::Round,
+            },
+            yellow: HalftoneScreen {
+                lpi: 133.0,
+                angle_deg: 0.0,
+                dot_shape: HalftoneDotShape::Round,
+            },
+            black: HalftoneScreen {
+                lpi: 133.0,
+                angle_deg: 45.0,
+                dot_shape: HalftoneDotShape::Round,
+            },
+            spot_base_angle_deg: 22.5,
+        }
+    }
+}
+
+/// Screened binary/1-bit-density halftone preview plate (`0` = paper, `255` = ink dot).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HalftonePlate {
+    pub channel: SeparationChannel,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub screen: HalftoneScreen,
+    pub screened_bitmap: Vec<u8>,
+}
+
+/// Screens a continuous-tone [`SeparationPlate`] into an AM halftone dot bitmap using
+/// rotated spot-function threshold matrices (`Round`, `Elliptical`, `Line`, `Square`, `Diamond`).
+pub fn apply_halftone_screen(
+    plate: &SeparationPlate,
+    dpi: f64,
+    screen: &HalftoneScreen,
+) -> ProdResult<HalftonePlate> {
+    validate_positive("dpi", dpi)?;
+    validate_positive("screen.lpi", screen.lpi)?;
+    let w = plate.width as usize;
+    let h = plate.height as usize;
+    if plate.ink_map.len() != w.saturating_mul(h) {
+        return Err(ProdError::InvalidParameter(
+            "separation plate ink_map dimensions mismatch".into(),
+        ));
+    }
+    let rad = screen.angle_deg.to_radians();
+    let (sin_a, cos_a) = rad.sin_cos();
+    let cells_per_px = (screen.lpi / dpi).clamp(0.01, 0.5);
+    let mut screened = vec![0u8; w * h];
+
+    for y in 0..h {
+        let fy = (y as f64) * cells_per_px;
+        for x in 0..w {
+            let fx = (x as f64) * cells_per_px;
+            let rx = fx * cos_a - fy * sin_a;
+            let ry = fx * sin_a + fy * cos_a;
+            // Normalized [-1, 1] cell coordinates
+            let u = rx.rem_euclid(1.0) * 2.0 - 1.0;
+            let v = ry.rem_euclid(1.0) * 2.0 - 1.0;
+            let spot_val = match screen.dot_shape {
+                HalftoneDotShape::Round => 1.0 - 0.5 * (u * u + v * v),
+                HalftoneDotShape::Elliptical => 1.0 - (0.35 * u * u + 0.65 * v * v),
+                HalftoneDotShape::Line => 1.0 - v.abs(),
+                HalftoneDotShape::Square => 1.0 - u.abs().max(v.abs()),
+                HalftoneDotShape::Diamond => 1.0 - 0.5 * (u.abs() + v.abs()),
+            }
+            .clamp(0.0, 1.0);
+            let ink = f64::from(plate.ink_map[y * w + x]) / 255.0;
+            screened[y * w + x] = if ink > 0.0 && ink >= (1.0 - spot_val) {
+                255
+            } else {
+                0
+            };
+        }
+    }
+
+    Ok(HalftonePlate {
+        channel: plate.channel.clone(),
+        name: plate.name.clone(),
+        width: plate.width,
+        height: plate.height,
+        screen: *screen,
+        screened_bitmap: screened,
+    })
+}
+
+/// Applies rosette halftone screening across every CMYK and Spot plate in `sep`.
+pub fn generate_halftone_preview(
+    sep: &SeparationResult,
+    settings: &HalftoneSettings,
+) -> ProdResult<Vec<HalftonePlate>> {
+    let mut out = Vec::with_capacity(sep.plates.len());
+    let mut spot_idx = 0usize;
+    for plate in &sep.plates {
+        let screen = match &plate.channel {
+            SeparationChannel::Cyan => settings.cyan,
+            SeparationChannel::Magenta => settings.magenta,
+            SeparationChannel::Yellow => settings.yellow,
+            SeparationChannel::Black => settings.black,
+            SeparationChannel::Spot(_) => {
+                let angle = (settings.spot_base_angle_deg + (spot_idx as f64) * 30.0) % 180.0;
+                spot_idx += 1;
+                HalftoneScreen {
+                    lpi: settings.black.lpi,
+                    angle_deg: angle,
+                    dot_shape: settings.black.dot_shape,
+                }
+            }
+        };
+        out.push(apply_halftone_screen(plate, settings.dpi, &screen)?);
+    }
     Ok(out)
 }
 
@@ -2379,5 +4810,713 @@ mod tests {
         let spot_plate = sep.spot_plate("SpotGold").unwrap();
         assert_eq!(spot_plate.ink_map[22 * 100 + 62], 255);
         assert_eq!(spot_plate.ink_map[30 * 100 + 70], 0);
+    }
+
+    #[test]
+    fn vector_separations_and_separated_pdf_export_cover_cmyk_and_spots() {
+        let mut doc = Document::new("SepVec", 100.0, 100.0, coree_core::ColorMode::Cmyk, 300.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CyanBox",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "SpotSeal",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 15.0,
+                    ry: 15.0,
+                    mode: EllipseMode::Full,
+                    start_deg: 0.0,
+                    end_deg: 360.0,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::spot(
+                "Pantone485",
+                1.0,
+                [0.0, 0.95, 1.0, 0.0],
+            )))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(70.0, 50.0)),
+            None,
+        )
+        .unwrap();
+
+        let plates = compute_vector_separations(&doc, 0, true).unwrap();
+        assert_eq!(plates.len(), 5);
+        assert!(!plates[0].vector_ops.is_empty());
+        let spot = plates
+            .iter()
+            .find(|p| p.channel == SeparationChannel::Spot("Pantone485".to_owned()))
+            .unwrap();
+        assert!(!spot.vector_ops.is_empty());
+
+        let (pdf_bytes, names) =
+            export_separated_plates_pdf_bytes(&doc, 0, &SeparationOptions::default()).unwrap();
+        assert_eq!(names.len(), 5);
+        assert!(pdf_bytes.starts_with(b"%PDF-1.4"));
+        let text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(text.contains("Pantone485"));
+    }
+
+    #[test]
+    fn perfect_bound_imposition_creates_signatures_and_spine_creep() {
+        let mut doc = Document::new("Book8", 148.0, 210.0, coree_core::ColorMode::Cmyk, 300.0);
+        for i in 1..8 {
+            doc.add_page(format!("P{}", i + 1), 148.0, 210.0, 0.0);
+        }
+        for idx in 0..doc.pages().len() {
+            let lid = doc.pages()[idx].layers[0].id;
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    format!("PageBox{}", idx + 1),
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 40.0,
+                        height: 40.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: coree_core::CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::CYAN))
+                .with_transform(Affine2D::translate(20.0, 20.0)),
+                Some(lid),
+            )
+            .unwrap();
+        }
+        let imposed = impose_document(
+            &doc,
+            &ImpositionMode::PerfectBound {
+                sheet_w_mm: 320.0,
+                sheet_h_mm: 240.0,
+                signature_pages: 4,
+                spine_thickness_mm: 6.0,
+                creep_mm: 1.0,
+                milling_allowance_mm: 2.0,
+            },
+        )
+        .unwrap();
+        // 8 pages in 4-page signatures => 2 signatures * 2 sides = 4 press sheets
+        assert_eq!(imposed.pages().len(), 4);
+        assert!(imposed.pages()[0].name.contains("Sig 1"));
+        assert!(imposed.pages()[2].name.contains("Sig 2"));
+    }
+
+    #[test]
+    fn trapping_spreads_light_yellow_into_dark_black_and_halftone_screens() {
+        let mut doc = Document::new("TrapHalf", 100.0, 100.0, coree_core::ColorMode::Cmyk, 300.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Yellow",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(0.0, 0.0, 1.0, 0.0)))
+            .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Black",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(0.0, 0.0, 0.0, 1.0)))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(40.0, 0.0)),
+            None,
+        )
+        .unwrap();
+
+        let res = apply_trapping(&mut doc, 0, &TrappingSettings::default()).unwrap();
+        assert!(
+            !res.traps.is_empty(),
+            "Expected trap between abutting yellow and black"
+        );
+
+        let sep = compute_separations(
+            &doc,
+            0,
+            &SeparationOptions {
+                dpi: 50.0,
+                max_dimension_px: 256,
+                include_cut_layers: true,
+            },
+        )
+        .unwrap();
+        let screened = generate_halftone_preview(&sep, &HalftoneSettings::default()).unwrap();
+        assert_eq!(screened.len(), 4);
+        assert!(screened[2].screened_bitmap.contains(&255));
+    }
+
+    #[test]
+    fn vector_separations_outline_live_text_honor_clips_rasters_and_overprint_knockout() {
+        let mut doc = Document::new(
+            "VecSepFull",
+            100.0,
+            100.0,
+            coree_core::ColorMode::Cmyk,
+            300.0,
+        );
+
+        // 1. Live ArtisticText "O" (with counter hole) must emit real glyph curves, NOT an AABB rectangle
+        let mut txt = ArtisticText::from_plain(
+            "O",
+            TextStyle {
+                font_size_pt: 48.0,
+                fill: Color::KEY_BLACK,
+                ..TextStyle::default()
+            },
+        );
+        if let Some(r) = txt.runs.first_mut() {
+            r.style.font_family = "DejaVu Sans".into();
+        }
+        let est = txt.estimated_bounds();
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "LiveO", NodePayload::ArtisticText(txt))
+                .with_transform(Affine2D::translate(10.0, 20.0))
+                .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+
+        // 2. Knockout vs Overprint: Cyan base + non-overprinting Magenta on top + overprinting Yellow on top
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CyanBase",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::CYAN))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(50.0, 10.0)),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "MagKnockout",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 20.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::MAGENTA))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(55.0, 15.0)),
+            None,
+        )
+        .unwrap();
+        let mut yel_op = SceneObject::new(
+            ObjectId(0),
+            "YelOverprint",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 10.0,
+                height: 10.0,
+                corner_radii: [0.0; 4],
+                corner_style: coree_core::CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::YELLOW))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(60.0, 20.0));
+        yel_op.blend_mode = BlendMode::Multiply;
+        doc.add_object(yel_op, None).unwrap();
+
+        // 3. PowerClip clipping a wide child
+        let child_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "WideChild",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 50.0,
+                        height: 20.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: coree_core::CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::CYAN))
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+        let clip_rect = BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 15.0, 15.0));
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "ClipContainer",
+                NodePayload::PowerClip {
+                    container: Box::new(clip_rect),
+                    container_parametric: None,
+                    contents: vec![child_id],
+                    lock_contents: true,
+                },
+            )
+            .with_transform(Affine2D::translate(10.0, 60.0)),
+            None,
+        )
+        .unwrap();
+
+        // 4. MeshFill / isolated composite produces RasterPlatePrimitive on separated plates
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "MeshObj",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 20.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::MeshFill {
+                rows: 2,
+                cols: 2,
+                nodes: vec![
+                    coree_core::MeshNode::new(0, 0, Point2D::new(0.0, 0.0), Color::CYAN),
+                    coree_core::MeshNode::new(0, 1, Point2D::new(20.0, 0.0), Color::MAGENTA),
+                    coree_core::MeshNode::new(1, 0, Point2D::new(0.0, 20.0), Color::YELLOW),
+                    coree_core::MeshNode::new(1, 1, Point2D::new(20.0, 20.0), Color::KEY_BLACK),
+                ],
+            })
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(70.0, 60.0)),
+            None,
+        )
+        .unwrap();
+
+        let plates = compute_vector_separations(&doc, 0, true).unwrap();
+        let k_plate = plates
+            .iter()
+            .find(|p| p.channel == SeparationChannel::Black)
+            .unwrap();
+        let aabb_world = BezierPath::from_rect(est).transformed(&Affine2D::translate(10.0, 20.0));
+        assert!(
+            !k_plate.vector_ops.is_empty(),
+            "Live text must produce glyph outline vector ops"
+        );
+        assert!(
+            k_plate.vector_ops.iter().any(|op| {
+                op.path.subpaths.len() >= 2 || op.path.subpaths.iter().any(|s| s.nodes.len() > 4)
+            }) && k_plate.vector_ops.iter().all(|op| op.path != aabb_world),
+            "Live text must emit real glyph curves, never an AABB rectangle"
+        );
+
+        let c_plate = plates
+            .iter()
+            .find(|p| p.channel == SeparationChannel::Cyan)
+            .unwrap();
+        assert!(
+            c_plate
+                .vector_ops
+                .iter()
+                .any(|op| op.fill_density == Some(0.0) && !op.overprint),
+            "Non-overprinting Magenta box must emit explicit knockout on Cyan plate"
+        );
+        assert!(
+            c_plate
+                .vector_ops
+                .iter()
+                .any(|op| !op.clip_paths.is_empty()),
+            "PowerClip contents must retain clip_paths"
+        );
+        assert!(
+            !c_plate.raster_ops.is_empty(),
+            "MeshFill / isolated raster must be emitted into raster_ops"
+        );
+
+        let (pdf_bytes, _) =
+            export_separated_plates_pdf_bytes(&doc, 0, &SeparationOptions::default()).unwrap();
+        let pdf_txt = String::from_utf8_lossy(&pdf_bytes);
+        assert!(pdf_txt.contains("/GSko") && pdf_txt.contains("/GSop"));
+        assert!(pdf_txt.contains("/XObject"));
+    }
+
+    #[test]
+    fn compute_trapping_expands_containers_clones_symbols_and_choke_geometry() {
+        let mut doc = Document::new("TrapAll", 200.0, 200.0, coree_core::ColorMode::Cmyk, 300.0);
+        let rect = |w: f64, h: f64| {
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: coree_core::CornerStyle::Rounded,
+                lock_corners: true,
+            })
+        };
+        let yellow = Color::cmyk(0.0, 0.0, 1.0, 0.0);
+        let black = Color::cmyk(0.0, 0.0, 0.0, 1.0);
+
+        // 1. Group containing abutting Yellow & Black
+        let g1 = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "GY", rect(20.0, 20.0))
+                    .with_fill(Fill::Solid(yellow.clone()))
+                    .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+        let g2 = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "GB", rect(20.0, 20.0))
+                    .with_fill(Fill::Solid(black.clone()))
+                    .with_outline(OutlineStyle::none())
+                    .with_transform(Affine2D::translate(20.0, 0.0)),
+                None,
+            )
+            .unwrap();
+        doc.group_objects(&[g1, g2], "TrapGrp").unwrap();
+
+        // 2. SymbolInstance containing abutting Yellow & Black
+        let s1 = SceneObject::new(ObjectId(101), "SY", rect(20.0, 20.0))
+            .with_fill(Fill::Solid(yellow.clone()))
+            .with_outline(OutlineStyle::none());
+        let s2 = SceneObject::new(ObjectId(102), "SB", rect(20.0, 20.0))
+            .with_fill(Fill::Solid(black.clone()))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(20.0, 0.0));
+        let sym = coree_core::SymbolDef::new("TrapSym", vec![s1, s2]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "TrapSymInst",
+                NodePayload::SymbolInstance(sym_id),
+            )
+            .with_transform(Affine2D::translate(0.0, 40.0)),
+            None,
+        )
+        .unwrap();
+
+        // 3. Live Clone (`link_fill: true`) abutting a Black rect
+        let c_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "TrapClone",
+                    NodePayload::Clone {
+                        master_id: g1,
+                        link_fill: true,
+                        link_outline: true,
+                        link_shape: true,
+                    },
+                )
+                .with_transform(Affine2D::translate(0.0, 80.0)),
+                None,
+            )
+            .unwrap();
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "CloneBlack", rect(20.0, 20.0))
+                .with_fill(Fill::Solid(black.clone()))
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(20.0, 80.0)),
+            None,
+        )
+        .unwrap();
+
+        let res = compute_trapping(&doc, 0, &TrappingSettings::default()).unwrap();
+        assert!(
+            res.traps
+                .iter()
+                .any(|t| t.source_id == g1 && t.target_id == g2),
+            "Expected trap inside Group"
+        );
+        assert!(
+            res.traps
+                .iter()
+                .any(|t| t.source_id == ObjectId(101) && t.target_id == ObjectId(102)),
+            "Expected trap inside SymbolInstance"
+        );
+        assert!(
+            res.traps.iter().any(|t| t.source_id == c_id),
+            "Expected trap for live Clone with link_fill=true"
+        );
+
+        // 4. Overlapping Yellow (0..60) + Black (20..50) distinguishes Choke vs Spread!
+        let mut overlap_doc = Document::new(
+            "ChokeVsSpread",
+            100.0,
+            100.0,
+            coree_core::ColorMode::Cmyk,
+            300.0,
+        );
+        overlap_doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "BgY", rect(60.0, 60.0))
+                    .with_fill(Fill::Solid(yellow))
+                    .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+        let blk_id = overlap_doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "FgB", rect(30.0, 30.0))
+                    .with_fill(Fill::Solid(black))
+                    .with_outline(OutlineStyle::none())
+                    .with_transform(Affine2D::translate(15.0, 15.0)),
+                None,
+            )
+            .unwrap();
+        let spread_res = compute_trapping(
+            &overlap_doc,
+            0,
+            &TrappingSettings {
+                placement: TrapPlacement::Spread,
+                trap_width_mm: 0.5,
+                ..TrappingSettings::default()
+            },
+        )
+        .unwrap();
+        let choke_res = compute_trapping(
+            &overlap_doc,
+            0,
+            &TrappingSettings {
+                placement: TrapPlacement::Choke,
+                trap_width_mm: 0.5,
+                ..TrappingSettings::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            spread_res.traps.is_empty(),
+            "Yellow background already covers Black so Spread adds no outer trap"
+        );
+        assert_eq!(choke_res.traps.len(), 1);
+        assert!(choke_res.traps[0].is_choke);
+        assert_eq!(choke_res.traps[0].spread_object_id, blk_id);
+    }
+
+    #[test]
+    fn compute_separations_preserves_text_effects_and_symbol_meshfill() {
+        let mut doc = Document::new("SepFxSym", 100.0, 100.0, coree_core::ColorMode::Cmyk, 300.0);
+        // Live text with DropShadow (offset +10, +10) even with text_outliner returning Some(...)
+        let mut txt = SceneObject::new(
+            ObjectId(0),
+            "ShadowText",
+            NodePayload::ArtisticText(ArtisticText::from_plain(
+                "A",
+                TextStyle {
+                    font_size_pt: 24.0,
+                    fill: Color::CYAN,
+                    ..TextStyle::default()
+                },
+            )),
+        )
+        .with_transform(Affine2D::translate(10.0, 10.0))
+        .with_outline(OutlineStyle::none());
+        txt.effects.push(Effect::DropShadow {
+            dx_mm: 12.0,
+            dy_mm: 12.0,
+            blur_mm: 1.0,
+            opacity: 1.0,
+            color: Color::MAGENTA,
+            feather_direction: coree_core::FeatherDirection::Outside,
+        });
+        doc.add_object(txt, None).unwrap();
+
+        // SymbolInstance containing a MeshFill child
+        let sym_mesh = SceneObject::new(
+            ObjectId(1),
+            "SymMesh",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 20.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: coree_core::CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::MeshFill {
+            rows: 2,
+            cols: 2,
+            nodes: vec![
+                coree_core::MeshNode::new(0, 0, Point2D::new(0.0, 0.0), Color::YELLOW),
+                coree_core::MeshNode::new(0, 1, Point2D::new(20.0, 0.0), Color::YELLOW),
+                coree_core::MeshNode::new(1, 0, Point2D::new(0.0, 20.0), Color::YELLOW),
+                coree_core::MeshNode::new(1, 1, Point2D::new(20.0, 20.0), Color::YELLOW),
+            ],
+        })
+        .with_outline(OutlineStyle::none());
+        let sym = coree_core::SymbolDef::new("MeshSym", vec![sym_mesh]);
+        let sym_id = sym.id;
+        doc.insert_symbol(sym);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "SymMeshInst",
+                NodePayload::SymbolInstance(sym_id),
+            )
+            .with_transform(Affine2D::translate(60.0, 60.0)),
+            None,
+        )
+        .unwrap();
+
+        let opts = SeparationOptions {
+            dpi: 25.4,
+            max_dimension_px: 256,
+            include_cut_layers: true,
+        };
+        let sep = compute_separations_with_text_outliner(&doc, 0, &opts, |_, _| {
+            Some(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 5.0, 5.0)))
+        })
+        .unwrap();
+
+        let m_plate = sep.plate(&SeparationChannel::Magenta).unwrap();
+        assert!(
+            m_plate.max_coverage_pct > 5.0,
+            "Magenta DropShadow on live text must render even when text_outliner returns Some"
+        );
+        let y_plate = sep.plate(&SeparationChannel::Yellow).unwrap();
+        assert!(
+            y_plate.ink_map[70 * 100 + 70] > 128,
+            "Yellow MeshFill inside SymbolInstance must render onto Yellow separation plate"
+        );
+    }
+
+    #[test]
+    fn separations_apply_raster_filters_for_raster_and_vector_plates() {
+        use coree_core::{RasterAsset, RasterFilter, RasterLayerData};
+
+        let make_doc = |filters: Vec<RasterFilter>| -> Document {
+            let mut doc =
+                Document::new("SepRasterFx", 60.0, 60.0, coree_core::ColorMode::Cmyk, 72.0);
+            let asset = RasterAsset::new(
+                8,
+                8,
+                [220u8, 40, 20, 255].repeat(64),
+                72.0,
+                coree_core::ColorMode::Rgb,
+            )
+            .unwrap();
+            let aid = doc.register_asset(asset);
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "RasterFx",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid,
+                        width_mm: 40.0,
+                        height_mm: 40.0,
+                        crop_rect: None,
+                        filters,
+                    }),
+                )
+                .with_transform(Affine2D::translate(10.0, 10.0)),
+                None,
+            )
+            .unwrap();
+            doc
+        };
+
+        let doc_id = make_doc(Vec::new());
+        let doc_fx = make_doc(vec![
+            RasterFilter::ChannelMixer {
+                red: [0.0, 1.0, 0.0],
+                green: [1.0, 0.0, 0.0],
+                blue: [0.0, 0.0, 1.0],
+                monochrome: false,
+            },
+            RasterFilter::ToneCurve {
+                points: vec![(0.0, 0.0), (0.5, 0.85), (1.0, 1.0)],
+            },
+        ]);
+
+        // 1. Rasterized CMYK separations (`paint_raster_object`)
+        let sep_opts = SeparationOptions {
+            dpi: 25.4,
+            max_dimension_px: 128,
+            include_cut_layers: true,
+        };
+        let sep_id = compute_separations(&doc_id, 0, &sep_opts).unwrap();
+        let sep_fx = compute_separations(&doc_fx, 0, &sep_opts).unwrap();
+        let c_id = sep_id
+            .plate(&SeparationChannel::Cyan)
+            .unwrap()
+            .max_coverage_pct;
+        let m_id = sep_id
+            .plate(&SeparationChannel::Magenta)
+            .unwrap()
+            .max_coverage_pct;
+        let c_fx = sep_fx
+            .plate(&SeparationChannel::Cyan)
+            .unwrap()
+            .max_coverage_pct;
+        let m_fx = sep_fx
+            .plate(&SeparationChannel::Magenta)
+            .unwrap()
+            .max_coverage_pct;
+        assert!(
+            m_id > c_id && c_fx > m_fx && c_fx > c_id + 40.0 && m_id > m_fx + 40.0,
+            "compute_separations must reflect red->green CMYK shift (id C={c_id:.1}% M={m_id:.1}%, fx C={c_fx:.1}% M={m_fx:.1}%)"
+        );
+
+        // 2. Vector CMYK separations (`ExportDisplayList` -> `compute_vector_separations`) + PDF plates
+        let vec_id = compute_vector_separations(&doc_id, 0, true).unwrap();
+        let vec_fx = compute_vector_separations(&doc_fx, 0, true).unwrap();
+        let ink_byte = |plates: &[SeparationPlate], ch: SeparationChannel| -> u8 {
+            plates
+                .iter()
+                .find(|p| p.channel == ch)
+                .and_then(|p| p.raster_ops.first())
+                .and_then(|r| r.ink_channel.first().copied())
+                .unwrap_or(0)
+        };
+        let v_c_id = ink_byte(&vec_id, SeparationChannel::Cyan);
+        let v_m_id = ink_byte(&vec_id, SeparationChannel::Magenta);
+        let v_c_fx = ink_byte(&vec_fx, SeparationChannel::Cyan);
+        let v_m_fx = ink_byte(&vec_fx, SeparationChannel::Magenta);
+        assert!(
+            v_m_id > v_c_id && v_c_fx > v_m_fx && v_c_fx > v_c_id.saturating_add(100) && v_m_id > v_m_fx.saturating_add(100),
+            "compute_vector_separations must reflect red->green CMYK shift (id C={v_c_id} M={v_m_id}, fx C={v_c_fx} M={v_m_fx})"
+        );
+
+        let pdf_plates_id = export_separated_plates_pdf_bytes(&doc_id, 0, &sep_opts).unwrap();
+        let pdf_plates_fx = export_separated_plates_pdf_bytes(&doc_fx, 0, &sep_opts).unwrap();
+        assert_ne!(
+            pdf_plates_id, pdf_plates_fx,
+            "separated PDF plates must differ when RasterFilters are applied"
+        );
     }
 }

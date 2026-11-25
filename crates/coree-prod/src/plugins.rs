@@ -1586,6 +1586,208 @@ fn parse_toml_quoted(s: &str, line_no: usize) -> ProdResult<(String, &str)> {
     )))
 }
 
+// =============================================================================
+// JSON-RPC 2.0 Plugin Host Protocol (Stdio / Memory-Pipe, Zero `std::net`)
+// =============================================================================
+
+/// JSON-RPC 2.0 request envelope for out-of-process or embedded plugins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginJsonRpcRequest {
+    pub jsonrpc: String,
+    #[serde(default)]
+    pub id: Option<serde_json::Value>,
+    pub method: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+/// JSON-RPC 2.0 error payload (`code`, `message`, optional `data`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginJsonRpcError {
+    pub code: i32,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// JSON-RPC 2.0 response envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginJsonRpcResponse {
+    pub jsonrpc: String,
+    pub id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<PluginJsonRpcError>,
+}
+
+impl PluginJsonRpcResponse {
+    #[must_use]
+    pub fn ok(id: serde_json::Value, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn err(id: serde_json::Value, code: i32, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result: None,
+            error: Some(PluginJsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
+/// Dispatches a parsed JSON-RPC 2.0 plugin request against `doc` and `registry`.
+#[must_use]
+pub fn dispatch_plugin_jsonrpc(
+    doc: &mut Document,
+    registry: &PluginRegistry,
+    req: &PluginJsonRpcRequest,
+) -> PluginJsonRpcResponse {
+    let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+    if req.jsonrpc != "2.0" {
+        return PluginJsonRpcResponse::err(id, -32600, "Invalid Request: jsonrpc must be \"2.0\"");
+    }
+    let params = req.params.as_ref().unwrap_or(&serde_json::Value::Null);
+
+    match req.method.as_str() {
+        "plugin.ping" => PluginJsonRpcResponse::ok(
+            id,
+            serde_json::json!({
+                "pong": true,
+                "protocol": "jsonrpc-2.0",
+                "plugin_count": registry.plugins().len()
+            }),
+        ),
+        "plugin.list" => {
+            let items: Vec<serde_json::Value> = registry
+                .plugins()
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "version": p.version,
+                        "category": format!("{:?}", p.category),
+                        "builtin": p.builtin
+                    })
+                })
+                .collect();
+            PluginJsonRpcResponse::ok(id, serde_json::json!({ "plugins": items }))
+        }
+        "document.info" => {
+            let page_idx = doc.active_page_index();
+            let page = doc.page(page_idx);
+            PluginJsonRpcResponse::ok(
+                id,
+                serde_json::json!({
+                    "title": doc.title(),
+                    "page_count": doc.pages().len(),
+                    "active_page": page_idx,
+                    "width_mm": page.map(|p| p.width_mm).unwrap_or(210.0),
+                    "height_mm": page.map(|p| p.height_mm).unwrap_or(297.0),
+                    "object_count": doc.objects().len()
+                }),
+            )
+        }
+        "document.query_cql" => {
+            let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            match crate::find_replace::evaluate_cql_query(
+                doc,
+                crate::find_replace::FindScope::WholeDocument,
+                query,
+            ) {
+                Ok(hits) => {
+                    let ids: Vec<u64> = hits.into_iter().map(|oid| oid.0).collect();
+                    PluginJsonRpcResponse::ok(id, serde_json::json!({ "object_ids": ids }))
+                }
+                Err(err) => PluginJsonRpcResponse::err(id, -32602, err.to_string()),
+            }
+        }
+        "document.run_macro" => {
+            let script = params.get("script").and_then(|v| v.as_str()).unwrap_or("");
+            if script.is_empty() {
+                return PluginJsonRpcResponse::err(id, -32602, "missing 'script' string param");
+            }
+            let sandbox = MacroSandboxConfig::default();
+            match run_macro_with_ops(doc, script, &BTreeMap::new(), &sandbox) {
+                Ok((res, _ops)) => PluginJsonRpcResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "commands": res.commands_executed,
+                        "logs": res.logs
+                    }),
+                ),
+                Err(err) => PluginJsonRpcResponse::err(id, -32000, err.to_string()),
+            }
+        }
+        "document.preflight" => {
+            let report =
+                crate::preflight::run_preflight(doc, &crate::preflight::PreflightRules::default());
+            PluginJsonRpcResponse::ok(
+                id,
+                serde_json::json!({
+                    "passed": report.passed(),
+                    "error_count": report.error_count(),
+                    "warning_count": report.warning_count()
+                }),
+            )
+        }
+        other => PluginJsonRpcResponse::err(id, -32601, format!("Method not found: {other}")),
+    }
+}
+
+/// Parses and executes one NDJSON JSON-RPC 2.0 plugin line, returning serialized JSON response.
+#[must_use]
+pub fn handle_plugin_jsonrpc_line(
+    doc: &mut Document,
+    registry: &PluginRegistry,
+    line: &str,
+) -> String {
+    let resp = match serde_json::from_str::<PluginJsonRpcRequest>(line.trim()) {
+        Ok(req) => dispatch_plugin_jsonrpc(doc, registry, &req),
+        Err(e) => {
+            PluginJsonRpcResponse::err(serde_json::Value::Null, -32700, format!("Parse error: {e}"))
+        }
+    };
+    serde_json::to_string(&resp).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Serialization error"}}"#
+            .to_owned()
+    })
+}
+
+/// Processes a stream of NDJSON JSON-RPC 2.0 requests (e.g. stdio pipe transport).
+pub fn serve_plugin_jsonrpc_stream<R: std::io::BufRead, W: std::io::Write>(
+    doc: &mut Document,
+    registry: &PluginRegistry,
+    reader: R,
+    mut writer: W,
+) -> ProdResult<usize> {
+    let mut handled = 0usize;
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = handle_plugin_jsonrpc_line(doc, registry, &line);
+        writer.write_all(reply.as_bytes())?;
+        writer.write_all(b"\n")?;
+        handled += 1;
+    }
+    writer.flush()?;
+    Ok(handled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,5 +2049,42 @@ auto_hatch = false
         fs::write(&fake_exe, b"#!/bin/sh\n").unwrap();
         let lb = reg.find("lightburn-bridge").unwrap();
         assert_eq!(detect_executable(lb, Some(&fake_exe)), Some(fake_exe));
+    }
+
+    #[test]
+    fn jsonrpc_plugin_host_protocol_dispatches_and_validates() {
+        let mut doc = sample_laser_doc();
+        let reg = PluginRegistry::with_builtins();
+
+        let ping_raw = handle_plugin_jsonrpc_line(
+            &mut doc,
+            &reg,
+            r#"{"jsonrpc":"2.0","id":1,"method":"plugin.ping"}"#,
+        );
+        let ping_val: serde_json::Value = serde_json::from_str(&ping_raw).unwrap();
+        assert_eq!(ping_val["jsonrpc"], "2.0");
+        assert_eq!(ping_val["id"], 1);
+        assert_eq!(ping_val["result"]["pong"], true);
+
+        let info_raw = handle_plugin_jsonrpc_line(
+            &mut doc,
+            &reg,
+            r#"{"jsonrpc":"2.0","id":"info-1","method":"document.info"}"#,
+        );
+        let info_val: serde_json::Value = serde_json::from_str(&info_raw).unwrap();
+        assert_eq!(info_val["id"], "info-1");
+        assert_eq!(info_val["result"]["title"], "Laser Plugin Test");
+
+        let bad_method = handle_plugin_jsonrpc_line(
+            &mut doc,
+            &reg,
+            r#"{"jsonrpc":"2.0","id":2,"method":"unknown.op"}"#,
+        );
+        let bad_val: serde_json::Value = serde_json::from_str(&bad_method).unwrap();
+        assert_eq!(bad_val["error"]["code"], -32601);
+
+        let bad_json = handle_plugin_jsonrpc_line(&mut doc, &reg, "{not json");
+        let err_val: serde_json::Value = serde_json::from_str(&bad_json).unwrap();
+        assert_eq!(err_val["error"]["code"], -32700);
     }
 }

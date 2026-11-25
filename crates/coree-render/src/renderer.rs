@@ -1673,7 +1673,19 @@ impl SceneRenderer {
                     .filter(|c| c.is_finite())
                     .and_then(|c| c.intersection(full))
                     .unwrap_or(full);
-                obj_to_screen.try_transform_rect(rc)
+                let local_bb = if let Some(persp) = obj.perspective {
+                    persp.try_transform_rect(rc)?
+                } else {
+                    rc
+                };
+                let mut sb = obj_to_screen.try_transform_rect(local_bb)?;
+                Self::expand_screen_bounds_for_deforms(
+                    &obj.effects,
+                    &obj_to_screen,
+                    Some(local_bb.height()),
+                    &mut sb,
+                );
+                Some(sb)
             }
             NodePayload::Table(t) => {
                 let r = t.to_bounding_box();
@@ -2599,10 +2611,13 @@ impl SceneRenderer {
                     doc,
                     obj,
                     raster,
+                    page_to_surface,
+                    parent_to_screen,
                     obj_to_screen,
                     px_per_mm,
                     view_mode,
                     options,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -8931,10 +8946,13 @@ fn render_raster_object(
     doc: &Document,
     obj: &SceneObject,
     raster: &coree_core::RasterLayerData,
+    page_to_surface: Affine2D,
+    parent_to_screen: Affine2D,
     obj_to_screen: Affine2D,
     px_per_mm: f64,
     view_mode: ViewMode,
     options: &RenderOptions,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let w_mm = sanitize_f64(raster.width_mm, 50.0).max(0.1);
@@ -8945,56 +8963,177 @@ fn render_raster_object(
         .filter(|r| r.is_finite())
         .unwrap_or(full_rect);
 
+    let mut frame_path = BezierPath::from_rect(clip_rect);
+    if let Some(persp) = obj.perspective {
+        frame_path = persp.transform_bezier_path(&frame_path);
+    }
+    let pre_eff_bb = frame_path.bounding_box();
+    let deformed_frame = apply_geometry_effects_in_bounds(&frame_path, pre_eff_bb, &obj.effects);
+
     if view_mode == ViewMode::Wireframe {
-        let mut frame = BezierPath::from_rect(clip_rect);
+        let mut wf = deformed_frame.clone();
         // Diagonal X indicator for wireframe raster placeholders
-        frame.subpaths.push(Subpath::from_points(
+        let mut diag = BezierPath::default();
+        diag.subpaths.push(Subpath::from_points(
             [
                 Point2D::new(clip_rect.min_x, clip_rect.min_y),
                 Point2D::new(clip_rect.max_x, clip_rect.max_y),
             ],
             false,
         ));
-        frame.subpaths.push(Subpath::from_points(
+        diag.subpaths.push(Subpath::from_points(
             [
                 Point2D::new(clip_rect.max_x, clip_rect.min_y),
                 Point2D::new(clip_rect.min_x, clip_rect.max_y),
             ],
             false,
         ));
-        stroke_wireframe(&frame, obj_to_screen, px_per_mm, options, backend);
+        if let Some(persp) = obj.perspective {
+            diag = persp.transform_bezier_path(&diag);
+        }
+        let diag_def = apply_geometry_effects_in_bounds(&diag, pre_eff_bb, &obj.effects);
+        wf.subpaths.extend(diag_def.subpaths);
+        stroke_wireframe(&wf, obj_to_screen, px_per_mm, options, backend);
         return;
     }
 
     let Some(asset) = doc.asset(raster.asset_id) else {
         return;
     };
+    let anti_alias = view_mode != ViewMode::Pixels;
+    if !obj.effects.is_empty() {
+        render_underlay_effects(
+            doc,
+            obj,
+            &deformed_frame,
+            obj.transform,
+            parent_to_screen,
+            page_to_surface,
+            px_per_mm,
+            anti_alias,
+            icc,
+            backend,
+        );
+    }
+
     let filtered = if raster.filters.is_empty() {
         None
     } else {
         Some(apply_raster_filters(asset, &raster.filters))
     };
     let active_asset = filtered.as_ref().unwrap_or(asset);
-    let Ok(buf) = RgbaBuffer::from_vec(
+    let smooth = view_mode != ViewMode::Pixels;
+
+    // Compose obj.perspective + any Effect::Perspective into a single local homography
+    let mut combined_persp = obj.perspective;
+    let mut cur_bb = pre_eff_bb.unwrap_or(clip_rect);
+    for eff in &obj.effects {
+        if let Effect::Perspective { quad } = eff {
+            if let Some(eff_h) = Perspective3x3::from_rect_to_quad(cur_bb, quad) {
+                combined_persp = Some(match combined_persp {
+                    Some(p) => eff_h.compose(&p),
+                    None => eff_h,
+                });
+                if let Some(next_bb) = eff_h.try_transform_rect(cur_bb) {
+                    cur_bb = next_bb;
+                }
+            }
+        }
+    }
+
+    if let Some(persp) = combined_persp {
+        if let (Some(inv_persp), Some(warped_bb)) =
+            (persp.inverse(), persp.try_transform_rect(clip_rect))
+        {
+            let scale_est = estimate_scale(&obj_to_screen).max(px_per_mm).max(0.25);
+            let out_w = ((warped_bb.width() * scale_est).ceil() as u32).clamp(1, 2048);
+            let out_h = ((warped_bb.height() * scale_est).ceil() as u32).clamp(1, 2048);
+            let src_rgba = active_asset.to_rgba8_vec();
+            let sw = active_asset.width as usize;
+            let sh = active_asset.height as usize;
+            let mut warped = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+            let step_x = warped_bb.width() / f64::from(out_w);
+            let step_y = warped_bb.height() / f64::from(out_h);
+            for py in 0..out_h {
+                let wy = warped_bb.min_y + (f64::from(py) + 0.5) * step_y;
+                for px in 0..out_w {
+                    let wx = warped_bb.min_x + (f64::from(px) + 0.5) * step_x;
+                    let Some(src_mm) = inv_persp.transform_point(Point2D::new(wx, wy)) else {
+                        continue;
+                    };
+                    if src_mm.x < clip_rect.min_x
+                        || src_mm.x > clip_rect.max_x
+                        || src_mm.y < clip_rect.min_y
+                        || src_mm.y > clip_rect.max_y
+                    {
+                        continue;
+                    }
+                    let u = (src_mm.x / w_mm) * f64::from(active_asset.width);
+                    let v = (src_mm.y / h_mm) * f64::from(active_asset.height);
+                    if u < 0.0
+                        || v < 0.0
+                        || u >= f64::from(active_asset.width)
+                        || v >= f64::from(active_asset.height)
+                    {
+                        continue;
+                    }
+                    let x0 = (u.floor() as usize).min(sw.saturating_sub(1));
+                    let y0 = (v.floor() as usize).min(sh.saturating_sub(1));
+                    let x1 = (x0 + 1).min(sw.saturating_sub(1));
+                    let y1 = (y0 + 1).min(sh.saturating_sub(1));
+                    let fx = (u - x0 as f64) as f32;
+                    let fy = (v - y0 as f64) as f32;
+                    let i00 = (y0 * sw + x0) * 4;
+                    let i10 = (y0 * sw + x1) * 4;
+                    let i01 = (y1 * sw + x0) * 4;
+                    let i11 = (y1 * sw + x1) * 4;
+                    let dst_i = ((py as usize) * (out_w as usize) + (px as usize)) * 4;
+                    for c in 0..4 {
+                        let top = f32::from(src_rgba[i00 + c]) * (1.0 - fx)
+                            + f32::from(src_rgba[i10 + c]) * fx;
+                        let bot = f32::from(src_rgba[i01 + c]) * (1.0 - fx)
+                            + f32::from(src_rgba[i11 + c]) * fx;
+                        warped[dst_i + c] =
+                            (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+            if let Ok(buf) = RgbaBuffer::from_vec(out_w, out_h, warped) {
+                let draw_xf = obj_to_screen
+                    .compose(&Affine2D::translate(warped_bb.min_x, warped_bb.min_y))
+                    .compose(&Affine2D::scale(step_x, step_y));
+                backend.draw_pixmap(&buf, draw_xf, obj.opacity, obj.blend_mode, smooth);
+            }
+        }
+    } else if let Ok(buf) = RgbaBuffer::from_vec(
         active_asset.width,
         active_asset.height,
         active_asset.to_rgba8_vec(),
-    ) else {
-        return;
-    };
+    ) {
+        let sx = w_mm / f64::from(active_asset.width.max(1));
+        let sy = h_mm / f64::from(active_asset.height.max(1));
+        let img_xf = obj_to_screen.compose(&Affine2D::scale(sx, sy));
+        if raster.crop_rect.is_some() {
+            let crop_path = BezierPath::from_rect(clip_rect);
+            backend.push_clip(&crop_path, FillRule::Winding, obj_to_screen);
+            backend.draw_pixmap(&buf, img_xf, obj.opacity, obj.blend_mode, smooth);
+            backend.pop_clip();
+        } else {
+            backend.draw_pixmap(&buf, img_xf, obj.opacity, obj.blend_mode, smooth);
+        }
+    }
 
-    let sx = w_mm / f64::from(active_asset.width.max(1));
-    let sy = h_mm / f64::from(active_asset.height.max(1));
-    let img_xf = obj_to_screen.compose(&Affine2D::scale(sx, sy));
-    let smooth = view_mode != ViewMode::Pixels;
-
-    if raster.crop_rect.is_some() {
-        let crop_path = BezierPath::from_rect(clip_rect);
-        backend.push_clip(&crop_path, FillRule::Winding, obj_to_screen);
-        backend.draw_pixmap(&buf, img_xf, obj.opacity, obj.blend_mode, smooth);
-        backend.pop_clip();
-    } else {
-        backend.draw_pixmap(&buf, img_xf, obj.opacity, obj.blend_mode, smooth);
+    if !obj.effects.is_empty() {
+        render_overlay_effects(
+            obj,
+            &deformed_frame,
+            obj.transform,
+            parent_to_screen,
+            px_per_mm,
+            anti_alias,
+            icc,
+            backend,
+        );
     }
 }
 

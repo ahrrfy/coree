@@ -1427,6 +1427,7 @@ fn vector_trace_outline_and_centerline_vectorize_synthetic_shapes() {
             detail: 0.85,
             remove_background: true,
             corner_threshold: 55.0,
+            speckle_size: 0,
         },
     );
     assert_eq!(
@@ -1467,6 +1468,7 @@ fn vector_trace_outline_and_centerline_vectorize_synthetic_shapes() {
             detail: 0.85,
             remove_background: true,
             corner_threshold: 50.0,
+            speckle_size: 0,
         },
     );
     assert!(

@@ -86,11 +86,27 @@ impl EmbeddedPdfFont {
 pub(crate) struct PdfFontRegistry {
     fonts: Vec<CollectedFont>,
     by_key: HashMap<FontFaceKey, usize>,
+    ptr_cache: HashMap<(usize, usize, u32), FontFaceKey>,
 }
 
 impl PdfFontRegistry {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn ptr_cache(&self) -> &HashMap<(usize, usize, u32), FontFaceKey> {
+        &self.ptr_cache
+    }
+
+    fn key_for_run(&mut self, run: &ShapedPdfRun) -> FontFaceKey {
+        let ptr = Arc::as_ptr(&run.font_bytes).cast::<u8>() as usize;
+        let ptr_key = (ptr, run.font_bytes.len(), run.face_index);
+        if let Some(&k) = self.ptr_cache.get(&ptr_key) {
+            return k;
+        }
+        let k = FontFaceKey::new(&run.font_bytes, run.face_index);
+        self.ptr_cache.insert(ptr_key, k);
+        k
     }
 
     /// Registers all glyphs in `run` when the underlying SFNT face can be embedded.
@@ -99,7 +115,7 @@ impl PdfFontRegistry {
         if run.glyphs.is_empty() || run.font_bytes.is_empty() {
             return None;
         }
-        let key = FontFaceKey::new(&run.font_bytes, run.face_index);
+        let key = self.key_for_run(run);
         let idx = if let Some(&existing) = self.by_key.get(&key) {
             existing
         } else {
@@ -152,6 +168,228 @@ impl PdfFontRegistry {
         }
         Ok(result)
     }
+
+    /// Registers `run` for streaming identity-GID PDF output (`type0_obj_id` deferred until `finish()`).
+    pub(crate) fn register_run_identity(
+        &mut self,
+        run: &ShapedPdfRun,
+        embedded_map: &mut HashMap<FontFaceKey, EmbeddedPdfFont>,
+    ) -> Option<FontFaceKey> {
+        let key = self.register_run(run)?;
+        let idx = *self.by_key.get(&key)?;
+        let font = &self.fonts[idx];
+        let entry = embedded_map.entry(key).or_insert_with(|| EmbeddedPdfFont {
+            res_name: format!("F{}", idx + 1),
+            type0_obj_id: 0,
+            is_identity_remapped: false,
+            orig_to_subset: HashMap::new(),
+            widths_1000: HashMap::new(),
+        });
+        let all_cached = run
+            .glyphs
+            .iter()
+            .all(|g| entry.widths_1000.contains_key(&g.glyph_id));
+        if !all_cached {
+            if let Ok(face) = Face::parse(&font.font_bytes, font.face_index) {
+                let upem = f64::from(face.units_per_em().max(1));
+                let scale = 1000.0 / upem;
+                for g in &run.glyphs {
+                    entry.widths_1000.entry(g.glyph_id).or_insert_with(|| {
+                        let adv = face.glyph_hor_advance(GlyphId(g.glyph_id)).unwrap_or(0);
+                        (f64::from(adv) * scale).round() as u32
+                    });
+                }
+            }
+        }
+        Some(key)
+    }
+
+    /// Emits all accumulated fonts with original identity GIDs (`/CIDToGIDMap /Identity`) and
+    /// full `/ToUnicode` CMaps, returning `(res_name, type0_obj_id)` pairs for the shared `/Font` dict.
+    pub(crate) fn emit_all_identity(
+        &self,
+        add_obj: &mut dyn FnMut(Vec<u8>) -> usize,
+    ) -> IoResult<Vec<(String, usize)>> {
+        let mut refs = Vec::with_capacity(self.fonts.len());
+        for (idx, font) in self.fonts.iter().enumerate() {
+            let res_name = format!("F{}", idx + 1);
+            let type0_id = build_and_emit_identity_font(font, add_obj)?;
+            refs.push((res_name, type0_id));
+        }
+        Ok(refs)
+    }
+}
+
+fn extract_standalone_sfnt(bytes: &[u8], face_index: u32) -> IoResult<Vec<u8>> {
+    if bytes.len() < 12 || &bytes[0..4] != b"ttcf" {
+        return Ok(bytes.to_vec());
+    }
+    let num_fonts = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let fi = face_index.min(num_fonts.saturating_sub(1)) as usize;
+    let off_pos = 12 + fi * 4;
+    if off_pos + 4 > bytes.len() {
+        return Ok(bytes.to_vec());
+    }
+    let face_off = u32::from_be_bytes([
+        bytes[off_pos],
+        bytes[off_pos + 1],
+        bytes[off_pos + 2],
+        bytes[off_pos + 3],
+    ]) as usize;
+    if face_off + 12 > bytes.len() {
+        return Ok(bytes.to_vec());
+    }
+    let num_tables = usize::from(u16::from_be_bytes([
+        bytes[face_off + 4],
+        bytes[face_off + 5],
+    ]));
+    let dir_start = face_off + 12;
+    let dir_end = dir_start + num_tables * 16;
+    if dir_end > bytes.len() {
+        return Ok(bytes.to_vec());
+    }
+    let mut tables: Vec<(&[u8], &[u8])> = Vec::with_capacity(num_tables);
+    for rec in bytes[dir_start..dir_end].as_chunks::<16>().0 {
+        let off = u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]) as usize;
+        let len = u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize;
+        if off + len <= bytes.len() {
+            tables.push((&rec[0..4], &bytes[off..off + len]));
+        }
+    }
+    let header_size = 12 + tables.len() * 16;
+    let mut out = vec![0u8; header_size];
+    out[0..4].copy_from_slice(&bytes[face_off..face_off + 4]);
+    let num_out = tables.len().min(usize::from(u16::MAX)) as u16;
+    out[4..6].copy_from_slice(&num_out.to_be_bytes());
+    let (search_range, entry_selector, range_shift) = if num_out == 0 {
+        (0u16, 0u16, 0u16)
+    } else {
+        let es = u32::from(num_out).ilog2() as u16;
+        let max_pow2 = 1u16 << es;
+        let sr = max_pow2.saturating_mul(16);
+        let rs = num_out.saturating_mul(16).saturating_sub(sr);
+        (sr, es, rs)
+    };
+    out[6..8].copy_from_slice(&search_range.to_be_bytes());
+    out[8..10].copy_from_slice(&entry_selector.to_be_bytes());
+    out[10..12].copy_from_slice(&range_shift.to_be_bytes());
+    let mut cursor = header_size;
+    for (i, (tag, data)) in tables.iter().enumerate() {
+        let rec_off = 12 + i * 16;
+        out[rec_off..rec_off + 4].copy_from_slice(tag);
+        out[rec_off + 8..rec_off + 12].copy_from_slice(&(cursor as u32).to_be_bytes());
+        out[rec_off + 12..rec_off + 16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        cursor = out.len();
+    }
+    Ok(out)
+}
+
+fn build_and_emit_identity_font(
+    collected: &CollectedFont,
+    add_obj: &mut dyn FnMut(Vec<u8>) -> usize,
+) -> IoResult<usize> {
+    let face = Face::parse(&collected.font_bytes, collected.face_index).map_err(|e| {
+        IoError::InvalidFormat {
+            format: "pdf".into(),
+            message: format!("failed to parse streaming font: {e}"),
+        }
+    })?;
+    let upem = f64::from(face.units_per_em().max(1));
+    let scale = 1000.0 / upem;
+    let bbox = face.global_bounding_box();
+    let x_min = (f64::from(bbox.x_min) * scale).round() as i32;
+    let y_min = (f64::from(bbox.y_min) * scale).round() as i32;
+    let x_max = (f64::from(bbox.x_max) * scale).round() as i32;
+    let y_max = (f64::from(bbox.y_max) * scale).round() as i32;
+    let ascent = (f64::from(face.ascender()) * scale).round() as i32;
+    let descent = (f64::from(face.descender()) * scale).round() as i32;
+    let cap_height = face
+        .capital_height()
+        .map_or((ascent as f64 * 0.72).round() as i32, |c| {
+            (f64::from(c) * scale).round() as i32
+        });
+    let italic_angle = face.italic_angle();
+    let stem_v = if face.is_bold() { 120 } else { 80 };
+    let mut flags: u32 = 4;
+    if face.is_monospaced() {
+        flags |= 1;
+    }
+    if face.is_italic() {
+        flags |= 64;
+    }
+
+    let tag = compute_subset_tag(&collected.used_gids, &collected.font_bytes);
+    let base_ps = sanitize_ps_font_name(&collected.postscript_name);
+    let font_name = format!("{tag}+{base_ps}");
+
+    let raw_face = face.raw_face();
+    let is_ttf = raw_face.table(Tag::from_bytes(b"glyf")).is_some()
+        && raw_face.table(Tag::from_bytes(b"loca")).is_some();
+
+    let mut w_str = String::new();
+    let mut to_unicode_entries = Vec::new();
+    for (&orig_gid, uni) in &collected.used_gids {
+        let adv = face.glyph_hor_advance(GlyphId(orig_gid)).unwrap_or(0);
+        let w_pdf = (f64::from(adv) * scale).round() as u32;
+        let _ = write!(w_str, "{orig_gid} [{w_pdf}] ");
+        if !uni.is_empty() {
+            to_unicode_entries.push((orig_gid, uni.clone()));
+        }
+    }
+    if to_unicode_entries.is_empty() {
+        to_unicode_entries.push((0, "\u{FFFD}".to_owned()));
+    }
+
+    let (fd_id, subtype, extra_cid) = if is_ttf {
+        let sfnt = extract_standalone_sfnt(&collected.font_bytes, collected.face_index)?;
+        let font_file_dict = format!("/Length1 {}", sfnt.len());
+        let font_file_id = add_obj(compress_pdf_stream(&font_file_dict, &sfnt)?);
+        let fd_body = format!(
+            "<< /Type /FontDescriptor /FontName /{font_name} /Flags {flags} \
+             /FontBBox [{x_min} {y_min} {x_max} {y_max}] /ItalicAngle {italic_angle:.2} \
+             /Ascent {ascent} /Descent {descent} /CapHeight {cap_height} /StemV {stem_v} \
+             /FontFile2 {font_file_id} 0 R >>"
+        );
+        (
+            add_obj(fd_body.into_bytes()),
+            "CIDFontType2",
+            " /CIDToGIDMap /Identity",
+        )
+    } else {
+        let cff_data =
+            raw_face
+                .table(Tag::from_bytes(b"CFF "))
+                .ok_or_else(|| IoError::InvalidFormat {
+                    format: "pdf".into(),
+                    message: "streaming font has neither glyf nor CFF table".into(),
+                })?;
+        let font_file_id = add_obj(compress_pdf_stream("/Subtype /CIDFontType0C", cff_data)?);
+        let fd_body = format!(
+            "<< /Type /FontDescriptor /FontName /{font_name} /Flags {flags} \
+             /FontBBox [{x_min} {y_min} {x_max} {y_max}] /ItalicAngle {italic_angle:.2} \
+             /Ascent {ascent} /Descent {descent} /CapHeight {cap_height} /StemV {stem_v} \
+             /FontFile3 {font_file_id} 0 R >>"
+        );
+        (add_obj(fd_body.into_bytes()), "CIDFontType0", "")
+    };
+
+    let cid_body = format!(
+        "<< /Type /Font /Subtype /{subtype} /BaseFont /{font_name} \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+         /FontDescriptor {fd_id} 0 R /DW 1000 /W [{w_str}]{extra_cid} >>"
+    );
+    let cid_id = add_obj(cid_body.into_bytes());
+    let cmap_bytes = build_tounicode_cmap(&to_unicode_entries);
+    let cmap_id = add_obj(compress_pdf_stream("", &cmap_bytes)?);
+    let type0_body = format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /{font_name} \
+         /Encoding /Identity-H /DescendantFonts [{cid_id} 0 R] /ToUnicode {cmap_id} 0 R >>"
+    );
+    Ok(add_obj(type0_body.into_bytes()))
 }
 
 fn sanitize_ps_font_name(raw: &str) -> String {
@@ -794,5 +1032,37 @@ mod tests {
         assert!(all_text.contains("/Subtype /CIDFontType2"));
         assert!(all_text.contains("/CIDToGIDMap /Identity"));
         assert!(all_text.contains("/FontFile2"));
+    }
+
+    #[test]
+    fn extract_standalone_sfnt_sets_binary_search_header_fields() {
+        // Minimal TTC with 1 face containing 5 dummy tables
+        let num_tables = 5u16;
+        let face_off = 32u32;
+        let mut ttc = vec![0u8; 512];
+        ttc[0..4].copy_from_slice(b"ttcf");
+        ttc[4..8].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        ttc[8..12].copy_from_slice(&1u32.to_be_bytes());
+        ttc[12..16].copy_from_slice(&face_off.to_be_bytes());
+
+        let f = face_off as usize;
+        ttc[f..f + 4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        ttc[f + 4..f + 6].copy_from_slice(&num_tables.to_be_bytes());
+        let tags = [b"cmap", b"glyf", b"head", b"hhea", b"maxp"];
+        let mut data_off = f + 12 + usize::from(num_tables) * 16;
+        for (i, tag) in tags.iter().enumerate() {
+            let rec = f + 12 + i * 16;
+            ttc[rec..rec + 4].copy_from_slice(*tag);
+            ttc[rec + 8..rec + 12].copy_from_slice(&(data_off as u32).to_be_bytes());
+            ttc[rec + 12..rec + 16].copy_from_slice(&8u32.to_be_bytes());
+            ttc[data_off..data_off + 8].fill(0xAA);
+            data_off += 8;
+        }
+
+        let sfnt = extract_standalone_sfnt(&ttc, 0).unwrap();
+        assert_eq!(u16::from_be_bytes([sfnt[4], sfnt[5]]), 5);
+        assert_eq!(u16::from_be_bytes([sfnt[6], sfnt[7]]), 64); // searchRange = 4 * 16
+        assert_eq!(u16::from_be_bytes([sfnt[8], sfnt[9]]), 2); // entrySelector = floor(log2(5))
+        assert_eq!(u16::from_be_bytes([sfnt[10], sfnt[11]]), 16); // rangeShift = 5*16 - 64
     }
 }

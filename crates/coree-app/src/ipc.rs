@@ -436,6 +436,79 @@ pub fn dispatch_jsonrpc_on_session(
                 "redo": history.redo_labels(),
             }),
         ),
+        "scene.query_cql" => {
+            let query = req
+                .params
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match coree_prod::evaluate_cql_query(doc, coree_prod::FindScope::WholeDocument, query) {
+                Ok(ids) => JsonRpcResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "object_ids": ids.into_iter().map(|o| o.0).collect::<Vec<u64>>(),
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::err(id, JSONRPC_INVALID_PARAMS, e.to_string()),
+            }
+        }
+        "scene.run_macro" => {
+            let script = req
+                .params
+                .get("script")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if script.trim().is_empty() {
+                return JsonRpcResponse::err(id, JSONRPC_INVALID_PARAMS, "missing params.script");
+            }
+            let sandbox = coree_prod::MacroSandboxConfig::default();
+            match coree_prod::plan_macro_ops(
+                doc,
+                script,
+                &std::collections::BTreeMap::new(),
+                &sandbox,
+            ) {
+                Ok((res, ops)) => {
+                    let applied = if ops.is_empty() {
+                        Ok(())
+                    } else {
+                        history
+                            .execute(doc, CommandOp::Batch(ops))
+                            .map_err(|e| e.to_string())
+                    };
+                    match applied {
+                        Ok(()) => JsonRpcResponse::ok(
+                            id,
+                            serde_json::json!({
+                                "commands_executed": res.commands_executed,
+                                "logs": res.logs,
+                                "object_count": doc.objects().len(),
+                                "undo_depth": history.undo_labels().len(),
+                            }),
+                        ),
+                        Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e),
+                    }
+                }
+                Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e.to_string()),
+            }
+        }
+        "scene.preflight" => {
+            let mut rules = coree_prod::PreflightRules::default();
+            if let Some(min_dpi) = req
+                .params
+                .get("min_dpi")
+                .and_then(serde_json::Value::as_f64)
+            {
+                if min_dpi.is_finite() && min_dpi > 0.0 {
+                    rules.min_dpi = min_dpi;
+                }
+            }
+            let report = coree_prod::run_preflight(doc, &rules);
+            match serde_json::to_value(&report) {
+                Ok(val) => JsonRpcResponse::ok(id, val),
+                Err(e) => JsonRpcResponse::err(id, JSONRPC_SERVER_ERROR, e.to_string()),
+            }
+        }
         other => JsonRpcResponse::err(
             id,
             JSONRPC_METHOD_NOT_FOUND,
@@ -818,12 +891,14 @@ $srv=[System.IO.Pipes.NamedPipeServerStream]::new('{short_name}',[System.IO.Pipe
 $srv.WaitForConnection();
 $sr=New-Object System.IO.StreamReader($srv,[System.Text.Encoding]::UTF8,$false,4096,$true);
 $sw=New-Object System.IO.StreamWriter($srv,[System.Text.Encoding]::UTF8,4096,$true);
-$line=$sr.ReadLine();
-if($null -ne $line){{
+while($null -ne ($line=$sr.ReadLine())){{
+  if($line.Trim().Length -eq 0){{ continue; }}
   [Console]::Out.WriteLine($line);
   [Console]::Out.Flush();
   $resp=[Console]::In.ReadLine();
-  if($null -ne $resp){{ $sw.WriteLine($resp); $sw.Flush(); }}
+  if($null -eq $resp){{ break; }}
+  $sw.WriteLine($resp);
+  $sw.Flush();
 }}
 $srv.Dispose();"#,
         );
@@ -845,19 +920,28 @@ $srv.Dispose();"#,
                 let _ = proc.kill();
                 break;
             };
-            let mut reader = BufReader::new(stdout.take(MAX_IPC_LINE_BYTES));
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                if stop_flag.load(Ordering::SeqCst) {
-                    let _ = proc.wait();
-                    break;
+            let mut reader = BufReader::new(stdout);
+            while !stop_flag.load(Ordering::SeqCst) {
+                let mut line = String::new();
+                let read_res = {
+                    let mut limited = (&mut reader).take(MAX_IPC_LINE_BYTES);
+                    limited.read_line(&mut line)
+                };
+                match read_res {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
                 let resp =
-                    process_jsonrpc_line(line.trim(), expected_token, tx_batches, tx_rpc, wake_ctx);
+                    process_jsonrpc_line(trimmed, expected_token, tx_batches, tx_rpc, wake_ctx);
                 if let Ok(mut encoded) = serde_json::to_string(&resp) {
                     encoded.push('\n');
-                    let _ = stdin.write_all(encoded.as_bytes());
-                    let _ = stdin.flush();
+                    if stdin.write_all(encoded.as_bytes()).is_err() || stdin.flush().is_err() {
+                        break;
+                    }
                 }
             }
             drop(stdin);
@@ -1184,7 +1268,40 @@ mod tests {
             1
         );
 
-        // 6. Unknown method (-32601)
+        // 6. scene.query_cql, scene.run_macro, scene.preflight
+        let cql_resp = send_jsonrpc_at(
+            &lock_path,
+            &JsonRpcRequest::new(
+                90,
+                "scene.query_cql",
+                serde_json::json!({ "query": "@name == 'RpcRect'" }),
+            ),
+        )
+        .expect("scene.query_cql");
+        assert_eq!(
+            cql_resp.result.unwrap()["object_ids"],
+            serde_json::json!([oid])
+        );
+
+        let macro_resp = send_jsonrpc_at(
+            &lock_path,
+            &JsonRpcRequest::new(
+                91,
+                "scene.run_macro",
+                serde_json::json!({ "script": "let s = doc.pages[0].shapes[0]; s.name = \"MacroNamed\";" }),
+            ),
+        )
+        .expect("scene.run_macro");
+        assert!(macro_resp.error.is_none(), "{:?}", macro_resp.error);
+
+        let pf_resp = send_jsonrpc_at(
+            &lock_path,
+            &JsonRpcRequest::new(92, "scene.preflight", serde_json::json!({})),
+        )
+        .expect("scene.preflight");
+        assert!(pf_resp.result.unwrap().get("issues").is_some());
+
+        // 7. Unknown method (-32601)
         let unknown_resp = send_jsonrpc_at(
             &lock_path,
             &JsonRpcRequest::new(9, "scene.nonexistent", serde_json::json!({})),

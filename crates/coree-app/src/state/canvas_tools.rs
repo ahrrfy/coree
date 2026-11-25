@@ -450,13 +450,27 @@ impl StudioApp {
                 return;
             }
             ToolId::MaskSelect => {
+                let mode = self.tool_settings.mask_mode;
+                let feather_px = self.tool_settings.mask_feather_px.max(0.0);
+                let inverted = self.tool_settings.mask_inverted;
+                let shape = match mode {
+                    RasterMaskMode::Ellipse => RasterMaskShape::Ellipse(rect),
+                    _ => RasterMaskShape::Rectangle(rect),
+                };
                 if let Some(tab) = self.active_tab_mut() {
                     tab.raster_mask_rect_mm = Some(rect);
+                    tab.tool_core.raster_mask_rect_mm = Some(rect);
+                    tab.raster_mask = Some(RasterMaskSelection {
+                        shape,
+                        feather_px,
+                        inverted,
+                    });
                     tab.needs_rerender = true;
                 }
                 self.push_toast(
                     format!(
-                        "Set bitmap mask ({:.1} × {:.1} mm)",
+                        "Set {} bitmap mask ({:.1} × {:.1} mm)",
+                        mode.label(),
                         rect.width(),
                         rect.height()
                     ),
@@ -519,23 +533,34 @@ impl StudioApp {
         if polygon.len() < 3 {
             return Vec::new();
         }
-        let Some(tab) = self.active_tab_mut() else {
-            return Vec::new();
-        };
-        let hits =
-            coree_tools::compute_lasso_hits_scoped(&tab.document, tab.powerclip_edit_id, polygon);
-        if additive {
-            let mut combined = tab.selection.objects.clone();
-            for id in &hits {
-                if !combined.contains(id) {
-                    combined.push(*id);
+        let before_sel = self
+            .active_tab()
+            .map(|t| t.selection.objects.clone())
+            .unwrap_or_default();
+        let hits = {
+            let Some(tab) = self.active_tab_mut() else {
+                return Vec::new();
+            };
+            let hits = coree_tools::compute_lasso_hits_scoped(
+                &tab.document,
+                tab.powerclip_edit_id,
+                polygon,
+            );
+            if additive {
+                let mut combined = tab.selection.objects.clone();
+                for id in &hits {
+                    if !combined.contains(id) {
+                        combined.push(*id);
+                    }
                 }
+                tab.selection.select_many(&tab.document, &combined);
+            } else {
+                tab.selection.select_many(&tab.document, &hits);
             }
-            tab.selection.select_many(&tab.document, &combined);
-        } else {
-            tab.selection.select_many(&tab.document, &hits);
-        }
-        tab.metrics_dirty = true;
+            tab.metrics_dirty = true;
+            hits
+        };
+        self.maybe_fire_selection_change(&before_sel);
         hits
     }
 
@@ -3112,6 +3137,8 @@ impl StudioApp {
         let clone_src_world = self.tool_settings.clone_source_mm;
         let curve = PressureCurve::from_json(&self.tool_settings.pressure_curve_json);
 
+        let default_feather = self.tool_settings.mask_feather_px;
+        let default_inverted = self.tool_settings.mask_inverted;
         let prepared = self.active_tab().and_then(|tab| {
             if !is_object_editable_in_doc(&tab.document, oid) {
                 return None;
@@ -3134,17 +3161,32 @@ impl StudioApp {
                 r.width_mm.max(1e-3),
                 r.height_mm.max(1e-3),
                 world_inverse_transform_of(&tab.document, oid),
+                obj.perspective.and_then(|p| p.inverse()),
+                tab.raster_mask.clone(),
                 tab.raster_mask_rect_mm,
             ))
         });
-        let Some((mut new_asset, updated_data, w_mm, h_mm, inv_xf, mask_rect_mm)) = prepared else {
+        let Some((
+            mut new_asset,
+            updated_data,
+            w_mm,
+            h_mm,
+            inv_xf,
+            inv_persp,
+            mask_sel,
+            mask_rect_mm,
+        )) = prepared
+        else {
             return false;
         };
 
         let aw = f64::from(new_asset.width);
         let ah = f64::from(new_asset.height);
         let to_px = |p: Point2D| {
-            let lp = inv_xf.transform_point(p);
+            let mut lp = inv_xf.transform_point(p);
+            if let Some(ref ih) = inv_persp {
+                lp = ih.transform_point_or(lp);
+            }
             Point2D::new((lp.x / w_mm) * aw, (lp.y / h_mm) * ah)
         };
         let px_pts: Vec<Point2D> = points.iter().copied().map(to_px).collect();
@@ -3167,13 +3209,14 @@ impl StudioApp {
             })
             .unwrap_or(Point2D::ZERO);
 
-        let active_mask = mask_rect_mm.map(|mr| {
-            let p0 = to_px(mr.min());
-            let p1 = to_px(mr.max());
-            let px_rect = Rect2D::from_points(p0, p1);
-            RasterMask::from_rectangle(new_asset.width, new_asset.height, px_rect)
-        });
-        let orig_before_mask = active_mask.as_ref().map(|_| new_asset.clone());
+        let active_mask = Self::build_raster_mask_for_asset(
+            &new_asset,
+            mask_sel.as_ref(),
+            mask_rect_mm,
+            &to_px,
+            default_feather,
+            default_inverted,
+        );
 
         match op {
             RasterBrushOp::Paint => {
@@ -3188,19 +3231,45 @@ impl StudioApp {
                 );
             }
             RasterBrushOp::Eraser => {
-                erase_stroke_stylus(&mut new_asset, &stylus_pts, r_px, hard);
+                erase_stroke_stylus_masked(
+                    &mut new_asset,
+                    &stylus_pts,
+                    r_px,
+                    hard,
+                    active_mask.as_ref(),
+                );
             }
             RasterBrushOp::CloneStamp => {
-                clone_stamp_stroke_stylus(&mut new_asset, src_origin, &stylus_pts, r_px, hard);
+                clone_stamp_stroke_stylus_masked(
+                    &mut new_asset,
+                    src_origin,
+                    &stylus_pts,
+                    r_px,
+                    hard,
+                    active_mask.as_ref(),
+                );
             }
             RasterBrushOp::Smudge => {
-                smudge_stroke_stylus(&mut new_asset, &stylus_pts, r_px, smudge_str);
+                smudge_stroke_stylus_masked(
+                    &mut new_asset,
+                    &stylus_pts,
+                    r_px,
+                    smudge_str,
+                    active_mask.as_ref(),
+                );
             }
             RasterBrushOp::Healing => {
-                apply_healing_stroke_stylus(&mut new_asset, src_origin, &stylus_pts, r_px, hard);
+                apply_healing_stroke_stylus_masked(
+                    &mut new_asset,
+                    src_origin,
+                    &stylus_pts,
+                    r_px,
+                    hard,
+                    active_mask.as_ref(),
+                );
             }
             RasterBrushOp::Dodge => {
-                apply_dodge_burn_stroke_stylus(
+                apply_dodge_burn_stroke_stylus_masked(
                     &mut new_asset,
                     &stylus_pts,
                     r_px,
@@ -3208,10 +3277,11 @@ impl StudioApp {
                     DodgeBurnMode::Dodge,
                     db_tone,
                     db_exp,
+                    active_mask.as_ref(),
                 );
             }
             RasterBrushOp::Burn => {
-                apply_dodge_burn_stroke_stylus(
+                apply_dodge_burn_stroke_stylus_masked(
                     &mut new_asset,
                     &stylus_pts,
                     r_px,
@@ -3219,6 +3289,7 @@ impl StudioApp {
                     DodgeBurnMode::Burn,
                     db_tone,
                     db_exp,
+                    active_mask.as_ref(),
                 );
             }
             RasterBrushOp::FloodFill => {
@@ -3227,37 +3298,14 @@ impl StudioApp {
                     let max_y = i64::from(new_asset.height).saturating_sub(1).max(0);
                     let sx = (seed.x.round() as i64).clamp(0, max_x) as u32;
                     let sy = (seed.y.round() as i64).clamp(0, max_y) as u32;
-                    let _ = raster_flood_fill(&mut new_asset, sx, sy, col, flood_tol);
-                }
-            }
-        }
-        if !matches!(op, RasterBrushOp::Paint) {
-            if let (Some(mask), Some(orig_asset)) = (&active_mask, &orig_before_mask) {
-                for y in 0..new_asset.height {
-                    for x in 0..new_asset.width {
-                        let m = f32::from(mask.get(x, y)) / 255.0;
-                        if m >= 1.0 - 1e-4 {
-                            continue;
-                        }
-                        if let (Some(orig_px), Some(new_px)) = (
-                            orig_asset.read_pixel_f32(x, y),
-                            new_asset.read_pixel_f32(x, y),
-                        ) {
-                            let blended = if m <= 1e-4 {
-                                orig_px
-                            } else {
-                                [
-                                    orig_px[0] + (new_px[0] - orig_px[0]) * m,
-                                    orig_px[1] + (new_px[1] - orig_px[1]) * m,
-                                    orig_px[2] + (new_px[2] - orig_px[2]) * m,
-                                    orig_px[3] + (new_px[3] - orig_px[3]) * m,
-                                ]
-                            };
-                            if blended != new_px {
-                                new_asset.write_pixel_f32(x, y, blended);
-                            }
-                        }
-                    }
+                    let _ = raster_flood_fill_masked(
+                        &mut new_asset,
+                        sx,
+                        sy,
+                        col,
+                        flood_tol,
+                        active_mask.as_ref(),
+                    );
                 }
             }
         }
@@ -3277,6 +3325,92 @@ impl StudioApp {
         } else {
             false
         }
+    }
+
+    pub(super) fn build_raster_mask_for_asset(
+        asset: &RasterAsset,
+        mask_sel: Option<&RasterMaskSelection>,
+        mask_rect_mm: Option<Rect2D>,
+        to_px: &dyn Fn(Point2D) -> Point2D,
+        default_feather_px: f32,
+        default_inverted: bool,
+    ) -> Option<RasterMask> {
+        let mut built = if let Some(sel) = mask_sel {
+            let mut m = match &sel.shape {
+                RasterMaskShape::Rectangle(mr) => {
+                    let quad = [
+                        to_px(Point2D::new(mr.min_x, mr.min_y)),
+                        to_px(Point2D::new(mr.max_x, mr.min_y)),
+                        to_px(Point2D::new(mr.max_x, mr.max_y)),
+                        to_px(Point2D::new(mr.min_x, mr.max_y)),
+                    ];
+                    RasterMask::from_lasso(asset.width, asset.height, &quad)
+                }
+                RasterMaskShape::Ellipse(mr) => {
+                    let c = mr.center();
+                    let rx = mr.width() * 0.5;
+                    let ry = mr.height() * 0.5;
+                    let poly: Vec<Point2D> = (0..48)
+                        .map(|i| {
+                            let theta = (f64::from(i) / 48.0) * std::f64::consts::TAU;
+                            to_px(Point2D::new(c.x + rx * theta.cos(), c.y + ry * theta.sin()))
+                        })
+                        .collect();
+                    RasterMask::from_lasso(asset.width, asset.height, &poly)
+                }
+                RasterMaskShape::Lasso(pts) => {
+                    let poly: Vec<Point2D> = pts.iter().copied().map(to_px).collect();
+                    RasterMask::from_lasso(asset.width, asset.height, &poly)
+                }
+                RasterMaskShape::MagicWand {
+                    seed_mm,
+                    tolerance,
+                    contiguous,
+                } => {
+                    let seed = to_px(*seed_mm);
+                    let max_x = i64::from(asset.width).saturating_sub(1).max(0);
+                    let max_y = i64::from(asset.height).saturating_sub(1).max(0);
+                    let sx = (seed.x.round() as i64).clamp(0, max_x) as u32;
+                    let sy = (seed.y.round() as i64).clamp(0, max_y) as u32;
+                    RasterMask::from_magic_wand(asset, sx, sy, *tolerance, *contiguous)
+                }
+            };
+            let feather = if sel.feather_px > 0.0 {
+                sel.feather_px
+            } else {
+                default_feather_px.max(0.0)
+            };
+            if feather > 0.0 {
+                m.feather(feather);
+            }
+            if sel.inverted {
+                m.invert();
+            }
+            Some(m)
+        } else if let Some(mr) = mask_rect_mm {
+            let quad = [
+                to_px(Point2D::new(mr.min_x, mr.min_y)),
+                to_px(Point2D::new(mr.max_x, mr.min_y)),
+                to_px(Point2D::new(mr.max_x, mr.max_y)),
+                to_px(Point2D::new(mr.min_x, mr.max_y)),
+            ];
+            let mut m = RasterMask::from_lasso(asset.width, asset.height, &quad);
+            if default_feather_px > 0.0 {
+                m.feather(default_feather_px);
+            }
+            if default_inverted {
+                m.invert();
+            }
+            Some(m)
+        } else {
+            None
+        };
+        if let Some(ref mut m) = built {
+            if mask_sel.is_some() && default_inverted && !mask_sel.is_some_and(|s| s.inverted) {
+                m.invert();
+            }
+        }
+        built
     }
 
     /// Creates an ArtisticText object at `pos_mm`.

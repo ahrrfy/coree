@@ -35,8 +35,8 @@ use coree_core::{
     hit_test_node, hit_test_powerclip_contents_rect, hit_test_rect, Affine2D, ArtisticMedia,
     ArtisticMediaStyle, BSplineCurve, BezierPath, CommandOp, DynamicGuideLine, Effect, Fill,
     GuideOrientation, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, ParametricShape,
-    PathNode, Point2D, PressureCurve, Rect2D, SceneObject, SnapEngine, StylusSample, Subpath,
-    TransformMode, TransparencyMode, Vec2D,
+    PathNode, Point2D, PressureCurve, RasterMaskMode, RasterMaskSelection, RasterMaskShape, Rect2D,
+    SceneObject, SnapEngine, StylusSample, Subpath, TransformMode, TransparencyMode, Vec2D,
 };
 
 /// Trait implemented by modular tool state machines.
@@ -1641,6 +1641,25 @@ impl ToolCore {
                     samples: vec![ev.stylus],
                 };
             }
+            ToolId::MaskSelect => match ctx.settings.mask_mode {
+                RasterMaskMode::Lasso => {
+                    self.drag_state = ActiveDragState::DrawingStroke {
+                        points_mm: vec![pt],
+                        samples: vec![ev.stylus],
+                    };
+                }
+                RasterMaskMode::MagicWand => {
+                    self.drag_state = ActiveDragState::Idle;
+                }
+                RasterMaskMode::Rectangle | RasterMaskMode::Ellipse => {
+                    self.drag_state = ActiveDragState::DrawingBox {
+                        start_mm: pt,
+                        current_mm: pt,
+                        ctrl,
+                        shift,
+                    };
+                }
+            },
             _ => {
                 let (snapped, guides) = SnapEngine::snap_point(
                     ctx.document,
@@ -2907,6 +2926,35 @@ impl ToolCore {
                     ToolOutput::noop()
                 }
             }
+            ToolId::MaskSelect => {
+                if ctx.settings.mask_mode == RasterMaskMode::MagicWand {
+                    let sel = RasterMaskSelection {
+                        shape: RasterMaskShape::MagicWand {
+                            seed_mm: pt,
+                            tolerance: ctx.settings.magic_wand_tolerance,
+                            contiguous: ctx.settings.magic_wand_contiguous,
+                        },
+                        feather_px: ctx.settings.mask_feather_px,
+                        inverted: ctx.settings.mask_inverted,
+                    };
+                    ToolOutput::actions(vec![
+                        ToolActionRequest::SetRasterMaskRect(None),
+                        ToolActionRequest::SetRasterMask(Some(sel)),
+                        ToolActionRequest::Toast {
+                            message: format!(
+                                "Magic Wand mask at ({:.1}, {:.1}) mm (tol {:.0})",
+                                pt.x, pt.y, ctx.settings.magic_wand_tolerance
+                            ),
+                            is_error: false,
+                        },
+                    ])
+                } else {
+                    ToolOutput::actions(vec![
+                        ToolActionRequest::SetRasterMaskRect(None),
+                        ToolActionRequest::ClearRasterMask,
+                    ])
+                }
+            }
             _ => ToolOutput::noop(),
         }
     }
@@ -3428,6 +3476,26 @@ impl ToolCore {
                     points_mm: points,
                     samples,
                 }])
+            }
+            ToolId::MaskSelect => {
+                let _ = shift;
+                if points.len() < 3 {
+                    return ToolOutput::noop();
+                }
+                let sel = RasterMaskSelection {
+                    shape: RasterMaskShape::Lasso(points),
+                    feather_px: ctx.settings.mask_feather_px,
+                    inverted: ctx.settings.mask_inverted,
+                };
+                let bb = sel.world_bounds();
+                ToolOutput::actions(vec![
+                    ToolActionRequest::SetRasterMaskRect(bb),
+                    ToolActionRequest::SetRasterMask(Some(sel)),
+                    ToolActionRequest::Toast {
+                        message: "Set lasso bitmap mask".to_owned(),
+                        is_error: false,
+                    },
+                ])
             }
             _ => ToolOutput::noop(),
         }
@@ -3991,7 +4059,11 @@ impl ToolCore {
                             ));
                         }
                     } else {
-                        let p = if matches!(self.active_tool, ToolId::Ellipse | ToolId::LensTool) {
+                        let is_ellipse =
+                            matches!(self.active_tool, ToolId::Ellipse | ToolId::LensTool)
+                                || (self.active_tool == ToolId::MaskSelect
+                                    && ctx.settings.mask_mode == RasterMaskMode::Ellipse);
+                        let p = if is_ellipse {
                             ellipse_rect_to_bezier_path(box_mm)
                         } else {
                             rect_to_bezier_path(box_mm)
@@ -4040,7 +4112,10 @@ impl ToolCore {
                         preview_paths.push(OverlayPath::stroke(expanded, kind));
                     } else {
                         preview_paths.push(OverlayPath::stroke(
-                            BezierPath::from_polygon(points_mm.clone(), false),
+                            BezierPath::from_polygon(
+                                points_mm.clone(),
+                                self.active_tool == ToolId::MaskSelect,
+                            ),
                             kind,
                         ));
                     }

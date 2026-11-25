@@ -294,6 +294,11 @@ pub struct ToolSettings {
     pub dodge_burn_exposure: f32,
     pub flood_tolerance: u8,
     pub clone_source_mm: Option<Point2D>,
+    pub mask_mode: RasterMaskMode,
+    pub mask_feather_px: f32,
+    pub magic_wand_tolerance: f32,
+    pub magic_wand_contiguous: bool,
+    pub mask_inverted: bool,
     pub eyedropper_apply_mode: bool,
     pub sampled_effects: Vec<Effect>,
     pub shape_reduce_tolerance_mm: f64,
@@ -338,6 +343,11 @@ impl Default for ToolSettings {
             dodge_burn_exposure: 0.35,
             flood_tolerance: 24,
             clone_source_mm: None,
+            mask_mode: RasterMaskMode::Rectangle,
+            mask_feather_px: 0.0,
+            magic_wand_tolerance: 24.0,
+            magic_wand_contiguous: true,
+            mask_inverted: false,
             eyedropper_apply_mode: false,
             sampled_effects: Vec::new(),
             shape_reduce_tolerance_mm: 0.5,
@@ -384,6 +394,11 @@ impl ToolSettings {
             brush_radius_px: self.brush_radius_px,
             raster_op: self.raster_op,
             clone_source_mm: self.clone_source_mm,
+            mask_mode: self.mask_mode,
+            mask_feather_px: self.mask_feather_px,
+            magic_wand_tolerance: self.magic_wand_tolerance,
+            magic_wand_contiguous: self.magic_wand_contiguous,
+            mask_inverted: self.mask_inverted,
             eyedropper_apply_mode: self.eyedropper_apply_mode,
             sampled_effects: self.sampled_effects.clone(),
             text_insert_draft: self.text_insert_draft.clone(),
@@ -771,6 +786,7 @@ pub struct TraceDockerState {
     pub detail: f64,
     pub remove_background: bool,
     pub corner_threshold: f64,
+    pub speckle_size: usize,
 }
 
 impl Default for TraceDockerState {
@@ -783,6 +799,7 @@ impl Default for TraceDockerState {
             detail: 0.75,
             remove_background: true,
             corner_threshold: 60.0,
+            speckle_size: 4,
         }
     }
 }
@@ -803,6 +820,7 @@ impl TraceDockerState {
             detail: self.detail.clamp(0.0, 1.0),
             remove_background: self.remove_background,
             corner_threshold: self.corner_threshold.clamp(0.0, 180.0),
+            speckle_size: self.speckle_size.min(4096),
         }
     }
 }
@@ -821,6 +839,9 @@ pub struct BitmapDockerState {
     pub target_depth: coree_core::PixelDepth,
     pub target_color_mode: ColorMode,
     pub convert_dpi: f64,
+    pub cutout_bg_threshold: f32,
+    pub cutout_feather_px: f32,
+    pub histogram_cache: std::cell::RefCell<Option<(u64, coree_render::RasterHistogram)>>,
 }
 
 impl Default for BitmapDockerState {
@@ -836,6 +857,9 @@ impl Default for BitmapDockerState {
             target_depth: coree_core::PixelDepth::Bit16,
             target_color_mode: ColorMode::Cmyk,
             convert_dpi: 300.0,
+            cutout_bg_threshold: 24.0,
+            cutout_feather_px: 1.5,
+            histogram_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -962,7 +986,9 @@ pub struct ProductionDockerState {
     pub preflight_min_dpi: f64,
     pub cut_offset_mm: f64,
     pub cut_spot_name: String,
-    pub dieline_type: usize, // 0=TuckEndBox, 1=Envelope, 2=ShoppingBag, 3=StickerSheet
+    pub dieline_type: usize, // 0=TuckEndBox, 1=Envelope, 2=ShoppingBag, 3=StickerSheet, 4=Fefco
+    pub fefco_code: FefcoCode,
+    pub flute_type: FluteType,
     pub box_l_mm: f64,
     pub box_w_mm: f64,
     pub box_h_mm: f64,
@@ -970,10 +996,21 @@ pub struct ProductionDockerState {
     pub sticker_rows: u32,
     pub barcode_symbology: BarcodeSymbology,
     pub barcode_payload: String,
+    pub barcode_bwr_mm: f64,
+    pub code128_mode: Code128Mode,
     pub qr_payload: String,
     pub qr_size_mm: f64,
     pub qr_ec: QrErrorCorrection,
-    pub imposition_kind: usize, // 0=NUp, 1=Booklet, 2=Tiling
+    pub imposition_kind: usize, // 0=NUp, 1=Booklet, 2=Tiling, 3=PerfectBound
+    pub imposition_signature_pages: u32,
+    pub spine_thickness_mm: f64,
+    pub creep_mm: f64,
+    pub milling_allowance_mm: f64,
+    pub trap_width_mm: f64,
+    pub trap_placement: TrapPlacement,
+    pub halftone_lpi: f64,
+    pub halftone_shape: HalftoneDotShape,
+    pub laser_protocol: OpenLaserProtocol,
     pub nup_cols: u32,
     pub nup_rows: u32,
     pub sheet_w_mm: f64,
@@ -994,6 +1031,8 @@ impl Default for ProductionDockerState {
             cut_offset_mm: 2.0,
             cut_spot_name: "CutContour".to_owned(),
             dieline_type: 0,
+            fefco_code: FefcoCode::Fefco0201,
+            flute_type: FluteType::B,
             box_l_mm: 80.0,
             box_w_mm: 40.0,
             box_h_mm: 100.0,
@@ -1001,10 +1040,21 @@ impl Default for ProductionDockerState {
             sticker_rows: 4,
             barcode_symbology: BarcodeSymbology::Ean13,
             barcode_payload: "590123412345".to_owned(),
+            barcode_bwr_mm: 0.0,
+            code128_mode: Code128Mode::Auto,
             qr_payload: coree_core::brand::REPO_URL.to_owned(),
             qr_size_mm: 28.0,
             qr_ec: QrErrorCorrection::M,
             imposition_kind: 0,
+            imposition_signature_pages: 4,
+            spine_thickness_mm: 4.0,
+            creep_mm: 0.5,
+            milling_allowance_mm: 1.0,
+            trap_width_mm: 0.15,
+            trap_placement: TrapPlacement::Centerline,
+            halftone_lpi: 133.0,
+            halftone_shape: HalftoneDotShape::Round,
+            laser_protocol: OpenLaserProtocol::GrblStream,
             nup_cols: 2,
             nup_rows: 2,
             sheet_w_mm: 320.0,

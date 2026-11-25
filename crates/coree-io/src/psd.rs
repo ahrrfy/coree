@@ -20,10 +20,12 @@ use crate::atomic::atomic_write_with;
 use crate::error::{IoError, IoResult};
 use coree_core::{
     Affine2D, BlendMode, Color, ColorMode, ColorSwatch, Document, Fill, MasterLayerScope,
-    NodePayload, ObjectId, OutlineStyle, PixelDepth, RasterAsset, RasterLayerData, SceneObject,
-    RASTER_TILE_DIM,
+    NodePayload, ObjectId, OutlineStyle, PixelDepth, RasterAsset, RasterFilter, RasterLayerData,
+    SceneObject, RASTER_TILE_DIM,
 };
-use coree_render::{render_isolated_object_to_rgba, render_page_to_rgba, ViewMode};
+use coree_render::{
+    apply_raster_filters, render_isolated_object_to_rgba, render_page_to_rgba, ViewMode,
+};
 use flate2::read::ZlibDecoder;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -590,7 +592,10 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
 
     enum ExportLayerSource {
         Empty,
-        Asset(coree_core::ImageAssetId),
+        Asset {
+            id: coree_core::ImageAssetId,
+            filters: Vec<RasterFilter>,
+        },
         Rendered {
             oid: ObjectId,
             cached_rgba: Option<Vec<u8>>,
@@ -699,7 +704,10 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                         ch_len_offsets: Vec::with_capacity(ch_ids.len()),
                         ch_written_lens: Vec::with_capacity(ch_ids.len()),
                         ch_ids,
-                        source: ExportLayerSource::Asset(r.asset_id),
+                        source: ExportLayerSource::Asset {
+                            id: r.asset_id,
+                            filters: r.filters.clone(),
+                        },
                     });
                 }
             }
@@ -888,11 +896,21 @@ fn export_psd_to_writer_with_options<W: Write + Seek>(
                         layer.ch_written_lens.push(2);
                     }
                 }
-                ExportLayerSource::Asset(aid) => {
-                    if let Some(asset) = doc.asset(*aid) {
+                ExportLayerSource::Asset { id, filters } => {
+                    if let Some(asset) = doc.asset(*id) {
+                        let filtered =
+                            (!filters.is_empty()).then(|| apply_raster_filters(asset, filters));
+                        let active_asset = filtered.as_ref().unwrap_or(asset);
                         for &cid in &layer.ch_ids {
                             let ch_start = writer.stream_position()?;
-                            write_asset_channel_rle(writer, asset, cid, depth, use_cmyk, is_psb)?;
+                            write_asset_channel_rle(
+                                writer,
+                                active_asset,
+                                cid,
+                                depth,
+                                use_cmyk,
+                                is_psb,
+                            )?;
                             let ch_end = writer.stream_position()?;
                             layer.ch_written_lens.push(ch_end - ch_start);
                         }
@@ -4019,5 +4037,106 @@ mod tests {
         assert_eq!(asset16[7], 0);
         assert_eq!(asset16[11], 0);
         assert!((i32::from(asset16[15]) - 16_384).abs() <= 1);
+    }
+
+    #[test]
+    fn psd_export_applies_raster_filters_for_8bit_and_16bit_layers() {
+        let filters = vec![
+            RasterFilter::ChannelMixer {
+                red: [0.0, 1.0, 0.0],
+                green: [1.0, 0.0, 0.0],
+                blue: [0.0, 0.0, 1.0],
+                monochrome: false,
+            },
+            RasterFilter::ToneCurve {
+                points: vec![(0.0, 0.0), (0.5, 0.85), (1.0, 1.0)],
+            },
+        ];
+
+        // 8-bit PSD export with filters vs unfiltered
+        let make_doc8 = |f: Vec<RasterFilter>| -> Document {
+            let mut doc = Document::new("PsdFx8", 20.0, 20.0, ColorMode::Rgb, 72.0);
+            let asset =
+                RasterAsset::new(8, 8, [220u8, 40, 20, 255].repeat(64), 72.0, ColorMode::Rgb)
+                    .unwrap();
+            let aid = doc.register_asset(asset);
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "LayerFx8",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid,
+                        width_mm: 10.0,
+                        height_mm: 10.0,
+                        crop_rect: None,
+                        filters: f,
+                    }),
+                ),
+                None,
+            )
+            .unwrap();
+            doc
+        };
+        let psd_id8 = export_psd_to_bytes(&make_doc8(Vec::new()), 0).unwrap();
+        let psd_fx8 = export_psd_to_bytes(&make_doc8(filters.clone()), 0).unwrap();
+        assert_ne!(
+            psd_id8, psd_fx8,
+            "filtered 8-bit PSD must differ from unfiltered PSD"
+        );
+        let back8 = import_psd_bytes(&psd_fx8, "Back8").unwrap();
+        let layer_aid8 = back8
+            .objects()
+            .values()
+            .find_map(|o| match &o.payload {
+                NodePayload::Raster(r) => Some(r.asset_id),
+                _ => None,
+            })
+            .expect("re-imported PSD must have a Raster layer");
+        let px8 = back8.asset(layer_aid8).unwrap().to_rgba8_vec();
+        assert_eq!(
+            &px8[0..4],
+            &[75, 249, 36, 255],
+            "8-bit PSD layer must contain filtered green pixels"
+        );
+
+        // 16-bit PSD export with filters preserves 16-bit depth and applies filters
+        let mut doc16 = Document::new("PsdFx16", 20.0, 20.0, ColorMode::Rgb, 72.0);
+        let rgba16 = [56540u16, 10280, 5140, 65535].repeat(64);
+        let asset16 = RasterAsset::new_16bit(8, 8, rgba16, 72.0, ColorMode::Rgb).unwrap();
+        let aid16 = doc16.register_asset(asset16);
+        doc16
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "LayerFx16",
+                    NodePayload::Raster(RasterLayerData {
+                        asset_id: aid16,
+                        width_mm: 10.0,
+                        height_mm: 10.0,
+                        crop_rect: None,
+                        filters,
+                    }),
+                ),
+                None,
+            )
+            .unwrap();
+        let psd_fx16 = export_psd_to_bytes(&doc16, 0).unwrap();
+        let back16 = import_psd_bytes(&psd_fx16, "Back16").unwrap();
+        let layer_aid16 = back16
+            .objects()
+            .values()
+            .find_map(|o| match &o.payload {
+                NodePayload::Raster(r) => Some(r.asset_id),
+                _ => None,
+            })
+            .expect("re-imported 16-bit PSD must have a Raster layer");
+        let back_asset16 = back16.asset(layer_aid16).unwrap();
+        assert_eq!(back_asset16.pixel_depth, PixelDepth::Bit16);
+        let px16 = back_asset16.to_rgba16_vec();
+        assert!(
+            px16[1] > 60_000 && px16[0] < 25_000 && px16[2] < 15_000,
+            "16-bit PSD layer must reflect green filtered pixels, got {:?}",
+            &px16[0..4]
+        );
     }
 }

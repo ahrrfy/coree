@@ -18,7 +18,6 @@ use coree_core::{
 use coree_render::{outline_arrowhead_geometries, ShapedPdfRun, TextEngine};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use kurbo::PathEl;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as IoWrite;
@@ -118,40 +117,166 @@ struct GStateKey {
     overprint: bool,
 }
 
+enum PdfObjectSink {
+    Memory(Vec<Vec<u8>>),
+    Streaming {
+        writer: std::io::BufWriter<std::fs::File>,
+        offsets: Vec<u64>, // 0-based index => obj_num = idx + 1; 0 = pending placeholder
+        byte_pos: u64,
+    },
+}
+
 struct PdfObjectStore {
-    objects: Vec<Vec<u8>>, // 1-based indexing via `index + 1`
+    sink: PdfObjectSink,
 }
 
 impl PdfObjectStore {
     fn new() -> Self {
         Self {
-            objects: Vec::new(),
+            sink: PdfObjectSink::Memory(Vec::new()),
         }
     }
 
+    fn new_streaming(path: &Path) -> IoResult<Self> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
+        writer.write_all(header)?;
+        Ok(Self {
+            sink: PdfObjectSink::Streaming {
+                writer,
+                offsets: Vec::with_capacity(1024),
+                byte_pos: header.len() as u64,
+            },
+        })
+    }
+
     fn alloc_placeholder(&mut self) -> usize {
-        self.objects.push(Vec::new());
-        self.objects.len()
+        match &mut self.sink {
+            PdfObjectSink::Memory(objs) => {
+                objs.push(Vec::new());
+                objs.len()
+            }
+            PdfObjectSink::Streaming { offsets, .. } => {
+                offsets.push(0);
+                offsets.len()
+            }
+        }
+    }
+
+    fn write_streaming_obj(
+        writer: &mut std::io::BufWriter<std::fs::File>,
+        offsets: &mut [u64],
+        byte_pos: &mut u64,
+        obj_num: usize,
+        body: &[u8],
+    ) -> IoResult<()> {
+        offsets[obj_num - 1] = *byte_pos;
+        let head = format!("{obj_num} 0 obj\n");
+        writer.write_all(head.as_bytes())?;
+        writer.write_all(body)?;
+        let trail: &[u8] = if body.ends_with(b"\n") {
+            b"endobj\n"
+        } else {
+            b"\nendobj\n"
+        };
+        writer.write_all(trail)?;
+        *byte_pos += (head.len() + body.len() + trail.len()) as u64;
+        Ok(())
     }
 
     fn add(&mut self, body: Vec<u8>) -> usize {
-        self.objects.push(body);
-        self.objects.len()
+        match &mut self.sink {
+            PdfObjectSink::Memory(objs) => {
+                objs.push(body);
+                objs.len()
+            }
+            PdfObjectSink::Streaming {
+                writer,
+                offsets,
+                byte_pos,
+            } => {
+                offsets.push(0);
+                let id = offsets.len();
+                let _ = Self::write_streaming_obj(writer, offsets, byte_pos, id, &body);
+                id
+            }
+        }
     }
 
     fn set(&mut self, id: usize, body: Vec<u8>) {
-        self.objects[id - 1] = body;
+        match &mut self.sink {
+            PdfObjectSink::Memory(objs) => {
+                objs[id - 1] = body;
+            }
+            PdfObjectSink::Streaming {
+                writer,
+                offsets,
+                byte_pos,
+            } => {
+                let _ = Self::write_streaming_obj(writer, offsets, byte_pos, id, &body);
+            }
+        }
+    }
+
+    fn finish_streaming(self, root_id: usize, info_id: usize, title: &str) -> IoResult<()> {
+        let PdfObjectSink::Streaming {
+            mut writer,
+            offsets,
+            byte_pos,
+        } = self.sink
+        else {
+            return Err(IoError::InvalidFormat {
+                format: "pdf".into(),
+                message: "finish_streaming called on in-memory store".into(),
+            });
+        };
+
+        let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
+        let mut h2 = 0x8422_2325_cbf2_9ce4_u64;
+        for b in title.as_bytes() {
+            h1 = (h1 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+            h2 = (h2 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h1 ^= byte_pos;
+        h2 ^= (offsets.len() + 1) as u64;
+        let file_id_hex = format!("{h1:016X}{h2:016X}");
+
+        let xref_offset = byte_pos;
+        let total = offsets.len() + 1;
+        writeln!(writer, "xref")?;
+        writeln!(writer, "0 {total}")?;
+        writer.write_all(b"0000000000 65535 f \n")?;
+        for &off in &offsets {
+            writeln!(writer, "{off:010} 00000 n ")?;
+        }
+        writeln!(writer, "trailer")?;
+        writeln!(
+            writer,
+            "<< /Size {total} /Root {root_id} 0 R /Info {info_id} 0 R /ID [<{file_id_hex}> <{file_id_hex}>] >>"
+        )?;
+        writeln!(writer, "startxref")?;
+        writeln!(writer, "{xref_offset}")?;
+        writer.write_all(b"%%EOF\n")?;
+        writer.flush()?;
+        Ok(())
     }
 
     fn serialize(self, root_id: usize, info_id: usize, title: &str) -> Vec<u8> {
+        let PdfObjectSink::Memory(objects) = self.sink else {
+            return Vec::new();
+        };
         let mut out = Vec::with_capacity(8192);
         // PDF 1.7 header + standard 4-byte binary comment
         out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
 
-        let mut offsets = Vec::with_capacity(self.objects.len() + 1);
+        let mut offsets = Vec::with_capacity(objects.len() + 1);
         offsets.push(0usize); // object 0 (free head)
 
-        for (idx, body) in self.objects.into_iter().enumerate() {
+        for (idx, body) in objects.into_iter().enumerate() {
             let obj_num = idx + 1;
             offsets.push(out.len());
             let _ = writeln!(out, "{obj_num} 0 obj");
@@ -355,6 +480,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         let mut emit_state = PdfPageEmit {
             store: &mut store,
             embedded_fonts: &embedded_fonts,
+            font_ptr_cache: font_registry.ptr_cache(),
             used_fonts: BTreeMap::new(),
             gstates: BTreeMap::new(),
             used_images: BTreeMap::new(),
@@ -604,6 +730,443 @@ pub fn export_pdf(doc: &Document, opts: &PdfExportOptions, path: &Path) -> IoRes
     atomic_write_bytes(path, &bytes)
 }
 
+/// Incremental, constant-memory PDF 1.7 writer for large variable-data merges (`10,000+` pages).
+///
+/// Reuses one `TextEngine`, one `PdfFontRegistry`, shared raster XObjects, and writes each page's
+/// `/FlateDecode` content stream and `/Page` dictionary directly to `BufWriter<File>` before
+/// emitting `/Type0` + `/ToUnicode` fonts, `/Pages`, `/Catalog`, and `xref` on [`Self::finish`].
+pub struct StreamingPdfDocument {
+    store: PdfObjectStore,
+    catalog_id: usize,
+    info_id: usize,
+    pages_root_id: usize,
+    shared_fonts_dict_id: usize,
+    opts: PdfExportOptions,
+    use_cmyk: bool,
+    use_icc_for_raster: bool,
+    doc_icc: coree_core::IccColorPipeline,
+    custom_icc: Option<Vec<u8>>,
+    title: String,
+    author: String,
+    text_engine: TextEngine,
+    font_registry: PdfFontRegistry,
+    embedded_fonts: std::collections::HashMap<FontFaceKey, EmbeddedPdfFont>,
+    image_xobjects: BTreeMap<coree_core::ImageAssetId, (String, usize)>,
+    spot_cache: BTreeMap<String, (String, usize)>,
+    dynamic_img_counter: usize,
+    any_transparency: bool,
+    page_obj_ids: Vec<usize>,
+    deflater: flate2::Compress,
+    stream_buf: String,
+    comp_buf: Vec<u8>,
+}
+
+impl StreamingPdfDocument {
+    /// Initializes a streaming PDF file at `path` from `template_doc`'s metadata, ICC pipeline,
+    /// and static raster assets.
+    pub fn create(template_doc: &Document, opts: &PdfExportOptions, path: &Path) -> IoResult<Self> {
+        let mut store = PdfObjectStore::new_streaming(path)?;
+        let catalog_id = store.alloc_placeholder(); // 1
+        let info_id = store.alloc_placeholder(); // 2
+        let pages_root_id = store.alloc_placeholder(); // 3
+        let shared_fonts_dict_id = store.alloc_placeholder(); // 4
+
+        let use_cmyk = match opts.color_space {
+            PdfColorSpace::DeviceCmyk => true,
+            PdfColorSpace::DeviceRgb => false,
+            PdfColorSpace::DocumentDefault => template_doc.color_mode() == ColorMode::Cmyk,
+        };
+        let doc_icc = template_doc.icc_pipeline();
+        let use_icc_for_raster = use_cmyk
+            && (template_doc.cmyk_icc_profile().is_some()
+                || template_doc.custom_icc_profile().is_some());
+
+        let mut image_xobjects = BTreeMap::new();
+        for (img_idx, (&asset_id, asset)) in template_doc.assets().iter().enumerate() {
+            let name = format!("Im{}", img_idx + 1);
+            let xobj_id = add_raster_xobject(
+                &mut store,
+                asset,
+                use_cmyk,
+                use_icc_for_raster.then_some(&doc_icc),
+            )?;
+            image_xobjects.insert(asset_id, (name, xobj_id));
+        }
+
+        let dynamic_img_counter = image_xobjects.len();
+        Ok(Self {
+            store,
+            catalog_id,
+            info_id,
+            pages_root_id,
+            shared_fonts_dict_id,
+            opts: opts.clone(),
+            use_cmyk,
+            use_icc_for_raster,
+            doc_icc,
+            custom_icc: template_doc.custom_icc_profile().map(|b| b.to_vec()),
+            title: template_doc.title().to_owned(),
+            author: template_doc.metadata().author.clone(),
+            text_engine: TextEngine::new(),
+            font_registry: PdfFontRegistry::new(),
+            embedded_fonts: std::collections::HashMap::new(),
+            image_xobjects,
+            spot_cache: BTreeMap::new(),
+            dynamic_img_counter,
+            any_transparency: false,
+            page_obj_ids: Vec::new(),
+            deflater: flate2::Compress::new(Compression::fast(), true),
+            stream_buf: String::with_capacity(8192),
+            comp_buf: Vec::with_capacity(8192),
+        })
+    }
+
+    /// Renders `page_index` of `page_doc` and flushes its PDF page objects straight to disk.
+    pub fn push_page(&mut self, page_doc: &Document, page_index: usize) -> IoResult<()> {
+        let dl_opts = DisplayListOptions::pdf();
+        let dl = ExportDisplayList::build(page_doc, page_index, &dl_opts, &mut self.text_engine)?;
+        for op in &dl.ops {
+            if let DisplayOp::DrawTextRuns { shaped_runs, .. } = op {
+                for r in shaped_runs {
+                    self.font_registry
+                        .register_run_identity(r, &mut self.embedded_fonts);
+                }
+            }
+        }
+        if dl.has_transparency {
+            self.any_transparency = true;
+        }
+
+        let page = &page_doc.pages()[page_index];
+        let bleed_mm = if self.opts.include_bleed && page.bleed_mm.is_finite() {
+            page.bleed_mm.max(0.0)
+        } else {
+            0.0
+        };
+        let has_marks = self.opts.crop_marks
+            || self.opts.registration_marks
+            || self.opts.color_calibration_bars
+            || self.opts.page_info_slug;
+        let margin_mm = if has_marks { bleed_mm + 12.0 } else { bleed_mm };
+
+        let media_w_pt = (page.width_mm + 2.0 * margin_mm) * MM_TO_PT;
+        let media_h_pt = (page.height_mm + 2.0 * margin_mm) * MM_TO_PT;
+        let trim_x0 = margin_mm * MM_TO_PT;
+        let trim_y0 = margin_mm * MM_TO_PT;
+        let trim_x1 = (margin_mm + page.width_mm) * MM_TO_PT;
+        let trim_y1 = (margin_mm + page.height_mm) * MM_TO_PT;
+        let bleed_x0 = (margin_mm - bleed_mm) * MM_TO_PT;
+        let bleed_y0 = (margin_mm - bleed_mm) * MM_TO_PT;
+        let bleed_x1 = (margin_mm + page.width_mm + bleed_mm) * MM_TO_PT;
+        let bleed_y1 = (margin_mm + page.height_mm + bleed_mm) * MM_TO_PT;
+
+        let slug_layout = if self.opts.page_info_slug {
+            let mode_str = if self.use_cmyk {
+                "DeviceCMYK"
+            } else {
+                "DeviceRGB"
+            };
+            let slug = format!(
+                "Page {} ({}) | {:.1}x{:.1}mm | Bleed {:.1}mm | {mode_str} | coree",
+                self.page_obj_ids.len() + 1,
+                page.name,
+                page.width_mm,
+                page.height_mm,
+                bleed_mm
+            );
+            let slug_color = if self.use_cmyk {
+                Color::cmyk(0.0, 0.0, 0.0, 1.0)
+            } else {
+                Color::BLACK
+            };
+            let at = coree_core::ArtisticText::from_plain(
+                slug,
+                coree_core::TextStyle {
+                    font_size_pt: 6.0,
+                    fill: slug_color,
+                    ..coree_core::TextStyle::default()
+                },
+            );
+            let (s_runs, s_curves) = self.text_engine.layout_artistic_pdf_runs(&at);
+            for r in &s_runs {
+                self.font_registry
+                    .register_run_identity(r, &mut self.embedded_fonts);
+            }
+            Some((s_runs, s_curves))
+        } else {
+            None
+        };
+
+        let mut emit_state = PdfPageEmit {
+            store: &mut self.store,
+            embedded_fonts: &self.embedded_fonts,
+            font_ptr_cache: self.font_registry.ptr_cache(),
+            used_fonts: BTreeMap::new(),
+            gstates: BTreeMap::new(),
+            used_images: BTreeMap::new(),
+            shadings: BTreeMap::new(),
+            used_spots: BTreeMap::new(),
+            spot_cache: &mut self.spot_cache,
+            dynamic_img_counter: &mut self.dynamic_img_counter,
+            use_icc_for_raster: self.use_icc_for_raster,
+            doc_icc: &self.doc_icc,
+        };
+        let mut stream = std::mem::take(&mut self.stream_buf);
+        stream.clear();
+        let ctx = PageRenderCtx {
+            page,
+            margin_mm,
+            use_cmyk: self.use_cmyk,
+            image_xobjects: &self.image_xobjects,
+        };
+
+        let _ = writeln!(
+            stream,
+            "q\n{bleed_x0:.4} {bleed_y0:.4} {:.4} {:.4} re W n",
+            bleed_x1 - bleed_x0,
+            bleed_y1 - bleed_y0
+        );
+        for op in &dl.ops {
+            emit_display_op(&ctx, op, &mut emit_state, &mut stream);
+        }
+        stream.push_str("Q\n");
+
+        if has_marks {
+            emit_print_marks(
+                &ctx,
+                &mut stream,
+                page,
+                margin_mm,
+                bleed_mm,
+                self.use_cmyk,
+                &self.opts,
+                slug_layout.as_ref(),
+                &mut emit_state,
+            );
+        }
+
+        let gstates = emit_state.gstates;
+        let used_images = emit_state.used_images;
+        let page_shadings = emit_state.shadings;
+        let page_spots = emit_state.used_spots;
+        let has_fonts = !emit_state.used_fonts.is_empty();
+
+        let mut gstate_refs = String::new();
+        for (key, gs_name) in &gstates {
+            let mut dict = format!(
+                "<< /Type /ExtGState /ca {:.4} /CA {:.4} /BM /{}",
+                f64::from(key.fill_alpha_milli) / 1000.0,
+                f64::from(key.stroke_alpha_milli) / 1000.0,
+                key.blend_mode
+            );
+            if key.overprint {
+                dict.push_str(" /OP true /op true /OPM 1");
+            }
+            dict.push_str(" >>");
+            let gs_id = self.store.add(dict.into_bytes());
+            let _ = write!(gstate_refs, " /{gs_name} {gs_id} 0 R");
+        }
+
+        let mut xobj_refs = String::new();
+        for (im_name, im_id) in &used_images {
+            let _ = write!(xobj_refs, " /{im_name} {im_id} 0 R");
+        }
+        let mut shading_refs = String::new();
+        for (sh_name, sh_id) in &page_shadings {
+            let _ = write!(shading_refs, " /{sh_name} {sh_id} 0 R");
+        }
+        let mut colorspace_refs = String::new();
+        for (cs_name, cs_id) in &page_spots {
+            let _ = write!(colorspace_refs, " /{cs_name} {cs_id} 0 R");
+        }
+
+        let content_obj_bytes = if self.opts.compress_streams {
+            compress_zlib_reusable(&mut self.deflater, stream.as_bytes(), &mut self.comp_buf)
+                .map_err(|e| IoError::InvalidFormat {
+                    format: "pdf".into(),
+                    message: format!("zlib compression failed: {e}"),
+                })?;
+            let mut buf = Vec::with_capacity(self.comp_buf.len() + 64);
+            let _ = write!(
+                buf,
+                "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                self.comp_buf.len()
+            );
+            buf.extend_from_slice(&self.comp_buf);
+            buf.extend_from_slice(b"\nendstream");
+            buf
+        } else {
+            let raw = stream.as_bytes();
+            let mut buf = Vec::with_capacity(raw.len() + 64);
+            let _ = write!(buf, "<< /Length {} >>\nstream\n", raw.len());
+            buf.extend_from_slice(raw);
+            buf.extend_from_slice(b"\nendstream");
+            buf
+        };
+        self.stream_buf = stream;
+        let content_id = self.store.add(content_obj_bytes);
+
+        let mut resources = String::from("<<");
+        if has_fonts {
+            let _ = write!(resources, " /Font {} 0 R", self.shared_fonts_dict_id);
+        }
+        if !gstate_refs.is_empty() {
+            let _ = write!(resources, " /ExtGState <<{gstate_refs} >>");
+        }
+        if !xobj_refs.is_empty() {
+            let _ = write!(resources, " /XObject <<{xobj_refs} >>");
+        }
+        if !shading_refs.is_empty() {
+            let _ = write!(resources, " /Shading <<{shading_refs} >>");
+        }
+        if !colorspace_refs.is_empty() {
+            let _ = write!(resources, " /ColorSpace <<{colorspace_refs} >>");
+        }
+        resources.push_str(" >>");
+
+        let group_entry = if dl.has_transparency {
+            let grp_cs = if self.use_cmyk {
+                "/DeviceCMYK"
+            } else {
+                "/DeviceRGB"
+            };
+            format!(" /Group << /S /Transparency /CS {grp_cs} /I true >>")
+        } else {
+            String::new()
+        };
+
+        let page_dict = format!(
+            "<< /Type /Page /Parent {} 0 R \
+             /MediaBox [0 0 {media_w_pt:.4} {media_h_pt:.4}] \
+             /TrimBox [{trim_x0:.4} {trim_y0:.4} {trim_x1:.4} {trim_y1:.4}] \
+             /BleedBox [{bleed_x0:.4} {bleed_y0:.4} {bleed_x1:.4} {bleed_y1:.4}]{group_entry} \
+             /Resources {resources} \
+             /Contents {content_id} 0 R >>",
+            self.pages_root_id
+        );
+        let page_obj_id = self.store.add(page_dict.into_bytes());
+        self.page_obj_ids.push(page_obj_id);
+        Ok(())
+    }
+
+    /// Finalizes shared `/Type0` fonts, `/Pages`, `/Catalog`, `/Info`, and `xref` trailer to disk.
+    pub fn finish(mut self) -> IoResult<()> {
+        let font_entries = self
+            .font_registry
+            .emit_all_identity(&mut |bytes| self.store.add(bytes))?;
+        let mut shared_font_dict = String::from("<<");
+        for (res_name, obj_id) in font_entries {
+            let _ = write!(shared_font_dict, " /{res_name} {obj_id} 0 R");
+        }
+        shared_font_dict.push_str(" >>");
+        self.store
+            .set(self.shared_fonts_dict_id, shared_font_dict.into_bytes());
+
+        let kids: Vec<String> = self
+            .page_obj_ids
+            .iter()
+            .map(|id| format!("{id} 0 R"))
+            .collect();
+        let pages_dict = format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            self.page_obj_ids.len()
+        );
+        self.store.set(self.pages_root_id, pages_dict.into_bytes());
+
+        let raw_icc = if let Some(bytes) = self.custom_icc.as_deref() {
+            bytes.to_vec()
+        } else if self.use_cmyk {
+            generate_minimal_cmyk_icc_v2(
+                "ISO Coated v2 CMYK (coree Clean-Room)",
+                BuiltinIccProfile::IsoCoatedV2Cmyk,
+            )
+        } else {
+            generate_minimal_srgb_icc_v2("sRGB IEC61966-2.1 (coree Clean-Room)")
+        };
+        let parsed_icc = IccProfile::from_bytes(&raw_icc).ok();
+        let icc_n = parsed_icc
+            .as_ref()
+            .map_or(if self.use_cmyk { 4 } else { 3 }, |p| {
+                p.header.color_space.channel_count().clamp(1, 4)
+            });
+        let icc_info = parsed_icc
+            .as_ref()
+            .map(|p| p.description.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if self.use_cmyk {
+                    "ISO Coated v2 CMYK".to_owned()
+                } else {
+                    "sRGB IEC61966-2.1".to_owned()
+                }
+            });
+        let icc_cond = if icc_n == 4 { "FOGRA39" } else { "sRGB" };
+
+        let mut enc_icc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        let icc_obj_bytes = if enc_icc.write_all(&raw_icc).is_ok() {
+            let compressed_icc = enc_icc.finish().unwrap_or_default();
+            let mut buf = format!(
+                "<< /N {icc_n} /Length {} /Filter /FlateDecode >>\nstream\n",
+                compressed_icc.len()
+            )
+            .into_bytes();
+            buf.extend_from_slice(&compressed_icc);
+            buf.extend_from_slice(b"\nendstream");
+            buf
+        } else {
+            let mut buf =
+                format!("<< /N {icc_n} /Length {} >>\nstream\n", raw_icc.len()).into_bytes();
+            buf.extend_from_slice(&raw_icc);
+            buf.extend_from_slice(b"\nendstream");
+            buf
+        };
+        let icc_stream_id = self.store.add(icc_obj_bytes);
+        let oi_dict = format!(
+            "<< /Type /OutputIntent /S /GTS_PDFX /OutputConditionIdentifier ({cond}) /Info ({info}) /RegistryName (http://www.color.org) /DestOutputProfile {icc_stream_id} 0 R >>",
+            cond = escape_pdf_string(icc_cond),
+            info = escape_pdf_string(&icc_info),
+        );
+        let output_intent_id = self.store.add(oi_dict.into_bytes());
+
+        let catalog_dict = format!(
+            "<< /Type /Catalog /Pages {} 0 R /OutputIntents [{output_intent_id} 0 R] >>",
+            self.pages_root_id
+        );
+        self.store.set(self.catalog_id, catalog_dict.into_bytes());
+
+        let resolved_pdfx = match self.opts.pdfx_conformance {
+            PdfXConformance::Auto => {
+                if self.use_cmyk && !self.any_transparency {
+                    PdfXConformance::PdfX1a2001
+                } else {
+                    PdfXConformance::PdfX4
+                }
+            }
+            other => other,
+        };
+        let now_pdf = chrono::Utc::now().format("D:%Y%m%d%H%M%SZ").to_string();
+        let pdfx_meta = match resolved_pdfx {
+            PdfXConformance::PdfX1a2001 => {
+                " /GTS_PDFXVersion (PDF/X-1a:2001) /GTS_PDFXConformance (PDF/X-1a:2001) /Trapped /False"
+            }
+            PdfXConformance::PdfX4 => {
+                " /GTS_PDFXVersion (PDF/X-4) /GTS_PDFXConformance (PDF/X-4) /Trapped /False"
+            }
+            PdfXConformance::Auto | PdfXConformance::None => "",
+        };
+        let info_dict = format!(
+            "<< /Title ({}) /Author ({}) /Creator (coree) /Producer (coree-io Streaming PDF/X Writer) /CreationDate ({now_pdf}) /ModDate ({now_pdf}){pdfx_meta} >>",
+            escape_pdf_string(&self.title),
+            escape_pdf_string(&self.author)
+        );
+        self.store.set(self.info_id, info_dict.into_bytes());
+
+        self.store
+            .finish_streaming(self.catalog_id, self.info_id, &self.title)
+    }
+}
+
 struct PageRenderCtx<'a> {
     page: &'a Page,
     margin_mm: f64,
@@ -622,6 +1185,7 @@ impl PageRenderCtx<'_> {
 struct PdfPageEmit<'a> {
     store: &'a mut PdfObjectStore,
     embedded_fonts: &'a std::collections::HashMap<FontFaceKey, EmbeddedPdfFont>,
+    font_ptr_cache: &'a std::collections::HashMap<(usize, usize, u32), FontFaceKey>,
     used_fonts: BTreeMap<String, usize>,
     gstates: BTreeMap<GStateKey, String>,
     used_images: BTreeMap<String, usize>,
@@ -807,7 +1371,16 @@ fn emit_pdf_embedded_run(
     if run.glyphs.is_empty() || !world_xf.is_finite() {
         return true;
     }
-    let key = FontFaceKey::new(&run.font_bytes, run.face_index);
+    let ptr_key = (
+        std::sync::Arc::as_ptr(&run.font_bytes).cast::<u8>() as usize,
+        run.font_bytes.len(),
+        run.face_index,
+    );
+    let key = emit
+        .font_ptr_cache
+        .get(&ptr_key)
+        .copied()
+        .unwrap_or_else(|| FontFaceKey::new(&run.font_bytes, run.face_index));
     let Some(emb) = emit.embedded_fonts.get(&key) else {
         return false;
     };
@@ -1324,44 +1897,144 @@ fn emit_pdf_shaped_pieces(
     }
 }
 
+fn compress_zlib_reusable(
+    deflater: &mut flate2::Compress,
+    input: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), flate2::CompressError> {
+    deflater.reset();
+    out.clear();
+    out.reserve(input.len() / 2 + 64);
+    let mut in_off = 0usize;
+    loop {
+        let before_in = deflater.total_in() as usize;
+        let flush = if in_off >= input.len() {
+            flate2::FlushCompress::Finish
+        } else {
+            flate2::FlushCompress::None
+        };
+        let prev_len = out.len();
+        if out.capacity() == prev_len {
+            out.reserve(4096);
+        }
+        let status = deflater.compress_vec(&input[in_off..], out, flush)?;
+        let consumed = (deflater.total_in() as usize).saturating_sub(before_in);
+        in_off += consumed;
+        if status == flate2::Status::StreamEnd {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn push_pdf_f4(out: &mut String, val: f64) {
+    if !val.is_finite() {
+        out.push_str("0.0000");
+        return;
+    }
+    let scaled = (val * 10_000.0).round();
+    if scaled.abs() > 9.0e14 {
+        let _ = write!(out, "{val:.4}");
+        return;
+    }
+    let iv = scaled as i64;
+    if iv == 0 {
+        out.push_str("0.0000");
+        return;
+    }
+    let abs_v = iv.unsigned_abs();
+    if iv < 0 {
+        out.push('-');
+    }
+    let whole = abs_v / 10_000;
+    let frac = (abs_v % 10_000) as u32;
+    let mut digits = [b'0'; 24];
+    let mut i = digits.len();
+    let mut n = whole;
+    if n == 0 {
+        i -= 1;
+        digits[i] = b'0';
+    } else {
+        while n > 0 {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    for &b in &digits[i..] {
+        out.push(b as char);
+    }
+    out.push('.');
+    out.push((b'0' + ((frac / 1000) % 10) as u8) as char);
+    out.push((b'0' + ((frac / 100) % 10) as u8) as char);
+    out.push((b'0' + ((frac / 10) % 10) as u8) as char);
+    out.push((b'0' + (frac % 10) as u8) as char);
+}
+
 fn emit_pdf_path_ops(ctx: &PageRenderCtx<'_>, path: &BezierPath, out: &mut String) {
-    let kb = path.to_kurbo();
-    let mut cur = kurbo::Point::ZERO;
-    let mut subpath_start = kurbo::Point::ZERO;
     let pt_ok = |p: kurbo::Point| p.x.is_finite() && p.y.is_finite();
-    for el in kb.elements() {
-        match *el {
-            PathEl::MoveTo(p) if pt_ok(p) => {
-                cur = p;
-                subpath_start = p;
-                let (x, y) = ctx.to_pdf_pt(Point2D::from_kurbo(p));
-                let _ = writeln!(out, "{x:.4} {y:.4} m");
+    for sp in &path.subpaths {
+        if sp.nodes.is_empty() || !sp.nodes[0].pos.is_finite() {
+            continue;
+        }
+        let (x0, y0) = ctx.to_pdf_pt(sp.nodes[0].pos);
+        push_pdf_f4(out, x0);
+        out.push(' ');
+        push_pdf_f4(out, y0);
+        out.push_str(" m\n");
+        let seg_count = sp.segment_count();
+        for s in 0..seg_count {
+            if let Some(seg) = sp.segment_to_kurbo(s) {
+                match seg {
+                    kurbo::PathSeg::Line(l) if pt_ok(l.p1) => {
+                        let (bx, by) = ctx.to_pdf_pt(Point2D::from_kurbo(l.p1));
+                        push_pdf_f4(out, bx);
+                        out.push(' ');
+                        push_pdf_f4(out, by);
+                        out.push_str(" l\n");
+                    }
+                    kurbo::PathSeg::Quad(q) if pt_ok(q.p0) && pt_ok(q.p1) && pt_ok(q.p2) => {
+                        let c = q.raise();
+                        let (x1, y1) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p1));
+                        let (x2, y2) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p2));
+                        let (x3, y3) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p3));
+                        push_pdf_f4(out, x1);
+                        out.push(' ');
+                        push_pdf_f4(out, y1);
+                        out.push(' ');
+                        push_pdf_f4(out, x2);
+                        out.push(' ');
+                        push_pdf_f4(out, y2);
+                        out.push(' ');
+                        push_pdf_f4(out, x3);
+                        out.push(' ');
+                        push_pdf_f4(out, y3);
+                        out.push_str(" c\n");
+                    }
+                    kurbo::PathSeg::Cubic(c) if pt_ok(c.p1) && pt_ok(c.p2) && pt_ok(c.p3) => {
+                        let (x1, y1) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p1));
+                        let (x2, y2) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p2));
+                        let (x3, y3) = ctx.to_pdf_pt(Point2D::from_kurbo(c.p3));
+                        push_pdf_f4(out, x1);
+                        out.push(' ');
+                        push_pdf_f4(out, y1);
+                        out.push(' ');
+                        push_pdf_f4(out, x2);
+                        out.push(' ');
+                        push_pdf_f4(out, y2);
+                        out.push(' ');
+                        push_pdf_f4(out, x3);
+                        out.push(' ');
+                        push_pdf_f4(out, y3);
+                        out.push_str(" c\n");
+                    }
+                    _ => {}
+                }
             }
-            PathEl::LineTo(p) if pt_ok(p) => {
-                cur = p;
-                let (x, y) = ctx.to_pdf_pt(Point2D::from_kurbo(p));
-                let _ = writeln!(out, "{x:.4} {y:.4} l");
-            }
-            PathEl::QuadTo(p1, p2) if pt_ok(cur) && pt_ok(p1) && pt_ok(p2) => {
-                let cubic = kurbo::QuadBez::new(cur, p1, p2).raise();
-                cur = p2;
-                let (x1, y1) = ctx.to_pdf_pt(Point2D::from_kurbo(cubic.p1));
-                let (x2, y2) = ctx.to_pdf_pt(Point2D::from_kurbo(cubic.p2));
-                let (x3, y3) = ctx.to_pdf_pt(Point2D::from_kurbo(cubic.p3));
-                let _ = writeln!(out, "{x1:.4} {y1:.4} {x2:.4} {y2:.4} {x3:.4} {y3:.4} c");
-            }
-            PathEl::CurveTo(p1, p2, p3) if pt_ok(p1) && pt_ok(p2) && pt_ok(p3) => {
-                cur = p3;
-                let (x1, y1) = ctx.to_pdf_pt(Point2D::from_kurbo(p1));
-                let (x2, y2) = ctx.to_pdf_pt(Point2D::from_kurbo(p2));
-                let (x3, y3) = ctx.to_pdf_pt(Point2D::from_kurbo(p3));
-                let _ = writeln!(out, "{x1:.4} {y1:.4} {x2:.4} {y2:.4} {x3:.4} {y3:.4} c");
-            }
-            PathEl::ClosePath => {
-                cur = subpath_start;
-                out.push_str("h\n");
-            }
-            _ => {}
+        }
+        if sp.closed {
+            out.push_str("h\n");
         }
     }
 }

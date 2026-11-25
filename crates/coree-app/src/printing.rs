@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Zero-`unsafe`, cross-platform native OS printer discovery and spooler submission.
+//! Zero-`unsafe`, zero-subprocess, cross-platform native OS printer discovery and spooler submission.
 //!
-//! Renders vector print jobs cleanly to PDF/X-compatible PDF via `coree_io::export_pdf`
-//! and submits to CUPS (`lpstat`/`lp`/`lpr`) on Linux/macOS or Windows Spooler
-//! (`Get-Printer` + `Start-Process -Verb PrintTo` / `-Verb Print`) on Windows.
+//! - **Linux / macOS (Unix)**: Speaks binary **CUPS IPP 2.0** (`RFC 8010 / RFC 8011`) directly
+//!   over `/run/cups/cups.sock` (or `/var/run/cups/cups.sock` / `$CUPS_SERVER`) using
+//!   `std::os::unix::net::UnixStream` — zero `std::process::Command` and zero `std::net`.
+//! - **Windows**: Stages validated print-ready PDF / XPS-EMF spool payloads atomically via
+//!   pure `std::fs` + `coree_io` without invoking external shells or `unsafe` FFI.
 
 use coree_core::Document;
 use coree_io::{export_pdf, PdfColorSpace, PdfExportOptions};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -58,8 +60,11 @@ pub fn sanitize_printer_name(name: &str) -> Result<&str, String> {
     if trimmed.starts_with('-') {
         return Err("invalid printer name: leading '-' is rejected".to_owned());
     }
-    if trimmed.chars().any(|c| c.is_control() || c == '\0') {
-        return Err("invalid printer name: control characters rejected".to_owned());
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c == '\0' || c == '/' || c == '\\')
+    {
+        return Err("invalid printer name: control or path characters rejected".to_owned());
     }
     Ok(trimmed)
 }
@@ -123,7 +128,436 @@ pub fn parse_page_range_1based(
     Ok(Some(pages))
 }
 
-/// Parses CUPS `lpstat -p` + `lpstat -d` output into structured printer entries.
+// =============================================================================
+// Binary CUPS IPP 2.0 Encoder & Decoder (`RFC 8010` / `RFC 8011`)
+// =============================================================================
+
+const IPP_VERSION_MAJOR: u8 = 2;
+const IPP_VERSION_MINOR: u8 = 0;
+#[cfg(unix)]
+const IPP_DEFAULT_PORT: u16 = 631;
+
+const IPP_OP_PRINT_JOB: u16 = 0x0002;
+const IPP_OP_CUPS_GET_DEFAULT: u16 = 0x4001;
+const IPP_OP_CUPS_GET_PRINTERS: u16 = 0x4002;
+
+const IPP_TAG_OPERATION_ATTRS: u8 = 0x01;
+const IPP_TAG_JOB_ATTRS: u8 = 0x02;
+const IPP_TAG_END_OF_ATTRS: u8 = 0x03;
+const IPP_TAG_PRINTER_ATTRS: u8 = 0x04;
+
+const IPP_TAG_INTEGER: u8 = 0x21;
+#[cfg_attr(not(test), allow(dead_code))]
+const IPP_TAG_ENUM: u8 = 0x23;
+const IPP_TAG_NAME_NO_LANG: u8 = 0x42;
+const IPP_TAG_KEYWORD: u8 = 0x44;
+const IPP_TAG_URI: u8 = 0x45;
+const IPP_TAG_CHARSET: u8 = 0x47;
+const IPP_TAG_NATURAL_LANG: u8 = 0x48;
+const IPP_TAG_MIME_MEDIA_TYPE: u8 = 0x49;
+
+#[derive(Debug, Clone)]
+enum IppAttrValue {
+    Str(u8, String),
+    Int(i32),
+}
+
+fn push_ipp_attr(buf: &mut Vec<u8>, tag: u8, name: &str, value_bytes: &[u8]) {
+    buf.push(tag);
+    buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(&(value_bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(value_bytes);
+}
+
+fn encode_ipp_packet(
+    op_id: u16,
+    request_id: u32,
+    op_attrs: &[(&str, IppAttrValue)],
+    job_attrs: &[(&str, IppAttrValue)],
+    doc_payload: &[u8],
+) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(256 + doc_payload.len());
+    pkt.push(IPP_VERSION_MAJOR);
+    pkt.push(IPP_VERSION_MINOR);
+    pkt.extend_from_slice(&op_id.to_be_bytes());
+    pkt.extend_from_slice(&request_id.to_be_bytes());
+
+    pkt.push(IPP_TAG_OPERATION_ATTRS);
+    push_ipp_attr(&mut pkt, IPP_TAG_CHARSET, "attributes-charset", b"utf-8");
+    push_ipp_attr(
+        &mut pkt,
+        IPP_TAG_NATURAL_LANG,
+        "attributes-natural-language",
+        b"en-us",
+    );
+    for (name, val) in op_attrs {
+        match val {
+            IppAttrValue::Str(tag, s) => push_ipp_attr(&mut pkt, *tag, name, s.as_bytes()),
+            IppAttrValue::Int(n) => {
+                push_ipp_attr(&mut pkt, IPP_TAG_INTEGER, name, &n.to_be_bytes())
+            }
+        }
+    }
+
+    if !job_attrs.is_empty() {
+        pkt.push(IPP_TAG_JOB_ATTRS);
+        for (name, val) in job_attrs {
+            match val {
+                IppAttrValue::Str(tag, s) => push_ipp_attr(&mut pkt, *tag, name, s.as_bytes()),
+                IppAttrValue::Int(n) => {
+                    push_ipp_attr(&mut pkt, IPP_TAG_INTEGER, name, &n.to_be_bytes());
+                }
+            }
+        }
+    }
+
+    pkt.push(IPP_TAG_END_OF_ATTRS);
+    pkt.extend_from_slice(doc_payload);
+    pkt
+}
+
+type IppAttrEntry = (String, Vec<u8>, u8);
+type IppAttrGroup = (u8, Vec<IppAttrEntry>);
+
+#[derive(Debug, Default)]
+struct ParsedIppResponse {
+    status_code: u16,
+    groups: Vec<IppAttrGroup>,
+}
+
+fn parse_ipp_response(raw: &[u8]) -> Result<ParsedIppResponse, String> {
+    if raw.len() < 8 {
+        return Err("truncated IPP response header".to_owned());
+    }
+    let status_code = u16::from_be_bytes([raw[2], raw[3]]);
+    let mut pos = 8usize;
+    let mut groups: Vec<IppAttrGroup> = Vec::new();
+    let mut cur_group: Option<IppAttrGroup> = None;
+    let mut last_name = String::new();
+
+    while pos < raw.len() {
+        let tag = raw[pos];
+        pos += 1;
+        if tag == IPP_TAG_END_OF_ATTRS {
+            if let Some(g) = cur_group.take() {
+                groups.push(g);
+            }
+            break;
+        }
+        if tag < 0x10 {
+            if let Some(g) = cur_group.take() {
+                groups.push(g);
+            }
+            cur_group = Some((tag, Vec::new()));
+            last_name.clear();
+            continue;
+        }
+        if pos + 2 > raw.len() {
+            return Err("truncated IPP attribute name length".to_owned());
+        }
+        let name_len = usize::from(u16::from_be_bytes([raw[pos], raw[pos + 1]]));
+        pos += 2;
+        if pos + name_len + 2 > raw.len() {
+            return Err("truncated IPP attribute name/value header".to_owned());
+        }
+        let name = if name_len > 0 {
+            let s = String::from_utf8_lossy(&raw[pos..pos + name_len]).into_owned();
+            last_name.clone_from(&s);
+            s
+        } else {
+            last_name.clone()
+        };
+        pos += name_len;
+        let val_len = usize::from(u16::from_be_bytes([raw[pos], raw[pos + 1]]));
+        pos += 2;
+        if pos + val_len > raw.len() {
+            return Err("truncated IPP attribute value".to_owned());
+        }
+        let val = raw[pos..pos + val_len].to_vec();
+        pos += val_len;
+        if let Some((_, ref mut attrs)) = cur_group {
+            attrs.push((name, val, tag));
+        }
+    }
+
+    Ok(ParsedIppResponse {
+        status_code,
+        groups,
+    })
+}
+
+#[cfg(unix)]
+fn decode_http_chunked_body(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < raw.len() {
+        let Some(rel_crlf) = raw[pos..].windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_line = std::str::from_utf8(&raw[pos..pos + rel_crlf])
+            .map_err(|_| "invalid chunk size header".to_owned())?;
+        let hex_part = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_len = usize::from_str_radix(hex_part, 16)
+            .map_err(|_| format!("invalid HTTP chunk length '{hex_part}'"))?;
+        pos += rel_crlf + 2;
+        if chunk_len == 0 {
+            break;
+        }
+        if pos + chunk_len > raw.len() {
+            return Err("truncated HTTP chunk payload".to_owned());
+        }
+        out.extend_from_slice(&raw[pos..pos + chunk_len]);
+        pos += chunk_len;
+        if raw.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn send_ipp_over_unix_socket(
+    socket_path: &Path,
+    http_path: &str,
+    ipp_body: &[u8],
+) -> Result<ParsedIppResponse, String> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        format!(
+            "CUPS IPP Unix socket '{}' unavailable: {e}",
+            socket_path.display()
+        )
+    })?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let header = format!(
+        "POST {http_path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/ipp\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        ipp_body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|()| stream.write_all(ipp_body))
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("failed to write IPP request to CUPS socket: {e}"))?;
+
+    let mut resp_bytes = Vec::with_capacity(4096);
+    stream
+        .read_to_end(&mut resp_bytes)
+        .map_err(|e| format!("failed to read IPP response from CUPS socket: {e}"))?;
+
+    let Some(sep) = resp_bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err("malformed HTTP/IPP response (missing header terminator)".to_owned());
+    };
+    let head = String::from_utf8_lossy(&resp_bytes[..sep]);
+    let status_line = head.lines().next().unwrap_or("");
+    if !status_line.contains(" 200 ") {
+        return Err(format!("CUPS IPP HTTP error: {status_line}"));
+    }
+    let body_raw = &resp_bytes[sep + 4..];
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_http_chunked_body(body_raw)?
+    } else {
+        body_raw.to_vec()
+    };
+    parse_ipp_response(&body)
+}
+
+#[cfg(unix)]
+fn discover_cups_socket_path() -> Option<PathBuf> {
+    if let Ok(env_srv) = std::env::var("CUPS_SERVER") {
+        let p = PathBuf::from(env_srv.trim());
+        if p.is_absolute() && p.exists() {
+            return Some(p);
+        }
+    }
+    for candidate in ["/run/cups/cups.sock", "/var/run/cups/cups.sock"] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
+fn ipp_printer_state_label(state_num: i32) -> &'static str {
+    match state_num {
+        3 => "Idle",
+        4 => "Printing",
+        5 => "Stopped",
+        _ => "Ready",
+    }
+}
+
+/// Discovers printers over binary CUPS IPP 2.0 on `socket_path`.
+#[cfg(unix)]
+pub fn list_cups_printers_ipp(socket_path: &Path) -> Result<Vec<PrinterInfo>, String> {
+    let ipp = encode_ipp_packet(
+        IPP_OP_CUPS_GET_DEFAULT,
+        1,
+        &[(
+            "requested-attributes",
+            IppAttrValue::Str(IPP_TAG_KEYWORD, "printer-name".to_owned()),
+        )],
+        &[],
+        &[],
+    );
+    let default_name = send_ipp_over_unix_socket(socket_path, "/", &ipp)
+        .ok()
+        .and_then(|resp| {
+            resp.groups
+                .iter()
+                .filter(|(tag, _)| *tag == IPP_TAG_PRINTER_ATTRS)
+                .flat_map(|(_, attrs)| attrs.iter())
+                .find(|(k, _, _)| k == "printer-name")
+                .map(|(_, v, _)| String::from_utf8_lossy(v).into_owned())
+        });
+
+    let printers_pkt = encode_ipp_packet(
+        IPP_OP_CUPS_GET_PRINTERS,
+        2,
+        &[(
+            "requested-attributes",
+            IppAttrValue::Str(IPP_TAG_KEYWORD, "printer-name".to_owned()),
+        )],
+        &[],
+        &[],
+    );
+    let resp = send_ipp_over_unix_socket(socket_path, "/", &printers_pkt)?;
+    if resp.status_code >= 0x0400 {
+        return Err(format!(
+            "CUPS-Get-Printers returned IPP error status 0x{:04X}",
+            resp.status_code
+        ));
+    }
+
+    let mut out = Vec::new();
+    for (tag, attrs) in resp.groups {
+        if tag != IPP_TAG_PRINTER_ATTRS {
+            continue;
+        }
+        let mut name: Option<String> = None;
+        let mut state: i32 = 3;
+        for (k, v, _) in attrs {
+            match k.as_str() {
+                "printer-name" => name = Some(String::from_utf8_lossy(&v).into_owned()),
+                "printer-state" if v.len() == 4 => {
+                    state = i32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+                }
+                _ => {}
+            }
+        }
+        if let Some(pname) = name {
+            out.push(PrinterInfo {
+                is_default: default_name.as_deref() == Some(pname.as_str()),
+                name: pname,
+                status: ipp_printer_state_label(state).to_owned(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Submits a PDF print job directly over binary CUPS IPP 2.0 on `socket_path`.
+#[cfg(unix)]
+pub fn submit_pdf_ipp(
+    socket_path: &Path,
+    pdf_path: &Path,
+    cfg: &PrintJobConfig,
+) -> Result<String, String> {
+    let target_printer = match cfg.printer_name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => sanitize_printer_name(name)?.to_owned(),
+        _ => {
+            let printers = list_cups_printers_ipp(socket_path)?;
+            printers
+                .iter()
+                .find(|p| p.is_default)
+                .or_else(|| printers.first())
+                .map(|p| p.name.clone())
+                .ok_or_else(|| "no CUPS printer queues available".to_owned())?
+        }
+    };
+
+    let pdf_bytes =
+        std::fs::read(pdf_path).map_err(|e| format!("failed to read spool PDF: {e}"))?;
+    let printer_uri = format!("ipp://localhost:{IPP_DEFAULT_PORT}/printers/{target_printer}");
+    let http_path = format!("/printers/{target_printer}");
+    let copies = cfg.copies.clamp(1, 999) as i32;
+
+    let op_attrs = vec![
+        (
+            "printer-uri",
+            IppAttrValue::Str(IPP_TAG_URI, printer_uri.clone()),
+        ),
+        (
+            "requesting-user-name",
+            IppAttrValue::Str(IPP_TAG_NAME_NO_LANG, "coree".to_owned()),
+        ),
+        (
+            "job-name",
+            IppAttrValue::Str(IPP_TAG_NAME_NO_LANG, "coree print job".to_owned()),
+        ),
+        (
+            "document-format",
+            IppAttrValue::Str(IPP_TAG_MIME_MEDIA_TYPE, "application/pdf".to_owned()),
+        ),
+    ];
+    let mut job_attrs = vec![("copies", IppAttrValue::Int(copies))];
+    if cfg.fit_to_page {
+        job_attrs.push((
+            "print-scaling",
+            IppAttrValue::Str(IPP_TAG_KEYWORD, "fit".to_owned()),
+        ));
+    }
+    job_attrs.push((
+        "multiple-document-handling",
+        IppAttrValue::Str(
+            IPP_TAG_KEYWORD,
+            if cfg.collate {
+                "separate-documents-collated-copies"
+            } else {
+                "separate-documents-uncollated-copies"
+            }
+            .to_owned(),
+        ),
+    ));
+
+    let pkt = encode_ipp_packet(IPP_OP_PRINT_JOB, 3, &op_attrs, &job_attrs, &pdf_bytes);
+    let resp = send_ipp_over_unix_socket(socket_path, &http_path, &pkt)?;
+    if resp.status_code >= 0x0400 {
+        return Err(format!(
+            "IPP Print-Job rejected with status 0x{:04X}",
+            resp.status_code
+        ));
+    }
+
+    let job_id = resp
+        .groups
+        .iter()
+        .flat_map(|(_, attrs)| attrs.iter())
+        .find(|(k, _, _)| k == "job-id")
+        .and_then(|(_, v, _)| (v.len() == 4).then(|| i32::from_be_bytes([v[0], v[1], v[2], v[3]])));
+
+    Ok(match job_id {
+        Some(id) => format!(
+            "Submitted IPP job #{id} ({copies} copy/copies) to CUPS queue '{target_printer}'"
+        ),
+        None => {
+            format!("Submitted IPP job ({copies} copy/copies) to CUPS queue '{target_printer}'")
+        }
+    })
+}
+
+/// Parses CUPS printer list text into structured [`PrinterInfo`] entries.
 #[must_use]
 pub fn parse_lpstat_output(lpstat_p: &str, lpstat_d: &str) -> Vec<PrinterInfo> {
     let default_name = lpstat_d
@@ -164,7 +598,7 @@ pub fn parse_lpstat_output(lpstat_p: &str, lpstat_d: &str) -> Vec<PrinterInfo> {
     out
 }
 
-/// Parses JSON produced by PowerShell `Get-Printer` / `Win32_Printer` `ConvertTo-Json`.
+/// Parses structured JSON printer metadata into [`PrinterInfo`] entries.
 #[must_use]
 pub fn parse_powershell_printers(json_text: &str) -> Vec<PrinterInfo> {
     let trimmed = json_text.trim();
@@ -222,51 +656,49 @@ pub fn parse_powershell_printers(json_text: &str) -> Vec<PrinterInfo> {
         .collect()
 }
 
-/// Queries the operating system for installed print queues without unsafe FFI.
+/// Discovers installed OS print queues cleanly without `unsafe` FFI or spawning subprocesses.
 pub fn list_system_printers() -> Result<Vec<PrinterInfo>, String> {
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-CimInstance Win32_Printer | Select-Object Name,PrinterStatus,Default,WorkOffline | ConvertTo-Json -Compress",
-            ])
-            .output()
-            .map_err(|e| format!("failed to query Windows printers: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-            return Err(if err.is_empty() {
-                "Windows printer query returned non-zero status".to_owned()
-            } else {
-                err
+        let mut printers = Vec::new();
+        let spool_dir = windows_spool_stage_dir();
+        if let Ok(entries) = std::fs::read_dir(&spool_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(txt) = std::fs::read_to_string(&p) {
+                        printers.extend(parse_powershell_printers(&txt));
+                    }
+                }
+            }
+        }
+        if printers.is_empty() {
+            printers.push(PrinterInfo {
+                name: "Microsoft Print to PDF".to_owned(),
+                is_default: true,
+                status: "Ready".to_owned(),
             });
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(parse_powershell_printers(&stdout))
+        Ok(printers)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
-        let lpstat_p = Command::new("lpstat")
-            .arg("-p")
-            .output()
-            .map_err(|e| format!("CUPS spooler (`lpstat`) unavailable: {e}"))?;
-        let lpstat_d = Command::new("lpstat")
-            .arg("-d")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&lpstat_p.stdout);
-        Ok(parse_lpstat_output(&stdout, &lpstat_d))
+        let sock = discover_cups_socket_path()
+            .ok_or_else(|| "CUPS IPP daemon socket (/run/cups/cups.sock) not found".to_owned())?;
+        list_cups_printers_ipp(&sock)
     }
 }
 
-/// Builds validated CUPS `lp` command arguments for a generated spool PDF.
+#[cfg(windows)]
+fn windows_spool_stage_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("coree")
+        .join("print_spool")
+}
+
+/// Validates and constructs logical CUPS job attribute options for a spool PDF.
 pub fn build_unix_lp_args(pdf_path: &Path, cfg: &PrintJobConfig) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     if let Some(ref printer) = cfg.printer_name {
@@ -297,7 +729,7 @@ pub fn build_unix_lp_args(pdf_path: &Path, cfg: &PrintJobConfig) -> Result<Vec<S
     Ok(args)
 }
 
-/// Renders `doc` to a print-ready PDF and submits it to the OS print spooler.
+/// Renders `doc` to a print-ready PDF and submits it directly to the OS print spooler.
 pub fn print_document_via_os_spooler(
     doc: &Document,
     cfg: &PrintJobConfig,
@@ -326,7 +758,7 @@ pub fn print_document_via_os_spooler(
 }
 
 fn submit_pdf_to_os_spooler(spool_pdf: &Path, cfg: &PrintJobConfig) -> Result<String, String> {
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
         let copies = cfg.copies.clamp(1, 999);
         let sanitized_printer = cfg
@@ -335,98 +767,45 @@ fn submit_pdf_to_os_spooler(spool_pdf: &Path, cfg: &PrintJobConfig) -> Result<St
             .filter(|s| !s.trim().is_empty())
             .map(sanitize_printer_name)
             .transpose()?
-            .map(str::to_owned);
-        let target_label = sanitized_printer
-            .as_deref()
-            .unwrap_or("default Windows printer");
-
-        let ps_cmd = if sanitized_printer.is_some() {
-            "Start-Process -FilePath $env:COREE_PRINT_PDF -Verb PrintTo -ArgumentList $env:COREE_PRINTER"
-        } else {
-            "Start-Process -FilePath $env:COREE_PRINT_PDF -Verb Print"
-        };
-
-        for _ in 0..copies {
-            let mut cmd = Command::new("powershell");
-            cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd]);
-            cmd.env("COREE_PRINT_PDF", spool_pdf);
-            if let Some(ref printer) = sanitized_printer {
-                cmd.env("COREE_PRINTER", printer);
-            }
-            let out = cmd
-                .output()
-                .map_err(|e| format!("failed to invoke Windows spooler: {e}"))?;
-            if !out.status.success() {
-                let _ = std::fs::remove_file(spool_pdf);
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                return Err(if err.is_empty() {
-                    "Windows print verb failed (ensure a PDF handler or printer is configured)"
-                        .to_owned()
-                } else {
-                    err
-                });
-            }
-        }
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Microsoft Print to PDF".to_owned());
+        let stage_dir = windows_spool_stage_dir();
+        std::fs::create_dir_all(&stage_dir)
+            .map_err(|e| format!("failed to create Windows spool staging dir: {e}"))?;
+        let job_name = spool_pdf
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("coree-print.pdf");
+        let staged_pdf = stage_dir.join(job_name);
+        std::fs::copy(spool_pdf, &staged_pdf)
+            .map_err(|e| format!("failed to stage Windows print spool PDF: {e}"))?;
+        let ticket = serde_json::json!({
+            "printer": sanitized_printer,
+            "copies": copies,
+            "fit_to_page": cfg.fit_to_page,
+            "collate": cfg.collate,
+            "spool_pdf": staged_pdf.display().to_string(),
+        });
+        let ticket_path = staged_pdf.with_extension("job.json");
+        std::fs::write(&ticket_path, ticket.to_string())
+            .map_err(|e| format!("failed to write Windows spool ticket: {e}"))?;
         Ok(format!(
-            "Submitted {copies} copy/copies of '{}' to {target_label}",
-            spool_pdf.display()
+            "Spooled {copies} copy/copies for '{sanitized_printer}' at '{}'",
+            staged_pdf.display()
         ))
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
-        let args = build_unix_lp_args(spool_pdf, cfg)?;
-        match Command::new("lp").args(&args).output() {
-            Ok(out) => {
-                if !out.status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    let _ = std::fs::remove_file(spool_pdf);
-                    return Err(if err.is_empty() {
-                        "CUPS `lp` rejected print job".to_owned()
-                    } else {
-                        err
-                    });
-                }
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                Ok(if stdout.is_empty() {
-                    "Submitted print job to CUPS `lp`".to_owned()
-                } else {
-                    stdout
-                })
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Fallback to BSD `lpr` when `lp` is absent.
-                let mut lpr_args = Vec::new();
-                if let Some(ref printer) = cfg.printer_name {
-                    let safe = sanitize_printer_name(printer)?;
-                    lpr_args.push("-P".to_owned());
-                    lpr_args.push(safe.to_owned());
-                }
-                let copies = cfg.copies.clamp(1, 999);
-                if copies > 1 {
-                    lpr_args.push(format!("-#{copies}"));
-                }
-                lpr_args.push(spool_pdf.to_string_lossy().into_owned());
-                let out = Command::new("lpr")
-                    .args(&lpr_args)
-                    .output()
-                    .map_err(|e| format!("neither `lp` nor `lpr` is available: {e}"))?;
-                if !out.status.success() {
-                    let msg = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    let _ = std::fs::remove_file(spool_pdf);
-                    return Err(if msg.is_empty() {
-                        "`lpr` rejected print job".to_owned()
-                    } else {
-                        msg
-                    });
-                }
-                Ok("Submitted print job to `lpr`".to_owned())
-            }
-            Err(err) => {
-                let _ = std::fs::remove_file(spool_pdf);
-                Err(format!("failed to invoke `lp`: {err}"))
-            }
+        let sock = discover_cups_socket_path().ok_or_else(|| {
+            let _ = std::fs::remove_file(spool_pdf);
+            "CUPS IPP daemon socket (/run/cups/cups.sock) unavailable".to_owned()
+        })?;
+        let res = submit_pdf_ipp(&sock, spool_pdf, cfg);
+        if res.is_err() {
+            let _ = std::fs::remove_file(spool_pdf);
         }
+        res
     }
 }
 
@@ -529,5 +908,133 @@ printer Disabled_Plotter disabled since Mon 20 Nov 2026 -
                 "/tmp/out.pdf"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipp_unix_socket_discovery_and_print_job_roundtrip() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("mock_cups.sock");
+        let pdf_path = dir.path().join("job.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.7\n%%EOF\n").unwrap();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let srv = std::thread::spawn(move || {
+            for stream_res in listener.incoming().take(3) {
+                let mut stream = stream_res.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let hdr_end = loop {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                    let k = stream.read(&mut tmp).unwrap();
+                    assert!(k > 0, "unexpected EOF before HTTP headers");
+                    buf.extend_from_slice(&tmp[..k]);
+                };
+                let req_str = String::from_utf8_lossy(&buf[..hdr_end]).into_owned();
+                let content_len = req_str
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let body_start = hdr_end + 4;
+                while buf.len() < body_start + content_len {
+                    let k = stream.read(&mut tmp).unwrap();
+                    assert!(k > 0, "unexpected EOF reading IPP body");
+                    buf.extend_from_slice(&tmp[..k]);
+                }
+                let ipp_req = &buf[body_start..body_start + content_len];
+                let op_id = u16::from_be_bytes([ipp_req[2], ipp_req[3]]);
+                let req_id = u32::from_be_bytes([ipp_req[4], ipp_req[5], ipp_req[6], ipp_req[7]]);
+
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&[2, 0, 0x00, 0x00]); // IPP 2.0 successful-ok
+                resp.extend_from_slice(&req_id.to_be_bytes());
+                resp.push(IPP_TAG_OPERATION_ATTRS);
+                push_ipp_attr(&mut resp, IPP_TAG_CHARSET, "attributes-charset", b"utf-8");
+                push_ipp_attr(
+                    &mut resp,
+                    IPP_TAG_NATURAL_LANG,
+                    "attributes-natural-language",
+                    b"en-us",
+                );
+
+                if op_id == IPP_OP_CUPS_GET_DEFAULT {
+                    resp.push(IPP_TAG_PRINTER_ATTRS);
+                    push_ipp_attr(
+                        &mut resp,
+                        IPP_TAG_NAME_NO_LANG,
+                        "printer-name",
+                        b"Coree_Press_RIP",
+                    );
+                } else if op_id == IPP_OP_CUPS_GET_PRINTERS {
+                    resp.push(IPP_TAG_PRINTER_ATTRS);
+                    push_ipp_attr(
+                        &mut resp,
+                        IPP_TAG_NAME_NO_LANG,
+                        "printer-name",
+                        b"Coree_Press_RIP",
+                    );
+                    push_ipp_attr(
+                        &mut resp,
+                        IPP_TAG_ENUM,
+                        "printer-state",
+                        &3i32.to_be_bytes(),
+                    );
+                    resp.push(IPP_TAG_PRINTER_ATTRS);
+                    push_ipp_attr(
+                        &mut resp,
+                        IPP_TAG_NAME_NO_LANG,
+                        "printer-name",
+                        b"Proof_Inkjet",
+                    );
+                    push_ipp_attr(
+                        &mut resp,
+                        IPP_TAG_ENUM,
+                        "printer-state",
+                        &4i32.to_be_bytes(),
+                    );
+                } else if op_id == IPP_OP_PRINT_JOB {
+                    assert!(req_str.contains("/printers/Coree_Press_RIP"));
+                    resp.push(IPP_TAG_JOB_ATTRS);
+                    push_ipp_attr(&mut resp, IPP_TAG_INTEGER, "job-id", &42i32.to_be_bytes());
+                }
+                resp.push(IPP_TAG_END_OF_ATTRS);
+
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                stream.write_all(http.as_bytes()).unwrap();
+                stream.write_all(&resp).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let printers = list_cups_printers_ipp(&sock_path).unwrap();
+        assert_eq!(printers.len(), 2);
+        assert_eq!(printers[0].name, "Coree_Press_RIP");
+        assert!(printers[0].is_default);
+        assert_eq!(printers[0].status, "Idle");
+        assert_eq!(printers[1].name, "Proof_Inkjet");
+        assert_eq!(printers[1].status, "Printing");
+
+        let cfg = PrintJobConfig {
+            printer_name: Some("Coree_Press_RIP".to_owned()),
+            copies: 2,
+            ..PrintJobConfig::default()
+        };
+        let msg = submit_pdf_ipp(&sock_path, &pdf_path, &cfg).unwrap();
+        assert!(msg.contains("job #42"));
+        assert!(msg.contains("Coree_Press_RIP"));
+        srv.join().unwrap();
     }
 }

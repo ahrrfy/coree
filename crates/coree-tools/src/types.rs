@@ -4,7 +4,7 @@
 
 use coree_core::{
     ArtisticWidthProfile, BasicShapeKind, BlendMode, Color, ContourMode, CornerStyle, DistortKind,
-    Effect, EllipseMode, EnvelopeMode, ImpactStyle, NodeKind, Point2D,
+    Effect, EllipseMode, EnvelopeMode, ImpactStyle, NodeKind, Point2D, RasterMaskMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -369,6 +369,11 @@ pub struct ToolSettingsSnapshot {
     pub brush_radius_px: f32,
     pub raster_op: RasterBrushOp,
     pub clone_source_mm: Option<Point2D>,
+    pub mask_mode: RasterMaskMode,
+    pub mask_feather_px: f32,
+    pub magic_wand_tolerance: f32,
+    pub magic_wand_contiguous: bool,
+    pub mask_inverted: bool,
     pub eyedropper_apply_mode: bool,
     pub sampled_effects: Vec<Effect>,
     pub text_insert_draft: String,
@@ -422,6 +427,11 @@ impl Default for ToolSettingsSnapshot {
             brush_radius_px: 12.0,
             raster_op: RasterBrushOp::Paint,
             clone_source_mm: None,
+            mask_mode: RasterMaskMode::Rectangle,
+            mask_feather_px: 0.0,
+            magic_wand_tolerance: 24.0,
+            magic_wand_contiguous: true,
+            mask_inverted: false,
             eyedropper_apply_mode: false,
             sampled_effects: Vec::new(),
             text_insert_draft: "coree Studio".to_owned(),

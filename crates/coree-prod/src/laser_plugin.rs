@@ -22,6 +22,13 @@ use coree_core::{
     Affine2D, ArtisticMedia, BezierPath, Color, Document, Effect, Fill, Layer, NodePayload,
     ObjectId, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId, Vec2D,
 };
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay::Overlay;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::i_float::int::point::IntPoint;
+use i_overlay::i_shape::int::shape::IntContour;
+use i_overlay::mesh::float::outline::offset::OutlineOffset;
+use i_overlay::mesh::float::style::{LineJoin as IoLineJoin, OutlineStyle as IoOutlineStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -744,20 +751,20 @@ fn signed_polygon_area(ring: &[Point2D]) -> f64 {
     0.5 * sum
 }
 
-/// Applies a miter-limited geometric normal offset of `kerf_mm / 2.0` to `polyline`.
+/// Applies a boolean-cleaned, miter-limited geometric kerf offset (`kerf_mm / 2.0`) to `polyline`,
+/// returning zero, one, or multiple non-self-intersecting contours.
 ///
-/// - For **closed** polygons (`closed == true`), positive `kerf_mm` offsets **outward** by
-///   `+kerf_mm / 2` (compensating outer part perimeters) and negative `kerf_mm` offsets
-///   **inward** by `-|kerf_mm| / 2` (compensating inner holes/slots), independent of CW/CCW
-///   input winding.
-/// - For **open** polylines (`closed == false`), offsets consistently along the left normal
-///   of the traversal direction by `kerf_mm / 2`.
-/// - Sharp acute corners exceeding [`KERF_MITER_LIMIT`] (`4.0`) are cleanly beveled.
+/// Closed shapes use `i_overlay`'s integer sweep (`OutlineOffset` + `Overlay`) so inward or
+/// outward offsets across acute vertices never emit bowtie self-intersections or overlapping edges.
 #[must_use]
-pub fn apply_kerf_offset(polyline: &[Point2D], closed: bool, kerf_mm: f64) -> Vec<Point2D> {
+pub fn apply_kerf_offset_multi(
+    polyline: &[Point2D],
+    closed: bool,
+    kerf_mm: f64,
+) -> Vec<Vec<Point2D>> {
     let clean = clean_finite_polyline(polyline);
     if clean.len() < 2 || !kerf_mm.is_finite() || kerf_mm.abs() <= 1e-9 {
-        return clean;
+        return vec![clean];
     }
 
     let half = kerf_mm * 0.5;
@@ -771,43 +778,114 @@ pub fn apply_kerf_offset(polyline: &[Point2D], closed: bool, kerf_mm: f64) -> Ve
             &clean
         };
         if ring.len() < 3 {
-            return clean;
+            return vec![clean];
         }
 
         let area = signed_polygon_area(ring);
-        // Universal outward normal sign invariant across both Y-up and Y-down coordinate systems:
-        // If signed_area >= 0, outward normal of unit tangent (tx, ty) is (ty, -tx).
-        // If signed_area < 0, outward normal is (-ty, tx).
-        let normal_sign = if area >= 0.0 { 1.0 } else { -1.0 };
-
-        let n = ring.len();
-        let mut edge_normals: Vec<Vec2D> = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = ring[i];
-            let b = ring[(i + 1) % n];
-            let edge = b - a;
-            let unit = edge.normalized().unwrap_or(Vec2D::new(1.0, 0.0));
-            edge_normals.push(Vec2D::new(normal_sign * unit.y, -normal_sign * unit.x));
+        if area.abs() <= 1e-9 {
+            return Vec::new();
+        }
+        // Normalize input ring to positive signed area (CCW in standard orientation) so positive
+        // `half` expands outward and negative `half` contracts inward consistently regardless of
+        // input winding.
+        let mut ccw_ring: Vec<[f64; 2]> = ring.iter().map(|p| [p.x, p.y]).collect();
+        if area < 0.0 {
+            ccw_ring.reverse();
         }
 
-        let mut out: Vec<Point2D> = Vec::with_capacity(n + 4);
-        for i in 0..n {
-            let v = ring[i];
-            let n_prev = edge_normals[(i + n - 1) % n];
-            let n_next = edge_normals[i];
-            emit_miter_or_bevel(v, n_prev, n_next, half, &mut out);
-        }
+        let min_angle = (2.0 * (1.0 / KERF_MITER_LIMIT).asin()).clamp(0.02, std::f64::consts::PI);
+        let style = IoOutlineStyle::new(half).line_join(IoLineJoin::Miter(min_angle));
+        let mut shapes = vec![ccw_ring.clone()].outline_as::<i64>(&style);
 
-        if !out.is_empty() && (had_closing_dup || closed) {
-            let first = out[0];
-            if out
-                .last()
-                .is_some_and(|last| last.distance_to(first) > 1e-9)
-            {
-                out.push(first);
+        // Clean subject self-intersections first if raw input already self-intersected.
+        if shapes.is_empty() && half > 0.0 {
+            let scale = 10_000.0_f64;
+            let subj_int: Vec<IntContour<i64>> = vec![ccw_ring
+                .iter()
+                .map(|&[x, y]| {
+                    IntPoint::new((x * scale).round() as i64, (y * scale).round() as i64)
+                })
+                .collect()];
+            let empty_clip: &[IntContour<i64>] = &[];
+            let clean_int = Overlay::<i64>::from_subj_and_clip(&subj_int, empty_clip)
+                .overlay(OverlayRule::Subject, FillRule::EvenOdd);
+            let clean_float: Vec<Vec<[f64; 2]>> = clean_int
+                .into_iter()
+                .flatten()
+                .filter(|c| c.len() >= 3)
+                .map(|c| {
+                    c.into_iter()
+                        .map(|p| [(p.x as f64) / scale, (p.y as f64) / scale])
+                        .collect()
+                })
+                .collect();
+            if !clean_float.is_empty() {
+                shapes = clean_float.outline_as::<i64>(&style);
             }
         }
-        out
+
+        // Convert resulting boolean contours and run final `Overlay` pass to guarantee zero
+        // overlapping or self-intersecting edges in any resulting loop.
+        let mut max_coord = 1.0_f64;
+        for shape in &shapes {
+            for contour in shape {
+                for &[x, y] in contour {
+                    if x.is_finite() && y.is_finite() {
+                        max_coord = max_coord.max(x.abs()).max(y.abs());
+                    }
+                }
+            }
+        }
+        let scale = (10_000.0_f64).min(1.0e12 / max_coord);
+        let mut int_contours: Vec<IntContour<i64>> = Vec::new();
+        for shape in shapes {
+            for contour in shape {
+                if contour.len() < 3 {
+                    continue;
+                }
+                let ic: IntContour<i64> = contour
+                    .into_iter()
+                    .filter(|&[x, y]| x.is_finite() && y.is_finite())
+                    .map(|[x, y]| {
+                        IntPoint::new((x * scale).round() as i64, (y * scale).round() as i64)
+                    })
+                    .collect();
+                if ic.len() >= 3 {
+                    int_contours.push(ic);
+                }
+            }
+        }
+        if int_contours.is_empty() {
+            return Vec::new();
+        }
+        let empty_clip: &[IntContour<i64>] = &[];
+        let verified_shapes = Overlay::<i64>::from_subj_and_clip(&int_contours, empty_clip)
+            .overlay(OverlayRule::Subject, FillRule::EvenOdd);
+        let inv_scale = 1.0 / scale;
+
+        let mut results: Vec<Vec<Point2D>> = Vec::new();
+        for shape in verified_shapes {
+            for contour in shape {
+                if contour.len() < 3 {
+                    continue;
+                }
+                let mut pts: Vec<Point2D> = contour
+                    .into_iter()
+                    .map(|p| Point2D::new((p.x as f64) * inv_scale, (p.y as f64) * inv_scale))
+                    .collect();
+                if pts.len() >= 3 {
+                    if area < 0.0 {
+                        pts.reverse();
+                    }
+                    let first = pts[0];
+                    if pts.last().is_some_and(|l| l.distance_to(first) > 1e-9) {
+                        pts.push(first);
+                    }
+                    results.push(pts);
+                }
+            }
+        }
+        results
     } else {
         let seg_count = clean.len() - 1;
         let mut edge_normals: Vec<Vec2D> = Vec::with_capacity(seg_count);
@@ -829,8 +907,38 @@ pub fn apply_kerf_offset(polyline: &[Point2D], closed: bool, kerf_mm: f64) -> Ve
             );
         }
         out.push(clean[seg_count] + edge_normals[seg_count - 1] * half);
-        out
+        vec![out]
     }
+}
+
+/// Applies a miter-limited geometric normal offset of `kerf_mm / 2.0` to `polyline`,
+/// backed by `i_overlay` boolean self-intersection cleanup for closed polygons.
+///
+/// - For **closed** polygons (`closed == true`), positive `kerf_mm` offsets **outward** by
+///   `+kerf_mm / 2` (compensating outer part perimeters) and negative `kerf_mm` offsets
+///   **inward** by `-|kerf_mm| / 2` (compensating inner holes/slots), independent of CW/CCW
+///   input winding.
+/// - For **open** polylines (`closed == false`), offsets consistently along the left normal
+///   of the traversal direction by `kerf_mm / 2`.
+/// - Sharp acute corners exceeding [`KERF_MITER_LIMIT`] (`4.0`) are cleanly beveled/cleaned.
+#[must_use]
+pub fn apply_kerf_offset(polyline: &[Point2D], closed: bool, kerf_mm: f64) -> Vec<Point2D> {
+    let mut multi = apply_kerf_offset_multi(polyline, closed, kerf_mm);
+    if multi.is_empty() {
+        return Vec::new();
+    }
+    if multi.len() == 1 {
+        return multi.pop().unwrap_or_default();
+    }
+    multi
+        .into_iter()
+        .max_by(|a, b| {
+            signed_polygon_area(a)
+                .abs()
+                .partial_cmp(&signed_polygon_area(b).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or_default()
 }
 
 fn emit_miter_or_bevel(
@@ -1480,41 +1588,12 @@ fn compose_laser_parent_persp(
     }
 }
 
-fn container_own_persp(doc: &Document, obj: &SceneObject) -> Option<Perspective3x3> {
-    let mut own = obj.perspective;
-    let has_eff_persp = obj
-        .effects
-        .iter()
-        .any(|e| matches!(e, Effect::Perspective { .. }));
-    if has_eff_persp {
-        let raw_bb = match &obj.payload {
-            NodePayload::SymbolInstance(sym_id) => {
-                doc.symbol_bounds_with_xf_and_space(*sym_id, &Affine2D::IDENTITY, None)
-            }
-            NodePayload::PowerClip { container, .. } => container.bounding_box(),
-            _ if obj.id.0 != 0 => doc.local_object_bounds(obj.id),
-            _ => None,
-        };
-        let mut cur_bb = match (own, raw_bb) {
-            (Some(p), Some(bb)) => p.try_transform_rect(bb),
-            (None, Some(bb)) => Some(bb),
-            (_, None) => None,
-        };
-        for eff in &obj.effects {
-            if let Effect::Perspective { quad } = eff {
-                if let Some(bb) = cur_bb {
-                    if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
-                        own = Some(match own {
-                            Some(prev) => h.compose(&prev),
-                            None => h,
-                        });
-                        cur_bb = h.try_transform_rect(bb);
-                    }
-                }
-            }
-        }
-    }
-    own
+fn container_own_persp(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
+) -> Option<Perspective3x3> {
+    crate::scene_helpers::container_own_persp(doc, obj, sym_ctx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1599,8 +1678,8 @@ fn collect_laser_scene_object_polylines(
 
     match &obj.payload {
         NodePayload::Clone { .. } => {
-            if let Some((eff_payload, eff_fill, eff_outline)) =
-                doc.resolve_clone_payload_and_style(obj)
+            if let Some((eff_payload, eff_fill, eff_outline, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
             {
                 let mut tmp = obj.clone();
                 tmp.payload = eff_payload;
@@ -1612,7 +1691,7 @@ fn collect_laser_scene_object_polylines(
                     &tmp,
                     parent_xf,
                     parent_persp,
-                    sym_ctx,
+                    if in_sym { sym_ctx } else { None },
                     sel_set,
                     is_selected,
                     depth + 1,
@@ -1628,7 +1707,7 @@ fn collect_laser_scene_object_polylines(
             return;
         }
         NodePayload::Group(children) => {
-            let own_persp = container_own_persp(doc, obj);
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
             let child_persp =
                 compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in children {
@@ -1673,7 +1752,7 @@ fn collect_laser_scene_object_polylines(
                     total_extracted,
                 );
             }
-            let own_persp = container_own_persp(doc, obj);
+            let own_persp = container_own_persp(doc, obj, sym_ctx);
             let child_persp =
                 compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
             for &cid in contents {
@@ -1700,7 +1779,7 @@ fn collect_laser_scene_object_polylines(
         }
         NodePayload::SymbolInstance(sym_id) => {
             if is_selected && visiting_syms.insert(*sym_id) {
-                let own_persp = container_own_persp(doc, obj);
+                let own_persp = container_own_persp(doc, obj, sym_ctx);
                 let child_persp =
                     compose_laser_parent_persp(parent_persp, &parent_xf, &obj.transform, own_persp);
                 if let Some(sym) = doc.symbol(*sym_id) {
@@ -2154,39 +2233,58 @@ fn process_rule_bucket(
         let is_closed = closed_flags[idx];
         let depth = local_depths[idx];
 
-        let kerfed = if kerf.abs() > 1e-9 {
+        let kerf_islands = if kerf.abs() > 1e-9 {
             let signed_kerf = if is_closed && depth % 2 == 1 {
                 -kerf
             } else {
                 kerf
             };
-            apply_kerf_offset(&poly, is_closed, signed_kerf)
+            apply_kerf_offset_multi(&poly, is_closed, signed_kerf)
         } else {
-            poly
+            vec![poly]
         };
 
-        if kerfed.len() < 2 {
-            continue;
-        }
-
-        if rule.operation == LaserOperationKind::Perforate {
-            let remaining_budget = MAX_PLAN_POLYLINES.saturating_sub(out_segments.len());
-            if remaining_budget == 0 {
-                break;
+        for kerfed in kerf_islands {
+            if kerfed.len() < 2 {
+                continue;
             }
-            let dashes = dash_polyline(
-                &kerfed,
-                PERFORATE_DASH_MM,
-                PERFORATE_GAP_MM,
-                remaining_budget,
-            );
-            for dash in dashes {
+
+            if rule.operation == LaserOperationKind::Perforate {
+                let remaining_budget = MAX_PLAN_POLYLINES.saturating_sub(out_segments.len());
+                if remaining_budget == 0 {
+                    break;
+                }
+                let dashes = dash_polyline(
+                    &kerfed,
+                    PERFORATE_DASH_MM,
+                    PERFORATE_GAP_MM,
+                    remaining_budget,
+                );
+                for dash in dashes {
+                    out_segments.push(ToolpathSegment {
+                        operation: LaserOperationKind::Perforate,
+                        rule_name: rule.name.clone(),
+                        color_rgb: rule.match_rgb,
+                        points: dash,
+                        closed: false,
+                        speed_mm_s: speed,
+                        min_power_pct: min_power,
+                        max_power_pct: max_power,
+                        passes,
+                        air_assist: rule.air_assist,
+                        z_step_mm: z_step,
+                        frequency_khz: freq,
+                        containment_depth: depth,
+                        is_weeding_box: false,
+                    });
+                }
+            } else {
                 out_segments.push(ToolpathSegment {
-                    operation: LaserOperationKind::Perforate,
+                    operation: rule.operation,
                     rule_name: rule.name.clone(),
                     color_rgb: rule.match_rgb,
-                    points: dash,
-                    closed: false,
+                    points: kerfed,
+                    closed: is_closed,
                     speed_mm_s: speed,
                     min_power_pct: min_power,
                     max_power_pct: max_power,
@@ -2198,23 +2296,6 @@ fn process_rule_bucket(
                     is_weeding_box: false,
                 });
             }
-        } else {
-            out_segments.push(ToolpathSegment {
-                operation: rule.operation,
-                rule_name: rule.name.clone(),
-                color_rgb: rule.match_rgb,
-                points: kerfed,
-                closed: is_closed,
-                speed_mm_s: speed,
-                min_power_pct: min_power,
-                max_power_pct: max_power,
-                passes,
-                air_assist: rule.air_assist,
-                z_step_mm: z_step,
-                frequency_khz: freq,
-                containment_depth: depth,
-                is_weeding_box: false,
-            });
         }
     }
 }
@@ -3038,6 +3119,232 @@ pub fn export_laser_eps(plan: &LaserToolpathPlan) -> String {
     out
 }
 
+/// Supported open laser / plotter controller protocol framers (offline payload generators, zero network I/O).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum OpenLaserProtocol {
+    /// GRBL 1.1 line-buffered real-time streaming G-Code (`<= 127` bytes/line).
+    #[default]
+    GrblStream,
+    /// Marlin `G0/G1` + `M106/M107` line stream.
+    MarlinStream,
+    /// Binary Ruida `.rd` scrambled packet format (`0x88` XOR + bit-swap framing).
+    RuidaRdPacket,
+    /// LightBurn XML project (`.lbrn2`) format.
+    LightBurnLbrn2,
+    /// Lihuiyu / K40 Whisperer M2-Nano EGV step packet stream (1000 DPI).
+    K40M2NanoEgv,
+    /// HPGL `.plt` plotter command stream.
+    HpglStream,
+}
+
+/// Framed controller protocol payload ready for serial/USB/SD-card transport by host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaserControllerFrame {
+    pub protocol: OpenLaserProtocol,
+    pub payload: Vec<u8>,
+    pub description: String,
+}
+
+fn ruida_scramble_byte(b: u8) -> u8 {
+    let swapped = ((b & 0x01) << 7) | ((b & 0x80) >> 7) | (b & 0x7E);
+    swapped ^ 0x88
+}
+
+fn ruida_encode_coord_um(um: i64, out: &mut Vec<u8>) {
+    // 35-bit (5 * 7-bit) absolute micron encoding used by Ruida RD packets
+    let v = um.clamp(-134_217_728, 134_217_727);
+    let u = v as u64;
+    for shift in [28u32, 21, 14, 7, 0] {
+        out.push(ruida_scramble_byte(((u >> shift) & 0x7F) as u8));
+    }
+}
+
+fn egv_append_steps(steps: i64, pos_cmd: u8, neg_cmd: u8, out: &mut Vec<u8>) {
+    let mut rem = steps.abs();
+    let dir = if steps >= 0 { pos_cmd } else { neg_cmd };
+    if rem == 0 {
+        return;
+    }
+    out.push(dir);
+    while rem > 0 {
+        if rem >= 255 {
+            out.push(b'z');
+            rem -= 255;
+        } else if rem >= 26 {
+            let chunk = (rem / 26).min(9);
+            out.push(b'0' + (chunk as u8));
+            rem -= chunk * 26;
+        } else {
+            out.push(b'a' + ((rem - 1) as u8));
+            rem = 0;
+        }
+    }
+}
+
+/// Frames `plan` into the requested open laser controller protocol payload (pure offline framing,
+/// zero `std::net` or process execution).
+pub fn frame_open_laser_protocol(
+    plan: &LaserToolpathPlan,
+    config: &LaserJobConfig,
+    protocol: OpenLaserProtocol,
+) -> ProdResult<LaserControllerFrame> {
+    match protocol {
+        OpenLaserProtocol::GrblStream => {
+            let mut c = config.clone();
+            c.dialect = GcodeDialect::Grbl11;
+            let gcode = export_laser_gcode(plan, &c);
+            let mut buf = Vec::with_capacity(gcode.len());
+            for line in gcode.lines() {
+                let trimmed = line.split(';').next().unwrap_or("").trim();
+                if !trimmed.is_empty() {
+                    buf.extend_from_slice(trimmed.as_bytes());
+                    buf.push(b'\n');
+                }
+            }
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("GRBL 1.1 stream ({} bytes)", buf.len()),
+                payload: buf,
+            })
+        }
+        OpenLaserProtocol::MarlinStream => {
+            let mut c = config.clone();
+            c.dialect = GcodeDialect::Marlin;
+            let gcode = export_laser_gcode(plan, &c);
+            let payload = gcode.into_bytes();
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("Marlin G-Code stream ({} bytes)", payload.len()),
+                payload,
+            })
+        }
+        OpenLaserProtocol::HpglStream => {
+            let plt = export_laser_plt(plan);
+            let payload = plt.into_bytes();
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("HPGL PLT stream ({} bytes)", payload.len()),
+                payload,
+            })
+        }
+        OpenLaserProtocol::LightBurnLbrn2 => {
+            let mut xml = String::with_capacity(plan.segments.len() * 128 + 256);
+            let _ = writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+            let _ = writeln!(
+                xml,
+                r#"<LightBurnProject AppVersion="1.4.00" FormatVersion="1" MaterialHeight="0">"#
+            );
+            for (idx, seg) in plan.segments.iter().enumerate() {
+                if seg.points.len() < 2 || seg.operation == LaserOperationKind::Ignore {
+                    continue;
+                }
+                let speed = finite_or(seg.speed_mm_s, 20.0).clamp(0.1, 10_000.0);
+                let max_p = finite_or(seg.max_power_pct, 50.0).clamp(0.0, 100.0);
+                let min_p = finite_or(seg.min_power_pct, 10.0).clamp(0.0, max_p);
+                let _ = writeln!(
+                    xml,
+                    r#"  <CutSetting type="Cut"><index Value="{idx}"/><name Value="{}"/><speed Value="{speed:.2}"/><minPower Value="{min_p:.1}"/><maxPower Value="{max_p:.1}"/></CutSetting>"#,
+                    seg.rule_name.replace('"', "")
+                );
+                let _ = writeln!(
+                    xml,
+                    r#"  <Shape Type="Path" CutIndex="{idx}" VertIDList="{}">"#,
+                    seg.points.len()
+                );
+                for pt in &seg.points {
+                    if pt.is_finite() {
+                        let _ = writeln!(xml, r#"    <V vx="{:.4}" vy="{:.4}"/>"#, pt.x, pt.y);
+                    }
+                }
+                let _ = writeln!(xml, "  </Shape>");
+            }
+            let _ = writeln!(xml, "</LightBurnProject>");
+            let payload = xml.into_bytes();
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("LightBurn .lbrn2 project ({} bytes)", payload.len()),
+                payload,
+            })
+        }
+        OpenLaserProtocol::RuidaRdPacket => {
+            let mut raw = Vec::with_capacity(plan.segments.len() * 64 + 64);
+            // Ruida header command: D8 12 (start job)
+            raw.push(ruida_scramble_byte(0xD8));
+            raw.push(ruida_scramble_byte(0x12));
+            for seg in &plan.segments {
+                if seg.points.len() < 2 || seg.operation == LaserOperationKind::Ignore {
+                    continue;
+                }
+                // Set layer speed (C9 02) & power (C6 01)
+                let pwr = (finite_or(seg.max_power_pct, 50.0).clamp(0.0, 100.0) * 163.83) as u16;
+                raw.push(ruida_scramble_byte(0xC6));
+                raw.push(ruida_scramble_byte(0x01));
+                raw.push(ruida_scramble_byte(((pwr >> 7) & 0x7F) as u8));
+                raw.push(ruida_scramble_byte((pwr & 0x7F) as u8));
+                let first = seg.points[0];
+                // Move absolute (88)
+                raw.push(ruida_scramble_byte(0x88));
+                ruida_encode_coord_um((first.x * 1000.0).round() as i64, &mut raw);
+                ruida_encode_coord_um((first.y * 1000.0).round() as i64, &mut raw);
+                for pt in seg.points.iter().skip(1) {
+                    if !pt.is_finite() {
+                        continue;
+                    }
+                    // Cut absolute (A8)
+                    raw.push(ruida_scramble_byte(0xA8));
+                    ruida_encode_coord_um((pt.x * 1000.0).round() as i64, &mut raw);
+                    ruida_encode_coord_um((pt.y * 1000.0).round() as i64, &mut raw);
+                }
+            }
+            // EOF packet (D7)
+            raw.push(ruida_scramble_byte(0xD7));
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("Ruida .rd packet stream ({} bytes)", raw.len()),
+                payload: raw,
+            })
+        }
+        OpenLaserProtocol::K40M2NanoEgv => {
+            const STEPS_PER_MM: f64 = 1000.0 / 25.4;
+            let mut egv = Vec::with_capacity(plan.segments.len() * 64 + 64);
+            egv.extend_from_slice(b"Document\r\n");
+            let mut cx = 0i64;
+            let mut cy = 0i64;
+            for seg in &plan.segments {
+                if seg.points.len() < 2 || seg.operation == LaserOperationKind::Ignore {
+                    continue;
+                }
+                let p0 = seg.points[0];
+                let tx = (p0.x * STEPS_PER_MM).round() as i64;
+                let ty = (p0.y * STEPS_PER_MM).round() as i64;
+                egv.push(b'U'); // laser off travel
+                egv_append_steps(tx - cx, b'R', b'L', &mut egv);
+                egv_append_steps(ty - cy, b'B', b'T', &mut egv);
+                cx = tx;
+                cy = ty;
+                egv.push(b'D'); // laser on cut
+                for pt in seg.points.iter().skip(1) {
+                    if !pt.is_finite() {
+                        continue;
+                    }
+                    let nx = (pt.x * STEPS_PER_MM).round() as i64;
+                    let ny = (pt.y * STEPS_PER_MM).round() as i64;
+                    egv_append_steps(nx - cx, b'R', b'L', &mut egv);
+                    egv_append_steps(ny - cy, b'B', b'T', &mut egv);
+                    cx = nx;
+                    cy = ny;
+                }
+            }
+            egv.extend_from_slice(b"U\r\nFNSE");
+            Ok(LaserControllerFrame {
+                protocol,
+                description: format!("K40 M2-Nano EGV stream ({} bytes)", egv.len()),
+                payload: egv,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3382,5 +3689,68 @@ mod tests {
         assert!(eps.starts_with("%!PS-Adobe-3.0 EPSF-3.0"));
         assert!(eps.contains("%%BoundingBox:"));
         assert!(eps.contains("%%EOF"));
+
+        // Open laser controller protocol framing
+        for proto in [
+            OpenLaserProtocol::GrblStream,
+            OpenLaserProtocol::MarlinStream,
+            OpenLaserProtocol::RuidaRdPacket,
+            OpenLaserProtocol::LightBurnLbrn2,
+            OpenLaserProtocol::K40M2NanoEgv,
+            OpenLaserProtocol::HpglStream,
+        ] {
+            let frame = frame_open_laser_protocol(&plan, &cfg, proto).unwrap();
+            assert!(!frame.payload.is_empty(), "{proto:?} must emit payload");
+        }
+    }
+
+    fn segments_strictly_intersect(a1: Point2D, a2: Point2D, b1: Point2D, b2: Point2D) -> bool {
+        let orient = |p: Point2D, q: Point2D, r: Point2D| -> f64 {
+            (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+        };
+        let d1 = orient(b1, b2, a1);
+        let d2 = orient(b1, b2, a2);
+        let d3 = orient(a1, a2, b1);
+        let d4 = orient(a1, a2, b2);
+        (d1 * d2) < -1e-7 && (d3 * d4) < -1e-7
+    }
+
+    #[test]
+    fn kerf_offset_eliminates_self_intersections_on_acute_star() {
+        // 5-point acute star with deep valleys
+        let mut star = Vec::new();
+        for i in 0..10 {
+            let angle = (i as f64) * std::f64::consts::PI / 5.0;
+            let r = if i % 2 == 0 { 40.0 } else { 12.0 };
+            star.push(Point2D::new(50.0 + r * angle.cos(), 50.0 + r * angle.sin()));
+        }
+        star.push(star[0]);
+
+        for kerf in [2.0_f64, -6.0_f64] {
+            let contours = apply_kerf_offset_multi(&star, true, kerf);
+            assert!(
+                !contours.is_empty(),
+                "star kerf {kerf} should retain non-empty valid loop"
+            );
+            for poly in &contours {
+                let n = poly.len().saturating_sub(1);
+                for i in 0..n {
+                    for j in (i + 2)..n {
+                        if i == 0 && j == n - 1 {
+                            continue;
+                        }
+                        assert!(
+                            !segments_strictly_intersect(
+                                poly[i],
+                                poly[i + 1],
+                                poly[j],
+                                poly[j + 1]
+                            ),
+                            "self-intersection found at kerf={kerf}: edge {i} vs {j}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

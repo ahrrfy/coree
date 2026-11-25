@@ -324,10 +324,11 @@ pub fn apply_cutout_background_removal(
                 let mut fg_cnt = 0.0_f32;
                 let mut bg_sum = [0.0_f32; 3];
                 let mut bg_cnt = 0.0_f32;
-                let x0 = x.saturating_sub(2);
-                let y0 = y.saturating_sub(2);
-                let x1 = (x + 3).min(w);
-                let y1 = (y + 3).min(h);
+                let search_r = (feather_px.ceil() as u32 + 2).clamp(2, 8);
+                let x0 = x.saturating_sub(search_r);
+                let y0 = y.saturating_sub(search_r);
+                let x1 = (x + search_r + 1).min(w);
+                let y1 = (y + search_r + 1).min(h);
                 for ny in y0..y1 {
                     for nx in x0..x1 {
                         let nm = mask.get(nx, ny);
@@ -459,7 +460,7 @@ pub fn paint_brush_stroke_stylus(
         let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
         let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
         let base_alpha = sa * op * (0.2 + 0.8 * p);
-        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, asset.width, asset.height);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(&dab, dab_r, asset.width, asset.height);
         for y in y0..y1 {
             for x in x0..x1 {
                 let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
@@ -491,6 +492,17 @@ pub fn erase_stroke_stylus(
     radius_px: f32,
     hardness: f32,
 ) {
+    erase_stroke_stylus_masked(asset, points, radius_px, hardness, None);
+}
+
+/// Erases pixel alpha along pressure- & tilt-sensitive [`StylusPoint`]s constrained natively to `mask`.
+pub fn erase_stroke_stylus_masked(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+    mask: Option<&RasterMask>,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.8).clamp(0.0, 1.0);
     if points.is_empty() || !is_valid_raster_asset(asset) {
@@ -501,11 +513,15 @@ pub fn erase_stroke_stylus(
         let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
         let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
         let op_scale = 0.2 + 0.8 * p;
-        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, asset.width, asset.height);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(&dab, dab_r, asset.width, asset.height);
         for y in y0..y1 {
             for x in x0..x1 {
+                let mask_f = mask.map_or(1.0, |m| f32::from(m.get(x, y)) / 255.0);
+                if mask_f <= 1e-5 {
+                    continue;
+                }
                 let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
-                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale;
+                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale * mask_f;
                 if falloff <= 1e-5 {
                     continue;
                 }
@@ -542,6 +558,18 @@ pub fn clone_stamp_stroke_stylus(
     radius_px: f32,
     hardness: f32,
 ) {
+    clone_stamp_stroke_stylus_masked(asset, src_origin, dst_points, radius_px, hardness, None);
+}
+
+/// Pressure- & tilt-sensitive Clone Stamp brush constrained natively to `mask` (CoW-tile safe).
+pub fn clone_stamp_stroke_stylus_masked(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+    mask: Option<&RasterMask>,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.8).clamp(0.0, 1.0);
     if !src_origin.is_finite() || dst_points.is_empty() || !is_valid_raster_asset(asset) {
@@ -560,11 +588,15 @@ pub fn clone_stamp_stroke_stylus(
         let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
         let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
         let op_scale = 0.2 + 0.8 * p;
-        let (x0, y0, x1, y1) = dab_bounds(dab.pos, dab_r, w, h);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(&dab, dab_r, w, h);
         for y in y0..y1 {
             for x in x0..x1 {
+                let mask_f = mask.map_or(1.0, |m| f32::from(m.get(x, y)) / 255.0);
+                if mask_f <= 1e-5 {
+                    continue;
+                }
                 let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
-                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale;
+                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale * mask_f;
                 if falloff <= 1e-5 {
                     continue;
                 }
@@ -597,6 +629,17 @@ pub fn smudge_stroke_stylus(
     radius_px: f32,
     strength: f32,
 ) {
+    smudge_stroke_stylus_masked(asset, points, radius_px, strength, None);
+}
+
+/// Pressure-sensitive Smudge brush constrained natively to `mask` (samples & writes only inside mask).
+pub fn smudge_stroke_stylus_masked(
+    asset: &mut RasterAsset,
+    points: &[StylusPoint],
+    radius_px: f32,
+    strength: f32,
+    mask: Option<&RasterMask>,
+) {
     let r = sanitize_f32(radius_px, 4.0).clamp(0.5, 128.0);
     let str_f = sanitize_f32(strength, 0.5).clamp(0.0, 1.0);
     if points.len() < 2 || str_f <= 1e-5 || !is_valid_raster_asset(asset) {
@@ -610,6 +653,7 @@ pub fn smudge_stroke_stylus(
     let rad_i64 = i64::from(rad_i);
     let side = (rad_i * 2 + 1) as usize;
     let mut pickup = vec![[0.0_f32; 4]; side * side];
+    let mut pickup_valid = vec![false; side * side];
     let w_i64 = i64::from(asset.width);
     let h_i64 = i64::from(asset.height);
 
@@ -620,9 +664,13 @@ pub fn smudge_stroke_stylus(
         for dx in -rad_i..=rad_i {
             let sx = (seed_x + i64::from(dx)).clamp(0, w_i64 - 1) as u32;
             let sy = (seed_y + i64::from(dy)).clamp(0, h_i64 - 1) as u32;
-            let px = asset.read_pixel_f32(sx, sy).unwrap_or([0.0; 4]);
             let k = ((dy + rad_i) as usize) * side + ((dx + rad_i) as usize);
+            if mask.is_some_and(|m| m.get(sx, sy) == 0) {
+                continue;
+            }
+            let px = asset.read_pixel_f32(sx, sy).unwrap_or([0.0; 4]);
             pickup[k] = px;
+            pickup_valid[k] = true;
         }
     }
 
@@ -645,21 +693,30 @@ pub fn smudge_stroke_stylus(
                 if px_i < 0 || px_i >= w_i64 {
                     continue;
                 }
-                let dist = ((dx * dx + dy * dy) as f32).sqrt();
-                let w = brush_hardness_falloff(dist, dab_r, 0.25) * eff_str;
+                let ux = px_i as u32;
+                let uy = py as u32;
+                let mask_f = mask.map_or(1.0, |m| f32::from(m.get(ux, uy)) / 255.0);
+                if mask_f <= 1e-5 {
+                    continue;
+                }
+                let dist = dab_elliptical_dist(f64::from(ux) + 0.5, f64::from(uy) + 0.5, dab);
+                let w = brush_hardness_falloff(dist, dab_r, 0.25) * eff_str * mask_f;
                 if w <= 1e-5 {
                     continue;
                 }
                 let k = ((dy + rad_i) as usize) * side + ((dx + rad_i) as usize);
-                let cur = asset
-                    .read_pixel_f32(px_i as u32, py as u32)
-                    .unwrap_or([0.0; 4]);
+                let cur = asset.read_pixel_f32(ux, uy).unwrap_or([0.0; 4]);
+                if !pickup_valid[k] {
+                    pickup[k] = cur;
+                    pickup_valid[k] = true;
+                    continue;
+                }
                 let mut next = [0.0_f32; 4];
                 for c in 0..4 {
                     next[c] = (cur[c] * (1.0 - w) + pickup[k][c] * w).clamp(0.0, 1.0);
                     pickup[k][c] = pickup[k][c] * eff_str + cur[c] * (1.0 - eff_str);
                 }
-                asset.write_pixel_f32(px_i as u32, py as u32, next);
+                asset.write_pixel_f32(ux, uy, next);
             }
         }
     }
@@ -684,8 +741,8 @@ pub enum DodgeBurnMode {
     Burn,
 }
 
-/// Seamless Poisson Healing Brush: solves a discrete 2D Poisson PDE (`poisson` Gauss-Seidel
-/// on RGB/YCbCr gradient fields) over the stroke mask so source texture blends seamlessly
+/// Seamless Poisson Healing Brush: solves a discrete 2D Poisson PDE (`poisson` multigrid /
+/// red-black SOR on RGB gradient fields) over the stroke mask so source texture blends seamlessly
 /// onto the destination boundary tones without visible seams (CoW-tile + 16-bit safe).
 pub fn apply_healing_stroke(
     asset: &mut RasterAsset,
@@ -694,29 +751,59 @@ pub fn apply_healing_stroke(
     radius_px: f32,
     hardness: f32,
 ) {
+    let sp: Vec<StylusPoint> = dst_points
+        .iter()
+        .copied()
+        .map(StylusPoint::uniform)
+        .collect();
+    apply_healing_stroke_stylus_masked(asset, src_origin, &sp, radius_px, hardness, None);
+}
+
+/// Seamless Poisson Healing Brush along pressure- & tilt-sensitive [`StylusPoint`]s.
+pub fn apply_healing_stroke_stylus(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+) {
+    apply_healing_stroke_stylus_masked(asset, src_origin, dst_points, radius_px, hardness, None);
+}
+
+/// Seamless Poisson Healing Brush constrained natively to `mask` (treating masked-out pixels
+/// as fixed Dirichlet boundary values and using V-cycle multigrid initialization for `r >= 10`).
+pub fn apply_healing_stroke_stylus_masked(
+    asset: &mut RasterAsset,
+    src_origin: Point2D,
+    dst_points: &[StylusPoint],
+    radius_px: f32,
+    hardness: f32,
+    mask: Option<&RasterMask>,
+) {
     let r = sanitize_f32(radius_px, 8.0).clamp(1.0, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.5).clamp(0.0, 1.0);
     if !src_origin.is_finite() || dst_points.is_empty() || !is_valid_raster_asset(asset) {
         return;
     }
-    let dabs = sample_stroke_dabs(dst_points, (r * 0.3).max(1.0));
+    let dabs = sample_stylus_dabs(dst_points, (r * 0.3).max(1.0));
     let Some(first_dab) = dabs.first().copied() else {
         return;
     };
     let snapshot = asset.clone();
-    let offset = src_origin - first_dab;
+    let offset = src_origin - first_dab.pos;
     let w = asset.width;
     let h = asset.height;
     let w_i64 = i64::from(w);
     let h_i64 = i64::from(h);
 
-    // Compute union bounding box covering all stroke dabs + 1px Dirichlet boundary ring
     let mut bx0 = w;
     let mut by0 = h;
     let mut bx1 = 0u32;
     let mut by1 = 0u32;
-    for &dab in &dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r + 2.0, w, h);
+    for dab in &dabs {
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(1.0, MAX_BRUSH_RADIUS_PX);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(dab, dab_r + 2.0, w, h);
         if x0 < x1 && y0 < y1 {
             bx0 = bx0.min(x0);
             by0 = by0.min(y0);
@@ -731,12 +818,18 @@ pub fn apply_healing_stroke(
     let bw = (bx1 - bx0) as usize;
     let bh = (by1 - by0) as usize;
     let mut falloff_mask = vec![0.0_f32; bw * bh];
-    for &dab in &dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, w, h);
+    for dab in &dabs {
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(1.0, MAX_BRUSH_RADIUS_PX);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(dab, dab_r, w, h);
         for y in y0..y1 {
             for x in x0..x1 {
-                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
-                let f = brush_hardness_falloff(d, r, hard);
+                let mask_f = mask.map_or(1.0, |m| f32::from(m.get(x, y)) / 255.0);
+                if mask_f <= 1e-5 {
+                    continue;
+                }
+                let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, dab);
+                let f = brush_hardness_falloff(d, dab_r, hard) * mask_f;
                 if f > 1e-5 {
                     let k = ((y - by0) as usize) * bw + ((x - bx0) as usize);
                     if f > falloff_mask[k] {
@@ -747,7 +840,6 @@ pub fn apply_healing_stroke(
         }
     }
 
-    // Initialize Poisson PDE solution grid `poisson` from destination + source Laplacian guidance
     let mut poisson = vec![[0.0_f32; 3]; bw * bh];
     let mut src_px_grid = vec![[0.0_f32; 3]; bw * bh];
     let mut src_alpha_grid = vec![0.0_f32; bw * bh];
@@ -772,31 +864,30 @@ pub fn apply_healing_stroke(
         }
     }
 
-    // Gauss-Seidel Poisson solver: `4*u(p) - sum_neighbors(u) = div(grad(src))(p)`
-    for _iter in 0..24 {
-        for ly in 1..(bh.saturating_sub(1)) {
-            for lx in 1..(bw.saturating_sub(1)) {
-                let k = ly * bw + lx;
-                if falloff_mask[k] <= 1e-5 || src_alpha_grid[k] <= 1e-4 {
-                    continue;
-                }
-                let kl = k - 1;
-                let kr = k + 1;
-                let ku = k - bw;
-                let kd = k + bw;
-                for ch in 0..3 {
-                    let lap_src = 4.0 * src_px_grid[k][ch]
-                        - src_px_grid[kl][ch]
-                        - src_px_grid[kr][ch]
-                        - src_px_grid[ku][ch]
-                        - src_px_grid[kd][ch];
-                    let sum_nbr =
-                        poisson[kl][ch] + poisson[kr][ch] + poisson[ku][ch] + poisson[kd][ch];
-                    poisson[k][ch] = (0.25 * (sum_nbr + lap_src)).clamp(0.0, 1.0);
-                }
+    let mut rhs = vec![[0.0_f32; 3]; bw * bh];
+    let mut active = vec![false; bw * bh];
+    for ly in 1..(bh.saturating_sub(1)) {
+        for lx in 1..(bw.saturating_sub(1)) {
+            let k = ly * bw + lx;
+            if falloff_mask[k] <= 1e-5 || src_alpha_grid[k] <= 1e-4 {
+                continue;
+            }
+            active[k] = true;
+            let kl = k - 1;
+            let kr = k + 1;
+            let ku = k - bw;
+            let kd = k + bw;
+            for ch in 0..3 {
+                rhs[k][ch] = 4.0 * src_px_grid[k][ch]
+                    - src_px_grid[kl][ch]
+                    - src_px_grid[kr][ch]
+                    - src_px_grid[ku][ch]
+                    - src_px_grid[kd][ch];
             }
         }
     }
+
+    solve_poisson_vcycle(&mut poisson, &rhs, &active, bw, bh, 0);
 
     for ly in 0..bh {
         let y = by0 + ly as u32;
@@ -809,9 +900,9 @@ pub fn apply_healing_stroke(
                     asset,
                     x,
                     y,
-                    poisson[k][0],
-                    poisson[k][1],
-                    poisson[k][2],
+                    poisson[k][0].clamp(0.0, 1.0),
+                    poisson[k][1].clamp(0.0, 1.0),
+                    poisson[k][2].clamp(0.0, 1.0),
                     eff_a,
                 );
             }
@@ -819,29 +910,132 @@ pub fn apply_healing_stroke(
     }
 }
 
-/// Seamless Poisson Healing Brush along pressure-sensitive [`StylusPoint`]s.
-pub fn apply_healing_stroke_stylus(
-    asset: &mut RasterAsset,
-    src_origin: Point2D,
-    dst_points: &[StylusPoint],
-    radius_px: f32,
-    hardness: f32,
+fn solve_poisson_vcycle(
+    u: &mut [[f32; 3]],
+    rhs: &[[f32; 3]],
+    active: &[bool],
+    bw: usize,
+    bh: usize,
+    depth: usize,
 ) {
-    let avg_p = if dst_points.is_empty() {
-        1.0
+    let sor_sweeps = if depth == 0 && bw.max(bh) < 20 {
+        24
     } else {
-        dst_points
-            .iter()
-            .map(|p| sanitize_f32(p.pressure, 1.0).clamp(0.0, 1.0))
-            .sum::<f32>()
-            / (dst_points.len() as f32)
+        12
     };
-    let pts: Vec<Point2D> = dst_points.iter().map(|p| p.pos).collect();
-    let eff_r = (radius_px * (0.25 + 0.75 * avg_p)).clamp(1.0, MAX_BRUSH_RADIUS_PX);
-    apply_healing_stroke(asset, src_origin, &pts, eff_r, hardness);
+    let omega = 1.72_f32;
+    for _ in 0..sor_sweeps {
+        for parity in 0..2 {
+            for ly in 1..(bh.saturating_sub(1)) {
+                for lx in 1..(bw.saturating_sub(1)) {
+                    if (lx + ly) % 2 != parity {
+                        continue;
+                    }
+                    let k = ly * bw + lx;
+                    if !active[k] {
+                        continue;
+                    }
+                    let kl = k - 1;
+                    let kr = k + 1;
+                    let ku = k - bw;
+                    let kd = k + bw;
+                    for ch in 0..3 {
+                        let gs =
+                            0.25 * (u[kl][ch] + u[kr][ch] + u[ku][ch] + u[kd][ch] + rhs[k][ch]);
+                        u[k][ch] += omega * (gs - u[k][ch]);
+                    }
+                }
+            }
+        }
+    }
+
+    if bw.max(bh) >= 20 && bw >= 6 && bh >= 6 && depth < 4 {
+        let cw = bw.div_ceil(2);
+        let ch_dim = bh.div_ceil(2);
+        let mut cu = vec![[0.0_f32; 3]; cw * ch_dim];
+        let mut crhs = vec![[0.0_f32; 3]; cw * ch_dim];
+        let mut cactive = vec![false; cw * ch_dim];
+
+        for cy in 1..(ch_dim.saturating_sub(1)) {
+            let fy = (cy * 2).min(bh - 2);
+            for cx in 1..(cw.saturating_sub(1)) {
+                let fx = (cx * 2).min(bw - 2);
+                let fk = fy * bw + fx;
+                if !active[fk] {
+                    continue;
+                }
+                let ck = cy * cw + cx;
+                cactive[ck] = true;
+                for ch in 0..3 {
+                    let res = rhs[fk][ch]
+                        - (4.0 * u[fk][ch]
+                            - u[fk - 1][ch]
+                            - u[fk + 1][ch]
+                            - u[fk - bw][ch]
+                            - u[fk + bw][ch]);
+                    crhs[ck][ch] = 4.0 * res;
+                }
+            }
+        }
+
+        solve_poisson_vcycle(&mut cu, &crhs, &cactive, cw, ch_dim, depth + 1);
+
+        for ly in 1..(bh.saturating_sub(1)) {
+            let cy0 = (ly / 2).min(ch_dim - 1);
+            let cy1 = (cy0 + 1).min(ch_dim - 1);
+            let fy_w = if ly % 2 == 1 { 0.5_f32 } else { 0.0_f32 };
+            for lx in 1..(bw.saturating_sub(1)) {
+                let fk = ly * bw + lx;
+                if !active[fk] {
+                    continue;
+                }
+                let cx0 = (lx / 2).min(cw - 1);
+                let cx1 = (cx0 + 1).min(cw - 1);
+                let fx_w = if lx % 2 == 1 { 0.5_f32 } else { 0.0_f32 };
+                for ch in 0..3 {
+                    let top = cu[cy0 * cw + cx0][ch] * (1.0 - fx_w) + cu[cy0 * cw + cx1][ch] * fx_w;
+                    let bot = cu[cy1 * cw + cx0][ch] * (1.0 - fx_w) + cu[cy1 * cw + cx1][ch] * fx_w;
+                    u[fk][ch] += top * (1.0 - fy_w) + bot * fy_w;
+                }
+            }
+        }
+
+        for _ in 0..12 {
+            for parity in 0..2 {
+                for ly in 1..(bh.saturating_sub(1)) {
+                    for lx in 1..(bw.saturating_sub(1)) {
+                        if (lx + ly) % 2 != parity {
+                            continue;
+                        }
+                        let k = ly * bw + lx;
+                        if !active[k] {
+                            continue;
+                        }
+                        let kl = k - 1;
+                        let kr = k + 1;
+                        let ku = k - bw;
+                        let kd = k + bw;
+                        for ch in 0..3 {
+                            let gs =
+                                0.25 * (u[kl][ch] + u[kr][ch] + u[ku][ch] + u[kd][ch] + rhs[k][ch]);
+                            u[k][ch] += omega * (gs - u[k][ch]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if depth == 0 {
+        for px in u.iter_mut() {
+            px[0] = px[0].clamp(0.0, 1.0);
+            px[1] = px[1].clamp(0.0, 1.0);
+            px[2] = px[2].clamp(0.0, 1.0);
+        }
+    }
 }
 
-/// Pressure-sensitive Dodge or Burn stroke along [`StylusPoint`]s.
+/// Pressure- & tilt-sensitive Dodge or Burn stroke along [`StylusPoint`]s.
 pub fn apply_dodge_burn_stroke_stylus(
     asset: &mut RasterAsset,
     points: &[StylusPoint],
@@ -851,34 +1045,22 @@ pub fn apply_dodge_burn_stroke_stylus(
     range: ToneRange,
     exposure: f32,
 ) {
-    let avg_p = if points.is_empty() {
-        1.0
-    } else {
-        points
-            .iter()
-            .map(|p| sanitize_f32(p.pressure, 1.0).clamp(0.0, 1.0))
-            .sum::<f32>()
-            / (points.len() as f32)
-    };
-    let pts: Vec<Point2D> = points.iter().map(|p| p.pos).collect();
-    let eff_r = (radius_px * (0.25 + 0.75 * avg_p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
-    let eff_exp = (exposure * (0.2 + 0.8 * avg_p)).clamp(0.0, 1.0);
-    apply_dodge_burn_stroke(asset, &pts, eff_r, hardness, mode, range, eff_exp);
+    apply_dodge_burn_stroke_stylus_masked(
+        asset, points, radius_px, hardness, mode, range, exposure, None,
+    );
 }
 
-/// Applies photographic Dodge (lighten) or Burn (darken) exposure adjustment along `points`,
-/// smoothly weighted to the chosen [`ToneRange`] (`Shadows`, `Midtones`, or `Highlights`).
-///
-/// Uses a per-stroke maximum coverage mask so overlapping dabs along a single drag produce
-/// smooth, uniform exposure without runaway clipping.
-pub fn apply_dodge_burn_stroke(
+/// Pressure- & tilt-sensitive Dodge or Burn stroke constrained natively to `mask`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_dodge_burn_stroke_stylus_masked(
     asset: &mut RasterAsset,
-    points: &[Point2D],
+    points: &[StylusPoint],
     radius_px: f32,
     hardness: f32,
     mode: DodgeBurnMode,
     range: ToneRange,
     exposure: f32,
+    mask: Option<&RasterMask>,
 ) {
     let r = sanitize_f32(radius_px, 8.0).clamp(0.5, MAX_BRUSH_RADIUS_PX);
     let hard = sanitize_f32(hardness, 0.4).clamp(0.0, 1.0);
@@ -886,18 +1068,19 @@ pub fn apply_dodge_burn_stroke(
     if points.is_empty() || exp <= 1e-5 || !is_valid_raster_asset(asset) {
         return;
     }
-    let dabs = sample_stroke_dabs(points, (r * 0.25).max(1.0));
+    let dabs = sample_stylus_dabs(points, (r * 0.25).max(1.0));
     if dabs.is_empty() {
         return;
     }
 
-    // Compute tight clamped pixel bbox covering the entire stroke
     let mut bx0 = asset.width;
     let mut by0 = asset.height;
     let mut bx1 = 0u32;
     let mut by1 = 0u32;
-    for &dab in &dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+    for dab in &dabs {
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+        let (x0, y0, x1, y1) = dab_bounds_stylus(dab, dab_r, asset.width, asset.height);
         if x0 < x1 && y0 < y1 {
             bx0 = bx0.min(x0);
             by0 = by0.min(y0);
@@ -914,12 +1097,19 @@ pub fn apply_dodge_burn_stroke(
     let mut coverage = vec![0.0_f32; bw.saturating_mul(bh)];
 
     for dab in dabs {
-        let (x0, y0, x1, y1) = dab_bounds(dab, r, asset.width, asset.height);
+        let p = sanitize_f32(dab.pressure, 1.0).clamp(0.0, 1.0);
+        let dab_r = (r * (0.25 + 0.75 * p)).clamp(0.5, MAX_BRUSH_RADIUS_PX);
+        let op_scale = 0.2 + 0.8 * p;
+        let (x0, y0, x1, y1) = dab_bounds_stylus(&dab, dab_r, asset.width, asset.height);
         for y in y0..y1 {
             let row_off = ((y - by0) as usize) * bw;
             for x in x0..x1 {
-                let d = ((f64::from(x) + 0.5 - dab.x).hypot(f64::from(y) + 0.5 - dab.y)) as f32;
-                let falloff = brush_hardness_falloff(d, r, hard);
+                let mask_f = mask.map_or(1.0, |m| f32::from(m.get(x, y)) / 255.0);
+                if mask_f <= 1e-5 {
+                    continue;
+                }
+                let d = dab_elliptical_dist(f64::from(x) + 0.5, f64::from(y) + 0.5, &dab);
+                let falloff = brush_hardness_falloff(d, dab_r, hard) * op_scale * mask_f;
                 if falloff > 1e-5 {
                     let slot = &mut coverage[row_off + ((x - bx0) as usize)];
                     if falloff > *slot {
@@ -946,7 +1136,6 @@ pub fn apply_dodge_burn_stroke(
                 continue;
             }
             let luma = (0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]).clamp(0.0, 1.0);
-
             let tone_weight = match range {
                 ToneRange::Shadows => (1.0 - luma) * (1.0 - luma),
                 ToneRange::Midtones => 4.0 * luma * (1.0 - luma),
@@ -956,7 +1145,6 @@ pub fn apply_dodge_burn_stroke(
             if strength <= 1e-5 {
                 continue;
             }
-
             let adjust = |ch: f32| -> f32 {
                 match mode {
                     DodgeBurnMode::Dodge => ch + (1.0 - ch) * strength,
@@ -972,6 +1160,23 @@ pub fn apply_dodge_burn_stroke(
     }
 }
 
+/// Applies photographic Dodge (lighten) or Burn (darken) exposure adjustment along `points`,
+/// smoothly weighted to the chosen [`ToneRange`] (`Shadows`, `Midtones`, or `Highlights`).
+pub fn apply_dodge_burn_stroke(
+    asset: &mut RasterAsset,
+    points: &[Point2D],
+    radius_px: f32,
+    hardness: f32,
+    mode: DodgeBurnMode,
+    range: ToneRange,
+    exposure: f32,
+) {
+    let sp: Vec<StylusPoint> = points.iter().copied().map(StylusPoint::uniform).collect();
+    apply_dodge_burn_stroke_stylus_masked(
+        asset, &sp, radius_px, hardness, mode, range, exposure, None,
+    );
+}
+
 /// Contiguous raster paint-bucket flood fill using an iterative scanline-span BFS queue
 /// (zero recursion, safe on arbitrarily large images) with per-channel tolerance `0..=255`.
 ///
@@ -983,7 +1188,23 @@ pub fn raster_flood_fill(
     fill_color: Color,
     tolerance: u8,
 ) -> usize {
+    raster_flood_fill_masked(asset, seed_x, seed_y, fill_color, tolerance, None)
+}
+
+/// Contiguous raster paint-bucket flood fill constrained natively to `mask` so traversal
+/// never leaks across mask boundaries and never dirties CoW tiles outside the mask.
+pub fn raster_flood_fill_masked(
+    asset: &mut RasterAsset,
+    seed_x: u32,
+    seed_y: u32,
+    fill_color: Color,
+    tolerance: u8,
+    mask: Option<&RasterMask>,
+) -> usize {
     if !is_valid_raster_asset(asset) || seed_x >= asset.width || seed_y >= asset.height {
+        return 0;
+    }
+    if mask.is_some_and(|m| m.get(seed_x, seed_y) == 0) {
         return 0;
     }
     let w = asset.width as usize;
@@ -997,6 +1218,9 @@ pub fn raster_flood_fill(
 
     let tol = i32::from(tolerance);
     let matches_seed = |bytes: &[u8], x: usize, y: usize| -> bool {
+        if mask.is_some_and(|m| m.get(x as u32, y as u32) == 0) {
+            return false;
+        }
         let idx = (y * w + x) * 4;
         (i32::from(bytes[idx]) - i32::from(seed_px[0])).abs() <= tol
             && (i32::from(bytes[idx + 1]) - i32::from(seed_px[1])).abs() <= tol
@@ -1018,7 +1242,6 @@ pub fn raster_flood_fill(
             continue;
         }
 
-        // Expand horizontal span to left & right boundaries
         let mut lx = sx;
         while lx > 0 && !visited[row_base + lx - 1] && matches_seed(&rgba8, lx - 1, sy) {
             lx -= 1;
@@ -1028,15 +1251,15 @@ pub fn raster_flood_fill(
             rx += 1;
         }
 
-        // Fill span and queue contiguous matching runs on rows above and below
         let mut above_in_run = false;
         let mut below_in_run = false;
         for x in lx..=rx {
             visited[row_base + x] = true;
-            if direct_write {
+            let mask_f = mask.map_or(1.0, |m| f32::from(m.get(x as u32, sy as u32)) / 255.0);
+            if direct_write && mask_f >= 0.999 {
                 asset.write_pixel_f32(x as u32, sy as u32, [fr, fg, fb, fa]);
             } else {
-                blend_pixel_over(asset, x as u32, sy as u32, fr, fg, fb, fa);
+                blend_pixel_over(asset, x as u32, sy as u32, fr, fg, fb, fa * mask_f);
             }
             filled_count += 1;
 
@@ -2141,23 +2364,82 @@ fn prepare_tone_curve_knots(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
     sorted
 }
 
+/// Monotonic Fritsch-Carlson cubic Hermite spline evaluation over sorted `(x, y)` knots.
 #[inline]
 fn eval_tone_curve_hermite(sorted: &[(f32, f32)], x: f32) -> f32 {
-    for win in sorted.windows(2) {
-        let (x0, y0) = win[0];
-        let (x1, y1) = win[1];
-        if x >= x0 && x <= x1 {
-            let span = x1 - x0;
-            return if span <= 1e-6 {
-                y1
-            } else {
-                let t = (x - x0) / span;
-                let s = t * t * (3.0 - 2.0 * t);
-                (y0 + (y1 - y0) * s).clamp(0.0, 1.0)
-            };
+    if sorted.is_empty() {
+        return x.clamp(0.0, 1.0);
+    }
+    if sorted.len() == 1 {
+        return sorted[0].1.clamp(0.0, 1.0);
+    }
+    // Deduplicate knots sharing identical x within 1e-5
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(sorted.len());
+    for &p in sorted {
+        if let Some(last) = pts.last_mut() {
+            if (p.0 - last.0).abs() <= 1e-5 {
+                last.1 = p.1;
+                continue;
+            }
+        }
+        pts.push(p);
+    }
+    let n = pts.len();
+    if n < 2 {
+        return pts[0].1.clamp(0.0, 1.0);
+    }
+    let mut h = Vec::with_capacity(n - 1);
+    let mut d = Vec::with_capacity(n - 1);
+    for k in 0..(n - 1) {
+        let hk = (pts[k + 1].0 - pts[k].0).max(1e-6);
+        h.push(hk);
+        d.push((pts[k + 1].1 - pts[k].1) / hk);
+    }
+    let mut m = vec![0.0_f32; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for k in 1..(n - 1) {
+        if d[k - 1] * d[k] <= 0.0 {
+            m[k] = 0.0;
+        } else {
+            m[k] = 0.5 * (d[k - 1] + d[k]);
         }
     }
-    x.clamp(0.0, 1.0)
+    for k in 0..(n - 1) {
+        let dk = d[k];
+        if dk.abs() <= 1e-6 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+        } else {
+            let a = m[k] / dk;
+            let b = m[k + 1] / dk;
+            let s = a * a + b * b;
+            if s > 9.0 {
+                let tau = 3.0 / s.sqrt();
+                m[k] = tau * a * dk;
+                m[k + 1] = tau * b * dk;
+            }
+        }
+    }
+
+    let xc = x.clamp(pts[0].0, pts[n - 1].0);
+    for k in 0..(n - 1) {
+        let (x0, y0) = pts[k];
+        let (x1, y1) = pts[k + 1];
+        if xc >= x0 && xc <= x1 {
+            let span = h[k];
+            let t = ((xc - x0) / span).clamp(0.0, 1.0);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + t;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            return (h00 * y0 + h10 * span * m[k] + h01 * y1 + h11 * span * m[k + 1])
+                .clamp(0.0, 1.0);
+        }
+    }
+    xc.clamp(0.0, 1.0)
 }
 
 fn build_tone_curve_lut_from_knots(sorted: &[(f32, f32)]) -> [u8; 256] {
@@ -2294,37 +2576,12 @@ fn sample_stylus_dabs(points: &[StylusPoint], step: f32) -> Vec<StylusPoint> {
     dabs
 }
 
-fn sample_stroke_dabs(points: &[Point2D], step: f32) -> Vec<Point2D> {
-    let finite: Vec<Point2D> = points.iter().copied().filter(|p| p.is_finite()).collect();
-    if finite.is_empty() {
-        return Vec::new();
-    }
-    let step_f64 = f64::from(step.max(0.5));
-    let mut dabs = Vec::new();
-    dabs.push(finite[0]);
-    for win in finite.windows(2) {
-        if dabs.len() >= MAX_STROKE_DABS {
-            break;
-        }
-        let a = win[0];
-        let b = win[1];
-        let dist = a.distance_to(b);
-        if !dist.is_finite() || dist <= 1e-6 {
-            continue;
-        }
-        let remaining = MAX_STROKE_DABS.saturating_sub(dabs.len());
-        let raw_steps = (dist / step_f64).ceil();
-        let steps = if !raw_steps.is_finite() || raw_steps >= remaining as f64 {
-            remaining.max(1)
-        } else {
-            (raw_steps as usize).max(1)
-        };
-        for i in 1..=steps {
-            let t = i as f64 / steps as f64;
-            dabs.push(a.lerp(b, t));
-        }
-    }
-    dabs
+fn dab_bounds_stylus(dab: &StylusPoint, r: f32, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let tx = sanitize_f32(dab.tilt_x_deg, 0.0).clamp(-85.0, 85.0);
+    let ty = sanitize_f32(dab.tilt_y_deg, 0.0).clamp(-85.0, 85.0);
+    let tilt_mag = tx.hypot(ty).clamp(0.0, 85.0);
+    let aspect = 1.0 + tilt_mag / 60.0;
+    dab_bounds(dab.pos, r * aspect, width, height)
 }
 
 fn dab_bounds(dab: Point2D, r: f32, width: u32, height: u32) -> (u32, u32, u32, u32) {
@@ -2586,5 +2843,50 @@ mod tests {
             heavy.read_pixel_rgba8(64, 64).unwrap()[3] > light.read_pixel_rgba8(64, 64).unwrap()[3],
             "Higher pressure must yield higher center alpha"
         );
+    }
+
+    #[test]
+    fn tone_curve_monotonic_hermite_preserves_identity_knots() {
+        let knots = prepare_tone_curve_knots(&[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)]);
+        for i in 0..=10 {
+            let x = i as f32 / 10.0;
+            let y = eval_tone_curve_hermite(&knots, x);
+            assert!(
+                (y - x).abs() < 1e-4,
+                "Expected monotonic Hermite identity at {x}, got {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn masked_brushes_and_flood_fill_preserve_cow_tiles() {
+        let orig =
+            RasterAsset::new(512, 512, vec![128u8; 512 * 512 * 4], 300.0, ColorMode::Rgb).unwrap();
+        let before = orig.shared_tile_ptrs();
+        // Mask covers only tile (0,0): [0..100, 0..100]
+        let mask = RasterMask::from_rectangle(512, 512, Rect2D::from_xywh(0.0, 0.0, 100.0, 100.0));
+
+        let mut erased = orig.clone();
+        erase_stroke_stylus_masked(
+            &mut erased,
+            &[StylusPoint::uniform(Point2D::new(90.0, 90.0))],
+            40.0,
+            0.8,
+            Some(&mask),
+        );
+        assert_eq!(erased.read_pixel_rgba8(150, 90).unwrap()[3], 128);
+        assert_eq!(&erased.shared_tile_ptrs()[1..], &before[1..]);
+
+        let mut filled = orig.clone();
+        let cnt = raster_flood_fill_masked(
+            &mut filled,
+            50,
+            50,
+            Color::rgba8(20, 40, 200, 255),
+            10,
+            Some(&mask),
+        );
+        assert_eq!(cnt, 100 * 100);
+        assert_eq!(&filled.shared_tile_ptrs()[1..], &before[1..]);
     }
 }

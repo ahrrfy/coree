@@ -1377,9 +1377,12 @@ fn emit_object(
             }
             NodePayload::Raster(raster) => {
                 if let Some(asset) = doc.asset(raster.asset_id) {
+                    let filtered = (!raster.filters.is_empty())
+                        .then(|| coree_render::apply_raster_filters(asset, &raster.filters));
+                    let active_asset = filtered.as_ref().unwrap_or(asset);
                     if opacity < 1.0 - 1e-4
                         || obj.blend_mode != BlendMode::Normal
-                        || asset_has_alpha(asset)
+                        || asset_has_alpha(active_asset)
                     {
                         *has_transparency = true;
                     }
@@ -1387,11 +1390,19 @@ fn emit_object(
                     let br =
                         world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
                     let tl = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                    let (asset_id, inline_rgba) = if let Some(filt) = filtered {
+                        (
+                            None,
+                            Some(Arc::new((filt.width, filt.height, filt.to_rgba8_vec()))),
+                        )
+                    } else {
+                        (Some(raster.asset_id), None)
+                    };
                     ops.push(DisplayOp::DrawRaster {
                         id: obj.id,
                         id_suffix,
-                        asset_id: Some(raster.asset_id),
-                        inline_rgba: None,
+                        asset_id,
+                        inline_rgba,
                         rect_mm: None,
                         bl,
                         br,
@@ -2437,5 +2448,153 @@ mod tests {
             clone_px[2] > 150 && clone_px[1] > 150 && clone_px[0] < 100 && clone_px[3] > 200,
             "CutClone raster pixel should be cyan, got {clone_px:?}"
         );
+    }
+
+    #[test]
+    fn display_list_and_exports_apply_raster_filters_end_to_end() {
+        use crate::eps::{export_eps_to_string, import_eps_bytes};
+        use crate::pdf::{export_pdf_to_bytes, PdfColorSpace, PdfExportOptions};
+        use crate::pdf_import::import_pdf_bytes;
+        use crate::svg::{export_svg_to_string, import_svg_str};
+        use coree_core::{ColorMode, RasterAsset, RasterFilter, RasterLayerData};
+
+        let make_doc = |filters: Vec<RasterFilter>| -> Document {
+            let mut doc = Document::new("RasterFxExport", 100.0, 100.0, ColorMode::Rgb, 72.0);
+            let rgba = [220u8, 40, 20, 255].repeat(16 * 16);
+            let asset = RasterAsset::new(16, 16, rgba, 72.0, ColorMode::Rgb).unwrap();
+            let aid = doc.register_asset(asset);
+            let master_id = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        "FilteredRaster",
+                        NodePayload::Raster(RasterLayerData {
+                            asset_id: aid,
+                            width_mm: 50.0,
+                            height_mm: 50.0,
+                            crop_rect: None,
+                            filters,
+                        }),
+                    )
+                    .with_transform(Affine2D::translate(5.0, 5.0)),
+                    None,
+                )
+                .unwrap();
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "CloneRaster",
+                    NodePayload::Clone {
+                        master_id,
+                        link_fill: true,
+                        link_outline: true,
+                        link_shape: true,
+                    },
+                )
+                .with_transform(Affine2D::translate(50.0, 5.0)),
+                None,
+            )
+            .unwrap();
+            doc
+        };
+
+        let doc_id = make_doc(Vec::new());
+        let doc_fx = make_doc(vec![
+            RasterFilter::ChannelMixer {
+                red: [0.0, 1.0, 0.0],
+                green: [1.0, 0.0, 0.0],
+                blue: [0.0, 0.0, 1.0],
+                monochrome: false,
+            },
+            RasterFilter::ToneCurve {
+                points: vec![(0.0, 0.0), (0.5, 0.85), (1.0, 1.0)],
+            },
+        ]);
+
+        let mut te = TextEngine::new();
+        let dl_fx =
+            ExportDisplayList::build(&doc_fx, 0, &DisplayListOptions::pdf(), &mut te).unwrap();
+        let raster_ops: Vec<_> = dl_fx
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DisplayOp::DrawRaster {
+                    asset_id,
+                    inline_rgba,
+                    ..
+                } => Some((*asset_id, inline_rgba.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raster_ops.len(),
+            2,
+            "expected DrawRaster for both Raster and Clone->Raster"
+        );
+        for (aid, inline) in &raster_ops {
+            assert!(
+                aid.is_none(),
+                "filtered raster must emit inline_rgba with asset_id: None"
+            );
+            let (w, h, bytes) = inline.as_deref().expect("inline_rgba must be Some");
+            assert_eq!((*w, *h), (16, 16));
+            assert_eq!(
+                &bytes[0..4],
+                &[75, 249, 36, 255],
+                "expected ChannelMixer+ToneCurve green pixel"
+            );
+        }
+
+        // PDF export + re-import check
+        let pdf_opts = PdfExportOptions {
+            color_space: PdfColorSpace::DeviceRgb,
+            ..PdfExportOptions::default()
+        };
+        let pdf_id = export_pdf_to_bytes(&doc_id, &pdf_opts).unwrap();
+        let pdf_fx = export_pdf_to_bytes(&doc_fx, &pdf_opts).unwrap();
+        assert_ne!(
+            pdf_id, pdf_fx,
+            "filtered PDF must differ from unfiltered PDF"
+        );
+        let pdf_back = import_pdf_bytes(&pdf_fx, "PdfFxBack").unwrap();
+        let pdf_px = pdf_back
+            .assets()
+            .values()
+            .next()
+            .expect("imported PDF must contain raster asset")
+            .to_rgba8_vec();
+        assert_eq!(&pdf_px[0..4], &[75, 249, 36, 255]);
+
+        // SVG export + re-import check
+        let svg_id = export_svg_to_string(&doc_id, 0).unwrap();
+        let svg_fx = export_svg_to_string(&doc_fx, 0).unwrap();
+        assert_ne!(
+            svg_id, svg_fx,
+            "filtered SVG must differ from unfiltered SVG"
+        );
+        let svg_back = import_svg_str(&svg_fx).unwrap();
+        let svg_px = svg_back
+            .assets()
+            .values()
+            .next()
+            .expect("imported SVG must contain raster asset")
+            .to_rgba8_vec();
+        assert_eq!(&svg_px[0..4], &[75, 249, 36, 255]);
+
+        // EPS export + re-import check
+        let eps_id = export_eps_to_string(&doc_id, 0).unwrap();
+        let eps_fx = export_eps_to_string(&doc_fx, 0).unwrap();
+        assert_ne!(
+            eps_id, eps_fx,
+            "filtered EPS must differ from unfiltered EPS"
+        );
+        let eps_back = import_eps_bytes(eps_fx.as_bytes(), "EpsFxBack").unwrap();
+        let eps_px = eps_back
+            .assets()
+            .values()
+            .next()
+            .expect("imported EPS must contain raster asset")
+            .to_rgba8_vec();
+        assert_eq!(&eps_px[0..4], &[75, 249, 36, 255]);
     }
 }

@@ -14,8 +14,12 @@ use crate::barcode::{
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{clone_document_shell, clone_page_contents_into, get_page};
 use coree_core::{Affine2D, Document, LayerId, NodePayload, ObjectId, Point2D};
+use coree_io::pdf::{PdfExportOptions, StreamingPdfDocument};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 /// Configuration for generating automatic padded serial numbers during print merge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +406,398 @@ pub fn apply_print_merge(
     Ok(out)
 }
 
+struct PreparedMergeTemplate {
+    base_doc: Document,
+    top_ids: Vec<ObjectId>,
+    page_layer_objects: Vec<(LayerId, Vec<ObjectId>)>,
+}
+
+fn prepare_merge_template(
+    template_doc: &Document,
+    tpl_w: f64,
+    tpl_h: f64,
+    tpl_bleed: f64,
+    options: &PrintMergeOptions,
+) -> ProdResult<PreparedMergeTemplate> {
+    let mut base_doc = clone_document_shell(template_doc, template_doc.title());
+    base_doc.palettes_mut().clear();
+    base_doc.document_palette_mut().swatches.clear();
+    base_doc.add_page("Page 1", tpl_w, tpl_h, tpl_bleed);
+    let top_ids = clone_page_contents_into(
+        template_doc,
+        options.template_page_index,
+        &mut base_doc,
+        0,
+        Affine2D::IDENTITY,
+        None,
+    )?;
+    let page_layer_objects: Vec<(LayerId, Vec<ObjectId>)> = base_doc.pages()[0]
+        .layers
+        .iter()
+        .map(|l| (l.id, l.objects.clone()))
+        .collect();
+    Ok(PreparedMergeTemplate {
+        base_doc,
+        top_ids,
+        page_layer_objects,
+    })
+}
+
+fn merge_prepared_row_into_doc(
+    prepared: &PreparedMergeTemplate,
+    fields: &BTreeMap<String, String>,
+    options: &PrintMergeOptions,
+) -> ProdResult<Document> {
+    let mut out = prepared.base_doc.clone();
+    if let Some(p0) = out.page_mut(0) {
+        p0.name = substitute_placeholders(&options.page_name_pattern, fields);
+    }
+
+    let mut replacements: Vec<BarcodeReplacement> = Vec::new();
+    for (lid, obj_ids) in &prepared.page_layer_objects {
+        for &oid in obj_ids {
+            collect_barcode_replacements(
+                &out,
+                oid,
+                BarcodeParent::Layer(*lid),
+                *lid,
+                fields,
+                options,
+                0,
+                &mut replacements,
+            );
+        }
+    }
+
+    for rep in replacements {
+        let new_id = match rep.directive {
+            BarcodeDirective::Qr(data) => add_qr_code_to_document(
+                &mut out,
+                &data,
+                rep.origin,
+                &options.qr_options,
+                Some(rep.host_layer_id),
+            )?,
+            BarcodeDirective::Linear { symbology, data } => add_barcode_to_document(
+                &mut out,
+                symbology,
+                &data,
+                rep.origin,
+                &options.barcode_options,
+                Some(rep.host_layer_id),
+            )?,
+        };
+        out.cleanup_dangling_refs_for_object_ids(&[rep.old_id]);
+        match rep.parent {
+            BarcodeParent::Layer(lid) => {
+                if let Some(layer) = out.find_layer_mut(lid) {
+                    layer.objects.retain(|&id| id != new_id);
+                    if let Some(pos) = layer.objects.iter().position(|&id| id == rep.old_id) {
+                        layer.objects[pos] = new_id;
+                    } else {
+                        layer.objects.push(new_id);
+                    }
+                }
+            }
+            BarcodeParent::Container(parent_id) => {
+                if let Some(layer) = out.find_layer_mut(rep.host_layer_id) {
+                    layer.objects.retain(|&id| id != new_id);
+                }
+                let _ = out.replace_container_child(parent_id, rep.old_id, new_id);
+            }
+        }
+        let _ = out.remove_object(rep.old_id);
+    }
+
+    for &oid in &prepared.top_ids {
+        if out.has_object(oid) {
+            out.substitute_object_text_and_table_placeholders(oid, |s| {
+                substitute_placeholders(s, fields)
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Streaming RFC-4180 CSV/TSV record reader reading incrementally from `BufReader`.
+struct StreamingCsvReader<R: BufRead> {
+    reader: R,
+    delimiter: char,
+    line_no: usize,
+    line_buf: String,
+    stripped_bom: bool,
+    eof: bool,
+}
+
+impl<R: BufRead> StreamingCsvReader<R> {
+    fn new(reader: R, delimiter: char) -> Self {
+        Self {
+            reader,
+            delimiter,
+            line_no: 0,
+            line_buf: String::with_capacity(512),
+            stripped_bom: false,
+            eof: false,
+        }
+    }
+
+    fn read_next_record(&mut self) -> ProdResult<Option<Vec<String>>> {
+        if self.eof {
+            return Ok(None);
+        }
+        let mut row: Vec<String> = Vec::new();
+        let mut field = String::new();
+        let mut in_quotes = false;
+        let mut started_record = false;
+
+        loop {
+            self.line_buf.clear();
+            let n = self.reader.read_line(&mut self.line_buf)?;
+            if n == 0 {
+                self.eof = true;
+                if in_quotes {
+                    return Err(ProdError::CsvParseError {
+                        line: self.line_no.max(1),
+                        reason: "unterminated quoted field".into(),
+                    });
+                }
+                if !started_record {
+                    return Ok(None);
+                }
+                row.push(field);
+                return Ok(Some(row));
+            }
+            self.line_no += 1;
+            let mut slice = self.line_buf.as_str();
+            if !self.stripped_bom {
+                self.stripped_bom = true;
+                slice = slice.strip_prefix('\u{FEFF}').unwrap_or(slice);
+            }
+            if !started_record && !in_quotes {
+                let no_nl = slice.trim_end_matches(&['\r', '\n'][..]);
+                if no_nl.is_empty() {
+                    continue;
+                }
+            }
+            started_record = true;
+
+            let mut chars = slice.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if in_quotes {
+                    if ch == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            field.push('"');
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        field.push(ch);
+                    }
+                } else if ch == '"' && field.is_empty() {
+                    in_quotes = true;
+                } else if ch == self.delimiter {
+                    row.push(std::mem::take(&mut field));
+                } else if ch == '\r' {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                } else if ch == '\n' {
+                    // end of physical line; if not inside quotes, record finishes below
+                } else {
+                    field.push(ch);
+                }
+            }
+            if !in_quotes {
+                row.push(field);
+                return Ok(Some(row));
+            }
+        }
+    }
+}
+
+/// Streams a CSV/TSV file directly into a multi-page `/FlateDecode` PDF at `pdf_path` using
+/// constant `O(1)` memory per row (reusing one `TextEngine`, one `PdfFontRegistry`, and direct
+/// `BufWriter<File>` disk streaming). Returns the number of merged PDF pages emitted.
+pub fn stream_print_merge_csv_to_pdf(
+    template_doc: &Document,
+    csv_path: &Path,
+    pdf_path: &Path,
+    options: &PrintMergeOptions,
+) -> ProdResult<usize> {
+    let delimiter = if csv_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tsv"))
+    {
+        '\t'
+    } else {
+        ','
+    };
+
+    let tpl_page = get_page(template_doc, options.template_page_index)?;
+    let tpl_w = tpl_page.width_mm;
+    let tpl_h = tpl_page.height_mm;
+    let tpl_bleed = if tpl_page.bleed_mm.is_finite() {
+        tpl_page.bleed_mm.max(0.0)
+    } else {
+        0.0
+    };
+    if !tpl_w.is_finite() || tpl_w <= 0.0 || !tpl_h.is_finite() || tpl_h <= 0.0 {
+        return Err(ProdError::MergeError(
+            "template page dimensions must be positive and finite".into(),
+        ));
+    }
+
+    let file = File::open(csv_path)?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut csv = StreamingCsvReader::new(reader, delimiter);
+
+    let Some(raw_headers) = csv.read_next_record()? else {
+        return Err(ProdError::CsvParseError {
+            line: 1,
+            reason: "input contains no header row".into(),
+        });
+    };
+    let headers: Vec<String> = raw_headers
+        .into_iter()
+        .map(|h| h.trim().to_owned())
+        .collect();
+    if headers.is_empty() || headers.iter().all(String::is_empty) {
+        return Err(ProdError::CsvParseError {
+            line: 1,
+            reason: "header row is empty".into(),
+        });
+    }
+
+    let pdf_opts = PdfExportOptions {
+        compress_streams: true,
+        page_info_slug: false,
+        ..PdfExportOptions::default()
+    };
+    let mut writer = StreamingPdfDocument::create(template_doc, &pdf_opts, pdf_path)
+        .map_err(|e| ProdError::MergeError(format!("failed to create streaming PDF: {e}")))?;
+
+    const BATCH_SIZE: usize = 256;
+    let mut row_count = 0usize;
+    let prepared = prepare_merge_template(template_doc, tpl_w, tpl_h, tpl_bleed, options)?;
+    let mut batch_fields: Vec<BTreeMap<String, String>> = Vec::with_capacity(BATCH_SIZE);
+
+    let flush_batch = |batch: &mut Vec<BTreeMap<String, String>>,
+                       writer: &mut StreamingPdfDocument|
+     -> ProdResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        use rayon::prelude::*;
+        let docs: Vec<ProdResult<Document>> = batch
+            .par_iter()
+            .map(|fields| merge_prepared_row_into_doc(&prepared, fields, options))
+            .collect();
+        for doc_res in docs {
+            let doc = doc_res?;
+            writer
+                .push_page(&doc, 0)
+                .map_err(|e| ProdError::MergeError(format!("streaming PDF page failed: {e}")))?;
+        }
+        batch.clear();
+        Ok(())
+    };
+
+    while let Some(mut rec) = csv.read_next_record()? {
+        if rec.len() == 1 && rec[0].is_empty() && headers.len() > 1 {
+            continue;
+        }
+        rec.resize(headers.len(), String::new());
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        for (h, val) in headers.iter().zip(rec) {
+            fields.insert(h.clone(), val);
+        }
+        fields.insert("_Row".to_owned(), (row_count + 1).to_string());
+        if let Some(serial_cfg) = &options.serial {
+            fields
+                .entry(serial_cfg.column_name.clone())
+                .or_insert_with(|| serial_cfg.format_row(row_count));
+        }
+        batch_fields.push(fields);
+        row_count += 1;
+        if batch_fields.len() >= BATCH_SIZE {
+            flush_batch(&mut batch_fields, &mut writer)?;
+        }
+    }
+    flush_batch(&mut batch_fields, &mut writer)?;
+
+    if row_count == 0 {
+        return Err(ProdError::MergeError(
+            "print merge CSV contains zero data rows".into(),
+        ));
+    }
+
+    writer
+        .finish()
+        .map_err(|e| ProdError::MergeError(format!("failed to finalize streaming PDF: {e}")))?;
+    Ok(row_count)
+}
+
+/// Streams an in-memory [`PrintMergeTable`] row-by-row into a PDF at `pdf_path`.
+pub fn stream_print_merge_table_to_pdf(
+    template_doc: &Document,
+    table: &PrintMergeTable,
+    pdf_path: &Path,
+    options: &PrintMergeOptions,
+) -> ProdResult<usize> {
+    if table.rows.is_empty() {
+        return Err(ProdError::MergeError(
+            "print merge table contains zero data rows".into(),
+        ));
+    }
+    let tpl_page = get_page(template_doc, options.template_page_index)?;
+    let tpl_w = tpl_page.width_mm;
+    let tpl_h = tpl_page.height_mm;
+    let tpl_bleed = if tpl_page.bleed_mm.is_finite() {
+        tpl_page.bleed_mm.max(0.0)
+    } else {
+        0.0
+    };
+    let pdf_opts = PdfExportOptions {
+        compress_streams: true,
+        page_info_slug: false,
+        ..PdfExportOptions::default()
+    };
+    let mut writer = StreamingPdfDocument::create(template_doc, &pdf_opts, pdf_path)
+        .map_err(|e| ProdError::MergeError(format!("failed to create streaming PDF: {e}")))?;
+    let prepared = prepare_merge_template(template_doc, tpl_w, tpl_h, tpl_bleed, options)?;
+
+    const BATCH_SIZE: usize = 256;
+    for chunk_start in (0..table.rows.len()).step_by(BATCH_SIZE) {
+        let chunk_end = (chunk_start + BATCH_SIZE).min(table.rows.len());
+        use rayon::prelude::*;
+        let docs: Vec<ProdResult<Document>> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|row_idx| {
+                let mut fields = table.row_map(row_idx);
+                fields.insert("_Row".to_owned(), (row_idx + 1).to_string());
+                if let Some(serial_cfg) = &options.serial {
+                    fields
+                        .entry(serial_cfg.column_name.clone())
+                        .or_insert_with(|| serial_cfg.format_row(row_idx));
+                }
+                merge_prepared_row_into_doc(&prepared, &fields, options)
+            })
+            .collect();
+        for doc_res in docs {
+            let doc = doc_res?;
+            writer
+                .push_page(&doc, 0)
+                .map_err(|e| ProdError::MergeError(format!("streaming PDF page failed: {e}")))?;
+        }
+    }
+    writer
+        .finish()
+        .map_err(|e| ProdError::MergeError(format!("failed to finalize streaming PDF: {e}")))?;
+    Ok(table.rows.len())
+}
+
 #[derive(Debug, Clone)]
 enum BarcodeDirective {
     Qr(String),
@@ -728,5 +1124,67 @@ mod tests {
         assert_eq!(table.row_count(), 100);
         assert_eq!(table.rows[0][0], "TKT-0001");
         assert_eq!(table.rows[99][0], "TKT-0100");
+    }
+
+    #[test]
+    fn stream_print_merge_csv_to_pdf_streams_arabic_latin_and_qr_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("rows.csv");
+        let pdf_path = dir.path().join("merged_stream.pdf");
+        std::fs::write(
+            &csv_path,
+            "Name,Code\n\"أحمد\",\"QR-101\"\n\"Sara, Chen\",\"QR-102\"\n",
+        )
+        .unwrap();
+
+        let mut tpl = Document::new_a4("Stream Template");
+        tpl.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Label",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "Hello <<Name>> <<_Row>>",
+                    TextStyle {
+                        font_size_pt: 14.0,
+                        fill: Color::KEY_BLACK,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_transform(Affine2D::translate(20.0, 30.0)),
+            None,
+        )
+        .unwrap();
+        tpl.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "QR:<<Code>>",
+                NodePayload::Shape(coree_core::ParametricShape::Rectangle {
+                    width: 20.0,
+                    height: 20.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: coree_core::CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_transform(Affine2D::translate(20.0, 50.0)),
+            None,
+        )
+        .unwrap();
+
+        let count = stream_print_merge_csv_to_pdf(
+            &tpl,
+            &csv_path,
+            &pdf_path,
+            &PrintMergeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        let bytes = std::fs::read(&pdf_path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(bytes.starts_with(b"%PDF-1.7\n"));
+        assert!(text.contains("/Count 2"));
+        assert!(text.contains("/Filter /FlateDecode"));
+        assert!(text.contains("xref\n"));
     }
 }

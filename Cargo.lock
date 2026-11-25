@@ -648,6 +648,9 @@ name = "coree-prod"
 version = "0.3.1"
 dependencies = [
  "coree-core",
+ "coree-io",
+ "coree-render",
+ "flate2",
  "i_overlay",
  "image",
  "kurbo",
@@ -659,6 +662,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tiny-skia",
+ "ttf-parser",
 ]
 
 [[package]]

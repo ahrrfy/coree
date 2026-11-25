@@ -4,7 +4,10 @@
 
 use crate::overlay::TransientOverlay;
 use crate::types::ToolId;
-use coree_core::{Affine2D, CommandOp, NodeRef, ObjectId, Point2D, Rect2D, StylusSample, Vec2D};
+use coree_core::{
+    Affine2D, CommandOp, NodeRef, ObjectId, Point2D, RasterMaskSelection, Rect2D, StylusSample,
+    Vec2D,
+};
 
 /// Non-`CommandOp` / `coree-render`-dependent / UI-shell side-effect requested by [`ToolCore`](crate::ToolCore).
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +44,8 @@ pub enum ToolActionRequest {
     SetPendingCropRect(Option<Rect2D>),
     ApplyCropRect(Rect2D),
     SetRasterMaskRect(Option<Rect2D>),
+    SetRasterMask(Option<RasterMaskSelection>),
+    ClearRasterMask,
     SetSelectedGuide(Option<u64>),
     SetSelectedMeshNode(Option<(ObjectId, usize)>),
     EnterPowerClipEdit(ObjectId),

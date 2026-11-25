@@ -5,13 +5,13 @@
 //! - [`TraceMode::OutlineTrace`] with presets (`LineArt`, `Logo`, `DetailedLogo`, `Clipart`, etc.)
 //! - [`TraceMode::CenterlineTrace`] via Zhang-Suen morphological skeletonization for CNC / laser / plotters!
 //!
-//! Pipeline: K-Means color quantization -> connected component pruning ->
-//! Marching Squares contour extraction (or Zhang-Suen thinning) ->
-//! Ramer-Douglas-Peucker simplification -> smooth Cubic Bézier curve fitting.
+//! Pipeline: >16MP safe downscale -> K-Means++ `Vec<u8>` quantization -> speckle reassignment ->
+//! topological shared-edge pixel-grid Potrace (`calc_lon`, `bestpolygon`, `adjust_vertices`,
+//! `smooth`, `opticurve`) -> zero-gap shared Cubic Bézier curves.
 
 use crate::backend::validate_surface_dimensions;
 use coree_core::math::{sanitize_f64, MM_PER_INCH};
-use coree_core::{BezierPath, Color, NodeKind, PathNode, Point2D, RasterAsset, Subpath};
+use coree_core::{BezierPath, Color, NodeKind, PathNode, Point2D, RasterAsset, Subpath, Vec2D};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Preset tuning for [`TraceMode::OutlineTrace`].
@@ -50,6 +50,8 @@ pub struct TraceConfig {
     pub remove_background: bool,
     /// Sharp corner threshold in degrees (`0.0..=180.0`); corners sharper than this stay `NodeKind::Cusp`.
     pub corner_threshold: f64,
+    /// Minimum speckle area in pixels (`0` derives automatically from `detail`).
+    pub speckle_size: usize,
 }
 
 impl Default for TraceConfig {
@@ -61,8 +63,51 @@ impl Default for TraceConfig {
             detail: 0.75,
             remove_background: true,
             corner_threshold: 60.0,
+            speckle_size: 0,
         }
     }
+}
+
+const MAX_TRACE_DIM: u32 = 4096;
+const MAX_TRACE_PIXELS: u64 = 12_000_000;
+const EDGE_BUDGET_MIN_PIXELS: usize = 1_000_000;
+const MAX_SAFE_BOUNDARY_EDGES: usize = 1_200_000;
+const MAX_SAFE_POTRACE_ARCS: usize = 200_000;
+
+/// Downscales oversized rasters (>4096px or >16MP) directly from CoW tiles without
+/// materializing a full-res RGBA8 intermediate buffer, preserving aspect ratio and physical mm size.
+fn prepare_trace_rgba8(asset: &RasterAsset) -> (u32, u32, Vec<u8>) {
+    let w = asset.width;
+    let h = asset.height;
+    let total = u64::from(w) * u64::from(h);
+    if w <= MAX_TRACE_DIM && h <= MAX_TRACE_DIM && total <= MAX_TRACE_PIXELS {
+        return (w, h, asset.to_rgba8_vec());
+    }
+    let scale_dim =
+        (f64::from(MAX_TRACE_DIM) / f64::from(w)).min(f64::from(MAX_TRACE_DIM) / f64::from(h));
+    let scale_px = (MAX_TRACE_PIXELS as f64 / total as f64).sqrt();
+    let s = scale_dim.min(scale_px).clamp(0.01, 1.0);
+    let nw = ((f64::from(w) * s).floor() as u32).clamp(2, MAX_TRACE_DIM);
+    let nh = ((f64::from(h) * s).floor() as u32).clamp(2, MAX_TRACE_DIM);
+    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    for ny in 0..nh {
+        let sy0 = ((u64::from(ny) * u64::from(h)) / u64::from(nh)) as u32;
+        let sy1 = (((u64::from(ny) + 1) * u64::from(h)) / u64::from(nh))
+            .max(u64::from(sy0) + 1)
+            .min(u64::from(h)) as u32;
+        let sample_y = sy0 + (sy1 - sy0) / 2;
+        for nx in 0..nw {
+            let sx0 = ((u64::from(nx) * u64::from(w)) / u64::from(nw)) as u32;
+            let sx1 = (((u64::from(nx) + 1) * u64::from(w)) / u64::from(nw))
+                .max(u64::from(sx0) + 1)
+                .min(u64::from(w)) as u32;
+            let sample_x = sx0 + (sx1 - sx0) / 2;
+            let px = asset.read_pixel_rgba8(sample_x, sample_y).unwrap_or([0; 4]);
+            let dst = ((ny as usize) * (nw as usize) + (nx as usize)) * 4;
+            out[dst..dst + 4].copy_from_slice(&px);
+        }
+    }
+    (nw, nh, out)
 }
 
 /// Traces `asset` into `(BezierPath, Color)` vector paths scaled into millimeters using `asset.source_dpi`.
@@ -89,14 +134,18 @@ pub fn trace_raster_to_mm(
     {
         return Vec::new();
     }
-    let scale_x = sanitize_f64(width_mm, f64::from(asset.width)).max(1e-3) / f64::from(asset.width);
-    let scale_y =
-        sanitize_f64(height_mm, f64::from(asset.height)).max(1e-3) / f64::from(asset.height);
+    let w_mm = sanitize_f64(width_mm, f64::from(asset.width)).max(1e-3);
+    let h_mm = sanitize_f64(height_mm, f64::from(asset.height)).max(1e-3);
+    let (tw, th, rgba8) = prepare_trace_rgba8(asset);
+    let scale_x = w_mm / f64::from(tw);
+    let scale_y = h_mm / f64::from(th);
 
     match config.mode {
-        TraceMode::CenterlineTrace => trace_centerline(asset, config, scale_x, scale_y),
+        TraceMode::CenterlineTrace => {
+            trace_centerline_rgba(&rgba8, tw as usize, th as usize, config, scale_x, scale_y)
+        }
         TraceMode::QuickTrace | TraceMode::OutlineTrace(_) => {
-            trace_outline(asset, config, scale_x, scale_y)
+            trace_outline_potrace(rgba8, tw as usize, th as usize, config, scale_x, scale_y)
         }
     }
 }
@@ -118,94 +167,1254 @@ fn effective_params(config: &TraceConfig) -> (usize, f64, f64, f64, usize) {
     let smooth = (0.5 * sanitize_f64(config.smoothing, preset_smooth) + 0.5 * preset_smooth)
         .clamp(0.0_f64, 1.0);
     let corner_deg = sanitize_f64(config.corner_threshold, 60.0).clamp(5.0_f64, 175.0);
-    let min_area_px = ((1.0 - detail) * 16.0).round() as usize + 1;
+    let min_area_px = if config.speckle_size > 0 {
+        config.speckle_size
+    } else {
+        ((1.0 - detail) * 16.0).round() as usize + 1
+    };
     (k, detail, smooth, corner_deg, min_area_px)
 }
 
-fn trace_outline(
-    asset: &RasterAsset,
+/// Topological shared-edge Potrace outline vectorizer:
+/// builds a planar pixel-grid label boundary graph, traces each canonical arc/loop once
+/// through Potrace (`calc_lon` -> `bestpolygon` -> `adjust_vertices` -> `smooth` -> `opticurve`),
+/// and stitches reversed shared Bézier chains per color region so adjacent shapes share exact
+/// zero-gap boundaries with 0 white seam pixels.
+fn trace_outline_potrace(
+    rgba8: Vec<u8>,
+    mut w: usize,
+    mut h: usize,
     config: &TraceConfig,
-    scale_x: f64,
-    scale_y: f64,
+    mut scale_x: f64,
+    mut scale_y: f64,
 ) -> Vec<(BezierPath, Color)> {
-    let (k, detail, smooth, corner_deg, min_area_px) = effective_params(config);
-    let w = asset.width as usize;
-    let h = asset.height as usize;
-
-    let (palette, labels) = quantize_kmeans(asset, k);
+    let (k, detail, smooth, corner_deg, turd_size) = effective_params(config);
+    let (palette, mut labels) = quantize_kmeans_u8(&rgba8, w, h, k);
+    drop(rgba8);
     if palette.is_empty() {
         return Vec::new();
     }
 
-    let bg_label = if config.remove_background {
-        detect_border_background_label(&labels, w, h)
-    } else {
-        None
-    };
+    if config.remove_background {
+        if let Some(bg_lbl) = detect_border_background_label_u8(&labels, w, h) {
+            for l in &mut labels {
+                if *l == bg_lbl {
+                    *l = u8::MAX;
+                }
+            }
+        }
+    }
 
-    // Pixel-space RDP tolerance based on detail & smoothing
-    let rdp_eps_px = (0.4 + (1.0 - detail) * 2.2 + smooth * 0.6).clamp(0.35, 4.0);
+    prune_speckles_reassign(&mut labels, w, h, turd_size);
+    enforce_trace_edge_budget(&mut labels, &mut w, &mut h, &mut scale_x, &mut scale_y);
 
-    // Order color layers by pixel area (largest first so smaller details sit on top)
-    let mut color_counts: Vec<(usize, usize)> = (0..palette.len())
-        .map(|ci| {
-            let cnt = labels.iter().filter(|&&l| l == Some(ci)).count();
-            (ci, cnt)
-        })
-        .filter(|&(ci, cnt)| cnt >= min_area_px && Some(ci) != bg_label)
+    // Count area per label after background removal, speckle reassignment, and edge-budget pass
+    let mut color_counts = vec![0usize; palette.len()];
+    for &l in &labels {
+        if (l as usize) < palette.len() {
+            color_counts[l as usize] += 1;
+        }
+    }
+
+    let potrace_alphamax = potrace_alphamax_from_params(corner_deg, smooth);
+    let potrace_opttol = 0.05 + smooth * 0.35 + (1.0 - detail) * 0.25;
+    let region_subpaths = potrace_extract_shared_subpaths(
+        &labels,
+        w,
+        h,
+        palette.len(),
+        potrace_alphamax,
+        potrace_opttol,
+        smooth,
+        corner_deg,
+        scale_x,
+        scale_y,
+    );
+    drop(labels);
+
+    let mut ordered: Vec<(usize, usize)> = color_counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &cnt)| cnt > 0)
+        .map(|(i, &cnt)| (i, cnt))
         .collect();
-    color_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
+    ordered.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let mut results = Vec::new();
-    for (label_idx, _count) in color_counts {
-        let mut mask = vec![false; w * h];
-        for (i, &l) in labels.iter().enumerate() {
-            if l == Some(label_idx) {
-                mask[i] = true;
+    for (label_idx, _) in ordered {
+        if let Some(subpaths) = region_subpaths.get(&label_idx) {
+            if !subpaths.is_empty() {
+                let [r, g, b] = palette[label_idx];
+                results.push((
+                    BezierPath {
+                        subpaths: subpaths.clone(),
+                    },
+                    Color::rgba8(r, g, b, 255),
+                ));
             }
-        }
-        prune_small_components(&mut mask, w, h, min_area_px);
-        let loops = extract_marching_squares_contours(&mask, w, h);
-        let mut subpaths = Vec::new();
-        for poly in loops {
-            if poly.len() < 3 {
-                continue;
-            }
-            let simplified = rdp_simplify_closed(&poly, rdp_eps_px);
-            if simplified.len() < 3 {
-                continue;
-            }
-            let scaled: Vec<Point2D> = simplified
-                .into_iter()
-                .map(|p| Point2D::new(p.x * scale_x, p.y * scale_y))
-                .collect();
-            let sp = fit_smooth_subpath(&scaled, true, smooth, corner_deg);
-            if sp.nodes.len() >= 3 {
-                subpaths.push(sp);
-            }
-        }
-        if !subpaths.is_empty() {
-            let [r, g, b] = palette[label_idx];
-            results.push((BezierPath { subpaths }, Color::rgba8(r, g, b, 255)));
         }
     }
     results
 }
 
+fn potrace_alphamax_from_params(corner_deg: f64, smooth: f64) -> f64 {
+    if smooth <= 0.05 {
+        return 0.0;
+    }
+    // Lower corner_threshold => keep more corners crisp (lower alphamax);
+    // higher smoothing => allow gentler bends to become smooth cubic curves.
+    let base = 0.55 + (corner_deg / 180.0) * 0.65;
+    (base * (0.65 + 0.55 * smooth)).clamp(0.25, 1.3333)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArcKind {
+    ClosedLoop,
+    OpenArc,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PotraceChain<'a> {
+    pts: &'a [(i32, i32)],
+    kind: ArcKind,
+}
+
+#[derive(Debug, Clone)]
+struct TracedBoundarySeg {
+    left_label: u8,
+    right_label: u8,
+    start_v: u32,
+    end_v: u32,
+    /// Nodes along `start_v -> end_v`, with `start_v` (first) and `end_v` (last) pinned endpoints.
+    nodes: Vec<PathNode>,
+}
+
+/// Computes `(boundary_edge_count, open_arc_estimate)` over quantized `labels` in `O(1)` extra memory.
+fn estimate_label_boundary_complexity(labels: &[u8], w: usize, h: usize) -> (usize, usize) {
+    if w == 0 || h == 0 || labels.len() < w * h {
+        return (0, 0);
+    }
+    let lbl_at = |px: isize, py: isize| -> u8 {
+        if px < 0 || py < 0 || px >= w as isize || py >= h as isize {
+            u8::MAX
+        } else {
+            labels[(py as usize) * w + (px as usize)]
+        }
+    };
+    let mut edge_count = 0usize;
+    let mut junction_half_arcs = 0usize;
+    for gy in 0..=h {
+        let gy_i = gy as isize;
+        for gx in 0..=w {
+            let gx_i = gx as isize;
+            let tl = lbl_at(gx_i - 1, gy_i - 1);
+            let tr = lbl_at(gx_i, gy_i - 1);
+            let bl = lbl_at(gx_i - 1, gy_i);
+            let br = lbl_at(gx_i, gy_i);
+            let has_e = u8::from(tr != br);
+            let has_s = u8::from(br != bl);
+            let has_w = u8::from(bl != tl);
+            let has_n = u8::from(tl != tr);
+            edge_count += usize::from(has_e + has_s);
+            let deg = has_e + has_s + has_w + has_n;
+            if deg != 0 && deg != 2 {
+                junction_half_arcs += usize::from(deg);
+            }
+        }
+    }
+    (edge_count, junction_half_arcs / 2)
+}
+
+/// Deterministic mode/center downsample of quantized `u8` label grids using `O(1)` scratch per pixel.
+fn downsample_labels_mode(labels: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    let mut out = vec![u8::MAX; nw * nh];
+    for ny in 0..nh {
+        let sy0 = (ny * h) / nh;
+        let sy1 = (((ny + 1) * h) / nh).max(sy0 + 1).min(h);
+        let mid_y = sy0 + (sy1 - sy0) / 2;
+        for nx in 0..nw {
+            let sx0 = (nx * w) / nw;
+            let sx1 = (((nx + 1) * w) / nw).max(sx0 + 1).min(w);
+            let mid_x = sx0 + (sx1 - sx0) / 2;
+            let center_lbl = labels[mid_y * w + mid_x];
+            if (sx1 - sx0) == 1 && (sy1 - sy0) == 1 {
+                out[ny * nw + nx] = center_lbl;
+                continue;
+            }
+            let mut counts: [(u8, u16); 16] = [(u8::MAX, 0); 16];
+            let mut used_slots = 0usize;
+            for sy in sy0..sy1 {
+                let row = sy * w;
+                for sx in sx0..sx1 {
+                    let lbl = labels[row + sx];
+                    let mut found = false;
+                    for slot in &mut counts[..used_slots] {
+                        if slot.0 == lbl {
+                            slot.1 = slot.1.saturating_add(1);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found && used_slots < counts.len() {
+                        counts[used_slots] = (lbl, 1);
+                        used_slots += 1;
+                    }
+                }
+            }
+            let mut best_lbl = center_lbl;
+            let mut best_cnt = 0u16;
+            for &(lbl, cnt) in &counts[..used_slots] {
+                if cnt > best_cnt || (cnt == best_cnt && lbl == center_lbl) {
+                    best_cnt = cnt;
+                    best_lbl = lbl;
+                }
+            }
+            out[ny * nw + nx] = best_lbl;
+        }
+    }
+    out
+}
+
+/// Guards high-pixel (>1MP) dense textures/checkerboards so Potrace stays comfortably within
+/// a 512 MiB address-space budget without altering <=1MP or low-edge >1MP artwork.
+fn enforce_trace_edge_budget(
+    labels: &mut Vec<u8>,
+    w: &mut usize,
+    h: &mut usize,
+    scale_x: &mut f64,
+    scale_y: &mut f64,
+) {
+    if (*w) * (*h) <= EDGE_BUDGET_MIN_PIXELS {
+        return;
+    }
+    while *w > 256 || *h > 256 {
+        let (edge_count, open_arcs) = estimate_label_boundary_complexity(labels, *w, *h);
+        if edge_count <= MAX_SAFE_BOUNDARY_EDGES && open_arcs <= MAX_SAFE_POTRACE_ARCS {
+            break;
+        }
+        let nw = (*w / 2).max(256).min(*w);
+        let nh = (*h / 2).max(256).min(*h);
+        if nw == *w && nh == *h {
+            break;
+        }
+        let next_labels = downsample_labels_mode(labels, *w, *h, nw, nh);
+        *scale_x = ((*w as f64) * *scale_x) / (nw as f64);
+        *scale_y = ((*h as f64) * *scale_y) / (nh as f64);
+        *w = nw;
+        *h = nh;
+        *labels = next_labels;
+    }
+}
+
+/// Topological shared-edge Potrace boundary extractor.
+/// Uses a 1-byte-per-vertex packed bitmask over `(w + 1) * (h + 1)` vertices (no per-vertex
+/// `HashMap` or `UndirEdge` heap bloat), traces every boundary arc between `(left_label, right_label)`
+/// ONCE by Potrace, and shares it identically (forward for `left_label`, reversed for `right_label`).
+#[allow(clippy::too_many_arguments)]
+fn potrace_extract_shared_subpaths(
+    labels: &[u8],
+    w: usize,
+    h: usize,
+    palette_len: usize,
+    alphamax: f64,
+    opttol: f64,
+    smooth: f64,
+    corner_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+) -> HashMap<usize, Vec<Subpath>> {
+    const BIT_E: u8 = 1 << 0;
+    const BIT_S: u8 = 1 << 1;
+    const BIT_W: u8 = 1 << 2;
+    const BIT_N: u8 = 1 << 3;
+
+    let gw = w + 1;
+    let gh = h + 1;
+    let lbl_at = |px: isize, py: isize| -> u8 {
+        if px < 0 || py < 0 || px >= w as isize || py >= h as isize {
+            u8::MAX
+        } else {
+            labels[(py as usize) * w + (px as usize)]
+        }
+    };
+    let vid = |gx: usize, gy: usize| -> usize { gy * gw + gx };
+    let vcoords = |v: usize| -> (i32, i32) { ((v % gw) as i32, (v / gw) as i32) };
+    let opp_bit = |bit: u8| -> u8 {
+        match bit {
+            BIT_E => BIT_W,
+            BIT_W => BIT_E,
+            BIT_S => BIT_N,
+            BIT_N => BIT_S,
+            _ => 0,
+        }
+    };
+    let step_vertex = |v: usize, bit: u8| -> usize {
+        match bit {
+            BIT_E => v + 1,
+            BIT_S => v + gw,
+            BIT_W => v - 1,
+            BIT_N => v - gw,
+            _ => v,
+        }
+    };
+    let edge_labels = |v: usize, bit: u8| -> (u8, u8) {
+        let gx = (v % gw) as isize;
+        let gy = (v / gw) as isize;
+        match bit {
+            BIT_E => (lbl_at(gx, gy - 1), lbl_at(gx, gy)),
+            BIT_S => (lbl_at(gx, gy), lbl_at(gx - 1, gy)),
+            BIT_W => (lbl_at(gx - 1, gy), lbl_at(gx - 1, gy - 1)),
+            BIT_N => (lbl_at(gx - 1, gy - 1), lbl_at(gx, gy - 1)),
+            _ => (u8::MAX, u8::MAX),
+        }
+    };
+
+    // Lower 4 bits: unused incident edge mask; upper 4 bits: original incident edge mask.
+    let mut vert_mask: Vec<u8> = vec![0u8; gw * gh];
+    let mut total_edges = 0usize;
+
+    // Horizontal grid edges: (gx, gy) -> (gx+1, gy)
+    for gy in 0..=h {
+        for gx in 0..w {
+            let lu = lbl_at(gx as isize, gy as isize - 1);
+            let ru = lbl_at(gx as isize, gy as isize);
+            if lu != ru {
+                let u = vid(gx, gy);
+                let v = u + 1;
+                vert_mask[u] |= BIT_E | (BIT_E << 4);
+                vert_mask[v] |= BIT_W | (BIT_W << 4);
+                total_edges += 1;
+            }
+        }
+    }
+    // Vertical grid edges: (gx, gy) -> (gx, gy+1)
+    for gy in 0..h {
+        for gx in 0..=w {
+            let lu = lbl_at(gx as isize, gy as isize);
+            let ru = lbl_at(gx as isize - 1, gy as isize);
+            if lu != ru {
+                let u = vid(gx, gy);
+                let v = u + gw;
+                vert_mask[u] |= BIT_S | (BIT_S << 4);
+                vert_mask[v] |= BIT_N | (BIT_N << 4);
+                total_edges += 1;
+            }
+        }
+    }
+
+    if total_edges == 0 {
+        return HashMap::new();
+    }
+
+    let num_labels = palette_len.max(1);
+    let mut per_label_loops: Vec<Vec<Subpath>> = vec![Vec::new(); num_labels];
+    let mut traced_segs: Vec<TracedBoundarySeg> = Vec::new();
+    let mut pts: Vec<(i32, i32)> = Vec::new();
+
+    // 1. Extract all open arcs starting/ending at junction vertices (original degree != 2)
+    for start_v in 0..(gw * gh) {
+        let orig = vert_mask[start_v] >> 4;
+        if orig == 0 || orig.count_ones() == 2 {
+            continue;
+        }
+        for bit in [BIT_W, BIT_E, BIT_N, BIT_S] {
+            if (vert_mask[start_v] & bit) == 0 {
+                continue;
+            }
+            vert_mask[start_v] &= !bit;
+            let next_v = step_vertex(start_v, bit);
+            vert_mask[next_v] &= !opp_bit(bit);
+            let (left_lbl, right_lbl) = edge_labels(start_v, bit);
+
+            pts.clear();
+            pts.push(vcoords(start_v));
+            pts.push(vcoords(next_v));
+            let mut cur_v = next_v;
+            let mut guard = 0usize;
+            while (vert_mask[cur_v] >> 4).count_ones() == 2 && guard < total_edges + 4 {
+                guard += 1;
+                let rem = vert_mask[cur_v] & 0x0F;
+                if rem == 0 {
+                    break;
+                }
+                let nbit = 1u8 << rem.trailing_zeros();
+                vert_mask[cur_v] &= !nbit;
+                let nv = step_vertex(cur_v, nbit);
+                vert_mask[nv] &= !opp_bit(nbit);
+                pts.push(vcoords(nv));
+                cur_v = nv;
+            }
+            let chain = PotraceChain {
+                pts: &pts,
+                kind: ArcKind::OpenArc,
+            };
+            let nodes = potrace(
+                &chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+            );
+            traced_segs.push(TracedBoundarySeg {
+                left_label: left_lbl,
+                right_label: right_lbl,
+                start_v: start_v as u32,
+                end_v: cur_v as u32,
+                nodes,
+            });
+        }
+    }
+
+    // 2. Extract all remaining pure degree-2 closed loops directly into `per_label_loops`
+    for start_v in 0..(gw * gh) {
+        if (vert_mask[start_v] & 0x0F) == 0 {
+            continue;
+        }
+        for bit in [BIT_E, BIT_S, BIT_W, BIT_N] {
+            if (vert_mask[start_v] & bit) == 0 {
+                continue;
+            }
+            vert_mask[start_v] &= !bit;
+            let mut cur_v = step_vertex(start_v, bit);
+            vert_mask[cur_v] &= !opp_bit(bit);
+            let (left_lbl, right_lbl) = edge_labels(start_v, bit);
+
+            pts.clear();
+            pts.push(vcoords(start_v));
+            pts.push(vcoords(cur_v));
+            let mut guard = 0usize;
+            while cur_v != start_v && guard < total_edges + 4 {
+                guard += 1;
+                let rem = vert_mask[cur_v] & 0x0F;
+                if rem == 0 {
+                    break;
+                }
+                let nbit = 1u8 << rem.trailing_zeros();
+                vert_mask[cur_v] &= !nbit;
+                let nv = step_vertex(cur_v, nbit);
+                vert_mask[nv] &= !opp_bit(nbit);
+                if nv != start_v {
+                    pts.push(vcoords(nv));
+                }
+                cur_v = nv;
+            }
+            if pts.len() >= 4 {
+                let chain = PotraceChain {
+                    pts: &pts,
+                    kind: ArcKind::ClosedLoop,
+                };
+                let nodes = potrace(
+                    &chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+                );
+                if nodes.len() >= 2 {
+                    if (left_lbl as usize) < num_labels {
+                        per_label_loops[left_lbl as usize].push(Subpath {
+                            nodes: nodes.clone(),
+                            closed: true,
+                        });
+                    }
+                    if (right_lbl as usize) < num_labels {
+                        per_label_loops[right_lbl as usize].push(Subpath {
+                            nodes: reverse_nodes(&nodes),
+                            closed: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    drop(pts);
+    drop(vert_mask);
+
+    // 3. Assemble closed Subpaths for every foreground label from shared OpenArc TracedBoundarySegs
+    #[derive(Clone, Copy)]
+    struct HalfSeg {
+        seg_idx: u32,
+        from_v: u32,
+        to_v: u32,
+        in_dir: (i8, i8),
+        out_dir: (i8, i8),
+        forward: bool,
+        used: bool,
+    }
+
+    let mut by_label: Vec<Vec<HalfSeg>> = vec![Vec::new(); num_labels];
+    for (seg_idx, seg) in traced_segs.iter().enumerate() {
+        if seg.nodes.len() < 2 {
+            continue;
+        }
+        let out_fwd = dir_sign_vec(seg.nodes[0].pos, seg.nodes[1].pos);
+        let in_fwd = dir_sign_vec(
+            seg.nodes[seg.nodes.len() - 2].pos,
+            seg.nodes[seg.nodes.len() - 1].pos,
+        );
+
+        if (seg.left_label as usize) < num_labels {
+            by_label[seg.left_label as usize].push(HalfSeg {
+                seg_idx: seg_idx as u32,
+                from_v: seg.start_v,
+                to_v: seg.end_v,
+                in_dir: out_fwd,
+                out_dir: in_fwd,
+                forward: true,
+                used: false,
+            });
+        }
+        if (seg.right_label as usize) < num_labels {
+            by_label[seg.right_label as usize].push(HalfSeg {
+                seg_idx: seg_idx as u32,
+                from_v: seg.end_v,
+                to_v: seg.start_v,
+                in_dir: (-in_fwd.0, -in_fwd.1),
+                out_dir: (-out_fwd.0, -out_fwd.1),
+                forward: false,
+                used: false,
+            });
+        }
+    }
+
+    for (lbl, mut hsegs) in by_label.into_iter().enumerate() {
+        if hsegs.is_empty() {
+            continue;
+        }
+        let mut adj: Vec<(u32, u32)> = hsegs
+            .iter()
+            .enumerate()
+            .map(|(i, hs)| (hs.from_v, i as u32))
+            .collect();
+        adj.sort_unstable_by_key(|&(v, _)| v);
+
+        for start_i in 0..hsegs.len() {
+            if hsegs[start_i].used {
+                continue;
+            }
+            hsegs[start_i].used = true;
+            let start_v = hsegs[start_i].from_v;
+            let mut chain_indices = vec![(hsegs[start_i].seg_idx, hsegs[start_i].forward)];
+            let mut cur_v = hsegs[start_i].to_v;
+            let mut cur_dir = hsegs[start_i].out_dir;
+            let mut guard = 0usize;
+            while cur_v != start_v && guard < hsegs.len() + 2 {
+                guard += 1;
+                let pos = adj.partition_point(|&(v, _)| v < cur_v);
+                if pos >= adj.len() || adj[pos].0 != cur_v {
+                    break;
+                }
+                // Pick sharpest LEFT turn in screen coords so diagonal touchers stay simple & non-crossing
+                let mut best_cand: Option<(usize, i32)> = None;
+                for &(v, ci_u32) in &adj[pos..] {
+                    if v != cur_v {
+                        break;
+                    }
+                    let ci = ci_u32 as usize;
+                    if hsegs[ci].used {
+                        continue;
+                    }
+                    let prio = left_turn_priority(cur_dir, hsegs[ci].in_dir);
+                    if best_cand.is_none_or(|(_, bp)| prio < bp) {
+                        best_cand = Some((ci, prio));
+                    }
+                }
+                let Some((chosen, _)) = best_cand else {
+                    break;
+                };
+                hsegs[chosen].used = true;
+                chain_indices.push((hsegs[chosen].seg_idx, hsegs[chosen].forward));
+                cur_v = hsegs[chosen].to_v;
+                cur_dir = hsegs[chosen].out_dir;
+            }
+            if cur_v != start_v {
+                continue;
+            }
+
+            let mut stitched: Vec<PathNode> = Vec::new();
+            for (seg_idx, forward) in chain_indices {
+                let seg_nodes = &traced_segs[seg_idx as usize].nodes;
+                if forward {
+                    if stitched.is_empty() {
+                        stitched.extend_from_slice(seg_nodes);
+                    } else if let Some(first) = seg_nodes.first() {
+                        if let Some(last) = stitched.last_mut() {
+                            last.handle_out = first.handle_out;
+                            last.kind = NodeKind::Cusp;
+                        }
+                        stitched.extend(seg_nodes.iter().skip(1).cloned());
+                    }
+                } else {
+                    let rev = reverse_nodes(seg_nodes);
+                    if stitched.is_empty() {
+                        stitched.extend(rev);
+                    } else if let Some(first) = rev.first() {
+                        if let Some(last) = stitched.last_mut() {
+                            last.handle_out = first.handle_out;
+                            last.kind = NodeKind::Cusp;
+                        }
+                        stitched.extend(rev.into_iter().skip(1));
+                    }
+                }
+            }
+            if stitched.len() >= 3 {
+                // Close back onto stitched[0] cleanly
+                if let Some(last) = stitched.pop() {
+                    stitched[0].handle_in = last.handle_in;
+                    stitched[0].kind = NodeKind::Cusp;
+                }
+                if stitched.len() >= 3 {
+                    per_label_loops[lbl].push(Subpath {
+                        nodes: stitched,
+                        closed: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (lbl, subpaths) in per_label_loops.into_iter().enumerate() {
+        if !subpaths.is_empty() {
+            out.insert(lbl, subpaths);
+        }
+    }
+    out
+}
+
+fn dir_sign_vec(a: Point2D, b: Point2D) -> (i8, i8) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if dx.abs() >= dy.abs() {
+        (if dx >= 0.0 { 1 } else { -1 }, 0)
+    } else {
+        (0, if dy >= 0.0 { 1 } else { -1 })
+    }
+}
+
+/// Priority for sharpest LEFT turn in screen coords (`+X right, +Y down`):
+/// left (-90 deg) = 0, straight = 1, right (+90 deg) = 2, u-turn = 3.
+fn left_turn_priority(d_in: (i8, i8), d_out: (i8, i8)) -> i32 {
+    let left = (d_in.1, -d_in.0);
+    let right = (-d_in.1, d_in.0);
+    if d_out == left {
+        0
+    } else if d_out == d_in {
+        1
+    } else if d_out == right {
+        2
+    } else {
+        3
+    }
+}
+
+fn reverse_nodes(nodes: &[PathNode]) -> Vec<PathNode> {
+    nodes
+        .iter()
+        .rev()
+        .map(|n| PathNode::new(n.pos, n.handle_out, n.handle_in, n.kind))
+        .collect()
+}
+
+/// Peter Selinger's Potrace polygon & cubic Bézier optimization on one canonical chain/loop.
+fn potrace(
+    chain: &PotraceChain<'_>,
+    alphamax: f64,
+    opttol: f64,
+    smooth: f64,
+    corner_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+) -> Vec<PathNode> {
+    potrace_vectorize_chain(
+        chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+    )
+}
+
+fn potrace_vectorize_chain(
+    chain: &PotraceChain<'_>,
+    alphamax: f64,
+    opttol: f64,
+    smooth: f64,
+    corner_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+) -> Vec<PathNode> {
+    let m = chain.pts.len();
+    if m < 2 {
+        return Vec::new();
+    }
+    let closed = chain.kind == ArcKind::ClosedLoop;
+    let sums = potrace_calc_sums(chain.pts, closed);
+    let lon = potrace_calc_lon(chain.pts, closed);
+    let po = potrace_bestpolygon(chain.pts, &sums, &lon, closed);
+    let vertices = potrace_adjust_vertices(chain.pts, &sums, &po, closed);
+    let mut nodes = potrace_smooth_and_opticurve(
+        &vertices, closed, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+    );
+    if nodes.len() < 2 {
+        nodes = chain
+            .pts
+            .iter()
+            .map(|&(x, y)| {
+                PathNode::corner(Point2D::new(f64::from(x) * scale_x, f64::from(y) * scale_y))
+            })
+            .collect();
+    }
+    nodes
+}
+
+#[derive(Default, Clone, Copy)]
+struct PotraceSum {
+    x: f64,
+    y: f64,
+    x2: f64,
+    xy: f64,
+    y2: f64,
+}
+
+fn potrace_calc_sums(pts: &[(i32, i32)], closed: bool) -> Vec<PotraceSum> {
+    let n = pts.len();
+    let total = if closed { n * 2 + 1 } else { n + 1 };
+    let mut sums = vec![PotraceSum::default(); total];
+    let x0 = f64::from(pts[0].0);
+    let y0 = f64::from(pts[0].1);
+    for i in 1..total {
+        let idx = if closed { (i - 1) % n } else { i - 1 };
+        let px = f64::from(pts[idx].0) - x0;
+        let py = f64::from(pts[idx].1) - y0;
+        let prev = sums[i - 1];
+        sums[i] = PotraceSum {
+            x: prev.x + px,
+            y: prev.y + py,
+            x2: prev.x2 + px * px,
+            xy: prev.xy + px * py,
+            y2: prev.y2 + py * py,
+        };
+    }
+    sums
+}
+
+fn potrace_penalty3(pts: &[(i32, i32)], sums: &[PotraceSum], i: usize, j: usize) -> f64 {
+    let n = pts.len();
+    let k = j - i;
+    if k <= 1 {
+        return 0.0;
+    }
+    let s = PotraceSum {
+        x: sums[j + 1].x - sums[i].x,
+        y: sums[j + 1].y - sums[i].y,
+        x2: sums[j + 1].x2 - sums[i].x2,
+        xy: sums[j + 1].xy - sums[i].xy,
+        y2: sums[j + 1].y2 - sums[i].y2,
+    };
+    let x0 = f64::from(pts[0].0);
+    let y0 = f64::from(pts[0].1);
+    let pi = pts[i % n];
+    let pj = pts[j % n];
+    let px = (f64::from(pi.0) + f64::from(pj.0)) * 0.5 - x0;
+    let py = (f64::from(pi.1) + f64::from(pj.1)) * 0.5 - y0;
+    let ey = f64::from(pj.0 - pi.0);
+    let ex = -f64::from(pj.1 - pi.1);
+    let len_sq = ex * ex + ey * ey;
+    if len_sq <= 1e-9 {
+        return 1e9;
+    }
+    let kf = (k + 1) as f64;
+    let a = (s.x2 - 2.0 * s.x * px) / kf + px * px;
+    let b = (s.xy - s.x * py - s.y * px) / kf + px * py;
+    let c = (s.y2 - 2.0 * s.y * py) / kf + py * py;
+    let s_val = ex * ex * a + 2.0 * ex * ey * b + ey * ey * c;
+    s_val.max(0.0).sqrt()
+}
+
+fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
+    let n = pts.len();
+    if n < 2 {
+        return vec![0; n];
+    }
+    let mut lon = vec![0usize; n];
+    let limit = if closed { n } else { n - 1 };
+
+    for i in 0..limit {
+        let p0 = pts[i];
+        let mut dir_mask = 0u8;
+        let mut c0 = (0i64, 0i64);
+        let mut c1 = (0i64, 0i64);
+        let mut last_valid = i + 1;
+        let max_j = if closed {
+            (i + n).min(i + 2048)
+        } else {
+            (n - 1).min(i + 2048)
+        };
+
+        for j in (i + 1)..=max_j {
+            let cur = pts[j % n];
+            let prev = pts[(j - 1) % n];
+            let step_dx = cur.0 - prev.0;
+            let step_dy = cur.1 - prev.1;
+            let bit = match (step_dx.signum(), step_dy.signum()) {
+                (1, 0) => 1u8,
+                (0, 1) => 2u8,
+                (-1, 0) => 4u8,
+                (0, -1) => 8u8,
+                _ => 0u8,
+            };
+            dir_mask |= bit;
+            // Guard against all 4 directions OR any 180-degree U-turn (E+W or S+N)
+            // so 1px border strips and 1px peninsulas cannot collapse into chords.
+            if dir_mask == 0x0F || (dir_mask & 0x05) == 0x05 || (dir_mask & 0x0A) == 0x0A {
+                break;
+            }
+            // Scale by 2 so ±1 offsets represent Selinger's exact ±0.5-pixel tolerance cone.
+            let cur_x = 2 * i64::from(cur.0 - p0.0);
+            let cur_y = 2 * i64::from(cur.1 - p0.1);
+            if xprod(c0.0, c0.1, cur_x, cur_y) < 0 || xprod(c1.0, c1.1, cur_x, cur_y) > 0 {
+                break;
+            }
+            last_valid = j;
+            if cur_x.abs() > 1 || cur_y.abs() > 1 {
+                // Tighten cone constraints around exact ±0.5-pixel box (±1 in 2x coordinates)
+                let off0 = (
+                    cur_x
+                        + if cur_y >= 0 && (cur_y > 0 || cur_x < 0) {
+                            1
+                        } else {
+                            -1
+                        },
+                    cur_y
+                        + if cur_x <= 0 && (cur_x < 0 || cur_y < 0) {
+                            1
+                        } else {
+                            -1
+                        },
+                );
+                if xprod(c0.0, c0.1, off0.0, off0.1) >= 0 {
+                    c0 = off0;
+                }
+                let off1 = (
+                    cur_x
+                        + if cur_y <= 0 && (cur_y < 0 || cur_x < 0) {
+                            1
+                        } else {
+                            -1
+                        },
+                    cur_y
+                        + if cur_x >= 0 && (cur_x > 0 || cur_y < 0) {
+                            1
+                        } else {
+                            -1
+                        },
+                );
+                if xprod(c1.0, c1.1, off1.0, off1.1) <= 0 {
+                    c1 = off1;
+                }
+            }
+        }
+        lon[i] = last_valid;
+    }
+    if !closed {
+        lon[n - 1] = n - 1;
+    }
+    lon
+}
+
+#[inline]
+const fn xprod(ax: i64, ay: i64, bx: i64, by: i64) -> i64 {
+    ax * by - ay * bx
+}
+
+fn potrace_bestpolygon(
+    pts: &[(i32, i32)],
+    sums: &[PotraceSum],
+    lon: &[usize],
+    closed: bool,
+) -> Vec<usize> {
+    let n = pts.len();
+    if n <= 3 {
+        return (0..n).collect();
+    }
+    let max_span = lon
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| l.saturating_sub(i))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    if !closed {
+        let mut pen = vec![f64::INFINITY; n];
+        let mut prev = vec![0usize; n];
+        let mut segs = vec![usize::MAX; n];
+        pen[0] = 0.0;
+        segs[0] = 0;
+        for j in 1..n {
+            let start_i = j.saturating_sub(max_span);
+            for i in start_i..j {
+                if lon[i] < j || segs[i] == usize::MAX {
+                    continue;
+                }
+                let cand_segs = segs[i] + 1;
+                let cand_pen = pen[i] + potrace_penalty3(pts, sums, i, j);
+                if cand_segs < segs[j] || (cand_segs == segs[j] && cand_pen < pen[j]) {
+                    segs[j] = cand_segs;
+                    pen[j] = cand_pen;
+                    prev[j] = i;
+                }
+            }
+        }
+        let mut po = Vec::new();
+        let mut cur = n - 1;
+        while cur > 0 {
+            po.push(cur);
+            cur = prev[cur];
+        }
+        po.push(0);
+        po.reverse();
+        return po;
+    }
+
+    // Closed loop DP starting from index 0..n
+    let mut pen = vec![f64::INFINITY; n + 1];
+    let mut prev = vec![0usize; n + 1];
+    let mut segs = vec![usize::MAX; n + 1];
+    pen[0] = 0.0;
+    segs[0] = 0;
+    for j in 1..=n {
+        let start_i = j.saturating_sub(max_span);
+        for i in start_i..j {
+            if lon[i] < j || segs[i] == usize::MAX {
+                continue;
+            }
+            let cand_segs = segs[i] + 1;
+            let cand_pen = pen[i] + potrace_penalty3(pts, sums, i, j);
+            if cand_segs < segs[j] || (cand_segs == segs[j] && cand_pen < pen[j]) {
+                segs[j] = cand_segs;
+                pen[j] = cand_pen;
+                prev[j] = i;
+            }
+        }
+    }
+    let mut po = Vec::new();
+    let mut cur = n;
+    while cur > 0 {
+        cur = prev[cur];
+        po.push(cur);
+    }
+    po.reverse();
+    if po.len() < 3 {
+        // Fallback evenly spaced indices around loop
+        let step = (n / 4).max(1);
+        po = (0..n).step_by(step).collect();
+    }
+    po
+}
+
+fn potrace_adjust_vertices(
+    pts: &[(i32, i32)],
+    sums: &[PotraceSum],
+    po: &[usize],
+    closed: bool,
+) -> Vec<Point2D> {
+    let n = pts.len();
+    let m = po.len();
+    if m < 2 {
+        return pts
+            .iter()
+            .map(|&(x, y)| Point2D::new(f64::from(x), f64::from(y)))
+            .collect();
+    }
+    let x0 = f64::from(pts[0].0);
+    let y0 = f64::from(pts[0].1);
+    let raw_vert = |idx: usize| -> Point2D {
+        let p = pts[idx % n];
+        Point2D::new(f64::from(p.0), f64::from(p.1))
+    };
+
+    // Fit optimal line (point ctr, unit direction dir) for segment i..j
+    let fit_line = |i: usize, j: usize| -> (Point2D, Vec2D) {
+        let jj = if j < i { j + n } else { j };
+        let k = (jj - i + 1) as f64;
+        let s = PotraceSum {
+            x: sums[jj + 1].x - sums[i].x,
+            y: sums[jj + 1].y - sums[i].y,
+            x2: sums[jj + 1].x2 - sums[i].x2,
+            xy: sums[jj + 1].xy - sums[i].xy,
+            y2: sums[jj + 1].y2 - sums[i].y2,
+        };
+        let cx = s.x / k;
+        let cy = s.y / k;
+        let a = (s.x2 / k) - cx * cx;
+        let b = (s.xy / k) - cx * cy;
+        let c = (s.y2 / k) - cy * cy;
+        let trace = a + c;
+        let det = a * c - b * b;
+        let disc = ((trace * trace * 0.25) - det).max(0.0).sqrt();
+        let lambda = trace * 0.5 + disc;
+        let mut dir = if a >= c {
+            Vec2D::new(b, lambda - a)
+        } else {
+            Vec2D::new(lambda - c, b)
+        };
+        if dir.length_sq() <= 1e-9 {
+            let p_a = raw_vert(i);
+            let p_b = raw_vert(jj);
+            dir = p_b - p_a;
+        }
+        dir = dir.normalize_or_zero();
+        (Point2D::new(x0 + cx, y0 + cy), dir)
+    };
+
+    let seg_count = if closed { m } else { m - 1 };
+    let mut lines = Vec::with_capacity(seg_count);
+    for k in 0..seg_count {
+        let i = po[k];
+        let j = po[(k + 1) % m];
+        lines.push(fit_line(i, j));
+    }
+
+    let mut out = Vec::with_capacity(m);
+    for k in 0..m {
+        let base = raw_vert(po[k]);
+        if !closed && (k == 0 || k + 1 == m) {
+            // Pin junction endpoints strictly!
+            out.push(base);
+            continue;
+        }
+        let l_prev = lines[(k + seg_count - 1) % seg_count];
+        let l_curr = lines[k];
+        if let Some(inter) = intersect_lines(l_prev.0, l_prev.1, l_curr.0, l_curr.1) {
+            let dx = (inter.x - base.x).clamp(-0.48, 0.48);
+            let dy = (inter.y - base.y).clamp(-0.48, 0.48);
+            out.push(Point2D::new(base.x + dx, base.y + dy));
+        } else {
+            out.push(base);
+        }
+    }
+    out
+}
+
+fn intersect_lines(p0: Point2D, d0: Vec2D, p1: Point2D, d1: Vec2D) -> Option<Point2D> {
+    let denom = d0.x * d1.y - d0.y * d1.x;
+    if denom.abs() <= 1e-6 {
+        return None;
+    }
+    let dp = p1 - p0;
+    let t = (dp.x * d1.y - dp.y * d1.x) / denom;
+    let pt = p0 + d0 * t;
+    pt.is_finite().then_some(pt)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn potrace_smooth_and_opticurve(
+    vertices: &[Point2D],
+    closed: bool,
+    alphamax: f64,
+    opttol: f64,
+    smooth: f64,
+    corner_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+) -> Vec<PathNode> {
+    let m = vertices.len();
+    if m < 2 {
+        return Vec::new();
+    }
+    let scale = |p: Point2D| Point2D::new(p.x * scale_x, p.y * scale_y);
+    if smooth <= 0.05 || (closed && m < 3) {
+        return vertices
+            .iter()
+            .map(|&p| PathNode::corner(scale(p)))
+            .collect();
+    }
+
+    let corner_rad = corner_deg.to_radians();
+    // Classify each vertex as corner (Cusp) or smooth curve with Potrace alpha parameter
+    let mut alphas = vec![0.0_f64; m];
+    let mut is_corner = vec![false; m];
+    for i in 0..m {
+        if !closed && (i == 0 || i + 1 == m) {
+            is_corner[i] = true;
+            continue;
+        }
+        let prev = vertices[(i + m - 1) % m];
+        let curr = vertices[i];
+        let next = vertices[(i + 1) % m];
+        let v_in = (curr - prev).normalize_or_zero();
+        let v_out = (next - curr).normalize_or_zero();
+        let turn = v_in.dot(v_out).clamp(-1.0, 1.0).acos();
+        if turn >= corner_rad {
+            is_corner[i] = true;
+            continue;
+        }
+        // Potrace dpara / ddenom metric
+        let dx = (next.x - prev.x).abs();
+        let dy = (next.y - prev.y).abs();
+        let ddenom = (dx + dy).max(1e-6);
+        let dpara =
+            ((curr.x - prev.x) * (next.y - prev.y) - (curr.y - prev.y) * (next.x - prev.x)).abs();
+        let dd = dpara / ddenom;
+        let alpha = if dd > 0.75 {
+            ((4.0 / 3.0) * (1.0 - 0.75 / dd)).min(1.0)
+        } else {
+            0.0
+        };
+        if alpha <= 0.05 || alpha > alphamax {
+            is_corner[i] = true;
+        } else {
+            alphas[i] = (alpha * (0.45 + 0.35 * smooth)).clamp(0.15, 0.75);
+        }
+    }
+
+    // Build curve / corner nodes using Potrace midpoints and cubic Bézier control handles
+    let mut nodes: Vec<PathNode> = Vec::with_capacity(m * 2);
+    if !closed {
+        nodes.push(PathNode::corner(scale(vertices[0])));
+        for i in 1..(m - 1) {
+            let prev = vertices[i - 1];
+            let curr = vertices[i];
+            let next = vertices[i + 1];
+            if is_corner[i] {
+                nodes.push(PathNode::corner(scale(curr)));
+            } else {
+                let b_in = prev.lerp(curr, 0.5);
+                let b_out = curr.lerp(next, 0.5);
+                let a = alphas[i];
+                let c1 = b_in.lerp(curr, a);
+                let c2 = b_out.lerp(curr, a);
+                // If previous node wasn't already b_in, push b_in
+                let b_in_s = scale(b_in);
+                let c1_s = scale(c1);
+                let c2_s = scale(c2);
+                let b_out_s = scale(b_out);
+                if nodes
+                    .last()
+                    .is_some_and(|n| n.pos.distance_to(b_in_s) < 1e-6)
+                {
+                    if let Some(last) = nodes.last_mut() {
+                        last.handle_out = Some(c1_s);
+                        last.kind = NodeKind::Smooth;
+                    }
+                } else {
+                    nodes.push(PathNode::new(b_in_s, None, Some(c1_s), NodeKind::Smooth));
+                }
+                nodes.push(PathNode::new(b_out_s, Some(c2_s), None, NodeKind::Smooth));
+            }
+        }
+        nodes.push(PathNode::corner(scale(vertices[m - 1])));
+    } else {
+        for i in 0..m {
+            let prev = vertices[(i + m - 1) % m];
+            let curr = vertices[i];
+            let next = vertices[(i + 1) % m];
+            if is_corner[i] {
+                nodes.push(PathNode::corner(scale(curr)));
+            } else {
+                let b_in = prev.lerp(curr, 0.5);
+                let b_out = curr.lerp(next, 0.5);
+                let a = alphas[i];
+                let c1 = b_in.lerp(curr, a);
+                let c2 = b_out.lerp(curr, a);
+                let b_in_s = scale(b_in);
+                let c1_s = scale(c1);
+                let c2_s = scale(c2);
+                let b_out_s = scale(b_out);
+                if nodes
+                    .last()
+                    .is_some_and(|n| n.pos.distance_to(b_in_s) < 1e-6)
+                {
+                    if let Some(last) = nodes.last_mut() {
+                        last.handle_out = Some(c1_s);
+                        last.kind = NodeKind::Smooth;
+                    }
+                } else {
+                    nodes.push(PathNode::new(b_in_s, None, Some(c1_s), NodeKind::Smooth));
+                }
+                nodes.push(PathNode::new(b_out_s, Some(c2_s), None, NodeKind::Smooth));
+            }
+        }
+        // Merge wrap-around duplicate node if last == first
+        if nodes.len() >= 4 && nodes.last().unwrap().pos.distance_to(nodes[0].pos) < 1e-6 {
+            let last = nodes.pop().unwrap();
+            nodes[0].handle_in = last.handle_in;
+            nodes[0].kind = NodeKind::Smooth;
+        }
+    }
+
+    // Potrace opticurve pass: merge consecutive collinear/co-curving smooth segments within opttolerance
+    potrace_opticurve_merge(&mut nodes, closed, opttol * scale_x.min(scale_y));
+    nodes
+}
+
+fn potrace_opticurve_merge(nodes: &mut Vec<PathNode>, closed: bool, tol_mm: f64) {
+    if nodes.len() < 4 || tol_mm <= 1e-6 {
+        return;
+    }
+    let mut i = if closed { 0 } else { 1 };
+    let mut guard = 0usize;
+    while nodes.len() >= 4 && guard < nodes.len() * 2 {
+        guard += 1;
+        let len = nodes.len();
+        if !closed && i + 2 >= len {
+            break;
+        }
+        if closed && i >= len {
+            break;
+        }
+        let i0 = i % len;
+        let i1 = (i + 1) % len;
+        let i2 = (i + 2) % len;
+        if nodes[i1].kind != NodeKind::Smooth
+            || nodes[i0].handle_out.is_none()
+            || nodes[i1].handle_in.is_none()
+            || nodes[i1].handle_out.is_none()
+            || nodes[i2].handle_in.is_none()
+        {
+            i += 1;
+            continue;
+        }
+        let p0 = nodes[i0].pos;
+        let p1 = nodes[i1].pos;
+        let p2 = nodes[i2].pos;
+        // Check matching bend side & small deviation at midpoint
+        let c1 = nodes[i0].handle_out.unwrap();
+        let c2 = nodes[i2].handle_in.unwrap();
+        let t1 = (c1 - p0).normalize_or_zero();
+        let t2 = (c2 - p2).normalize_or_zero();
+        let cross1 = (c1 - p0).x * (p2 - p0).y - (c1 - p0).y * (p2 - p0).x;
+        let cross2 = (c2 - p2).x * (p2 - p0).y - (c2 - p2).y * (p2 - p0).x;
+        if cross1 * cross2 > 0.0 || (t1.dot(t2) > 0.85) {
+            i += 1;
+            continue;
+        }
+        let mid_merged = cubic_eval(p0, p0 + (c1 - p0) * 1.5, p2 + (c2 - p2) * 1.5, p2, 0.5);
+        if mid_merged.distance_to(p1) <= tol_mm {
+            nodes[i0].handle_out = Some(p0 + (c1 - p0) * 1.5);
+            nodes[i2].handle_in = Some(p2 + (c2 - p2) * 1.5);
+            nodes.remove(i1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn cubic_eval(p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64) -> Point2D {
+    let u = 1.0 - t;
+    let w0 = u * u * u;
+    let w1 = 3.0 * u * u * t;
+    let w2 = 3.0 * u * t * t;
+    let w3 = t * t * t;
+    Point2D::new(
+        p0.x * w0 + p1.x * w1 + p2.x * w2 + p3.x * w3,
+        p0.y * w0 + p1.y * w1 + p2.y * w2 + p3.y * w3,
+    )
+}
+
 /// Centerline Trace using Zhang-Suen iterative morphological thinning/skeletonization.
-fn trace_centerline(
-    asset: &RasterAsset,
+fn trace_centerline_rgba(
+    rgba8: &[u8],
+    w: usize,
+    h: usize,
     config: &TraceConfig,
     scale_x: f64,
     scale_y: f64,
 ) -> Vec<(BezierPath, Color)> {
     let (_, detail, smooth, corner_deg, _) = effective_params(config);
-    let w = asset.width as usize;
-    let h = asset.height as usize;
 
     // Identify background RGB from border pixels
-    let bg_rgb = estimate_border_rgb(asset);
-    let rgba8 = asset.to_rgba8_vec();
+    let bg_rgb = estimate_border_rgb_rgba(rgba8, w, h);
     let mut fg_mask = vec![false; w * h];
     let mut sum_r = 0u64;
     let mut sum_g = 0u64;
@@ -503,11 +1712,16 @@ fn extract_skeleton_chains(skeleton: &[bool], w: usize, h: usize) -> Vec<(Vec<Po
 }
 
 /// Deterministic K-Means++ RGB color quantization ignoring transparent pixels (`alpha < 128`).
-fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec<Option<usize>>) {
-    let n_px = (asset.width as usize) * (asset.height as usize);
+/// Stores `u8` palette indices (`1 B/px`, `u8::MAX` = transparent) to keep >16MP traces low-RSS.
+fn quantize_kmeans_u8(
+    rgba8: &[u8],
+    w: usize,
+    h: usize,
+    max_colors: usize,
+) -> (Vec<[u8; 3]>, Vec<u8>) {
+    let n_px = w * h;
     let mut opaque_samples: Vec<[f32; 3]> = Vec::new();
     let stride = (n_px / 8192).max(1);
-    let rgba8 = asset.to_rgba8_vec();
 
     for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
         if i % stride == 0 && px[3] >= 128 {
@@ -515,30 +1729,29 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
         }
     }
     if opaque_samples.is_empty() {
-        return (Vec::new(), vec![None; n_px]);
+        return (Vec::new(), vec![u8::MAX; n_px]);
     }
 
-    // Collect distinct colors first if fewer than max_colors
+    let eff_max = max_colors.clamp(1, 254);
     let mut distinct: Vec<[u8; 3]> = Vec::new();
     for s in &opaque_samples {
         let rgb = [s[0] as u8, s[1] as u8, s[2] as u8];
         if !distinct.contains(&rgb) {
             distinct.push(rgb);
-            if distinct.len() > max_colors {
+            if distinct.len() > eff_max {
                 break;
             }
         }
     }
 
-    let mut centroids: Vec<[f32; 3]> = if distinct.len() <= max_colors {
+    let mut centroids: Vec<[f32; 3]> = if distinct.len() <= eff_max {
         distinct
             .into_iter()
             .map(|[r, g, b]| [f32::from(r), f32::from(g), f32::from(b)])
             .collect()
     } else {
-        // Deterministic farthest-point K-Means++ initialization
         let mut init = vec![opaque_samples[0]];
-        while init.len() < max_colors {
+        while init.len() < eff_max {
             let mut best_dist = -1.0_f32;
             let mut best_sample = opaque_samples[0];
             for &s in &opaque_samples {
@@ -559,7 +1772,6 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
         init
     };
 
-    // Lloyd iterations on sampled pixels
     for _ in 0..10 {
         let mut sums = vec![[0.0_f64; 3]; centroids.len()];
         let mut counts = vec![0u64; centroids.len()];
@@ -589,7 +1801,18 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
         }
     }
 
-    let palette: Vec<[u8; 3]> = centroids
+    // Merge near-identical centroids (Euclidean^2 < 16.0)
+    let mut merged: Vec<[f32; 3]> = Vec::new();
+    for c in centroids {
+        if !merged.iter().any(|&m| color_dist_sq(c, m) < 16.0) {
+            merged.push(c);
+        }
+    }
+    if merged.is_empty() {
+        return (Vec::new(), vec![u8::MAX; n_px]);
+    }
+
+    let palette: Vec<[u8; 3]> = merged
         .iter()
         .map(|c| {
             [
@@ -600,11 +1823,11 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
         })
         .collect();
 
-    let mut labels = vec![None; n_px];
+    let mut labels = vec![u8::MAX; n_px];
     for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
         if px[3] >= 128 {
             let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
-            labels[i] = Some(nearest_centroid(s, &centroids));
+            labels[i] = nearest_centroid(s, &merged) as u8;
         }
     }
 
@@ -633,13 +1856,14 @@ fn nearest_centroid(sample: [f32; 3], centroids: &[[f32; 3]]) -> usize {
     best_i
 }
 
-fn detect_border_background_label(labels: &[Option<usize>], w: usize, h: usize) -> Option<usize> {
-    let mut counts: HashMap<usize, usize> = HashMap::new();
+fn detect_border_background_label_u8(labels: &[u8], w: usize, h: usize) -> Option<u8> {
+    let mut counts: [usize; 255] = [0; 255];
     let mut total_border = 0usize;
     let mut visit = |x: usize, y: usize| {
         total_border += 1;
-        if let Some(lbl) = labels[y * w + x] {
-            *counts.entry(lbl).or_insert(0) += 1;
+        let lbl = labels[y * w + x];
+        if lbl != u8::MAX {
+            counts[lbl as usize] += 1;
         }
     };
     for x in 0..w {
@@ -655,19 +1879,16 @@ fn detect_border_background_label(labels: &[Option<usize>], w: usize, h: usize) 
         }
     }
     counts
-        .into_iter()
-        .max_by_key(|&(_, c)| c)
-        .filter(|&(_, c)| c * 4 >= total_border) // at least 25% of border pixels
-        .map(|(lbl, _)| lbl)
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &c)| c)
+        .filter(|&(_, &c)| c > 0 && c * 4 >= total_border)
+        .map(|(lbl, _)| lbl as u8)
 }
 
 /// Estimates the dominant background RGB color from opaque border pixels using
 /// quantized mode voting so edge-touching foreground strokes cannot skew the average.
-fn estimate_border_rgb(asset: &RasterAsset) -> [u8; 3] {
-    let w = asset.width as usize;
-    let h = asset.height as usize;
-    let rgba8 = asset.to_rgba8_vec();
-    // Bucket border pixels into 16x16x16 color bins: [count, sum_r, sum_g, sum_b]
+fn estimate_border_rgb_rgba(rgba8: &[u8], w: usize, h: usize) -> [u8; 3] {
     let mut buckets: HashMap<[u8; 3], [u64; 4]> = HashMap::new();
     let mut add = |x: usize, y: usize| {
         let idx = (y * w + x) * 4;
@@ -706,42 +1927,68 @@ fn estimate_border_rgb(asset: &RasterAsset) -> [u8; 3] {
     }
 }
 
-fn prune_small_components(mask: &mut [bool], w: usize, h: usize, min_area: usize) {
-    if min_area <= 1 {
+/// Reassigns speckles smaller than `min_area` pixels to their dominant neighbor label so
+/// removing small speckles never introduces white pinholes along color boundaries.
+fn prune_speckles_reassign(labels: &mut [u8], w: usize, h: usize, min_area: usize) {
+    if min_area <= 1 || w == 0 || h == 0 {
         return;
     }
-    let mut visited = vec![false; w * h];
-    let mut queue = VecDeque::new();
-    let mut comp = Vec::new();
-    for y in 0..h {
-        for x in 0..w {
-            let start = y * w + x;
-            if !mask[start] || visited[start] {
-                continue;
-            }
-            visited[start] = true;
-            queue.push_back((x, y));
-            comp.clear();
-            while let Some((cx, cy)) = queue.pop_front() {
-                comp.push(cy * w + cx);
-                let nbs = [
-                    cx.checked_sub(1).map(|nx| (nx, cy)),
-                    (cx + 1 < w).then_some((cx + 1, cy)),
-                    cy.checked_sub(1).map(|ny| (cx, ny)),
-                    (cy + 1 < h).then_some((cx, cy + 1)),
-                ];
-                for (nx, ny) in nbs.into_iter().flatten() {
-                    let ni = ny * w + nx;
-                    if mask[ni] && !visited[ni] {
-                        visited[ni] = true;
-                        queue.push_back((nx, ny));
-                    }
-                }
-            }
+    let total = w * h;
+    let mut visited = vec![0u64; total.div_ceil(64)];
+    let is_visited =
+        |vis: &[u64], idx: usize| -> bool { (vis[idx >> 6] & (1u64 << (idx & 63))) != 0 };
+    let mark_visited = |vis: &mut [u64], idx: usize| {
+        vis[idx >> 6] |= 1u64 << (idx & 63);
+    };
+
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    let mut comp: Vec<u32> = Vec::with_capacity(min_area);
+    for start in 0..total {
+        let lbl = labels[start];
+        if lbl == u8::MAX || is_visited(&visited, start) {
+            continue;
+        }
+        mark_visited(&mut visited, start);
+        queue.push_back(start as u32);
+        comp.clear();
+        let mut comp_count = 0usize;
+        let mut nb_counts = [0u32; 255];
+        while let Some(idx_u32) = queue.pop_front() {
+            let idx = idx_u32 as usize;
+            comp_count += 1;
             if comp.len() < min_area {
-                for &idx in &comp {
-                    mask[idx] = false;
+                comp.push(idx_u32);
+            }
+            let cx = idx % w;
+            let cy = idx / w;
+            let nbs = [
+                (cx > 0).then(|| idx - 1),
+                (cx + 1 < w).then(|| idx + 1),
+                (cy > 0).then(|| idx - w),
+                (cy + 1 < h).then(|| idx + w),
+            ];
+            for ni in nbs.into_iter().flatten() {
+                let nl = labels[ni];
+                if nl == lbl {
+                    if !is_visited(&visited, ni) {
+                        mark_visited(&mut visited, ni);
+                        queue.push_back(ni as u32);
+                    }
+                } else if comp_count < min_area && nl != u8::MAX {
+                    nb_counts[nl as usize] = nb_counts[nl as usize].saturating_add(1);
                 }
+            }
+        }
+        if comp_count < min_area {
+            let replacement = nb_counts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c > 0)
+                .max_by_key(|&(_, &c)| c)
+                .map(|(k, _)| k as u8)
+                .unwrap_or(u8::MAX);
+            for &idx in &comp {
+                labels[idx as usize] = replacement;
             }
         }
     }
@@ -751,6 +1998,7 @@ fn prune_small_components(mask: &mut [bool], w: usize, h: usize, min_area: usize
 ///
 /// Operates on a 1-pixel zero-padded grid so shapes touching image edges always produce
 /// clean closed boundary loops in `[0..w, 0..h]` pixel coordinates. Shared with `smart_fill.rs`.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn extract_marching_squares_contours(
     mask: &[bool],
@@ -998,4 +2246,307 @@ fn point_seg_dist(p: Point2D, a: Point2D, b: Point2D) -> f64 {
     }
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     p.distance_to(a + ab * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_page_to_rgba;
+    use coree_core::{ColorMode, Document, Fill, ObjectId, OutlineStyle, SceneObject, ViewMode};
+
+    #[test]
+    fn potrace_adjacent_blocks_produce_zero_white_seam_pixels() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut buf = vec![255u8; (w * h * 4) as usize];
+        for y in 8..56 {
+            for x in 8..32 {
+                let i = ((y * w + x) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[220, 20, 20, 255]);
+            }
+            for x in 32..56 {
+                let i = ((y * w + x) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[20, 60, 220, 255]);
+            }
+        }
+        let asset = RasterAsset::new(w, h, buf, 96.0, ColorMode::Rgb).unwrap();
+        let traced = trace_raster_to_mm(
+            &asset,
+            64.0,
+            64.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                max_colors: 4,
+                remove_background: true,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(traced.len(), 2);
+
+        let mut doc = Document::new("PotraceZeroGap", 64.0, 64.0, ColorMode::Rgb, 96.0);
+        for (idx, (path, col)) in traced.into_iter().enumerate() {
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    format!("Region{idx}"),
+                    coree_core::NodePayload::Path(path),
+                )
+                .with_fill(Fill::Solid(col))
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+        }
+        let rendered = render_page_to_rgba(&doc, 0, 101.6, ViewMode::Normal).unwrap();
+        let rw = rendered.width as usize;
+        let rh = rendered.height as usize;
+        let cx = rw / 2;
+        let mut white_seams = 0usize;
+        for y in (rh / 5)..(rh * 4 / 5) {
+            for dx in -1isize..=1 {
+                let x = (cx as isize + dx) as usize;
+                let i = (y * rw + x) * 4;
+                if rendered.rgba[i] >= 245
+                    && rendered.rgba[i + 1] >= 245
+                    && rendered.rgba[i + 2] >= 245
+                {
+                    white_seams += 1;
+                }
+            }
+        }
+        assert_eq!(
+            white_seams, 0,
+            "Expected 0 white seam pixels along shared Potrace edge"
+        );
+    }
+
+    #[test]
+    fn potrace_sparse_graph_handles_12mp_quadrants_cleanly() {
+        // 3464 x 3464 (~12MP) 4-quadrant label grid (~14k boundary vertices vs 12M total grid vertices)
+        let w = 3464usize;
+        let h = 3464usize;
+        let mut labels = vec![0u8; w * h];
+        for y in 0..h {
+            let row_off = y * w;
+            let top = y < h / 2;
+            for x in 0..w {
+                let left = x < w / 2;
+                labels[row_off + x] = match (top, left) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                };
+            }
+        }
+        let regions =
+            potrace_extract_shared_subpaths(&labels, w, h, 4, 1.0, 0.2, 0.5, 60.0, 0.1, 0.1);
+        assert_eq!(regions.len(), 4);
+        for lbl in 0..4usize {
+            assert!(!regions[&lbl].is_empty());
+        }
+    }
+
+    #[test]
+    fn potrace_dense_checkerboard_enforces_edge_budget_without_oom() {
+        // 1) <= 1MP (400x400) 1px checkerboard must NOT be downscaled by edge budget.
+        let small_w = 400usize;
+        let small_h = 400usize;
+        let mut small_labels = vec![0u8; small_w * small_h];
+        for y in 0..small_h {
+            for x in 0..small_w {
+                small_labels[y * small_w + x] = ((x + y) & 1) as u8;
+            }
+        }
+        let (mut sw, mut sh, mut ssx, mut ssy) = (small_w, small_h, 0.25, 0.25);
+        enforce_trace_edge_budget(&mut small_labels, &mut sw, &mut sh, &mut ssx, &mut ssy);
+        assert_eq!((sw, sh), (400, 400));
+
+        // 2) > 1MP (1400x1400) 4-quadrant (low edge count) must NOT be downscaled.
+        let quad_w = 1400usize;
+        let quad_h = 1400usize;
+        let mut quad_labels = vec![0u8; quad_w * quad_h];
+        for y in 0..quad_h {
+            for x in 0..quad_w {
+                quad_labels[y * quad_w + x] =
+                    u8::from(x >= quad_w / 2) + 2 * u8::from(y >= quad_h / 2);
+            }
+        }
+        let (mut qw, mut qh, mut qsx, mut qsy) = (quad_w, quad_h, 0.1, 0.1);
+        enforce_trace_edge_budget(&mut quad_labels, &mut qw, &mut qh, &mut qsx, &mut qsy);
+        assert_eq!((qw, qh), (1400, 1400));
+
+        // 3) > 1MP (1400x1400) 2px checkerboard exceeds edge/arc budget and must downscale cleanly
+        // while preserving exact physical mm dimensions and producing valid Potrace regions.
+        let chk_w = 1400usize;
+        let chk_h = 1400usize;
+        let mut chk_labels = vec![0u8; chk_w * chk_h];
+        for y in 0..chk_h {
+            for x in 0..chk_w {
+                chk_labels[y * chk_w + x] = (((x / 2) + (y / 2)) & 1) as u8;
+            }
+        }
+        let (mut cw, mut ch, mut csx, mut csy) = (chk_w, chk_h, 0.1, 0.1);
+        enforce_trace_edge_budget(&mut chk_labels, &mut cw, &mut ch, &mut csx, &mut csy);
+        assert!(cw < chk_w && ch < chk_h);
+        assert!(((cw as f64) * csx - 140.0).abs() < 1e-6);
+        assert!(((ch as f64) * csy - 140.0).abs() < 1e-6);
+        let (edges_after, arcs_after) = estimate_label_boundary_complexity(&chk_labels, cw, ch);
+        assert!(edges_after <= MAX_SAFE_BOUNDARY_EDGES);
+        assert!(arcs_after <= MAX_SAFE_POTRACE_ARCS);
+        let regions =
+            potrace_extract_shared_subpaths(&chk_labels, cw, ch, 2, 0.5, 0.2, 0.5, 60.0, csx, csy);
+        assert!(!regions.is_empty());
+    }
+
+    #[test]
+    fn potrace_diagonal_x_junction_preserves_full_border_zero_gaps() {
+        let w = 400u32;
+        let h = 400u32;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let colors = [
+            [220u8, 25, 25, 255],
+            [25u8, 160, 50, 255],
+            [30u8, 80, 220, 255],
+            [230u8, 200, 25, 255],
+        ];
+        for y in 0..h {
+            let dy = f64::from(y) - 199.5;
+            for x in 0..w {
+                let dx = f64::from(x) - 199.5;
+                let idx = if dy.abs() >= dx.abs() {
+                    if dy < 0.0 {
+                        0
+                    } else {
+                        1
+                    }
+                } else if dx < 0.0 {
+                    2
+                } else {
+                    3
+                };
+                let off = ((y * w + x) * 4) as usize;
+                buf[off..off + 4].copy_from_slice(&colors[idx]);
+            }
+        }
+        let asset = RasterAsset::new(w, h, buf, 96.0, ColorMode::Rgb).unwrap();
+        let traced = trace_raster_to_mm(
+            &asset,
+            400.0,
+            400.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                max_colors: 4,
+                remove_background: false,
+                speckle_size: 1,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(traced.len(), 4);
+
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let mut doc = Document::new("DiagXJunction", 400.0, 400.0, ColorMode::Rgb, 96.0);
+        for (idx, (path, col)) in traced.into_iter().enumerate() {
+            if let Some(bb) = path.bounding_box() {
+                min_x = min_x.min(bb.min().x);
+                min_y = min_y.min(bb.min().y);
+                max_x = max_x.max(bb.max().x);
+                max_y = max_y.max(bb.max().y);
+            }
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    format!("Quad{idx}"),
+                    coree_core::NodePayload::Path(path),
+                )
+                .with_fill(Fill::Solid(col))
+                .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            min_x <= 0.01 && min_y <= 0.01 && max_x >= 399.99 && max_y >= 399.99,
+            "Expected full [0..400, 0..400] coverage, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+
+        let rendered = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Normal).unwrap();
+        let near_white = rendered
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] >= 245 && px[1] >= 245 && px[2] >= 245)
+            .count();
+        assert_eq!(
+            near_white, 0,
+            "Expected 0 white/near-white gap pixels on 400x400 diagonal X-junction"
+        );
+    }
+
+    #[test]
+    fn potrace_one_px_interior_peninsula_preserves_width() {
+        let w = 400u32;
+        let h = 400u32;
+        let mut buf = vec![255u8; (w * h * 4) as usize];
+        for y in 150..250 {
+            for x in 100..200 {
+                let off = ((y * w + x) * 4) as usize;
+                buf[off..off + 4].copy_from_slice(&[210, 30, 30, 255]);
+            }
+        }
+        // 1px-tall, 120px-long red finger at y = 200, x = 200..320
+        for x in 200..320 {
+            let off = ((200 * w + x) * 4) as usize;
+            buf[off..off + 4].copy_from_slice(&[210, 30, 30, 255]);
+        }
+        let asset = RasterAsset::new(w, h, buf, 96.0, ColorMode::Rgb).unwrap();
+        let traced = trace_raster_to_mm(
+            &asset,
+            400.0,
+            400.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                max_colors: 4,
+                remove_background: true,
+                speckle_size: 1,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(traced.len(), 1);
+        let (path, col) = traced.into_iter().next().unwrap();
+        let bb = path.bounding_box().unwrap();
+        assert!(
+            bb.max().x >= 319.5,
+            "Expected 1px peninsula tip preserved to x>=319.5, got {}",
+            bb.max().x
+        );
+
+        let mut doc = Document::new("Peninsula1Px", 400.0, 400.0, ColorMode::Rgb, 96.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Peninsula".to_string(),
+                coree_core::NodePayload::Path(path),
+            )
+            .with_fill(Fill::Solid(col))
+            .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+        // Render at 25.4 DPI (1 px == 1 mm) so pixel (310, 200) probes exact 1px peninsula width
+        let rendered = render_page_to_rgba(&doc, 0, 25.4, ViewMode::Normal).unwrap();
+        let rw = rendered.width as usize;
+        for x in [210usize, 260, 310, 318] {
+            let off = (200 * rw + x) * 4;
+            assert!(
+                rendered.rgba[off] > 150 && rendered.rgba[off + 1] < 100,
+                "Expected intact 1px red peninsula at ({x}, 200), got rgba={:?}",
+                &rendered.rgba[off..off + 4]
+            );
+        }
+    }
 }

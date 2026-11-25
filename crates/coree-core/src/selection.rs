@@ -7,6 +7,86 @@ use crate::ids::ObjectId;
 use crate::math::{Point2D, Rect2D};
 use serde::{Deserialize, Serialize};
 
+/// Interactive bitmap selection mask mode for Photo Studio (`IMP-06`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum RasterMaskMode {
+    #[default]
+    Rectangle,
+    Ellipse,
+    Lasso,
+    MagicWand,
+}
+
+impl RasterMaskMode {
+    /// Human-readable label for toolbars and Bitmap Studio controls.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Rectangle",
+            Self::Ellipse => "Ellipse",
+            Self::Lasso => "Lasso",
+            Self::MagicWand => "Magic Wand",
+        }
+    }
+}
+
+/// Geometric/sample specification of a bitmap selection mask in world millimeters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RasterMaskShape {
+    Rectangle(Rect2D),
+    Ellipse(Rect2D),
+    Lasso(Vec<Point2D>),
+    MagicWand {
+        seed_mm: Point2D,
+        tolerance: f32,
+        contiguous: bool,
+    },
+}
+
+/// Complete active bitmap mask selection with feathering and inversion state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterMaskSelection {
+    pub shape: RasterMaskShape,
+    pub feather_px: f32,
+    pub inverted: bool,
+}
+
+impl RasterMaskSelection {
+    /// Creates a non-feathered, non-inverted mask selection from `shape`.
+    #[must_use]
+    pub const fn new(shape: RasterMaskShape) -> Self {
+        Self {
+            shape,
+            feather_px: 0.0,
+            inverted: false,
+        }
+    }
+
+    /// World-space bounding rectangle when defined by the mask geometry (`None` for Magic Wand).
+    #[must_use]
+    pub fn world_bounds(&self) -> Option<Rect2D> {
+        match &self.shape {
+            RasterMaskShape::Rectangle(r) | RasterMaskShape::Ellipse(r) => Some(*r),
+            RasterMaskShape::Lasso(pts) => {
+                let mut iter = pts.iter().copied().filter(|p| p.is_finite());
+                let first = iter.next()?;
+                let mut min_x = first.x;
+                let mut min_y = first.y;
+                let mut max_x = first.x;
+                let mut max_y = first.y;
+                for p in iter {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                }
+                Some(Rect2D::new(min_x, min_y, max_x, max_y))
+            }
+            RasterMaskShape::MagicWand { .. } => None,
+        }
+    }
+}
+
 /// Dual-click interactive transform handle mode on the Pick tool.
 ///
 /// First click selects an object in [`TransformMode::ScaleAndMove`]; clicking the

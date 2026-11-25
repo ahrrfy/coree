@@ -4,15 +4,17 @@
 //! placements, live non-curved text, hairline outlines on non-cut layers, missing bleed
 //! coverage, locked/hidden/non-printable layers, and excessive CMYK Total Area Coverage (TAC).
 
+use crate::collect::{font_index_contains, scan_system_font_index};
 use crate::prepress::{PRINT_MARKS_LAYER_NAME, TILE_MARKS_LAYER_NAME};
-use crate::scene_helpers::{world_bounds_with_xf, MAX_SCENE_DEPTH};
+use crate::scene_helpers::{world_bounds_with_sym_xf, SymBoundsCtx, SymParentRef, MAX_SCENE_DEPTH};
 use coree_core::{
-    Affine2D, Color, ColorMode, Document, Layer, LayerId, NodePayload, ObjectId, Page, PageId,
-    Rect2D, SceneObject,
+    Affine2D, Color, ColorMode, Document, Fill, Layer, LayerId, LensKind, NodePayload, ObjectId,
+    Page, PageId, Rect2D, SceneObject,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 /// Severity classification for a preflight diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -28,13 +30,29 @@ pub enum PreflightIssueKind {
     RgbInCmykDocument,
     LowResolutionImage,
     LiveTextNotCurves,
+    MissingFont,
     HairlineOutlineOnNonCutLayer,
     InsufficientBleedCoverage,
     HiddenOrNonPrintableLayerWithObjects,
     LockedLayerWithObjects,
     TotalInkCoverageExceeded,
     MissingRasterAsset,
+    CustomCqlRuleViolation,
     EmptyDocument,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Custom user/print-shop CQL rule evaluated during [`run_preflight`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightCqlRule {
+    pub name: String,
+    pub query: String,
+    pub severity: PreflightSeverity,
+    #[serde(default)]
+    pub suggestion: String,
 }
 
 /// A single actionable finding produced by [`run_preflight`].
@@ -60,6 +78,12 @@ pub struct PreflightRules {
     pub min_dpi: f64,
     /// Emit a print-shop warning for live text objects not yet converted to curves.
     pub warn_live_text: bool,
+    /// Verify referenced font families exist in local/system SFNT font directories (`MissingFont`).
+    #[serde(default = "default_true")]
+    pub check_missing_fonts: bool,
+    /// Additional font directories scanned when `check_missing_fonts` is enabled.
+    #[serde(default)]
+    pub extra_font_search_dirs: Vec<PathBuf>,
     /// Minimum safe outline thickness in mm on non-cut layers (default: `0.1`).
     pub min_outline_width_mm: f64,
     /// Check objects near/crossing trim edges for full bleed coverage.
@@ -70,6 +94,9 @@ pub struct PreflightRules {
     pub check_layer_states: bool,
     /// Maximum allowed CMYK Total Area Coverage (`C+M+Y+K` in %, default: `300.0`).
     pub max_tac_pct: f64,
+    /// Optional print-shop CQL rules flagging matching scene objects.
+    #[serde(default)]
+    pub custom_cql_rules: Vec<PreflightCqlRule>,
 }
 
 impl Default for PreflightRules {
@@ -78,11 +105,14 @@ impl Default for PreflightRules {
             check_rgb_in_cmyk: true,
             min_dpi: 300.0,
             warn_live_text: true,
+            check_missing_fonts: true,
+            extra_font_search_dirs: Vec::new(),
             min_outline_width_mm: 0.1,
             check_bleed: true,
             bleed_edge_tolerance_mm: 1.0,
             check_layer_states: true,
             max_tac_pct: 300.0,
+            custom_cql_rules: Vec::new(),
         }
     }
 }
@@ -263,6 +293,11 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
     }
 
     let mut seen_layer_state_checks: HashSet<LayerId> = HashSet::new();
+    let font_index = safe_rules
+        .check_missing_fonts
+        .then(|| scan_system_font_index(&safe_rules.extra_font_search_dirs));
+    let mut visiting_syms: HashSet<coree_core::SymbolId> = HashSet::new();
+
     let pages = doc.pages();
     for (p_idx, page) in pages.iter().enumerate() {
         for layer in &page.layers {
@@ -272,7 +307,9 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
                     page,
                     layer,
                     &safe_rules,
+                    font_index.as_ref(),
                     &mut seen_layer_state_checks,
+                    &mut visiting_syms,
                     &mut issues,
                 );
             }
@@ -288,10 +325,76 @@ pub fn run_preflight(doc: &Document, rules: &PreflightRules) -> PreflightReport 
                         page,
                         layer,
                         &safe_rules,
+                        font_index.as_ref(),
                         &mut seen_layer_state_checks,
+                        &mut visiting_syms,
                         &mut issues,
                     );
                 }
+            }
+        }
+    }
+
+    for cql_rule in &safe_rules.custom_cql_rules {
+        if cql_rule.query.trim().is_empty() {
+            continue;
+        }
+        match crate::find_replace::evaluate_cql_query(
+            doc,
+            crate::find_replace::FindScope::WholeDocument,
+            &cql_rule.query,
+        ) {
+            Ok(matches) => {
+                for oid in matches {
+                    let obj_name = doc.object(oid).map(|o| o.name.as_str()).unwrap_or("Object");
+                    let suggestion = if cql_rule.suggestion.trim().is_empty() {
+                        format!(
+                            "Adjust object '{obj_name}' to satisfy rule '{}'.",
+                            cql_rule.name
+                        )
+                    } else {
+                        cql_rule.suggestion.clone()
+                    };
+                    let (page_id, layer_id) = doc
+                        .pages()
+                        .iter()
+                        .find_map(|p| {
+                            p.layers
+                                .iter()
+                                .find(|l| l.objects.contains(&oid))
+                                .map(|l| (Some(p.id), Some(l.id)))
+                        })
+                        .unwrap_or((None, None));
+                    issues.push(PreflightIssue {
+                        severity: cql_rule.severity,
+                        kind: PreflightIssueKind::CustomCqlRuleViolation,
+                        page_id,
+                        layer_id,
+                        object_id: Some(oid),
+                        message: format!(
+                            "Custom rule '{}' matched '{}' ({})",
+                            cql_rule.name, obj_name, cql_rule.query
+                        ),
+                        suggestion,
+                        measured_value: None,
+                    });
+                }
+            }
+            Err(err) => {
+                issues.push(PreflightIssue {
+                    severity: PreflightSeverity::Warning,
+                    kind: PreflightIssueKind::CustomCqlRuleViolation,
+                    page_id: None,
+                    layer_id: None,
+                    object_id: None,
+                    message: format!(
+                        "Custom preflight CQL rule '{}' failed to parse ({}): {err}",
+                        cql_rule.name, cql_rule.query
+                    ),
+                    suggestion: "Fix the CQL query syntax in PreflightRules::custom_cql_rules."
+                        .into(),
+                    measured_value: None,
+                });
             }
         }
     }
@@ -310,12 +413,15 @@ fn is_marks_layer(layer: &Layer) -> bool {
         || layer.name.eq_ignore_ascii_case(TILE_MARKS_LAYER_NAME)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_layer(
     doc: &Document,
     page: &Page,
     layer: &Layer,
     rules: &PreflightRules,
+    font_index: Option<&BTreeMap<String, PathBuf>>,
     seen_layer_state_checks: &mut HashSet<LayerId>,
+    visiting_syms: &mut HashSet<coree_core::SymbolId>,
     issues: &mut Vec<PreflightIssue>,
 ) {
     if rules.check_layer_states
@@ -367,19 +473,25 @@ fn check_layer(
     let marks = is_marks_layer(layer);
     let mut visiting = HashSet::new();
     for &oid in &layer.objects {
-        check_object_recursive(
-            doc,
-            page,
-            layer,
-            oid,
-            Affine2D::IDENTITY,
-            None,
-            marks,
-            rules,
-            0,
-            &mut visiting,
-            issues,
-        );
+        if let Some(obj) = doc.object(oid) {
+            check_object_recursive(
+                doc,
+                page,
+                layer,
+                oid,
+                obj,
+                Affine2D::IDENTITY,
+                None,
+                None,
+                marks,
+                rules,
+                font_index,
+                0,
+                &mut visiting,
+                visiting_syms,
+                issues,
+            );
+        }
     }
 }
 
@@ -389,80 +501,190 @@ fn check_object_recursive(
     page: &Page,
     layer: &Layer,
     oid: ObjectId,
+    obj: &SceneObject,
     parent_xf: Affine2D,
     clip_bounds: Option<Rect2D>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
     is_marks: bool,
     rules: &PreflightRules,
+    font_index: Option<&BTreeMap<String, PathBuf>>,
     depth: usize,
     visiting: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<coree_core::SymbolId>,
     issues: &mut Vec<PreflightIssue>,
 ) {
     if depth > MAX_SCENE_DEPTH || !visiting.insert(oid) {
         return;
     }
-    if let Some(obj) = doc.object(oid) {
-        let world_xf = parent_xf.compose(&obj.transform);
-        check_object(
-            doc,
-            page,
-            layer,
-            oid,
-            obj,
-            world_xf,
-            clip_bounds,
-            is_marks,
-            rules,
-            issues,
-        );
-        match &obj.payload {
-            NodePayload::Group(children) => {
-                for &cid in children {
-                    check_object_recursive(
-                        doc,
-                        page,
-                        layer,
-                        cid,
-                        world_xf,
-                        clip_bounds,
-                        is_marks,
-                        rules,
-                        depth + 1,
-                        visiting,
-                        issues,
-                    );
-                }
-            }
-            NodePayload::PowerClip {
-                container,
-                contents,
-                ..
-            } => {
-                let container_bb = container.transformed(&world_xf).bounding_box();
-                let child_clip = match (clip_bounds, container_bb) {
-                    (Some(a), Some(b)) => a.intersection(b),
-                    (None, Some(b)) => Some(b),
-                    (Some(a), None) => Some(a),
-                    (None, None) => None,
-                };
-                for &cid in contents {
-                    check_object_recursive(
-                        doc,
-                        page,
-                        layer,
-                        cid,
-                        world_xf,
-                        child_clip,
-                        is_marks,
-                        rules,
-                        depth + 1,
-                        visiting,
-                        issues,
-                    );
-                }
-            }
-            _ => {}
+    let world_xf = parent_xf.compose(&obj.transform);
+
+    if let NodePayload::Clone { .. } = &obj.payload {
+        if let Some((payload, fill, outline, in_sym)) =
+            doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|c| c.sym_map))
+        {
+            let mut tmp = obj.clone();
+            tmp.payload = payload;
+            tmp.fill = fill;
+            tmp.outline = outline;
+            visiting.remove(&oid);
+            check_object_recursive(
+                doc,
+                page,
+                layer,
+                oid,
+                &tmp,
+                parent_xf,
+                clip_bounds,
+                if in_sym { sym_ctx } else { None },
+                is_marks,
+                rules,
+                font_index,
+                depth + 1,
+                visiting,
+                visiting_syms,
+                issues,
+            );
+            return;
         }
     }
+
+    check_object(
+        doc,
+        page,
+        layer,
+        oid,
+        obj,
+        world_xf,
+        clip_bounds,
+        sym_ctx,
+        is_marks,
+        rules,
+        font_index,
+        issues,
+    );
+
+    match &obj.payload {
+        NodePayload::Group(children) => {
+            for &cid in children {
+                let child = sym_ctx
+                    .and_then(|c| c.sym_map.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child_obj) = child {
+                    check_object_recursive(
+                        doc,
+                        page,
+                        layer,
+                        cid,
+                        child_obj,
+                        world_xf,
+                        clip_bounds,
+                        sym_ctx,
+                        is_marks,
+                        rules,
+                        font_index,
+                        depth + 1,
+                        visiting,
+                        visiting_syms,
+                        issues,
+                    );
+                }
+            }
+        }
+        NodePayload::PowerClip {
+            container,
+            contents,
+            ..
+        } => {
+            let container_bb = container.transformed(&world_xf).bounding_box();
+            let child_clip = match (clip_bounds, container_bb) {
+                (Some(a), Some(b)) => a.intersection(b),
+                (None, Some(b)) => Some(b),
+                (Some(a), None) => Some(a),
+                (None, None) => None,
+            };
+            for &cid in contents {
+                let child = sym_ctx
+                    .and_then(|c| c.sym_map.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child_obj) = child {
+                    check_object_recursive(
+                        doc,
+                        page,
+                        layer,
+                        cid,
+                        child_obj,
+                        world_xf,
+                        child_clip,
+                        sym_ctx,
+                        is_marks,
+                        rules,
+                        font_index,
+                        depth + 1,
+                        visiting,
+                        visiting_syms,
+                        issues,
+                    );
+                }
+            }
+        }
+        NodePayload::SymbolInstance(symbol_id) if visiting_syms.insert(*symbol_id) => {
+            if let Some(sym) = doc.symbol(*symbol_id) {
+                if !sym.objects.is_empty() {
+                    let inst_xf = world_xf;
+                    let sym_map: std::collections::HashMap<ObjectId, &SceneObject> =
+                        sym.objects.iter().map(|o| (o.id, o)).collect();
+                    let mut sym_parent_map: std::collections::HashMap<ObjectId, SymParentRef> =
+                        std::collections::HashMap::new();
+                    for o in &sym.objects {
+                        match &o.payload {
+                            NodePayload::Group(kids) => {
+                                for &kid in kids {
+                                    sym_parent_map.insert(kid, SymParentRef::Id(o.id));
+                                }
+                            }
+                            NodePayload::PowerClip { contents, .. } => {
+                                for &kid in contents {
+                                    sym_parent_map.insert(kid, SymParentRef::Id(o.id));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let child_ctx = SymBoundsCtx {
+                        root_xf: &inst_xf,
+                        sym_objects: &sym.objects,
+                        sym_map: &sym_map,
+                        sym_parent_map: &sym_parent_map,
+                    };
+                    let mut local_visiting = HashSet::new();
+                    for child in &sym.objects {
+                        if !sym_parent_map.contains_key(&child.id) {
+                            check_object_recursive(
+                                doc,
+                                page,
+                                layer,
+                                child.id,
+                                child,
+                                inst_xf,
+                                clip_bounds,
+                                Some(&child_ctx),
+                                is_marks,
+                                rules,
+                                font_index,
+                                depth + 1,
+                                &mut local_visiting,
+                                visiting_syms,
+                                issues,
+                            );
+                        }
+                    }
+                }
+            }
+            visiting_syms.remove(symbol_id);
+        }
+        _ => {}
+    }
+
     visiting.remove(&oid);
 }
 
@@ -475,31 +697,30 @@ fn check_object(
     obj: &SceneObject,
     world_xf: Affine2D,
     clip_bounds: Option<Rect2D>,
+    sym_ctx: Option<&SymBoundsCtx<'_>>,
     is_marks: bool,
     rules: &PreflightRules,
+    font_index: Option<&BTreeMap<String, PathBuf>>,
     issues: &mut Vec<PreflightIssue>,
 ) {
     // 1. Collect all vector/text colors referenced directly by this object
     let mut colors: Vec<(&str, &Color)> = Vec::new();
     match &obj.fill {
-        coree_core::Fill::None
-        | coree_core::Fill::VectorPattern { .. }
-        | coree_core::Fill::BitmapPattern { .. } => {}
-        coree_core::Fill::Solid(c) => colors.push(("fill", c)),
-        coree_core::Fill::LinearGradient { stops, .. }
-        | coree_core::Fill::RadialGradient { stops, .. }
-        | coree_core::Fill::ConicalGradient { stops, .. }
-        | coree_core::Fill::SquareGradient { stops, .. } => {
+        Fill::None | Fill::VectorPattern { .. } | Fill::BitmapPattern { .. } => {}
+        Fill::Solid(c) => colors.push(("fill", c)),
+        Fill::LinearGradient { stops, .. }
+        | Fill::RadialGradient { stops, .. }
+        | Fill::ConicalGradient { stops, .. }
+        | Fill::SquareGradient { stops, .. } => {
             for s in stops {
                 colors.push(("gradient fill", &s.color));
             }
         }
-        coree_core::Fill::TwoColorPattern { fg, bg, .. }
-        | coree_core::Fill::TextureFill { fg, bg, .. } => {
+        Fill::TwoColorPattern { fg, bg, .. } | Fill::TextureFill { fg, bg, .. } => {
             colors.push(("pattern foreground", fg));
             colors.push(("pattern background", bg));
         }
-        coree_core::Fill::MeshFill { nodes, .. } => {
+        Fill::MeshFill { nodes, .. } => {
             for n in nodes {
                 colors.push(("mesh node", &n.color));
             }
@@ -508,23 +729,79 @@ fn check_object(
     if obj.outline.is_visible() {
         colors.push(("outline", &obj.outline.color));
     }
+    if let Some(lens) = &obj.lens {
+        if let LensKind::TintedGrayscale { tint } = &lens.kind {
+            colors.push(("lens tint", tint));
+        }
+    }
+
+    let mut font_families: Vec<&str> = Vec::new();
     match &obj.payload {
         NodePayload::ArtisticText(t) => {
             for run in &t.runs {
                 colors.push(("text fill", &run.style.fill));
+                font_families.push(run.style.font_family.as_str());
             }
         }
         NodePayload::ParagraphText(t) => {
             for run in &t.runs {
                 colors.push(("text fill", &run.style.fill));
+                font_families.push(run.style.font_family.as_str());
             }
         }
         NodePayload::TextOnPath(top) => {
             for run in &top.text.runs {
                 colors.push(("text fill", &run.style.fill));
+                font_families.push(run.style.font_family.as_str());
             }
         }
+        NodePayload::Table(table) => {
+            if table.border_style.is_visible() {
+                colors.push(("table border", &table.border_style.color));
+            }
+            for cell in &table.cells {
+                if !cell.is_covered() {
+                    if let Fill::Solid(c) = &cell.fill {
+                        colors.push(("table cell fill", c));
+                    }
+                    colors.push(("table cell text", &cell.text_style.fill));
+                    if !cell.text.trim().is_empty() {
+                        font_families.push(cell.text_style.font_family.as_str());
+                    }
+                }
+            }
+        }
+        NodePayload::Dimension(dim) => {
+            colors.push(("dimension text", &dim.text_style.fill));
+            font_families.push(dim.text_style.font_family.as_str());
+        }
         _ => {}
+    }
+
+    // 1c. Missing font family audit (shared SFNT scanner with Collect for Output)
+    if let Some(idx) = font_index {
+        let mut checked_fonts: HashSet<&str> = HashSet::new();
+        for family in font_families {
+            let trimmed = family.trim();
+            if trimmed.is_empty() || !checked_fonts.insert(trimmed) {
+                continue;
+            }
+            if !font_index_contains(idx, trimmed) {
+                issues.push(PreflightIssue {
+                    severity: PreflightSeverity::Warning,
+                    kind: PreflightIssueKind::MissingFont,
+                    page_id: Some(page.id),
+                    layer_id: Some(layer.id),
+                    object_id: Some(oid),
+                    message: format!(
+                        "Object '{}' references font family '{}' which was not found in system font directories",
+                        obj.name, trimmed
+                    ),
+                    suggestion: "Install the missing font or convert text to vector curves before press export.".into(),
+                    measured_value: None,
+                });
+            }
+        }
     }
 
     // 1a. RGB inside CMYK document check
@@ -719,7 +996,7 @@ fn check_object(
         && !layer.is_cut_layer
         && !matches!(obj.payload, NodePayload::Group(_))
     {
-        let raw_bb = world_bounds_with_xf(doc, oid, obj, &world_xf);
+        let raw_bb = world_bounds_with_sym_xf(doc, oid, obj, &world_xf, sym_ctx);
         let visible_bb = match (raw_bb, clip_bounds) {
             (Some(bb), Some(clip)) => bb.intersection(clip),
             (Some(bb), None) => Some(bb),
@@ -988,5 +1265,52 @@ mod tests {
         assert!(report.passed(), "unexpected issues: {:?}", report.issues);
         assert_eq!(report.error_count(), 0);
         assert_eq!(report.warning_count(), 0);
+    }
+
+    #[test]
+    fn preflight_detects_missing_font_and_custom_cql_rule_and_recurses_symbols() {
+        let mut doc = Document::new_a4("Missing Font & CQL Preflight");
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Missing Font Text",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "Missing Font Probe",
+                    TextStyle {
+                        font_family: "NonExistentCoreeTestFont_XYZ_999".to_owned(),
+                        fill: Color::KEY_BLACK,
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_transform(Affine2D::translate(30.0, 40.0)),
+            None,
+        )
+        .unwrap();
+
+        let flagged_id = doc
+            .add_object(
+                rect(40.0, 90.0, 20.0, 20.0)
+                    .with_fill(Fill::Solid(Color::CYAN))
+                    .with_outline(OutlineStyle::none()),
+                None,
+            )
+            .unwrap();
+
+        let rules = PreflightRules {
+            custom_cql_rules: vec![PreflightCqlRule {
+                name: "Disallow Cyan Box".to_owned(),
+                query: "@type == 'rectangle'".to_owned(),
+                severity: PreflightSeverity::Error,
+                suggestion: "Convert rectangle or switch fill.".to_owned(),
+            }],
+            ..PreflightRules::default()
+        };
+
+        let report = run_preflight(&doc, &rules);
+        assert!(report.has_issue_kind(PreflightIssueKind::MissingFont));
+        assert!(report.issues.iter().any(|i| {
+            i.kind == PreflightIssueKind::CustomCqlRuleViolation && i.object_id == Some(flagged_id)
+        }));
     }
 }

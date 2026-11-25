@@ -4904,7 +4904,10 @@ impl Document {
             .map(|(p, f, o, _)| (p, f, o))
     }
 
-    pub(crate) fn resolve_clone_payload_and_style_with_sym_scope(
+    /// Resolves the effective `(payload, fill, outline, in_sym)` for a `NodePayload::Clone` object,
+    /// checking `sym_map` first before falling back to `self.objects`.
+    #[must_use]
+    pub fn resolve_clone_payload_and_style_with_sym_scope(
         &self,
         obj: &SceneObject,
         sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
