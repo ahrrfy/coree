@@ -331,30 +331,63 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                         crate::i18n::I18nKey::DlgPrintImposPerfect.tr_ui(lang),
                     );
                 });
-                shell_dir.with_horizontal(ui, |ui| {
-                    ui.label(crate::i18n::I18nKey::DlgPrintSheetW.tr_ui(lang))
-                        .on_hover_text(format!(
-                            "{} / {}",
-                            crate::i18n::I18nKey::PrintTileWidth.tr_ui(lang),
-                            crate::i18n::I18nKey::PrintScalePercent.tr_ui(lang)
-                        ));
+                shell_dir.with_horizontal_wrapped(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DlgPrintSheetW.tr_ui(lang));
                     ui.add(
                         DragValue::new(&mut app.production_state.sheet_w_mm)
                             .range(50.0..=5000.0)
                             .suffix(" mm"),
                     );
-                    ui.label(crate::i18n::I18nKey::DlgPrintSheetH.tr_ui(lang))
-                        .on_hover_text(format!(
-                            "{} / {}",
-                            crate::i18n::I18nKey::PrintTileHeight.tr_ui(lang),
-                            crate::i18n::I18nKey::PrintTileOverlap.tr_ui(lang)
-                        ));
+                    ui.label(crate::i18n::I18nKey::DlgPrintSheetH.tr_ui(lang));
                     ui.add(
                         DragValue::new(&mut app.production_state.sheet_h_mm)
                             .range(50.0..=5000.0)
                             .suffix(" mm"),
                     );
+                    ui.label(crate::i18n::I18nKey::PrintScalePercent.tr_ui(lang));
+                    if ui
+                        .add(
+                            DragValue::new(&mut app.production_state.print_scale_pct)
+                                .range(10.0..=400.0)
+                                .speed(1.0)
+                                .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        app.print_job_config.scale_pct = app.production_state.print_scale_pct;
+                    }
                 });
+                if app.production_state.imposition_kind == 2 {
+                    shell_dir.with_horizontal_wrapped(ui, |ui| {
+                        ui.label(crate::i18n::I18nKey::PrintTileWidth.tr_ui(lang));
+                        ui.add(
+                            DragValue::new(&mut app.production_state.tile_w_mm)
+                                .range(30.0..=5000.0)
+                                .suffix(" mm"),
+                        );
+                        ui.label(crate::i18n::I18nKey::PrintTileHeight.tr_ui(lang));
+                        ui.add(
+                            DragValue::new(&mut app.production_state.tile_h_mm)
+                                .range(30.0..=5000.0)
+                                .suffix(" mm"),
+                        );
+                        ui.label(crate::i18n::I18nKey::PrintTileOverlap.tr_ui(lang));
+                        let max_overlap = (app
+                            .production_state
+                            .tile_w_mm
+                            .min(app.production_state.tile_h_mm)
+                            - 1.0)
+                            .max(0.0);
+                        app.production_state.tile_overlap_mm =
+                            app.production_state.tile_overlap_mm.clamp(0.0, max_overlap);
+                        ui.add(
+                            DragValue::new(&mut app.production_state.tile_overlap_mm)
+                                .range(0.0..=max_overlap)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        );
+                    });
+                }
                 ui.separator();
                 shell_dir.with_horizontal(ui, |ui| {
                     ui.label(
@@ -483,6 +516,92 @@ fn show_print_preview_dialog(ctx: &egui::Context, app: &mut StudioApp) {
     app.show_print_preview_dialog = open;
 }
 
+fn print_preview_cache_key(
+    app: &StudioApp,
+    tab: &crate::state::DocumentTab,
+    page_w: f32,
+    page_h: f32,
+    bleed_mm: f32,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mix = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    mix(&mut h, &tab.id.as_u128().to_le_bytes());
+    mix(&mut h, &tab.document.spatial_revision().to_le_bytes());
+    mix(
+        &mut h,
+        &(tab.document.active_page_index() as u64).to_le_bytes(),
+    );
+    mix(&mut h, &page_w.to_bits().to_le_bytes());
+    mix(&mut h, &page_h.to_bits().to_le_bytes());
+    mix(&mut h, &bleed_mm.to_bits().to_le_bytes());
+    mix(&mut h, &[u8::from(app.print_job_config.force_cmyk)]);
+    mix(&mut h, &[u8::from(app.soft_proof_cmyk)]);
+    mix(&mut h, &(app.proof_profile as u8).to_le_bytes());
+    mix(&mut h, &(app.proof_intent as u8).to_le_bytes());
+    mix(
+        &mut h,
+        &app.print_preview_plate
+            .map_or(u64::MAX, |i| i as u64)
+            .to_le_bytes(),
+    );
+    if let Some(ref sep) = tab.separations_preview {
+        mix(&mut h, &(sep.plates.len() as u64).to_le_bytes());
+        mix(&mut h, &sep.width.to_le_bytes());
+        mix(&mut h, &sep.height.to_le_bytes());
+        if let Some(plate) = app.print_preview_plate.and_then(|idx| sep.plates.get(idx)) {
+            mix(&mut h, plate.name.as_bytes());
+            mix(&mut h, &plate.average_coverage_pct.to_bits().to_le_bytes());
+            mix(&mut h, &plate.max_coverage_pct.to_bits().to_le_bytes());
+            if let Some(fb) = plate.spot_fallback_cmyk {
+                for c in fb {
+                    mix(&mut h, &c.to_bits().to_le_bytes());
+                }
+            }
+        }
+    } else {
+        mix(&mut h, &[0u8]);
+    }
+    h
+}
+
+fn rasterize_separation_plate_rgba(
+    plate: &coree_prod::SeparationPlate,
+    doc: &Document,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let expected = (plate.width as usize).checked_mul(plate.height as usize)?;
+    if plate.width == 0 || plate.height == 0 || plate.ink_map.len() != expected {
+        return None;
+    }
+    let ink_color = match &plate.channel {
+        coree_prod::SeparationChannel::Cyan => Color::cmyk(1.0, 0.0, 0.0, 0.0),
+        coree_prod::SeparationChannel::Magenta => Color::cmyk(0.0, 1.0, 0.0, 0.0),
+        coree_prod::SeparationChannel::Yellow => Color::cmyk(0.0, 0.0, 1.0, 0.0),
+        coree_prod::SeparationChannel::Black => Color::cmyk(0.0, 0.0, 0.0, 1.0),
+        coree_prod::SeparationChannel::Spot(name) => {
+            let fb = plate.spot_fallback_cmyk.unwrap_or([0.0, 1.0, 0.0, 0.0]);
+            Color::spot(name.clone(), 1.0, fb)
+        }
+    };
+    let [ir, ig, ib, _] = ink_color.to_rgba_f32_icc(&doc.icc_pipeline());
+    let ink_r = ir.clamp(0.0, 1.0) * 255.0;
+    let ink_g = ig.clamp(0.0, 1.0) * 255.0;
+    let ink_b = ib.clamp(0.0, 1.0) * 255.0;
+    let mut rgba = Vec::with_capacity(expected * 4);
+    for &density in &plate.ink_map {
+        let d = f32::from(density) / 255.0;
+        rgba.push((255.0 + (ink_r - 255.0) * d).round().clamp(0.0, 255.0) as u8);
+        rgba.push((255.0 + (ink_g - 255.0) * d).round().clamp(0.0, 255.0) as u8);
+        rgba.push((255.0 + (ink_b - 255.0) * d).round().clamp(0.0, 255.0) as u8);
+        rgba.push(255);
+    }
+    Some((plate.width, plate.height, rgba))
+}
+
 fn draw_print_preview_thumbnail(
     ui: &mut egui::Ui,
     app: &mut StudioApp,
@@ -490,12 +609,10 @@ fn draw_print_preview_thumbnail(
 ) {
     let sheet_w = app.production_state.sheet_w_mm.max(10.0) as f32;
     let sheet_h = app.production_state.sheet_h_mm.max(10.0) as f32;
-    let active_plate_info = app
-        .active_tab()
-        .and_then(|t| t.separations_preview.as_ref())
-        .and_then(|sep| app.print_preview_plate.and_then(|idx| sep.plates.get(idx)))
-        .map(|p| (p.name.clone(), p.average_coverage_pct));
-    let (page_w, page_h, bleed_mm, doc_thumbs) = if let Some(tab) = app.active_tab() {
+    let scale_pct = app.production_state.print_scale_pct.clamp(10.0, 400.0);
+    let scale_factor = (scale_pct / 100.0) as f32;
+
+    let (page_w, page_h, bleed_mm, preview_tex_id) = if let Some(tab) = app.active_tab() {
         let p = tab.document.active_page();
         let (pw, ph, bm) = p.map_or((210.0_f32, 297.0_f32, 3.0_f32), |pg| {
             (
@@ -504,59 +621,73 @@ fn draw_print_preview_thumbnail(
                 pg.bleed_mm.max(0.0) as f32,
             )
         });
-        let mut thumbs: Vec<((f32, f32, f32, f32), Color32)> = Vec::new();
-        if let Some(pg) = p {
-            for layer in &pg.layers {
-                if !layer.visible || !layer.printable {
-                    continue;
-                }
-                for &oid in &layer.objects {
-                    if thumbs.len() >= 48 {
-                        break;
-                    }
-                    if let (Some(obj), Some(bb)) = (
-                        tab.document.object(oid),
-                        tab.document.world_object_bounds(oid),
-                    ) {
-                        if !obj.visible || !obj.printable {
-                            continue;
-                        }
-                        let base_c = obj
-                            .fill
-                            .referenced_colors()
-                            .first()
-                            .map(core_color_to_egui)
-                            .unwrap_or(core_color_to_egui(&obj.outline.color));
-                        let fill_c = if let Some((ref pname, _)) = active_plate_info {
-                            let luma = (u16::from(base_c.r())
-                                + u16::from(base_c.g())
-                                + u16::from(base_c.b()))
-                                / 3;
-                            let shade = (luma as u8).clamp(35, 225);
-                            if pname.to_ascii_lowercase().contains("cyan") {
-                                Color32::from_rgb(0, 210 - shade / 3, 240)
-                            } else if pname.to_ascii_lowercase().contains("magenta") {
-                                Color32::from_rgb(235, 20, 150)
-                            } else if pname.to_ascii_lowercase().contains("yellow") {
-                                Color32::from_rgb(245, 215, 25)
-                            } else {
-                                Color32::from_gray(shade)
-                            }
-                        } else {
-                            base_c
-                        };
-                        let nx = (bb.min_x as f32 / pw).clamp(-0.1, 1.1);
-                        let ny = (bb.min_y as f32 / ph).clamp(-0.1, 1.1);
-                        let nw = ((bb.max_x - bb.min_x) as f32 / pw).clamp(0.01, 1.2);
-                        let nh = ((bb.max_y - bb.min_y) as f32 / ph).clamp(0.01, 1.2);
-                        thumbs.push(((nx, ny, nw, nh), fill_c.gamma_multiply(0.85)));
-                    }
+        let cache_key = print_preview_cache_key(app, tab, pw, ph, bm);
+        let mut tex_slot = app.print_preview_tex.borrow_mut();
+        let cache_hit = tex_slot.as_ref().is_some_and(|(k, _)| *k == cache_key);
+        if !cache_hit {
+            let plate_opt = tab
+                .separations_preview
+                .as_ref()
+                .and_then(|sep| app.print_preview_plate.and_then(|idx| sep.plates.get(idx)));
+            let rendered_buf = plate_opt
+                .and_then(|plate| rasterize_separation_plate_rgba(plate, &tab.document))
+                .or_else(|| {
+                    use coree_render::{
+                        CanvasBackend, RenderOptions, SceneRenderer, TinySkiaBackend, ViewMode,
+                        Viewport,
+                    };
+                    const PREVIEW_MAX_DIM: u32 = 512;
+                    let max_mm = f64::from(pw).max(f64::from(ph)).max(1.0);
+                    let scale_px_per_mm = f64::from(PREVIEW_MAX_DIM) / max_mm;
+                    let target_w = (f64::from(pw) * scale_px_per_mm)
+                        .round()
+                        .clamp(16.0, f64::from(PREVIEW_MAX_DIM))
+                        as u32;
+                    let target_h = (f64::from(ph) * scale_px_per_mm)
+                        .round()
+                        .clamp(16.0, f64::from(PREVIEW_MAX_DIM))
+                        as u32;
+                    let raw_dpi = scale_px_per_mm * coree_core::math::MM_PER_INCH;
+                    let clamped_dpi = raw_dpi.clamp(1.0, 4800.0);
+                    let zoom = (raw_dpi / clamped_dpi).clamp(0.01, 256.0);
+                    let mut backend = TinySkiaBackend::new(target_w, target_h).ok()?;
+                    let mut viewport = Viewport::for_export(target_w, target_h, clamped_dpi);
+                    viewport.zoom = zoom;
+                    let mut doc_view = tab.document.clone();
+                    doc_view.set_multipage_view(false);
+                    let mut opts = RenderOptions::export();
+                    opts.soft_proof_cmyk = app.print_job_config.force_cmyk || app.soft_proof_cmyk;
+                    opts.proof_profile = app.proof_profile;
+                    opts.proof_intent = app.proof_intent;
+                    let mut renderer = SceneRenderer::new();
+                    renderer.render_document(
+                        &doc_view,
+                        &viewport,
+                        ViewMode::Enhanced,
+                        &opts,
+                        &mut backend,
+                    );
+                    let buf = backend.into_rgba();
+                    Some((buf.width, buf.height, buf.rgba))
+                });
+            if let Some((w, h, rgba)) = rendered_buf {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                if let Some((ref mut cached_k, ref mut handle)) = *tex_slot {
+                    *cached_k = cache_key;
+                    handle.set(img, egui::TextureOptions::LINEAR);
+                } else {
+                    let handle = ui.ctx().load_texture(
+                        "coree_print_preview",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    *tex_slot = Some((cache_key, handle));
                 }
             }
         }
-        (pw, ph, bm, thumbs)
+        (pw, ph, bm, tex_slot.as_ref().map(|(_, h)| h.id()))
     } else {
-        (210.0, 297.0, 3.0, Vec::new())
+        (210.0, 297.0, 3.0, None)
     };
 
     let avail_w = ui.available_width().clamp(260.0, 480.0);
@@ -591,18 +722,19 @@ fn draw_print_preview_thumbnail(
         inner.center() + vec2(app.print_preview_pan[0], app.print_preview_pan[1]),
         sheet_px_size,
     );
+    let well_painter = painter.with_clip_rect(resp.rect);
 
-    painter.rect_filled(
+    well_painter.rect_filled(
         sheet_rect.translate(vec2(2.5, 2.5)),
         CornerRadius::ZERO,
         Color32::from_black_alpha(70),
     );
-    painter.rect_filled(
+    well_painter.rect_filled(
         sheet_rect,
         CornerRadius::ZERO,
         Color32::from_rgb(248, 249, 251),
     );
-    painter.rect_stroke(
+    well_painter.rect_stroke(
         sheet_rect,
         CornerRadius::ZERO,
         Stroke::new(1.0, Color32::from_rgb(130, 140, 155)),
@@ -614,42 +746,33 @@ fn draw_print_preview_thumbnail(
             let bx = (bleed_mm / page_w) * slot_rect.width();
             let by = (bleed_mm / page_h) * slot_rect.height();
             let bleed_rect = slot_rect.expand2(vec2(bx.min(8.0), by.min(8.0)));
-            painter.rect_stroke(
+            well_painter.rect_stroke(
                 bleed_rect,
                 CornerRadius::ZERO,
                 Stroke::new(0.9, Color32::from_rgb(220, 65, 85)),
                 StrokeKind::Inside,
             );
         }
+        if let Some(tex_id) = preview_tex_id {
+            well_painter.image(
+                tex_id,
+                slot_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
         // Safe inner margin (5mm visual guide)
         let safe_inset = ((5.0 / page_w.max(page_h)) * slot_rect.width().min(slot_rect.height()))
             .clamp(1.5, 10.0);
         if slot_rect.width() > 14.0 && slot_rect.height() > 14.0 {
-            painter.rect_stroke(
+            well_painter.rect_stroke(
                 slot_rect.shrink(safe_inset),
                 CornerRadius::ZERO,
                 Stroke::new(0.7, Color32::from_rgba_unmultiplied(40, 130, 210, 140)),
                 StrokeKind::Inside,
             );
         }
-        // Artwork silhouettes scaled inside slot trim box
-        for &((nx, ny, nw, nh), col) in &doc_thumbs {
-            let r = Rect::from_min_size(
-                pos2(
-                    slot_rect.left() + nx * slot_rect.width(),
-                    slot_rect.top() + ny * slot_rect.height(),
-                ),
-                vec2(
-                    (nw * slot_rect.width()).max(1.5),
-                    (nh * slot_rect.height()).max(1.5),
-                ),
-            )
-            .intersect(slot_rect);
-            if r.width() > 0.5 && r.height() > 0.5 {
-                painter.rect_filled(r, CornerRadius::ZERO, col);
-            }
-        }
-        painter.rect_stroke(
+        well_painter.rect_stroke(
             slot_rect,
             CornerRadius::ZERO,
             Stroke::new(1.0, Color32::from_rgb(55, 65, 80)),
@@ -666,11 +789,11 @@ fn draw_print_preview_thumbnail(
                 (slot_rect.right(), slot_rect.bottom(), 1.0, 1.0),
             ] {
                 let p = pos2(cx, cy);
-                painter.line_segment(
+                well_painter.line_segment(
                     [p + vec2(sx * gap, 0.0), p + vec2(sx * (gap + tick), 0.0)],
                     mc,
                 );
-                painter.line_segment(
+                well_painter.line_segment(
                     [p + vec2(0.0, sy * gap), p + vec2(0.0, sy * (gap + tick))],
                     mc,
                 );
@@ -685,15 +808,15 @@ fn draw_print_preview_thumbnail(
             let work = sheet_rect.shrink(margin_px);
             let half_w = (work.width() * 0.5).max(4.0);
             let s_scale = (half_w / page_w).min(work.height() / page_h).max(1e-3);
-            let pw_px = page_w * s_scale;
-            let ph_px = page_h * s_scale;
+            let pw_px = page_w * s_scale * scale_factor;
+            let ph_px = page_h * s_scale * scale_factor;
             let top = work.center().y - ph_px * 0.5;
             let left_slot =
                 Rect::from_min_size(pos2(work.center().x - pw_px, top), vec2(pw_px, ph_px));
             let right_slot = Rect::from_min_size(pos2(work.center().x, top), vec2(pw_px, ph_px));
             draw_slot_contents(left_slot);
             draw_slot_contents(right_slot);
-            painter.line_segment(
+            well_painter.line_segment(
                 [
                     pos2(work.center().x, sheet_rect.top()),
                     pos2(work.center().x, sheet_rect.bottom()),
@@ -705,15 +828,21 @@ fn draw_print_preview_thumbnail(
             // Large-Format Tiling grid
             let margin_px = (4.0 * scale).clamp(2.0, 10.0);
             let work = sheet_rect.shrink(margin_px);
-            let p_scale = (work.width() / page_w)
-                .min(work.height() / page_h)
+            let scaled_w = page_w * scale_factor;
+            let scaled_h = page_h * scale_factor;
+            let p_scale = (work.width() / scaled_w)
+                .min(work.height() / scaled_h)
                 .max(1e-3);
             let art_rect =
-                Rect::from_center_size(work.center(), vec2(page_w * p_scale, page_h * p_scale));
+                Rect::from_center_size(work.center(), vec2(scaled_w * p_scale, scaled_h * p_scale));
             draw_slot_contents(art_rect);
-            let tw = (app.production_state.tile_w_mm.max(10.0) as f32) * p_scale;
-            let th = (app.production_state.tile_h_mm.max(10.0) as f32) * p_scale;
-            let ov = (app.production_state.tile_overlap_mm.max(0.0) as f32) * p_scale;
+            let tile_w_mm = app.production_state.tile_w_mm.max(10.0) as f32;
+            let tile_h_mm = app.production_state.tile_h_mm.max(10.0) as f32;
+            let ov_mm = (app.production_state.tile_overlap_mm.max(0.0) as f32)
+                .min((tile_w_mm.min(tile_h_mm) - 1.0).max(0.0));
+            let tw = tile_w_mm * p_scale;
+            let th = tile_h_mm * p_scale;
+            let ov = ov_mm * p_scale;
             let step_x = (tw - ov).max(8.0);
             let step_y = (th - ov).max(8.0);
             let mut x = art_rect.left();
@@ -721,7 +850,7 @@ fn draw_print_preview_thumbnail(
                 let mut y = art_rect.top();
                 while y < art_rect.bottom() - 1.0 {
                     let tile = Rect::from_min_size(pos2(x, y), vec2(tw, th)).intersect(art_rect);
-                    painter.rect_stroke(
+                    well_painter.rect_stroke(
                         tile,
                         CornerRadius::ZERO,
                         Stroke::new(1.0, Color32::from_rgb(25, 130, 195)),
@@ -743,7 +872,10 @@ fn draw_print_preview_thumbnail(
             let fit_scale = ((cell_w - 4.0).max(2.0) / page_w)
                 .min((cell_h - 4.0).max(2.0) / page_h)
                 .max(1e-3);
-            let slot_size = vec2(page_w * fit_scale, page_h * fit_scale);
+            let slot_size = vec2(
+                page_w * fit_scale * scale_factor,
+                page_h * fit_scale * scale_factor,
+            );
             for r in 0..rows {
                 for c in 0..cols {
                     let cell = Rect::from_min_size(
@@ -761,7 +893,7 @@ fn draw_print_preview_thumbnail(
     }
 
     let summary = format!(
-        "Sheet {sheet_w:.0}×{sheet_h:.0} mm · Trim {page_w:.0}×{page_h:.0} mm · Bleed {bleed_mm:.1} mm · {}",
+        "Sheet {sheet_w:.0}×{sheet_h:.0} mm · Trim {page_w:.0}×{page_h:.0} mm · Scale {scale_pct:.0}% · Bleed {bleed_mm:.1} mm · {}",
         if app.print_job_config.force_cmyk {
             "CMYK Press"
         } else {

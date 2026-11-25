@@ -552,8 +552,15 @@ impl ShortcutAction {
         ),
         (ShortcutAction::SelectPick, "Tool: Pick"),
         (ShortcutAction::SelectShapeNode, "Tool: Shape / Node"),
+        (ShortcutAction::SelectZoom, "Tool: Zoom"),
+        (ShortcutAction::SelectPan, "Tool: Pan"),
+        (ShortcutAction::SelectFreehand, "Tool: Freehand"),
+        (ShortcutAction::SelectPen, "Tool: Pen"),
         (ShortcutAction::SelectRectangle, "Tool: Rectangle"),
         (ShortcutAction::SelectEllipse, "Tool: Ellipse"),
+        (ShortcutAction::SelectPolygon, "Tool: Polygon"),
+        (ShortcutAction::SelectSpiral, "Tool: Spiral"),
+        (ShortcutAction::SelectGraphPaper, "Tool: Graph Paper"),
         (ShortcutAction::SelectArtisticText, "Tool: Artistic Text"),
         (
             ShortcutAction::SelectInteractiveFill,
@@ -584,8 +591,6 @@ impl ShortcutAction {
             "Tool: Virtual Segment Delete",
         ),
         (ShortcutAction::SelectTool(ToolId::Eraser), "Tool: Eraser"),
-        (ShortcutAction::SelectTool(ToolId::Zoom), "Tool: Zoom"),
-        (ShortcutAction::SelectTool(ToolId::Pan), "Tool: Pan"),
         (
             ShortcutAction::SelectTool(ToolId::TwoPointLine),
             "Tool: 2-Point Line",
@@ -1208,5 +1213,90 @@ mod tests {
         let json = serde_json::to_string(&custom).unwrap();
         let decoded: CustomShortcutMap = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, custom);
+    }
+
+    #[test]
+    fn remappable_actions_cover_all_65_tools_and_roundtrip_ids() {
+        use std::collections::HashSet;
+
+        let all_tools: Vec<ToolId> = coree_tools::TOOL_GROUPS
+            .iter()
+            .flat_map(|g| g.iter().copied())
+            .collect();
+        assert_eq!(all_tools.len(), 65);
+
+        let mut seen_ids = HashSet::new();
+        for &(act, label) in ShortcutAction::REMAPPABLE_ACTIONS {
+            assert!(!label.is_empty(), "remappable label must be non-empty");
+            let id = act
+                .action_id()
+                .expect("every REMAPPABLE_ACTIONS entry must have an action_id");
+            assert!(
+                seen_ids.insert(id),
+                "duplicate action_id '{id}' in REMAPPABLE_ACTIONS"
+            );
+            assert_eq!(
+                ShortcutAction::from_id(id),
+                Some(act),
+                "from_id('{id}') must round-trip to {act:?}"
+            );
+        }
+
+        for tool in all_tools {
+            let act = crate::state::shortcut_action(tool)
+                .unwrap_or_else(|| panic!("tool {tool:?} missing shortcut_action"));
+            let id = act
+                .action_id()
+                .unwrap_or_else(|| panic!("tool {tool:?} shortcut {act:?} missing action_id"));
+            assert!(
+                ShortcutAction::REMAPPABLE_ACTIONS
+                    .iter()
+                    .any(|&(a, _)| a == act),
+                "tool {tool:?} ({act:?} / '{id}') must appear in REMAPPABLE_ACTIONS"
+            );
+            assert_eq!(ShortcutAction::from_id(id), Some(act));
+        }
+
+        let mut custom = CustomShortcutMap::default();
+        for (tool, action, expected_id, combo) in [
+            (
+                ToolId::Freehand,
+                ShortcutAction::SelectFreehand,
+                "tool.freehand",
+                "Ctrl+Alt+F",
+            ),
+            (
+                ToolId::Pen,
+                ShortcutAction::SelectPen,
+                "tool.pen",
+                "Ctrl+Alt+P",
+            ),
+            (
+                ToolId::Polygon,
+                ShortcutAction::SelectPolygon,
+                "tool.polygon",
+                "Ctrl+Alt+Y",
+            ),
+            (
+                ToolId::Spiral,
+                ShortcutAction::SelectSpiral,
+                "tool.spiral",
+                "Ctrl+Alt+A",
+            ),
+            (
+                ToolId::GraphPaper,
+                ShortcutAction::SelectGraphPaper,
+                "tool.graph_paper",
+                "Ctrl+Alt+D",
+            ),
+        ] {
+            assert_eq!(crate::state::shortcut_action(tool), Some(action));
+            assert_eq!(action.action_id(), Some(expected_id));
+            assert_eq!(ShortcutAction::from_id(expected_id), Some(action));
+            custom.set_binding(action, combo).unwrap();
+        }
+        let json = serde_json::to_string(&custom).unwrap();
+        let roundtrip: CustomShortcutMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, custom);
     }
 }

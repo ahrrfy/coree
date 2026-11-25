@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS recent_documents (
     file_path           TEXT NOT NULL UNIQUE,
     display_name        TEXT NOT NULL,
     file_format         TEXT NOT NULL CHECK (file_format IN (
-                            'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'png', 'jpg', 'tiff', 'psd', 'coree'
+                            'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'dwg', 'wmf', 'emf', 'png', 'jpg', 'tiff', 'webp', 'bmp', 'psd', 'coree'
                         )),
     cdr_version         TEXT,
     page_count          INTEGER NOT NULL DEFAULT 1 CHECK (page_count >= 1),
@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS font_index (
     is_variable         INTEGER NOT NULL DEFAULT 0 CHECK (is_variable IN (0, 1)),
     supports_arabic_rtl INTEGER NOT NULL DEFAULT 0 CHECK (supports_arabic_rtl IN (0, 1)),
     supports_kashida    INTEGER NOT NULL DEFAULT 0 CHECK (supports_kashida IN (0, 1)),
+    panose_hex          TEXT NOT NULL DEFAULT '00000000000000000000',
     collection_tag      TEXT NOT NULL DEFAULT 'system',
     favorite            INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1)),
     file_mtime_epoch    INTEGER NOT NULL DEFAULT 0,
@@ -223,3 +224,11 @@ CREATE TABLE IF NOT EXISTS app_preferences (
 
 CREATE INDEX IF NOT EXISTS idx_app_preferences_category
     ON app_preferences (category);
+
+-- 11. User-confirmed PANOSE font substitution overrides (REQ-07)
+CREATE TABLE IF NOT EXISTS font_substitutions (
+    missing_family    TEXT PRIMARY KEY COLLATE NOCASE NOT NULL,
+    substitute_family TEXT NOT NULL,
+    panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);

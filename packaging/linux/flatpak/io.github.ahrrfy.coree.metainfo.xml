@@ -23,7 +23,7 @@
       <li>Native CDR (RIFF v4–v13, ZIP X4–X5, ZCF X6–2025), CDT, CMX, and CPT support with unknown-chunk passthrough and embedded preview extraction.</li>
       <li>Pro format import and export: PDF/AI, EPS, AutoCAD DXF, HPGL PLT, multi-layer PSD/PSB, SVG/SVGZ, and high-DPI raster formats.</li>
       <li>Pure-Rust ICC v2/v4 color management with live CMYK soft-proofing and out-of-gamut warning.</li>
-      <li>62 interactive vector, node-sculpting, optical lens, effect, mesh-fill, and raster tools (including Healing Brush, Dodge/Burn, Flood Fill, and 10 procedural PostScript fills).</li>
+      <li>65 interactive vector, node-sculpting, optical lens, effect, mesh-fill, and raster tools (including Healing Brush, Dodge/Burn, Flood Fill, and 10 procedural PostScript fills).</li>
       <li>Native Arabic RTL/BiDi typography, Kashida elongation, Glyphs Docker, and legacy CP1256 text decoding.</li>
       <li>Laser cutting, engraving, and vinyl plotter toolpath engine (dedupe, curve join, kerf offset, hatch fill, G-Code, DXF R12, HPGL) with extensible plugins for LightBurn, RDWorks, EZCad, LaserDRW, LaserGRBL, and InkCut.</li>
       <li>Prepress separations, imposition, print marks, Preflight, Collect for Output, CutContour, parametric packaging dielines, vector QR/barcodes, CSV Print Merge, and sandboxed Rhai macros.</li>

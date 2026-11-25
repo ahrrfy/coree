@@ -57,7 +57,7 @@ impl UiDriver {
         let _ = self.step_with_output(events, modifiers);
     }
 
-    fn step_with_output(
+    fn step_with_raw_output(
         &mut self,
         mut events: Vec<Event>,
         modifiers: Modifiers,
@@ -72,7 +72,11 @@ impl UiDriver {
             events,
             ..RawInput::default()
         };
-        let mut out = self.ctx.run_ui(input, |ui| self.app.render_ui(ui));
+        self.ctx.run_ui(input, |ui| self.app.render_ui(ui))
+    }
+
+    fn step_with_output(&mut self, events: Vec<Event>, modifiers: Modifiers) -> egui::FullOutput {
+        let mut out = self.step_with_raw_output(events, modifiers);
         out.textures_delta.clear();
         out
     }

@@ -8,13 +8,18 @@
 //! - **Windows**: Stages validated print-ready PDF / XPS-EMF spool payloads atomically via
 //!   pure `std::fs` + `coree_io` without invoking external shells or `unsafe` FFI.
 
-use coree_core::Document;
+use coree_core::{Affine2D, CommandHistory, CommandOp, Document};
 use coree_io::{export_pdf, PdfColorSpace, PdfExportOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+const fn default_print_scale_pct() -> f64 {
+    100.0
+}
 
 /// Discovered local or network OS printer queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +30,7 @@ pub struct PrinterInfo {
 }
 
 /// Native OS print job configuration shown in Print Studio (`Ctrl+P`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrintJobConfig {
     pub printer_name: Option<String>,
     pub copies: u32,
@@ -35,6 +40,8 @@ pub struct PrintJobConfig {
     pub force_cmyk: bool,
     pub crop_marks: bool,
     pub collate: bool,
+    #[serde(default = "default_print_scale_pct")]
+    pub scale_pct: f64,
 }
 
 impl Default for PrintJobConfig {
@@ -47,6 +54,7 @@ impl Default for PrintJobConfig {
             force_cmyk: true,
             crop_marks: false,
             collate: true,
+            scale_pct: 100.0,
         }
     }
 }
@@ -735,13 +743,61 @@ pub fn build_unix_lp_args(pdf_path: &Path, cfg: &PrintJobConfig) -> Result<Vec<S
     Ok(args)
 }
 
+/// Uniformly scales a document's page sizes, bleed, and layer objects by `scale_pct`% (`10..=400`).
+#[must_use]
+pub fn scale_document_for_print(doc: &Document, scale_pct: f64) -> Document {
+    let clamped = if scale_pct.is_finite() {
+        scale_pct.clamp(10.0, 400.0)
+    } else {
+        100.0
+    };
+    if (clamped - 100.0).abs() <= 0.01 {
+        return doc.clone();
+    }
+    let factor = clamped / 100.0;
+    let mut scaled = doc.clone();
+    let mut seen = HashSet::new();
+    let mut top_ids = Vec::new();
+    for page in scaled.pages() {
+        for layer in &page.layers {
+            for &oid in &layer.objects {
+                if seen.insert(oid) {
+                    top_ids.push(oid);
+                }
+            }
+        }
+    }
+    if !top_ids.is_empty() {
+        let mut hist = CommandHistory::new(4);
+        let _ = hist.execute(
+            &mut scaled,
+            CommandOp::TransformObjects {
+                ids: top_ids,
+                affine: Affine2D::scale_uniform(factor),
+            },
+        );
+    }
+    let page_dims: Vec<(usize, f64, f64, f64)> = scaled
+        .pages()
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| (idx, p.width_mm, p.height_mm, p.bleed_mm))
+        .collect();
+    for (idx, w, h, b) in page_dims {
+        let _ = scaled.set_page_dimensions(idx, (w * factor).max(1.0), (h * factor).max(1.0));
+        let _ = scaled.set_page_bleed(idx, (b * factor).max(0.0));
+    }
+    scaled
+}
+
 /// Renders `doc` to a print-ready PDF and submits it directly to the OS print spooler.
 pub fn print_document_via_os_spooler(
     doc: &Document,
     cfg: &PrintJobConfig,
 ) -> Result<String, String> {
     cleanup_stale_print_pdfs();
-    let pages = parse_page_range_1based(&cfg.page_range, doc.pages().len())?;
+    let scaled_doc = scale_document_for_print(doc, cfg.scale_pct);
+    let pages = parse_page_range_1based(&cfg.page_range, scaled_doc.pages().len())?;
 
     let spool_pdf = std::env::temp_dir().join(format!("coree-print-{}.pdf", Uuid::new_v4()));
     let pdf_opts = PdfExportOptions {
@@ -757,7 +813,7 @@ pub fn print_document_via_os_spooler(
         ..PdfExportOptions::default()
     };
 
-    export_pdf(doc, &pdf_opts, &spool_pdf)
+    export_pdf(&scaled_doc, &pdf_opts, &spool_pdf)
         .map_err(|e| format!("failed to generate print spool PDF: {e}"))?;
 
     submit_pdf_to_os_spooler(&spool_pdf, cfg)
@@ -1042,5 +1098,40 @@ printer Disabled_Plotter disabled since Mon 20 Nov 2026 -
         assert!(msg.contains("job #42"));
         assert!(msg.contains("Coree_Press_RIP"));
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn scale_document_for_print_scales_pages_and_objects() {
+        use coree_core::{
+            Color, ColorMode, CornerStyle, Fill, NodePayload, ObjectId, ParametricShape,
+            SceneObject,
+        };
+
+        let mut doc = Document::new("ScaleTest", 200.0, 100.0, ColorMode::Cmyk, 300.0);
+        let lid = doc.active_page().unwrap().layers[0].id;
+        let obj = SceneObject::new(
+            ObjectId(0),
+            "Rect",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 80.0,
+                height: 40.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::CYAN))
+        .with_transform(Affine2D::translate(20.0, 10.0));
+        let oid = doc.add_object(obj, Some(lid)).unwrap();
+
+        let half = scale_document_for_print(&doc, 50.0);
+        let hp = half.active_page().unwrap();
+        assert!((hp.width_mm - 100.0).abs() < 1e-6);
+        assert!((hp.height_mm - 50.0).abs() < 1e-6);
+        let hbb = half.world_object_bounds(oid).unwrap();
+        assert!((hbb.min_x - 10.0).abs() < 1e-4);
+        assert!((hbb.min_y - 5.0).abs() < 1e-4);
+        assert!((hbb.width() - 40.0).abs() < 1e-4);
+        assert!((hbb.height() - 20.0).abs() < 1e-4);
     }
 }

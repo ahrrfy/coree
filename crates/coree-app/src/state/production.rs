@@ -510,7 +510,8 @@ impl StudioApp {
             self.push_toast("No active document to print", true);
             return;
         };
-        let cfg = self.print_job_config.clone();
+        let mut cfg = self.print_job_config.clone();
+        cfg.scale_pct = self.production_state.print_scale_pct.clamp(10.0, 400.0);
         match print_document_via_os_spooler(&doc, &cfg) {
             Ok(msg) => {
                 self.printers_status = Some(msg.clone());

@@ -932,3 +932,204 @@ fn w5b_arabic_menu_bar_uses_tr_ui_bidi_and_locked_layer_toast() {
         I18nKey::ErrorLayerLocked.tr_ui(StudioLanguage::Arabic)
     );
 }
+
+#[test]
+fn w5_print_preview_controls_non_aabb_raster_and_spot_plate_tinting() {
+    use coree_core::ParametricShape;
+
+    let mut d = UiDriver::new();
+    // Create a large non-AABB Ellipse occupying x=[20,190], y=[40,210] (center=(105,125), rx=85, ry=85)
+    // filled with SpotInk485 so AABB corners (25, 45) are outside the ellipse!
+    {
+        let lid = d.app.active_tab().unwrap().active_layer_id;
+        let spot_circle = SceneObject::new(
+            ObjectId(0),
+            "SpotCircle",
+            NodePayload::Shape(ParametricShape::Ellipse {
+                rx: 85.0,
+                ry: 85.0,
+                start_deg: 0.0,
+                end_deg: 360.0,
+                mode: coree_core::EllipseMode::Full,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::spot(
+            "SpotInk485",
+            1.0,
+            [0.0, 0.95, 0.9, 0.0],
+        )))
+        .with_outline(OutlineStyle::none())
+        .with_transform(Affine2D::translate(105.0, 125.0));
+        d.app
+            .execute_command(CommandOp::create_object(spot_circle, lid))
+            .unwrap();
+    }
+    d.app.show_print_preview_dialog = true;
+
+    // Frame 1: composite SceneRenderer preview texture is generated and uploaded
+    let mut frame1_out = d.step_with_raw_output(Vec::new(), Modifiers::NONE);
+    let preview_tex_id = d
+        .app
+        .print_preview_tex
+        .borrow()
+        .as_ref()
+        .map(|(_, h)| h.id())
+        .expect("print_preview_tex must be populated by SceneRenderer");
+
+    // Extract Frame 1 texture pixels before clearing textures_delta (prevents Drop panic)
+    let uploaded_composite = frame1_out
+        .textures_delta
+        .set
+        .iter()
+        .find(|(id, _)| **id == preview_tex_id)
+        .map(|(_, deltas)| {
+            let egui::ImageData::Color(ref img) = deltas.last().unwrap().image;
+            (img.size, img.pixels.clone())
+        })
+        .expect("First PrintPreviewDialog frame must upload print_preview_tex");
+    frame1_out.textures_delta.clear();
+
+    // Frame 2: Window sizing pass completes and all widgets/shapes are visible
+    let raw_out = d.step_with_output(Vec::new(), Modifiers::NONE);
+
+    // Verify Scale % DragValue label is exposed interactively
+    assert!(
+        find_text_rect_in_shapes(
+            &raw_out.shapes,
+            &I18nKey::PrintScalePercent.tr_ui(StudioLanguage::English)
+        )
+        .is_some(),
+        "PrintScalePercent label/control must render in PrintPreviewDialog"
+    );
+
+    // Check Mesh shape referencing preview_tex_id is painted
+    fn has_mesh_with_tex(shapes: &[egui::epaint::ClippedShape], tid: egui::TextureId) -> bool {
+        fn walk(s: &egui::Shape, tid: egui::TextureId) -> bool {
+            match s {
+                egui::Shape::Mesh(m) => m.texture_id == tid,
+                egui::Shape::Vec(v) => v.iter().any(|c| walk(c, tid)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|cs| walk(&cs.shape, tid))
+    }
+    assert!(
+        has_mesh_with_tex(&raw_out.shapes, preview_tex_id),
+        "draw_print_preview_thumbnail must paint rasterized preview texture via painter.image"
+    );
+
+    // Inspect uploaded texture delta for composite SceneRenderer non-AABB check
+    {
+        let ([w, h], pixels) = uploaded_composite;
+        // Ellipse AABB top-left corner (~12% x, ~16% y) lies outside the circle -> paper white
+        let corner = pixels[(h * 16 / 100) * w + (w * 12 / 100)];
+        assert!(
+            corner.r() > 240 && corner.g() > 240 && corner.b() > 240,
+            "Non-AABB circle AABB corner must stay white (not filled as AABB rect): {corner:?}"
+        );
+        // Center of circle (~50% x, ~42% y on 210x297 page) -> saturated red SpotInk485
+        let center = pixels[(h * 42 / 100) * w + (w * 50 / 100)];
+        assert!(
+            center.r() > center.g() + 40 && center.r() > center.b() + 40,
+            "Center of SpotInk485 circle must render tinted red: {center:?}"
+        );
+    }
+
+    // Switch to Tiling mode (imposition_kind == 2) -> PrintTileWidth/Height/Overlap DragValues appear
+    let tile_lbl = I18nKey::DlgPrintImposTiling.tr_ui(StudioLanguage::English);
+    let tile_btn = find_text_rect_in_shapes(&raw_out.shapes, &tile_lbl)
+        .expect("Tiling imposition mode button must render");
+    let tp = tile_btn.center();
+    d.step(
+        vec![
+            Event::PointerMoved(tp),
+            Event::PointerButton {
+                pos: tp,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    d.step(
+        vec![Event::PointerButton {
+            pos: tp,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    assert_eq!(d.app.production_state.imposition_kind, 2);
+
+    let tile_out = d.step_with_output(Vec::new(), Modifiers::NONE);
+    for key in [
+        I18nKey::PrintTileWidth,
+        I18nKey::PrintTileHeight,
+        I18nKey::PrintTileOverlap,
+    ] {
+        assert!(
+            find_text_rect_in_shapes(&tile_out.shapes, &key.tr_ui(StudioLanguage::English))
+                .is_some(),
+            "Tiling mode must expose interactive control for {key:?}"
+        );
+    }
+
+    // Compute separations and select SpotInk485 plate -> texture must be tinted with Spot color, NOT grayscale!
+    d.app.compute_separations_active();
+    let spot_idx = d
+        .app
+        .active_tab()
+        .unwrap()
+        .separations_preview
+        .as_ref()
+        .unwrap()
+        .plates
+        .iter()
+        .position(|p| p.name.contains("SpotInk485"))
+        .expect("SpotInk485 plate must exist");
+    d.app.print_preview_plate = Some(spot_idx);
+
+    let mut sep_raw = d.step_with_raw_output(Vec::new(), Modifiers::NONE);
+    let uploaded_spot = sep_raw
+        .textures_delta
+        .set
+        .iter()
+        .find(|(id, _)| **id == preview_tex_id)
+        .map(|(_, sep_deltas)| {
+            let egui::ImageData::Color(ref img) = sep_deltas.last().unwrap().image;
+            (img.size, img.pixels.clone())
+        })
+        .expect("Selecting Spot separation plate must update print_preview_tex");
+    sep_raw.textures_delta.clear();
+    {
+        let ([w, h], pixels) = uploaded_spot;
+        let corner = pixels[(h * 16 / 100) * w + (w * 12 / 100)];
+        assert!(
+            corner.r() > 240 && corner.g() > 240 && corner.b() > 240,
+            "Spot plate non-AABB corner must stay white: {corner:?}"
+        );
+        let center = pixels[(h * 42 / 100) * w + (w * 50 / 100)];
+        assert!(
+            center.r() > center.g() + 50 && center.r() > center.b() + 50,
+            "Spot plate center must be tinted with SpotInk485 ink color (not grayscale): {center:?}"
+        );
+    }
+
+    // Verify print_scale_pct scales run_imposition_active output
+    d.app.production_state.print_scale_pct = 50.0;
+    d.app.production_state.imposition_kind = 0; // N-Up
+    let before_tabs = d.app.tabs.len();
+    d.app.run_imposition_active();
+    assert_eq!(d.app.tabs.len(), before_tabs + 1);
+    let imposed_doc = &d.app.active_tab().unwrap().document;
+    let first_obj = imposed_doc.objects().values().next().unwrap();
+    let bb = imposed_doc.world_object_bounds(first_obj.id).unwrap();
+    // Original diameter was 170mm; at 50% print scale it must be ~85mm
+    assert!(
+        (bb.width() - 85.0).abs() < 1.5,
+        "print_scale_pct=50 must scale imposed object diameter from 170mm to ~85mm (got {})",
+        bb.width()
+    );
+}

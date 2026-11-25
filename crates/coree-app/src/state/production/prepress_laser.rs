@@ -774,7 +774,8 @@ impl StudioApp {
         let Some(doc) = self.active_tab().map(|t| t.document.clone()) else {
             return;
         };
-        match impose_document(&doc, &mode) {
+        let scaled_doc = crate::printing::scale_document_for_print(&doc, ps.print_scale_pct);
+        match impose_document(&scaled_doc, &mode) {
             Ok(imposed) => {
                 let n = imposed.pages().len();
                 self.new_document(imposed);
