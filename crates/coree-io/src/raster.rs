@@ -273,11 +273,11 @@ pub fn export_raster_to_bytes(
     Ok(out)
 }
 
-/// Encodes a 16-bit RGBA pixel buffer (`u16` per channel) into a 16-bit PNG with embedded `pHYs` DPI.
-pub fn export_raster_16_png_to_bytes(
+/// Encodes an owned 16-bit RGBA pixel buffer (`Vec<u16>`) into a 16-bit PNG without extra copy.
+pub fn export_raster_16_png_owned_to_bytes(
     width: u32,
     height: u32,
-    rgba16: &[u16],
+    rgba16: Vec<u16>,
     dpi: f32,
 ) -> IoResult<Vec<u8>> {
     validate_raster_dimensions(width, height, &IoLimits::default())?;
@@ -294,12 +294,10 @@ pub fn export_raster_16_png_to_bytes(
             message: format!("expected {expected} RGBA16 channels, got {}", rgba16.len()),
         });
     }
-    let img: ImageBuffer<Rgba<u16>, Vec<u16>> =
-        ImageBuffer::from_raw(width, height, rgba16.to_vec()).ok_or_else(|| {
-            IoError::InvalidFormat {
-                format: "png".into(),
-                message: "failed to build RGBA16 image".into(),
-            }
+    let img: ImageBuffer<Rgba<u16>, Vec<u16>> = ImageBuffer::from_raw(width, height, rgba16)
+        .ok_or_else(|| IoError::InvalidFormat {
+            format: "png".into(),
+            message: "failed to build RGBA16 image".into(),
         })?;
     let mut out = Vec::new();
     let mut cursor = Cursor::new(&mut out);
@@ -312,13 +310,28 @@ pub fn export_raster_16_png_to_bytes(
     inject_png_phys_chunk(&out, valid_dpi)
 }
 
+/// Encodes a 16-bit RGBA pixel buffer (`u16` per channel) into a 16-bit PNG with embedded `pHYs` DPI.
+pub fn export_raster_16_png_to_bytes(
+    width: u32,
+    height: u32,
+    rgba16: &[u16],
+    dpi: f32,
+) -> IoResult<Vec<u8>> {
+    export_raster_16_png_owned_to_bytes(width, height, rgba16.to_vec(), dpi)
+}
+
 /// Encodes a [`RasterAsset`] preserving 16-bit PNG depth when `asset.pixel_depth == PixelDepth::Bit16`.
 pub fn export_raster_asset_to_bytes(
     asset: &RasterAsset,
     opts: &RasterExportOptions,
 ) -> IoResult<Vec<u8>> {
     if asset.pixel_depth == PixelDepth::Bit16 && opts.format == RasterFormat::Png {
-        export_raster_16_png_to_bytes(asset.width, asset.height, &asset.to_rgba16_vec(), opts.dpi)
+        export_raster_16_png_owned_to_bytes(
+            asset.width,
+            asset.height,
+            asset.to_rgba16_vec(),
+            opts.dpi,
+        )
     } else {
         export_raster_to_bytes(asset.width, asset.height, &asset.to_rgba8_vec(), opts)
     }

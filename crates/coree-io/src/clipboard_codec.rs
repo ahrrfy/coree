@@ -10,9 +10,10 @@ use crate::raster::{
     decode_raster_bytes_with_limits, export_raster_to_bytes, RasterExportOptions, RasterFormat,
 };
 use crate::svg::{export_svg_to_string, import_svg_str_with_limits};
+use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
     Affine2D, BezierPath, Color, ColorMode, Document, Fill, NodePayload, ObjectId, OutlineStyle,
-    Point2D, Rect2D, SceneObject, Subpath,
+    Point2D, Rect2D, SceneObject, Subpath, SymbolDef,
 };
 use coree_render::{render_page_to_rgba, TextEngine, ViewMode};
 use kurbo::{BezPath, PathEl, Shape as _};
@@ -172,6 +173,42 @@ fn copy_clipboard_subtree(
                 copy_clipboard_subtree(src, dst, cid, depth + 1, visited);
             }
         }
+        NodePayload::Clone { master_id, .. } => {
+            if master_id.0 != 0 {
+                copy_clipboard_subtree(src, dst, *master_id, depth + 1, visited);
+            }
+        }
+        NodePayload::TextOnPath(top) => {
+            if top.path_id.0 != 0 {
+                copy_clipboard_subtree(src, dst, top.path_id, depth + 1, visited);
+            }
+        }
+        NodePayload::Connector(conn) => {
+            if let Some(fid) = conn.from_obj {
+                if fid.0 != 0 {
+                    copy_clipboard_subtree(src, dst, fid, depth + 1, visited);
+                }
+            }
+            if let Some(tid) = conn.to_obj {
+                if tid.0 != 0 {
+                    copy_clipboard_subtree(src, dst, tid, depth + 1, visited);
+                }
+            }
+        }
+        NodePayload::SymbolInstance(sym_id) if dst.symbol(*sym_id).is_none() => {
+            if let Some(sym) = src.symbol(*sym_id) {
+                dst.insert_symbol(sym.clone());
+                let mut sym_assets = HashSet::new();
+                for sub in &sym.objects {
+                    sub.collect_asset_refs(&mut sym_assets);
+                }
+                for aid in sym_assets {
+                    if let Some(asset) = src.asset(aid) {
+                        dst.insert_asset_if_absent(asset.clone());
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -254,21 +291,24 @@ pub fn encode_clipboard_emf(doc: &Document, page_index: usize) -> IoResult<Vec<u
             continue;
         }
         for &oid in &layer.objects {
-            emit_emf_object(
-                doc,
-                oid,
-                Affine2D::IDENTITY,
-                0,
-                &mut visited,
-                &mut text_engine,
-                &mut out,
-                &mut n_records,
-                &mut max_handle,
-                &mut bounds_min_x,
-                &mut bounds_min_y,
-                &mut bounds_max_x,
-                &mut bounds_max_y,
-            );
+            if let Some(obj) = doc.object(oid) {
+                emit_emf_object(
+                    doc,
+                    obj,
+                    Affine2D::IDENTITY,
+                    None,
+                    0,
+                    &mut visited,
+                    &mut text_engine,
+                    &mut out,
+                    &mut n_records,
+                    &mut max_handle,
+                    &mut bounds_min_x,
+                    &mut bounds_min_y,
+                    &mut bounds_max_x,
+                    &mut bounds_max_y,
+                );
+            }
         }
     }
 
@@ -308,11 +348,28 @@ pub fn encode_clipboard_emf(doc: &Document, page_index: usize) -> IoResult<Vec<u
     Ok(out)
 }
 
+fn build_emf_symbol_maps(sym: &SymbolDef) -> (HashMap<ObjectId, &SceneObject>, HashSet<ObjectId>) {
+    let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+    let mut referenced: HashSet<ObjectId> = HashSet::new();
+    for sub in &sym.objects {
+        if sub.id.0 != 0 {
+            child_map.insert(sub.id, sub);
+        }
+        match &sub.payload {
+            NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+            NodePayload::PowerClip { contents, .. } => referenced.extend(contents.iter().copied()),
+            _ => {}
+        }
+    }
+    (child_map, referenced)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_emf_object(
     doc: &Document,
-    id: ObjectId,
+    obj: &SceneObject,
     parent_xf: Affine2D,
+    sym_ctx: Option<ExportSymCtx<'_>>,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
     text_engine: &mut TextEngine,
@@ -324,15 +381,7 @@ fn emit_emf_object(
     max_x: &mut i32,
     max_y: &mut i32,
 ) {
-    if depth > 64 || !visited.insert(id) {
-        return;
-    }
-    let Some(obj) = doc.object(id) else {
-        visited.remove(&id);
-        return;
-    };
-    if !obj.visible {
-        visited.remove(&id);
+    if depth > 64 || !obj.visible || (obj.id.0 != 0 && !visited.insert(obj.id)) {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
@@ -340,21 +389,27 @@ fn emit_emf_object(
     match &obj.payload {
         NodePayload::Group(children) => {
             for &cid in children {
-                emit_emf_object(
-                    doc,
-                    cid,
-                    world_xf,
-                    depth + 1,
-                    visited,
-                    text_engine,
-                    out,
-                    n_records,
-                    max_handle,
-                    min_x,
-                    min_y,
-                    max_x,
-                    max_y,
-                );
+                let child_opt = sym_ctx
+                    .and_then(|(m, _, _)| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child) = child_opt {
+                    emit_emf_object(
+                        doc,
+                        child,
+                        world_xf,
+                        sym_ctx,
+                        depth + 1,
+                        visited,
+                        text_engine,
+                        out,
+                        n_records,
+                        max_handle,
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                    );
+                }
             }
         }
         NodePayload::PowerClip {
@@ -376,21 +431,27 @@ fn emit_emf_object(
                 max_y,
             );
             for &cid in contents {
-                emit_emf_object(
-                    doc,
-                    cid,
-                    world_xf,
-                    depth + 1,
-                    visited,
-                    text_engine,
-                    out,
-                    n_records,
-                    max_handle,
-                    min_x,
-                    min_y,
-                    max_x,
-                    max_y,
-                );
+                let child_opt = sym_ctx
+                    .and_then(|(m, _, _)| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child) = child_opt {
+                    emit_emf_object(
+                        doc,
+                        child,
+                        world_xf,
+                        sym_ctx,
+                        depth + 1,
+                        visited,
+                        text_engine,
+                        out,
+                        n_records,
+                        max_handle,
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                    );
+                }
             }
         }
         NodePayload::Path(bp) => {
@@ -457,22 +518,32 @@ fn emit_emf_object(
             );
         }
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-                let bp = match &p {
-                    NodePayload::Path(path) => Some(path.clone()),
-                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                    NodePayload::ArtisticMedia { spine, style } => {
-                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
-                    }
-                    _ => None,
-                };
-                if let Some(bp) = bp {
-                    emit_emf_bezier_shape(
-                        &bp, world_xf, &f, &o, out, n_records, max_handle, min_x, min_y, max_x,
-                        max_y,
-                    );
-                }
+            if let Some((p, f, o)) = crate::display_list::resolve_display_list_clone(
+                doc,
+                obj,
+                sym_ctx.map(|(m, _, _)| m),
+            ) {
+                let mut resolved = obj.clone();
+                resolved.id = ObjectId(0);
+                resolved.payload = p;
+                resolved.fill = f;
+                resolved.outline = o;
+                emit_emf_object(
+                    doc,
+                    &resolved,
+                    parent_xf,
+                    sym_ctx,
+                    depth + 1,
+                    visited,
+                    text_engine,
+                    out,
+                    n_records,
+                    max_handle,
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                );
             }
         }
         NodePayload::ArtisticText(text) => {
@@ -518,7 +589,7 @@ fn emit_emf_object(
             );
         }
         NodePayload::TextOnPath(top) => {
-            if let Some(host_bp) = doc.world_path_of(top.path_id) {
+            if let Some(host_bp) = resolve_export_world_path(doc, top.path_id, sym_ctx) {
                 let bp = text_engine.text_on_path_to_curves(top, &host_bp);
                 let fill = top
                     .text
@@ -563,8 +634,8 @@ fn emit_emf_object(
             );
         }
         NodePayload::Connector(conn) => {
-            let (a, b) = doc.resolve_connector_endpoints_with_transform(conn, &world_xf);
-            let bp = BezierPath::from_line(a, b);
+            let (a, b) = resolve_export_connector_endpoints(doc, conn, &world_xf, sym_ctx);
+            let bp = conn.route_path(a, b);
             emit_emf_bezier_shape(
                 &bp,
                 Affine2D::IDENTITY,
@@ -581,45 +652,28 @@ fn emit_emf_object(
         }
         NodePayload::SymbolInstance(sym_id) => {
             if let Some(sym) = doc.symbol(*sym_id) {
+                let (child_map, referenced) = build_emf_symbol_maps(sym);
+                let mut sym_visited = HashSet::new();
                 for sym_obj in &sym.objects {
-                    if !sym_obj.visible {
+                    if sym_obj.id.0 != 0 && referenced.contains(&sym_obj.id) {
                         continue;
                     }
-                    let combined = world_xf.compose(&sym_obj.transform);
-                    match &sym_obj.payload {
-                        NodePayload::Path(bp) => {
-                            emit_emf_bezier_shape(
-                                bp,
-                                combined,
-                                &sym_obj.fill,
-                                &sym_obj.outline,
-                                out,
-                                n_records,
-                                max_handle,
-                                min_x,
-                                min_y,
-                                max_x,
-                                max_y,
-                            );
-                        }
-                        NodePayload::Shape(shape) => {
-                            let bp = shape.to_bezier_path();
-                            emit_emf_bezier_shape(
-                                &bp,
-                                combined,
-                                &sym_obj.fill,
-                                &sym_obj.outline,
-                                out,
-                                n_records,
-                                max_handle,
-                                min_x,
-                                min_y,
-                                max_x,
-                                max_y,
-                            );
-                        }
-                        _ => {}
-                    }
+                    emit_emf_object(
+                        doc,
+                        sym_obj,
+                        world_xf,
+                        Some((&child_map, &sym.objects, world_xf)),
+                        depth + 1,
+                        &mut sym_visited,
+                        text_engine,
+                        out,
+                        n_records,
+                        max_handle,
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                    );
                 }
             }
         }
@@ -683,7 +737,9 @@ fn emit_emf_object(
         }
     }
 
-    visited.remove(&id);
+    if obj.id.0 != 0 {
+        visited.remove(&obj.id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1586,5 +1642,335 @@ mod tests {
         assert_eq!(export_doc.page(0).unwrap().layers[0].objects, vec![oid]);
         let svg = encode_clipboard_svg(&export_doc, 0).unwrap();
         assert!(svg.contains("<path"));
+    }
+
+    #[test]
+    fn clipboard_subtree_copies_symbols_clones_and_emits_emf() {
+        let mut src = Document::new_a4("ClipSym");
+        let lid = src.page(0).unwrap().layers[0].id;
+        let master_id = src.alloc_object_id();
+        src.add_object(
+            SceneObject::new(
+                master_id,
+                "Master",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    5.0, 5.0, 12.0, 12.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::rgba8(20, 140, 220, 255))),
+            Some(lid),
+        )
+        .unwrap();
+        let clone_id = src.alloc_object_id();
+        src.add_object(
+            SceneObject::new(
+                clone_id,
+                "CloneObj",
+                NodePayload::Clone {
+                    master_id,
+                    link_fill: true,
+                    link_outline: true,
+                    link_shape: true,
+                },
+            )
+            .with_transform(Affine2D::translate(30.0, 0.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let sym_id = coree_core::SymbolId::new();
+        let child_id = ObjectId(8801);
+        let grp_id = ObjectId(8802);
+        let sym_child = SceneObject::new(
+            child_id,
+            "SymChild",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 6.0, 6.0))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(220, 80, 20, 255)));
+        let sym_grp = SceneObject::new(grp_id, "SymGroup", NodePayload::Group(vec![child_id]));
+        src.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "SymClip".into(),
+            objects: vec![sym_child, sym_grp],
+        });
+        let inst_id = src.alloc_object_id();
+        src.add_object(
+            SceneObject::new(inst_id, "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(60.0, 10.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let clip_doc = build_clipboard_document(&src, &[clone_id, inst_id], None).unwrap();
+        assert!(
+            clip_doc.object(master_id).is_some(),
+            "Clone master must be copied"
+        );
+        assert!(
+            clip_doc.symbol(sym_id).is_some(),
+            "SymbolDef must be copied"
+        );
+        let emf = encode_clipboard_emf(&clip_doc, 0).unwrap();
+        assert!(emf.len() > 88);
+
+        // Verify visible TextOnPath host path in SymbolDef is not hidden by referenced set
+        let sym_ref = clip_doc.symbol(sym_id).unwrap();
+        let (_, referenced) = build_emf_symbol_maps(sym_ref);
+        assert!(referenced.contains(&child_id));
+        let path_id = ObjectId(8803);
+        let top_id = ObjectId(8804);
+        let sym_top = SymbolDef {
+            id: coree_core::SymbolId::new(),
+            name: "SymTop".into(),
+            objects: vec![
+                SceneObject::new(
+                    path_id,
+                    "HostPath",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 20.0, 10.0,
+                    ))),
+                ),
+                SceneObject::new(
+                    top_id,
+                    "Top",
+                    NodePayload::TextOnPath(coree_core::TextOnPath {
+                        text: coree_core::ArtisticText::from_plain(
+                            "OnPath",
+                            coree_core::TextStyle::default(),
+                        ),
+                        path_id,
+                        offset_mm: 0.0,
+                        distance_mm: 0.0,
+                        flip_vertical: false,
+                        flip_horizontal: false,
+                    }),
+                ),
+            ],
+        };
+        let (_, top_ref) = build_emf_symbol_maps(&sym_top);
+        assert!(!top_ref.contains(&path_id));
+    }
+
+    #[test]
+    fn clipboard_emf_resolves_clone_inside_symbol_def() {
+        let mut doc = Document::new_a4("EmfSymClone");
+        let lid = doc.page(0).unwrap().layers[0].id;
+        let sym_id = coree_core::SymbolId::new();
+        let sym_master_id = ObjectId(9901);
+        let sym_clone_id = ObjectId(9902);
+        let sym_master = SceneObject::new(
+            sym_master_id,
+            "SymMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(20, 120, 220, 255)))
+        .with_outline(OutlineStyle::none());
+        let sym_clone = SceneObject::new(
+            sym_clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id: sym_master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(30.0, 0.0));
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "SymWithClone".into(),
+            objects: vec![sym_master, sym_clone],
+        });
+        let inst_id = doc.alloc_object_id();
+        doc.add_object(
+            SceneObject::new(inst_id, "Inst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(10.0, 15.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let emf = encode_clipboard_emf(&doc, 0).expect("encode EMF with SymbolDef Clone");
+        let (decoded, fmt) =
+            decode_clipboard_auto(None, None, Some(&emf), None).expect("decode EMF");
+        assert_eq!(fmt, ClipboardDecodedFormat::Emf);
+        assert_eq!(
+            decoded.objects().len(),
+            2,
+            "both SymbolDef master and Clone must emit EMF shapes"
+        );
+        let mut xs: Vec<f64> = decoded
+            .objects()
+            .keys()
+            .filter_map(|id| decoded.world_object_bounds(*id).map(|b| b.min_x))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        assert!((xs[0] - 10.0).abs() < 0.5, "master at x=10, got {:?}", xs);
+        assert!((xs[1] - 40.0).abs() < 0.5, "clone at x=40, got {:?}", xs);
+    }
+
+    #[test]
+    fn clipboard_emf_chained_symbol_clone_preserves_overrides_skips_unlinked_and_avoids_text_on_path_double_xf(
+    ) {
+        let mut doc = Document::new("EmfChainedClone", 160.0, 100.0, ColorMode::Rgb, 300.0);
+        let lid = doc.page(0).unwrap().layers[0].id;
+        let sym_id = coree_core::SymbolId::new();
+        let master_id = ObjectId(9911);
+        let clone_id = ObjectId(9912);
+        let chained_id = ObjectId(9913);
+        let unlinked_id = ObjectId(9914);
+        let host_id = ObjectId(9915);
+        let top_id = ObjectId(9916);
+
+        let master = SceneObject::new(
+            master_id,
+            "SymMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(255, 0, 0, 255)))
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.4));
+        let clone = SceneObject::new(
+            clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(30.0, 0.0));
+        let chained = SceneObject::new(
+            chained_id,
+            "SymChained",
+            NodePayload::Clone {
+                master_id: clone_id,
+                link_fill: false,
+                link_outline: false,
+                link_shape: true,
+            },
+        )
+        .with_fill(Fill::Solid(Color::rgba8(0, 0, 255, 255)))
+        .with_outline(OutlineStyle::solid(Color::rgba8(0, 255, 0, 255), 1.0))
+        .with_transform(Affine2D::translate(60.0, 0.0));
+        let unlinked = SceneObject::new(
+            unlinked_id,
+            "SymUnlinked",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: false,
+            },
+        )
+        .with_transform(Affine2D::translate(90.0, 0.0));
+        let host = SceneObject::new(
+            host_id,
+            "Host",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(0.0, 40.0),
+                Point2D::new(30.0, 40.0),
+            )),
+        )
+        .with_outline(OutlineStyle::none());
+        let top = SceneObject::new(
+            top_id,
+            "Top",
+            NodePayload::TextOnPath(coree_core::TextOnPath {
+                text: coree_core::ArtisticText::from_plain(
+                    "AB",
+                    coree_core::TextStyle {
+                        font_size_pt: 14.0,
+                        fill: Color::BLACK,
+                        ..coree_core::TextStyle::default()
+                    },
+                ),
+                path_id: host_id,
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "ChainedEmfSym".into(),
+            objects: vec![master, clone, chained, unlinked, host, top],
+        });
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(10.0, 15.0)),
+            Some(lid),
+        )
+        .unwrap();
+
+        let emf = encode_clipboard_emf(&doc, 0).expect("encode EMF");
+        let (decoded, fmt) =
+            decode_clipboard_auto(None, None, Some(&emf), None).expect("decode EMF");
+        assert_eq!(fmt, ClipboardDecodedFormat::Emf);
+
+        let rects: Vec<_> = decoded
+            .objects()
+            .iter()
+            .filter_map(|(id, o)| {
+                let bb = decoded.world_object_bounds(*id)?;
+                if bb.height() >= 8.0 && bb.height() <= 12.0 {
+                    Some((bb.min_x, o))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            rects.len(),
+            3,
+            "expected 3 rectangles (master, clone, chained) and 0 for link_shape=false, got {}",
+            rects.len()
+        );
+        let (_, chained_obj) = rects
+            .iter()
+            .find(|(min_x, _)| (*min_x - 70.0).abs() < 0.8)
+            .expect("chained clone at x=70");
+        match &chained_obj.fill {
+            Fill::Solid(c) => {
+                let [r, g, b, _] = c.to_rgba8();
+                assert!(
+                    b > 200 && r < 30 && g < 30,
+                    "chained fill must be Blue, got {:?}",
+                    [r, g, b]
+                );
+            }
+            other => panic!("expected solid blue fill, got {other:?}"),
+        }
+        let [or, og, ob, _] = chained_obj.outline.color.to_rgba8();
+        assert!(
+            og > 200 && or < 30 && ob < 30,
+            "chained outline must be Green, got {:?}",
+            [or, og, ob]
+        );
+
+        // TextOnPath host is at local y=40, inst offset (10,15) => world y<=55, x<=40 (not double-transformed to x=20..50, y=70)
+        let text_objs: Vec<_> = decoded
+            .objects()
+            .keys()
+            .filter_map(|id| {
+                let bb = decoded.world_object_bounds(*id)?;
+                (bb.min_y > 35.0).then_some(bb)
+            })
+            .collect();
+        assert!(
+            !text_objs.is_empty(),
+            "expected decoded TextOnPath glyph shapes"
+        );
+        for bb in &text_objs {
+            assert!(
+                bb.max_y <= 57.0 && bb.min_x < 19.0,
+                "TextOnPath must not be double-transformed by sym_root_xf (10,15): {bb:?}"
+            );
+        }
     }
 }

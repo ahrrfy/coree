@@ -449,6 +449,11 @@ impl DirtyTileCache {
                                 NodePayload::TextOnPath(top) => {
                                     dependents.entry(top.path_id).or_default().push(oid);
                                 }
+                                NodePayload::Clone { master_id, .. }
+                                    if !sym.objects.iter().any(|s| s.id == *master_id) =>
+                                {
+                                    dependents.entry(*master_id).or_default().push(oid);
+                                }
                                 _ => {}
                             }
                             for eff in &sub.effects {

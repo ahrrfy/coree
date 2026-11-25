@@ -2285,6 +2285,41 @@ impl IccColorPipeline {
         ]
     }
 
+    /// Returns `true` when the document binds a custom RGB ICC profile (not default sRGB).
+    #[must_use]
+    pub fn has_custom_rgb_profile(&self) -> bool {
+        !self.rgb_is_srgb
+    }
+
+    /// Maps display sRGB `[0..1]` back into the document's bound RGB ICC profile space.
+    /// When `self.rgb_is_srgb` is true, returns clamped sRGB unchanged.
+    #[must_use]
+    pub fn srgb_to_doc_rgb_f32(&self, srgb: [f32; 3]) -> [f32; 3] {
+        let srgb_clamped = [
+            sanitize_f32(srgb[0], 0.0).clamp(0.0, 1.0),
+            sanitize_f32(srgb[1], 0.0).clamp(0.0, 1.0),
+            sanitize_f32(srgb[2], 0.0).clamp(0.0, 1.0),
+        ];
+        if self.rgb_is_srgb {
+            return srgb_clamped;
+        }
+        let srgb64 = [
+            f64::from(srgb_clamped[0]),
+            f64::from(srgb_clamped[1]),
+            f64::from(srgb_clamped[2]),
+        ];
+        let xyz = srgb_to_xyz_d50(srgb64);
+        let out = self
+            .rgb_profile
+            .pcs_xyz_to_rgb_impl(xyz, self.intent, true)
+            .unwrap_or(srgb64);
+        [
+            out[0].clamp(0.0, 1.0) as f32,
+            out[1].clamp(0.0, 1.0) as f32,
+            out[2].clamp(0.0, 1.0) as f32,
+        ]
+    }
+
     /// ICC-aware color interpolation between `a` (`t = 0.0`) and `b` (`t = 1.0`).
     #[must_use]
     pub fn lerp_color(

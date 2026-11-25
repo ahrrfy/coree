@@ -20,10 +20,11 @@
 //!   UTF-16BE BOM, and WinAnsi/PDFDocEncoding).
 
 use crate::error::{IoError, IoResult};
+use crate::pdf_crypto::{parse_cipher_map, EncryptDictParams, PdfCipher, PdfCryptoCtx};
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Fill, LayerId,
-    LineCap, LineJoin, NodePayload, ObjectId, OutlineStyle, Point2D, RasterAsset, RasterLayerData,
-    SceneObject, TextDirection, TextStyle, Vec2D,
+    Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Fill, GradientStop,
+    LayerId, LineCap, LineJoin, NodePayload, ObjectId, OutlineStyle, Point2D, RasterAsset,
+    RasterLayerData, Rect2D, SceneObject, TextDirection, TextStyle, Vec2D,
 };
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use image::{ImageFormat, ImageReader, Limits};
@@ -74,6 +75,11 @@ const MAX_CONTENT_TOKENS: usize = 4_000_000;
 
 /// Imports a PDF (or PDF-compatible `.ai`) file from `path` into a multipage millimeter [`Document`].
 pub fn import_pdf(path: &Path) -> IoResult<Document> {
+    import_pdf_with_password(path, "")
+}
+
+/// Imports a PDF (or PDF-compatible `.ai`) file from `path`, decrypting encrypted documents using `password`.
+pub fn import_pdf_with_password(path: &Path, password: &str) -> IoResult<Document> {
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     file.take((MAX_PDF_INPUT_BYTES as u64).saturating_add(1))
@@ -89,11 +95,20 @@ pub fn import_pdf(path: &Path) -> IoResult<Document> {
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("Imported PDF");
-    import_pdf_bytes(&bytes, title)
+    import_pdf_bytes_with_password(&bytes, title, password)
 }
 
 /// Imports a PDF 1.0–2.0 (or PDF-compatible `.ai`) byte slice into a multipage [`Document`].
 pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
+    import_pdf_bytes_with_password(bytes, title, "")
+}
+
+/// Imports a PDF 1.0–2.0 (or PDF-compatible `.ai`) byte slice, decrypting encrypted documents using `password`.
+pub fn import_pdf_bytes_with_password(
+    bytes: &[u8],
+    title: &str,
+    password: &str,
+) -> IoResult<Document> {
     if bytes.len() < 8 {
         return Err(pdf_err("input too short to be a valid PDF"));
     }
@@ -111,7 +126,7 @@ pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     parser.load_xref()?;
 
     if parser.has_encrypt {
-        return Err(pdf_err("encrypted PDF documents are not supported"));
+        parser.init_encryption(password)?;
     }
 
     let root_ref = parser
@@ -211,6 +226,8 @@ pub fn import_pdf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 &mut ctx,
                 layer_id,
                 page_to_mm,
+                w_mm,
+                h_mm,
                 spec.resources.clone(),
             );
             interp.run(&content_bytes, 0)?;
@@ -298,6 +315,10 @@ struct PdfParser<'a> {
     root_ref: Option<(u32, u16)>,
     info_ref: Option<(u32, u16)>,
     has_encrypt: bool,
+    encrypt_obj: Option<PdfObj>,
+    trailer_id0: Vec<u8>,
+    crypto: Option<PdfCryptoCtx>,
+    stream_obj_refs: HashMap<usize, (u32, u16)>,
     obj_stm_cache: HashMap<u32, ObjStmCache>,
     resolving_objs: HashSet<u32>,
     cumulative_decompressed: usize,
@@ -312,10 +333,93 @@ impl<'a> PdfParser<'a> {
             root_ref: None,
             info_ref: None,
             has_encrypt: false,
+            encrypt_obj: None,
+            trailer_id0: Vec::new(),
+            crypto: None,
+            stream_obj_refs: HashMap::new(),
             obj_stm_cache: HashMap::new(),
             resolving_objs: HashSet::new(),
             cumulative_decompressed: 0,
         }
+    }
+
+    fn init_encryption(&mut self, password: &str) -> IoResult<()> {
+        let Some(enc_obj) = self.encrypt_obj.clone() else {
+            return Err(pdf_err(
+                "PDF marked /Encrypt but missing /Encrypt dictionary",
+            ));
+        };
+        let enc_obj_num = enc_obj.as_ref().map(|(n, _)| n);
+        let dict = self.resolve_dict(&enc_obj, 0)?;
+        let filter = dict
+            .get("Filter")
+            .and_then(PdfObj::as_name)
+            .unwrap_or("Standard");
+        let v = dict.get("V").and_then(PdfObj::as_i64).unwrap_or(0);
+        let r = dict.get("R").and_then(PdfObj::as_i64).unwrap_or(2);
+        let length_bits = dict
+            .get("Length")
+            .and_then(PdfObj::as_i64)
+            .unwrap_or(if r == 2 { 40 } else { 128 })
+            .clamp(40, 256) as usize;
+        let p = dict.get("P").and_then(PdfObj::as_i64).unwrap_or(0) as i32;
+        let o = match dict.get("O") {
+            Some(PdfObj::Str(b)) => b.as_slice(),
+            _ => &[],
+        };
+        let u = match dict.get("U") {
+            Some(PdfObj::Str(b)) => b.as_slice(),
+            _ => &[],
+        };
+        let oe = match dict.get("OE") {
+            Some(PdfObj::Str(b)) => b.as_slice(),
+            _ => &[],
+        };
+        let ue = match dict.get("UE") {
+            Some(PdfObj::Str(b)) => b.as_slice(),
+            _ => &[],
+        };
+        let encrypt_metadata = !matches!(dict.get("EncryptMetadata"), Some(PdfObj::Bool(false)));
+
+        let mut cf_cfms: BTreeMap<String, PdfCipher> = BTreeMap::new();
+        if let Some(cf_obj) = dict.get("CF").cloned() {
+            if let Ok(cf_dict) = self.resolve_dict(&cf_obj, 0) {
+                for (cf_name, cf_val) in cf_dict {
+                    if let Ok(sub) = self.resolve_dict(&cf_val, 1) {
+                        let cfm = match sub.get("CFM").and_then(PdfObj::as_name) {
+                            Some("AESV2") => PdfCipher::Aes128Cbc,
+                            Some("AESV3") => PdfCipher::Aes256Cbc,
+                            Some("None") => PdfCipher::None,
+                            _ => PdfCipher::Rc4,
+                        };
+                        cf_cfms.insert(cf_name, cfm);
+                    }
+                }
+            }
+        }
+        let strf = dict.get("StrF").and_then(PdfObj::as_name);
+        let stmf = dict.get("StmF").and_then(PdfObj::as_name);
+        let (str_cipher, stm_cipher) = parse_cipher_map(&cf_cfms, strf, stmf, v);
+
+        let params = EncryptDictParams {
+            filter,
+            v,
+            r,
+            length_bits,
+            p,
+            o,
+            u,
+            oe,
+            ue,
+            id0: &self.trailer_id0,
+            encrypt_metadata,
+            str_cipher,
+            stm_cipher,
+            encrypt_obj_num: enc_obj_num,
+        };
+        let ctx = PdfCryptoCtx::from_params(&params, password)?;
+        self.crypto = Some(ctx);
+        Ok(())
     }
 
     fn charge_cumulative_bytes(&mut self, added: usize, label: &str) -> IoResult<()> {
@@ -537,8 +641,20 @@ impl<'a> PdfParser<'a> {
                 self.info_ref = Some(r);
             }
         }
-        if dict.contains_key("Encrypt") {
-            self.has_encrypt = true;
+        if let Some(enc) = dict.get("Encrypt") {
+            if !matches!(enc, PdfObj::Null) {
+                self.has_encrypt = true;
+                if self.encrypt_obj.is_none() {
+                    self.encrypt_obj = Some(enc.clone());
+                }
+            }
+        }
+        if self.trailer_id0.is_empty() {
+            if let Some(PdfObj::Array(ids)) = dict.get("ID") {
+                if let Some(PdfObj::Str(id0)) = ids.first() {
+                    self.trailer_id0 = id0.clone();
+                }
+            }
         }
     }
 
@@ -671,8 +787,7 @@ impl<'a> PdfParser<'a> {
                 .and_then(PdfObj::as_i64)
                 .unwrap_or(0)
                 .clamp(0, 100_000) as usize;
-            let raw = &self.bytes[start..start.saturating_add(len).min(self.bytes.len())];
-            let decoded = self.decode_stream_bytes(&dict, raw)?;
+            let decoded = self.decode_stream_slice(&dict, start, len)?;
 
             let mut hpos = 0usize;
             let mut offsets = Vec::with_capacity(n);
@@ -738,9 +853,10 @@ impl<'a> PdfParser<'a> {
             return Ok(None);
         };
         skip_pdf_ws(self.bytes, pos);
-        let Some(_gen_num) = read_ascii_uint(self.bytes, pos) else {
+        let Some(gen_num) = read_ascii_uint(self.bytes, pos) else {
             return Ok(None);
         };
+        let gen_u16 = gen_num.min(u64::from(u16::MAX)) as u16;
         skip_pdf_ws(self.bytes, pos);
         if !self.bytes[*pos..].starts_with(b"obj") {
             return Ok(None);
@@ -748,7 +864,10 @@ impl<'a> PdfParser<'a> {
         *pos += 3;
         skip_pdf_ws(self.bytes, pos);
 
-        let val = self.parse_obj_at(self.bytes, pos, 0)?;
+        let mut val = self.parse_obj_at(self.bytes, pos, 0)?;
+        if let Some(ref crypto) = self.crypto {
+            decrypt_pdf_obj_strings(crypto, &mut val, obj_num as u32, gen_u16);
+        }
         if let PdfObj::Dict(dict) = val {
             let save = *pos;
             skip_pdf_ws(self.bytes, pos);
@@ -788,6 +907,8 @@ impl<'a> PdfParser<'a> {
                 *pos = stream_start
                     .saturating_add(stream_len)
                     .min(self.bytes.len());
+                self.stream_obj_refs
+                    .insert(stream_start, (obj_num as u32, gen_u16));
                 return Ok(Some((
                     obj_num as u32,
                     PdfObj::Stream {
@@ -813,14 +934,33 @@ impl<'a> PdfParser<'a> {
         let PdfObj::Stream { dict, start, len } = resolved else {
             return Ok(Vec::new());
         };
+        self.decode_stream_slice(&dict, start, len)
+    }
+
+    fn decode_stream_slice(
+        &mut self,
+        dict: &BTreeMap<String, PdfObj>,
+        start: usize,
+        len: usize,
+    ) -> IoResult<Vec<u8>> {
         let raw = &self.bytes[start..start.saturating_add(len).min(self.bytes.len())];
-        self.decode_stream_bytes(&dict, raw)
+        let obj_ref = self.stream_obj_refs.get(&start).copied();
+        self.decode_stream_bytes_for_obj(dict, raw, obj_ref)
     }
 
     fn decode_stream_bytes(
         &mut self,
         dict: &BTreeMap<String, PdfObj>,
         raw: &[u8],
+    ) -> IoResult<Vec<u8>> {
+        self.decode_stream_bytes_for_obj(dict, raw, None)
+    }
+
+    fn decode_stream_bytes_for_obj(
+        &mut self,
+        dict: &BTreeMap<String, PdfObj>,
+        raw: &[u8],
+        obj_ref: Option<(u32, u16)>,
     ) -> IoResult<Vec<u8>> {
         let filters = self.extract_filter_chain(dict, 0)?;
         if filters.len() > MAX_FILTER_CHAIN_LEN {
@@ -831,17 +971,45 @@ impl<'a> PdfParser<'a> {
         }
         let parms = self.extract_decode_parms(dict, 0)?;
 
-        let mut data = raw.to_vec();
+        let mut data = if let (Some(ref crypto), Some((obj_num, gen_num))) = (&self.crypto, obj_ref)
+        {
+            let stream_type = dict.get("Type").and_then(PdfObj::as_name);
+            let crypt_name = filters
+                .iter()
+                .position(|f| f == "Crypt")
+                .and_then(|idx| parms.get(idx).and_then(|p| p.as_ref()))
+                .and_then(|dp| dp.get("Name"))
+                .and_then(PdfObj::as_name);
+            crypto.decrypt_stream(raw, obj_num, gen_num, stream_type, &filters, crypt_name)
+        } else {
+            raw.to_vec()
+        };
+
         for (idx, filter) in filters.iter().enumerate() {
             let dp = parms.get(idx).and_then(|p| p.as_ref());
             let rem = MAX_CUMULATIVE_DECOMPRESSED.saturating_sub(self.cumulative_decompressed);
             let step_cap = MAX_SINGLE_STREAM_DECOMPRESSED.min(rem);
             match filter.as_str() {
+                "Crypt" => {}
                 "FlateDecode" | "Fl" => {
                     data = self.flate_decode_bounded(&data)?;
                     if let Some(dp_dict) = dp {
                         data = apply_pdf_predictor(&data, dp_dict)?;
                     }
+                }
+                "LZWDecode" | "LZW" => {
+                    let early_change = dp
+                        .and_then(|d| d.get("EarlyChange"))
+                        .and_then(PdfObj::as_i64)
+                        .unwrap_or(1)
+                        != 0;
+                    data = self.lzw_decode_bounded(&data, early_change)?;
+                    if let Some(dp_dict) = dp {
+                        data = apply_pdf_predictor(&data, dp_dict)?;
+                    }
+                }
+                "CCITTFaxDecode" | "CCF" => {
+                    data = self.ccitt_decode_bounded(&data, dict, dp)?;
                 }
                 "ASCIIHexDecode" | "AHx" => {
                     data = decode_ascii_hex(&data, step_cap)?;
@@ -859,13 +1027,138 @@ impl<'a> PdfParser<'a> {
                     // DCTDecode is handled directly by the JPEG image decoder; stop filter chain here.
                     break;
                 }
+                "JBIG2Decode" | "JPXDecode" => {
+                    // Bounded pass-through for JBIG2/JPX payloads (enforces stream size cap).
+                    if data.len() > MAX_SINGLE_STREAM_DECOMPRESSED {
+                        return Err(IoError::LimitExceeded {
+                            limit: format!("max_pdf_stream_bytes={MAX_SINGLE_STREAM_DECOMPRESSED}"),
+                            actual: format!("{} bytes", data.len()),
+                        });
+                    }
+                    break;
+                }
                 _ => {
-                    // Unsupported filter (e.g. JBIG2/CCITT/JPX): leave bytes as-is so callers skip gracefully.
                     break;
                 }
             }
         }
         Ok(data)
+    }
+
+    fn lzw_decode_bounded(&mut self, compressed: &[u8], early_change: bool) -> IoResult<Vec<u8>> {
+        let mut decoder = if early_change {
+            weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+        } else {
+            weezl::decode::Decoder::new(weezl::BitOrder::Msb, 8)
+        };
+        let mut out = Vec::new();
+        let mut in_off = 0usize;
+        let mut buf = [0u8; 16 * 1024];
+        let denom = compressed.len().max(1) as f64;
+        loop {
+            let res = decoder.decode_bytes(&compressed[in_off..], &mut buf);
+            in_off = in_off.saturating_add(res.consumed_in).min(compressed.len());
+            if res.consumed_out > 0 {
+                let n = res.consumed_out;
+                let next_len = out.len().saturating_add(n);
+                if next_len > MAX_SINGLE_STREAM_DECOMPRESSED {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_pdf_stream_bytes={MAX_SINGLE_STREAM_DECOMPRESSED}"),
+                        actual: format!("stream exceeds {MAX_SINGLE_STREAM_DECOMPRESSED} bytes"),
+                    });
+                }
+                self.charge_cumulative_bytes(n, "LZWDecode")?;
+                if next_len >= MIN_RATIO_CHECK_BYTES
+                    && (next_len as f64) / denom > MAX_DECOMPRESSION_RATIO
+                {
+                    return Err(IoError::ZipBomb {
+                        reason: "PDF LZWDecode ratio exceeds limit".into(),
+                    });
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            match res.status {
+                Ok(weezl::LzwStatus::Done) => break,
+                Ok(weezl::LzwStatus::Ok) => {
+                    if res.consumed_in == 0 && res.consumed_out == 0 {
+                        break;
+                    }
+                }
+                Ok(weezl::LzwStatus::NoProgress) | Err(_) => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn ccitt_decode_bounded(
+        &mut self,
+        compressed: &[u8],
+        img_dict: &BTreeMap<String, PdfObj>,
+        dp: Option<&BTreeMap<String, PdfObj>>,
+    ) -> IoResult<Vec<u8>> {
+        let cols = dp
+            .and_then(|d| d.get("Columns"))
+            .or_else(|| img_dict.get("Width"))
+            .and_then(PdfObj::as_i64)
+            .unwrap_or(1728)
+            .clamp(1, i64::from(MAX_PDF_IMAGE_DIM)) as u16;
+        let rows = dp
+            .and_then(|d| d.get("Rows"))
+            .or_else(|| img_dict.get("Height"))
+            .and_then(PdfObj::as_i64)
+            .unwrap_or(0)
+            .clamp(0, i64::from(MAX_PDF_IMAGE_DIM)) as u16;
+        let k = dp
+            .and_then(|d| d.get("K"))
+            .and_then(PdfObj::as_i64)
+            .unwrap_or(0);
+        let black_is_1 = matches!(dp.and_then(|d| d.get("BlackIs1")), Some(PdfObj::Bool(true)));
+        let row_bytes = usize::from(cols).div_ceil(8);
+        let expected_rows = if rows > 0 {
+            usize::from(rows)
+        } else {
+            MAX_PDF_IMAGE_DIM as usize
+        };
+        let max_bytes = expected_rows
+            .saturating_mul(row_bytes)
+            .min(MAX_SINGLE_STREAM_DECOMPRESSED);
+
+        let mut packed = Vec::new();
+        let mut emit_line = |transitions: &[u16]| {
+            if packed.len().saturating_add(row_bytes) > max_bytes {
+                return;
+            }
+            let row_start = packed.len();
+            let white_byte = if black_is_1 { 0x00u8 } else { 0xFFu8 };
+            packed.resize(row_start + row_bytes, white_byte);
+            for (x, pel) in fax::decoder::pels(transitions, cols).enumerate() {
+                let bit_val = match (pel, black_is_1) {
+                    (fax::Color::Black, true) => 1u8,
+                    (fax::Color::Black, false) => 0u8,
+                    (fax::Color::White, true) => 0u8,
+                    (fax::Color::White, false) => 1u8,
+                };
+                if bit_val == 1 {
+                    packed[row_start + x / 8] |= 1 << (7 - (x % 8));
+                } else {
+                    packed[row_start + x / 8] &= !(1 << (7 - (x % 8)));
+                }
+            }
+        };
+
+        if k < 0 {
+            let h_opt = (rows > 0).then_some(rows);
+            fax::decoder::decode_g4(compressed.iter().copied(), cols, h_opt, |t| emit_line(t));
+        } else {
+            fax::decoder::decode_g3(compressed.iter().copied(), |t| emit_line(t));
+        }
+
+        if rows > 0 {
+            let fill_byte = if black_is_1 { 0x00u8 } else { 0xFFu8 };
+            packed.resize(usize::from(rows) * row_bytes, fill_byte);
+        }
+        self.charge_cumulative_bytes(packed.len(), "CCITTFaxDecode")?;
+        Ok(packed)
     }
 
     fn extract_filter_chain(
@@ -1073,8 +1366,7 @@ impl<'a> PdfParser<'a> {
         };
         match self.resolve(&contents_obj, 0)? {
             PdfObj::Stream { dict, start, len } => {
-                let raw = &self.bytes[start..start.saturating_add(len).min(self.bytes.len())];
-                let out = self.decode_stream_bytes(&dict, raw)?;
+                let out = self.decode_stream_slice(&dict, start, len)?;
                 if out.len() > MAX_PAGE_CONTENT_BYTES {
                     return Err(IoError::LimitExceeded {
                         limit: format!("max_page_content_bytes={MAX_PAGE_CONTENT_BYTES}"),
@@ -1697,11 +1989,137 @@ struct ImportContext<'d> {
 }
 
 #[derive(Debug, Clone)]
+enum PdfFunction {
+    Exponential {
+        c0: Vec<f64>,
+        c1: Vec<f64>,
+        n: f64,
+        domain: (f64, f64),
+    },
+    Stitching {
+        domain: (f64, f64),
+        bounds: Vec<f64>,
+        encode: Vec<(f64, f64)>,
+        funcs: Vec<PdfFunction>,
+    },
+    Sampled {
+        domain: (f64, f64),
+        range: Vec<(f64, f64)>,
+        size: usize,
+        bps: u32,
+        samples: Vec<u8>,
+    },
+}
+
+impl PdfFunction {
+    fn eval(&self, t_in: f64) -> Vec<f64> {
+        match self {
+            Self::Exponential { c0, c1, n, domain } => {
+                let x = t_in.clamp(domain.0, domain.1);
+                let len = (domain.1 - domain.0).abs();
+                let u = if len > 1e-12 {
+                    ((x - domain.0) / (domain.1 - domain.0)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let p = u.powf(*n);
+                let out_len = c0.len().max(c1.len()).max(1);
+                (0..out_len)
+                    .map(|i| {
+                        let a = c0.get(i).copied().unwrap_or(0.0);
+                        let b = c1.get(i).copied().unwrap_or(1.0);
+                        (a + p * (b - a)).clamp(0.0, 1.0)
+                    })
+                    .collect()
+            }
+            Self::Stitching {
+                domain,
+                bounds,
+                encode,
+                funcs,
+            } => {
+                if funcs.is_empty() {
+                    return vec![t_in.clamp(0.0, 1.0)];
+                }
+                let x = t_in.clamp(domain.0, domain.1);
+                let mut idx = 0usize;
+                for (i, &b) in bounds.iter().enumerate() {
+                    if x >= b {
+                        idx = i + 1;
+                    }
+                }
+                idx = idx.min(funcs.len() - 1);
+                let sub_lo = if idx == 0 { domain.0 } else { bounds[idx - 1] };
+                let sub_hi = if idx < bounds.len() {
+                    bounds[idx]
+                } else {
+                    domain.1
+                };
+                let enc = encode.get(idx).copied().unwrap_or((0.0, 1.0));
+                let span = sub_hi - sub_lo;
+                let mapped = if span.abs() > 1e-12 {
+                    enc.0 + ((x - sub_lo) / span) * (enc.1 - enc.0)
+                } else {
+                    enc.0
+                };
+                funcs[idx].eval(mapped)
+            }
+            Self::Sampled {
+                domain,
+                range,
+                size,
+                bps,
+                samples,
+            } => {
+                if *size == 0 || samples.is_empty() {
+                    return vec![t_in.clamp(0.0, 1.0)];
+                }
+                let x = t_in.clamp(domain.0, domain.1);
+                let span = (domain.1 - domain.0).abs();
+                let u = if span > 1e-12 && *size > 1 {
+                    ((x - domain.0) / (domain.1 - domain.0)).clamp(0.0, 1.0) * ((*size - 1) as f64)
+                } else {
+                    0.0
+                };
+                let i0 = (u.floor() as usize).min(size.saturating_sub(1));
+                let i1 = (i0 + 1).min(size.saturating_sub(1));
+                let frac = u - (i0 as f64);
+                let n_out = range.len().max(1);
+                let max_val = ((1u64 << (*bps).min(32)) - 1).max(1) as f64;
+                let read_sample = |si: usize, ci: usize| -> f64 {
+                    let elem = si * n_out + ci;
+                    let raw = match bps {
+                        16 => samples
+                            .get(elem * 2..elem * 2 + 2)
+                            .map_or(0.0, |b| f64::from(u16::from_be_bytes([b[0], b[1]]))),
+                        _ => samples.get(elem).copied().map_or(0.0, f64::from),
+                    };
+                    let (r0, r1) = range.get(ci).copied().unwrap_or((0.0, 1.0));
+                    (r0 + (raw / max_val) * (r1 - r0)).clamp(0.0, 1.0)
+                };
+                (0..n_out)
+                    .map(|ci| {
+                        let v0 = read_sample(i0, ci);
+                        let v1 = read_sample(i1, ci);
+                        (v0 + frac * (v1 - v0)).clamp(0.0, 1.0)
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum PdfColorSpaceKind {
     DeviceGray,
     DeviceRgb,
     DeviceCmyk,
-    Separation(String),
+    Separation {
+        name: String,
+        alternate_is_cmyk: bool,
+        alternate_comps: usize,
+        tint_fn: Option<PdfFunction>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1711,6 +2129,11 @@ struct PdfFontInfo {
     italic: bool,
     to_unicode: HashMap<u16, String>,
     is_two_byte: bool,
+    first_char: u16,
+    widths: Vec<f64>,
+    cid_widths: HashMap<u16, f64>,
+    default_cid_width: f64,
+    differences: HashMap<u8, char>,
 }
 
 impl Default for PdfFontInfo {
@@ -1721,6 +2144,11 @@ impl Default for PdfFontInfo {
             italic: false,
             to_unicode: HashMap::new(),
             is_two_byte: false,
+            first_char: 0,
+            widths: Vec::new(),
+            cid_widths: HashMap::new(),
+            default_cid_width: 1000.0,
+            differences: HashMap::new(),
         }
     }
 }
@@ -1782,6 +2210,10 @@ impl Default for PdfGState {
 enum ContentToken {
     Obj(PdfObj),
     Op(String),
+    InlineImage {
+        dict: BTreeMap<String, PdfObj>,
+        raw: Vec<u8>,
+    },
 }
 
 struct PdfContentInterpreter<'p, 'a, 'd> {
@@ -1789,12 +2221,16 @@ struct PdfContentInterpreter<'p, 'a, 'd> {
     ctx: &'p mut ImportContext<'d>,
     layer_id: LayerId,
     page_to_mm: Affine2D,
+    page_w_mm: f64,
+    page_h_mm: f64,
     resources: BTreeMap<String, PdfObj>,
     gstate: PdfGState,
     gstack: Vec<PdfGState>,
     path: BezPath,
     cur_pt: Option<Point2D>,
     subpath_start: Option<Point2D>,
+    pending_clip: Option<BezierPath>,
+    clip_stack: Vec<(usize, BezierPath, Vec<ObjectId>)>,
     in_text: bool,
     text_matrix: Affine2D,
     text_line_matrix: Affine2D,
@@ -1809,6 +2245,8 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         ctx: &'p mut ImportContext<'d>,
         layer_id: LayerId,
         page_to_mm: Affine2D,
+        page_w_mm: f64,
+        page_h_mm: f64,
         resources: BTreeMap<String, PdfObj>,
     ) -> Self {
         Self {
@@ -1816,12 +2254,16 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             ctx,
             layer_id,
             page_to_mm,
+            page_w_mm,
+            page_h_mm,
             resources,
             gstate: PdfGState::default(),
             gstack: Vec::new(),
             path: BezPath::new(),
             cur_pt: None,
             subpath_start: None,
+            pending_clip: None,
+            clip_stack: Vec::new(),
             in_text: false,
             text_matrix: Affine2D::IDENTITY,
             text_line_matrix: Affine2D::IDENTITY,
@@ -1853,6 +2295,50 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     self.exec_op(&op, &operands, form_depth)?;
                     operands.clear();
                 }
+                ContentToken::InlineImage { dict, raw } => {
+                    self.op_count += 1;
+                    if self.op_count > MAX_OPS_PER_PAGE {
+                        break;
+                    }
+                    self.exec_inline_image(&dict, &raw)?;
+                    operands.clear();
+                }
+            }
+        }
+        if form_depth == 0 {
+            self.flush_clips_to_depth(0)?;
+        }
+        Ok(())
+    }
+
+    fn record_emitted_id(&mut self, id: ObjectId) {
+        if let Some(top) = self.clip_stack.last_mut() {
+            top.2.push(id);
+        }
+    }
+
+    fn flush_clips_to_depth(&mut self, target_gstack_len: usize) -> IoResult<()> {
+        while let Some((depth, _, _)) = self.clip_stack.last() {
+            if *depth <= target_gstack_len {
+                break;
+            }
+            let (_, clip_path, children) = self.clip_stack.pop().unwrap();
+            if children.is_empty() {
+                continue;
+            }
+            self.emitted_count += 1;
+            let container = SceneObject::new(
+                ObjectId(0),
+                format!("PDF Clip {}", self.emitted_count),
+                NodePayload::Path(clip_path),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none());
+            let pc_id = self.ctx.doc.add_object(container, Some(self.layer_id))?;
+            if let Ok(created_id) = self.ctx.doc.create_powerclip(pc_id, &children) {
+                self.record_emitted_id(created_id);
+            } else {
+                self.record_emitted_id(pc_id);
             }
         }
         Ok(())
@@ -1873,6 +2359,8 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             "Q" => {
                 if let Some(prev) = self.gstack.pop() {
                     self.gstate = prev;
+                    let target = self.gstack.len();
+                    self.flush_clips_to_depth(target)?;
                 }
             }
             "cm" if args.len() >= 6 => {
@@ -2116,17 +2604,74 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             }
 
             // Path painting & clipping
-            "f" | "F" | "f*" => self.emit_path(true, false, false)?,
-            "S" => self.emit_path(false, true, false)?,
-            "s" => self.emit_path(false, true, true)?,
-            "B" | "B*" => self.emit_path(true, true, false)?,
-            "b" | "b*" => self.emit_path(true, true, true)?,
+            "f" | "F" => {
+                self.emit_path(true, false, false, false)?;
+                self.activate_pending_clip();
+            }
+            "f*" => {
+                self.emit_path(true, false, false, true)?;
+                self.activate_pending_clip();
+            }
+            "S" => {
+                self.emit_path(false, true, false, false)?;
+                self.activate_pending_clip();
+            }
+            "s" => {
+                self.emit_path(false, true, true, false)?;
+                self.activate_pending_clip();
+            }
+            "B" => {
+                self.emit_path(true, true, false, false)?;
+                self.activate_pending_clip();
+            }
+            "B*" => {
+                self.emit_path(true, true, false, true)?;
+                self.activate_pending_clip();
+            }
+            "b" => {
+                self.emit_path(true, true, true, false)?;
+                self.activate_pending_clip();
+            }
+            "b*" => {
+                self.emit_path(true, true, true, true)?;
+                self.activate_pending_clip();
+            }
             "n" => {
                 self.path = BezPath::new();
                 self.cur_pt = None;
                 self.subpath_start = None;
+                self.activate_pending_clip();
             }
-            "W" | "W*" => {}
+            "W" => {
+                if !self.path.is_empty() {
+                    let clip_bez = BezierPath::from_kurbo(&self.path);
+                    if !clip_bez.is_empty() {
+                        self.pending_clip = Some(clip_bez);
+                    }
+                }
+            }
+            "W*" => {
+                if !self.path.is_empty() {
+                    let mut clip_bez = BezierPath::from_kurbo(&self.path);
+                    if !clip_bez.is_empty() {
+                        if path_needs_even_odd_normalization(&clip_bez) {
+                            if let Some(norm) = normalize_even_odd_path(&clip_bez) {
+                                clip_bez = if norm.is_empty() {
+                                    BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 0.0, 0.0))
+                                } else {
+                                    norm
+                                };
+                            }
+                        }
+                        self.pending_clip = Some(clip_bez);
+                    }
+                }
+            }
+            "sh" if !args.is_empty() => {
+                if let Some(sh_name) = args[0].as_name() {
+                    self.exec_shading(sh_name)?;
+                }
+            }
 
             // XObjects (Form & Image)
             "Do" if !args.is_empty() => {
@@ -2215,22 +2760,37 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             }
             "Tj" if !args.is_empty() => {
                 if let PdfObj::Str(ref raw) = args[0] {
-                    let s = self.decode_font_string(raw);
-                    self.emit_text(&s)?;
+                    let (s, adv_1000) = self.decode_font_string_and_width(raw);
+                    self.emit_text(&s, Some(adv_1000))?;
                 }
             }
             "TJ" if !args.is_empty() => {
                 if let PdfObj::Array(ref items) = args[0] {
                     let mut combined = String::new();
+                    let mut total_w_1000 = 0.0_f64;
                     for item in items {
                         match item {
-                            PdfObj::Str(raw) => combined.push_str(&self.decode_font_string(raw)),
-                            PdfObj::Int(n) if *n < -180 => combined.push(' '),
-                            PdfObj::Real(v) if *v < -180.0 => combined.push(' '),
+                            PdfObj::Str(raw) => {
+                                let (s, adv) = self.decode_font_string_and_width(raw);
+                                combined.push_str(&s);
+                                total_w_1000 += adv;
+                            }
+                            PdfObj::Int(n) => {
+                                total_w_1000 -= *n as f64;
+                                if *n < -180 {
+                                    combined.push(' ');
+                                }
+                            }
+                            PdfObj::Real(v) => {
+                                total_w_1000 -= *v;
+                                if *v < -180.0 {
+                                    combined.push(' ');
+                                }
+                            }
                             _ => {}
                         }
                     }
-                    self.emit_text(&combined)?;
+                    self.emit_text(&combined, Some(total_w_1000))?;
                 }
             }
             "'" if !args.is_empty() => {
@@ -2239,8 +2799,8 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     self.text_line_matrix.compose(&Affine2D::translate(0.0, dy));
                 self.text_matrix = self.text_line_matrix;
                 if let PdfObj::Str(ref raw) = args[0] {
-                    let s = self.decode_font_string(raw);
-                    self.emit_text(&s)?;
+                    let (s, adv_1000) = self.decode_font_string_and_width(raw);
+                    self.emit_text(&s, Some(adv_1000))?;
                 }
             }
             "\"" if args.len() >= 3 => {
@@ -2253,8 +2813,8 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     self.text_line_matrix.compose(&Affine2D::translate(0.0, dy));
                 self.text_matrix = self.text_line_matrix;
                 if let PdfObj::Str(ref raw) = args[2] {
-                    let s = self.decode_font_string(raw);
-                    self.emit_text(&s)?;
+                    let (s, adv_1000) = self.decode_font_string_and_width(raw);
+                    self.emit_text(&s, Some(adv_1000))?;
                 }
             }
             _ => {}
@@ -2354,8 +2914,22 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                             if let Ok(d) = self.parser.resolve_dict(stm, 0) {
                                 return match d.get("N").and_then(PdfObj::as_i64) {
                                     Some(1) => PdfColorSpaceKind::DeviceGray,
-                                    Some(4) => PdfColorSpaceKind::DeviceCmyk,
-                                    _ => PdfColorSpaceKind::DeviceRgb,
+                                    Some(4) => {
+                                        self.ctx.saw_cmyk = true;
+                                        PdfColorSpaceKind::DeviceCmyk
+                                    }
+                                    Some(3) => {
+                                        self.ctx.saw_rgb = true;
+                                        PdfColorSpaceKind::DeviceRgb
+                                    }
+                                    _ => {
+                                        if let Some(alt) = d.get("Alternate").cloned() {
+                                            if let Ok(resolved) = self.parser.resolve(&alt, 1) {
+                                                return self.classify_colorspace(&resolved);
+                                            }
+                                        }
+                                        PdfColorSpaceKind::DeviceRgb
+                                    }
                                 };
                             }
                         }
@@ -2367,12 +2941,122 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                             .and_then(PdfObj::as_name)
                             .unwrap_or("Spot")
                             .to_owned();
-                        PdfColorSpaceKind::Separation(spot_name)
+                        let (alternate_is_cmyk, alternate_comps) = arr
+                            .get(2)
+                            .and_then(|o| self.parser.resolve(o, 1).ok())
+                            .map(|alt| match self.classify_colorspace(&alt) {
+                                PdfColorSpaceKind::DeviceCmyk => (true, 4usize),
+                                PdfColorSpaceKind::DeviceGray => (false, 1usize),
+                                _ => (false, 3usize),
+                            })
+                            .unwrap_or((true, 4usize));
+                        let tint_fn = arr.get(3).and_then(|o| self.parse_pdf_function(o, 0));
+                        PdfColorSpaceKind::Separation {
+                            name: spot_name,
+                            alternate_is_cmyk,
+                            alternate_comps,
+                            tint_fn,
+                        }
                     }
                     _ => PdfColorSpaceKind::DeviceRgb,
                 }
             }
             _ => PdfColorSpaceKind::DeviceRgb,
+        }
+    }
+
+    fn parse_pdf_function(&mut self, obj: &PdfObj, depth: usize) -> Option<PdfFunction> {
+        if depth > 8 {
+            return None;
+        }
+        let resolved = self.parser.resolve(obj, 0).ok()?;
+        let (dict, stream_bytes) = match resolved {
+            PdfObj::Dict(d) => (d, None),
+            PdfObj::Stream { dict, start, len } => {
+                let bytes = self.parser.decode_stream_slice(&dict, start, len).ok()?;
+                (dict, Some(bytes))
+            }
+            _ => return None,
+        };
+        let ftype = dict.get("FunctionType").and_then(PdfObj::as_i64)?;
+        let domain = match dict.get("Domain") {
+            Some(PdfObj::Array(a)) if a.len() >= 2 => {
+                (a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(1.0))
+            }
+            _ => (0.0, 1.0),
+        };
+        match ftype {
+            2 => {
+                let c0 = match dict.get("C0") {
+                    Some(PdfObj::Array(a)) => a.iter().filter_map(PdfObj::as_f64).collect(),
+                    _ => vec![0.0],
+                };
+                let c1 = match dict.get("C1") {
+                    Some(PdfObj::Array(a)) => a.iter().filter_map(PdfObj::as_f64).collect(),
+                    _ => vec![1.0],
+                };
+                let n = dict.get("N").and_then(PdfObj::as_f64).unwrap_or(1.0);
+                Some(PdfFunction::Exponential { c0, c1, n, domain })
+            }
+            3 => {
+                let bounds: Vec<f64> = match dict.get("Bounds") {
+                    Some(PdfObj::Array(a)) => a.iter().filter_map(PdfObj::as_f64).collect(),
+                    _ => Vec::new(),
+                };
+                let encode: Vec<(f64, f64)> = match dict.get("Encode") {
+                    Some(PdfObj::Array(a)) => a
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|p| (p[0].as_f64().unwrap_or(0.0), p[1].as_f64().unwrap_or(1.0)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut funcs = Vec::new();
+                if let Some(PdfObj::Array(arr)) = dict.get("Functions") {
+                    for sub in arr {
+                        if let Some(f) = self.parse_pdf_function(sub, depth + 1) {
+                            funcs.push(f);
+                        }
+                    }
+                }
+                Some(PdfFunction::Stitching {
+                    domain,
+                    bounds,
+                    encode,
+                    funcs,
+                })
+            }
+            0 => {
+                let samples = stream_bytes?;
+                let size = match dict.get("Size") {
+                    Some(PdfObj::Array(a)) => {
+                        a.first().and_then(PdfObj::as_i64).unwrap_or(0) as usize
+                    }
+                    _ => 0,
+                };
+                let bps = dict
+                    .get("BitsPerSample")
+                    .and_then(PdfObj::as_i64)
+                    .unwrap_or(8) as u32;
+                let range: Vec<(f64, f64)> = match dict.get("Range") {
+                    Some(PdfObj::Array(a)) => a
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|p| (p[0].as_f64().unwrap_or(0.0), p[1].as_f64().unwrap_or(1.0)))
+                        .collect(),
+                    _ => vec![(0.0, 1.0)],
+                };
+                Some(PdfFunction::Sampled {
+                    domain,
+                    range,
+                    size,
+                    bps,
+                    samples,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -2392,13 +3076,37 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     nums[3] as f32,
                 ))
             }
-            PdfColorSpaceKind::Separation(name) if !nums.is_empty() => {
+            PdfColorSpaceKind::Separation {
+                name,
+                alternate_is_cmyk,
+                alternate_comps,
+                tint_fn,
+            } if !nums.is_empty() => {
                 let tint = (nums[0] as f32).clamp(0.0, 1.0);
-                if name.eq_ignore_ascii_case("CutContour") {
-                    Some(Color::spot(name.clone(), tint, [0.0, 1.0, 0.0, 0.0]))
+                let cmyk_fallback = if let Some(tf) = tint_fn {
+                    let full = tf.eval(1.0);
+                    if *alternate_is_cmyk && full.len() >= 4 {
+                        [
+                            full[0] as f32,
+                            full[1] as f32,
+                            full[2] as f32,
+                            full[3] as f32,
+                        ]
+                    } else if *alternate_comps == 3 && full.len() >= 3 {
+                        Color::rgb(full[0] as f32, full[1] as f32, full[2] as f32).to_cmyk()
+                    } else if *alternate_comps == 1 && !full.is_empty() {
+                        Color::gray(full[0] as f32).to_cmyk()
+                    } else if name.eq_ignore_ascii_case("CutContour") {
+                        [0.0, 1.0, 0.0, 0.0]
+                    } else {
+                        [0.0, 0.0, 0.0, 1.0]
+                    }
+                } else if name.eq_ignore_ascii_case("CutContour") {
+                    [0.0, 1.0, 0.0, 0.0]
                 } else {
-                    Some(Color::spot(name.clone(), tint, [0.0, 0.0, 0.0, 1.0]))
-                }
+                    [0.0, 0.0, 0.0, 1.0]
+                };
+                Some(Color::spot(name.clone(), tint, cmyk_fallback))
             }
             _ => match nums.len() {
                 1 => Some(Color::gray(nums[0] as f32)),
@@ -2420,7 +3128,13 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         }
     }
 
-    fn emit_path(&mut self, do_fill: bool, do_stroke: bool, close: bool) -> IoResult<()> {
+    fn emit_path(
+        &mut self,
+        do_fill: bool,
+        do_stroke: bool,
+        close: bool,
+        even_odd: bool,
+    ) -> IoResult<()> {
         if close && self.cur_pt.is_some() {
             self.path.close_path();
         }
@@ -2465,6 +3179,53 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             OutlineStyle::none()
         };
 
+        if even_odd && do_fill && path_needs_even_odd_normalization(&bez) {
+            if let Some(norm_bez) = normalize_even_odd_path(&bez) {
+                if do_stroke {
+                    if !norm_bez.is_empty() {
+                        self.emitted_count += 1;
+                        let mut fill_obj = SceneObject::new(
+                            ObjectId(0),
+                            format!("PDF Path {}", self.emitted_count),
+                            NodePayload::Path(norm_bez),
+                        )
+                        .with_fill(fill)
+                        .with_outline(OutlineStyle::none());
+                        fill_obj.blend_mode = self.gstate.blend_mode;
+                        let oid = self.ctx.doc.add_object(fill_obj, Some(self.layer_id))?;
+                        self.record_emitted_id(oid);
+                    }
+                    self.emitted_count += 1;
+                    let mut stroke_obj = SceneObject::new(
+                        ObjectId(0),
+                        format!("PDF Path {}", self.emitted_count),
+                        NodePayload::Path(bez),
+                    )
+                    .with_fill(Fill::None)
+                    .with_outline(outline);
+                    stroke_obj.blend_mode = self.gstate.blend_mode;
+                    let oid = self.ctx.doc.add_object(stroke_obj, Some(self.layer_id))?;
+                    self.record_emitted_id(oid);
+                    return Ok(());
+                }
+                if norm_bez.is_empty() {
+                    return Ok(());
+                }
+                self.emitted_count += 1;
+                let mut obj = SceneObject::new(
+                    ObjectId(0),
+                    format!("PDF Path {}", self.emitted_count),
+                    NodePayload::Path(norm_bez),
+                )
+                .with_fill(fill)
+                .with_outline(OutlineStyle::none());
+                obj.blend_mode = self.gstate.blend_mode;
+                let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+                self.record_emitted_id(oid);
+                return Ok(());
+            }
+        }
+
         self.emitted_count += 1;
         let mut obj = SceneObject::new(
             ObjectId(0),
@@ -2474,7 +3235,142 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_fill(fill)
         .with_outline(outline);
         obj.blend_mode = self.gstate.blend_mode;
-        self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        self.record_emitted_id(oid);
+        Ok(())
+    }
+
+    fn activate_pending_clip(&mut self) {
+        if let Some(clip_path) = self.pending_clip.take() {
+            let is_full_page_rect = self.clip_stack.is_empty()
+                && clip_path.subpaths.len() == 1
+                && clip_path.subpaths[0].nodes.len() <= 5
+                && clip_path.bounding_box().is_some_and(|bb| {
+                    bb.min_x <= 0.25
+                        && bb.min_y <= 0.25
+                        && bb.max_x >= self.page_w_mm - 0.25
+                        && bb.max_y >= self.page_h_mm - 0.25
+                });
+            if !is_full_page_rect {
+                self.clip_stack
+                    .push((self.gstack.len(), clip_path, Vec::new()));
+            }
+        }
+    }
+
+    fn exec_shading(&mut self, name: &str) -> IoResult<()> {
+        let Some(sh_table_obj) = self.resources.get("Shading").cloned() else {
+            return Ok(());
+        };
+        let Ok(sh_table) = self.parser.resolve_dict(&sh_table_obj, 0) else {
+            return Ok(());
+        };
+        let Some(sh_ref) = sh_table.get(name).cloned() else {
+            return Ok(());
+        };
+        let Ok(sh_dict) = self.parser.resolve_dict(&sh_ref, 0) else {
+            return Ok(());
+        };
+        let sh_type = sh_dict
+            .get("ShadingType")
+            .and_then(PdfObj::as_i64)
+            .unwrap_or(0);
+        if sh_type != 2 && sh_type != 3 {
+            return Ok(());
+        }
+        let cs = match sh_dict.get("ColorSpace").cloned() {
+            Some(o) => match self.parser.resolve(&o, 0) {
+                Ok(res) => self.classify_colorspace(&res),
+                Err(_) => PdfColorSpaceKind::DeviceRgb,
+            },
+            None => PdfColorSpaceKind::DeviceRgb,
+        };
+        let Some(fn_obj) = sh_dict.get("Function").cloned() else {
+            return Ok(());
+        };
+        let Some(func) = self.parse_pdf_function(&fn_obj, 0) else {
+            return Ok(());
+        };
+        let (dom_lo, dom_hi) = match sh_dict.get("Domain") {
+            Some(PdfObj::Array(a)) if a.len() >= 2 => {
+                (a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(1.0))
+            }
+            _ => (0.0, 1.0),
+        };
+        let coords: Vec<f64> = match sh_dict.get("Coords") {
+            Some(PdfObj::Array(a)) => a.iter().filter_map(PdfObj::as_f64).collect(),
+            _ => return Ok(()),
+        };
+        let n_samples = match &func {
+            PdfFunction::Exponential { n, .. } if (*n - 1.0).abs() < 1e-4 => 2usize,
+            PdfFunction::Stitching { bounds, .. } => (bounds.len() + 2).clamp(3, 17),
+            _ => 9usize,
+        };
+        let mut stops = Vec::with_capacity(n_samples);
+        for i in 0..n_samples {
+            let u = (i as f64) / ((n_samples - 1).max(1) as f64);
+            let t = dom_lo + u * (dom_hi - dom_lo);
+            let comps = func.eval(t);
+            let col = self
+                .color_from_cs(&cs, &comps)
+                .unwrap_or(Color::BLACK)
+                .with_alpha(self.gstate.fill_alpha);
+            stops.push(GradientStop::new(u as f32, col));
+        }
+
+        let xf = self.world_xf();
+        let fill = if sh_type == 2 && coords.len() >= 4 {
+            let start = xf.transform_point(Point2D::new(coords[0], coords[1]));
+            let end = xf.transform_point(Point2D::new(coords[2], coords[3]));
+            Fill::LinearGradient { start, end, stops }
+        } else if sh_type == 3 && coords.len() >= 6 {
+            let focal = xf.transform_point(Point2D::new(coords[0], coords[1]));
+            let center = xf.transform_point(Point2D::new(coords[3], coords[4]));
+            let scale = effective_affine_scale(&xf);
+            let radius = (coords[5].abs() * scale).max(0.1);
+            Fill::RadialGradient {
+                center,
+                radius,
+                focal,
+                stops,
+            }
+        } else {
+            return Ok(());
+        };
+
+        let rect = match sh_dict.get("BBox") {
+            Some(PdfObj::Array(a)) if a.len() >= 4 => {
+                let x0 = a[0].as_f64().unwrap_or(0.0);
+                let y0 = a[1].as_f64().unwrap_or(0.0);
+                let x1 = a[2].as_f64().unwrap_or(100.0);
+                let y1 = a[3].as_f64().unwrap_or(100.0);
+                let p0 = xf.transform_point(Point2D::new(x0, y0));
+                let p1 = xf.transform_point(Point2D::new(x1, y1));
+                Rect2D::from_xywh(
+                    p0.x.min(p1.x),
+                    p0.y.min(p1.y),
+                    (p1.x - p0.x).abs().max(0.1),
+                    (p1.y - p0.y).abs().max(0.1),
+                )
+            }
+            _ => self
+                .clip_stack
+                .last()
+                .and_then(|(_, bp, _)| bp.bounding_box())
+                .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, self.page_w_mm, self.page_h_mm)),
+        };
+
+        self.emitted_count += 1;
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            format!("PDF Shading {}", self.emitted_count),
+            NodePayload::Path(BezierPath::from_rect(rect)),
+        )
+        .with_fill(fill)
+        .with_outline(OutlineStyle::none());
+        obj.blend_mode = self.gstate.blend_mode;
+        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        self.record_emitted_id(oid);
         Ok(())
     }
 
@@ -2510,8 +3406,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         if form_depth >= MAX_FORM_DEPTH {
             return Ok(());
         }
-        let raw = &self.parser.bytes[start..start.saturating_add(len).min(self.parser.bytes.len())];
-        let stream_bytes = self.parser.decode_stream_bytes(dict, raw)?;
+        let stream_bytes = self.parser.decode_stream_slice(dict, start, len)?;
         if stream_bytes.is_empty() {
             return Ok(());
         }
@@ -2552,12 +3447,26 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         res
     }
 
+    fn exec_inline_image(&mut self, dict: &BTreeMap<String, PdfObj>, raw: &[u8]) -> IoResult<()> {
+        self.exec_image_dict_bytes("Inline", dict, None, raw)
+    }
+
     fn exec_image_xobject(
         &mut self,
         name: &str,
         dict: &BTreeMap<String, PdfObj>,
         start: usize,
         len: usize,
+    ) -> IoResult<()> {
+        self.exec_image_dict_bytes(name, dict, Some((start, len)), &[])
+    }
+
+    fn exec_image_dict_bytes(
+        &mut self,
+        name: &str,
+        dict: &BTreeMap<String, PdfObj>,
+        stream_span: Option<(usize, usize)>,
+        inline_raw: &[u8],
     ) -> IoResult<()> {
         let width = dict.get("Width").and_then(PdfObj::as_i64).unwrap_or(0);
         let height = dict.get("Height").and_then(PdfObj::as_i64).unwrap_or(0);
@@ -2574,8 +3483,30 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         }
 
         let filters = self.parser.extract_filter_chain(dict, 0)?;
-        let raw_slice =
-            &self.parser.bytes[start..start.saturating_add(len).min(self.parser.bytes.len())];
+        let raw_owned: Vec<u8>;
+        let raw_slice = if let Some((start, len)) = stream_span {
+            let s =
+                &self.parser.bytes[start..start.saturating_add(len).min(self.parser.bytes.len())];
+            if let Some(obj_ref) = self.parser.stream_obj_refs.get(&start).copied() {
+                if let Some(ref crypto) = self.parser.crypto {
+                    raw_owned = crypto.decrypt_stream(
+                        s,
+                        obj_ref.0,
+                        obj_ref.1,
+                        dict.get("Type").and_then(PdfObj::as_name),
+                        &filters,
+                        None,
+                    );
+                    &raw_owned[..]
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        } else {
+            inline_raw
+        };
 
         let is_jpeg = filters
             .last()
@@ -2602,12 +3533,17 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                 Err(_) => return Ok(()),
             }
         } else {
-            // Uncompressed, FlateDecode, ASCII85, ASCIIHex, RunLength
+            // Uncompressed, FlateDecode, LZWDecode, CCITTFaxDecode, ASCII85, ASCIIHex, RunLength
             let supported = filters.iter().all(|f| {
                 matches!(
                     f.as_str(),
-                    "FlateDecode"
+                    "Crypt"
+                        | "FlateDecode"
                         | "Fl"
+                        | "LZWDecode"
+                        | "LZW"
+                        | "CCITTFaxDecode"
+                        | "CCF"
                         | "ASCII85Decode"
                         | "A85"
                         | "ASCIIHexDecode"
@@ -2637,9 +3573,9 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                 let sm_w = sm_dict.get("Width").and_then(PdfObj::as_i64).unwrap_or(0) as u32;
                 let sm_h = sm_dict.get("Height").and_then(PdfObj::as_i64).unwrap_or(0) as u32;
                 if sm_w == decoded_rgba.0 && sm_h == decoded_rgba.1 {
-                    let sm_raw = &self.parser.bytes
-                        [sm_start..sm_start.saturating_add(sm_len).min(self.parser.bytes.len())];
-                    if let Ok(sm_bytes) = self.parser.decode_stream_bytes(&sm_dict, sm_raw) {
+                    if let Ok(sm_bytes) =
+                        self.parser.decode_stream_slice(&sm_dict, sm_start, sm_len)
+                    {
                         let px_cnt = (sm_w as usize) * (sm_h as usize);
                         if sm_bytes.len() >= px_cnt {
                             for (i, &a) in sm_bytes.iter().take(px_cnt).enumerate() {
@@ -2705,7 +3641,8 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_transform(obj_xf);
         obj.opacity = self.gstate.fill_alpha;
         obj.blend_mode = self.gstate.blend_mode;
-        self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        self.record_emitted_id(oid);
         Ok(())
     }
 
@@ -2768,7 +3705,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                 let base_obj = self.parser.resolve(&arr[1], 0)?;
                 let base_cs = self.classify_colorspace(&base_obj);
                 let base_comps = match base_cs {
-                    PdfColorSpaceKind::DeviceGray | PdfColorSpaceKind::Separation(_) => 1usize,
+                    PdfColorSpaceKind::DeviceGray | PdfColorSpaceKind::Separation { .. } => 1usize,
                     PdfColorSpaceKind::DeviceCmyk => 4usize,
                     PdfColorSpaceKind::DeviceRgb => 3usize,
                 };
@@ -2778,11 +3715,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                         dict: ld,
                         start,
                         len,
-                    } => {
-                        let r = &self.parser.bytes
-                            [start..start.saturating_add(len).min(self.parser.bytes.len())];
-                        self.parser.decode_stream_bytes(&ld, r)?
-                    }
+                    } => self.parser.decode_stream_slice(&ld, start, len)?,
                     _ => Vec::new(),
                 };
                 let indices = unpack_bpc_samples(pixels, width, height, 1, bpc);
@@ -2825,7 +3758,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
 
         let cs_kind = self.classify_colorspace(&cs_obj);
         let comps = match cs_kind {
-            PdfColorSpaceKind::DeviceGray | PdfColorSpaceKind::Separation(_) => 1usize,
+            PdfColorSpaceKind::DeviceGray | PdfColorSpaceKind::Separation { .. } => 1usize,
             PdfColorSpaceKind::DeviceRgb => 3usize,
             PdfColorSpaceKind::DeviceCmyk => 4usize,
         };
@@ -2882,6 +3815,64 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                         if fdict.get("Subtype").and_then(PdfObj::as_name) == Some("Type0") {
                             info.is_two_byte = true;
                         }
+                        if let Some(fc) = fdict.get("FirstChar").and_then(PdfObj::as_i64) {
+                            info.first_char = fc.clamp(0, 255) as u16;
+                        }
+                        if let Some(widths_obj) = fdict.get("Widths").cloned() {
+                            if let Ok(PdfObj::Array(arr)) = self.parser.resolve(&widths_obj, 0) {
+                                info.widths = arr
+                                    .iter()
+                                    .take(512)
+                                    .map(|o| o.as_f64().unwrap_or(500.0).clamp(0.0, 4000.0))
+                                    .collect();
+                            }
+                        }
+                        if let Some(desc_obj) = fdict.get("DescendantFonts").cloned() {
+                            if let Ok(PdfObj::Array(desc_arr)) = self.parser.resolve(&desc_obj, 0) {
+                                if let Some(first_desc) = desc_arr.first() {
+                                    if let Ok(cid_dict) = self.parser.resolve_dict(first_desc, 0) {
+                                        if let Some(dw) =
+                                            cid_dict.get("DW").and_then(PdfObj::as_f64)
+                                        {
+                                            info.default_cid_width = dw.clamp(0.0, 4000.0);
+                                        }
+                                        if let Some(w_obj) = cid_dict.get("W").cloned() {
+                                            if let Ok(PdfObj::Array(w_arr)) =
+                                                self.parser.resolve(&w_obj, 0)
+                                            {
+                                                parse_cid_widths_array(
+                                                    &w_arr,
+                                                    &mut info.cid_widths,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(enc_obj) = fdict.get("Encoding").cloned() {
+                            if let Ok(enc_dict) = self.parser.resolve_dict(&enc_obj, 0) {
+                                if let Some(PdfObj::Array(diff_arr)) = enc_dict.get("Differences") {
+                                    let mut code: u16 = 0;
+                                    for item in diff_arr {
+                                        match item {
+                                            PdfObj::Int(n) => {
+                                                code = (*n).clamp(0, 255) as u16;
+                                            }
+                                            PdfObj::Name(gname) => {
+                                                if code <= 255 {
+                                                    if let Some(ch) = agl_name_to_char(gname) {
+                                                        info.differences.insert(code as u8, ch);
+                                                    }
+                                                }
+                                                code = code.saturating_add(1);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(tu_obj) = fdict.get("ToUnicode").cloned() {
                             if let Ok(cmap_bytes) = self.parser.decode_stream_obj(&tu_obj) {
                                 info.to_unicode = parse_to_unicode_cmap(&cmap_bytes);
@@ -2894,41 +3885,66 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         self.font_cache.insert(key.to_owned(), info);
     }
 
-    fn decode_font_string(&self, raw: &[u8]) -> String {
+    fn decode_font_string_and_width(&self, raw: &[u8]) -> (String, f64) {
         if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
-            return decode_utf16_be(&raw[2..]);
+            let s = decode_utf16_be(&raw[2..]);
+            let adv = (s.chars().count() as f64) * 550.0;
+            return (s, adv);
         }
         if raw.len() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF {
-            return String::from_utf8_lossy(&raw[3..]).into_owned();
+            let s = String::from_utf8_lossy(&raw[3..]).into_owned();
+            let adv = (s.chars().count() as f64) * 550.0;
+            return (s, adv);
         }
         if let Some(font) = self.font_cache.get(&self.gstate.font_key) {
-            if !font.to_unicode.is_empty() {
-                let mut out = String::new();
-                if font.is_two_byte && raw.len().is_multiple_of(2) {
-                    for pair in raw.as_chunks::<2>().0 {
-                        let code = u16::from_be_bytes([pair[0], pair[1]]);
-                        if let Some(mapped) = font.to_unicode.get(&code) {
-                            out.push_str(mapped);
-                        } else if let Some(ch) = char::from_u32(u32::from(code)) {
-                            out.push(ch);
-                        }
-                    }
-                    return out;
-                }
-                for &b in raw {
-                    if let Some(mapped) = font.to_unicode.get(&u16::from(b)) {
+            let mut out = String::new();
+            let mut width_sum = 0.0_f64;
+            if font.is_two_byte && raw.len().is_multiple_of(2) {
+                for pair in raw.as_chunks::<2>().0 {
+                    let code = u16::from_be_bytes([pair[0], pair[1]]);
+                    width_sum += font
+                        .cid_widths
+                        .get(&code)
+                        .copied()
+                        .unwrap_or(font.default_cid_width);
+                    if let Some(mapped) = font.to_unicode.get(&code) {
                         out.push_str(mapped);
+                    } else if let Some(ch) = char::from_u32(u32::from(code)) {
+                        out.push(ch);
+                    }
+                }
+                return (out, width_sum);
+            }
+            let has_tu = !font.to_unicode.is_empty();
+            for &b in raw {
+                let b_u16 = u16::from(b);
+                let w = b_u16
+                    .checked_sub(font.first_char)
+                    .and_then(|idx| font.widths.get(usize::from(idx)).copied())
+                    .unwrap_or(550.0);
+                width_sum += w;
+                if has_tu {
+                    if let Some(mapped) = font.to_unicode.get(&b_u16) {
+                        out.push_str(mapped);
+                    } else if let Some(&ch) = font.differences.get(&b) {
+                        out.push(ch);
                     } else {
                         out.push(winansi_byte_to_char(b));
                     }
+                } else if let Some(&ch) = font.differences.get(&b) {
+                    out.push(ch);
+                } else {
+                    out.push(winansi_byte_to_char(b));
                 }
-                return out;
             }
+            return (out, width_sum);
         }
-        decode_pdf_text_string(raw)
+        let s = decode_pdf_text_string(raw);
+        let adv = (s.chars().count() as f64) * 550.0;
+        (s, adv)
     }
 
-    fn emit_text(&mut self, text: &str) -> IoResult<()> {
+    fn emit_text(&mut self, text: &str, total_w_1000: Option<f64>) -> IoResult<()> {
         if text.is_empty() {
             return Ok(());
         }
@@ -2975,16 +3991,144 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_outline(OutlineStyle::none())
         .with_transform(text_xf);
         obj.blend_mode = self.gstate.blend_mode;
-        self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        self.record_emitted_id(oid);
 
-        // Advance text matrix horizontally by approximate glyph advance so consecutive Tj calls don't overlap
-        let approx_adv =
-            (text.chars().count() as f64) * font_pt * 0.55 * (self.gstate.horiz_scale / 100.0);
-        self.text_matrix = self
-            .text_matrix
-            .compose(&Affine2D::translate(approx_adv, 0.0));
+        let w_1000 = total_w_1000.unwrap_or_else(|| (text.chars().count() as f64) * 550.0);
+        let adv_pt = (w_1000 * font_pt / 1000.0) * (self.gstate.horiz_scale / 100.0);
+        self.text_matrix = self.text_matrix.compose(&Affine2D::translate(adv_pt, 0.0));
         Ok(())
     }
+}
+
+fn decrypt_pdf_obj_strings(crypto: &PdfCryptoCtx, obj: &mut PdfObj, obj_num: u32, gen_num: u16) {
+    if crypto.encrypt_obj_num == Some(obj_num) {
+        return;
+    }
+    match obj {
+        PdfObj::Str(bytes) => {
+            *bytes = crypto.decrypt_string(bytes, obj_num, gen_num);
+        }
+        PdfObj::Array(items) => {
+            for item in items {
+                decrypt_pdf_obj_strings(crypto, item, obj_num, gen_num);
+            }
+        }
+        PdfObj::Dict(dict) | PdfObj::Stream { dict, .. } => {
+            for val in dict.values_mut() {
+                decrypt_pdf_obj_strings(crypto, val, obj_num, gen_num);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_cid_widths_array(arr: &[PdfObj], out: &mut HashMap<u16, f64>) {
+    let mut i = 0usize;
+    while i < arr.len() {
+        let Some(c_first) = arr[i].as_i64() else {
+            i += 1;
+            continue;
+        };
+        if i + 1 >= arr.len() {
+            break;
+        }
+        match &arr[i + 1] {
+            PdfObj::Array(widths) => {
+                for (off, w_obj) in widths.iter().enumerate() {
+                    if let Some(w) = w_obj.as_f64() {
+                        let cid = c_first.saturating_add(off as i64);
+                        if (0..=i64::from(u16::MAX)).contains(&cid) {
+                            out.insert(cid as u16, w.clamp(0.0, 4000.0));
+                        }
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                if i + 2 < arr.len() {
+                    if let (Some(c_last), Some(w)) = (other.as_i64(), arr[i + 2].as_f64()) {
+                        let lo = c_first.clamp(0, i64::from(u16::MAX)) as u16;
+                        let hi = c_last.clamp(0, i64::from(u16::MAX)) as u16;
+                        let count = hi.saturating_sub(lo).min(4096);
+                        for off in 0..=count {
+                            out.insert(lo + off, w.clamp(0.0, 4000.0));
+                        }
+                        i += 3;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
+fn agl_name_to_char(name: &str) -> Option<char> {
+    if let Some(hex) = name.strip_prefix("uni") {
+        if hex.len() == 4 {
+            if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                return char::from_u32(cp);
+            }
+        }
+    }
+    if name.len() == 1 {
+        return name.chars().next();
+    }
+    Some(match name {
+        "space" => ' ',
+        "exclam" => '!',
+        "quotedbl" => '"',
+        "numbersign" => '#',
+        "dollar" => '$',
+        "percent" => '%',
+        "ampersand" => '&',
+        "quotesingle" => '\'',
+        "parenleft" => '(',
+        "parenright" => ')',
+        "asterisk" => '*',
+        "plus" => '+',
+        "comma" => ',',
+        "hyphen" => '-',
+        "period" => '.',
+        "slash" => '/',
+        "zero" => '0',
+        "one" => '1',
+        "two" => '2',
+        "three" => '3',
+        "four" => '4',
+        "five" => '5',
+        "six" => '6',
+        "seven" => '7',
+        "eight" => '8',
+        "nine" => '9',
+        "colon" => ':',
+        "semicolon" => ';',
+        "less" => '<',
+        "equal" => '=',
+        "greater" => '>',
+        "question" => '?',
+        "at" => '@',
+        "bullet" => '\u{2022}',
+        "endash" => '\u{2013}',
+        "emdash" => '\u{2014}',
+        "ellipsis" => '\u{2026}',
+        "Euro" => '\u{20AC}',
+        "trademark" => '\u{2122}',
+        "copyright" => '\u{00A9}',
+        "registered" => '\u{00AE}',
+        "degree" => '\u{00B0}',
+        "plusminus" => '\u{00B1}',
+        "multiply" => '\u{00D7}',
+        "divide" => '\u{00F7}',
+        "fi" => '\u{FB01}',
+        "fl" => '\u{FB02}',
+        "quoteleft" => '\u{2018}',
+        "quoteright" => '\u{2019}',
+        "quotedblleft" => '\u{201C}',
+        "quotedblright" => '\u{201D}',
+        _ => return None,
+    })
 }
 
 fn tokenize_content_stream(data: &[u8]) -> Vec<ContentToken> {
@@ -3025,9 +4169,11 @@ fn tokenize_content_stream(data: &[u8]) -> Vec<ContentToken> {
                     pos += 1;
                     continue;
                 }
-                // Skip inline image payloads (`BI ... ID <binary> EI`) safely!
+                // Parse inline image payloads (`BI ... ID <binary> EI`)
                 if word == "BI" {
-                    skip_inline_image(data, &mut pos);
+                    if let Some(tok) = parse_inline_image(data, &mut pos) {
+                        tokens.push(tok);
+                    }
                     continue;
                 }
                 if word == "true" {
@@ -3049,33 +4195,145 @@ fn tokenize_content_stream(data: &[u8]) -> Vec<ContentToken> {
     tokens
 }
 
-fn skip_inline_image(data: &[u8], pos: &mut usize) {
+fn parse_inline_image(data: &[u8], pos: &mut usize) -> Option<ContentToken> {
     let len = data.len();
-    // Advance past ID marker first
-    while *pos + 2 <= len {
-        if &data[*pos..*pos + 2] == b"ID"
-            && (*pos == 0 || is_pdf_ws(data[*pos - 1]))
+    let mut dict: BTreeMap<String, PdfObj> = BTreeMap::new();
+    let mut pending_key: Option<String> = None;
+
+    while *pos < len {
+        skip_pdf_ws(data, pos);
+        if *pos >= len {
+            return None;
+        }
+        if *pos + 2 <= len
+            && &data[*pos..*pos + 2] == b"ID"
             && data.get(*pos + 2).is_none_or(|&b| is_pdf_ws(b))
         {
-            *pos += 3.min(len - *pos);
+            *pos += 2;
+            if *pos < len && is_pdf_ws(data[*pos]) {
+                // Single whitespace byte separates `ID` from image bytes (or CRLF -> advance 2 if CR+LF)
+                if data[*pos] == b'\r' && data.get(*pos + 1) == Some(&b'\n') {
+                    *pos += 2;
+                } else {
+                    *pos += 1;
+                }
+            }
             break;
         }
-        *pos += 1;
+        let val = match data[*pos] {
+            b'/' | b'[' | b'<' | b'(' => {
+                let before = *pos;
+                let parsed = parse_obj_from_slice(data, pos, 0).ok()?;
+                if *pos == before {
+                    *pos += 1;
+                }
+                parsed
+            }
+            _ => {
+                let w = read_pdf_word(data, pos);
+                if w.is_empty() {
+                    *pos += 1;
+                    continue;
+                }
+                if w == "true" {
+                    PdfObj::Bool(true)
+                } else if w == "false" {
+                    PdfObj::Bool(false)
+                } else if let Ok(iv) = w.parse::<i64>() {
+                    PdfObj::Int(iv)
+                } else if let Ok(rv) = w.parse::<f64>() {
+                    PdfObj::Real(rv)
+                } else {
+                    PdfObj::Name(w)
+                }
+            }
+        };
+        if let Some(key_raw) = pending_key.take() {
+            let full_key = expand_inline_key(&key_raw);
+            let full_val = expand_inline_val(&full_key, val);
+            dict.insert(full_key, full_val);
+        } else if let PdfObj::Name(k) = val {
+            pending_key = Some(k);
+        }
     }
+
+    let img_start = *pos;
     // Scan for EI delimited by whitespace
+    let mut img_end = len;
     while *pos + 2 <= len {
         if &data[*pos..*pos + 2] == b"EI"
-            && (*pos == 0 || is_pdf_ws(data[*pos - 1]))
+            && (*pos == img_start || is_pdf_ws(data[*pos - 1]))
             && data
                 .get(*pos + 2)
                 .is_none_or(|&b| is_pdf_ws(b) || is_pdf_delim(b))
         {
+            img_end = if *pos > img_start && is_pdf_ws(data[*pos - 1]) {
+                *pos - 1
+            } else {
+                *pos
+            };
             *pos += 2;
-            return;
+            break;
         }
         *pos += 1;
     }
-    *pos = len;
+    let raw = data[img_start..img_end].to_vec();
+    Some(ContentToken::InlineImage { dict, raw })
+}
+
+fn expand_inline_key(k: &str) -> String {
+    match k {
+        "BPC" => "BitsPerComponent",
+        "CS" => "ColorSpace",
+        "D" => "Decode",
+        "DP" => "DecodeParms",
+        "F" => "Filter",
+        "H" => "Height",
+        "IM" => "ImageMask",
+        "I" => "Interpolate",
+        "W" => "Width",
+        other => other,
+    }
+    .to_owned()
+}
+
+fn expand_inline_val(key: &str, val: PdfObj) -> PdfObj {
+    match (key, val) {
+        ("ColorSpace", PdfObj::Name(n)) => PdfObj::Name(
+            match n.as_str() {
+                "G" => "DeviceGray",
+                "RGB" => "DeviceRGB",
+                "CMYK" => "DeviceCMYK",
+                "I" => "Indexed",
+                other => other,
+            }
+            .to_owned(),
+        ),
+        ("Filter", PdfObj::Name(n)) => PdfObj::Name(expand_inline_filter_name(&n)),
+        ("Filter", PdfObj::Array(arr)) => PdfObj::Array(
+            arr.into_iter()
+                .map(|item| match item {
+                    PdfObj::Name(n) => PdfObj::Name(expand_inline_filter_name(&n)),
+                    other => other,
+                })
+                .collect(),
+        ),
+        (_, other) => other,
+    }
+}
+
+fn expand_inline_filter_name(n: &str) -> String {
+    match n {
+        "AHx" => "ASCIIHexDecode",
+        "A85" => "ASCII85Decode",
+        "LZW" => "LZWDecode",
+        "Fl" => "FlateDecode",
+        "RL" => "RunLengthDecode",
+        "DCT" => "DCTDecode",
+        "CCF" => "CCITTFaxDecode",
+        other => other,
+    }
+    .to_owned()
 }
 
 /// Unpacks 1/2/4/8/16-bit packed PDF image samples into 8-bit values (`width * height * comps`).
@@ -3435,6 +4693,68 @@ fn effective_affine_scale(xf: &Affine2D) -> f64 {
     } else {
         1.0
     }
+}
+
+fn segments_properly_intersect(a1: Point2D, a2: Point2D, b1: Point2D, b2: Point2D) -> bool {
+    if a1.x.max(a2.x) < b1.x.min(b2.x)
+        || b1.x.max(b2.x) < a1.x.min(a2.x)
+        || a1.y.max(a2.y) < b1.y.min(b2.y)
+        || b1.y.max(b2.y) < a1.y.min(a2.y)
+    {
+        return false;
+    }
+    let cross =
+        |o: Point2D, p: Point2D, q: Point2D| (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+    let d1 = cross(a1, a2, b1);
+    let d2 = cross(a1, a2, b2);
+    let d3 = cross(b1, b2, a1);
+    let d4 = cross(b1, b2, a2);
+    ((d1 > 1e-9 && d2 < -1e-9) || (d1 < -1e-9 && d2 > 1e-9))
+        && ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9))
+}
+
+fn path_needs_even_odd_normalization(bez: &BezierPath) -> bool {
+    if bez.subpaths.len() > 1 {
+        return true;
+    }
+    if bez.subpaths.len() == 1 {
+        let polys = bez.flatten(0.1);
+        if let Some(pts) = polys.first() {
+            let mut ring: Vec<Point2D> = pts.clone();
+            if ring.len() > 1 && ring.first() == ring.last() {
+                ring.pop();
+            }
+            let n = ring.len();
+            if (4..=512).contains(&n) {
+                for i in 0..n {
+                    let a1 = ring[i];
+                    let a2 = ring[(i + 1) % n];
+                    for j in (i + 2)..n {
+                        if i == 0 && j == n - 1 {
+                            continue;
+                        }
+                        let b1 = ring[j];
+                        let b2 = ring[(j + 1) % n];
+                        if segments_properly_intersect(a1, a2, b1, b2) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn normalize_even_odd_path(bez: &BezierPath) -> Option<BezierPath> {
+    let welded =
+        coree_core::apply_boolean_many(coree_core::BooleanOp::Weld, std::slice::from_ref(bez))
+            .ok()?;
+    let mut subpaths = Vec::new();
+    for p in welded {
+        subpaths.extend(p.subpaths);
+    }
+    Some(BezierPath { subpaths })
 }
 
 #[cfg(test)]
@@ -3806,5 +5126,444 @@ mod tests {
         );
         let err = import_pdf_bytes(repeated_contents.as_bytes(), "Amp").unwrap_err();
         assert!(matches!(err, IoError::LimitExceeded { .. }));
+    }
+
+    #[test]
+    fn pdf_import_clipping_shadings_spot_tint_font_widths_lzw_ccitt_and_inline_image() {
+        // Compress an RGB 2x2 image via LZW (EarlyChange=1, MSB)
+        let mut lzw_enc = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
+        let lzw_rgb = lzw_enc
+            .encode(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0])
+            .unwrap();
+
+        // Compress a 2x2 monochrome CCITT Group 4 image (row0: Black,White; row1: White,Black)
+        let mut g4_enc = fax::encoder::Encoder::new(fax::VecWriter::new());
+        g4_enc
+            .encode_line([fax::Color::Black, fax::Color::White].into_iter(), 2)
+            .unwrap();
+        g4_enc
+            .encode_line([fax::Color::White, fax::Color::Black].into_iter(), 2)
+            .unwrap();
+        let g4_bytes = g4_enc.finish().unwrap().finish();
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offsets = Vec::new();
+        let push_obj = |buf: &mut Vec<u8>, offs: &mut Vec<usize>, id: usize, body: &[u8]| {
+            offs.push(buf.len());
+            buf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            2,
+            b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+               /Resources << \
+                 /ColorSpace << /CS1 [/Separation /PantoneRed /DeviceCMYK 6 0 R] >> \
+                 /Shading << /Sh1 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] /Function 7 0 R >> >> \
+                 /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /Widths [600 650] /Encoding << /Differences [65 /Euro] >> >> >> \
+                 /XObject << /ImLzw 4 0 R /ImFax 5 0 R >> \
+               >> /Contents 8 0 R >>",
+        );
+        let mut im4 = format!(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /LZWDecode /Length {} >>\nstream\n",
+            lzw_rgb.len()
+        )
+        .into_bytes();
+        im4.extend_from_slice(&lzw_rgb);
+        im4.extend_from_slice(b"\nendstream");
+        push_obj(&mut pdf, &mut offsets, 4, &im4);
+
+        let mut im5 = format!(
+            "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 2 /Rows 2 /BlackIs1 false >> /Length {} >>\nstream\n",
+            g4_bytes.len()
+        )
+        .into_bytes();
+        im5.extend_from_slice(&g4_bytes);
+        im5.extend_from_slice(b"\nendstream");
+        push_obj(&mut pdf, &mut offsets, 5, &im5);
+
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            6,
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0.0 0.9 0.85 0.05] /N 1 >>",
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            7,
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>",
+        );
+
+        let content = b"\
+            q 10 10 80 80 re W n /Sh1 sh Q\n\
+            /CS1 cs 1 scn 10 100 30 30 re f\n\
+            q 20 0 0 20 100 100 cm /ImLzw Do Q\n\
+            q 20 0 0 20 130 100 cm /ImFax Do Q\n\
+            q 10 0 0 10 100 140 cm BI /W 1 /H 1 /CS /RGB /BPC 8 ID \x11\x22\x33 EI Q\n\
+            BT /F1 12 Tf 10 160 Td (AB) Tj ET\n";
+        let mut s8 = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        s8.extend_from_slice(content);
+        s8.extend_from_slice(b"\nendstream");
+        push_obj(&mut pdf, &mut offsets, 8, &s8);
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+        );
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                offsets.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let doc = import_pdf_bytes(&pdf, "Req04 Features").unwrap();
+        assert_eq!(doc.pages().len(), 1);
+        assert!(
+            doc.assets().len() >= 3,
+            "expected LZW, CCITT G4, and inline BI images, got {}",
+            doc.assets().len()
+        );
+        let has_powerclip = doc
+            .objects()
+            .values()
+            .any(|o| matches!(o.payload, NodePayload::PowerClip { .. }));
+        assert!(has_powerclip, "expected W/W* clipping PowerClip node");
+        let has_gradient = doc
+            .objects()
+            .values()
+            .any(|o| matches!(o.fill, Fill::LinearGradient { .. }));
+        assert!(has_gradient, "expected Type 2 sh LinearGradient");
+        let has_spot = doc.objects().values().any(|o| matches!(&o.fill, Fill::Solid(Color::Spot { name, fallback_cmyk, .. }) if name == "PantoneRed" && (fallback_cmyk[1] - 0.9).abs() < 0.02));
+        assert!(
+            has_spot,
+            "expected /Separation /PantoneRed with TintTransform CMYK fallback"
+        );
+        let text_str: String = doc
+            .objects()
+            .values()
+            .filter_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) => Some(at.plain_text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text_str.contains('\u{20AC}') && text_str.contains('B'),
+            "expected /Differences /Euro + B, got {text_str:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_import_decrypts_rc4_and_aes128_and_rejects_wrong_password() {
+        use crate::pdf_crypto::{aes_128_cbc_encrypt_no_pad, md5, rc4_crypt};
+
+        // Build an encrypted PDF 1.6 (R=4, V=4, AESV2 128-bit) with user password "secret"
+        const PAD: [u8; 32] = [
+            0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA,
+            0x01, 0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE,
+            0x64, 0x53, 0x69, 0x7A,
+        ];
+        let id0 = b"0123456789ABCDEF";
+        let p_val: i32 = -4;
+        let pw = b"secret";
+        let mut pw32 = PAD;
+        pw32[..pw.len()].copy_from_slice(pw);
+        pw32[pw.len()..].copy_from_slice(&PAD[..32 - pw.len()]);
+
+        // Owner O = padded owner hashed 50 times, encrypting pw32
+        let mut ok = md5(&pw32);
+        for _ in 0..50 {
+            ok = md5(&ok);
+        }
+        let mut o_entry = pw32.to_vec();
+        for i in 0u8..=19 {
+            let mut ik = ok;
+            for b in &mut ik {
+                *b ^= i;
+            }
+            o_entry = rc4_crypt(&ik, &o_entry);
+        }
+
+        // File key
+        let mut fk_in = Vec::new();
+        fk_in.extend_from_slice(&pw32);
+        fk_in.extend_from_slice(&o_entry);
+        fk_in.extend_from_slice(&p_val.to_le_bytes());
+        fk_in.extend_from_slice(id0);
+        let mut fk = md5(&fk_in);
+        for _ in 0..50 {
+            fk = md5(&fk);
+        }
+
+        // User U entry
+        let mut h_in = Vec::from(PAD);
+        h_in.extend_from_slice(id0);
+        let h = md5(&h_in);
+        let mut u_entry = rc4_crypt(&fk, &h);
+        for i in 1u8..=19 {
+            let mut ik = fk;
+            for b in &mut ik {
+                *b ^= i;
+            }
+            u_entry = rc4_crypt(&ik, &u_entry);
+        }
+        u_entry.resize(32, 0);
+
+        let enc_obj = |plain: &[u8], obj_num: u32, gen_num: u16| -> Vec<u8> {
+            let mut k_in = Vec::new();
+            k_in.extend_from_slice(&fk);
+            k_in.extend_from_slice(&obj_num.to_le_bytes()[..3]);
+            k_in.extend_from_slice(&gen_num.to_le_bytes()[..2]);
+            k_in.extend_from_slice(b"sAlT");
+            let obj_key = md5(&k_in);
+            let iv = [0xA5u8; 16];
+            let pad_len = 16 - (plain.len() % 16);
+            let mut padded = plain.to_vec();
+            padded.resize(plain.len() + pad_len, pad_len as u8);
+            let mut out = iv.to_vec();
+            out.extend_from_slice(&aes_128_cbc_encrypt_no_pad(&obj_key, &iv, &padded));
+            out
+        };
+
+        let to_hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02X}")).collect() };
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.6\n");
+        let mut offsets = Vec::new();
+        let push_obj = |buf: &mut Vec<u8>, offs: &mut Vec<usize>, id: usize, body: &[u8]| {
+            offs.push(buf.len());
+            buf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            2,
+            b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        let enc_stm = enc_obj(b"0 1 0 rg 10 10 40 40 re f\n", 4, 0);
+        let mut s4 = format!("<< /Length {} >>\nstream\n", enc_stm.len()).into_bytes();
+        s4.extend_from_slice(&enc_stm);
+        s4.extend_from_slice(b"\nendstream");
+        push_obj(&mut pdf, &mut offsets, 4, &s4);
+
+        let enc_title = enc_obj(b"Secret Title", 5, 0);
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            5,
+            format!("<< /Title <{}> >>", to_hex(&enc_title)).as_bytes(),
+        );
+        push_obj(
+            &mut pdf,
+            &mut offsets,
+            6,
+            format!(
+                "<< /Filter /Standard /V 4 /R 4 /Length 128 /P {p_val} /CF << /StdCF << /CFM /AESV2 /Length 16 >> >> /StrF /StdCF /StmF /StdCF /O <{}> /U <{}> >>",
+                to_hex(&o_entry),
+                to_hex(&u_entry)
+            )
+            .as_bytes(),
+        );
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+        );
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<{}> <{}>] >>\nstartxref\n{xref_off}\n%%EOF\n",
+                offsets.len() + 1,
+                to_hex(id0),
+                to_hex(id0)
+            )
+            .as_bytes(),
+        );
+
+        assert!(import_pdf_bytes_with_password(&pdf, "Fail", "wrong").is_err());
+        let doc = import_pdf_bytes_with_password(&pdf, "Fallback", "secret").unwrap();
+        assert_eq!(doc.title(), "Secret Title");
+        assert_eq!(doc.objects().len(), 1);
+    }
+
+    fn build_minimal_pdf(
+        media_box: [i32; 4],
+        content: &str,
+        extra_resources: Option<&str>,
+        extra_objs: &[&str],
+    ) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+        let push_obj = |buf: &mut Vec<u8>, offs: &mut Vec<usize>, id: usize, body: &[u8]| {
+            offs.push(buf.len());
+            buf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+        push_obj(&mut pdf, &mut offs, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(
+            &mut pdf,
+            &mut offs,
+            2,
+            b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        );
+        let res_str = extra_resources.unwrap_or("<< >>");
+        push_obj(
+            &mut pdf,
+            &mut offs,
+            3,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [{} {} {} {}] /Resources {res_str} /Contents 4 0 R >>",
+                media_box[0], media_box[1], media_box[2], media_box[3]
+            )
+            .as_bytes(),
+        );
+        let stm = format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        );
+        push_obj(&mut pdf, &mut offs, 4, stm.as_bytes());
+        for (i, body) in extra_objs.iter().enumerate() {
+            push_obj(&mut pdf, &mut offs, 5 + i, body.as_bytes());
+        }
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offs.len() + 1).as_bytes(),
+        );
+        for off in &offs {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                offs.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn pixel_rgba(buf: &coree_render::RenderedImage, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y * buf.width + x) * 4) as usize;
+        [
+            buf.rgba[idx],
+            buf.rgba[idx + 1],
+            buf.rgba[idx + 2],
+            buf.rgba[idx + 3],
+        ]
+    }
+
+    #[test]
+    fn pdf_import_even_odd_clip_w_star_punches_center_hole_on_shading() {
+        let sh = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [10 50 90 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> /Extend [true true] >>";
+        let pdf = build_minimal_pdf(
+            [0, 0, 100, 100],
+            "q 10 10 80 80 re 30 30 40 40 re W* n /Sh1 sh Q",
+            Some("<< /Shading << /Sh1 5 0 R >> >>"),
+            &[sh],
+        );
+        let doc = import_pdf_bytes(&pdf, "WStarClip").unwrap();
+        let rendered =
+            coree_render::render_page_to_rgba(&doc, 0, 72.0, coree_core::ViewMode::Enhanced)
+                .unwrap();
+        assert_eq!(rendered.width, 100);
+        assert_eq!(rendered.height, 100);
+
+        // Center (50, 50) lies inside the inner 30..70 hole -> must be white
+        assert_eq!(pixel_rgba(&rendered, 50, 50), [255, 255, 255, 255]);
+        // Outer ring (20, 50) lies inside 10..90 outside 30..70 -> must be gradient colored (red-ish)
+        let ring = pixel_rgba(&rendered, 20, 50);
+        assert!(
+            ring[0] > 150 && ring[1] < 20,
+            "expected red-dominant gradient in outer ring, got {ring:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_import_even_odd_fill_f_star_and_b_star_punch_center_hole_and_preserve_strokes() {
+        let pdf_f = build_minimal_pdf(
+            [0, 0, 100, 100],
+            "1 0 0 rg 10 10 80 80 re 30 30 40 40 re f*",
+            None,
+            &[],
+        );
+        let doc_f = import_pdf_bytes(&pdf_f, "FStarFill").unwrap();
+        let ren_f =
+            coree_render::render_page_to_rgba(&doc_f, 0, 72.0, coree_core::ViewMode::Enhanced)
+                .unwrap();
+        assert_eq!(pixel_rgba(&ren_f, 50, 50), [255, 255, 255, 255]);
+        assert_eq!(pixel_rgba(&ren_f, 20, 50), [255, 0, 0, 255]);
+
+        // B* must punch center hole in fill AND stroke both outer and inner rectangle edges
+        let pdf_b = build_minimal_pdf(
+            [0, 0, 100, 100],
+            "1 0 0 rg 0 0 1 RG 2 w 10 10 80 80 re 30 30 40 40 re B*",
+            None,
+            &[],
+        );
+        let doc_b = import_pdf_bytes(&pdf_b, "BStarFillStroke").unwrap();
+        let ren_b =
+            coree_render::render_page_to_rgba(&doc_b, 0, 72.0, coree_core::ViewMode::Enhanced)
+                .unwrap();
+        assert_eq!(pixel_rgba(&ren_b, 50, 50), [255, 255, 255, 255]);
+        assert_eq!(pixel_rgba(&ren_b, 20, 50), [255, 0, 0, 255]);
+        // Inner hole boundary (x=30, y=50) must be blue stroked
+        let inner_edge = pixel_rgba(&ren_b, 30, 50);
+        assert!(
+            inner_edge[2] > 200 && inner_edge[0] < 30,
+            "expected blue inner stroke at (30,50), got {inner_edge:?}"
+        );
+
+        // Winding `f` (non-*) on same-winding concentric rects must keep center filled
+        let pdf_w = build_minimal_pdf(
+            [0, 0, 100, 100],
+            "1 0 0 rg 10 10 80 80 re 30 30 40 40 re f",
+            None,
+            &[],
+        );
+        let doc_w = import_pdf_bytes(&pdf_w, "WindingFill").unwrap();
+        let ren_w =
+            coree_render::render_page_to_rgba(&doc_w, 0, 72.0, coree_core::ViewMode::Enhanced)
+                .unwrap();
+        assert_eq!(pixel_rgba(&ren_w, 50, 50), [255, 0, 0, 255]);
     }
 }

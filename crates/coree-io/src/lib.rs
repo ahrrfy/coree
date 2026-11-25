@@ -7,15 +7,20 @@
 pub mod atomic;
 pub mod cad_plot;
 pub mod clipboard_codec;
+pub mod display_list;
+pub mod dwg;
 pub mod eps;
 pub mod error;
+pub(crate) mod font_subset;
 pub mod native;
 pub mod palette_io;
 pub mod pdf;
+pub(crate) mod pdf_crypto;
 pub mod pdf_import;
 pub mod psd;
 pub mod raster;
 pub mod svg;
+pub mod wmf_emf;
 
 /// Crate identifier used during workspace initialization and diagnostics.
 pub const CRATE_NAME: &str = "coree-io";
@@ -93,18 +98,21 @@ pub(crate) fn resolve_export_world_path(
                 coree_core::NodePayload::ArtisticMedia { spine, style } => {
                     Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
                 }
-                coree_core::NodePayload::Clone { .. } => doc
-                    .resolve_clone_payload_and_style(sub)
-                    .and_then(|(eff_p, _, _)| match eff_p {
-                        coree_core::NodePayload::Path(p) => Some(p),
-                        coree_core::NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                        coree_core::NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                        coree_core::NodePayload::ArtisticMedia { spine, style } => {
-                            Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
-                        }
-                        coree_core::NodePayload::PowerClip { container, .. } => Some(*container),
-                        _ => None,
-                    }),
+                coree_core::NodePayload::Clone { .. } => display_list::resolve_display_list_clone(
+                    doc,
+                    sub,
+                    Some(sym_map),
+                )
+                .and_then(|(eff_p, _, _)| match eff_p {
+                    coree_core::NodePayload::Path(p) => Some(p),
+                    coree_core::NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                    coree_core::NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                    coree_core::NodePayload::ArtisticMedia { spine, style } => {
+                        Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
+                    }
+                    coree_core::NodePayload::PowerClip { container, .. } => Some(*container),
+                    _ => None,
+                }),
                 coree_core::NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
@@ -134,17 +142,17 @@ pub(crate) fn resolve_export_connector_endpoints(
     base_world_xf: &coree_core::Affine2D,
     sym_ctx: Option<ExportSymCtx<'_>>,
 ) -> (coree_core::Point2D, coree_core::Point2D) {
-    let Some((sym_map, _, sym_root_xf)) = sym_ctx else {
+    let Some((sym_map, sym_objects, sym_root_xf)) = sym_ctx else {
         return doc.resolve_connector_endpoints(conn);
     };
     let mut visiting = std::collections::HashMap::new();
     let mut visited_syms = std::collections::HashSet::new();
     let mut cache = std::collections::HashMap::new();
-    coree_core::hit_test::resolve_connector_endpoints_with_sym(
+    coree_core::hit_test::resolve_connector_endpoints_with_sym_objs(
         doc,
         conn,
         base_world_xf,
-        Some((sym_map, sym_root_xf)),
+        Some((sym_map, Some(sym_objects), sym_root_xf)),
         &mut visiting,
         &mut visited_syms,
         &mut cache,
@@ -168,6 +176,7 @@ pub use clipboard_codec::{
     encode_clipboard_svg, ClipboardDecodedFormat, ClipboardPayload, MIME_EMF, MIME_PDF, MIME_PNG,
     MIME_SVG, MIME_TEXT_PLAIN,
 };
+pub use dwg::{export_dwg, export_dwg_to_bytes, import_dwg, import_dwg_bytes, DwgVersion};
 pub use eps::{export_eps, export_eps_to_string, import_eps, import_eps_bytes};
 pub use error::{sanitize_zip_path, IoError, IoLimits, IoResult};
 pub use native::{
@@ -175,20 +184,28 @@ pub use native::{
     read_coree_preview, save_coree, save_coree_with_preview, CoreeManifest, COREE_FORMAT_VERSION,
 };
 pub use palette_io::{
-    export_ase, export_gpl, export_pal, export_palette_file, import_ase, import_gpl, import_pal,
-    import_palette_file,
+    export_ase, export_gpl, export_pal, export_palette_file, import_acb, import_ase, import_gpl,
+    import_pal, import_palette_file,
 };
-pub use pdf::{export_pdf, export_pdf_to_bytes, PdfColorSpace, PdfExportOptions};
+pub use pdf::{export_pdf, export_pdf_to_bytes, PdfColorSpace, PdfExportOptions, PdfXConformance};
 pub use pdf_import::{import_pdf, import_pdf_bytes};
-pub use psd::{import_psd, import_psd_bytes};
+pub use psd::{
+    export_psd, export_psd_to_bytes, export_psd_to_bytes_with_options, import_psd,
+    import_psd_bytes, PsdExportOptions,
+};
 pub use raster::{
-    decode_raster_bytes_with_limits, export_raster, export_raster_to_bytes, import_raster,
-    import_raster_with_limits, inject_png_phys_chunk, parse_png_phys_dpi,
+    decode_raster_bytes_with_limits, export_raster, export_raster_16_png_owned_to_bytes,
+    export_raster_16_png_to_bytes, export_raster_asset_to_bytes, export_raster_to_bytes,
+    import_raster, import_raster_with_limits, inject_png_phys_chunk, parse_png_phys_dpi,
     validate_raster_dimensions, RasterExportOptions, RasterFormat,
 };
 pub use svg::{
     export_svg, export_svg_to_string, import_svg, import_svg_str, import_svg_str_with_limits,
     import_svg_with_limits,
+};
+pub use wmf_emf::{
+    export_emf, export_emf_to_bytes, export_wmf, export_wmf_to_bytes, import_emf, import_emf_bytes,
+    import_wmf, import_wmf_bytes,
 };
 
 #[cfg(test)]

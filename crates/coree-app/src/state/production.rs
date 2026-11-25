@@ -2490,10 +2490,10 @@ impl StudioApp {
                 "All Supported Studio Formats",
                 &[
                     "coree", "COREE", "cdr", "CDR", "cdt", "CDT", "cmx", "CMX", "cpt", "CPT",
-                    "pdf", "PDF", "ai", "AI", "eps", "EPS", "ps", "PS", "dxf", "DXF", "plt", "PLT",
-                    "psd", "PSD", "psb", "PSB", "svg", "SVG", "svgz", "SVGZ", "png", "PNG", "jpg",
-                    "JPG", "jpeg", "JPEG", "webp", "WEBP", "tiff", "TIFF", "tif", "TIF", "bmp",
-                    "BMP", "zip", "ZIP",
+                    "pdf", "PDF", "ai", "AI", "eps", "EPS", "ps", "PS", "dxf", "DXF", "dwg", "DWG",
+                    "wmf", "WMF", "emf", "EMF", "plt", "PLT", "psd", "PSD", "psb", "PSB", "svg",
+                    "SVG", "svgz", "SVGZ", "png", "PNG", "jpg", "JPG", "jpeg", "JPEG", "webp",
+                    "WEBP", "tiff", "TIFF", "tif", "TIF", "bmp", "BMP", "zip", "ZIP",
                 ],
             )
             .add_filter("Native coree (.coree)", &["coree", "COREE"])
@@ -2505,7 +2505,14 @@ impl StudioApp {
             )
             .add_filter("PDF & Vector AI (.pdf, .ai)", &["pdf", "PDF", "ai", "AI"])
             .add_filter("PostScript / EPS (.eps, .ps)", &["eps", "EPS", "ps", "PS"])
-            .add_filter("CAD / Plotter (.dxf, .plt)", &["dxf", "DXF", "plt", "PLT"])
+            .add_filter(
+                "CAD / Plotter (.dxf, .dwg, .plt)",
+                &["dxf", "DXF", "dwg", "DWG", "plt", "PLT"],
+            )
+            .add_filter(
+                "Windows Metafiles (.wmf, .emf)",
+                &["wmf", "WMF", "emf", "EMF"],
+            )
             .add_filter("SVG Vector (.svg, .svgz)", &["svg", "SVG", "svgz", "SVGZ"])
             .add_filter(
                 "Layered Raster / PSD (.psd, .psb)",
@@ -2537,10 +2544,10 @@ impl StudioApp {
                 "All Importable Formats",
                 &[
                     "coree", "COREE", "cdr", "CDR", "cdt", "CDT", "cmx", "CMX", "cpt", "CPT",
-                    "pdf", "PDF", "ai", "AI", "eps", "EPS", "ps", "PS", "dxf", "DXF", "plt", "PLT",
-                    "psd", "PSD", "psb", "PSB", "svg", "SVG", "svgz", "SVGZ", "png", "PNG", "jpg",
-                    "JPG", "jpeg", "JPEG", "webp", "WEBP", "tiff", "TIFF", "tif", "TIF", "bmp",
-                    "BMP", "zip", "ZIP",
+                    "pdf", "PDF", "ai", "AI", "eps", "EPS", "ps", "PS", "dxf", "DXF", "dwg", "DWG",
+                    "wmf", "WMF", "emf", "EMF", "plt", "PLT", "psd", "PSD", "psb", "PSB", "svg",
+                    "SVG", "svgz", "SVGZ", "png", "PNG", "jpg", "JPG", "jpeg", "JPEG", "webp",
+                    "WEBP", "tiff", "TIFF", "tif", "TIF", "bmp", "BMP", "zip", "ZIP",
                 ],
             )
             .add_filter(
@@ -2551,7 +2558,14 @@ impl StudioApp {
             )
             .add_filter("PDF & Vector AI (.pdf, .ai)", &["pdf", "PDF", "ai", "AI"])
             .add_filter("PostScript / EPS (.eps, .ps)", &["eps", "EPS", "ps", "PS"])
-            .add_filter("CAD / Plotter (.dxf, .plt)", &["dxf", "DXF", "plt", "PLT"])
+            .add_filter(
+                "CAD / Plotter (.dxf, .dwg, .plt)",
+                &["dxf", "DXF", "dwg", "DWG", "plt", "PLT"],
+            )
+            .add_filter(
+                "Windows Metafiles (.wmf, .emf)",
+                &["wmf", "WMF", "emf", "EMF"],
+            )
             .add_filter("SVG Vector (.svg, .svgz)", &["svg", "SVG", "svgz", "SVGZ"])
             .add_filter(
                 "Layered Raster / PSD (.psd, .psb)",

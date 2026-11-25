@@ -649,18 +649,30 @@ fn collect_object_paths(
     depth: usize,
     out: &mut Vec<BezierPath>,
 ) {
-    if depth > 64 {
-        return;
-    }
     let Some(obj) = doc.object(id) else {
         return;
     };
+    collect_scene_object_paths(doc, obj, None, parent_xf, depth, out);
+}
+
+fn collect_scene_object_paths(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_map: Option<&std::collections::HashMap<ObjectId, &SceneObject>>,
+    parent_xf: &Affine2D,
+    depth: usize,
+    out: &mut Vec<BezierPath>,
+) {
+    if depth > 64 {
+        return;
+    }
     if !obj.visible {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
     let resolved_payload = if matches!(obj.payload, NodePayload::Clone { .. }) {
-        doc.resolve_clone_payload_and_style(obj).map(|(p, _, _)| p)
+        doc.resolve_clone_payload_and_style_with_sym(obj, sym_map)
+            .map(|(p, _, _)| p)
     } else {
         Some(obj.payload.clone())
     };
@@ -682,8 +694,20 @@ fn collect_object_paths(
                 &world_xf,
             ));
         }
-        NodePayload::PowerClip { container, .. } => {
+        NodePayload::PowerClip {
+            container,
+            contents,
+            ..
+        } => {
             out.push(apply_persp_then_xf((**container).clone(), obj, &world_xf));
+            for &cid in contents {
+                if let Some(child) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    collect_scene_object_paths(doc, child, sym_map, &world_xf, depth + 1, out);
+                }
+            }
         }
         NodePayload::Table(t) => out.push(apply_persp_then_xf(t.to_grid_paths(), obj, &world_xf)),
         NodePayload::Connector(c) => {
@@ -692,28 +716,44 @@ fn collect_object_paths(
         }
         NodePayload::Group(children) => {
             for &cid in children {
-                collect_object_paths(doc, cid, &world_xf, depth + 1, out);
+                if let Some(child) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    collect_scene_object_paths(doc, child, sym_map, &world_xf, depth + 1, out);
+                }
             }
         }
         NodePayload::SymbolInstance(sym_id) => {
             if let Some(sym) = doc.symbol(*sym_id) {
+                let mut child_map: std::collections::HashMap<ObjectId, &SceneObject> =
+                    std::collections::HashMap::new();
+                let mut referenced: std::collections::HashSet<ObjectId> =
+                    std::collections::HashSet::new();
                 for sub in &sym.objects {
-                    if !sub.visible {
-                        continue;
+                    if sub.id.0 != 0 {
+                        child_map.insert(sub.id, sub);
                     }
-                    let sub_xf = world_xf.compose(&sub.transform);
                     match &sub.payload {
-                        NodePayload::Path(p) => {
-                            out.push(apply_persp_then_xf(p.clone(), sub, &sub_xf));
-                        }
-                        NodePayload::Shape(s) => {
-                            out.push(apply_persp_then_xf(s.to_bezier_path(), sub, &sub_xf));
-                        }
-                        NodePayload::BSpline(bs) => {
-                            out.push(apply_persp_then_xf(bs.to_bezier_path(), sub, &sub_xf));
+                        NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                        NodePayload::PowerClip { contents, .. } => {
+                            referenced.extend(contents.iter().copied());
                         }
                         _ => {}
                     }
+                }
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    collect_scene_object_paths(
+                        doc,
+                        sub,
+                        Some(&child_map),
+                        &world_xf,
+                        depth + 1,
+                        out,
+                    );
                 }
             }
         }

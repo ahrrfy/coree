@@ -142,7 +142,7 @@ const NEW_DOC_PRESETS: [(&str, f64, f64, ColorMode, f32, f64); 8] = [
     ),
 ];
 
-const EXPORT_FORMATS: [(&str, &str); 17] = [
+const EXPORT_FORMATS: [(&str, &str); 21] = [
     ("PDF Print-Ready (.pdf)", "pdf"),
     ("Native Lossless (.coree)", "coree"),
     ("CDR X6+ Archive (.cdr)", "cdr"),
@@ -160,6 +160,10 @@ const EXPORT_FORMATS: [(&str, &str); 17] = [
     ("WebP Raster (.webp)", "webp"),
     ("TIFF Raster (.tiff)", "tiff"),
     ("BMP Raster (.bmp)", "bmp"),
+    ("AutoCAD Binary (.dwg)", "dwg"),
+    ("Windows Metafile (.wmf)", "wmf"),
+    ("Enhanced Metafile (.emf)", "emf"),
+    ("Photoshop PSD (.psd)", "psd"),
 ];
 
 /// Format index constant for Laser G-Code inside [`EXPORT_FORMATS`].

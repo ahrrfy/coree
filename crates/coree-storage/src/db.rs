@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Current local SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Exact offline-first SQLite DDL from `replica/schema.sql` (all 10 tables,
 /// CHECK constraints, foreign keys, and indexes).
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS recent_documents (
     file_path           TEXT NOT NULL UNIQUE,
     display_name        TEXT NOT NULL,
     file_format         TEXT NOT NULL CHECK (file_format IN (
-                            'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'png', 'jpg', 'tiff', 'psd', 'coree'
+                            'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'dwg', 'wmf', 'emf', 'png', 'jpg', 'tiff', 'webp', 'bmp', 'psd', 'coree'
                         )),
     cdr_version         TEXT,
     page_count          INTEGER NOT NULL DEFAULT 1 CHECK (page_count >= 1),
@@ -557,6 +557,34 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
 
     if current == 0 {
         conn.execute_batch(SCHEMA_SQL)?;
+        if current < 3 {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE recent_documents_v3 (
+                     id                  TEXT PRIMARY KEY NOT NULL,
+                     file_path           TEXT NOT NULL UNIQUE,
+                     display_name        TEXT NOT NULL,
+                     file_format         TEXT NOT NULL CHECK (file_format IN (
+                                             'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'dwg', 'wmf', 'emf', 'png', 'jpg', 'tiff', 'webp', 'bmp', 'psd', 'coree'
+                                         )),
+                     cdr_version         TEXT,
+                     page_count          INTEGER NOT NULL DEFAULT 1 CHECK (page_count >= 1),
+                     color_mode          TEXT NOT NULL DEFAULT 'cmyk' CHECK (color_mode IN ('cmyk', 'rgb', 'grayscale')),
+                     thumbnail_png       BLOB,
+                     file_size_bytes     INTEGER NOT NULL DEFAULT 0 CHECK (file_size_bytes >= 0),
+                     pinned              INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+                     last_opened_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );
+                 INSERT INTO recent_documents_v3 SELECT * FROM recent_documents;
+                 DROP TABLE recent_documents;
+                 ALTER TABLE recent_documents_v3 RENAME TO recent_documents;
+                 CREATE INDEX IF NOT EXISTS idx_recent_documents_opened ON recent_documents (pinned DESC, last_opened_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_recent_documents_format ON recent_documents (file_format);
+                 PRAGMA foreign_keys = ON;",
+            )?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO schema_migrations (version) VALUES (?1)",
             [SCHEMA_VERSION],
@@ -580,6 +608,34 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
                      panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
                      updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
                  );",
+            )?;
+        }
+        if current < 3 {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE recent_documents_v3 (
+                     id                  TEXT PRIMARY KEY NOT NULL,
+                     file_path           TEXT NOT NULL UNIQUE,
+                     display_name        TEXT NOT NULL,
+                     file_format         TEXT NOT NULL CHECK (file_format IN (
+                                             'cdr', 'cdt', 'cmx', 'cpt', 'svg', 'pdf', 'eps', 'dxf', 'plt', 'dwg', 'wmf', 'emf', 'png', 'jpg', 'tiff', 'webp', 'bmp', 'psd', 'coree'
+                                         )),
+                     cdr_version         TEXT,
+                     page_count          INTEGER NOT NULL DEFAULT 1 CHECK (page_count >= 1),
+                     color_mode          TEXT NOT NULL DEFAULT 'cmyk' CHECK (color_mode IN ('cmyk', 'rgb', 'grayscale')),
+                     thumbnail_png       BLOB,
+                     file_size_bytes     INTEGER NOT NULL DEFAULT 0 CHECK (file_size_bytes >= 0),
+                     pinned              INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+                     last_opened_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );
+                 INSERT INTO recent_documents_v3 SELECT * FROM recent_documents;
+                 DROP TABLE recent_documents;
+                 ALTER TABLE recent_documents_v3 RENAME TO recent_documents;
+                 CREATE INDEX IF NOT EXISTS idx_recent_documents_opened ON recent_documents (pinned DESC, last_opened_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_recent_documents_format ON recent_documents (file_format);
+                 PRAGMA foreign_keys = ON;",
             )?;
         }
         conn.execute(

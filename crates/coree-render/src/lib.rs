@@ -32,8 +32,9 @@ pub use backend::{
 pub use effects_render::lower_effects_to_primitives;
 pub use error::{RenderError, RenderResult};
 pub use export_render::{
-    render_isolated_object_to_rgba, render_page_to_rgba, render_page_to_rgba_with_backend,
-    render_page_to_rgba_with_options, render_svg_to_rgba, RenderedImage,
+    render_isolated_object_to_rgba, render_isolated_object_to_rgba_with_options,
+    render_page_to_rgba, render_page_to_rgba_with_backend, render_page_to_rgba_with_options,
+    render_svg_to_rgba, RenderedImage,
 };
 pub use hit_test::{
     hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
@@ -58,7 +59,7 @@ pub use smart_fill::{compute_smart_fill, create_smart_fill_object, dcel_smart_fi
 pub use text_layout::{
     apply_kashida_elongation, contains_arabic, list_glyphs_for_block, paragraph_to_curves,
     text_on_path_to_curves, text_to_curves, GlyphBlockFilter, GlyphCatalogEntry, ShapedGlyphDraw,
-    TextEngine,
+    ShapedPdfGlyph, ShapedPdfRun, TextEngine,
 };
 pub use tile_cache::{
     object_visual_world_bounds, CachedTile, DirtyTileCache, WorldTileKey, TILE_SIZE_PX,

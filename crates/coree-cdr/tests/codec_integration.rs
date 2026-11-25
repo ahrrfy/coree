@@ -4161,3 +4161,38 @@ fn cdr_mesh_fill_preserves_alpha_and_nsew_handles_across_riff_and_x6() {
         assert!(nodes[3].handle_n.is_none());
     }
 }
+
+#[test]
+fn cdr_riff_preserves_non_default_disabled_grid_and_perspective_grid_guid_chunk_15() {
+    use coree_core::{PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, Point2D};
+
+    let mut doc = Document::new_a4("Disabled Grid");
+    let mut grid = doc.grid();
+    grid.visible = false;
+    grid.snap = false;
+    grid.spacing_x_mm = 17.5;
+    doc.set_grid(grid);
+    doc.set_perspective_grid(PerspectiveGridConfig {
+        enabled: false,
+        mode: PerspectiveGridMode::TwoPoint,
+        horizon_y_mm: 92.0,
+        vanishing_points: vec![Point2D::new(-20.0, 92.0), Point2D::new(230.0, 92.0)],
+        density: 12,
+        opacity: 0.35,
+        active_plane: PerspectivePlane::Right,
+    });
+
+    let riff = export_cdr_bytes(&doc, CdrWriteVersion::RiffV12).unwrap();
+    let rt = import_cdr_bytes(&riff).unwrap();
+    assert!(
+        !rt.document
+            .unknown_doc_chunks()
+            .iter()
+            .any(|c| &c.fourcc == b"guid"),
+        "guid chunk must be parsed without falling into unknown_doc_chunks"
+    );
+    assert!(!rt.document.grid().visible);
+    assert!((rt.document.grid().spacing_x_mm - 17.5).abs() < 1e-6);
+    assert!(!rt.document.perspective_grid().enabled);
+    assert!((rt.document.perspective_grid().horizon_y_mm - 92.0).abs() < 1e-6);
+}

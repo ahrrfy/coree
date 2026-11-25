@@ -143,7 +143,7 @@ fn sym_object_world_xf(
     xf.is_finite().then_some(xf)
 }
 
-fn resolve_sym_world_path(
+pub(crate) fn resolve_sym_world_path(
     doc: &Document,
     path_id: ObjectId,
     sym_ctx: Option<SymRenderCtx<'_>>,
@@ -158,19 +158,18 @@ fn resolve_sym_world_path(
                 NodePayload::ArtisticMedia { spine, style } => {
                     Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
                 }
-                NodePayload::Clone { .. } => {
-                    doc.resolve_clone_payload_and_style(sub)
-                        .and_then(|(eff_p, _, _)| match eff_p {
-                            NodePayload::Path(p) => Some(p),
-                            NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                            NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                            NodePayload::ArtisticMedia { spine, style } => {
-                                Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
-                            }
-                            NodePayload::PowerClip { container, .. } => Some(*container),
-                            _ => None,
-                        })
-                }
+                NodePayload::Clone { .. } => doc
+                    .resolve_clone_payload_and_style_with_sym(sub, Some(sym_map))
+                    .and_then(|(eff_p, _, _)| match eff_p {
+                        NodePayload::Path(p) => Some(p),
+                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            Some(coree_core::ArtisticMedia::expand_stroke(&spine, &style))
+                        }
+                        NodePayload::PowerClip { container, .. } => Some(*container),
+                        _ => None,
+                    }),
                 NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
@@ -220,6 +219,9 @@ pub struct RenderOptions {
     pub display_icc_profile: Option<Vec<u8>>,
     /// ICC rendering intent used when applying `display_icc_profile`.
     pub display_icc_intent: RenderingIntent,
+    /// When `true`, suppresses Spot `CutContour` strokes during rasterization (used when vector
+    /// `/CutContour` overlays are emitted separately in PDF/EPS export).
+    pub suppress_spot_cutcontour: bool,
 }
 
 impl Default for RenderOptions {
@@ -250,6 +252,7 @@ impl RenderOptions {
             proof_intent: RenderingIntent::RelativeColorimetric,
             display_icc_profile: None,
             display_icc_intent: RenderingIntent::RelativeColorimetric,
+            suppress_spot_cutcontour: false,
         }
     }
 
@@ -274,8 +277,17 @@ impl RenderOptions {
             proof_intent: RenderingIntent::RelativeColorimetric,
             display_icc_profile: None,
             display_icc_intent: RenderingIntent::RelativeColorimetric,
+            suppress_spot_cutcontour: false,
         }
     }
+}
+
+#[inline]
+pub(crate) fn is_cutcontour_spot(color: &Color) -> bool {
+    matches!(
+        color,
+        Color::Spot { name, .. } if name.trim().eq_ignore_ascii_case("CutContour")
+    )
 }
 
 /// Positioned page slot in canvas world millimeters (for single-page or Multipage View).
@@ -685,7 +697,7 @@ impl SceneRenderer {
         }
         let resolved_clone;
         let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
-            let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) else {
+            let Some((p, f, o)) = doc.resolve_clone_payload_and_style_with_sym(obj, sym_map) else {
                 return false;
             };
             let mut tmp = obj.clone();
@@ -1324,41 +1336,6 @@ impl SceneRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render_scene_object(
-        &mut self,
-        doc: &Document,
-        page: Option<&Page>,
-        obj: &SceneObject,
-        page_to_surface: Affine2D,
-        parent_to_screen: Affine2D,
-        view_mode: ViewMode,
-        options: &RenderOptions,
-        backend: &mut dyn CanvasBackend,
-        underlying_ids: &[ObjectId],
-        depth: usize,
-    ) {
-        let items: Vec<BackdropItem> = underlying_ids
-            .iter()
-            .copied()
-            .map(BackdropItem::Object)
-            .collect();
-        self.render_scene_object_with_sym(
-            doc,
-            page,
-            obj,
-            page_to_surface,
-            parent_to_screen,
-            None,
-            Affine2D::IDENTITY,
-            view_mode,
-            options,
-            backend,
-            &items,
-            depth,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_scene_object_with_backdrop(
         &mut self,
         doc: &Document,
@@ -1408,6 +1385,15 @@ impl SceneRenderer {
         if !obj.visible || obj_opacity <= 1e-6 || depth > MAX_RENDER_DEPTH {
             return;
         }
+        let stripped_cutcontour_obj: Option<Box<SceneObject>> =
+            if options.suppress_spot_cutcontour && is_cutcontour_spot(&obj.outline.color) {
+                let mut cloned = obj.clone();
+                cloned.outline = OutlineStyle::none();
+                Some(Box::new(cloned))
+            } else {
+                None
+            };
+        let obj = stripped_cutcontour_obj.as_deref().unwrap_or(obj);
         if !parent_to_screen.is_finite() || !obj.transform.is_finite() {
             return;
         }
@@ -1421,7 +1407,7 @@ impl SceneRenderer {
         let inv_parent_world = parent_world.inverse().unwrap_or(Affine2D::IDENTITY);
 
         let resolved_clone = if matches!(obj.payload, NodePayload::Clone { .. }) {
-            doc.resolve_clone_payload_and_style(obj)
+            doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
         } else {
             None
         };
@@ -1620,27 +1606,26 @@ impl SceneRenderer {
             )
             .transformed(&obj_to_screen)
             .bounding_box(),
-            NodePayload::Clone { .. } => {
-                doc.resolve_clone_payload_and_style(obj)
-                    .and_then(|(p, f, o)| {
-                        let mut tmp = obj.clone();
-                        tmp.payload = p;
-                        tmp.fill = f;
-                        tmp.outline = o;
-                        Self::compute_object_screen_bounds(
-                            doc,
-                            &tmp,
-                            page_to_surface,
-                            parent_to_screen,
-                            sym_ctx,
-                            ancestor_world_sym,
-                            false,
-                            visited_doc,
-                            visited_syms,
-                            depth + 1,
-                        )
-                    })
-            }
+            NodePayload::Clone { .. } => doc
+                .resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+                .and_then(|(p, f, o)| {
+                    let mut tmp = obj.clone();
+                    tmp.payload = p;
+                    tmp.fill = f;
+                    tmp.outline = o;
+                    Self::compute_object_screen_bounds(
+                        doc,
+                        &tmp,
+                        page_to_surface,
+                        parent_to_screen,
+                        sym_ctx,
+                        ancestor_world_sym,
+                        false,
+                        visited_doc,
+                        visited_syms,
+                        depth + 1,
+                    )
+                }),
             NodePayload::PowerClip { container, .. } => {
                 apply_geometry_effects(&apply_persp(container), &obj.effects)
                     .transformed(&obj_to_screen)
@@ -2138,7 +2123,12 @@ impl SceneRenderer {
         }
     }
 
-    fn extract_lens_local_path(&mut self, doc: &Document, obj: &SceneObject) -> Option<BezierPath> {
+    fn extract_lens_local_path(
+        &mut self,
+        doc: &Document,
+        obj: &SceneObject,
+        sym_ctx: Option<SymRenderCtx<'_>>,
+    ) -> Option<BezierPath> {
         match &obj.payload {
             NodePayload::Path(p) => Some(p.clone()),
             NodePayload::Shape(s) => Some(s.to_bezier_path()),
@@ -2163,8 +2153,14 @@ impl SceneRenderer {
             }
             NodePayload::TextOnPath(top) => {
                 let mut combined = BezierPath::new();
-                if let Some(host) = doc.world_path_of(top.path_id) {
-                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                if let Some(host) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
+                    let obj_world = if let Some((sym_map, sym_objects, sym_root_xf)) = sym_ctx {
+                        sym_object_world_xf(obj.id, &sym_root_xf, sym_map, sym_objects)
+                            .unwrap_or_else(|| sym_root_xf.compose(&obj.transform))
+                    } else {
+                        doc.world_transform_of(obj.id).unwrap_or(obj.transform)
+                    };
+                    let inv = obj_world.inverse().unwrap_or(Affine2D::IDENTITY);
                     for piece in self.text_engine.layout_text_on_path_pieces(top, &host) {
                         combined
                             .subpaths
@@ -2197,13 +2193,22 @@ impl SceneRenderer {
         if depth > MAX_RENDER_DEPTH {
             return;
         }
+        let stripped_cutcontour_obj: Option<Box<SceneObject>> =
+            if options.suppress_spot_cutcontour && is_cutcontour_spot(&obj.outline.color) {
+                let mut cloned = obj.clone();
+                cloned.outline = OutlineStyle::none();
+                Some(Box::new(cloned))
+            } else {
+                None
+            };
+        let obj = stripped_cutcontour_obj.as_deref().unwrap_or(obj);
         let anti_alias = view_mode != ViewMode::Pixels;
         let obj_to_screen = parent_to_screen.compose(&obj.transform);
 
         // Handle Lens objects first (all 11 optical & color lenses)
         if view_mode != ViewMode::Wireframe {
             if let Some(lens_cfg) = obj.lens.clone() {
-                if let Some(local_path) = self.extract_lens_local_path(doc, obj) {
+                if let Some(local_path) = self.extract_lens_local_path(doc, obj, sym_ctx) {
                     let local_persp = if let Some(persp) = obj.perspective {
                         persp.transform_bezier_path(&local_path)
                     } else {
@@ -2305,11 +2310,18 @@ impl SceneRenderer {
                 );
             }
             NodePayload::Clone { .. } => {
-                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                if let Some((p, f, o)) =
+                    doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+                {
                     let mut resolved = obj.clone();
                     resolved.payload = p;
                     resolved.fill = f;
-                    resolved.outline = o;
+                    resolved.outline =
+                        if options.suppress_spot_cutcontour && is_cutcontour_spot(&o.color) {
+                            OutlineStyle::none()
+                        } else {
+                            o
+                        };
                     self.render_scene_object_core(
                         doc,
                         page,
@@ -4155,7 +4167,9 @@ impl SceneRenderer {
                     }
                 }
                 NodePayload::Clone { .. } => {
-                    if let Some((_, f, _)) = doc.resolve_clone_payload_and_style(sub) {
+                    if let Some((_, f, _)) =
+                        doc.resolve_clone_payload_and_style_with_sym(sub, Some(child_map))
+                    {
                         if f.is_visible() {
                             return Some(f);
                         }
@@ -4189,7 +4203,9 @@ impl SceneRenderer {
                     }
                 }
                 NodePayload::Clone { .. } => {
-                    if let Some((_, f, _)) = doc.resolve_clone_payload_and_style(cobj) {
+                    if let Some((_, f, _)) = doc
+                        .resolve_clone_payload_and_style_with_sym(cobj, sym_ctx.map(|(m, _, _)| m))
+                    {
                         if f.is_visible() {
                             return Some(f);
                         }
@@ -4248,7 +4264,10 @@ impl SceneRenderer {
             if let Some(raw_obj) = cobj {
                 let resolved_clone;
                 let obj = if matches!(raw_obj.payload, NodePayload::Clone { .. }) {
-                    if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(raw_obj) {
+                    if let Some((p, f, o)) = doc.resolve_clone_payload_and_style_with_sym(
+                        raw_obj,
+                        sym_ctx.map(|(m, _, _)| m),
+                    ) {
                         let mut c = raw_obj.clone();
                         c.payload = p;
                         c.fill = f;
@@ -4408,7 +4427,9 @@ impl SceneRenderer {
             return out;
         }
         if matches!(obj.payload, NodePayload::Clone { .. }) {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o)) =
+                doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+            {
                 let mut tmp = obj.clone();
                 tmp.payload = p;
                 tmp.fill = f;
@@ -4653,7 +4674,9 @@ impl SceneRenderer {
         }
         let resolved_clone;
         let obj = if matches!(obj.payload, NodePayload::Clone { .. }) {
-            let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) else {
+            let Some((p, f, o)) =
+                doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+            else {
                 return;
             };
             let mut tmp = obj.clone();
@@ -5128,7 +5151,7 @@ impl SceneRenderer {
             }
             NodePayload::Clone { .. } => {
                 return doc
-                    .resolve_clone_payload_and_style(obj)
+                    .resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
                     .and_then(|(p, f, o)| {
                         let mut tmp = obj.clone();
                         tmp.payload = p;
@@ -5573,6 +5596,15 @@ impl SceneRenderer {
         if depth > MAX_RENDER_DEPTH {
             return;
         }
+        let stripped_cutcontour_obj: Option<Box<SceneObject>> =
+            if options.suppress_spot_cutcontour && is_cutcontour_spot(&obj.outline.color) {
+                let mut cloned = obj.clone();
+                cloned.outline = OutlineStyle::none();
+                Some(Box::new(cloned))
+            } else {
+                None
+            };
+        let obj = stripped_cutcontour_obj.as_deref().unwrap_or(obj);
         let anti_alias = view_mode != ViewMode::Pixels;
         let inner_to_outer_rel = deform_frames
             .iter()
@@ -5588,7 +5620,7 @@ impl SceneRenderer {
         };
         if view_mode != ViewMode::Wireframe {
             if let Some(lens_cfg) = obj.lens.clone() {
-                if let Some(local_path) = self.extract_lens_local_path(doc, obj) {
+                if let Some(local_path) = self.extract_lens_local_path(doc, obj, sym_ctx) {
                     let deformed = apply_deform_chain_in_bounds(
                         &apply_geometry_effects(&apply_own_persp(&local_path), &obj.effects),
                         c_xf,
@@ -5786,11 +5818,18 @@ impl SceneRenderer {
                 );
             }
             NodePayload::Clone { .. } => {
-                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+                if let Some((p, f, o)) =
+                    doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+                {
                     let mut tmp = obj.clone();
                     tmp.payload = p;
                     tmp.fill = f;
-                    tmp.outline = o;
+                    tmp.outline =
+                        if options.suppress_spot_cutcontour && is_cutcontour_spot(&o.color) {
+                            OutlineStyle::none()
+                        } else {
+                            o
+                        };
                     self.render_deformed_child_core(
                         doc,
                         page,
@@ -8045,13 +8084,33 @@ impl SceneRenderer {
             f64::from(tile_px) / tile_h.max(0.1),
         );
         let opts = RenderOptions::export();
+        let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+        let mut referenced: HashSet<ObjectId> = HashSet::new();
+        for sub in &sym.objects {
+            if sub.id.0 != 0 {
+                child_map.insert(sub.id, sub);
+            }
+            match &sub.payload {
+                NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                NodePayload::PowerClip { contents, .. } => {
+                    referenced.extend(contents.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        let sym_ctx = Some((&child_map, sym.objects.as_slice(), Affine2D::IDENTITY));
         for obj in &sym.objects {
-            self.render_scene_object(
+            if obj.id.0 != 0 && referenced.contains(&obj.id) {
+                continue;
+            }
+            self.render_scene_object_with_sym(
                 doc,
                 None,
                 obj,
                 scale,
                 scale,
+                sym_ctx,
+                Affine2D::IDENTITY,
                 ViewMode::Enhanced,
                 &opts,
                 &mut sub,
@@ -9367,6 +9426,17 @@ fn object_nonlocal_and_lens_info(
     visiting_syms: &mut HashSet<SymbolId>,
     depth: usize,
 ) -> (bool, bool) {
+    object_nonlocal_and_lens_info_inner(doc, obj, None, visiting_objs, visiting_syms, depth)
+}
+
+fn object_nonlocal_and_lens_info_inner(
+    doc: &Document,
+    obj: &SceneObject,
+    sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+    visiting_objs: &mut HashSet<ObjectId>,
+    visiting_syms: &mut HashSet<SymbolId>,
+    depth: usize,
+) -> (bool, bool) {
     if depth > MAX_RENDER_DEPTH {
         return (false, false);
     }
@@ -9392,10 +9462,14 @@ fn object_nonlocal_and_lens_info(
                 if !visiting_objs.insert(cid) {
                     continue;
                 }
-                if let Some(c) = doc.object(cid) {
-                    let (cn, cl) = object_nonlocal_and_lens_info(
+                if let Some(c) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    let (cn, cl) = object_nonlocal_and_lens_info_inner(
                         doc,
                         c,
+                        sym_map,
                         visiting_objs,
                         visiting_syms,
                         depth + 1,
@@ -9414,10 +9488,14 @@ fn object_nonlocal_and_lens_info(
                 if !visiting_objs.insert(cid) {
                     continue;
                 }
-                if let Some(c) = doc.object(cid) {
-                    let (cn, cl) = object_nonlocal_and_lens_info(
+                if let Some(c) = sym_map
+                    .and_then(|m| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid))
+                {
+                    let (cn, cl) = object_nonlocal_and_lens_info_inner(
                         doc,
                         c,
+                        sym_map,
                         visiting_objs,
                         visiting_syms,
                         depth + 1,
@@ -9431,36 +9509,58 @@ fn object_nonlocal_and_lens_info(
                 }
             }
         }
-        NodePayload::Clone { master_id, .. } => {
-            if visiting_objs.insert(*master_id) {
-                if let Some(m) = doc.object(*master_id) {
-                    let (mn, ml) = object_nonlocal_and_lens_info(
-                        doc,
-                        m,
-                        visiting_objs,
-                        visiting_syms,
-                        depth + 1,
-                    );
-                    nonlocal |= mn;
-                    has_lens |= ml;
-                }
-                visiting_objs.remove(master_id);
+        NodePayload::Clone { .. } => {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style_with_sym(obj, sym_map) {
+                let mut tmp = obj.clone();
+                tmp.payload = p;
+                tmp.fill = f;
+                tmp.outline = o;
+                let (mn, ml) = object_nonlocal_and_lens_info_inner(
+                    doc,
+                    &tmp,
+                    sym_map,
+                    visiting_objs,
+                    visiting_syms,
+                    depth + 1,
+                );
+                nonlocal |= mn;
+                has_lens |= ml;
             }
         }
         NodePayload::SymbolInstance(sym_id) if visiting_syms.insert(*sym_id) => {
             if let Some(sym) = doc.symbol(*sym_id) {
-                let saved_objs = std::mem::take(visiting_objs);
+                let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+                let mut referenced: HashSet<ObjectId> = HashSet::new();
                 for sub in &sym.objects {
-                    let inserted = sub.id.0 != 0 && visiting_objs.insert(sub.id);
-                    let (sn, sl) = object_nonlocal_and_lens_info(
+                    if sub.id.0 != 0 {
+                        child_map.insert(sub.id, sub);
+                    }
+                    match &sub.payload {
+                        NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+                        NodePayload::PowerClip { contents, .. } => {
+                            referenced.extend(contents.iter().copied());
+                        }
+                        _ => {}
+                    }
+                }
+                let mut sym_visiting = HashSet::new();
+                for sub in &sym.objects {
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    if sub.id.0 != 0 && !sym_visiting.insert(sub.id) {
+                        continue;
+                    }
+                    let (sn, sl) = object_nonlocal_and_lens_info_inner(
                         doc,
                         sub,
-                        visiting_objs,
+                        Some(&child_map),
+                        &mut sym_visiting,
                         visiting_syms,
                         depth + 1,
                     );
-                    if inserted {
-                        visiting_objs.remove(&sub.id);
+                    if sub.id.0 != 0 {
+                        sym_visiting.remove(&sub.id);
                     }
                     nonlocal |= sn;
                     has_lens |= sl;
@@ -9468,7 +9568,6 @@ fn object_nonlocal_and_lens_info(
                         break;
                     }
                 }
-                *visiting_objs = saved_objs;
             }
             visiting_syms.remove(sym_id);
         }
@@ -9652,7 +9751,7 @@ fn max_object_effect_padding_inner(
             visiting_syms.remove(sym_id);
         }
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style_with_sym(obj, sym_map) {
                 let mut tmp = obj.clone();
                 tmp.payload = p;
                 tmp.fill = f;
@@ -10103,6 +10202,196 @@ mod tests {
             lowered.len() >= 120,
             "Blend should honor >64 steps up to 999 (got {})",
             lowered.len()
+        );
+    }
+
+    #[test]
+    fn shadow_sym_render_page_and_isolated_preserve_clones_chained_override_and_text_on_path() {
+        let mut doc = Document::new("ShadowSym", 140.0, 60.0, ColorMode::Rgb, 72.0);
+        let sym_id = SymbolId::new();
+        let master_id = ObjectId(101);
+        let clone_id = ObjectId(102);
+        let clone2_id = ObjectId(103);
+        let unlinked_id = ObjectId(104);
+        let top_id = ObjectId(105);
+
+        let master = SceneObject::new(
+            master_id,
+            "SymMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                10.0, 15.0, 20.0, 20.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgba8(255, 0, 0, 255)))
+        .with_outline(OutlineStyle::none());
+
+        let mut clone1 = SceneObject::new(
+            clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(30.0, 0.0));
+        clone1.effects.push(Effect::InnerShadow {
+            dx_mm: 1.0,
+            dy_mm: 1.0,
+            blur_mm: 1.0,
+            opacity: 0.5,
+            color: Color::BLACK,
+            feather_direction: FeatherDirection::Middle,
+        });
+
+        let clone2 = SceneObject::new(
+            clone2_id,
+            "SymClone2",
+            NodePayload::Clone {
+                master_id: clone_id,
+                link_fill: false,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_fill(Fill::Solid(Color::rgba8(0, 0, 255, 255)))
+        .with_transform(Affine2D::translate(60.0, 0.0));
+
+        let unlinked = SceneObject::new(
+            unlinked_id,
+            "SymUnlinked",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: false,
+            },
+        )
+        .with_transform(Affine2D::translate(90.0, 0.0));
+
+        let top = SceneObject::new(
+            top_id,
+            "SymTop",
+            NodePayload::TextOnPath(coree_core::TextOnPath {
+                text: ArtisticText::from_plain(
+                    "HHHH",
+                    TextStyle {
+                        font_size_pt: 18.0,
+                        fill: Color::BLACK,
+                        ..TextStyle::default()
+                    },
+                ),
+                path_id: clone_id,
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+
+        doc.upsert_symbol(SymbolDef {
+            id: sym_id,
+            name: "ShadowSym".into(),
+            objects: vec![master, clone1, clone2, unlinked, top],
+        });
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "Inst", NodePayload::SymbolInstance(sym_id)),
+                None,
+            )
+            .unwrap();
+
+        let dpi = 72.0;
+        let px_per_mm = dpi / 25.4;
+        let rendered = crate::render_page_to_rgba(&doc, 0, dpi, ViewMode::Enhanced).unwrap();
+        let sample_page = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = (x_mm * px_per_mm).round() as u32;
+            let py = (y_mm * px_per_mm).round() as u32;
+            let idx = ((py * rendered.width + px) * 4) as usize;
+            [
+                rendered.rgba[idx],
+                rendered.rgba[idx + 1],
+                rendered.rgba[idx + 2],
+                rendered.rgba[idx + 3],
+            ]
+        };
+
+        let p_master = sample_page(20.0, 25.0);
+        let p_clone1 = sample_page(50.0, 25.0);
+        let p_clone2 = sample_page(80.0, 25.0);
+        let p_unlinked = sample_page(110.0, 25.0);
+        assert!(
+            p_master[0] > 180 && p_master[1] < 60 && p_master[2] < 60,
+            "master={p_master:?}"
+        );
+        assert!(
+            p_clone1[0] > 180 && p_clone1[1] < 60 && p_clone1[2] < 60,
+            "clone1={p_clone1:?}"
+        );
+        assert!(
+            p_clone2[2] > 180 && p_clone2[0] < 60 && p_clone2[1] < 60,
+            "clone2={p_clone2:?}"
+        );
+        assert_eq!(p_unlinked, [255, 255, 255, 255], "unlinked={p_unlinked:?}");
+
+        let top_dark_px = (0..20)
+            .flat_map(|dx| {
+                (0..12).map(move |dy| (40.5 + f64::from(dx) * 0.9, 9.5 + f64::from(dy) * 0.45))
+            })
+            .filter(|&(x, y)| {
+                let p = sample_page(x, y);
+                p[0] < 120 && p[1] < 120 && p[2] < 120
+            })
+            .count();
+        assert!(
+            top_dark_px > 5,
+            "TextOnPath targeting SymClone missing in direct render: {top_dark_px}"
+        );
+
+        let (iso_rect, iso_buf) = crate::render_isolated_object_to_rgba_with_options(
+            &doc,
+            0,
+            inst_id,
+            Affine2D::IDENTITY,
+            dpi,
+            true,
+        )
+        .unwrap()
+        .expect("isolated render");
+        assert!(
+            iso_rect.min_x <= 10.5 && iso_rect.max_x >= 89.5 && iso_rect.max_x < 105.0,
+            "iso_rect={iso_rect:?}"
+        );
+        let sample_iso = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = (((x_mm - iso_rect.min_x) / iso_rect.width()) * f64::from(iso_buf.width))
+                .floor()
+                .clamp(0.0, f64::from(iso_buf.width - 1)) as u32;
+            let py = (((y_mm - iso_rect.min_y) / iso_rect.height()) * f64::from(iso_buf.height))
+                .floor()
+                .clamp(0.0, f64::from(iso_buf.height - 1)) as u32;
+            let idx = ((py * iso_buf.width + px) * 4) as usize;
+            [
+                iso_buf.rgba[idx],
+                iso_buf.rgba[idx + 1],
+                iso_buf.rgba[idx + 2],
+                iso_buf.rgba[idx + 3],
+            ]
+        };
+        let i_master = sample_iso(20.0, 25.0);
+        let i_clone1 = sample_iso(50.0, 25.0);
+        let i_clone2 = sample_iso(80.0, 25.0);
+        assert!(
+            i_master[0] > 180 && i_master[1] < 60 && i_master[3] > 200,
+            "iso master={i_master:?}"
+        );
+        assert!(
+            i_clone1[0] > 180 && i_clone1[1] < 60 && i_clone1[3] > 200,
+            "iso clone1={i_clone1:?}"
+        );
+        assert!(
+            i_clone2[2] > 180 && i_clone2[0] < 60 && i_clone2[3] > 200,
+            "iso clone2={i_clone2:?}"
         );
     }
 }

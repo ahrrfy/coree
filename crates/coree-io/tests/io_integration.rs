@@ -509,6 +509,7 @@ fn svg_pdf_eps_dxf_plt_all_export_valid_industry_files_from_complex_document() {
             flatten_curves: true,
             flatten_tolerance_mm: 0.1,
             cut_layers_only: true,
+            ..DxfExportOptions::default()
         },
         &dxf_cut_path,
     )
@@ -1023,8 +1024,9 @@ fn regression_3_master_layer_z_order_rotated_text_eps_arabic_and_png_checked_ihd
     let pdf_bytes = export_pdf_to_bytes(&doc, &PdfExportOptions::default()).unwrap();
     let pdf_str = String::from_utf8_lossy(&pdf_bytes);
     assert!(
-        pdf_str.contains(" Tm (Spin) Tj"),
-        "PDF must emit Tm matrix for rotated text"
+        pdf_str.contains(" Tm (Spin) Tj")
+            || (pdf_str.contains(" Tm\n") && pdf_str.contains("/ToUnicode")),
+        "PDF must emit Tm matrix (and ToUnicode subset or WinAnsi text) for rotated text"
     );
     // Yellow master bg (0 0 1 0 k) must appear before Cyan page art (1 0 0 0 k) on Page 1
     assert!(

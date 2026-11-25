@@ -4886,6 +4886,29 @@ impl Document {
         &self,
         obj: &SceneObject,
     ) -> Option<(NodePayload, Fill, OutlineStyle)> {
+        self.resolve_clone_payload_and_style_with_sym(obj, None)
+    }
+
+    /// Resolves the effective `(payload, fill, outline)` for a `NodePayload::Clone` object,
+    /// checking `sym_map` first (for `SymbolDef`-local clones) before falling back to
+    /// `self.objects`, walking Clone-to-Clone chains safely with a cycle guard.
+    /// Returns `None` if `obj` is not a `Clone`, its `master_id` is missing/cyclic,
+    /// or any `link_shape == false` in the chain.
+    #[must_use]
+    pub fn resolve_clone_payload_and_style_with_sym(
+        &self,
+        obj: &SceneObject,
+        sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+    ) -> Option<(NodePayload, Fill, OutlineStyle)> {
+        self.resolve_clone_payload_and_style_with_sym_scope(obj, sym_map)
+            .map(|(p, f, o, _)| (p, f, o))
+    }
+
+    pub(crate) fn resolve_clone_payload_and_style_with_sym_scope(
+        &self,
+        obj: &SceneObject,
+        sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
+    ) -> Option<(NodePayload, Fill, OutlineStyle, bool)> {
         let NodePayload::Clone {
             master_id,
             link_fill,
@@ -4898,9 +4921,10 @@ impl Document {
         if !*link_shape {
             return None;
         }
-        let mut visited = HashSet::new();
+        let mut in_sym = sym_map.is_some();
+        let mut visited: HashSet<(bool, ObjectId)> = HashSet::new();
         if obj.id.0 != 0 {
-            visited.insert(obj.id);
+            visited.insert((in_sym, obj.id));
         }
         let mut cur_mid = *master_id;
         let mut use_fill = *link_fill;
@@ -4916,10 +4940,19 @@ impl Document {
             None
         };
         for _ in 0..=MAX_SCENE_DEPTH {
-            if !visited.insert(cur_mid) {
+            let master = if in_sym {
+                if let Some(m) = sym_map.and_then(|map| map.get(&cur_mid).copied()) {
+                    m
+                } else {
+                    in_sym = false;
+                    self.objects.get(&cur_mid)?
+                }
+            } else {
+                self.objects.get(&cur_mid)?
+            };
+            if !visited.insert((in_sym, cur_mid)) {
                 return None;
             }
-            let master = self.objects.get(&cur_mid)?;
             if override_fill.is_none() && !use_fill {
                 override_fill = Some(master.fill.clone());
             }
@@ -4949,7 +4982,7 @@ impl Document {
                 other => {
                     let eff_fill = override_fill.unwrap_or_else(|| master.fill.clone());
                     let eff_outline = override_outline.unwrap_or_else(|| master.outline.clone());
-                    return Some((other.clone(), eff_fill, eff_outline));
+                    return Some((other.clone(), eff_fill, eff_outline, in_sym));
                 }
             }
         }
@@ -6024,21 +6057,20 @@ impl Document {
                     .transformed(rel_xf)
                     .bounding_box()
             }
-            NodePayload::Clone { .. } => {
-                self.resolve_clone_payload_and_style(sub)
-                    .and_then(|(eff_p, _, _)| {
-                        self.payload_bounds_with_ctx(
-                            &eff_p,
-                            rel_xf,
-                            depth + 1,
-                            bounds_ctx,
-                            visiting_syms,
-                            Some(ctx),
-                            local_space,
-                        )
-                        .0
-                    })
-            }
+            NodePayload::Clone { .. } => self
+                .resolve_clone_payload_and_style_with_sym_scope(sub, Some(ctx.sym_map))
+                .and_then(|(eff_p, _, _, in_sym)| {
+                    self.payload_bounds_with_ctx(
+                        &eff_p,
+                        rel_xf,
+                        depth + 1,
+                        bounds_ctx,
+                        visiting_syms,
+                        if in_sym { Some(ctx) } else { None },
+                        local_space,
+                    )
+                    .0
+                }),
             NodePayload::ArtisticText(t) => rel_xf.try_transform_rect(t.estimated_bounds()),
             NodePayload::ParagraphText(t) => rel_xf.try_transform_rect(t.bounding_box()),
             NodePayload::PowerClip { container, .. } => {
@@ -7454,6 +7486,46 @@ impl Document {
             } => {
                 if !*link_shape {
                     None
+                } else if let Some(ctx) = sym_ctx {
+                    if let Some(&active_d) = ctx.visiting_sym_depth.get(master_id) {
+                        min_backedge = min_backedge.min(active_d);
+                        None
+                    } else if let Some(master) = ctx.sym_map.get(master_id).copied() {
+                        let md = ctx.visiting_sym_depth.len();
+                        ctx.visiting_sym_depth.insert(*master_id, md);
+                        let (bb, back) = self.payload_bounds_with_ctx(
+                            &master.payload,
+                            world_xf,
+                            depth + 1,
+                            bounds_ctx,
+                            visiting_syms,
+                            Some(ctx),
+                            pc_space,
+                        );
+                        ctx.visiting_sym_depth.remove(master_id);
+                        min_backedge = min_backedge.min(back);
+                        bb
+                    } else if let Some(&active_d) = bounds_ctx.visiting_depth.get(master_id) {
+                        min_backedge = min_backedge.min(active_d);
+                        None
+                    } else if let Some(master) = self.objects.get(master_id) {
+                        let md = bounds_ctx.visiting_depth.len();
+                        bounds_ctx.visiting_depth.insert(*master_id, md);
+                        let (bb, back) = self.payload_bounds_with_ctx(
+                            &master.payload,
+                            world_xf,
+                            depth + 1,
+                            bounds_ctx,
+                            visiting_syms,
+                            None,
+                            pc_space,
+                        );
+                        bounds_ctx.visiting_depth.remove(master_id);
+                        min_backedge = min_backedge.min(back);
+                        bb
+                    } else {
+                        None
+                    }
                 } else if let Some(&active_d) = bounds_ctx.visiting_depth.get(master_id) {
                     min_backedge = min_backedge.min(active_d);
                     None
@@ -7466,7 +7538,7 @@ impl Document {
                         depth + 1,
                         bounds_ctx,
                         visiting_syms,
-                        sym_ctx,
+                        None,
                         pc_space,
                     );
                     bounds_ctx.visiting_depth.remove(master_id);
@@ -7917,7 +7989,12 @@ impl Document {
                 out.push(ArtisticMedia::expand_stroke(spine, style).transformed(world_xf));
             }
             NodePayload::Clone { .. } => {
-                if let Some((eff_p, _, _)) = self.resolve_clone_payload_and_style(obj) {
+                if let Some((eff_p, _, _, in_sym)) = self
+                    .resolve_clone_payload_and_style_with_sym_scope(
+                        obj,
+                        sym_ctx.map(|(_, _, m, _)| m),
+                    )
+                {
                     let mut tmp = obj.clone();
                     tmp.payload = eff_p;
                     self.collect_obj_world_paths(
@@ -7926,8 +8003,8 @@ impl Document {
                         depth + 1,
                         visited_doc,
                         visiting_syms,
-                        sym_ctx,
-                        sym_visited,
+                        if in_sym { sym_ctx } else { None },
+                        if in_sym { sym_visited } else { None },
                         out,
                     );
                 }
@@ -9224,5 +9301,253 @@ mod tests {
         };
         let straight_wb = doc.visual_world_bounds(id).unwrap();
         assert!((straight_wb.min_y - min_cage_y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn symbol_def_clone_chains_bounds_hit_test_doc_fallback_and_cycles() {
+        let mut doc = Document::new("SymCloneCore", 200.0, 150.0, ColorMode::Rgb, 300.0);
+        let red = Color::rgba8(255, 0, 0, 255);
+        let green = Color::rgba8(0, 255, 0, 255);
+        let blue = Color::rgba8(0, 0, 255, 255);
+
+        // Doc-level master and colliding-ID test
+        let doc_master_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(500),
+                    "DocMaster",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 10.0, 10.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(green.clone())),
+                None,
+            )
+            .unwrap();
+        let doc_group_child = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "DocGrpChild",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 12.0, 12.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(green.clone()))
+                .with_transform(Affine2D::translate(5.0, 5.0)),
+                None,
+            )
+            .unwrap();
+        let doc_group_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "DocGrp",
+                    NodePayload::Group(vec![doc_group_child]),
+                ),
+                None,
+            )
+            .unwrap();
+
+        let sym_id = SymbolId::new();
+        let sym_master_id = ObjectId(101);
+        let sym_clone_id = ObjectId(102);
+        let sym_clone2_id = ObjectId(103);
+        let sym_unlinked_id = ObjectId(104);
+        let sym_top_id = ObjectId(105);
+        let sym_doc_fallback_id = ObjectId(106);
+        let sym_cyc_a_id = ObjectId(107);
+        let sym_cyc_b_id = ObjectId(108);
+
+        let sym_master = SceneObject::new(
+            sym_master_id,
+            "SymMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(red.clone()))
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.4));
+
+        let sym_clone = SceneObject::new(
+            sym_clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id: sym_master_id,
+                link_fill: true,
+                link_outline: false,
+                link_shape: true,
+            },
+        )
+        .with_outline(OutlineStyle::solid(green.clone(), 1.0))
+        .with_transform(Affine2D::translate(30.0, 0.0));
+
+        let sym_clone2 = SceneObject::new(
+            sym_clone2_id,
+            "SymClone2",
+            NodePayload::Clone {
+                master_id: sym_clone_id,
+                link_fill: false,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_fill(Fill::Solid(blue.clone()))
+        .with_transform(Affine2D::translate(60.0, 0.0));
+
+        let sym_unlinked = SceneObject::new(
+            sym_unlinked_id,
+            "SymUnlinked",
+            NodePayload::Clone {
+                master_id: sym_master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: false,
+            },
+        )
+        .with_transform(Affine2D::translate(120.0, 0.0));
+
+        let sym_top = SceneObject::new(
+            sym_top_id,
+            "SymTopOnClone",
+            NodePayload::TextOnPath(TextOnPath {
+                text: ArtisticText::from_plain("TOP", crate::TextStyle::default()),
+                path_id: sym_clone_id,
+                offset_mm: 0.0,
+                distance_mm: 0.0,
+                flip_vertical: false,
+                flip_horizontal: false,
+            }),
+        );
+
+        let sym_doc_fallback = SceneObject::new(
+            sym_doc_fallback_id,
+            "SymDocFallback",
+            NodePayload::Clone {
+                master_id: doc_group_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(0.0, 25.0));
+
+        let sym_cyc_a = SceneObject::new(
+            sym_cyc_a_id,
+            "SymCycA",
+            NodePayload::Clone {
+                master_id: sym_cyc_b_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        );
+        let sym_cyc_b = SceneObject::new(
+            sym_cyc_b_id,
+            "SymCycB",
+            NodePayload::Clone {
+                master_id: sym_cyc_a_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        );
+
+        let mut sym_map = HashMap::new();
+        sym_map.insert(sym_master_id, &sym_master);
+        sym_map.insert(sym_clone_id, &sym_clone);
+        sym_map.insert(sym_clone2_id, &sym_clone2);
+        sym_map.insert(sym_unlinked_id, &sym_unlinked);
+        sym_map.insert(sym_top_id, &sym_top);
+        sym_map.insert(sym_doc_fallback_id, &sym_doc_fallback);
+        sym_map.insert(sym_cyc_a_id, &sym_cyc_a);
+        sym_map.insert(sym_cyc_b_id, &sym_cyc_b);
+
+        let (_, f1, o1) = doc
+            .resolve_clone_payload_and_style_with_sym(&sym_clone, Some(&sym_map))
+            .expect("sym_clone resolves");
+        assert_eq!(f1, Fill::Solid(red));
+        assert_eq!(o1, OutlineStyle::solid(green.clone(), 1.0));
+
+        let (_, f2, o2) = doc
+            .resolve_clone_payload_and_style_with_sym(&sym_clone2, Some(&sym_map))
+            .expect("chained sym_clone2 resolves");
+        assert_eq!(f2, Fill::Solid(blue));
+        assert_eq!(o2, OutlineStyle::solid(green, 1.0));
+
+        assert!(doc
+            .resolve_clone_payload_and_style_with_sym(&sym_unlinked, Some(&sym_map))
+            .is_none());
+        assert!(doc
+            .resolve_clone_payload_and_style_with_sym(&sym_cyc_a, Some(&sym_map))
+            .is_none());
+        assert!(doc
+            .resolve_clone_payload_and_style_with_sym(&sym_doc_fallback, Some(&sym_map))
+            .is_some());
+
+        let _ = doc_master_id;
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "CloneChainSym".into(),
+            objects: vec![
+                sym_master,
+                sym_clone,
+                sym_clone2,
+                sym_unlinked,
+                sym_top,
+                sym_doc_fallback,
+                sym_cyc_a,
+                sym_cyc_b,
+            ],
+        });
+        let inst_id = doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                    .with_transform(Affine2D::translate(10.0, 20.0)),
+                None,
+            )
+            .unwrap();
+
+        let wb = doc.visual_world_bounds(inst_id).expect("inst world bounds");
+        // Master at x=10..20, Clone at x=40..50, Clone2 at x=70..80, Unlinked at 130..140 must be excluded
+        assert!(wb.min_x <= 10.5, "min_x={}", wb.min_x);
+        assert!(
+            wb.max_x >= 79.5,
+            "chained clone2 must extend bounds to >=80, got {}",
+            wb.max_x
+        );
+        assert!(
+            wb.max_x < 110.0,
+            "unlinked clone must be excluded, got {}",
+            wb.max_x
+        );
+        // Doc group fallback at y=20 + 25 + 5..17 => max_y >= 62
+        assert!(
+            wb.max_y >= 61.5,
+            "doc group fallback bounds missing: {:?}",
+            wb
+        );
+
+        // Hit-test must hit SymMaster (15, 25), SymClone (45, 25), SymClone2 (75, 25), DocGroup fallback (21, 56), and miss SymUnlinked (135, 25)
+        assert_eq!(
+            crate::hit_test_point(&doc, 0, Point2D::new(15.0, 25.0), 0.5),
+            Some(inst_id)
+        );
+        assert_eq!(
+            crate::hit_test_point(&doc, 0, Point2D::new(45.0, 25.0), 0.5),
+            Some(inst_id)
+        );
+        assert_eq!(
+            crate::hit_test_point(&doc, 0, Point2D::new(75.0, 25.0), 0.5),
+            Some(inst_id)
+        );
+        assert_eq!(
+            crate::hit_test_point(&doc, 0, Point2D::new(21.0, 56.0), 0.5),
+            Some(inst_id)
+        );
+        assert_eq!(
+            crate::hit_test_point(&doc, 0, Point2D::new(135.0, 25.0), 0.5),
+            None
+        );
     }
 }

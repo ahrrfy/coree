@@ -15,10 +15,11 @@ use coree_core::{
     ObjectId, ObjectStyleId, OutlineStyle, RasterLayerData, SceneObject, SymbolId, TextOnPath,
 };
 use coree_io::{
-    atomic_write_bytes, export_dxf_with_options, export_eps, export_pdf, export_plt_with_options,
-    export_raster, export_svg, import_dxf, import_eps, import_pdf, import_plt, import_psd,
-    import_raster, import_svg, load_coree, save_coree_with_preview, DxfExportOptions,
-    PdfColorSpace, PdfExportOptions, PltExportOptions, RasterExportOptions, RasterFormat,
+    atomic_write_bytes, export_dwg, export_dxf_with_options, export_emf, export_eps, export_pdf,
+    export_plt_with_options, export_psd, export_raster, export_svg, export_wmf, import_dwg,
+    import_dxf, import_emf, import_eps, import_pdf, import_plt, import_psd, import_raster,
+    import_svg, import_wmf, load_coree, save_coree_with_preview, DxfExportOptions, PdfColorSpace,
+    PdfExportOptions, PltExportOptions, RasterExportOptions, RasterFormat,
 };
 use coree_prod::{export_laser_gcode, plan_laser_toolpath, GcodeDialect, LaserJobConfig};
 use coree_render::{render_page_to_rgba, ViewMode};
@@ -169,8 +170,23 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
         MagicKind::Dxf => {
             return open_dxf_doc(path);
         }
+        MagicKind::Dwg => {
+            return open_dwg_doc(path);
+        }
+        MagicKind::Wmf => {
+            return open_wmf_doc(path);
+        }
+        MagicKind::Emf => {
+            return open_emf_doc(path);
+        }
         MagicKind::Plt => {
             return open_plt_doc(path);
+        }
+        MagicKind::Acb => {
+            return Err(
+                "Adobe Color Book (.acb) is a swatch palette; use inspect or Palette Import"
+                    .to_owned(),
+            );
         }
         MagicKind::Unknown => {}
     }
@@ -182,6 +198,9 @@ pub fn open_any_document(path: &Path) -> Result<OpenedDocument, String> {
         "pdf" | "ai" => open_pdf_doc(path),
         "eps" | "ps" => open_eps_doc(path),
         "dxf" => open_dxf_doc(path),
+        "dwg" => open_dwg_doc(path),
+        "wmf" => open_wmf_doc(path),
+        "emf" => open_emf_doc(path),
         "plt" | "hpgl" => open_plt_doc(path),
         "psd" | "psb" => open_psd_doc(path),
         "svg" | "svgz" => open_svg_doc(path),
@@ -295,6 +314,39 @@ fn open_psd_doc(path: &Path) -> Result<OpenedDocument, String> {
     Ok(OpenedDocument {
         document: doc,
         format_tag: "psd".to_owned(),
+        cdr_version: None,
+        warnings: Vec::new(),
+        inspection: None,
+    })
+}
+
+fn open_dwg_doc(path: &Path) -> Result<OpenedDocument, String> {
+    let doc = import_dwg(path).map_err(|e| format!("failed to import DWG: {e}"))?;
+    Ok(OpenedDocument {
+        document: doc,
+        format_tag: "dwg".to_owned(),
+        cdr_version: None,
+        warnings: Vec::new(),
+        inspection: None,
+    })
+}
+
+fn open_wmf_doc(path: &Path) -> Result<OpenedDocument, String> {
+    let doc = import_wmf(path).map_err(|e| format!("failed to import WMF: {e}"))?;
+    Ok(OpenedDocument {
+        document: doc,
+        format_tag: "wmf".to_owned(),
+        cdr_version: None,
+        warnings: Vec::new(),
+        inspection: None,
+    })
+}
+
+fn open_emf_doc(path: &Path) -> Result<OpenedDocument, String> {
+    let doc = import_emf(path).map_err(|e| format!("failed to import EMF: {e}"))?;
+    Ok(OpenedDocument {
+        document: doc,
+        format_tag: "emf".to_owned(),
         cdr_version: None,
         warnings: Vec::new(),
         inspection: None,
@@ -983,6 +1035,7 @@ pub fn export_any_document(
                 page_info_slug: opts.page_info_slug,
                 compress_streams: true,
                 pages: None,
+                ..Default::default()
             };
             export_pdf(doc, &pdf_opts, output_path)
                 .map_err(|e| format!("failed to export .pdf: {e}"))?;
@@ -1001,6 +1054,26 @@ pub fn export_any_document(
             export_dxf_with_options(doc, page_idx, &dxf_opts, output_path)
                 .map_err(|e| format!("failed to export .dxf: {e}"))?;
             Ok(format!("Exported .dxf to {}", output_path.display()))
+        }
+        "dwg" => {
+            export_dwg(doc, page_idx, output_path)
+                .map_err(|e| format!("failed to export .dwg: {e}"))?;
+            Ok(format!("Exported .dwg to {}", output_path.display()))
+        }
+        "wmf" => {
+            export_wmf(doc, page_idx, output_path)
+                .map_err(|e| format!("failed to export .wmf: {e}"))?;
+            Ok(format!("Exported .wmf to {}", output_path.display()))
+        }
+        "emf" => {
+            export_emf(doc, page_idx, output_path)
+                .map_err(|e| format!("failed to export .emf: {e}"))?;
+            Ok(format!("Exported .emf to {}", output_path.display()))
+        }
+        "psd" | "psb" => {
+            export_psd(doc, page_idx, output_path)
+                .map_err(|e| format!("failed to export .{ext}: {e}"))?;
+            Ok(format!("Exported .{ext} to {}", output_path.display()))
         }
         "plt" | "hpgl" => {
             let plt_opts = PltExportOptions {
@@ -1071,7 +1144,7 @@ pub fn export_any_document(
             ))
         }
         other => Err(format!(
-            "unsupported export format '.{other}' (supported: .coree, .cdr, .cdt, .cmx, .svg, .pdf, .eps, .dxf, .plt, .gcode, .nc, .png, .jpg, .webp, .tiff, .bmp)"
+            "unsupported export format '.{other}' (supported: .coree, .cdr, .cdt, .cmx, .svg, .pdf, .eps, .dxf, .dwg, .wmf, .emf, .plt, .psd, .gcode, .nc, .png, .jpg, .webp, .tiff, .bmp)"
         )),
     }
 }
@@ -1363,5 +1436,30 @@ mod tests {
         assert!(std::fs::read_to_string(&plugin_svg)
             .unwrap()
             .contains("<svg"));
+    }
+
+    #[test]
+    fn io_bridge_roundtrips_add06_dwg_wmf_emf_and_psd() {
+        let tmp = ScopedTempDir::new("add06_roundtrip");
+        let doc = generate_sample_document();
+        let opts = UniversalExportOptions::default();
+
+        for (ext, expected_fmt) in [
+            ("dwg", ContainerFormat::Dwg),
+            ("wmf", ContainerFormat::Wmf),
+            ("emf", ContainerFormat::Emf),
+            ("psd", ContainerFormat::Psd),
+        ] {
+            let out_path = tmp.path().join(format!("sample.{ext}"));
+            let msg = export_any_document(&doc, &out_path, &opts)
+                .unwrap_or_else(|e| panic!("export .{ext} failed: {e}"));
+            assert!(msg.contains(ext));
+            let rep = inspect_any_file(&out_path).unwrap();
+            assert_eq!(rep.detected_format, expected_fmt);
+            let opened = open_any_document(&out_path).unwrap();
+            assert_eq!(opened.format_tag, ext);
+            assert!(opened.document.object_count() > 0);
+        }
+        assert_eq!(crate::ui::dialogs::EXPORT_FMT_GCODE, 11);
     }
 }

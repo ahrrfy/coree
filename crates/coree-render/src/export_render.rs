@@ -459,7 +459,7 @@ pub(crate) fn object_or_subtree_has_lens_with_sym(
             hit
         }
         coree_core::NodePayload::Clone { .. } => doc
-            .resolve_clone_payload_and_style(obj)
+            .resolve_clone_payload_and_style_with_sym(obj, sym_map)
             .is_some_and(|(p, f, o)| {
                 let mut tmp = obj.clone();
                 tmp.payload = p;
@@ -488,6 +488,20 @@ pub fn render_isolated_object_to_rgba(
     obj_id: coree_core::ObjectId,
     parent_xf: coree_core::Affine2D,
     dpi: f64,
+) -> RenderResult<Option<(coree_core::Rect2D, RgbaBuffer)>> {
+    render_isolated_object_to_rgba_with_options(doc, page_idx, obj_id, parent_xf, dpi, false)
+}
+
+/// Variant of [`render_isolated_object_to_rgba`] allowing export pipelines to suppress Spot
+/// `CutContour` strokes inside the rasterized composite so vector `/CutContour` overlays can be
+/// emitted crisply on top without Magenta fallback bleed.
+pub fn render_isolated_object_to_rgba_with_options(
+    doc: &Document,
+    page_idx: usize,
+    obj_id: coree_core::ObjectId,
+    parent_xf: coree_core::Affine2D,
+    dpi: f64,
+    suppress_spot_cutcontour: bool,
 ) -> RenderResult<Option<(coree_core::Rect2D, RgbaBuffer)>> {
     use crate::effects_render::{
         apply_geometry_effects, extract_local_geometry_path, symmetry_effect_transforms,
@@ -739,6 +753,10 @@ pub fn render_isolated_object_to_rgba(
         .compose(&Affine2D::translate(-rect_mm.min_x, -rect_mm.min_y));
     let parent_to_surface = page_to_surface.compose(&effective_parent_xf);
 
+    let render_opts = RenderOptions {
+        suppress_spot_cutcontour,
+        ..RenderOptions::export()
+    };
     renderer.render_scene_object_with_backdrop(
         doc,
         Some(page),
@@ -746,7 +764,7 @@ pub fn render_isolated_object_to_rgba(
         page_to_surface,
         parent_to_surface,
         ViewMode::Enhanced,
-        &RenderOptions::export(),
+        &render_opts,
         &mut backend,
         &underlying_ids,
         0,

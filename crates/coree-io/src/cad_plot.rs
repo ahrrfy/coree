@@ -9,10 +9,11 @@
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
+use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
-    Affine2D, ArtisticText, BezierPath, Color, ColorMode, Document, EllipseMode, Fill, Layer,
-    LayerId, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page, ParametricShape, Point2D,
-    Rect2D, SceneObject, TextDirection, TextStyle, Vec2D,
+    Affine2D, ArtisticText, BezierPath, Color, ColorMode, DimensionKind, DimensionObject, Document,
+    EllipseMode, Fill, Layer, LayerId, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page,
+    ParametricShape, Point2D, Rect2D, SceneObject, SymbolDef, TextDirection, TextStyle, Vec2D,
 };
 use kurbo::{BezPath, PathSeg};
 use std::collections::{HashMap, HashSet};
@@ -31,12 +32,14 @@ const MAX_CAD_INPUT_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
 /// Options controlling AutoCAD ASCII DXF export.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DxfExportOptions {
-    /// When `true`, flattens cubic Bézier curves into `LWPOLYLINE` chords instead of `SPLINE`.
+    /// When `true`, flattens cubic Bézier curves into polyline chords instead of `SPLINE`.
     pub flatten_curves: bool,
     /// Chord tolerance in millimeters when flattening curves.
     pub flatten_tolerance_mm: f64,
     /// When `true`, exports only layers marked `is_cut_layer = true` (e.g. `CutContour`).
     pub cut_layers_only: bool,
+    /// When `true`, writes AutoCAD R12 (`AC1009`) compatible entities (`POLYLINE`/`VERTEX`/`SEQEND`).
+    pub r12_compat: bool,
 }
 
 impl Default for DxfExportOptions {
@@ -45,6 +48,7 @@ impl Default for DxfExportOptions {
             flatten_curves: false,
             flatten_tolerance_mm: 0.05,
             cut_layers_only: false,
+            r12_compat: false,
         }
     }
 }
@@ -87,9 +91,10 @@ pub fn export_dxf_to_string_with_options(
 
     let mut out = String::with_capacity(4096);
 
-    // 1. HEADER section (AC1015 / R2000, millimeter units $INSUNITS = 4)
+    // 1. HEADER section (AC1015 / R2000 or AC1009 / R12, millimeter units $INSUNITS = 4)
     out.push_str("0\nSECTION\n2\nHEADER\n");
-    out.push_str("9\n$ACADVER\n1\nAC1015\n");
+    let acadver = if opts.r12_compat { "AC1009" } else { "AC1015" };
+    let _ = writeln!(out, "9\n$ACADVER\n1\n{acadver}");
     out.push_str("9\n$INSUNITS\n70\n4\n"); // 4 = Millimeters
     out.push_str("9\n$MEASUREMENT\n70\n1\n"); // 1 = Metric
     let page_w = if page.width_mm.is_finite() && page.width_mm > 0.0 {
@@ -152,6 +157,7 @@ pub fn export_dxf_to_string_with_options(
                     page,
                     obj,
                     Affine2D::IDENTITY,
+                    None,
                     &layer_name,
                     opts,
                     &mut out,
@@ -182,24 +188,82 @@ pub fn export_dxf_with_options(
     atomic_write_bytes(path, dxf.as_bytes())
 }
 
+fn build_cad_symbol_maps(sym: &SymbolDef) -> (HashMap<ObjectId, &SceneObject>, HashSet<ObjectId>) {
+    let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
+    let mut referenced: HashSet<ObjectId> = HashSet::new();
+    for sub in &sym.objects {
+        if sub.id.0 != 0 {
+            child_map.insert(sub.id, sub);
+        }
+        match &sub.payload {
+            NodePayload::Group(c) => referenced.extend(c.iter().copied()),
+            NodePayload::PowerClip { contents, .. } => referenced.extend(contents.iter().copied()),
+            _ => {}
+        }
+    }
+    (child_map, referenced)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dxf_text_entity(
+    page: &Page,
+    pos_world: Point2D,
+    text: &str,
+    height_mm: f64,
+    rotation_deg: f64,
+    is_mtext: bool,
+    layer_name: &str,
+    out: &mut String,
+) {
+    let clean: String = text
+        .chars()
+        .filter(|&c| c != '\r' && !c.is_control() || c == '\n')
+        .collect();
+    if clean.trim().is_empty() {
+        return;
+    }
+    let (x, y) = to_cad_mm(page, pos_world);
+    let h = height_mm.max(0.5);
+    let rot = if rotation_deg.is_finite() {
+        rotation_deg
+    } else {
+        0.0
+    };
+    if is_mtext || clean.contains('\n') {
+        let mtext_body = clean.replace('\n', "\\P");
+        let _ = writeln!(
+            out,
+            "0\nMTEXT\n8\n{layer_name}\n10\n{x:.4}\n20\n{y:.4}\n30\n0.0\n40\n{h:.4}\n50\n{rot:.4}\n1\n{mtext_body}"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "0\nTEXT\n8\n{layer_name}\n10\n{x:.4}\n20\n{y:.4}\n30\n0.0\n40\n{h:.4}\n50\n{rot:.4}\n1\n{clean}"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_dxf_object_entities(
     doc: &Document,
     page: &Page,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    sym_ctx: Option<ExportSymCtx<'_>>,
     layer_name: &str,
     opts: &DxfExportOptions,
     out: &mut String,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
 ) {
-    if depth > MAX_CAD_DEPTH || !obj.visible || !visited.insert(obj.id) {
+    if depth > MAX_CAD_DEPTH || !obj.visible || (obj.id.0 != 0 && !visited.insert(obj.id)) {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
     if !world_xf.is_finite() {
-        visited.remove(&obj.id);
+        if obj.id.0 != 0 {
+            visited.remove(&obj.id);
+        }
         return;
     }
 
@@ -217,7 +281,9 @@ fn emit_dxf_object_entities(
             if try_emit_exact_dxf_circle_or_arc(
                 page, world_xf, *rx, *ry, *mode, *start_deg, *end_deg, layer_name, out,
             ) {
-                visited.remove(&obj.id);
+                if obj.id.0 != 0 {
+                    visited.remove(&obj.id);
+                }
                 return;
             }
         }
@@ -255,8 +321,13 @@ fn emit_dxf_object_entities(
             );
         }
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o)) = crate::display_list::resolve_display_list_clone(
+                doc,
+                obj,
+                sym_ctx.map(|(m, _, _)| m),
+            ) {
                 let mut resolved = obj.clone();
+                resolved.id = ObjectId(0);
                 resolved.payload = p;
                 resolved.fill = f;
                 resolved.outline = o;
@@ -265,6 +336,7 @@ fn emit_dxf_object_entities(
                     page,
                     &resolved,
                     parent_xf,
+                    sym_ctx,
                     layer_name,
                     opts,
                     out,
@@ -283,7 +355,7 @@ fn emit_dxf_object_entities(
             );
         }
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints_with_transform(c, &world_xf);
+            let (a, b) = resolve_export_connector_endpoints(doc, c, &world_xf, sym_ctx);
             emit_dxf_path(page, &c.route_path(a, b), layer_name, opts, out);
         }
         NodePayload::PowerClip { container, .. } => {
@@ -297,12 +369,16 @@ fn emit_dxf_object_entities(
         }
         NodePayload::Group(children) => {
             for &cid in children {
-                if let Some(child) = doc.object(cid) {
+                let child_opt = sym_ctx
+                    .and_then(|(m, _, _)| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child) = child_opt {
                     emit_dxf_object_entities(
                         doc,
                         page,
                         child,
                         world_xf,
+                        sym_ctx,
                         layer_name,
                         opts,
                         out,
@@ -314,13 +390,18 @@ fn emit_dxf_object_entities(
         }
         NodePayload::SymbolInstance(sym_id) => {
             if let Some(sym) = doc.symbol(*sym_id) {
+                let (child_map, referenced) = build_cad_symbol_maps(sym);
+                let mut sym_visited = HashSet::new();
                 for sub in &sym.objects {
-                    let mut sym_visited = HashSet::new();
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
                     emit_dxf_object_entities(
                         doc,
                         page,
                         sub,
                         world_xf,
+                        Some((&child_map, &sym.objects, world_xf)),
                         layer_name,
                         opts,
                         out,
@@ -330,14 +411,70 @@ fn emit_dxf_object_entities(
                 }
             }
         }
-        NodePayload::ArtisticText(_)
-        | NodePayload::ParagraphText(_)
-        | NodePayload::TextOnPath(_)
-        | NodePayload::Raster(_)
-        | NodePayload::Dimension(_) => {}
+        NodePayload::ArtisticText(at) => {
+            let text = at.plain_text();
+            let first = at.runs.first().map(|r| &r.style);
+            let h_mm = first.map_or(4.0, TextStyle::font_size_mm);
+            let sy = world_xf.m[2].hypot(world_xf.m[3]).max(1e-4);
+            let rot_deg = -world_xf.m[1].atan2(world_xf.m[0]).to_degrees();
+            let base = world_xf.transform_point(Point2D::new(0.0, h_mm));
+            emit_dxf_text_entity(
+                page,
+                base,
+                &text,
+                h_mm * sy,
+                rot_deg,
+                text.contains('\n'),
+                layer_name,
+                out,
+            );
+        }
+        NodePayload::ParagraphText(para) => {
+            let text = para
+                .runs
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<String>();
+            let first = para.runs.first().map(|r| &r.style);
+            let h_mm = first.map_or(4.0, TextStyle::font_size_mm);
+            let sy = world_xf.m[2].hypot(world_xf.m[3]).max(1e-4);
+            let rot_deg = -world_xf.m[1].atan2(world_xf.m[0]).to_degrees();
+            let base = world_xf.transform_point(Point2D::new(0.0, h_mm));
+            emit_dxf_text_entity(page, base, &text, h_mm * sy, rot_deg, true, layer_name, out);
+        }
+        NodePayload::TextOnPath(top) => {
+            let text = top.text.plain_text();
+            let first = top.text.runs.first().map(|r| &r.style);
+            let h_mm = first.map_or(4.0, TextStyle::font_size_mm);
+            let base = resolve_export_world_path(doc, top.path_id, sym_ctx)
+                .and_then(|hp| hp.bounding_box())
+                .map(|bb| Point2D::new(bb.min_x, bb.min_y))
+                .unwrap_or_else(|| world_xf.transform_point(Point2D::ZERO));
+            emit_dxf_text_entity(page, base, &text, h_mm, 0.0, false, layer_name, out);
+        }
+        NodePayload::Dimension(dim) => {
+            let p1 = world_xf.transform_point(dim.p1);
+            let p2 = world_xf.transform_point(dim.p2);
+            let (p1x, p1y) = to_cad_mm(page, p1);
+            let (p2x, p2y) = to_cad_mm(page, p2);
+            let mid = Point2D::new(0.5 * (p1.x + p2.x), 0.5 * (p1.y + p2.y) - dim.offset_mm);
+            let (tx, ty) = to_cad_mm(page, mid);
+            let meas_val = dim.compute_value(coree_core::Unit::Millimeter, f64::from(doc.dpi()));
+            let label = dim
+                .label_override
+                .clone()
+                .unwrap_or_else(|| dim.compute_measurement(coree_core::Unit::Millimeter));
+            let _ = writeln!(
+                out,
+                "0\nDIMENSION\n8\n{layer_name}\n10\n{p2x:.4}\n20\n{p2y:.4}\n30\n0.0\n11\n{tx:.4}\n21\n{ty:.4}\n31\n0.0\n70\n1\n1\n{label}\n13\n{p1x:.4}\n23\n{p1y:.4}\n33\n0.0\n14\n{p2x:.4}\n24\n{p2y:.4}\n34\n0.0\n42\n{meas_val:.4}"
+            );
+        }
+        NodePayload::Raster(_) => {}
     }
 
-    visited.remove(&obj.id);
+    if obj.id.0 != 0 {
+        visited.remove(&obj.id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,7 +589,7 @@ fn emit_dxf_path(
     } else {
         0.05
     };
-    if opts.flatten_curves {
+    if opts.flatten_curves || opts.r12_compat {
         for poly in path.flatten(safe_tol) {
             let poly: Vec<Point2D> = poly
                 .into_iter()
@@ -471,7 +608,7 @@ fn emit_dxf_path(
             } else {
                 poly.as_slice()
             };
-            emit_dxf_lwpolyline(page, pts, closed, layer_name, out);
+            emit_dxf_lwpolyline(page, pts, closed, layer_name, opts.r12_compat, out);
         }
         return;
     }
@@ -490,7 +627,7 @@ fn emit_dxf_path(
                 emit_dxf_line(page, sp.nodes[0].pos, sp.nodes[1].pos, layer_name, out);
             } else {
                 let pts: Vec<Point2D> = sp.nodes.iter().map(|n| n.pos).collect();
-                emit_dxf_lwpolyline(page, &pts, sp.closed, layer_name, out);
+                emit_dxf_lwpolyline(page, &pts, sp.closed, layer_name, opts.r12_compat, out);
             }
         } else {
             // Emit exact segments: LINE for straight segments, degree-3 SPLINE for cubic Béziers
@@ -558,6 +695,7 @@ fn emit_dxf_lwpolyline(
     pts: &[Point2D],
     closed: bool,
     layer_name: &str,
+    r12_compat: bool,
     out: &mut String,
 ) {
     let finite_pts: Vec<Point2D> = pts
@@ -569,14 +707,29 @@ fn emit_dxf_lwpolyline(
         return;
     }
     let flags = if closed { 1 } else { 0 };
-    let _ = writeln!(
-        out,
-        "0\nLWPOLYLINE\n8\n{layer_name}\n90\n{}\n70\n{flags}",
-        finite_pts.len()
-    );
-    for &p in &finite_pts {
-        let (x, y) = to_cad_mm(page, p);
-        let _ = writeln!(out, "10\n{x:.4}\n20\n{y:.4}");
+    if r12_compat {
+        let _ = writeln!(
+            out,
+            "0\nPOLYLINE\n8\n{layer_name}\n66\n1\n70\n{flags}\n10\n0.0\n20\n0.0\n30\n0.0"
+        );
+        for &p in &finite_pts {
+            let (x, y) = to_cad_mm(page, p);
+            let _ = writeln!(
+                out,
+                "0\nVERTEX\n8\n{layer_name}\n10\n{x:.4}\n20\n{y:.4}\n30\n0.0"
+            );
+        }
+        let _ = writeln!(out, "0\nSEQEND\n8\n{layer_name}");
+    } else {
+        let _ = writeln!(
+            out,
+            "0\nLWPOLYLINE\n8\n{layer_name}\n90\n{}\n70\n{flags}",
+            finite_pts.len()
+        );
+        for &p in &finite_pts {
+            let (x, y) = to_cad_mm(page, p);
+            let _ = writeln!(out, "10\n{x:.4}\n20\n{y:.4}");
+        }
     }
 }
 
@@ -625,14 +778,22 @@ pub fn export_plt_to_string_with_options(
 
     let mut pen_idx = 0usize;
     for layer in &layers {
-        let mut paths = Vec::new();
+        let mut ops = Vec::new();
         let mut visited = HashSet::new();
         for &oid in &layer.objects {
             if let Some(obj) = doc.object(oid) {
-                collect_vector_paths(doc, obj, Affine2D::IDENTITY, &mut paths, 0, &mut visited);
+                collect_plt_ops(
+                    doc,
+                    obj,
+                    Affine2D::IDENTITY,
+                    None,
+                    &mut ops,
+                    0,
+                    &mut visited,
+                );
             }
         }
-        if paths.is_empty() {
+        if ops.is_empty() {
             continue;
         }
         let pen = (pen_idx % 8) + 1; // HPGL standard pen slots SP1..SP8 (SP1 = primary blade)
@@ -643,25 +804,42 @@ pub fn export_plt_to_string_with_options(
         } else {
             0.05
         };
-        for path in &paths {
-            for poly in path.flatten(safe_tol) {
-                let poly: Vec<Point2D> = poly
-                    .into_iter()
-                    .filter(|p| p.x.is_finite() && p.y.is_finite())
-                    .collect();
-                if poly.len() < 2 {
-                    continue;
+        for op in &ops {
+            match op {
+                PltOp::Path(path) => {
+                    emit_plt_path_with_arcs(page, path, safe_tol, &mut out);
                 }
-                let (x0, y0) = to_hpgl_units(page, poly[0]);
-                let _ = write!(out, "PU{x0},{y0};PD");
-                for (i, &pt) in poly.iter().skip(1).enumerate() {
-                    let (x, y) = to_hpgl_units(page, pt);
-                    if i > 0 {
-                        out.push(',');
+                PltOp::Circle { center, radius_mm } => {
+                    let (cx, cy) = to_hpgl_units(page, *center);
+                    let r_units = (radius_mm * HPGL_UNITS_PER_MM).round().max(1.0) as i64;
+                    let _ = write!(out, "PU{cx},{cy};CI{r_units};PU;");
+                }
+                PltOp::Arc {
+                    start,
+                    center,
+                    sweep_deg,
+                } => {
+                    let (sx, sy) = to_hpgl_units(page, *start);
+                    let (cx, cy) = to_hpgl_units(page, *center);
+                    let _ = write!(out, "PU{sx},{sy};PD;AA{cx},{cy},{sweep_deg:.4};PU;");
+                }
+                PltOp::Label {
+                    pos,
+                    height_mm,
+                    text,
+                } => {
+                    let clean: String = text
+                        .chars()
+                        .filter(|&c| c != '\x03' && c != ';' && !c.is_control())
+                        .collect();
+                    if clean.trim().is_empty() {
+                        continue;
                     }
-                    let _ = write!(out, "{x},{y}");
+                    let (x, y) = to_hpgl_units(page, *pos);
+                    let h_cm = (height_mm / 10.0).clamp(0.05, 50.0);
+                    let w_cm = h_cm * 0.67;
+                    let _ = write!(out, "PU{x},{y};SI{w_cm:.4},{h_cm:.4};LB{clean}\x03;");
                 }
-                out.push_str(";PU;");
             }
         }
     }
@@ -718,66 +896,477 @@ fn collect_page_layers(doc: &Document, page_index: usize, cut_layers_only: bool)
     layers
 }
 
-fn collect_vector_paths(
+enum PltOp {
+    Path(BezierPath),
+    Circle {
+        center: Point2D,
+        radius_mm: f64,
+    },
+    Arc {
+        start: Point2D,
+        center: Point2D,
+        sweep_deg: f64,
+    },
+    Label {
+        pos: Point2D,
+        height_mm: f64,
+        text: String,
+    },
+}
+
+fn try_fit_cubic_circular_arc(
+    p0: Point2D,
+    c1: Point2D,
+    c2: Point2D,
+    p2: Point2D,
+) -> Option<(Point2D, f64)> {
+    if !p0.is_finite() || !c1.is_finite() || !c2.is_finite() || !p2.is_finite() {
+        return None;
+    }
+    if p0.distance_to(p2) <= 1e-4 {
+        return None;
+    }
+    let eval = |t: f64| -> Point2D {
+        let u = 1.0 - t;
+        let b0 = u * u * u;
+        let b1 = 3.0 * u * u * t;
+        let b2 = 3.0 * u * t * t;
+        let b3 = t * t * t;
+        Point2D::new(
+            b0 * p0.x + b1 * c1.x + b2 * c2.x + b3 * p2.x,
+            b0 * p0.y + b1 * c1.y + b2 * c2.y + b3 * p2.y,
+        )
+    };
+    let pm = eval(0.5);
+    let d = 2.0 * (p0.x * (pm.y - p2.y) + pm.x * (p2.y - p0.y) + p2.x * (p0.y - pm.y));
+    if !d.is_finite() || d.abs() < 1e-6 {
+        return None;
+    }
+    let a2 = p0.x * p0.x + p0.y * p0.y;
+    let b2 = pm.x * pm.x + pm.y * pm.y;
+    let c2v = p2.x * p2.x + p2.y * p2.y;
+    let cx = (a2 * (pm.y - p2.y) + b2 * (p2.y - p0.y) + c2v * (p0.y - pm.y)) / d;
+    let cy = (a2 * (p2.x - pm.x) + b2 * (p0.x - p2.x) + c2v * (pm.x - p0.x)) / d;
+    let center = Point2D::new(cx, cy);
+    if !center.is_finite() {
+        return None;
+    }
+    let r = p0.distance_to(center);
+    if !r.is_finite() || !(0.1..=100_000.0).contains(&r) {
+        return None;
+    }
+    let tol = 0.015_f64.max(r * 0.004);
+    for t in [0.15, 0.25, 0.35, 0.65, 0.75, 0.85] {
+        let pt = eval(t);
+        if (pt.distance_to(center) - r).abs() > tol {
+            return None;
+        }
+    }
+    let ang_s = (-(p0.y - center.y))
+        .atan2(p0.x - center.x)
+        .to_degrees()
+        .rem_euclid(360.0);
+    let ang_m = (-(pm.y - center.y))
+        .atan2(pm.x - center.x)
+        .to_degrees()
+        .rem_euclid(360.0);
+    let ang_e = (-(p2.y - center.y))
+        .atan2(p2.x - center.x)
+        .to_degrees()
+        .rem_euclid(360.0);
+    let ccw_tot = (ang_e - ang_s).rem_euclid(360.0);
+    let ccw_mid = (ang_m - ang_s).rem_euclid(360.0);
+    let sweep_deg = if ccw_mid <= ccw_tot {
+        ccw_tot
+    } else {
+        -((ang_s - ang_e).rem_euclid(360.0))
+    };
+    if !sweep_deg.is_finite() || sweep_deg.abs() < 1.0 || sweep_deg.abs() > 180.5 {
+        return None;
+    }
+    Some((center, sweep_deg))
+}
+
+fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut String) {
+    use kurbo::{flatten, CubicBez, PathEl, QuadBez};
+
+    let flush_pd = |out: &mut String, pts: &mut Vec<Point2D>| {
+        if pts.is_empty() {
+            return;
+        }
+        out.push_str("PD");
+        for (i, pt) in pts.iter().enumerate() {
+            let (x, y) = to_hpgl_units(page, *pt);
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{x},{y}");
+        }
+        out.push(';');
+        pts.clear();
+    };
+
+    let mut pd_pts: Vec<Point2D> = Vec::new();
+    let mut cur_pt = Point2D::ZERO;
+    let mut sub_start = Point2D::ZERO;
+    let mut subpath_open = false;
+    let mut pen_down = false;
+
+    for el in path.to_kurbo().elements() {
+        match el {
+            PathEl::MoveTo(p) => {
+                flush_pd(out, &mut pd_pts);
+                if subpath_open {
+                    out.push_str("PU;");
+                }
+                let pt = Point2D::from_kurbo(*p);
+                if pt.is_finite() {
+                    let (x, y) = to_hpgl_units(page, pt);
+                    let _ = write!(out, "PU{x},{y};");
+                    cur_pt = pt;
+                    sub_start = pt;
+                    subpath_open = true;
+                    pen_down = false;
+                } else {
+                    subpath_open = false;
+                    pen_down = false;
+                }
+            }
+            PathEl::LineTo(p) => {
+                let pt = Point2D::from_kurbo(*p);
+                if subpath_open && pt.is_finite() {
+                    pd_pts.push(pt);
+                    cur_pt = pt;
+                    pen_down = true;
+                }
+            }
+            PathEl::QuadTo(c1, p2) => {
+                let cp1 = Point2D::from_kurbo(*c1);
+                let ep = Point2D::from_kurbo(*p2);
+                if subpath_open && cp1.is_finite() && ep.is_finite() {
+                    let qb = QuadBez::new(cur_pt.to_kurbo(), cp1.to_kurbo(), ep.to_kurbo());
+                    let cb = qb.raise();
+                    flatten(
+                        [
+                            PathEl::MoveTo(cur_pt.to_kurbo()),
+                            PathEl::CurveTo(cb.p1, cb.p2, cb.p3),
+                        ],
+                        tol,
+                        |seg| {
+                            if let PathEl::LineTo(lp) = seg {
+                                let pt = Point2D::from_kurbo(lp);
+                                if pt.is_finite() {
+                                    pd_pts.push(pt);
+                                }
+                            }
+                        },
+                    );
+                    cur_pt = ep;
+                    pen_down = true;
+                }
+            }
+            PathEl::CurveTo(c1, c2, p2) => {
+                let cp1 = Point2D::from_kurbo(*c1);
+                let cp2 = Point2D::from_kurbo(*c2);
+                let ep = Point2D::from_kurbo(*p2);
+                if !subpath_open || !cp1.is_finite() || !cp2.is_finite() || !ep.is_finite() {
+                    continue;
+                }
+                if let Some((center, sweep_deg)) = try_fit_cubic_circular_arc(cur_pt, cp1, cp2, ep)
+                {
+                    if !pd_pts.is_empty() {
+                        flush_pd(out, &mut pd_pts);
+                        pen_down = true;
+                    } else if !pen_down {
+                        out.push_str("PD;");
+                        pen_down = true;
+                    }
+                    let (cx, cy) = to_hpgl_units(page, center);
+                    let _ = write!(out, "AA{cx},{cy},{sweep_deg:.4};");
+                    cur_pt = ep;
+                } else {
+                    let cb = CubicBez::new(
+                        cur_pt.to_kurbo(),
+                        cp1.to_kurbo(),
+                        cp2.to_kurbo(),
+                        ep.to_kurbo(),
+                    );
+                    flatten(
+                        [
+                            PathEl::MoveTo(cur_pt.to_kurbo()),
+                            PathEl::CurveTo(cb.p1, cb.p2, cb.p3),
+                        ],
+                        tol,
+                        |seg| {
+                            if let PathEl::LineTo(lp) = seg {
+                                let pt = Point2D::from_kurbo(lp);
+                                if pt.is_finite() {
+                                    pd_pts.push(pt);
+                                }
+                            }
+                        },
+                    );
+                    cur_pt = ep;
+                    pen_down = true;
+                }
+            }
+            PathEl::ClosePath => {
+                if subpath_open {
+                    if cur_pt.distance_to(sub_start) > 1e-4 {
+                        pd_pts.push(sub_start);
+                    }
+                    flush_pd(out, &mut pd_pts);
+                    out.push_str("PU;");
+                    cur_pt = sub_start;
+                    subpath_open = false;
+                    pen_down = false;
+                }
+            }
+        }
+    }
+    flush_pd(out, &mut pd_pts);
+    if subpath_open {
+        out.push_str("PU;");
+    }
+}
+
+fn try_collect_plt_circle_or_arc(
+    world_xf: Affine2D,
+    rx: f64,
+    ry: f64,
+    mode: EllipseMode,
+    start_deg: f64,
+    end_deg: f64,
+    out: &mut Vec<PltOp>,
+) -> bool {
+    if !rx.is_finite() || !ry.is_finite() || rx <= 1e-4 || (rx - ry).abs() > 1e-3 * rx.max(1.0) {
+        return false;
+    }
+    let sx = world_xf.m[0].hypot(world_xf.m[1]);
+    let sy = world_xf.m[2].hypot(world_xf.m[3]);
+    let skew = (world_xf.m[0] * world_xf.m[2] + world_xf.m[1] * world_xf.m[3]).abs();
+    if !sx.is_finite()
+        || !sy.is_finite()
+        || sx <= 1e-6
+        || (sx - sy).abs() > 1e-3 * sx.max(1.0)
+        || skew > 1e-3 * sx * sy
+    {
+        return false;
+    }
+    let radius_mm = rx * 0.5 * (sx + sy);
+    let center = world_xf.transform_point(Point2D::ZERO);
+    if !center.is_finite() || !radius_mm.is_finite() || radius_mm <= 1e-4 {
+        return false;
+    }
+    if mode == EllipseMode::Full {
+        out.push(PltOp::Circle { center, radius_mm });
+        return true;
+    }
+    if mode == EllipseMode::Arc {
+        let mut sweep = end_deg - start_deg;
+        if !start_deg.is_finite() || !end_deg.is_finite() || sweep.abs() < 1e-3 {
+            return false;
+        }
+        sweep = sweep.clamp(-360.0, 360.0);
+        if sweep.abs() >= 359.99 {
+            out.push(PltOp::Circle { center, radius_mm });
+            return true;
+        }
+        let s_rad = start_deg.to_radians();
+        let m_rad = (start_deg + 0.5 * sweep).to_radians();
+        let e_rad = (start_deg + sweep).to_radians();
+        let p_s = world_xf.transform_point(Point2D::new(rx * s_rad.cos(), ry * s_rad.sin()));
+        let p_m = world_xf.transform_point(Point2D::new(rx * m_rad.cos(), ry * m_rad.sin()));
+        let p_e = world_xf.transform_point(Point2D::new(rx * e_rad.cos(), ry * e_rad.sin()));
+        // Compute signed sweep in HPGL Y-up space (`dy_cad = -(y - cy)`):
+        let ang_s = (-(p_s.y - center.y))
+            .atan2(p_s.x - center.x)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let ang_m = (-(p_m.y - center.y))
+            .atan2(p_m.x - center.x)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let ang_e = (-(p_e.y - center.y))
+            .atan2(p_e.x - center.x)
+            .to_degrees()
+            .rem_euclid(360.0);
+        let mid_on_ccw = (ang_m - ang_s).rem_euclid(360.0) <= (ang_e - ang_s).rem_euclid(360.0);
+        let sweep_deg = if mid_on_ccw {
+            (ang_e - ang_s).rem_euclid(360.0)
+        } else {
+            -((ang_s - ang_e).rem_euclid(360.0))
+        };
+        out.push(PltOp::Arc {
+            start: p_s,
+            center,
+            sweep_deg,
+        });
+        return true;
+    }
+    false
+}
+
+fn collect_plt_ops(
     doc: &Document,
     obj: &SceneObject,
     parent_xf: Affine2D,
-    out: &mut Vec<BezierPath>,
+    sym_ctx: Option<ExportSymCtx<'_>>,
+    out: &mut Vec<PltOp>,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
 ) {
-    if depth > MAX_CAD_DEPTH || !obj.visible || !visited.insert(obj.id) {
+    if depth > MAX_CAD_DEPTH || !obj.visible || (obj.id.0 != 0 && !visited.insert(obj.id)) {
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
     if !world_xf.is_finite() {
-        visited.remove(&obj.id);
+        if obj.id.0 != 0 {
+            visited.remove(&obj.id);
+        }
         return;
     }
-    match &obj.payload {
-        NodePayload::Path(p) => out.push(p.transformed(&world_xf)),
-        NodePayload::Shape(s) => out.push(s.to_bezier_path().transformed(&world_xf)),
-        NodePayload::BSpline(bs) => out.push(bs.to_bezier_path().transformed(&world_xf)),
-        NodePayload::ArtisticMedia { spine, style } => {
-            out.push(coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf))
+    if obj.effects.is_empty() {
+        if let NodePayload::Shape(ParametricShape::Ellipse {
+            rx,
+            ry,
+            mode,
+            start_deg,
+            end_deg,
+        }) = &obj.payload
+        {
+            if try_collect_plt_circle_or_arc(world_xf, *rx, *ry, *mode, *start_deg, *end_deg, out) {
+                if obj.id.0 != 0 {
+                    visited.remove(&obj.id);
+                }
+                return;
+            }
         }
+    }
+    match &obj.payload {
+        NodePayload::Path(p) => out.push(PltOp::Path(p.transformed(&world_xf))),
+        NodePayload::Shape(s) => out.push(PltOp::Path(s.to_bezier_path().transformed(&world_xf))),
+        NodePayload::BSpline(bs) => {
+            out.push(PltOp::Path(bs.to_bezier_path().transformed(&world_xf)))
+        }
+        NodePayload::ArtisticMedia { spine, style } => out.push(PltOp::Path(
+            coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf),
+        )),
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o)) = crate::display_list::resolve_display_list_clone(
+                doc,
+                obj,
+                sym_ctx.map(|(m, _, _)| m),
+            ) {
                 let mut resolved = obj.clone();
+                resolved.id = ObjectId(0);
                 resolved.payload = p;
                 resolved.fill = f;
                 resolved.outline = o;
-                collect_vector_paths(doc, &resolved, parent_xf, out, depth + 1, visited);
+                collect_plt_ops(doc, &resolved, parent_xf, sym_ctx, out, depth + 1, visited);
             }
         }
-        NodePayload::Table(t) => out.push(t.to_grid_paths().transformed(&world_xf)),
+        NodePayload::Table(t) => out.push(PltOp::Path(t.to_grid_paths().transformed(&world_xf))),
         NodePayload::Connector(c) => {
-            let (a, b) = doc.resolve_connector_endpoints(c);
-            out.push(c.route_path(a, b));
+            let (a, b) = resolve_export_connector_endpoints(doc, c, &world_xf, sym_ctx);
+            out.push(PltOp::Path(c.route_path(a, b)));
         }
-        NodePayload::PowerClip { container, .. } => out.push(container.transformed(&world_xf)),
+        NodePayload::PowerClip { container, .. } => {
+            out.push(PltOp::Path(container.transformed(&world_xf)))
+        }
         NodePayload::Group(children) => {
             for &cid in children {
-                if let Some(child) = doc.object(cid) {
-                    collect_vector_paths(doc, child, world_xf, out, depth + 1, visited);
+                let child_opt = sym_ctx
+                    .and_then(|(m, _, _)| m.get(&cid).copied())
+                    .or_else(|| doc.object(cid));
+                if let Some(child) = child_opt {
+                    collect_plt_ops(doc, child, world_xf, sym_ctx, out, depth + 1, visited);
                 }
             }
         }
         NodePayload::SymbolInstance(sym_id) => {
             if let Some(sym) = doc.symbol(*sym_id) {
+                let (child_map, referenced) = build_cad_symbol_maps(sym);
+                let mut sym_visited = HashSet::new();
                 for sub in &sym.objects {
-                    let mut sym_visited = HashSet::new();
-                    collect_vector_paths(doc, sub, world_xf, out, depth + 1, &mut sym_visited);
+                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
+                        continue;
+                    }
+                    collect_plt_ops(
+                        doc,
+                        sub,
+                        world_xf,
+                        Some((&child_map, &sym.objects, world_xf)),
+                        out,
+                        depth + 1,
+                        &mut sym_visited,
+                    );
                 }
             }
         }
-        NodePayload::ArtisticText(_)
-        | NodePayload::ParagraphText(_)
-        | NodePayload::TextOnPath(_)
-        | NodePayload::Raster(_)
-        | NodePayload::Dimension(_) => {}
+        NodePayload::ArtisticText(at) => {
+            let text = at.plain_text();
+            let h_mm = at.runs.first().map_or(4.0, |r| r.style.font_size_mm());
+            let sy = world_xf.m[2].hypot(world_xf.m[3]).max(1e-4);
+            let pos = world_xf.transform_point(Point2D::new(0.0, h_mm));
+            out.push(PltOp::Label {
+                pos,
+                height_mm: h_mm * sy,
+                text,
+            });
+        }
+        NodePayload::ParagraphText(para) => {
+            let text: String = para.runs.iter().map(|r| r.text.as_str()).collect();
+            let h_mm = para.runs.first().map_or(4.0, |r| r.style.font_size_mm());
+            let sy = world_xf.m[2].hypot(world_xf.m[3]).max(1e-4);
+            let pos = world_xf.transform_point(Point2D::new(0.0, h_mm));
+            out.push(PltOp::Label {
+                pos,
+                height_mm: h_mm * sy,
+                text,
+            });
+        }
+        NodePayload::TextOnPath(top) => {
+            let text = top.text.plain_text();
+            let h_mm = top
+                .text
+                .runs
+                .first()
+                .map_or(4.0, |r| r.style.font_size_mm());
+            let pos = resolve_export_world_path(doc, top.path_id, sym_ctx)
+                .and_then(|hp| hp.bounding_box())
+                .map(|bb| Point2D::new(bb.min_x, bb.min_y))
+                .unwrap_or_else(|| world_xf.transform_point(Point2D::ZERO));
+            out.push(PltOp::Label {
+                pos,
+                height_mm: h_mm,
+                text,
+            });
+        }
+        NodePayload::Dimension(dim) => {
+            let p1 = world_xf.transform_point(dim.p1);
+            let p2 = world_xf.transform_point(dim.p2);
+            let l1 = Point2D::new(p1.x, p1.y - dim.offset_mm);
+            let l2 = Point2D::new(p2.x, p2.y - dim.offset_mm);
+            out.push(PltOp::Path(BezierPath::from_line(l1, l2)));
+            out.push(PltOp::Path(BezierPath::from_line(p1, l1)));
+            out.push(PltOp::Path(BezierPath::from_line(p2, l2)));
+            let label = dim
+                .label_override
+                .clone()
+                .unwrap_or_else(|| dim.compute_measurement(coree_core::Unit::Millimeter));
+            let mid = Point2D::new(0.5 * (l1.x + l2.x), l1.y.min(l2.y) - 1.5);
+            out.push(PltOp::Label {
+                pos: mid,
+                height_mm: dim.text_style.font_size_mm(),
+                text: label,
+            });
+        }
+        NodePayload::Raster(_) => {}
     }
-    visited.remove(&obj.id);
+    if obj.id.0 != 0 {
+        visited.remove(&obj.id);
+    }
 }
 
 fn to_cad_mm(page: &Page, pt: Point2D) -> (f64, f64) {
@@ -1093,6 +1682,32 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 .with_transform(xf);
                 doc.add_object(obj, Some(lid))?;
             }
+            ResolvedCadItemKind::Dimension {
+                p1,
+                p2,
+                text_pos,
+                label,
+                color,
+            } => {
+                let page_p1 = cad_to_page.transform_point(p1);
+                let page_p2 = cad_to_page.transform_point(p2);
+                let page_txt = cad_to_page.transform_point(text_pos);
+                let mid_y = 0.5 * (page_p1.y + page_p2.y);
+                let offset_mm = mid_y - page_txt.y;
+                let mut dim =
+                    DimensionObject::linear(DimensionKind::Parallel, page_p1, page_p2, offset_mm);
+                if !label.trim().is_empty() {
+                    dim.label_override = Some(label);
+                }
+                let obj = SceneObject::new(
+                    ObjectId(0),
+                    format!("DXF Dimension {}", idx + 1),
+                    NodePayload::Dimension(dim),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::solid(color, 0.25));
+                doc.add_object(obj, Some(lid))?;
+            }
         }
     }
 
@@ -1377,6 +1992,12 @@ enum DxfEntityKind {
         height: f64,
         rotation_deg: f64,
     },
+    Dimension {
+        p1: Point2D,
+        p2: Point2D,
+        text_pos: Point2D,
+        label: String,
+    },
     Insert {
         block_name: String,
         pos: Point2D,
@@ -1440,6 +2061,7 @@ fn parse_dxf_entity_list(
             "SOLID" | "TRACE" => parse_dxf_solid(attrs),
             "TEXT" => parse_dxf_text(attrs, false),
             "MTEXT" => parse_dxf_text(attrs, true),
+            "DIMENSION" => parse_dxf_dimension(attrs),
             "INSERT" => parse_dxf_insert(attrs),
             _ => None,
         };
@@ -1767,6 +2389,53 @@ fn parse_dxf_text(attrs: &[(i32, String)], is_mtext: bool) -> Option<DxfEntityKi
     })
 }
 
+fn parse_dxf_dimension(attrs: &[(i32, String)]) -> Option<DxfEntityKind> {
+    let mut def = Point2D::ZERO;
+    let mut mid = Point2D::ZERO;
+    let mut p1 = None;
+    let mut p2 = None;
+    let mut p1x = None;
+    let mut p1y = None;
+    let mut p2x = None;
+    let mut p2y = None;
+    let mut label = String::new();
+    for (c, v) in attrs {
+        match *c {
+            10 => def.x = parse_finite_f64(v).unwrap_or(0.0),
+            20 => def.y = parse_finite_f64(v).unwrap_or(0.0),
+            11 => mid.x = parse_finite_f64(v).unwrap_or(0.0),
+            21 => mid.y = parse_finite_f64(v).unwrap_or(0.0),
+            13 => p1x = parse_finite_f64(v),
+            23 => p1y = parse_finite_f64(v),
+            14 => p2x = parse_finite_f64(v),
+            24 => p2y = parse_finite_f64(v),
+            1 => label = v.trim().to_owned(),
+            _ => {}
+        }
+    }
+    if let (Some(x), Some(y)) = (p1x, p1y) {
+        p1 = Some(Point2D::new(x, y));
+    }
+    if let (Some(x), Some(y)) = (p2x, p2y) {
+        p2 = Some(Point2D::new(x, y));
+    }
+    let ep1 = p1.unwrap_or(mid);
+    let ep2 = p2.unwrap_or(def);
+    if ep1.distance_to(ep2) <= 1e-6 && label.is_empty() {
+        return None;
+    }
+    Some(DxfEntityKind::Dimension {
+        p1: ep1,
+        p2: ep2,
+        text_pos: if mid == Point2D::ZERO {
+            ep1.midpoint(ep2)
+        } else {
+            mid
+        },
+        label,
+    })
+}
+
 fn clean_dxf_text(raw: &str, is_mtext: bool) -> String {
     let replaced = raw
         .replace("%%d", "°")
@@ -1869,6 +2538,13 @@ enum ResolvedCadItemKind {
         rotation_deg: f64,
         color: Color,
     },
+    Dimension {
+        p1: Point2D,
+        p2: Point2D,
+        text_pos: Point2D,
+        label: String,
+        color: Color,
+    },
 }
 
 impl ResolvedCadItem {
@@ -1883,6 +2559,11 @@ impl ResolvedCadItem {
             } => {
                 let w = (text.chars().count().max(1) as f64) * height_mm * 0.6;
                 Some(Rect2D::from_xywh(pos.x, pos.y, w, *height_mm))
+            }
+            ResolvedCadItemKind::Dimension {
+                p1, p2, text_pos, ..
+            } => {
+                Some(Rect2D::from_points(*p1, *p2).union(Rect2D::from_points(*text_pos, *text_pos)))
             }
         }
     }
@@ -2113,6 +2794,23 @@ fn expand_dxf_entity(
                     pos: world_pos,
                     height_mm: (*height * scale.max(1e-6)).max(0.5),
                     rotation_deg: *rotation_deg + xf_rot,
+                    color,
+                },
+            });
+        }
+        DxfEntityKind::Dimension {
+            p1,
+            p2,
+            text_pos,
+            label,
+        } => {
+            out.push(ResolvedCadItem {
+                layer: eff_layer,
+                kind: ResolvedCadItemKind::Dimension {
+                    p1: xf.transform_point(*p1),
+                    p2: xf.transform_point(*p2),
+                    text_pos: xf.transform_point(*text_pos),
+                    label: label.clone(),
                     color,
                 },
             });
@@ -3311,6 +4009,310 @@ mod tests {
         assert!(
             hole_bb.is_some(),
             "imported DXF circle must keep 30x30 mm diameter"
+        );
+    }
+
+    #[test]
+    fn dxf_r12_text_mtext_dimension_roundtrip_and_plt_ci_aa_si_lb_symbol_filter() {
+        let mut doc = Document::new("CAD REM08", 120.0, 100.0, ColorMode::Rgb, 300.0);
+        // Circle + Arc for PLT CI & AA
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Circle",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 10.0,
+                    ry: 10.0,
+                    mode: EllipseMode::Full,
+                    start_deg: 0.0,
+                    end_deg: 360.0,
+                }),
+            )
+            .with_transform(Affine2D::translate(30.0, 30.0)),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Arc",
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 12.0,
+                    ry: 12.0,
+                    mode: EllipseMode::Arc,
+                    start_deg: 0.0,
+                    end_deg: 90.0,
+                }),
+            )
+            .with_transform(Affine2D::translate(60.0, 40.0)),
+            None,
+        )
+        .unwrap();
+        // ArtisticText & Dimension
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Note",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "CUT HERE",
+                    TextStyle::default(),
+                )),
+            )
+            .with_transform(Affine2D::translate(15.0, 70.0)),
+            None,
+        )
+        .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Span",
+                NodePayload::Dimension(DimensionObject::linear(
+                    DimensionKind::Parallel,
+                    Point2D::new(10.0, 80.0),
+                    Point2D::new(50.0, 80.0),
+                    5.0,
+                )),
+            ),
+            None,
+        )
+        .unwrap();
+        // Symbol with PowerClip hiding its referenced child
+        let sym_id = coree_core::SymbolId::new();
+        let child_id = ObjectId(7001);
+        let pc_id = ObjectId(7002);
+        let sym_child = SceneObject::new(
+            child_id,
+            "SymChild",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 5.0, 5.0))),
+        );
+        let sym_pc = SceneObject::new(
+            pc_id,
+            "SymPC",
+            NodePayload::PowerClip {
+                container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 8.0, 8.0))),
+                container_parametric: None,
+                contents: vec![child_id],
+                lock_contents: true,
+            },
+        );
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "SymClip".into(),
+            objects: vec![sym_child, sym_pc],
+        });
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(80.0, 15.0)),
+            None,
+        )
+        .unwrap();
+
+        let dxf = export_dxf_to_string(&doc, 0).unwrap();
+        assert!(dxf.contains("0\nTEXT\n"));
+        assert!(dxf.contains("0\nDIMENSION\n"));
+        assert!(dxf.contains("CUT HERE"));
+        let imported = import_dxf_bytes(dxf.as_bytes(), "DXF REM08").unwrap();
+        assert!(imported
+            .objects()
+            .values()
+            .any(|o| matches!(o.payload, NodePayload::ArtisticText(_))));
+        assert!(imported
+            .objects()
+            .values()
+            .any(|o| matches!(o.payload, NodePayload::Dimension(_))));
+
+        let dxf_r12 = export_dxf_to_string_with_options(
+            &doc,
+            0,
+            &DxfExportOptions {
+                r12_compat: true,
+                ..DxfExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(dxf_r12.contains("AC1009"));
+        assert!(dxf_r12.contains("0\nPOLYLINE\n"));
+        assert!(!dxf_r12.contains("0\nLWPOLYLINE\n"));
+
+        let plt = export_plt_to_string(&doc, 0).unwrap();
+        assert!(plt.contains(";CI"), "PLT must emit native CI circles");
+        assert!(plt.contains(";AA"), "PLT must emit native AA arcs");
+        assert!(plt.contains(";SI"), "PLT must emit SI sizing");
+        assert!(plt.contains(";LBCUT HERE\x03"), "PLT must emit LB labels");
+        let plt_imported = import_plt_bytes(plt.as_bytes(), "PLT REM08").unwrap();
+        assert!(!plt_imported.objects().is_empty());
+    }
+
+    #[test]
+    fn plt_exports_aa_arcs_for_rounded_rect_corners_and_circular_curves() {
+        let mut doc = Document::new("Rounded PLT", 120.0, 90.0, ColorMode::Cmyk, 300.0);
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "Rounded Box",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 50.0,
+                    height: 30.0,
+                    corner_radii: [4.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_transform(Affine2D::translate(20.0, 15.0))
+            .with_outline(OutlineStyle::solid(Color::BLACK, 0.25)),
+            None,
+        )
+        .unwrap();
+
+        let plt = export_plt_to_string(&doc, 0).unwrap();
+        let aa_count = plt.matches(";AA").count();
+        assert_eq!(
+            aa_count, 4,
+            "expected 4 HPGL AA arc commands for 4 rounded corners, got: {plt}"
+        );
+
+        let reimported = import_plt_bytes(plt.as_bytes(), "Rounded PLT Reimport").unwrap();
+        let (&oid, _) = reimported.objects().iter().next().unwrap();
+        let bb = reimported.object_bounds(oid).unwrap();
+        assert!(
+            (bb.width() - 50.0).abs() < 0.2 && (bb.height() - 30.0).abs() < 0.2,
+            "rounded rect PLT AA round-trip dims mismatch: {bb:?}"
+        );
+    }
+
+    #[test]
+    fn dxf_symbol_exports_visible_clone_master_alongside_clone() {
+        let mut doc = Document::new("SymCloneDXF", 100.0, 100.0, ColorMode::Rgb, 300.0);
+        let sym_id = coree_core::SymbolId::new();
+        let master_id = ObjectId(7101);
+        let clone_id = ObjectId(7102);
+        let master = SceneObject::new(
+            master_id,
+            "SymMaster",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            ))),
+        )
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.25));
+        let clone = SceneObject::new(
+            clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(20.0, 0.0));
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "CloneSym".into(),
+            objects: vec![master, clone],
+        });
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(10.0, 10.0)),
+            None,
+        )
+        .unwrap();
+
+        let dxf = export_dxf_to_string(&doc, 0).unwrap();
+        let poly_count = dxf.matches("0\nLWPOLYLINE\n").count();
+        assert_eq!(
+            poly_count, 2,
+            "both visible master and clone in SymbolDef must export to DXF"
+        );
+    }
+
+    #[test]
+    fn dxf_and_plt_chained_symbol_clone_preserve_overrides_and_skip_link_shape_false() {
+        let mut doc = Document::new("CadChainedClone", 160.0, 120.0, ColorMode::Rgb, 300.0);
+        let sym_id = coree_core::SymbolId::new();
+        let master_id = ObjectId(7201);
+        let clone_id = ObjectId(7202);
+        let chained_id = ObjectId(7203);
+        let unlinked_id = ObjectId(7204);
+
+        let master = SceneObject::new(
+            master_id,
+            "SymMaster",
+            NodePayload::Shape(ParametricShape::Ellipse {
+                rx: 5.0,
+                ry: 5.0,
+                mode: EllipseMode::Full,
+                start_deg: 0.0,
+                end_deg: 360.0,
+            }),
+        )
+        .with_outline(OutlineStyle::solid(Color::rgba8(255, 0, 0, 255), 0.4));
+        let clone = SceneObject::new(
+            clone_id,
+            "SymClone",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: true,
+            },
+        )
+        .with_transform(Affine2D::translate(25.0, 0.0));
+        let chained = SceneObject::new(
+            chained_id,
+            "SymChained",
+            NodePayload::Clone {
+                master_id: clone_id,
+                link_fill: false,
+                link_outline: false,
+                link_shape: true,
+            },
+        )
+        .with_fill(Fill::Solid(Color::rgba8(0, 0, 255, 255)))
+        .with_outline(OutlineStyle::solid(Color::rgba8(0, 255, 0, 255), 1.0))
+        .with_transform(Affine2D::translate(55.0, 0.0));
+        let unlinked = SceneObject::new(
+            unlinked_id,
+            "SymUnlinked",
+            NodePayload::Clone {
+                master_id,
+                link_fill: true,
+                link_outline: true,
+                link_shape: false,
+            },
+        )
+        .with_transform(Affine2D::translate(85.0, 0.0));
+
+        doc.insert_symbol(SymbolDef {
+            id: sym_id,
+            name: "CadChainSym".into(),
+            objects: vec![master, clone, chained, unlinked],
+        });
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+                .with_transform(Affine2D::translate(15.0, 30.0)),
+            None,
+        )
+        .unwrap();
+
+        let dxf = export_dxf_to_string(&doc, 0).unwrap();
+        assert_eq!(
+            dxf.matches("0\nCIRCLE\n").count(),
+            3,
+            "expected 3 DXF CIRCLEs (SymUnlinked skipped), got:\n{dxf}"
+        );
+        assert!(
+            dxf.contains("15.0000")
+                && dxf.contains("40.0000")
+                && dxf.contains("70.0000")
+                && !dxf.contains("100.0000"),
+            "DXF circle centers must match master/clone/chained and omit unlinked:\n{dxf}"
+        );
+
+        let plt = export_plt_to_string(&doc, 0).unwrap();
+        assert_eq!(
+            plt.matches(";CI").count(),
+            3,
+            "expected 3 HPGL CI circles (SymUnlinked skipped), got:\n{plt}"
         );
     }
 }

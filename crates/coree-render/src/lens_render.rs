@@ -1563,7 +1563,11 @@ fn obtain_sample_backdrop(
                             &mut sub,
                         );
                     }
-                    if pc_obj.outline.behind_fill && pc_obj.outline.is_visible() {
+                    if pc_obj.outline.behind_fill
+                        && pc_obj.outline.is_visible()
+                        && !(options.suppress_spot_cutcontour
+                            && crate::renderer::is_cutcontour_spot(&pc_obj.outline.color))
+                    {
                         crate::renderer::draw_outline_styled(
                             &deformed_container,
                             pc_local_xf,
@@ -2598,7 +2602,9 @@ fn rasterize_silhouette_payload(
             }
         }
         NodePayload::Clone { .. } => {
-            if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
+            if let Some((p, f, o)) =
+                doc.resolve_clone_payload_and_style_with_sym(obj, sym_ctx.map(|(m, _, _)| m))
+            {
                 let mut tmp = obj.clone();
                 tmp.payload = p;
                 tmp.fill = f;
@@ -3033,7 +3039,9 @@ fn rasterize_silhouette_payload(
         }
         NodePayload::TextOnPath(top) => {
             if !top.text.plain_text().trim().is_empty() {
-                if let Some(host_path) = doc.world_path_of(top.path_id) {
+                if let Some(host_path) =
+                    crate::renderer::resolve_sym_world_path(doc, top.path_id, sym_ctx)
+                {
                     let inv_world = obj_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
                     for piece in text_engine.layout_text_on_path_pieces(top, &host_path) {
                         fill_winding!(&piece.path.transformed(&inv_world));

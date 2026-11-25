@@ -121,9 +121,8 @@ pub(crate) fn write_cdr_riff_with_options_inner(
 
     // Guides, Grid, and Perspective Grid (`guid`)
     if !doc.guides().is_empty()
-        || doc.grid().visible
-        || doc.grid().snap
-        || doc.perspective_grid().enabled
+        || doc.grid() != coree_core::GridConfig::default()
+        || *doc.perspective_grid() != coree_core::PerspectiveGridConfig::default()
     {
         let gp = GuidPayload {
             guides: doc.guides().to_vec(),

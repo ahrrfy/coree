@@ -26,6 +26,57 @@ fn icc_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
 }
 
 #[inline]
+fn lerp_effect_color(
+    a: &Color,
+    b: &Color,
+    t: f32,
+    icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
+) -> Color {
+    if preserve_doc_rgb && icc.has_custom_rgb_profile() {
+        if let (
+            Color::Rgba {
+                r: r0,
+                g: g0,
+                b: b0,
+                a: a0,
+            },
+            Color::Rgba {
+                r: r1,
+                g: g1,
+                b: b1,
+                a: a1,
+            },
+        ) = (a, b)
+        {
+            let t = sanitize_f32(t, 0.0).clamp(0.0, 1.0);
+            return Color::rgba(
+                r0 + (r1 - r0) * t,
+                g0 + (g1 - g0) * t,
+                b0 + (b1 - b0) * t,
+                a0 + (a1 - a0) * t,
+            );
+        }
+        return doc_color_from_srgb_if_custom(a.lerp_icc(b, t, icc), icc);
+    }
+    a.lerp_icc(b, t, icc)
+}
+
+#[inline]
+fn doc_color_from_srgb_if_custom(color: Color, icc: &IccColorPipeline) -> Color {
+    if !icc.has_custom_rgb_profile() {
+        return color;
+    }
+    match color {
+        Color::Rgba { r, g, b, a } => {
+            let [dr, dg, db] = icc.srgb_to_doc_rgb_f32([r, g, b]);
+            Color::rgba(dr, dg, db, a)
+        }
+        other => other,
+    }
+}
+
+#[inline]
 fn icc_lerp_result_to_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
     match color {
         Color::Rgba { .. } => color.clone(),
@@ -834,6 +885,7 @@ fn compute_contour_rings(
     base_outline: &OutlineStyle,
     target_outline: &Color,
     icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
 ) -> Vec<(u32, BezierPath, Color, Color)> {
     let step_mm = sanitize_f64(offset_mm, 1.0).abs().max(0.05);
     let max_steps = steps.clamp(1, 512);
@@ -872,8 +924,14 @@ fn compute_contour_rings(
             (
                 k,
                 ring,
-                base_fill.lerp_icc(target_fill, t, icc),
-                base_outline.color.lerp_icc(target_outline, t, icc),
+                lerp_effect_color(base_fill, target_fill, t, icc, preserve_doc_rgb),
+                lerp_effect_color(
+                    &base_outline.color,
+                    target_outline,
+                    t,
+                    icc,
+                    preserve_doc_rgb,
+                ),
             )
         })
         .collect()
@@ -906,6 +964,7 @@ fn render_contour_steps(
         base_outline,
         target_outline,
         icc,
+        false,
     );
     if rings.is_empty() {
         return;
@@ -940,6 +999,7 @@ fn render_contour_steps(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_extrude_25d_faces(
     world_path: &BezierPath,
     base_color: Color,
@@ -948,6 +1008,7 @@ fn compute_extrude_25d_faces(
     shade_color: &Color,
     light_dir: [f32; 3],
     icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
 ) -> Vec<([Point2D; 4], Color)> {
     if world_path.is_empty() || !vanishing_point.is_finite() {
         return Vec::new();
@@ -979,7 +1040,13 @@ fn compute_extrude_25d_faces(
                 (normal_2d.x as f32 * ldir[0] + normal_2d.y as f32 * ldir[1] + 0.35 * ldir[2])
                     .clamp(-1.0, 1.0);
             let lit_t = (0.5 + 0.5 * ndotl).clamp(0.0, 1.0);
-            let face_col = shade_color.lerp_icc(&base_color, lit_t * 0.85, icc);
+            let face_col = lerp_effect_color(
+                shade_color,
+                &base_color,
+                lit_t * 0.85,
+                icc,
+                preserve_doc_rgb,
+            );
             let mid = p0.midpoint(p1).midpoint(q0.midpoint(q1));
             faces.push(([p0, p1, q1, q0], mid.distance_to(vanishing_point), face_col));
         }
@@ -1010,6 +1077,7 @@ fn render_extrude_25d(
         shade_color,
         light_dir,
         icc,
+        false,
     ) {
         let quad_path = BezierPath::from_polygon(quad, true);
         let paint = BackendPaint {
@@ -1295,11 +1363,41 @@ fn shade_color_by_lights(
     normal: [f64; 3],
     lights: &[ExtrudeLight],
     icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
 ) -> Color {
-    let [br, bg, bb, ba] = base.to_rgba8_icc(icc);
-    let mut r_acc = f64::from(br) / 255.0 * 0.22;
-    let mut g_acc = f64::from(bg) / 255.0 * 0.22;
-    let mut b_acc = f64::from(bb) / 255.0 * 0.22;
+    let (br_f, bg_f, bb_f, ba_f, used_doc_rgb) = if preserve_doc_rgb && icc.has_custom_rgb_profile()
+    {
+        if let Color::Rgba { r, g, b, a } = *base {
+            (
+                f64::from(sanitize_f32(r, 0.0).clamp(0.0, 1.0)),
+                f64::from(sanitize_f32(g, 0.0).clamp(0.0, 1.0)),
+                f64::from(sanitize_f32(b, 0.0).clamp(0.0, 1.0)),
+                sanitize_f32(a, 1.0).clamp(0.0, 1.0),
+                true,
+            )
+        } else {
+            let [br, bg, bb, ba] = base.to_rgba8_icc(icc);
+            (
+                f64::from(br) / 255.0,
+                f64::from(bg) / 255.0,
+                f64::from(bb) / 255.0,
+                f32::from(ba) / 255.0,
+                false,
+            )
+        }
+    } else {
+        let [br, bg, bb, ba] = base.to_rgba8_icc(icc);
+        (
+            f64::from(br) / 255.0,
+            f64::from(bg) / 255.0,
+            f64::from(bb) / 255.0,
+            f32::from(ba) / 255.0,
+            false,
+        )
+    };
+    let mut r_acc = br_f * 0.22;
+    let mut g_acc = bg_f * 0.22;
+    let mut b_acc = bb_f * 0.22;
     let default_lights = [ExtrudeLight {
         dir: [0.45, -0.6, 0.65],
         intensity: 0.9,
@@ -1324,18 +1422,24 @@ fn shade_color_by_lights(
             .max(1e-9);
         let dot = ((n[0] * ld[0] + n[1] * ld[1] + n[2] * ld[2]) / l_len).max(0.0);
         let inten = f64::from(sanitize_f32(l.intensity, 0.8).clamp(0.0, 3.0));
-        r_acc += (f64::from(br) / 255.0) * dot * inten;
-        g_acc += (f64::from(bg) / 255.0) * dot * inten;
-        b_acc += (f64::from(bb) / 255.0) * dot * inten;
+        r_acc += br_f * dot * inten;
+        g_acc += bg_f * dot * inten;
+        b_acc += bb_f * dot * inten;
     }
-    Color::rgba(
+    let out = Color::rgba(
         r_acc.clamp(0.0, 1.0) as f32,
         g_acc.clamp(0.0, 1.0) as f32,
         b_acc.clamp(0.0, 1.0) as f32,
-        f32::from(ba) / 255.0,
-    )
+        ba_f,
+    );
+    if preserve_doc_rgb && !used_doc_rgb {
+        doc_color_from_srgb_if_custom(out, icc)
+    } else {
+        out
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_extrude_3d_faces(
     world_path: &BezierPath,
     base_color: &Color,
@@ -1344,6 +1448,7 @@ fn compute_extrude_3d_faces(
     rotation_3d: [f64; 3],
     lights: &[ExtrudeLight],
     icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
 ) -> Vec<(Vec<Point2D>, Color)> {
     let mut out = Vec::new();
     let Some(wb) = world_path.bounding_box() else {
@@ -1388,7 +1493,8 @@ fn compute_extrude_3d_faces(
             .collect();
         let back2: Vec<Point2D> = back3.iter().map(|&p| project_3d(p)).collect();
         let back_avg_z = back3.iter().map(|p| p[2]).sum::<f64>() / back3.len() as f64;
-        let back_col = shade_color_by_lights(base_color, [0.0, 0.0, -1.0], lights, icc);
+        let back_col =
+            shade_color_by_lights(base_color, [0.0, 0.0, -1.0], lights, icc, preserve_doc_rgb);
         tagged.push((back_avg_z, back2, back_col));
 
         for i in 0..(poly.len() - 1) {
@@ -1410,7 +1516,7 @@ fn compute_extrude_3d_faces(
                 project_3d(b1),
                 project_3d(b0),
             ];
-            let shade = shade_color_by_lights(base_color, n, lights, icc);
+            let shade = shade_color_by_lights(base_color, n, lights, icc, preserve_doc_rgb);
             tagged.push((avg_z, quad, shade));
         }
     }
@@ -1443,6 +1549,7 @@ fn render_extrude_3d(
         rotation_3d,
         lights,
         icc,
+        false,
     ) {
         let quad_path = BezierPath::from_polygon(quad, true);
         let paint = BackendPaint {
@@ -1474,6 +1581,7 @@ fn compute_blend_steps(
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
     icc: &IccColorPipeline,
+    preserve_doc_rgb: bool,
 ) -> Vec<ComputedBlendStep> {
     let n_steps = steps.clamp(1, 999);
     let Some(target_obj) = doc.object(target_id) else {
@@ -1575,13 +1683,16 @@ fn compute_blend_steps(
             path: BezierPath {
                 subpaths: step_subpaths,
             },
-            fill: src_fill.lerp_icc(&dst_fill, tf, icc),
+            fill: lerp_effect_color(&src_fill, &dst_fill, tf, icc, preserve_doc_rgb),
             opacity: src_obj.opacity + (target_obj.opacity - src_obj.opacity) * tf,
             outline_width_mm: w_mm,
-            outline_color: src_obj
-                .outline
-                .color
-                .lerp_icc(&target_obj.outline.color, tf, icc),
+            outline_color: lerp_effect_color(
+                &src_obj.outline.color,
+                &target_obj.outline.color,
+                tf,
+                icc,
+                preserve_doc_rgb,
+            ),
         });
     }
     out
@@ -1613,6 +1724,7 @@ fn render_blend_effect(
         along_path,
         rotate_along_path,
         icc,
+        false,
     ) {
         let paint = BackendPaint {
             shader: crate::backend::PaintShader::Solid(icc_lerp_result_to_srgb(&step.fill, icc)),
@@ -2393,6 +2505,7 @@ pub fn lower_effects_to_primitives(
                         *rotation_3d,
                         lights,
                         &icc,
+                        true,
                     ) {
                         let mut face = SceneObject::new(
                             alloc_id(),
@@ -2483,8 +2596,13 @@ pub fn lower_effects_to_primitives(
                                     format!("{} Bevel{suffix}", obj.name),
                                     NodePayload::Path(inner),
                                 );
-                                bv.fill =
-                                    Fill::Solid(base_color.lerp_icc(&Color::WHITE, 0.35, &icc));
+                                bv.fill = Fill::Solid(lerp_effect_color(
+                                    &base_color,
+                                    &Color::WHITE,
+                                    0.35,
+                                    &icc,
+                                    true,
+                                ));
                                 bv.outline = OutlineStyle::none();
                                 bv.opacity = obj.opacity * 0.75;
                                 out.push(bv);
@@ -2549,6 +2667,7 @@ fn emit_lowered_contour_objects(
         &obj.outline,
         target_outline,
         icc,
+        true,
     ) {
         let mut co = SceneObject::new(
             alloc_id(),
@@ -2591,6 +2710,7 @@ fn emit_lowered_extrude_objects(
         shade_color,
         light_dir,
         icc,
+        true,
     )
     .into_iter()
     .enumerate()
@@ -2632,6 +2752,7 @@ fn emit_lowered_blend_objects(
         along_path,
         rotate_along_path,
         icc,
+        true,
     )
     .into_iter()
     .enumerate()
@@ -2880,5 +3001,77 @@ mod tests {
             overprint: false,
         };
         assert_ne!(bs_plain, bs_simp);
+    }
+
+    #[test]
+    fn effects_lower_preserves_wide_gamut_adobe_rgb_18c() {
+        let Ok(adobe_icc) = std::fs::read("/usr/share/color/icc/colord/AdobeRGB1998.icc") else {
+            return;
+        };
+        let mut doc = Document::new_a4("AdobeRGB18c");
+        doc.set_rgb_icc_profile(adobe_icc).unwrap();
+
+        // Pure AdobeRGB green-ish cyan (0.1, 0.95, 0.2) -> sRGB green clamps if double-converted!
+        let r1 = SceneObject::new(
+            ObjectId(0),
+            "BoxA",
+            NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                10.0, 10.0, 20.0, 20.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgb(0.1, 0.95, 0.2)));
+        let id1 = doc.add_object(r1, None).unwrap();
+        let r2 = SceneObject::new(
+            ObjectId(0),
+            "BoxB",
+            NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                40.0, 10.0, 20.0, 20.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgb(0.9, 0.2, 0.1)));
+        let id2 = doc.add_object(r2, None).unwrap();
+
+        let blend = SceneObject::new(
+            ObjectId(0),
+            "BlendWide",
+            NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                10.0, 10.0, 20.0, 20.0,
+            ))),
+        )
+        .with_fill(Fill::Solid(Color::rgb(0.1, 0.95, 0.2)));
+        let mut blend_obj = blend;
+        blend_obj.effects.push(Effect::Blend {
+            target_id: id2,
+            steps: 3,
+            along_path: None,
+            rotation_deg: 0.0,
+            rotate_along_path: false,
+        });
+        let bid = doc.add_object(blend_obj, None).unwrap();
+        let _ = id1;
+
+        let mut next = 900u64;
+        let lowered = lower_effects_to_primitives(
+            &doc,
+            doc.object(bid).unwrap(),
+            Affine2D::IDENTITY,
+            &mut || {
+                next += 1;
+                ObjectId(next)
+            },
+        );
+        assert!(lowered.len() >= 3);
+        // Step 0 midpoint/interpolated colors must remain in doc RGB space without sRGB 1.0 clamp distortion
+        let has_valid_interp = lowered.iter().any(|o| {
+            let [r, g, b, _] = match &o.fill {
+                Fill::Solid(c) => c.to_rgba_f32(),
+                _ => [0.0; 4],
+            };
+            r.is_finite() && g > 0.2 && b.is_finite()
+        });
+        assert!(
+            has_valid_interp,
+            "wide-gamut AdobeRGB1998 blend lowering failed"
+        );
     }
 }

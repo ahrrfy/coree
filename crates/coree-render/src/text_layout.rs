@@ -41,12 +41,39 @@ pub struct ShapedGlyphDraw {
     pub fill: Color,
 }
 
+/// Single shaped glyph positioned in local object coordinates (mm, Y-down).
+#[derive(Debug, Clone)]
+pub struct ShapedPdfGlyph {
+    pub glyph_id: u16,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub advance_mm: f64,
+    pub unicode: String,
+}
+
+/// Shaped PDF text run sharing one SFNT font face, point size, fill color, and direction.
+#[derive(Debug, Clone)]
+pub struct ShapedPdfRun {
+    pub font_bytes: std::sync::Arc<[u8]>,
+    pub face_index: u32,
+    pub postscript_name: String,
+    pub units_per_em: u16,
+    pub font_size_pt: f64,
+    pub fill: Color,
+    pub is_rtl: bool,
+    pub actual_text: Option<String>,
+    pub glyphs: Vec<ShapedPdfGlyph>,
+}
+
+type PdfFontBlobEntry = (std::sync::Arc<[u8]>, u32, String, u16);
+
 /// Persistent typography engine holding `cosmic-text`'s `FontSystem` and `SwashCache`.
 pub struct TextEngine {
     font_system: FontSystem,
     swash_cache: SwashCache,
     var_scale_ctx: ScaleContext,
     arabic_fallback_family: Option<String>,
+    font_blob_cache: HashMap<(cosmic_text::fontdb::ID, u16), Option<PdfFontBlobEntry>>,
 }
 
 impl Default for TextEngine {
@@ -67,6 +94,7 @@ impl TextEngine {
             swash_cache: SwashCache::new(),
             var_scale_ctx: ScaleContext::new(),
             arabic_fallback_family,
+            font_blob_cache: HashMap::new(),
         }
     }
 
@@ -484,7 +512,115 @@ impl TextEngine {
             .fold(f32::INFINITY, f32::min);
         let x_shift = if min_x_px.is_finite() { -min_x_px } else { 0.0 };
 
-        self.extract_buffer_glyph_paths(&buffer, &processed_runs, x_shift, 0.0, None)
+        self.extract_buffer_glyph_paths_inner(
+            &buffer,
+            &processed_runs,
+            None,
+            x_shift,
+            0.0,
+            None,
+            None,
+        )
+    }
+
+    /// Lays out an [`ArtisticText`] object into positioned PDF font runs ([`ShapedPdfRun`]) plus
+    /// vector curve fallbacks ([`ShapedGlyphDraw`]) for variable-axis/decoration/non-SFNT glyphs,
+    /// using identical shaping, Kashida, and coordinates as [`Self::layout_artistic_pieces`].
+    #[must_use]
+    pub fn layout_artistic_pdf_runs(
+        &mut self,
+        text: &ArtisticText,
+    ) -> (Vec<ShapedPdfRun>, Vec<ShapedGlyphDraw>) {
+        if text.runs.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let direction = text.effective_direction();
+        let processed_runs = self.preprocess_runs_for_kashida_shaped(&text.runs, text.align, None);
+        let default_style = processed_runs
+            .first()
+            .map_or_else(TextStyle::default, |r| r.style.clone());
+        let font_px = (default_style.font_size_mm() as f32 * LAYOUT_UNITS_PER_MM).max(4.0);
+        let line_ratio = sanitize_f64(default_style.line_height_ratio, 1.2).clamp(0.6, 4.0) as f32;
+        let metrics = Metrics::new(font_px, font_px * line_ratio);
+
+        let full_text: String = processed_runs.iter().map(|r| r.text.as_str()).collect();
+        let has_arabic = contains_arabic(&full_text);
+        let max_line_chars = full_text
+            .split('\n')
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let generous_width = ((max_line_chars as f32) * font_px * 1.4).max(font_px * 8.0);
+        let cosmic_align = map_align(text.align, direction);
+
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        {
+            let mut b = buffer.borrow_with(&mut self.font_system);
+            b.set_wrap(Wrap::None);
+            b.set_size(Some(generous_width), None);
+        }
+
+        let default_family = self.resolve_family(
+            default_style.family_for_direction(if has_arabic {
+                TextDirection::Rtl
+            } else {
+                TextDirection::Ltr
+            }),
+            has_arabic,
+        );
+        let default_attrs = build_attrs(&default_style, default_family, 0);
+        let spans: Vec<(&str, Attrs<'_>)> = processed_runs
+            .iter()
+            .enumerate()
+            .map(|(idx, run)| {
+                let run_ar = has_arabic || contains_arabic(&run.text);
+                let target_fam = run.style.family_for_direction(if run_ar {
+                    TextDirection::Rtl
+                } else {
+                    TextDirection::Ltr
+                });
+                let fam = self.resolve_family(target_fam, run_ar);
+                (run.text.as_str(), build_attrs(&run.style, fam, idx))
+            })
+            .collect();
+
+        buffer.set_rich_text(spans, &default_attrs, Shaping::Advanced, Some(cosmic_align));
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        let min_x_px = buffer
+            .layout_runs()
+            .flat_map(|r| r.glyphs.iter())
+            .map(|g| g.x)
+            .fold(f32::INFINITY, f32::min);
+        let x_shift = if min_x_px.is_finite() { -min_x_px } else { 0.0 };
+
+        let mut pdf_runs = Vec::new();
+        let fallback_curves = self.extract_buffer_glyph_paths_inner(
+            &buffer,
+            &processed_runs,
+            Some(&text.runs),
+            x_shift,
+            0.0,
+            None,
+            Some(&mut pdf_runs),
+        );
+        (pdf_runs, fallback_curves)
+    }
+
+    /// Lays out a [`ParagraphText`] object inside `doc` into positioned PDF font runs plus
+    /// vector curve fallbacks, reusing exact [`Self::layout_paragraph_in_doc`] layout.
+    #[must_use]
+    pub fn layout_paragraph_pdf_runs(
+        &mut self,
+        doc: &Document,
+        obj_id: ObjectId,
+        para: &ParagraphText,
+    ) -> (Vec<ShapedPdfRun>, Vec<ShapedGlyphDraw>) {
+        let mut pdf_runs = Vec::new();
+        let fallback_curves =
+            self.layout_paragraph_in_doc_inner(doc, obj_id, para, Some(&mut pdf_runs));
+        (pdf_runs, fallback_curves)
     }
 
     #[must_use]
@@ -503,9 +639,19 @@ impl TextEngine {
         obj_id: ObjectId,
         para: &ParagraphText,
     ) -> Vec<ShapedGlyphDraw> {
+        self.layout_paragraph_in_doc_inner(doc, obj_id, para, None)
+    }
+
+    fn layout_paragraph_in_doc_inner(
+        &mut self,
+        doc: &Document,
+        obj_id: ObjectId,
+        para: &ParagraphText,
+        mut pdf_out: Option<&mut Vec<ShapedPdfRun>>,
+    ) -> Vec<ShapedGlyphDraw> {
         if obj_id.0 == 0 || doc.object(obj_id).is_none() {
             let obstacles = collect_frame_wrap_obstacles(doc, obj_id, para.wrap_mode);
-            return self.layout_paragraph_core(para, &obstacles);
+            return self.layout_paragraph_core_inner(para, &obstacles, pdf_out);
         }
 
         // Find chain head by walking incoming `linked_next_frame` pointers (cycle-safe)
@@ -547,7 +693,7 @@ impl TextEngine {
         }
         if !chain.contains(&obj_id) {
             let obstacles = collect_frame_wrap_obstacles(doc, obj_id, para.wrap_mode);
-            return self.layout_paragraph_core(para, &obstacles);
+            return self.layout_paragraph_core_inner(para, &obstacles, pdf_out);
         }
 
         let head_para = doc
@@ -560,7 +706,7 @@ impl TextEngine {
 
         if chain.len() == 1 {
             let obstacles = collect_frame_wrap_obstacles(doc, obj_id, head_para.wrap_mode);
-            return self.layout_paragraph_core(head_para, &obstacles);
+            return self.layout_paragraph_core_inner(head_para, &obstacles, pdf_out);
         }
 
         // Distribute shaped text sequentially across frames in `chain` up to `obj_id`
@@ -584,8 +730,14 @@ impl TextEngine {
                 .unwrap_or(para);
             let obstacles = collect_frame_wrap_obstacles(doc, fid, frame_para.wrap_mode);
             let is_target = fid == obj_id;
-            let (pieces, next_cursor) = self
-                .layout_paragraph_frame_slice(head_para, frame_para, &obstacles, cur, is_target);
+            let (pieces, next_cursor) = self.layout_paragraph_frame_slice(
+                head_para,
+                frame_para,
+                &obstacles,
+                cur,
+                is_target,
+                if is_target { pdf_out.take() } else { None },
+            );
             if is_target {
                 return pieces;
             }
@@ -599,6 +751,15 @@ impl TextEngine {
         para: &ParagraphText,
         obstacles: &[Rect2D],
     ) -> Vec<ShapedGlyphDraw> {
+        self.layout_paragraph_core_inner(para, obstacles, None)
+    }
+
+    fn layout_paragraph_core_inner(
+        &mut self,
+        para: &ParagraphText,
+        obstacles: &[Rect2D],
+        pdf_out: Option<&mut Vec<ShapedPdfRun>>,
+    ) -> Vec<ShapedGlyphDraw> {
         let (pieces, _) = self.layout_paragraph_frame_slice(
             para,
             para,
@@ -608,6 +769,7 @@ impl TextEngine {
                 byte_offset: 0,
             },
             true,
+            pdf_out,
         );
         pieces
     }
@@ -619,6 +781,7 @@ impl TextEngine {
         obstacles: &[Rect2D],
         start_cursor: ParagraphCursor,
         emit_pieces: bool,
+        mut pdf_out: Option<&mut Vec<ShapedPdfRun>>,
     ) -> (Vec<ShapedGlyphDraw>, Option<ParagraphCursor>) {
         if content_para.runs.is_empty() {
             return (Vec::new(), None);
@@ -878,6 +1041,7 @@ impl TextEngine {
                             None,
                             baseline_y_px,
                             &mut pieces,
+                            pdf_out.as_deref_mut(),
                         );
                     }
                     col_y_px += *lh_px;
@@ -1083,6 +1247,7 @@ impl TextEngine {
                             x_clip_mm,
                             baseline_y_px,
                             &mut pieces,
+                            pdf_out.as_deref_mut(),
                         );
                     }
                     col_y_px += lh_px;
@@ -1282,6 +1447,7 @@ impl TextEngine {
         x_clip_mm: Option<(f64, f64)>,
         baseline_y_px: f32,
         pieces: &mut Vec<ShapedGlyphDraw>,
+        mut pdf_out: Option<&mut Vec<ShapedPdfRun>>,
     ) {
         let mut glyphs = self.apply_tab_stops_and_fvar(
             raw_glyphs,
@@ -1303,7 +1469,13 @@ impl TextEngine {
         }
 
         let origin_x_px = (body_l_mm as f32) * LAYOUT_UNITS_PER_MM;
-        let mut line_pieces: Vec<ShapedGlyphDraw> = Vec::with_capacity(glyphs.len());
+        let inv_scale = 1.0 / f64::from(LAYOUT_UNITS_PER_MM);
+        struct LineGlyphItem {
+            draw: Option<ShapedGlyphDraw>,
+            pdf_glyph: Option<(PdfFontBlobEntry, f64, Color, bool, ShapedPdfGlyph)>,
+        }
+        let mut line_items: Vec<LineGlyphItem> = Vec::with_capacity(glyphs.len());
+        let mut seen_clusters: HashSet<(usize, usize)> = HashSet::new();
         let mut extra_spacing_px = 0.0_f32;
         let mut seen_base = false;
         for g in &glyphs {
@@ -1322,32 +1494,67 @@ impl TextEngine {
                 seen_base = true;
             }
             let gx_px = origin_x_px + g.x + extra_spacing_px;
-            if let Some(path) = self.glyph_outline_mm(g, gx_px, baseline_y_px + g.y, run_style, g.w)
-            {
-                line_pieces.push(ShapedGlyphDraw {
+            let gy_px = baseline_y_px + g.y;
+            let mut pdf_entry = None;
+            if pdf_out.is_some() && run_style.variation_axes.is_empty() {
+                if let Some(blob) = self.lookup_pdf_font_blob(g.font_id, g.font_weight) {
+                    let unicode = if g.start < g.end && seen_clusters.insert((g.start, g.end)) {
+                        line_text.get(g.start..g.end).unwrap_or("").to_owned()
+                    } else if g.start == 0 && g.end == 0 && g.w > 0.0 {
+                        "\u{0640}".to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let font_size_pt = f64::from(g.font_size) * inv_scale * (72.0 / 25.4);
+                    let glyph_rtl =
+                        (!unicode.is_empty() && contains_arabic(&unicode)) || line_is_rtl;
+                    pdf_entry = Some((
+                        blob,
+                        font_size_pt,
+                        run_style.fill.clone(),
+                        glyph_rtl,
+                        ShapedPdfGlyph {
+                            glyph_id: g.glyph_id,
+                            x_mm: f64::from(gx_px) * inv_scale,
+                            y_mm: f64::from(gy_px) * inv_scale,
+                            advance_mm: f64::from(g.w) * inv_scale,
+                            unicode,
+                        },
+                    ));
+                }
+            }
+            let draw = self
+                .glyph_outline_mm(g, gx_px, gy_px, run_style, g.w)
+                .map(|path| ShapedGlyphDraw {
                     path,
                     fill: run_style.fill.clone(),
+                });
+            if draw.is_some() || pdf_entry.is_some() {
+                line_items.push(LineGlyphItem {
+                    draw,
+                    pdf_glyph: pdf_entry,
                 });
             }
         }
 
-        if line_pieces.is_empty() {
+        if line_items.is_empty() {
             return;
         }
 
         let mut l_min_x = f64::INFINITY;
         let mut l_max_x = f64::NEG_INFINITY;
-        for p in &line_pieces {
-            if let Some(bb) = p.path.bounding_box() {
+        for item in &line_items {
+            if let Some(bb) = item.draw.as_ref().and_then(|d| d.path.bounding_box()) {
                 l_min_x = l_min_x.min(bb.min_x);
                 l_max_x = l_max_x.max(bb.max_x);
             }
         }
+        let mut shift = 0.0_f64;
         if l_min_x.is_finite() && l_max_x.is_finite() {
             let span_w = l_max_x - l_min_x;
             let avail_span = (body_r_mm - body_l_mm).max(0.0);
             if span_w <= avail_span + 0.05 {
-                let shift = if l_max_x > body_r_mm {
+                shift = if l_max_x > body_r_mm {
                     (body_r_mm - l_max_x).max(body_l_mm - l_min_x)
                 } else if l_min_x < body_l_mm {
                     (body_l_mm - l_min_x).min(body_r_mm - l_max_x)
@@ -1356,22 +1563,36 @@ impl TextEngine {
                 };
                 if shift.abs() > 1e-6 {
                     let xf = Affine2D::translate(shift, 0.0);
-                    for p in &mut line_pieces {
-                        p.path.transform(&xf);
+                    for item in &mut line_items {
+                        if let Some(ref mut d) = item.draw {
+                            d.path.transform(&xf);
+                        }
                     }
                 }
             }
         }
 
         if let Some((clip_l_mm, clip_r_mm)) = x_clip_mm {
-            line_pieces.retain(|p| {
-                p.path
-                    .bounding_box()
+            line_items.retain(|item| {
+                item.draw
+                    .as_ref()
+                    .and_then(|d| d.path.bounding_box())
                     .is_none_or(|bb| bb.min_x >= clip_l_mm - 0.02 && bb.max_x <= clip_r_mm + 0.02)
             });
         }
 
-        pieces.extend(line_pieces);
+        if let Some(ref mut runs_out) = pdf_out {
+            for item in line_items {
+                if let Some((blob, pt, fill, is_rtl, mut pg)) = item.pdf_glyph {
+                    pg.x_mm += shift;
+                    push_pdf_glyph_to_runs(runs_out, &blob, pt, &fill, is_rtl, None, pg);
+                } else if let Some(d) = item.draw {
+                    pieces.push(d);
+                }
+            }
+        } else {
+            pieces.extend(line_items.into_iter().filter_map(|i| i.draw));
+        }
     }
 
     #[must_use]
@@ -1591,6 +1812,31 @@ impl TextEngine {
         pieces
     }
 
+    fn lookup_pdf_font_blob(
+        &mut self,
+        font_id: cosmic_text::fontdb::ID,
+        font_weight: Weight,
+    ) -> Option<PdfFontBlobEntry> {
+        let key = (font_id, font_weight.0);
+        if let Some(cached) = self.font_blob_cache.get(&key) {
+            return cached.clone();
+        }
+        let entry = self.font_system.get_font(font_id, font_weight).map(|font| {
+            let data: std::sync::Arc<[u8]> = std::sync::Arc::from(font.data());
+            let upem = font.as_swash().metrics(&[]).units_per_em.max(1);
+            let face_info = self.font_system.db().face(font_id);
+            let face_index = face_info.map_or(0, |f| f.index);
+            let ps_name = face_info
+                .map(|f| f.post_script_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "CoreeSubsetFont".to_owned());
+            (data, face_index, ps_name, upem)
+        });
+        self.font_blob_cache.insert(key, entry.clone());
+        entry
+    }
+
+    #[allow(dead_code)]
     fn extract_buffer_glyph_paths(
         &mut self,
         buffer: &Buffer,
@@ -1599,10 +1845,32 @@ impl TextEngine {
         y_shift_px: f32,
         max_height_px: Option<f32>,
     ) -> Vec<ShapedGlyphDraw> {
+        self.extract_buffer_glyph_paths_inner(
+            buffer,
+            runs,
+            None,
+            x_shift_px,
+            y_shift_px,
+            max_height_px,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_buffer_glyph_paths_inner(
+        &mut self,
+        buffer: &Buffer,
+        runs: &[TextRun],
+        orig_runs: Option<&[TextRun]>,
+        x_shift_px: f32,
+        y_shift_px: f32,
+        max_height_px: Option<f32>,
+        mut pdf_out: Option<&mut Vec<ShapedPdfRun>>,
+    ) -> Vec<ShapedGlyphDraw> {
         let default_style = runs
             .first()
             .map_or_else(TextStyle::default, |r| r.style.clone());
-        let snapshots: Vec<(f32, Vec<GlyphSnapshot>)> = buffer
+        let snapshots: Vec<(f32, String, Vec<GlyphSnapshot>)> = buffer
             .layout_runs()
             .filter(|run| max_height_px.is_none_or(|mh| run.line_top < mh))
             .map(|run| {
@@ -1623,15 +1891,17 @@ impl TextEngine {
                         end: g.end,
                     })
                     .collect();
-                (run.line_y, glyphs)
+                (run.line_y, run.text.to_owned(), glyphs)
             })
             .collect();
 
+        let inv_scale = 1.0 / f64::from(LAYOUT_UNITS_PER_MM);
         let mut pieces = Vec::new();
-        for (line_y, raw_glyphs) in snapshots {
+        for (line_y, line_text, raw_glyphs) in snapshots {
             let glyphs = self.apply_tab_stops_and_fvar(&raw_glyphs, "", runs, &default_style, &[]);
             let mut extra_spacing_px = 0.0_f32;
             let mut seen_base = false;
+            let mut seen_clusters: HashSet<(usize, usize)> = HashSet::new();
             for g in &glyphs {
                 let run_style = runs
                     .get(g.metadata)
@@ -1649,6 +1919,56 @@ impl TextEngine {
                 }
                 let gx = g.x + x_shift_px + extra_spacing_px;
                 let gy = line_y + g.y + y_shift_px;
+                if let Some(ref mut runs_out) = pdf_out {
+                    if run_style.variation_axes.is_empty() {
+                        if let Some(blob) = self.lookup_pdf_font_blob(g.font_id, g.font_weight) {
+                            let unicode =
+                                if g.start < g.end && seen_clusters.insert((g.start, g.end)) {
+                                    line_text.get(g.start..g.end).unwrap_or("").to_owned()
+                                } else if g.start == 0 && g.end == 0 && g.w > 0.0 {
+                                    "\u{0640}".to_owned()
+                                } else {
+                                    String::new()
+                                };
+                            let font_size_pt = f64::from(g.font_size) * inv_scale * (72.0 / 25.4);
+                            let is_rtl = (!unicode.is_empty() && contains_arabic(&unicode))
+                                || run_style.direction == TextDirection::Rtl;
+                            let actual_opt = orig_runs.and_then(|orig| {
+                                let o = orig.get(g.metadata)?;
+                                let p = runs.get(g.metadata)?;
+                                if o.text != p.text && !o.text.contains('\n') {
+                                    Some(o.text.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                            push_pdf_glyph_to_runs(
+                                runs_out,
+                                &blob,
+                                font_size_pt,
+                                &run_style.fill,
+                                is_rtl,
+                                actual_opt,
+                                ShapedPdfGlyph {
+                                    glyph_id: g.glyph_id,
+                                    x_mm: f64::from(gx) * inv_scale,
+                                    y_mm: f64::from(gy) * inv_scale,
+                                    advance_mm: f64::from(g.w) * inv_scale,
+                                    unicode,
+                                },
+                            );
+                            if let Some(bar_path) =
+                                decoration_bars_mm(f64::from(gx), f64::from(gy), run_style, g.w)
+                            {
+                                pieces.push(ShapedGlyphDraw {
+                                    path: bar_path,
+                                    fill: run_style.fill.clone(),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Some(path) = self.glyph_outline_mm(g, gx, gy, run_style, g.w) {
                     pieces.push(ShapedGlyphDraw {
                         path,
@@ -2225,6 +2545,71 @@ impl TextEngine {
 struct ParagraphCursor {
     para_idx: usize,
     byte_offset: usize,
+}
+
+fn decoration_bars_mm(
+    ox_px: f64,
+    by_px: f64,
+    style: &TextStyle,
+    advance_px: f32,
+) -> Option<BezierPath> {
+    if !style.underline && !style.strikethrough {
+        return None;
+    }
+    let inv_scale = 1.0 / f64::from(LAYOUT_UNITS_PER_MM);
+    let adv_mm = f64::from(advance_px) * inv_scale;
+    if adv_mm <= 1e-4 {
+        return None;
+    }
+    let size_mm = style.font_size_mm();
+    let mut path = BezierPath::new();
+    if style.underline {
+        let bar_h = (size_mm * 0.07).max(0.12);
+        let bar_y = by_px * inv_scale + size_mm * 0.12;
+        let bar = BezierPath::from_rect(Rect2D::from_xywh(ox_px * inv_scale, bar_y, adv_mm, bar_h));
+        path.subpaths.extend(bar.subpaths);
+    }
+    if style.strikethrough {
+        let bar_h = (size_mm * 0.06).max(0.12);
+        let bar_y = by_px * inv_scale - size_mm * 0.30;
+        let bar = BezierPath::from_rect(Rect2D::from_xywh(ox_px * inv_scale, bar_y, adv_mm, bar_h));
+        path.subpaths.extend(bar.subpaths);
+    }
+    (!path.is_empty()).then_some(path)
+}
+
+fn push_pdf_glyph_to_runs(
+    runs_out: &mut Vec<ShapedPdfRun>,
+    blob: &PdfFontBlobEntry,
+    font_size_pt: f64,
+    fill: &Color,
+    is_rtl: bool,
+    actual_text: Option<String>,
+    glyph: ShapedPdfGlyph,
+) {
+    if let Some(last) = runs_out.last_mut() {
+        if std::sync::Arc::ptr_eq(&last.font_bytes, &blob.0)
+            && last.face_index == blob.1
+            && (last.font_size_pt - font_size_pt).abs() < 1e-4
+            && last.fill == *fill
+            && last.is_rtl == is_rtl
+            && last.actual_text == actual_text
+        {
+            last.glyphs.push(glyph);
+            return;
+        }
+    }
+    runs_out.push(ShapedPdfRun {
+        font_bytes: blob.0.clone(),
+        face_index: blob.1,
+        postscript_name: blob.2.clone(),
+        units_per_em: blob.3,
+        font_size_pt,
+        fill: fill.clone(),
+        is_rtl,
+        actual_text,
+        glyphs: vec![glyph],
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -3694,6 +4079,7 @@ mod tests {
                 byte_offset: 0,
             },
             true,
+            None,
         );
         let next_cur = f1_next.expect("F1 should overflow into F2");
         assert!(next_cur.para_idx > 0 || next_cur.byte_offset > 0);
@@ -3706,6 +4092,7 @@ mod tests {
             &[],
             next_cur,
             true,
+            None,
         );
         assert!(f2_next.is_none(), "F2 should consume remaining text");
         // Frame 1 has the drop-cap 'A' piece at the start; Frame 2 must NOT duplicate 'A'

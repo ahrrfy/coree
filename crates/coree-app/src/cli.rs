@@ -212,7 +212,7 @@ pub enum Commands {
         #[arg(long, value_enum)]
         format: Option<SampleFormatArg>,
     },
-    /// Structurally inspect any `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.coree`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, or `.psd` file.
+    /// Structurally inspect any `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.coree`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.dwg`, `.wmf`, `.emf`, `.plt`, `.psd`, or `.acb` file.
     Inspect {
         /// Input file path.
         input_path: PathBuf,
@@ -220,7 +220,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Universal offline converter across `.coree`, `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.plt`, `.psd`, `.gcode`, `.png`, `.jpg`, `.webp`, `.tiff`, `.bmp`.
+    /// Universal offline converter across `.coree`, `.cdr`, `.cdr.zip`, `.cdt`, `.cmx`, `.cpt`, `.svg`, `.pdf`, `.ai`, `.eps`, `.dxf`, `.dwg`, `.wmf`, `.emf`, `.plt`, `.psd`, `.gcode`, `.png`, `.jpg`, `.webp`, `.tiff`, `.bmp` (note: `.acb` swatch palettes use `inspect` / Palette Import).
     Convert {
         /// Input document or image path.
         input_path: PathBuf,
@@ -1090,8 +1090,8 @@ pub fn build_diagnostics_report() -> String {
         "{} v{} ({})\n\
          Repository: {}\n\
          Workspace Crates: {}, {}, {}, {}, {}, {}, {}\n\
-         Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025 / .cdr.zip), .cdt (.cdt.zip), .cmx (16/32-bit), .cpt, .svg, .svgz, .pdf, .ai, .eps, .dxf, .plt (HPGL), .psd, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal\n\
-         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .plt (HPGL), .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
+         Supported Import Formats: .coree, .cdr (RIFF v4-v13 / X4-X5 / X6-2025 / .cdr.zip), .cdt (.cdt.zip), .cmx (16/32-bit), .cpt, .svg, .svgz, .pdf, .ai, .eps, .dxf, .dwg, .wmf, .emf, .plt (HPGL), .psd, .png, .jpg, .webp, .tiff, .bmp, .gpl, .ase, .pal, .acb\n\
+         Supported Export Formats: .coree, .cdr (RIFF/X4/X6), .cdt, .cmx, .svg, .pdf (CMYK/RGB + print marks), .eps, .dxf, .dwg, .wmf, .emf, .plt (HPGL), .psd, .gcode (GRBL/Marlin/Ruida), .png, .jpg, .webp, .tiff, .bmp\n\
          Built-in Laser & Plotter Plugins: {} ({})\n\
          Local System Fonts Indexed: {}\n\
          Mode: 100% Offline Pure-Rust (#![forbid(unsafe_code)])",
@@ -1341,5 +1341,21 @@ mod tests {
             .values()
             .all(|o| matches!(o.payload, NodePayload::Path(_))));
         assert!(rev_loaded.objects().values().all(|o| o.fill.is_visible()));
+    }
+
+    #[test]
+    fn cli_help_lists_dwg_wmf_emf_and_acb_for_inspect_and_convert() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        for sub in ["inspect", "convert"] {
+            let subcmd = cmd.find_subcommand_mut(sub).expect("subcommand exists");
+            let help = subcmd.render_long_help().to_string();
+            for ext in [".dwg", ".wmf", ".emf", ".acb"] {
+                assert!(
+                    help.contains(ext),
+                    "`{sub} --help` must list `{ext}`:\n{help}"
+                );
+            }
+        }
     }
 }

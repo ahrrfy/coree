@@ -5,21 +5,20 @@
 //! gradients, vector paths, styling, RTL/Arabic text, and embedded rasters.
 
 use crate::atomic::atomic_write_bytes;
+use crate::display_list::{DisplayListOptions, DisplayOp, DisplayTextKind, ExportDisplayList};
 use crate::error::{IoError, IoLimits, IoResult};
 use crate::raster::{
     decode_raster_bytes_with_limits, export_raster_to_bytes, RasterExportOptions, RasterFormat,
 };
-use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
-    encode_base64, Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document,
-    Effect, Fill, GradientStop, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload,
-    ObjectId, OutlineStyle, Perspective3x3, Point2D, RasterLayerData, SceneObject, SymbolDef,
-    TextAlign, TextDirection, TextRun, TextStyle, Unit,
+    encode_base64, Affine2D, ArtisticText, BezierPath, BlendMode, Color, ColorMode, Document, Fill,
+    GradientStop, LayerId, LineCap, LineJoin, MasterLayerScope, NodePayload, ObjectId,
+    OutlineStyle, Point2D, RasterLayerData, SceneObject, TextAlign, TextDirection, TextOnPath,
+    TextRun, TextStyle, Unit,
 };
-use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
-use coree_render::{outline_arrowhead_geometries, render_isolated_object_to_rgba, TextEngine};
+use coree_render::{outline_arrowhead_geometries, FillRule, TextEngine};
 use kurbo::{BezPath, PathEl};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -27,7 +26,6 @@ use usvg::tiny_skia_path::PathSegment;
 
 /// Canonical SVG CSS pixel-to-millimeter factor at 96 DPI (`25.4 / 96.0`).
 const PX_TO_MM_96: f64 = 25.4 / 96.0;
-const MAX_EXPORT_DEPTH: usize = 64;
 
 fn cached_system_fontdb() -> Arc<usvg::fontdb::Database> {
     static DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
@@ -443,7 +441,9 @@ fn import_usvg_node_inner(
             } else {
                 path.id().to_owned()
             };
-            let fill = path.fill().map_or(Fill::None, convert_usvg_fill);
+            let fill = path
+                .fill()
+                .map_or(Fill::None, |f| convert_usvg_fill(f, unit_scale_mm));
             let outline = path.stroke().map_or_else(OutlineStyle::none, |s| {
                 convert_usvg_stroke(s, path.paint_order(), unit_scale_mm)
             });
@@ -578,7 +578,7 @@ fn import_usvg_node_inner(
                         let font_size_pt = Unit::Point.from_mm(font_size_mm, 96.0).max(1.0);
                         let fill_color = span
                             .fill()
-                            .map(convert_usvg_fill_primary_color)
+                            .map(|f| convert_usvg_fill_primary_color(f, local_scale))
                             .unwrap_or(Color::BLACK);
                         let style = TextStyle {
                             font_family: family,
@@ -914,7 +914,153 @@ fn usvg_path_to_bezier_raw(path: &usvg::tiny_skia_path::Path) -> BezierPath {
     BezierPath::from_kurbo(&kb)
 }
 
-fn convert_usvg_fill(fill: &usvg::Fill) -> Fill {
+#[allow(clippy::too_many_arguments)]
+fn collect_pattern_colors_and_shapes(
+    group: &usvg::Group,
+    opacity: f32,
+    colors: &mut Vec<Color>,
+    has_circle_or_curve: &mut bool,
+    has_diag_stroke: &mut bool,
+    has_axis_stroke: &mut bool,
+    rect_count: &mut usize,
+    depth: u32,
+) {
+    if depth > 16 {
+        return;
+    }
+    let push_color = |colors: &mut Vec<Color>, c: usvg::Color, op: f32| {
+        let col = Color::rgba(
+            f32::from(c.red) / 255.0,
+            f32::from(c.green) / 255.0,
+            f32::from(c.blue) / 255.0,
+            (op * opacity).clamp(0.0, 1.0),
+        );
+        if !colors.iter().any(|existing| {
+            let ea = existing.to_rgba8();
+            let cb = col.to_rgba8();
+            ea == cb
+        }) {
+            colors.push(col);
+        }
+    };
+    for node in group.children() {
+        match node {
+            usvg::Node::Group(sub) => collect_pattern_colors_and_shapes(
+                sub,
+                opacity,
+                colors,
+                has_circle_or_curve,
+                has_diag_stroke,
+                has_axis_stroke,
+                rect_count,
+                depth + 1,
+            ),
+            usvg::Node::Path(path) => {
+                if let Some(f) = path.fill() {
+                    if let usvg::Paint::Color(c) = f.paint() {
+                        push_color(colors, *c, f.opacity().get());
+                    }
+                }
+                if let Some(s) = path.stroke() {
+                    if let usvg::Paint::Color(c) = s.paint() {
+                        push_color(colors, *c, s.opacity().get());
+                    }
+                }
+                let mut seg_diag = false;
+                let mut seg_axis = false;
+                let mut seg_curve = false;
+                let mut prev: Option<(f32, f32)> = None;
+                let mut line_segs = 0usize;
+                for seg in path.data().segments() {
+                    match seg {
+                        PathSegment::MoveTo(p) => prev = Some((p.x, p.y)),
+                        PathSegment::LineTo(p) => {
+                            line_segs += 1;
+                            if let Some((px, py)) = prev {
+                                let dx = (p.x - px).abs();
+                                let dy = (p.y - py).abs();
+                                if dx > 1e-3 && dy > 1e-3 {
+                                    seg_diag = true;
+                                } else if dx > 1e-3 || dy > 1e-3 {
+                                    seg_axis = true;
+                                }
+                            }
+                            prev = Some((p.x, p.y));
+                        }
+                        PathSegment::QuadTo(_, p) | PathSegment::CubicTo(_, _, p) => {
+                            seg_curve = true;
+                            prev = Some((p.x, p.y));
+                        }
+                        PathSegment::Close => {}
+                    }
+                }
+                if seg_curve {
+                    *has_circle_or_curve = true;
+                }
+                if path.stroke().is_some() {
+                    if seg_diag {
+                        *has_diag_stroke = true;
+                    } else if seg_axis {
+                        *has_axis_stroke = true;
+                    }
+                } else if line_segs >= 3 && seg_axis && !seg_curve {
+                    *rect_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn convert_usvg_pattern(pat: &usvg::Pattern, opacity: f32, unit_scale_mm: f64) -> Fill {
+    let mut colors = Vec::new();
+    let mut has_circle_or_curve = false;
+    let mut has_diag_stroke = false;
+    let mut has_axis_stroke = false;
+    let mut rect_count = 0usize;
+    collect_pattern_colors_and_shapes(
+        pat.root(),
+        opacity,
+        &mut colors,
+        &mut has_circle_or_curve,
+        &mut has_diag_stroke,
+        &mut has_axis_stroke,
+        &mut rect_count,
+        0,
+    );
+    if colors.is_empty() {
+        return Fill::None;
+    }
+    if colors.len() == 1 {
+        return Fill::Solid(colors[0].clone());
+    }
+    let bg = colors[0].clone();
+    let fg = colors[1].clone();
+    let pattern_name = if has_circle_or_curve {
+        "PolkaDots".to_owned()
+    } else if has_diag_stroke && !has_axis_stroke {
+        "DiagonalStripe".to_owned()
+    } else if has_axis_stroke && has_diag_stroke {
+        "CrossHatch".to_owned()
+    } else if has_axis_stroke {
+        "Grid".to_owned()
+    } else if rect_count == 2 {
+        "Stripe".to_owned()
+    } else {
+        "Checker".to_owned()
+    };
+    let tile_w = (f64::from(pat.rect().width()) * unit_scale_mm).max(0.5);
+    let tile_h = (f64::from(pat.rect().height()) * unit_scale_mm).max(0.5);
+    Fill::TwoColorPattern {
+        fg,
+        bg,
+        pattern_name,
+        tile_w,
+        tile_h,
+    }
+}
+
+fn convert_usvg_fill(fill: &usvg::Fill, unit_scale_mm: f64) -> Fill {
     let opacity = fill.opacity().get();
     match fill.paint() {
         usvg::Paint::Color(c) => Fill::Solid(Color::rgba(
@@ -975,13 +1121,14 @@ fn convert_usvg_fill(fill: &usvg::Fill) -> Fill {
                 stops,
             }
         }
-        usvg::Paint::Pattern(_) => Fill::None,
+        usvg::Paint::Pattern(pat) => convert_usvg_pattern(pat, opacity, unit_scale_mm),
     }
 }
 
-fn convert_usvg_fill_primary_color(fill: &usvg::Fill) -> Color {
-    match convert_usvg_fill(fill) {
+fn convert_usvg_fill_primary_color(fill: &usvg::Fill, unit_scale_mm: f64) -> Color {
+    match convert_usvg_fill(fill, unit_scale_mm) {
         Fill::Solid(c) => c,
+        Fill::TwoColorPattern { fg, .. } => fg,
         Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
             stops.first().map_or(Color::BLACK, |s| s.color.clone())
         }
@@ -1073,18 +1220,20 @@ fn convert_usvg_blend_mode(bm: usvg::BlendMode) -> BlendMode {
 
 /// Exports `page_index` of `doc` as a clean SVG 1.1 XML string (millimeter `viewBox`).
 pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<String> {
-    let page = doc.page(page_index).ok_or(IoError::PageOutOfRange {
+    let mut text_engine = TextEngine::new();
+    let dl = ExportDisplayList::build(
+        doc,
         page_index,
-        page_count: doc.pages().len(),
-    })?;
-
-    let page_w = if page.width_mm.is_finite() && page.width_mm > 0.0 {
-        page.width_mm
+        &DisplayListOptions::svg(),
+        &mut text_engine,
+    )?;
+    let page_w = if dl.width_mm.is_finite() && dl.width_mm > 0.0 {
+        dl.width_mm
     } else {
         210.0
     };
-    let page_h = if page.height_mm.is_finite() && page.height_mm > 0.0 {
-        page.height_mm
+    let page_h = if dl.height_mm.is_finite() && dl.height_mm > 0.0 {
+        dl.height_mm
     } else {
         297.0
     };
@@ -1092,70 +1241,16 @@ pub fn export_svg_to_string(doc: &Document, page_index: usize) -> IoResult<Strin
     let mut defs = String::new();
     let mut body = String::new();
     let mut def_counter = 0usize;
-    let mut text_engine: Option<TextEngine> = None;
 
-    // Emit applicable master layers from OTHER pages first (bottom), then target page's own layers.
-    let mut layers_to_emit = Vec::new();
-    for (p_idx, p) in doc.pages().iter().enumerate() {
-        if p_idx == page_index {
-            continue;
-        }
-        for layer in &p.layers {
-            let include = layer.is_desktop_layer
-                || match layer.master_scope {
-                    MasterLayerScope::None => false,
-                    MasterLayerScope::AllPages => true,
-                    MasterLayerScope::OddPages => (page_index + 1) % 2 == 1,
-                    MasterLayerScope::EvenPages => (page_index + 1).is_multiple_of(2),
-                };
-            if include {
-                layers_to_emit.push(layer);
-            }
-        }
-    }
-    for layer in &page.layers {
-        layers_to_emit.push(layer);
-    }
-
-    for layer in layers_to_emit {
-        let vis_attr = if layer.visible {
-            ""
-        } else {
-            " display=\"none\""
-        };
-        let cut_attr = if layer.is_cut_layer {
-            " data-cut-layer=\"true\""
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            body,
-            "  <g id=\"layer-{}\" data-layer=\"{}\"{vis_attr}{cut_attr}>",
-            layer.id.0,
-            escape_xml_attr(&layer.name)
-        );
-        let mut visited = HashSet::new();
-        for &oid in &layer.objects {
-            if let Some(obj) = doc.object(oid) {
-                write_svg_object(
-                    doc,
-                    page_index,
-                    obj,
-                    Affine2D::IDENTITY,
-                    None,
-                    None,
-                    &mut text_engine,
-                    &mut defs,
-                    &mut body,
-                    &mut def_counter,
-                    4,
-                    0,
-                    &mut visited,
-                );
-            }
-        }
-        body.push_str("  </g>\n");
-    }
+    svg_render_display_ops(
+        doc,
+        &dl.ops,
+        &mut text_engine,
+        &mut defs,
+        &mut body,
+        &mut def_counter,
+        2,
+    );
 
     let mut out = String::with_capacity(defs.len() + body.len() + 512);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1180,187 +1275,333 @@ pub fn export_svg(doc: &Document, page_index: usize, path: &Path) -> IoResult<()
     atomic_write_bytes(path, svg.as_bytes())
 }
 
-fn svg_requires_raster_composite(doc: &Document, obj: &SceneObject) -> bool {
-    let mut visited_objs = HashSet::new();
-    let mut visited_syms = HashSet::new();
-    svg_requires_raster_composite_inner(
-        doc,
-        obj,
-        None,
-        false,
-        &mut visited_objs,
-        &mut visited_syms,
-        0,
-    )
-}
-
-fn svg_requires_raster_composite_inner(
-    doc: &Document,
-    obj: &SceneObject,
-    sym_map: Option<&HashMap<ObjectId, &SceneObject>>,
-    in_forced_vector_ancestor: bool,
-    visited_objs: &mut HashSet<ObjectId>,
-    visited_syms: &mut HashSet<coree_core::SymbolId>,
-    depth: usize,
-) -> bool {
-    if depth > MAX_EXPORT_DEPTH
-        || (depth > 0 && !obj.visible)
-        || (obj.id.0 != 0 && !visited_objs.insert(obj.id))
-    {
-        return false;
-    }
-    let has_raster_fx = obj.effects.iter().any(|e| {
-        matches!(
-            e,
-            Effect::DropShadow { .. }
-                | Effect::BlockShadow { .. }
-                | Effect::Contour { .. }
-                | Effect::Extrude25D { .. }
-                | Effect::Blend { .. }
-                | Effect::Transparency { .. }
-                | Effect::InnerShadow { .. }
-                | Effect::Bevel { .. }
-                | Effect::Extrude3D { .. }
-        )
-    });
-    let has_geom_fx = obj.effects.iter().any(|e| {
-        matches!(
-            e,
-            Effect::Distort { .. } | Effect::Envelope { .. } | Effect::Perspective { .. }
-        )
-    });
-    let result = if obj.lens.is_some() || has_raster_fx {
-        true
+fn format_svg_opacity_attr(opacity: f32) -> String {
+    let safe_opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
     } else {
-        match &obj.payload {
-            NodePayload::Group(children) => {
-                has_geom_fx
-                    || ((in_forced_vector_ancestor || obj.perspective.is_some())
-                        && children.iter().any(|cid| {
-                            sym_map
-                                .and_then(|m| m.get(cid).copied())
-                                .or_else(|| doc.object(*cid))
-                                .is_some_and(|child| {
-                                    svg_requires_raster_composite_inner(
-                                        doc,
-                                        child,
-                                        sym_map,
-                                        true,
-                                        visited_objs,
-                                        visited_syms,
-                                        depth + 1,
-                                    )
-                                })
-                        }))
-            }
-            NodePayload::SymbolInstance(sym_id) => {
-                has_geom_fx
-                    || (visited_syms.insert(*sym_id) && {
-                        let hit = doc.symbol(*sym_id).is_some_and(|sym| {
-                            let (child_map, referenced) = build_svg_symbol_maps(sym);
-                            let mut sym_visited = HashSet::new();
-                            sym.objects.iter().any(|sub| {
-                                !(sub.id.0 != 0 && referenced.contains(&sub.id))
-                                    && svg_requires_raster_composite_inner(
-                                        doc,
-                                        sub,
-                                        Some(&child_map),
-                                        true,
-                                        &mut sym_visited,
-                                        visited_syms,
-                                        depth + 1,
-                                    )
-                            })
-                        });
-                        visited_syms.remove(sym_id);
-                        hit
-                    })
-            }
-            NodePayload::PowerClip { contents, .. } => {
-                let own_fill = matches!(
-                    obj.fill,
-                    Fill::ConicalGradient { .. }
-                        | Fill::SquareGradient { .. }
-                        | Fill::MeshFill { .. }
-                        | Fill::TextureFill { .. }
-                );
-                own_fill
-                    || ((in_forced_vector_ancestor || obj.perspective.is_some())
-                        && contents.iter().any(|cid| {
-                            sym_map
-                                .and_then(|m| m.get(cid).copied())
-                                .or_else(|| doc.object(*cid))
-                                .is_some_and(|child| {
-                                    svg_requires_raster_composite_inner(
-                                        doc,
-                                        child,
-                                        sym_map,
-                                        true,
-                                        visited_objs,
-                                        visited_syms,
-                                        depth + 1,
-                                    )
-                                })
-                        }))
-            }
-            _ => matches!(
-                obj.fill,
-                Fill::ConicalGradient { .. }
-                    | Fill::SquareGradient { .. }
-                    | Fill::MeshFill { .. }
-                    | Fill::TextureFill { .. }
-            ),
-        }
+        1.0
     };
-    if obj.id.0 != 0 {
-        visited_objs.remove(&obj.id);
-    }
-    result
-}
-
-fn compose_svg_parent_persp(
-    parent_persp: Option<Perspective3x3>,
-    effective_local_xf: Affine2D,
-    own_persp: Option<Perspective3x3>,
-) -> Option<Perspective3x3> {
-    match (parent_persp, own_persp) {
-        (Some(pp), Some(op)) => Some(
-            pp.compose(&Perspective3x3::from_affine(effective_local_xf))
-                .compose(&op),
-        ),
-        (Some(pp), None) => Some(pp.compose(&Perspective3x3::from_affine(effective_local_xf))),
-        (None, Some(op)) => Some(Perspective3x3::from_affine(effective_local_xf).compose(&op)),
-        (None, None) => None,
-    }
-}
-
-fn transform_svg_local_path(
-    local_deformed: &BezierPath,
-    effective_local_xf: Affine2D,
-    parent_persp: Option<Perspective3x3>,
-) -> BezierPath {
-    if let Some(pp) = parent_persp {
-        pp.compose(&Perspective3x3::from_affine(effective_local_xf))
-            .transform_bezier_path(local_deformed)
+    if (safe_opacity - 1.0).abs() > 1e-4 {
+        format!(" opacity=\"{safe_opacity:.4}\"")
     } else {
-        local_deformed.clone()
+        String::new()
     }
 }
 
-fn build_svg_symbol_maps(sym: &SymbolDef) -> (HashMap<ObjectId, &SceneObject>, HashSet<ObjectId>) {
-    let mut child_map: HashMap<ObjectId, &SceneObject> = HashMap::new();
-    let mut referenced: HashSet<ObjectId> = HashSet::new();
-    for sub in &sym.objects {
-        if sub.id.0 != 0 {
-            child_map.insert(sub.id, sub);
-        }
-        match &sub.payload {
-            NodePayload::Group(c) => referenced.extend(c.iter().copied()),
-            NodePayload::PowerClip { contents, .. } => referenced.extend(contents.iter().copied()),
-            _ => {}
+fn svg_render_display_ops(
+    doc: &Document,
+    ops: &[DisplayOp],
+    text_engine: &mut TextEngine,
+    defs: &mut String,
+    body: &mut String,
+    def_counter: &mut usize,
+    initial_indent: usize,
+) {
+    let mut indent = initial_indent;
+    let mut persp_stack: Vec<bool> = Vec::new();
+
+    for op in ops {
+        let parent_is_persp = persp_stack.last().copied().unwrap_or(false);
+        match op {
+            DisplayOp::PushLayer {
+                id,
+                name,
+                visible,
+                is_cut_layer,
+                ..
+            } => {
+                let pad = " ".repeat(indent);
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                let cut_attr = if *is_cut_layer {
+                    " data-cut-layer=\"true\""
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    body,
+                    "{pad}<g id=\"layer-{}\" data-layer=\"{}\"{vis_attr}{cut_attr}>",
+                    id.0,
+                    escape_xml_attr(name)
+                );
+                indent += 2;
+            }
+            DisplayOp::PopLayer => {
+                indent = indent.saturating_sub(2);
+                let pad = " ".repeat(indent);
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            DisplayOp::PushGroup {
+                id_suffix,
+                local_xf,
+                visible,
+                is_perspective,
+                ..
+            } => {
+                let pad = " ".repeat(indent);
+                let xf_attr = if *is_perspective {
+                    String::new()
+                } else {
+                    format_svg_transform(*local_xf)
+                };
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                let _ = writeln!(body, "{pad}<g id=\"{id_suffix}\"{xf_attr}{vis_attr}>");
+                indent += 2;
+                persp_stack.push(*is_perspective);
+            }
+            DisplayOp::PopGroup => {
+                persp_stack.pop();
+                indent = indent.saturating_sub(2);
+                let pad = " ".repeat(indent);
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            DisplayOp::PushClip {
+                id_suffix,
+                local_path,
+                fill_rule,
+                local_xf,
+                visible,
+                is_perspective,
+                ..
+            } => {
+                let pad = " ".repeat(indent);
+                *def_counter += 1;
+                let clip_id = format!("clip-{}", *def_counter);
+                let rule_attr = match fill_rule {
+                    FillRule::EvenOdd => " clip-rule=\"evenodd\"",
+                    FillRule::Winding => "",
+                };
+                let container_d = bezier_to_svg_d(local_path);
+                let _ = writeln!(
+                    defs,
+                    "    <clipPath id=\"{clip_id}\"><path d=\"{container_d}\"{rule_attr}/></clipPath>"
+                );
+                let xf_attr = if *is_perspective {
+                    String::new()
+                } else {
+                    format_svg_transform(*local_xf)
+                };
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                let _ = writeln!(
+                    body,
+                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{vis_attr} clip-path=\"url(#{clip_id})\">"
+                );
+                indent += 2;
+                persp_stack.push(*is_perspective);
+            }
+            DisplayOp::PopClip => {
+                persp_stack.pop();
+                indent = indent.saturating_sub(2);
+                let pad = " ".repeat(indent);
+                let _ = writeln!(body, "{pad}</g>");
+            }
+            DisplayOp::PushTransparencyGroup { .. } | DisplayOp::PopTransparencyGroup => {}
+            DisplayOp::DrawVector {
+                id_suffix,
+                local_path,
+                fill,
+                outline,
+                local_xf,
+                opacity,
+                blend_mode,
+                visible,
+                is_perspective,
+                emit_arrowheads,
+                ..
+            } => {
+                let d = bezier_to_svg_d(local_path);
+                if d.is_empty() {
+                    continue;
+                }
+                let pad = " ".repeat(indent);
+                let skip_xf = parent_is_persp
+                    || (*is_perspective
+                        && (id_suffix.ends_with("-bg") || id_suffix.ends_with("-fg")));
+                let xf_attr = if skip_xf {
+                    String::new()
+                } else {
+                    format_svg_transform(*local_xf)
+                };
+                let op_attr = format_svg_opacity_attr(*opacity);
+                let blend_attr = format_svg_blend_style(*blend_mode);
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                let paint_attrs = format_svg_paint_attrs_with_doc(
+                    doc,
+                    fill,
+                    outline,
+                    defs,
+                    def_counter,
+                    text_engine,
+                );
+                let _ = writeln!(
+                    body,
+                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                );
+                if *emit_arrowheads && outline.is_visible() {
+                    write_svg_arrowheads(
+                        local_path,
+                        outline,
+                        &xf_attr,
+                        &op_attr,
+                        &blend_attr,
+                        vis_attr,
+                        body,
+                        &pad,
+                    );
+                }
+            }
+            DisplayOp::DrawRaster {
+                id_suffix,
+                asset_id,
+                inline_rgba,
+                rect_mm,
+                local_xf,
+                width_mm,
+                height_mm,
+                opacity,
+                blend_mode,
+                visible,
+                ..
+            } => {
+                let pad = " ".repeat(indent);
+                let op_attr = format_svg_opacity_attr(*opacity);
+                let blend_attr = format_svg_blend_style(*blend_mode);
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                let xf_attr = format_svg_transform(*local_xf);
+                if let Some(rgba_arc) = inline_rgba {
+                    if let Ok(png) = export_raster_to_bytes(
+                        rgba_arc.0,
+                        rgba_arc.1,
+                        &rgba_arc.2,
+                        &RasterExportOptions::new(RasterFormat::Png, 150.0),
+                    ) {
+                        let b64 = encode_base64(&png);
+                        let (x, y) = rect_mm.map_or((0.0, 0.0), |r| (r.min_x, r.min_y));
+                        let _ = writeln!(
+                            body,
+                            "{pad}<image id=\"{id_suffix}\" x=\"{x:.4}\" y=\"{y:.4}\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
+                            *width_mm, *height_mm
+                        );
+                    }
+                } else if let Some(aid) = asset_id {
+                    if let Some(asset) = doc.asset(*aid) {
+                        if let Ok(png) = export_raster_to_bytes(
+                            asset.width,
+                            asset.height,
+                            &asset.to_rgba8_vec(),
+                            &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
+                        ) {
+                            let b64 = encode_base64(&png);
+                            let _ = writeln!(
+                                body,
+                                "{pad}<image id=\"{id_suffix}\" x=\"0\" y=\"0\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
+                                *width_mm, *height_mm
+                            );
+                        }
+                    }
+                }
+            }
+            DisplayOp::DrawTextRuns {
+                id_suffix,
+                kind,
+                artistic,
+                fallback_curves,
+                svg_fallback_curves,
+                outline,
+                local_xf,
+                sym_xf,
+                opacity,
+                blend_mode,
+                visible,
+                is_perspective,
+                ..
+            } => {
+                let pad = " ".repeat(indent);
+                let op_attr = format_svg_opacity_attr(*opacity);
+                let blend_attr = format_svg_blend_style(*blend_mode);
+                let vis_attr = if *visible { "" } else { " display=\"none\"" };
+                if *is_perspective {
+                    let xf_attr = if parent_is_persp {
+                        String::new()
+                    } else {
+                        format_svg_transform(*local_xf)
+                    };
+                    for (p_idx, piece) in svg_fallback_curves.iter().enumerate() {
+                        let d = bezier_to_svg_d(&piece.path);
+                        if d.is_empty() {
+                            continue;
+                        }
+                        let paint_attrs = format_svg_paint_attrs_with_doc(
+                            doc,
+                            &Fill::Solid(piece.fill.clone()),
+                            outline,
+                            defs,
+                            def_counter,
+                            text_engine,
+                        );
+                        let _ = writeln!(
+                            body,
+                            "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                        );
+                    }
+                } else if let DisplayTextKind::OnPath {
+                    text_on_path,
+                    local_host_path: Some(local_host),
+                } = kind
+                {
+                    write_svg_text_on_path(
+                        id_suffix,
+                        text_on_path,
+                        local_host,
+                        *sym_xf,
+                        &op_attr,
+                        &blend_attr,
+                        vis_attr,
+                        defs,
+                        body,
+                        def_counter,
+                        &pad,
+                    );
+                } else if matches!(
+                    kind,
+                    DisplayTextKind::Paragraph {
+                        needs_doc_flow: true
+                    }
+                ) {
+                    let xf_attr = format_svg_transform(*local_xf);
+                    for (p_idx, piece) in fallback_curves.iter().enumerate() {
+                        let d = bezier_to_svg_d(&piece.path);
+                        if d.is_empty() {
+                            continue;
+                        }
+                        let paint_attrs = format_svg_paint_attrs_with_doc(
+                            doc,
+                            &Fill::Solid(piece.fill.clone()),
+                            outline,
+                            defs,
+                            def_counter,
+                            text_engine,
+                        );
+                        let _ = writeln!(
+                            body,
+                            "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
+                        );
+                    }
+                } else {
+                    let xf_attr = format_svg_transform(*local_xf);
+                    write_svg_artistic_text(
+                        id_suffix,
+                        artistic,
+                        &xf_attr,
+                        &op_attr,
+                        &blend_attr,
+                        vis_attr,
+                        body,
+                        &pad,
+                    );
+                }
+            }
         }
     }
-    (child_map, referenced)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1399,850 +1640,130 @@ fn write_svg_arrowheads(
     }
 }
 
+fn split_artistic_lines(text: &ArtisticText) -> Vec<Vec<(String, TextStyle)>> {
+    let mut lines: Vec<Vec<(String, TextStyle)>> = vec![Vec::new()];
+    for run in &text.runs {
+        let mut first_part = true;
+        for part in run.text.split('\n') {
+            if !first_part {
+                lines.push(Vec::new());
+            }
+            first_part = false;
+            if !part.is_empty() {
+                if let Some(cur) = lines.last_mut() {
+                    cur.push((part.to_owned(), run.style.clone()));
+                }
+            }
+        }
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_svg_object(
-    doc: &Document,
-    page_index: usize,
-    obj: &SceneObject,
-    parent_xf: Affine2D,
-    parent_persp: Option<Perspective3x3>,
-    sym_ctx: Option<ExportSymCtx<'_>>,
-    text_engine: &mut Option<TextEngine>,
+fn write_svg_text_on_path(
+    id_suffix: &str,
+    top: &TextOnPath,
+    local_host: &BezierPath,
+    sym_xf: Affine2D,
+    op_attr: &str,
+    blend_attr: &str,
+    vis_attr: &str,
     defs: &mut String,
     body: &mut String,
     def_counter: &mut usize,
-    indent: usize,
-    depth: usize,
-    visited: &mut HashSet<ObjectId>,
+    pad: &str,
 ) {
-    if depth > MAX_EXPORT_DEPTH
-        || !obj.transform.is_finite()
-        || (obj.id.0 != 0 && !visited.insert(obj.id))
-    {
-        return;
-    }
-
-    let pad = " ".repeat(indent);
-    let vis_attr = if obj.visible { "" } else { " display=\"none\"" };
-    let safe_opacity = if obj.opacity.is_finite() {
-        obj.opacity.clamp(0.0, 1.0)
+    let dir_attr = if top.text.effective_direction() == TextDirection::Rtl {
+        " direction=\"rtl\" unicode-bidi=\"embed\""
     } else {
-        1.0
+        ""
     };
-    let op_attr = if (safe_opacity - 1.0).abs() > 1e-4 {
-        format!(" opacity=\"{safe_opacity:.4}\"")
+    let first_style = top
+        .text
+        .runs
+        .first()
+        .map(|r| r.style.clone())
+        .unwrap_or_default();
+    let sym_attr = format_svg_transform(sym_xf);
+    let start_off = if top.offset_mm.is_finite() && top.offset_mm.abs() > 1e-4 {
+        format!(" startOffset=\"{:.4}\"", top.offset_mm)
     } else {
         String::new()
     };
-    let blend_attr = format_svg_blend_style(obj.blend_mode);
+    let lines = split_artistic_lines(&top.text);
+    let default_line_h =
+        (first_style.font_size_mm() * first_style.line_height_ratio.max(1.0)).max(2.0);
+    let mut y_acc = -top.distance_mm;
 
-    if svg_requires_raster_composite(doc, obj)
-        && sym_ctx.is_none()
-        && obj.id.0 != 0
-        && parent_persp.is_none()
-    {
-        if let Ok(Some((rect_mm, rgba_buf))) =
-            render_isolated_object_to_rgba(doc, page_index, obj.id, parent_xf, 150.0)
-        {
-            if let Ok(png) = export_raster_to_bytes(
-                rgba_buf.width,
-                rgba_buf.height,
-                &rgba_buf.rgba,
-                &RasterExportOptions::new(RasterFormat::Png, 150.0),
-            ) {
-                let b64 = encode_base64(&png);
-                // Express world rect inside parent group's local coordinates if inside a group
-                let local_inv = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-                let inv_attr = format_svg_transform(local_inv);
-                let _ = writeln!(
+    for (line_idx, line_runs) in lines.iter().enumerate() {
+        let line_max_h = line_runs
+            .iter()
+            .map(|(_, st)| (st.font_size_mm() * st.line_height_ratio.max(1.0)).max(2.0))
+            .fold(default_line_h, f64::max);
+        let host_line = if y_acc.abs() > 1e-4 {
+            local_host.transformed(&Affine2D::translate(0.0, y_acc))
+        } else {
+            local_host.clone()
+        };
+        y_acc += line_max_h;
+
+        *def_counter += 1;
+        let path_def_id = format!("textpath-{}", *def_counter);
+        let _ = writeln!(
+            defs,
+            "    <path id=\"{path_def_id}\" d=\"{}\"/>",
+            bezier_to_svg_d(&host_line)
+        );
+        let elem_id = if line_idx == 0 {
+            id_suffix.to_owned()
+        } else {
+            format!("{id_suffix}-l{line_idx}")
+        };
+        let line_style = line_runs.first().map(|(_, st)| st).unwrap_or(&first_style);
+        let text_weight = if line_runs.len() == 1 && line_style.bold {
+            " font-weight=\"bold\""
+        } else {
+            ""
+        };
+        let text_italic = if line_runs.len() == 1 && line_style.italic {
+            " font-style=\"italic\""
+        } else {
+            ""
+        };
+        let _ = write!(
+            body,
+            "{pad}<text id=\"{elem_id}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{text_weight}{text_italic}{dir_attr}{sym_attr}{op_attr}{blend_attr}{vis_attr}><textPath href=\"#{path_def_id}\"{start_off}>",
+            escape_xml_attr(&line_style.font_family),
+            line_style.font_size_mm(),
+            color_to_svg_rgb(&line_style.fill),
+        );
+        if line_runs.len() == 1 {
+            body.push_str(&escape_xml_text(&line_runs[0].0));
+        } else {
+            for (seg_text, st) in line_runs {
+                let weight = if st.bold { " font-weight=\"bold\"" } else { "" };
+                let italic = if st.italic {
+                    " font-style=\"italic\""
+                } else {
+                    ""
+                };
+                let _ = write!(
                     body,
-                    "{pad}<image id=\"obj-{}\" x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{inv_attr}{vis_attr}/>",
-                    obj.id.0,
-                    rect_mm.min_x,
-                    rect_mm.min_y,
-                    rect_mm.width(),
-                    rect_mm.height(),
+                    "<tspan font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{weight}{italic}>{}</tspan>",
+                    escape_xml_attr(&st.font_family),
+                    st.font_size_mm(),
+                    color_to_svg_rgb(&st.fill),
+                    escape_xml_text(seg_text),
                 );
-                visited.remove(&obj.id);
-                return;
             }
         }
-    }
-
-    let sym_transforms = symmetry_effect_transforms(&obj.effects);
-    for (sym_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
-        let effective_local_xf = sym_xf.compose(&obj.transform);
-        let world_xf = parent_xf.compose(&effective_local_xf);
-        let xf_attr = if parent_persp.is_some() {
-            String::new()
-        } else {
-            format_svg_transform(effective_local_xf)
-        };
-        let id_suffix = if sym_idx == 0 {
-            format!("obj-{}", obj.id.0)
-        } else {
-            format!("obj-{}-sym{sym_idx}", obj.id.0)
-        };
-
-        match &obj.payload {
-            NodePayload::Path(path) => {
-                let bp = if let Some(persp) = obj.perspective {
-                    persp.transform_bezier_path(path)
-                } else {
-                    path.clone()
-                };
-                let deformed = transform_svg_local_path(
-                    &apply_geometry_effects(&bp, &obj.effects),
-                    effective_local_xf,
-                    parent_persp,
-                );
-                let paint_attrs = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &obj.fill,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let d = bezier_to_svg_d(&deformed);
-                let _ = writeln!(
-                    body,
-                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                );
-                write_svg_arrowheads(
-                    &deformed,
-                    &obj.outline,
-                    &xf_attr,
-                    &op_attr,
-                    &blend_attr,
-                    vis_attr,
-                    body,
-                    &pad,
-                );
-            }
-            NodePayload::Shape(shape) => {
-                let bp = if let Some(persp) = obj.perspective {
-                    persp.transform_bezier_path(&shape.to_bezier_path())
-                } else {
-                    shape.to_bezier_path()
-                };
-                let deformed = transform_svg_local_path(
-                    &apply_geometry_effects(&bp, &obj.effects),
-                    effective_local_xf,
-                    parent_persp,
-                );
-                let paint_attrs = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &obj.fill,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let d = bezier_to_svg_d(&deformed);
-                let _ = writeln!(
-                    body,
-                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                );
-                write_svg_arrowheads(
-                    &deformed,
-                    &obj.outline,
-                    &xf_attr,
-                    &op_attr,
-                    &blend_attr,
-                    vis_attr,
-                    body,
-                    &pad,
-                );
-            }
-            NodePayload::BSpline(bs) => {
-                let bp = if let Some(persp) = obj.perspective {
-                    persp.transform_bezier_path(&bs.to_bezier_path())
-                } else {
-                    bs.to_bezier_path()
-                };
-                let deformed = transform_svg_local_path(
-                    &apply_geometry_effects(&bp, &obj.effects),
-                    effective_local_xf,
-                    parent_persp,
-                );
-                let paint_attrs = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &obj.fill,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let d = bezier_to_svg_d(&deformed);
-                let _ = writeln!(
-                    body,
-                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                );
-                write_svg_arrowheads(
-                    &deformed,
-                    &obj.outline,
-                    &xf_attr,
-                    &op_attr,
-                    &blend_attr,
-                    vis_attr,
-                    body,
-                    &pad,
-                );
-            }
-            NodePayload::ArtisticMedia { spine, style } => {
-                let raw = coree_core::ArtisticMedia::expand_stroke(spine, style);
-                let bp = if let Some(persp) = obj.perspective {
-                    persp.transform_bezier_path(&raw)
-                } else {
-                    raw
-                };
-                let deformed = transform_svg_local_path(
-                    &apply_geometry_effects(&bp, &obj.effects),
-                    effective_local_xf,
-                    parent_persp,
-                );
-                let paint_attrs = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &obj.fill,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let d = bezier_to_svg_d(&deformed);
-                let _ = writeln!(
-                    body,
-                    "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                );
-            }
-            NodePayload::Clone { .. } => {
-                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-                    let bp_opt = match &p {
-                        NodePayload::Path(path) => Some(path.clone()),
-                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                        NodePayload::ArtisticMedia { spine, style } => {
-                            Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
-                        }
-                        _ => None,
-                    };
-                    if let Some(raw) = bp_opt {
-                        let bp = if let Some(persp) = obj.perspective {
-                            persp.transform_bezier_path(&raw)
-                        } else {
-                            raw
-                        };
-                        let deformed = transform_svg_local_path(
-                            &apply_geometry_effects(&bp, &obj.effects),
-                            effective_local_xf,
-                            parent_persp,
-                        );
-                        let paint_attrs =
-                            format_svg_paint_attrs_with_doc(doc, &f, &o, defs, def_counter);
-                        let d = bezier_to_svg_d(&deformed);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<path id=\"{id_suffix}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                        );
-                        write_svg_arrowheads(
-                            &deformed,
-                            &o,
-                            &xf_attr,
-                            &op_attr,
-                            &blend_attr,
-                            vis_attr,
-                            body,
-                            &pad,
-                        );
-                    }
-                }
-            }
-            NodePayload::ArtisticText(text) => {
-                if parent_persp.is_some() || obj.perspective.is_some() {
-                    let te = text_engine.get_or_insert_with(TextEngine::new);
-                    let pieces = te.layout_artistic_pieces(text);
-                    for (p_idx, piece) in pieces.iter().enumerate() {
-                        let bp = if let Some(persp) = obj.perspective {
-                            persp.transform_bezier_path(&piece.path)
-                        } else {
-                            piece.path.clone()
-                        };
-                        let deformed = transform_svg_local_path(
-                            &apply_geometry_effects(&bp, &obj.effects),
-                            effective_local_xf,
-                            parent_persp,
-                        );
-                        let paint_attrs = format_svg_paint_attrs_with_doc(
-                            doc,
-                            &Fill::Solid(piece.fill.clone()),
-                            &obj.outline,
-                            defs,
-                            def_counter,
-                        );
-                        let d = bezier_to_svg_d(&deformed);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                        );
-                    }
-                } else {
-                    write_svg_artistic_text(
-                        obj.id,
-                        text,
-                        &xf_attr,
-                        &op_attr,
-                        &blend_attr,
-                        vis_attr,
-                        body,
-                        &pad,
-                    );
-                }
-            }
-            NodePayload::ParagraphText(para) => {
-                let is_linked_target = doc.objects().values().any(|other| {
-                    matches!(
-                        &other.payload,
-                        NodePayload::ParagraphText(p) if p.linked_next_frame == Some(obj.id)
-                    )
-                });
-                let needs_doc_flow = parent_persp.is_some()
-                    || obj.perspective.is_some()
-                    || para.linked_next_frame.is_some()
-                    || is_linked_target
-                    || para.wrap_mode != coree_core::TextWrapMode::None
-                    || para.drop_cap.as_ref().is_some_and(|d| d.enabled)
-                    || para
-                        .list_style
-                        .as_ref()
-                        .is_some_and(|l| !matches!(l, coree_core::ParagraphListStyle::None))
-                    || !para.tab_stops_mm.is_empty()
-                    || para.runs.iter().any(|r| !r.style.variation_axes.is_empty());
-                if needs_doc_flow {
-                    let te = text_engine.get_or_insert_with(TextEngine::new);
-                    let pieces = te.layout_paragraph_in_doc(doc, obj.id, para);
-                    for (p_idx, piece) in pieces.iter().enumerate() {
-                        let bp = if let Some(persp) = obj.perspective {
-                            persp.transform_bezier_path(&piece.path)
-                        } else {
-                            piece.path.clone()
-                        };
-                        let deformed = transform_svg_local_path(
-                            &apply_geometry_effects(&bp, &obj.effects),
-                            effective_local_xf,
-                            parent_persp,
-                        );
-                        let paint_attrs = format_svg_paint_attrs_with_doc(
-                            doc,
-                            &Fill::Solid(piece.fill.clone()),
-                            &obj.outline,
-                            defs,
-                            def_counter,
-                        );
-                        let d = bezier_to_svg_d(&deformed);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                        );
-                    }
-                } else {
-                    let artistic = ArtisticText {
-                        runs: para.runs.clone(),
-                        direction: para.direction,
-                        align: para.align,
-                    };
-                    write_svg_artistic_text(
-                        obj.id,
-                        &artistic,
-                        &xf_attr,
-                        &op_attr,
-                        &blend_attr,
-                        vis_attr,
-                        body,
-                        &pad,
-                    );
-                }
-            }
-            NodePayload::TextOnPath(top) => {
-                if let Some(world_host_path) = resolve_export_world_path(doc, top.path_id, sym_ctx)
-                {
-                    if parent_persp.is_some() || obj.perspective.is_some() {
-                        let te = text_engine.get_or_insert_with(TextEngine::new);
-                        let pieces = te.layout_text_on_path_pieces(top, &world_host_path);
-                        let inv_parent = parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
-                        let top_xf_attr = if parent_persp.is_some() {
-                            String::new()
-                        } else {
-                            format_svg_transform(sym_xf)
-                        };
-                        for (p_idx, piece) in pieces.iter().enumerate() {
-                            let local_piece = piece.path.transformed(&inv_parent);
-                            let bp = if let Some(persp) = obj.perspective {
-                                persp.transform_bezier_path(&local_piece)
-                            } else {
-                                local_piece
-                            };
-                            let deformed = transform_svg_local_path(
-                                &apply_geometry_effects(&bp, &obj.effects),
-                                sym_xf,
-                                parent_persp,
-                            );
-                            let paint_attrs = format_svg_paint_attrs_with_doc(
-                                doc,
-                                &Fill::Solid(piece.fill.clone()),
-                                &obj.outline,
-                                defs,
-                                def_counter,
-                            );
-                            let d = bezier_to_svg_d(&deformed);
-                            let _ = writeln!(
-                                body,
-                                "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{top_xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                            );
-                        }
-                    } else {
-                        let local_host =
-                            parent_xf.inverse().map_or(world_host_path.clone(), |inv| {
-                                world_host_path.transformed(&inv)
-                            });
-                        *def_counter += 1;
-                        let path_def_id = format!("textpath-{}", *def_counter);
-                        let _ = writeln!(
-                            defs,
-                            "    <path id=\"{path_def_id}\" d=\"{}\"/>",
-                            bezier_to_svg_d(&local_host)
-                        );
-                        let dir_attr = if top.text.effective_direction() == TextDirection::Rtl {
-                            " direction=\"rtl\" unicode-bidi=\"embed\""
-                        } else {
-                            ""
-                        };
-                        let first_style = top
-                            .text
-                            .runs
-                            .first()
-                            .map(|r| r.style.clone())
-                            .unwrap_or_default();
-                        let font_mm = first_style.font_size_mm();
-                        let sym_attr = format_svg_transform(sym_xf);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<text id=\"{id_suffix}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}{sym_attr}{op_attr}{blend_attr}{vis_attr}><textPath href=\"#{path_def_id}\">{}</textPath></text>",
-                            escape_xml_attr(&first_style.font_family),
-                            font_mm,
-                            color_to_svg_rgb(&first_style.fill),
-                            escape_xml_text(&top.text.plain_text())
-                        );
-                    }
-                } else if parent_persp.is_some() || obj.perspective.is_some() {
-                    let te = text_engine.get_or_insert_with(TextEngine::new);
-                    let pieces = te.layout_artistic_pieces(&top.text);
-                    for (p_idx, piece) in pieces.iter().enumerate() {
-                        let bp = if let Some(persp) = obj.perspective {
-                            persp.transform_bezier_path(&piece.path)
-                        } else {
-                            piece.path.clone()
-                        };
-                        let deformed = transform_svg_local_path(
-                            &apply_geometry_effects(&bp, &obj.effects),
-                            effective_local_xf,
-                            parent_persp,
-                        );
-                        let paint_attrs = format_svg_paint_attrs_with_doc(
-                            doc,
-                            &Fill::Solid(piece.fill.clone()),
-                            &obj.outline,
-                            defs,
-                            def_counter,
-                        );
-                        let d = bezier_to_svg_d(&deformed);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<path id=\"{id_suffix}-g{p_idx}\" d=\"{d}\"{paint_attrs}{xf_attr}{op_attr}{blend_attr}{vis_attr}/>"
-                        );
-                    }
-                } else {
-                    write_svg_artistic_text(
-                        obj.id,
-                        &top.text,
-                        &xf_attr,
-                        &op_attr,
-                        &blend_attr,
-                        vis_attr,
-                        body,
-                        &pad,
-                    );
-                }
-            }
-            NodePayload::Raster(raster) => {
-                if let Some(asset) = doc.asset(raster.asset_id) {
-                    if let Ok(png) = export_raster_to_bytes(
-                        asset.width,
-                        asset.height,
-                        &asset.to_rgba8_vec(),
-                        &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
-                    ) {
-                        let b64 = encode_base64(&png);
-                        let _ = writeln!(
-                            body,
-                            "{pad}<image id=\"{id_suffix}\" x=\"0\" y=\"0\" width=\"{:.4}\" height=\"{:.4}\" preserveAspectRatio=\"none\" href=\"data:image/png;base64,{b64}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}/>",
-                            raster.width_mm, raster.height_mm
-                        );
-                    }
-                }
-            }
-            NodePayload::Table(table) => {
-                let _ = writeln!(
-                    body,
-                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
-                );
-                for r in 0..table.rows {
-                    for c in 0..table.cols {
-                        if let (Some(cell), Some(rect)) = (table.cell(r, c), table.cell_rect(r, c))
-                        {
-                            let cell_paint = format_svg_paint_attrs_with_doc(
-                                doc,
-                                &cell.fill,
-                                &table.border_style,
-                                defs,
-                                def_counter,
-                            );
-                            if parent_persp.is_some() {
-                                let cell_path = transform_svg_local_path(
-                                    &BezierPath::from_rect(rect),
-                                    effective_local_xf,
-                                    parent_persp,
-                                );
-                                let _ = writeln!(
-                                    body,
-                                    "{pad}  <path d=\"{}\"{cell_paint}/>",
-                                    bezier_to_svg_d(&cell_path)
-                                );
-                                if !cell.text.is_empty() {
-                                    let te = text_engine.get_or_insert_with(TextEngine::new);
-                                    let at = ArtisticText::from_plain(
-                                        cell.text.clone(),
-                                        cell.text_style.clone(),
-                                    );
-                                    let tx = Affine2D::translate(
-                                        rect.min_x + cell.padding_mm,
-                                        rect.min_y + cell.padding_mm,
-                                    );
-                                    for piece in te.layout_artistic_pieces(&at) {
-                                        let gp = transform_svg_local_path(
-                                            &piece.path,
-                                            effective_local_xf.compose(&tx),
-                                            parent_persp,
-                                        );
-                                        let pa = format_svg_paint_attrs_with_doc(
-                                            doc,
-                                            &Fill::Solid(piece.fill),
-                                            &OutlineStyle::none(),
-                                            defs,
-                                            def_counter,
-                                        );
-                                        let _ = writeln!(
-                                            body,
-                                            "{pad}  <path d=\"{}\"{pa}/>",
-                                            bezier_to_svg_d(&gp)
-                                        );
-                                    }
-                                }
-                            } else {
-                                let _ = writeln!(
-                                    body,
-                                    "{pad}  <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\"{cell_paint}/>",
-                                    rect.min_x,
-                                    rect.min_y,
-                                    rect.width(),
-                                    rect.height()
-                                );
-                                if !cell.text.is_empty() {
-                                    let tx = rect.min_x + cell.padding_mm;
-                                    let ty = rect.min_y
-                                        + cell.padding_mm
-                                        + cell.text_style.font_size_mm();
-                                    let dir_attr = if TextDirection::detect(&cell.text)
-                                        == TextDirection::Rtl
-                                    {
-                                        " direction=\"rtl\" unicode-bidi=\"embed\""
-                                    } else {
-                                        ""
-                                    };
-                                    let _ = writeln!(
-                                        body,
-                                        "{pad}  <text x=\"{tx:.4}\" y=\"{ty:.4}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{dir_attr}>{}</text>",
-                                        escape_xml_attr(&cell.text_style.font_family),
-                                        cell.text_style.font_size_mm(),
-                                        color_to_svg_rgb(&cell.text_style.fill),
-                                        escape_xml_text(&cell.text)
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                let _ = writeln!(body, "{pad}</g>");
-            }
-            NodePayload::Dimension(dim) => {
-                let paint = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &Fill::None,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let label =
-                    dim.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
-                let mid = dim.p1.midpoint(dim.p2);
-                let _ = writeln!(
-                    body,
-                    "{pad}<g id=\"{id_suffix}\"{xf_attr}{op_attr}{blend_attr}{vis_attr}>"
-                );
-                if parent_persp.is_some() {
-                    let lp = transform_svg_local_path(
-                        &BezierPath::from_line(
-                            Point2D::new(dim.p1.x, dim.p1.y - dim.offset_mm),
-                            Point2D::new(dim.p2.x, dim.p2.y - dim.offset_mm),
-                        ),
-                        effective_local_xf,
-                        parent_persp,
-                    );
-                    let _ = writeln!(body, "{pad}  <path d=\"{}\"{paint}/>", bezier_to_svg_d(&lp));
-                    let at = ArtisticText::from_plain(label, dim.text_style.clone());
-                    let tx = Affine2D::translate(mid.x, mid.y - dim.offset_mm - 2.0);
-                    let te = text_engine.get_or_insert_with(TextEngine::new);
-                    let dim_local_xf = effective_local_xf.compose(&tx);
-                    for piece in te.layout_artistic_pieces(&at) {
-                        let gp = transform_svg_local_path(&piece.path, dim_local_xf, parent_persp);
-                        let pa = format_svg_paint_attrs_with_doc(
-                            doc,
-                            &Fill::Solid(piece.fill),
-                            &OutlineStyle::none(),
-                            defs,
-                            def_counter,
-                        );
-                        let _ = writeln!(body, "{pad}  <path d=\"{}\"{pa}/>", bezier_to_svg_d(&gp));
-                    }
-                } else {
-                    let _ = writeln!(
-                        body,
-                        "{pad}  <line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\"{paint}/>",
-                        dim.p1.x,
-                        dim.p1.y - dim.offset_mm,
-                        dim.p2.x,
-                        dim.p2.y - dim.offset_mm
-                    );
-                    let _ = writeln!(
-                        body,
-                        "{pad}  <text x=\"{:.4}\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{:.4}\" text-anchor=\"middle\" fill=\"{}\">{}</text>",
-                        mid.x,
-                        mid.y - dim.offset_mm - 1.5,
-                        escape_xml_attr(&dim.text_style.font_family),
-                        dim.text_style.font_size_mm(),
-                        color_to_svg_rgb(&dim.text_style.fill),
-                        escape_xml_text(&label)
-                    );
-                }
-                let _ = writeln!(body, "{pad}</g>");
-            }
-            NodePayload::Connector(conn) => {
-                let (a, b) = resolve_export_connector_endpoints(doc, conn, &world_xf, sym_ctx);
-                let world_path = conn.route_path(a, b);
-                let local_path = parent_xf
-                    .inverse()
-                    .map_or(world_path.clone(), |inv| world_path.transformed(&inv));
-                let out_path = if let Some(pp) = parent_persp {
-                    pp.transform_bezier_path(&local_path)
-                } else {
-                    local_path
-                };
-                let paint = format_svg_paint_attrs_with_doc(
-                    doc,
-                    &Fill::None,
-                    &obj.outline,
-                    defs,
-                    def_counter,
-                );
-                let _ = writeln!(
-                    body,
-                    "{pad}<path id=\"{id_suffix}\" d=\"{}\"{paint}{op_attr}{blend_attr}{vis_attr}/>",
-                    bezier_to_svg_d(&out_path)
-                );
-                write_svg_arrowheads(
-                    &out_path,
-                    &obj.outline,
-                    "",
-                    &op_attr,
-                    &blend_attr,
-                    vis_attr,
-                    body,
-                    &pad,
-                );
-            }
-            NodePayload::Group(children) => {
-                let child_persp =
-                    compose_svg_parent_persp(parent_persp, effective_local_xf, obj.perspective);
-                let g_xf_attr = if child_persp.is_some() {
-                    ""
-                } else {
-                    xf_attr.as_str()
-                };
-                let _ = writeln!(
-                    body,
-                    "{pad}<g id=\"{id_suffix}\"{g_xf_attr}{op_attr}{blend_attr}{vis_attr}>"
-                );
-                for &cid in children {
-                    let child_opt = sym_ctx
-                        .and_then(|(m, _, _)| m.get(&cid).copied())
-                        .or_else(|| doc.object(cid));
-                    if let Some(child) = child_opt {
-                        write_svg_object(
-                            doc,
-                            page_index,
-                            child,
-                            world_xf,
-                            child_persp,
-                            sym_ctx,
-                            text_engine,
-                            defs,
-                            body,
-                            def_counter,
-                            indent + 2,
-                            depth + 1,
-                            visited,
-                        );
-                    }
-                }
-                let _ = writeln!(body, "{pad}</g>");
-            }
-            NodePayload::PowerClip {
-                container,
-                contents,
-                ..
-            } => {
-                *def_counter += 1;
-                let clip_id = format!("clip-{}", *def_counter);
-                let container_bp = if let Some(persp) = obj.perspective {
-                    persp.transform_bezier_path(container)
-                } else {
-                    (**container).clone()
-                };
-                let raw_container = apply_geometry_effects(&container_bp, &obj.effects);
-                let deformed_container = if parent_persp.is_some() {
-                    transform_svg_local_path(&raw_container, effective_local_xf, parent_persp)
-                } else if obj.perspective.is_some() {
-                    raw_container.transformed(&effective_local_xf)
-                } else {
-                    raw_container
-                };
-                let child_persp =
-                    compose_svg_parent_persp(parent_persp, effective_local_xf, obj.perspective);
-                let container_d = bezier_to_svg_d(&deformed_container);
-                let _ = writeln!(
-                    defs,
-                    "    <clipPath id=\"{clip_id}\"><path d=\"{container_d}\"/></clipPath>"
-                );
-                let pc_xf_attr = if child_persp.is_some() {
-                    ""
-                } else {
-                    xf_attr.as_str()
-                };
-                let _ = writeln!(
-                    body,
-                    "{pad}<g id=\"{id_suffix}\"{pc_xf_attr}{op_attr}{blend_attr}{vis_attr}>"
-                );
-                if obj.fill.is_visible() {
-                    let fill_only = format_svg_paint_attrs_with_doc(
-                        doc,
-                        &obj.fill,
-                        &OutlineStyle::none(),
-                        defs,
-                        def_counter,
-                    );
-                    let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{fill_only}/>");
-                }
-                let _ = writeln!(body, "{pad}  <g clip-path=\"url(#{clip_id})\">");
-                for &cid in contents {
-                    let child_opt = sym_ctx
-                        .and_then(|(m, _, _)| m.get(&cid).copied())
-                        .or_else(|| doc.object(cid));
-                    if let Some(child) = child_opt {
-                        write_svg_object(
-                            doc,
-                            page_index,
-                            child,
-                            world_xf,
-                            child_persp,
-                            sym_ctx,
-                            text_engine,
-                            defs,
-                            body,
-                            def_counter,
-                            indent + 4,
-                            depth + 1,
-                            visited,
-                        );
-                    }
-                }
-                let _ = writeln!(body, "{pad}  </g>");
-                if obj.outline.is_visible() {
-                    let stroke_only = format_svg_paint_attrs_with_doc(
-                        doc,
-                        &Fill::None,
-                        &obj.outline,
-                        defs,
-                        def_counter,
-                    );
-                    let _ = writeln!(body, "{pad}  <path d=\"{container_d}\"{stroke_only}/>");
-                }
-                let _ = writeln!(body, "{pad}</g>");
-            }
-            NodePayload::SymbolInstance(sym_id) => {
-                if let Some(sym) = doc.symbol(*sym_id) {
-                    let (child_map, referenced) = build_svg_symbol_maps(sym);
-                    let child_persp =
-                        compose_svg_parent_persp(parent_persp, effective_local_xf, obj.perspective);
-                    let sym_xf_attr = if child_persp.is_some() {
-                        ""
-                    } else {
-                        xf_attr.as_str()
-                    };
-                    let _ = writeln!(
-                        body,
-                        "{pad}<g id=\"{id_suffix}\"{sym_xf_attr}{op_attr}{blend_attr}{vis_attr}>"
-                    );
-                    let mut sym_visited = HashSet::new();
-                    for sub in &sym.objects {
-                        if sub.id.0 != 0 && referenced.contains(&sub.id) {
-                            continue;
-                        }
-                        write_svg_object(
-                            doc,
-                            page_index,
-                            sub,
-                            world_xf,
-                            child_persp,
-                            Some((&child_map, &sym.objects, world_xf)),
-                            text_engine,
-                            defs,
-                            body,
-                            def_counter,
-                            indent + 2,
-                            depth + 1,
-                            &mut sym_visited,
-                        );
-                    }
-                    let _ = writeln!(body, "{pad}</g>");
-                }
-            }
-        }
-    }
-
-    if obj.id.0 != 0 {
-        visited.remove(&obj.id);
+        body.push_str("</textPath></text>\n");
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_svg_artistic_text(
-    obj_id: ObjectId,
+    id_suffix: &str,
     text: &ArtisticText,
     xf_attr: &str,
     op_attr: &str,
@@ -2267,37 +1788,57 @@ fn write_svg_artistic_text(
         .first()
         .map(|r| r.style.clone())
         .unwrap_or_default();
+    let single_line_single_run = text.runs.len() == 1 && !text.runs[0].text.contains('\n');
+    let text_weight = if single_line_single_run && primary_style.bold {
+        " font-weight=\"bold\""
+    } else {
+        ""
+    };
+    let text_italic = if single_line_single_run && primary_style.italic {
+        " font-style=\"italic\""
+    } else {
+        ""
+    };
     let _ = write!(
         body,
-        "{pad}<text id=\"obj-{}\" x=\"0\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{anchor}{dir_attr}{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
-        obj_id.0,
+        "{pad}<text id=\"{id_suffix}\" x=\"0\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{text_weight}{text_italic}{anchor}{dir_attr}{xf_attr}{op_attr}{blend_attr}{vis_attr}>",
         primary_style.font_size_mm(),
         escape_xml_attr(&primary_style.font_family),
         primary_style.font_size_mm(),
         color_to_svg_rgb(&primary_style.fill),
     );
-    if text.runs.len() == 1 {
+    if single_line_single_run {
         body.push_str(&escape_xml_text(&text.runs[0].text));
     } else {
-        for run in &text.runs {
-            let weight = if run.style.bold {
-                " font-weight=\"bold\""
-            } else {
-                ""
-            };
-            let italic = if run.style.italic {
-                " font-style=\"italic\""
-            } else {
-                ""
-            };
-            let _ = write!(
-                body,
-                "<tspan font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{weight}{italic}>{}</tspan>",
-                escape_xml_attr(&run.style.font_family),
-                run.style.font_size_mm(),
-                color_to_svg_rgb(&run.style.fill),
-                escape_xml_text(&run.text),
-            );
+        let lines = split_artistic_lines(text);
+        let default_lh =
+            (primary_style.font_size_mm() * primary_style.line_height_ratio.max(1.0)).max(2.0);
+        for (line_idx, line_runs) in lines.iter().enumerate() {
+            let line_lh = line_runs
+                .iter()
+                .map(|(_, st)| (st.font_size_mm() * st.line_height_ratio.max(1.0)).max(2.0))
+                .fold(default_lh, f64::max);
+            for (run_idx, (seg, st)) in line_runs.iter().enumerate() {
+                let weight = if st.bold { " font-weight=\"bold\"" } else { "" };
+                let italic = if st.italic {
+                    " font-style=\"italic\""
+                } else {
+                    ""
+                };
+                let pos_attr = if line_idx > 0 && run_idx == 0 {
+                    format!(" x=\"0\" dy=\"{line_lh:.4}\"")
+                } else {
+                    String::new()
+                };
+                let _ = write!(
+                    body,
+                    "<tspan{pos_attr} font-family=\"{}\" font-size=\"{:.4}\" fill=\"{}\"{weight}{italic}>{}</tspan>",
+                    escape_xml_attr(&st.font_family),
+                    st.font_size_mm(),
+                    color_to_svg_rgb(&st.fill),
+                    escape_xml_text(seg),
+                );
+            }
         }
     }
     body.push_str("</text>\n");
@@ -2309,6 +1850,7 @@ fn format_svg_paint_attrs_with_doc(
     outline: &OutlineStyle,
     defs: &mut String,
     def_counter: &mut usize,
+    text_engine: &mut TextEngine,
 ) -> String {
     let mut s = String::new();
 
@@ -2368,7 +1910,7 @@ fn format_svg_paint_attrs_with_doc(
         Fill::TwoColorPattern {
             fg,
             bg,
-            pattern_name: _,
+            pattern_name,
             tile_w,
             tile_h,
         } => {
@@ -2376,31 +1918,93 @@ fn format_svg_paint_attrs_with_doc(
             let pid = format!("pat-{}", *def_counter);
             let tw = tile_w.max(1.0);
             let th = tile_h.max(1.0);
+            let fg_hex = color_to_svg_rgb(fg);
+            let bg_hex = color_to_svg_rgb(bg);
+            let sw = (tw.min(th) * 0.14).max(0.25);
             let _ = writeln!(
                 defs,
-                "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\">"
+                "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\" data-pattern-name=\"{}\">",
+                escape_xml_attr(pattern_name)
             );
             let _ = writeln!(
                 defs,
-                "      <rect width=\"{tw:.4}\" height=\"{th:.4}\" fill=\"{}\"/>",
-                color_to_svg_rgb(bg)
+                "      <rect width=\"{tw:.4}\" height=\"{th:.4}\" fill=\"{bg_hex}\"/>"
             );
-            let _ = writeln!(
-                defs,
-                "      <rect width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\"/>",
-                tw * 0.5,
-                th * 0.5,
-                color_to_svg_rgb(fg)
-            );
-            let _ = writeln!(
-                defs,
-                "      <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\"/>",
-                tw * 0.5,
-                th * 0.5,
-                tw * 0.5,
-                th * 0.5,
-                color_to_svg_rgb(fg)
-            );
+            let pname = pattern_name.to_ascii_lowercase();
+            if pname.contains("dot") || pname.contains("polka") || pname.contains("circle") {
+                let r = (tw.min(th) * 0.22).max(0.2);
+                let _ = writeln!(
+                    defs,
+                    "      <circle cx=\"{:.4}\" cy=\"{:.4}\" r=\"{r:.4}\" fill=\"{fg_hex}\"/>",
+                    tw * 0.5,
+                    th * 0.5
+                );
+            } else if pname.contains("diagonal") || pname.contains("slant") {
+                let _ = writeln!(
+                    defs,
+                    "      <path d=\"M 0 {th:.4} L {tw:.4} 0 M {:.4} {:.4} L {:.4} {:.4} M {:.4} {:.4} L {:.4} {:.4}\" stroke=\"{fg_hex}\" stroke-width=\"{sw:.4}\" fill=\"none\"/>",
+                    -tw * 0.5,
+                    th * 0.5,
+                    tw * 0.5,
+                    -th * 0.5,
+                    tw * 0.5,
+                    th * 1.5,
+                    tw * 1.5,
+                    th * 0.5,
+                );
+            } else if pname.contains("cross") {
+                let _ = writeln!(
+                    defs,
+                    "      <path d=\"M 0 {th:.4} L {tw:.4} 0 M 0 0 L {tw:.4} {th:.4} M 0 {:.4} H {tw:.4}\" stroke=\"{fg_hex}\" stroke-width=\"{sw:.4}\" fill=\"none\"/>",
+                    th * 0.5,
+                );
+            } else if pname.contains("grid") || pname.contains("hatch") {
+                let _ = writeln!(
+                    defs,
+                    "      <path d=\"M 0 {:.4} H {tw:.4} M {:.4} 0 V {th:.4}\" stroke=\"{fg_hex}\" stroke-width=\"{sw:.4}\" fill=\"none\"/>",
+                    th * 0.5,
+                    tw * 0.5,
+                );
+            } else if pname.contains("brick") {
+                let _ = writeln!(
+                    defs,
+                    "      <path d=\"M 0 {:.4} H {tw:.4} M 0 {th:.4} H {tw:.4} M {:.4} 0 V {:.4} M {tw:.4} {:.4} V {th:.4}\" stroke=\"{fg_hex}\" stroke-width=\"{sw:.4}\" fill=\"none\"/>",
+                    th * 0.5,
+                    tw * 0.5,
+                    th * 0.5,
+                    th * 0.5,
+                );
+            } else if pname.contains("stripe") || pname.contains("vert") || pname.contains("horiz")
+            {
+                if pname.contains("vert") {
+                    let _ = writeln!(
+                        defs,
+                        "      <rect x=\"0\" y=\"0\" width=\"{:.4}\" height=\"{th:.4}\" fill=\"{fg_hex}\"/>",
+                        tw * 0.5
+                    );
+                } else {
+                    let _ = writeln!(
+                        defs,
+                        "      <rect x=\"0\" y=\"0\" width=\"{tw:.4}\" height=\"{:.4}\" fill=\"{fg_hex}\"/>",
+                        th * 0.5
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    defs,
+                    "      <rect width=\"{:.4}\" height=\"{:.4}\" fill=\"{fg_hex}\"/>",
+                    tw * 0.5,
+                    th * 0.5
+                );
+                let _ = writeln!(
+                    defs,
+                    "      <rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"{fg_hex}\"/>",
+                    tw * 0.5,
+                    th * 0.5,
+                    tw * 0.5,
+                    th * 0.5
+                );
+            }
             defs.push_str("    </pattern>\n");
             let _ = write!(s, " fill=\"url(#{pid})\"");
         }
@@ -2448,30 +2052,22 @@ fn format_svg_paint_attrs_with_doc(
                 let pid = format!("vpat-{}", *def_counter);
                 let tw = tile_w.max(1.0);
                 let th = tile_h.max(1.0);
+                let sym_ops = ExportDisplayList::build_symbol(
+                    doc,
+                    sym,
+                    &DisplayListOptions::svg(),
+                    text_engine,
+                );
                 let mut pat_body = String::new();
-                let mut pat_text_engine: Option<TextEngine> = None;
-                let (child_map, referenced) = build_svg_symbol_maps(sym);
-                let mut visited = HashSet::new();
-                for sub in &sym.objects {
-                    if sub.id.0 != 0 && referenced.contains(&sub.id) {
-                        continue;
-                    }
-                    write_svg_object(
-                        doc,
-                        0,
-                        sub,
-                        Affine2D::IDENTITY,
-                        None,
-                        Some((&child_map, &sym.objects, Affine2D::IDENTITY)),
-                        &mut pat_text_engine,
-                        defs,
-                        &mut pat_body,
-                        def_counter,
-                        6,
-                        0,
-                        &mut visited,
-                    );
-                }
+                svg_render_display_ops(
+                    doc,
+                    &sym_ops,
+                    text_engine,
+                    defs,
+                    &mut pat_body,
+                    def_counter,
+                    6,
+                );
                 let _ = writeln!(
                     defs,
                     "    <pattern id=\"{pid}\" patternUnits=\"userSpaceOnUse\" width=\"{tw:.4}\" height=\"{th:.4}\">"
@@ -2645,7 +2241,9 @@ fn escape_xml_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coree_core::{CornerStyle, ParametricShape, RasterAsset};
+    use coree_core::{
+        CornerStyle, Effect, MasterLayerScope, ParametricShape, RasterAsset, Rect2D, TextRun,
+    };
 
     #[test]
     fn svg_export_and_reimport_roundtrip_preserves_layers_gradients_strokes_and_rtl() {
@@ -2819,5 +2417,214 @@ mod tests {
         assert!(svg.contains("<pattern id=\"bpat-"));
         assert!(svg.contains("fill=\"url(#bpat-"));
         assert!(svg.contains("-sym1\""));
+    }
+
+    #[test]
+    fn svg_two_color_patterns_dynamic_geometry_and_import_roundtrip() {
+        let mut doc = Document::new("TwoColorPat", 120.0, 90.0, ColorMode::Rgb, 96.0);
+        let variants = [
+            "DiagonalStripe",
+            "PolkaDots",
+            "CrossHatch",
+            "Grid",
+            "Brick",
+            "Stripe",
+            "Checker",
+        ];
+        for (idx, name) in variants.iter().enumerate() {
+            let x = 5.0 + idx as f64 * 15.0;
+            doc.add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    *name,
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        x, 10.0, 12.0, 12.0,
+                    ))),
+                )
+                .with_fill(Fill::TwoColorPattern {
+                    fg: Color::rgba8(20, 40, 200, 255),
+                    bg: Color::rgba8(245, 240, 220, 255),
+                    pattern_name: (*name).to_owned(),
+                    tile_w: 4.0,
+                    tile_h: 4.0,
+                }),
+                None,
+            )
+            .unwrap();
+        }
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert!(svg.contains("<circle "));
+        assert!(svg.contains("stroke=\"#1428c8\""));
+        assert!(svg.contains("data-pattern-name=\"DiagonalStripe\""));
+        assert!(svg.contains("data-pattern-name=\"PolkaDots\""));
+        assert!(svg.contains("data-pattern-name=\"CrossHatch\""));
+
+        let imported = import_svg_str(&svg).unwrap();
+        let pat_count = imported
+            .objects()
+            .values()
+            .filter(|o| matches!(o.fill, Fill::TwoColorPattern { .. }))
+            .count();
+        assert_eq!(
+            pat_count,
+            variants.len(),
+            "all TwoColorPattern tiles must re-import"
+        );
+    }
+
+    #[test]
+    fn svg_text_on_path_multiline_multirun_tspans_18a() {
+        let mut doc = Document::new("TOP 18a", 120.0, 90.0, ColorMode::Rgb, 96.0);
+        let host_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(10.0, 30.0),
+                        Point2D::new(100.0, 30.0),
+                    )),
+                )
+                .with_outline(OutlineStyle::solid(Color::BLACK, 0.3)),
+                None,
+            )
+            .unwrap();
+
+        let artistic = ArtisticText {
+            runs: vec![
+                TextRun::new(
+                    "BoldRed",
+                    TextStyle {
+                        font_family: "Noto Sans".into(),
+                        font_size_pt: 12.0,
+                        bold: true,
+                        fill: Color::rgba8(200, 20, 20, 255),
+                        ..TextStyle::default()
+                    },
+                ),
+                TextRun::new(
+                    " ItalicBlue\nSecondLine",
+                    TextStyle {
+                        font_family: "DejaVu Sans".into(),
+                        font_size_pt: 10.0,
+                        italic: true,
+                        fill: Color::rgba8(10, 40, 210, 255),
+                        ..TextStyle::default()
+                    },
+                ),
+            ],
+            direction: TextDirection::Ltr,
+            align: TextAlign::Left,
+        };
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "MultiTOP",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: artistic,
+                    path_id: host_id,
+                    offset_mm: 2.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let svg = export_svg_to_string(&doc, 0).unwrap();
+        assert_eq!(
+            svg.matches("<textPath ").count(),
+            2,
+            "2 lines => 2 <textPath> elems"
+        );
+        assert!(svg.contains("<tspan "));
+        assert!(svg.contains("font-weight=\"bold\""));
+        assert!(svg.contains("font-style=\"italic\""));
+        assert!(svg.contains("#c81414"));
+        assert!(svg.contains("#0a28d2"));
+        assert!(svg.contains("SecondLine"));
+        // Verify valid SVG via usvg re-import
+        let imported = import_svg_str(&svg).unwrap();
+        assert!(!imported.objects().is_empty());
+    }
+
+    #[test]
+    fn svg_single_run_bold_italic_emits_attributes_on_text_element() {
+        let mut doc = Document::new("SingleRunStyle", 120.0, 90.0, ColorMode::Rgb, 96.0);
+        let bold_italic = TextStyle {
+            font_family: "Noto Sans".into(),
+            font_size_pt: 12.0,
+            bold: true,
+            italic: true,
+            fill: Color::rgba8(20, 30, 40, 255),
+            ..TextStyle::default()
+        };
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "ArtBoldItalic",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "SoloBoldItalic",
+                    bold_italic.clone(),
+                )),
+            )
+            .with_transform(Affine2D::translate(10.0, 20.0)),
+            None,
+        )
+        .unwrap();
+
+        let host_id = doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "Host",
+                    NodePayload::Path(BezierPath::from_line(
+                        Point2D::new(10.0, 50.0),
+                        Point2D::new(100.0, 50.0),
+                    )),
+                )
+                .with_outline(OutlineStyle::solid(Color::BLACK, 0.25)),
+                None,
+            )
+            .unwrap();
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "TopBoldItalic",
+                NodePayload::TextOnPath(TextOnPath {
+                    text: ArtisticText::from_plain("PathBoldItalic", bold_italic),
+                    path_id: host_id,
+                    offset_mm: 0.0,
+                    distance_mm: 0.0,
+                    flip_vertical: false,
+                    flip_horizontal: false,
+                }),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let svg = export_svg_to_string(&doc, 0).expect("export SVG");
+        let art_line = svg
+            .lines()
+            .find(|l| l.contains("SoloBoldItalic"))
+            .expect("ArtisticText <text> line");
+        assert!(
+            art_line.contains("font-weight=\"bold\"") && art_line.contains("font-style=\"italic\""),
+            "single-run ArtisticText <text> missing bold/italic attrs: {art_line}"
+        );
+        let top_line = svg
+            .lines()
+            .find(|l| l.contains("PathBoldItalic"))
+            .expect("TextOnPath <text> line");
+        assert!(
+            top_line.contains("font-weight=\"bold\"") && top_line.contains("font-style=\"italic\""),
+            "single-run TextOnPath <text> missing bold/italic attrs: {top_line}"
+        );
+        let imported = import_svg_str(&svg).expect("re-import SVG");
+        assert!(!imported.objects().is_empty());
     }
 }

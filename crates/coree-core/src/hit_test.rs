@@ -501,19 +501,45 @@ fn sym_obj_bounds_with_objs(
                 .transformed(&p_xf)
                 .bounding_box()
         }
-        NodePayload::Clone { .. } => doc
-            .resolve_clone_payload_and_style(sub)
-            .and_then(|(eff_p, _, _)| match eff_p {
-                NodePayload::Path(p) => Some(p),
-                NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                NodePayload::ArtisticMedia { spine, style } => {
-                    Some(ArtisticMedia::expand_stroke(&spine, &style))
+        NodePayload::Clone { .. } => {
+            if let Some((eff_p, eff_fill, eff_outline, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(sub, Some(sym_map))
+            {
+                let mut tmp = sub.clone();
+                tmp.payload = eff_p;
+                tmp.fill = eff_fill;
+                tmp.outline = eff_outline;
+                if in_sym {
+                    let (b, back) = sym_obj_bounds_with_objs(
+                        doc,
+                        &tmp,
+                        p_xf,
+                        sym_map,
+                        sym_objects,
+                        sym_root_xf,
+                        visiting,
+                        visited_syms,
+                        cache,
+                        depth + 1,
+                    );
+                    min_backedge = min_backedge.min(back);
+                    b
+                } else {
+                    tmp.transform = Affine2D::IDENTITY;
+                    object_warped_world_bounds(
+                        doc,
+                        &tmp,
+                        &p_xf,
+                        None,
+                        None,
+                        visited_syms,
+                        depth + 1,
+                    )
                 }
-                NodePayload::PowerClip { container, .. } => Some(*container),
-                _ => None,
-            })
-            .and_then(|local| apply_sub_persp(local).transformed(&p_xf).bounding_box()),
+            } else {
+                None
+            }
+        }
         NodePayload::PowerClip { container, .. } => apply_sub_persp((**container).clone())
             .transformed(&p_xf)
             .bounding_box(),
@@ -724,7 +750,8 @@ pub fn resolve_connector_endpoints_with_sym(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_connector_endpoints_with_sym_objs(
+#[doc(hidden)]
+pub fn resolve_connector_endpoints_with_sym_objs(
     doc: &Document,
     conn: &crate::ConnectorObject,
     base_world_xf: &Affine2D,
@@ -783,19 +810,18 @@ fn resolve_sym_world_path_with_objs(
                 NodePayload::ArtisticMedia { spine, style } => {
                     Some(ArtisticMedia::expand_stroke(spine, style))
                 }
-                NodePayload::Clone { .. } => {
-                    doc.resolve_clone_payload_and_style(sub)
-                        .and_then(|(eff_p, _, _)| match eff_p {
-                            NodePayload::Path(p) => Some(p),
-                            NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                            NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                            NodePayload::ArtisticMedia { spine, style } => {
-                                Some(ArtisticMedia::expand_stroke(&spine, &style))
-                            }
-                            NodePayload::PowerClip { container, .. } => Some(*container),
-                            _ => None,
-                        })
-                }
+                NodePayload::Clone { .. } => doc
+                    .resolve_clone_payload_and_style_with_sym(sub, Some(sym_map))
+                    .and_then(|(eff_p, _, _)| match eff_p {
+                        NodePayload::Path(p) => Some(p),
+                        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+                        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            Some(ArtisticMedia::expand_stroke(&spine, &style))
+                        }
+                        NodePayload::PowerClip { container, .. } => Some(*container),
+                        _ => None,
+                    }),
                 NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
@@ -1238,7 +1264,8 @@ fn object_warped_world_bounds(
             warp_local_to_world(&local, &world_xf, &obj.transform, parent_persp).bounding_box()
         }
         NodePayload::Clone { .. } => {
-            let (eff_p, eff_fill, eff_outline) = doc.resolve_clone_payload_and_style(obj)?;
+            let (eff_p, eff_fill, eff_outline, in_sym) = doc
+                .resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|(m, _, _)| m))?;
             let mut tmp = obj.clone();
             tmp.payload = eff_p;
             tmp.fill = eff_fill;
@@ -1248,7 +1275,7 @@ fn object_warped_world_bounds(
                 &tmp,
                 parent_xf,
                 parent_persp,
-                sym_ctx,
+                if in_sym { sym_ctx } else { None },
                 visited_syms,
                 depth + 1,
             )
@@ -1493,7 +1520,8 @@ fn object_ref_hits_point(
             )
         }
         NodePayload::Clone { .. } => {
-            let Some((eff_p, eff_fill, eff_outline)) = doc.resolve_clone_payload_and_style(obj)
+            let Some((eff_p, eff_fill, eff_outline, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|(m, _, _)| m))
             else {
                 return false;
             };
@@ -1508,7 +1536,7 @@ fn object_ref_hits_point(
                 parent_persp,
                 pt_mm,
                 tol_mm,
-                sym_ctx,
+                if in_sym { sym_ctx } else { None },
                 visited_syms,
                 depth + 1,
             )
@@ -1737,7 +1765,8 @@ fn object_intersects_rect(
             path_intersects_rect(&wp, obj.fill.is_visible() || obj.lens.is_some(), rect_mm)
         }
         NodePayload::Clone { .. } => {
-            let Some((eff_p, eff_fill, eff_outline)) = doc.resolve_clone_payload_and_style(obj)
+            let Some((eff_p, eff_fill, eff_outline, in_sym)) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, sym_ctx.map(|(m, _, _)| m))
             else {
                 return false;
             };
@@ -1751,7 +1780,7 @@ fn object_intersects_rect(
                 parent_xf,
                 parent_persp,
                 rect_mm,
-                sym_ctx,
+                if in_sym { sym_ctx } else { None },
                 visited_syms,
                 depth + 1,
             )

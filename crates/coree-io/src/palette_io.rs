@@ -3,6 +3,7 @@
 //! Pure-Rust import & export of open color palette formats:
 //! - **GIMP `.gpl`** (ASCII RGB swatch list)
 //! - **Adobe Swatch Exchange `.ase`** (binary big-endian CMYK, RGB, Lab, Gray, and Spot swatches)
+//! - **Adobe Color Book `.acb`** (legal clean-room `8BCB` binary reader: UTF-16BE `u32` strings, RGB/CMYK/Lab/Gray)
 //! - **JASC / Named ASCII `.pal`** (JASC-PAL v0100 + quoted-name CMYK/RGB ASCII `.pal`)
 
 use crate::atomic::atomic_write_bytes;
@@ -509,6 +510,9 @@ pub fn import_palette_file(path: &Path) -> IoResult<ColorPalette> {
     if bytes.starts_with(b"ASEF") {
         return import_ase(&bytes);
     }
+    if bytes.starts_with(b"8BCB") {
+        return import_acb(&bytes);
+    }
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -516,6 +520,7 @@ pub fn import_palette_file(path: &Path) -> IoResult<ColorPalette> {
         .unwrap_or_default();
     match ext.as_str() {
         "ase" => import_ase(&bytes),
+        "acb" => import_acb(&bytes),
         "gpl" => {
             let text = std::str::from_utf8(&bytes).map_err(|e| IoError::InvalidFormat {
                 format: "gpl".into(),
@@ -591,6 +596,210 @@ fn read_finite_f32_be(buf: &[u8], off: usize) -> IoResult<f32> {
         });
     }
     Ok(val)
+}
+
+// =============================================================================
+// Adobe Color Book (.acb) — clean-room 8BCB binary reader
+// =============================================================================
+
+fn strip_acb_localization(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("$$$") {
+        if let Some((_, rhs)) = trimmed.split_once('=') {
+            return rhs.trim().to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+/// Parses an Adobe Color Book (`.acb`, magic `8BCB`) binary palette into a [`ColorPalette`].
+pub fn import_acb(bytes: &[u8]) -> IoResult<ColorPalette> {
+    if bytes.len() < 16 || !bytes.starts_with(b"8BCB") {
+        return Err(IoError::InvalidFormat {
+            format: "acb".into(),
+            message: "missing 8BCB header signature".into(),
+        });
+    }
+    let version = read_u16_be(bytes, 4)?;
+    if version == 0 || version > 2 {
+        return Err(IoError::InvalidFormat {
+            format: "acb".into(),
+            message: format!("unsupported ACB version {version}"),
+        });
+    }
+    let _book_id = read_u16_be(bytes, 6)?;
+    let mut off = 8usize;
+
+    let (raw_title, next) = read_utf16be_u32_pascal(bytes, off)?;
+    off = next;
+    let (raw_prefix, next) = read_utf16be_u32_pascal(bytes, off)?;
+    off = next;
+    let (raw_postfix, next) = read_utf16be_u32_pascal(bytes, off)?;
+    off = next;
+    let (_raw_desc, next) = read_utf16be_u32_pascal(bytes, off)?;
+    off = next;
+
+    let title = strip_acb_localization(&raw_title);
+    let prefix = strip_acb_localization(&raw_prefix);
+    let postfix = strip_acb_localization(&raw_postfix);
+
+    let color_count = usize::from(read_u16_be(bytes, off)?);
+    let _page_size = read_u16_be(bytes, off + 2)?;
+    let _page_selector_offset = read_u16_be(bytes, off + 4)?;
+    let color_model = read_u16_be(bytes, off + 6)?;
+    off += 8;
+
+    if color_count > MAX_PALETTE_SWATCHES {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_palette_swatches={MAX_PALETTE_SWATCHES}"),
+            actual: format!("{color_count} swatches in ACB"),
+        });
+    }
+
+    let comp_count = match color_model {
+        0 => 3usize, // RGB
+        2 => 4usize, // CMYK (inverted 0=100%, 255=0%)
+        7 => 3usize, // Lab
+        8 => 1usize, // Grayscale
+        other => {
+            return Err(IoError::InvalidFormat {
+                format: "acb".into(),
+                message: format!("unsupported ACB color model {other}"),
+            });
+        }
+    };
+
+    let mut raw_entries: Vec<(String, Color)> = Vec::with_capacity(color_count);
+    for _ in 0..color_count {
+        let (raw_name, next) = read_utf16be_u32_pascal(bytes, off)?;
+        off = next;
+        let code_slice = bytes
+            .get(off..off + 6)
+            .ok_or_else(|| IoError::InvalidFormat {
+                format: "acb".into(),
+                message: "truncated ACB color key code".into(),
+            })?;
+        off += 6;
+        let ch = bytes
+            .get(off..off + comp_count)
+            .ok_or_else(|| IoError::InvalidFormat {
+                format: "acb".into(),
+                message: "truncated ACB color channel bytes".into(),
+            })?;
+        off += comp_count;
+
+        let clean_name = strip_acb_localization(&raw_name);
+        let full_name = if !clean_name.is_empty() {
+            let mut joined = String::new();
+            if !prefix.is_empty() {
+                joined.push_str(&prefix);
+                if !prefix.ends_with(' ') && !clean_name.starts_with(' ') {
+                    joined.push(' ');
+                }
+            }
+            joined.push_str(&clean_name);
+            if !postfix.is_empty() {
+                if !joined.ends_with(' ') && !postfix.starts_with(' ') {
+                    joined.push(' ');
+                }
+                joined.push_str(&postfix);
+            }
+            joined
+        } else {
+            String::from_utf8_lossy(code_slice).trim().to_owned()
+        };
+        let swatch_name = if full_name.is_empty() {
+            "Unnamed".to_owned()
+        } else {
+            full_name
+        };
+
+        let base_color = match color_model {
+            0 => Color::rgba8(ch[0], ch[1], ch[2], 255),
+            2 => Color::cmyk(
+                (255.0 - f32::from(ch[0])) / 255.0,
+                (255.0 - f32::from(ch[1])) / 255.0,
+                (255.0 - f32::from(ch[2])) / 255.0,
+                (255.0 - f32::from(ch[3])) / 255.0,
+            ),
+            7 => Color::lab(
+                (f32::from(ch[0]) * 100.0) / 255.0,
+                f32::from(i16::from(ch[1]) - 128),
+                f32::from(i16::from(ch[2]) - 128),
+            ),
+            8 => Color::gray(f32::from(ch[0]) / 255.0),
+            _ => unreachable!(),
+        };
+        raw_entries.push((swatch_name, base_color));
+    }
+
+    let is_spot_book = bytes.get(off..off + 4) == Some(b"spot");
+    let mode = if matches!(color_model, 2 | 7) || is_spot_book {
+        ColorMode::Cmyk
+    } else {
+        ColorMode::Rgb
+    };
+    let mut palette = ColorPalette::new(
+        if title.is_empty() {
+            "ACB Color Book".to_owned()
+        } else {
+            title
+        },
+        mode,
+    );
+    for (name, color) in raw_entries {
+        let final_color = if is_spot_book {
+            Color::spot(name.clone(), 1.0, color.to_cmyk())
+        } else {
+            color
+        };
+        palette.add_swatch(ColorSwatch::new(name, final_color));
+    }
+    Ok(palette)
+}
+
+fn read_utf16be_u32_pascal(buf: &[u8], off: usize) -> IoResult<(String, usize)> {
+    let unit_len = usize::try_from(read_u32_be(buf, off)?).map_err(|_| IoError::InvalidFormat {
+        format: "acb".into(),
+        message: "UTF-16 string length overflow".into(),
+    })?;
+    if unit_len > 65_536 {
+        return Err(IoError::LimitExceeded {
+            limit: "max_acb_string_units=65536".into(),
+            actual: format!("unit_len={unit_len}"),
+        });
+    }
+    let start = off + 4;
+    let byte_len = unit_len
+        .checked_mul(2)
+        .ok_or_else(|| IoError::InvalidFormat {
+            format: "acb".into(),
+            message: "UTF-16 string length overflow".into(),
+        })?;
+    let end = start
+        .checked_add(byte_len)
+        .ok_or_else(|| IoError::InvalidFormat {
+            format: "acb".into(),
+            message: "UTF-16 string offset overflow".into(),
+        })?;
+    if end > buf.len() {
+        return Err(IoError::InvalidFormat {
+            format: "acb".into(),
+            message: "truncated UTF-16BE string in ACB".into(),
+        });
+    }
+    let mut units = Vec::with_capacity(unit_len);
+    for chunk in buf[start..end].as_chunks::<2>().0 {
+        units.push(u16::from_be_bytes(*chunk));
+    }
+    if units.last() == Some(&0) {
+        units.pop();
+    }
+    let decoded = String::from_utf16(&units).map_err(|e| IoError::InvalidFormat {
+        format: "acb".into(),
+        message: format!("invalid UTF-16BE string in ACB: {e}"),
+    })?;
+    Ok((decoded, end))
 }
 
 fn read_utf16be_pascal(buf: &[u8], off: usize) -> IoResult<(String, usize)> {
@@ -722,5 +931,77 @@ mod tests {
             let loaded = import_palette_file(&path).unwrap();
             assert_eq!(loaded.swatches.len(), 5, "swatch count mismatch for .{ext}");
         }
+    }
+
+    fn push_acb_str(buf: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        buf.extend_from_slice(&(units.len() as u32).to_be_bytes());
+        for u in units {
+            buf.extend_from_slice(&u.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn acb_8bcb_import_parses_cmyk_inverted_rgb_lab_and_spot() {
+        // Test 1: CMYK inverted (0 => 100%, 255 => 0%) + $$$ localization + spot footer
+        let mut acb = Vec::new();
+        acb.extend_from_slice(b"8BCB");
+        acb.extend_from_slice(&1u16.to_be_bytes()); // version
+        acb.extend_from_slice(&4001u16.to_be_bytes()); // book_id
+        push_acb_str(&mut acb, "$$$/ColorBooks/Test/Title=Studio Spot Book");
+        push_acb_str(&mut acb, "Ink");
+        push_acb_str(&mut acb, "C");
+        push_acb_str(&mut acb, "Clean-room test book");
+        acb.extend_from_slice(&2u16.to_be_bytes()); // color_count
+        acb.extend_from_slice(&7u16.to_be_bytes()); // page_size
+        acb.extend_from_slice(&3u16.to_be_bytes()); // page_selector_offset
+        acb.extend_from_slice(&2u16.to_be_bytes()); // CMYK
+                                                    // Entry 1: pure Cyan => raw [0, 255, 255, 255]
+        push_acb_str(&mut acb, "100");
+        acb.extend_from_slice(b"INK100");
+        acb.extend_from_slice(&[0, 255, 255, 255]);
+        // Entry 2: 50% Magenta + 100% Yellow => raw [255, 128, 0, 255]
+        push_acb_str(&mut acb, "200");
+        acb.extend_from_slice(b"INK200");
+        acb.extend_from_slice(&[255, 128, 0, 255]);
+        acb.extend_from_slice(b"spot");
+
+        let pal = import_acb(&acb).unwrap();
+        assert_eq!(pal.name, "Studio Spot Book");
+        assert_eq!(pal.color_mode, ColorMode::Cmyk);
+        assert_eq!(pal.swatches.len(), 2);
+        assert_eq!(pal.swatches[0].name, "Ink 100 C");
+        assert!(matches!(
+            &pal.swatches[0].color,
+            Color::Spot { name, fallback_cmyk, .. }
+                if name == "Ink 100 C" && (fallback_cmyk[0] - 1.0).abs() < 1e-4 && fallback_cmyk[1] < 1e-4
+        ));
+        assert!(matches!(
+            &pal.swatches[1].color,
+            Color::Spot { fallback_cmyk, .. }
+                if (fallback_cmyk[1] - 0.5).abs() < 0.01 && (fallback_cmyk[2] - 1.0).abs() < 1e-4
+        ));
+
+        // Test 2: RGB via file auto-detect + Lab
+        let mut rgb_acb = Vec::new();
+        rgb_acb.extend_from_slice(b"8BCB");
+        rgb_acb.extend_from_slice(&1u16.to_be_bytes());
+        rgb_acb.extend_from_slice(&1u16.to_be_bytes());
+        push_acb_str(&mut rgb_acb, "RGB Book");
+        push_acb_str(&mut rgb_acb, "");
+        push_acb_str(&mut rgb_acb, "");
+        push_acb_str(&mut rgb_acb, "");
+        rgb_acb.extend_from_slice(&1u16.to_be_bytes());
+        rgb_acb.extend_from_slice(&5u16.to_be_bytes());
+        rgb_acb.extend_from_slice(&0u16.to_be_bytes());
+        rgb_acb.extend_from_slice(&0u16.to_be_bytes()); // RGB
+        push_acb_str(&mut rgb_acb, "Coral");
+        rgb_acb.extend_from_slice(b"CORAL1");
+        rgb_acb.extend_from_slice(&[240, 80, 60]);
+        let dir = tempfile::tempdir().unwrap();
+        let acb_path = dir.path().join("book.acb");
+        std::fs::write(&acb_path, &rgb_acb).unwrap();
+        let loaded = import_palette_file(&acb_path).unwrap();
+        assert_eq!(loaded.swatches[0].color.to_rgba8(), [240, 80, 60, 255]);
     }
 }

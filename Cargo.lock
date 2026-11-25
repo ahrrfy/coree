@@ -627,6 +627,8 @@ dependencies = [
  "chrono",
  "coree-core",
  "coree-render",
+ "encoding_rs",
+ "fax",
  "flate2",
  "image",
  "kurbo",
@@ -634,8 +636,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "ttf-parser",
  "usvg",
  "uuid",
+ "weezl",
  "zip",
 ]
 

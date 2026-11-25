@@ -724,8 +724,8 @@ impl StudioApp {
             .map(str::to_ascii_lowercase)
             .unwrap_or_else(|| "coree".to_owned());
         let file_format = match ext.as_str() {
-            "cdr" | "cdt" | "cmx" | "cpt" | "svg" | "pdf" | "eps" | "dxf" | "plt" | "png"
-            | "jpg" | "tiff" | "psd" | "coree" => ext,
+            "cdr" | "cdt" | "cmx" | "cpt" | "svg" | "pdf" | "eps" | "dxf" | "dwg" | "wmf"
+            | "emf" | "plt" | "png" | "jpg" | "tiff" | "psd" | "coree" => ext,
             _ => "coree".to_owned(),
         };
 

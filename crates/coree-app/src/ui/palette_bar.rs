@@ -268,7 +268,7 @@ pub fn show_palette_bar(ui: &mut Ui, app: &mut StudioApp) {
 fn import_palette_dialog(app: &mut StudioApp) {
     if let Some(path) = rfd::FileDialog::new()
         .set_title("Import Color Palette")
-        .add_filter("Color Palettes", &["gpl", "ase", "pal"])
+        .add_filter("Color Palettes", &["gpl", "ase", "pal", "acb"])
         .pick_file()
     {
         if let Err(err) = app.import_palette_from_path(&path) {

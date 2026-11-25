@@ -61,6 +61,10 @@ pub enum ContainerFormat {
     Dxf,
     Plt,
     Psd,
+    Dwg,
+    Wmf,
+    Emf,
+    Acb,
 }
 
 impl ContainerFormat {
@@ -79,6 +83,10 @@ impl ContainerFormat {
             Self::Dxf => "dxf",
             Self::Plt => "plt",
             Self::Psd => "psd",
+            Self::Dwg => "dwg",
+            Self::Wmf => "wmf",
+            Self::Emf => "emf",
+            Self::Acb => "acb",
         }
     }
 }
@@ -104,6 +112,14 @@ pub(crate) enum MagicKind {
     Raster(&'static str),
     /// AutoCAD ASCII DXF (`0\nSECTION` / `999\n...`).
     Dxf,
+    /// AutoCAD Binary DWG (`AC1012`..`AC1032`).
+    Dwg,
+    /// Windows Metafile (`.wmf`, Aldus Placeable `D7 CD C6 9A`).
+    Wmf,
+    /// Enhanced Metafile (`.emf`, `[MS-EMF]` signature ` EMF`).
+    Emf,
+    /// Adobe Color Book (`.acb`, signature `8BCB`).
+    Acb,
     /// HPGL cutting plotter stream (`IN;`, `SP`, `PU`, `PD`, `PA`, etc.).
     Plt,
     /// No unambiguous magic signature detected; caller may inspect file extension.
@@ -165,6 +181,11 @@ pub(crate) fn classify_magic_bytes(header: &[u8]) -> MagicKind {
         return MagicKind::Psd;
     }
 
+    // 5b. Adobe Color Book (`.acb`, magic `8BCB`)
+    if header.len() >= 4 && &header[0..4] == b"8BCB" {
+        return MagicKind::Acb;
+    }
+
     // 6. DOS EPS Binary (`C5 D0 D3 C6`) or ASCII PostScript/EPS (`%!PS-Adobe` / `%!PS`)
     // Checked before the 1024-byte offset `%PDF-` scan so EPS DSC comments mentioning `%PDF-`
     // are never misclassified as PDF.
@@ -204,6 +225,20 @@ pub(crate) fn classify_magic_bytes(header: &[u8]) -> MagicKind {
     // 10. XML / SVG text signature (must begin with `<` after optional BOM/whitespace)
     if looks_like_svg(trimmed) {
         return MagicKind::Svg;
+    }
+
+    // 10b. Binary DWG (`AC1012`..`AC1032`), Aldus Placeable WMF (`D7 CD C6 9A`), EMF (` EMF`)
+    if header.len() >= 6 && coree_io::DwgVersion::from_magic(&header[0..6]).is_some() {
+        return MagicKind::Dwg;
+    }
+    if header.len() >= 4 && header[0..4] == [0xD7, 0xCD, 0xC6, 0x9A] {
+        return MagicKind::Wmf;
+    }
+    if header.len() >= 44
+        && u32::from_le_bytes([header[0], header[1], header[2], header[3]]) == 1
+        && &header[40..44] == b" EMF"
+    {
+        return MagicKind::Emf;
     }
 
     // 11. ASCII DXF (`0` / `SECTION` or `999` comment + `0` / `SECTION`)
@@ -687,6 +722,18 @@ pub fn inspect_any_file(path: &Path) -> Result<FileInspectionReport, String> {
         MagicKind::Dxf => {
             return inspect_dxf_file(path, file_size_bytes);
         }
+        MagicKind::Dwg => {
+            return inspect_dwg_file(path, file_size_bytes);
+        }
+        MagicKind::Wmf => {
+            return inspect_wmf_file(path, file_size_bytes);
+        }
+        MagicKind::Emf => {
+            return inspect_emf_file(path, file_size_bytes);
+        }
+        MagicKind::Acb => {
+            return inspect_acb_file(path, file_size_bytes);
+        }
         MagicKind::Plt => {
             return inspect_plt_file(path, file_size_bytes);
         }
@@ -701,6 +748,10 @@ pub fn inspect_any_file(path: &Path) -> Result<FileInspectionReport, String> {
         "ai" => inspect_pdf_or_ai_file(path, true, file_size_bytes),
         "eps" | "ps" => inspect_eps_file(path, false, file_size_bytes),
         "dxf" => inspect_dxf_file(path, file_size_bytes),
+        "dwg" => inspect_dwg_file(path, file_size_bytes),
+        "wmf" => inspect_wmf_file(path, file_size_bytes),
+        "emf" => inspect_emf_file(path, file_size_bytes),
+        "acb" => inspect_acb_file(path, file_size_bytes),
         "plt" | "hpgl" => inspect_plt_file(path, file_size_bytes),
         "psd" | "psb" => inspect_psd_file(path, file_size_bytes),
         _ => import_and_inspect_binary_file(path)
@@ -819,6 +870,83 @@ fn inspect_psd_file(path: &Path, file_size_bytes: u64) -> Result<FileInspectionR
         &doc,
         ContainerFormat::Psd,
         "Photoshop Document (PSD/PSB)".to_owned(),
+        file_size_bytes,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
+fn inspect_dwg_file(path: &Path, file_size_bytes: u64) -> Result<FileInspectionReport, String> {
+    let doc = coree_io::import_dwg(path).map_err(|e| format!("failed to load DWG: {e}"))?;
+    Ok(build_report_from_doc(
+        &doc,
+        ContainerFormat::Dwg,
+        "AutoCAD Binary Drawing (DWG)".to_owned(),
+        file_size_bytes,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
+fn inspect_wmf_file(path: &Path, file_size_bytes: u64) -> Result<FileInspectionReport, String> {
+    let doc = coree_io::import_wmf(path).map_err(|e| format!("failed to load WMF: {e}"))?;
+    Ok(build_report_from_doc(
+        &doc,
+        ContainerFormat::Wmf,
+        "Windows Metafile (WMF)".to_owned(),
+        file_size_bytes,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
+fn inspect_emf_file(path: &Path, file_size_bytes: u64) -> Result<FileInspectionReport, String> {
+    let doc = coree_io::import_emf(path).map_err(|e| format!("failed to load EMF: {e}"))?;
+    Ok(build_report_from_doc(
+        &doc,
+        ContainerFormat::Emf,
+        "Enhanced Metafile (EMF)".to_owned(),
+        file_size_bytes,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
+fn inspect_acb_file(path: &Path, file_size_bytes: u64) -> Result<FileInspectionReport, String> {
+    const MAX_ACB_BYTES: u64 = 64 * 1024 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open ACB '{}': {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ACB_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read ACB '{}': {e}", path.display()))?;
+    if (bytes.len() as u64) > MAX_ACB_BYTES {
+        return Err(format!(
+            "failed to load ACB: file exceeds {MAX_ACB_BYTES} bytes"
+        ));
+    }
+    let palette = coree_io::import_acb(&bytes).map_err(|e| format!("failed to load ACB: {e}"))?;
+    let swatch_count = palette.swatches.len();
+    let mut doc = Document::new(
+        &palette.name,
+        210.0,
+        297.0,
+        coree_core::ColorMode::Cmyk,
+        300.0,
+    );
+    *doc.document_palette_mut() = palette;
+    Ok(build_report_from_doc(
+        &doc,
+        ContainerFormat::Acb,
+        format!("Adobe Color Book (ACB, {swatch_count} swatches)"),
         file_size_bytes,
         None,
         Vec::new(),
@@ -1254,6 +1382,10 @@ mod tests {
         assert_eq!(
             classify_magic_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]),
             MagicKind::Raster("jpg")
+        );
+        assert_eq!(
+            classify_magic_bytes(b"8BCB\x00\x01\x23\x29"),
+            MagicKind::Acb
         );
     }
 
