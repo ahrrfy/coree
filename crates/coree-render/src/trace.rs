@@ -85,13 +85,8 @@ pub fn trace_raster_to_mm(
     if asset.width < 2
         || asset.height < 2
         || validate_surface_dimensions(asset.width, asset.height).is_err()
+        || !asset.has_valid_layout()
     {
-        return Vec::new();
-    }
-    let expected_bytes = (asset.width as usize)
-        .checked_mul(asset.height as usize)
-        .and_then(|n| n.checked_mul(4));
-    if expected_bytes != Some(asset.rgba_bytes.len()) {
         return Vec::new();
     }
     let scale_x = sanitize_f64(width_mm, f64::from(asset.width)).max(1e-3) / f64::from(asset.width);
@@ -210,6 +205,7 @@ fn trace_centerline(
 
     // Identify background RGB from border pixels
     let bg_rgb = estimate_border_rgb(asset);
+    let rgba8 = asset.to_rgba8_vec();
     let mut fg_mask = vec![false; w * h];
     let mut sum_r = 0u64;
     let mut sum_g = 0u64;
@@ -219,13 +215,13 @@ fn trace_centerline(
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
-            let a = asset.rgba_bytes[idx + 3];
+            let a = rgba8[idx + 3];
             if a < 128 {
                 continue;
             }
-            let r = asset.rgba_bytes[idx];
-            let g = asset.rgba_bytes[idx + 1];
-            let b = asset.rgba_bytes[idx + 2];
+            let r = rgba8[idx];
+            let g = rgba8[idx + 1];
+            let b = rgba8[idx + 2];
             let is_fg = if config.remove_background {
                 let dr = f32::from(r) - f32::from(bg_rgb[0]);
                 let dg = f32::from(g) - f32::from(bg_rgb[1]);
@@ -511,8 +507,9 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
     let n_px = (asset.width as usize) * (asset.height as usize);
     let mut opaque_samples: Vec<[f32; 3]> = Vec::new();
     let stride = (n_px / 8192).max(1);
+    let rgba8 = asset.to_rgba8_vec();
 
-    for (i, px) in asset.rgba_bytes.as_chunks::<4>().0.iter().enumerate() {
+    for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
         if i % stride == 0 && px[3] >= 128 {
             opaque_samples.push([f32::from(px[0]), f32::from(px[1]), f32::from(px[2])]);
         }
@@ -604,7 +601,7 @@ fn quantize_kmeans(asset: &RasterAsset, max_colors: usize) -> (Vec<[u8; 3]>, Vec
         .collect();
 
     let mut labels = vec![None; n_px];
-    for (i, px) in asset.rgba_bytes.as_chunks::<4>().0.iter().enumerate() {
+    for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
         if px[3] >= 128 {
             let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
             labels[i] = Some(nearest_centroid(s, &centroids));
@@ -669,14 +666,15 @@ fn detect_border_background_label(labels: &[Option<usize>], w: usize, h: usize) 
 fn estimate_border_rgb(asset: &RasterAsset) -> [u8; 3] {
     let w = asset.width as usize;
     let h = asset.height as usize;
+    let rgba8 = asset.to_rgba8_vec();
     // Bucket border pixels into 16x16x16 color bins: [count, sum_r, sum_g, sum_b]
     let mut buckets: HashMap<[u8; 3], [u64; 4]> = HashMap::new();
     let mut add = |x: usize, y: usize| {
         let idx = (y * w + x) * 4;
-        if asset.rgba_bytes[idx + 3] >= 128 {
-            let r = asset.rgba_bytes[idx];
-            let g = asset.rgba_bytes[idx + 1];
-            let b = asset.rgba_bytes[idx + 2];
+        if rgba8[idx + 3] >= 128 {
+            let r = rgba8[idx];
+            let g = rgba8[idx + 1];
+            let b = rgba8[idx + 2];
             let key = [r >> 4, g >> 4, b >> 4];
             let entry = buckets.entry(key).or_insert([0; 4]);
             entry[0] += 1;

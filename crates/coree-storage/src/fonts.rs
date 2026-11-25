@@ -10,6 +10,7 @@
 use crate::db::StorageDb;
 use crate::error::{StorageError, StorageResult};
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,113 @@ use uuid::Uuid;
 
 const MAX_FONT_SCAN_DEPTH: usize = 8;
 const MAX_FONT_FILE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB guard
+
+/// 10-byte OS/2 PANOSE font classification vector (`bFamilyType` .. `bXHeight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct PanoseClassification(pub [u8; 10]);
+
+impl PanoseClassification {
+    /// Encodes the 10-byte PANOSE vector as 20 lowercase hex characters.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut s = String::with_capacity(20);
+        for b in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// Parses a 20-character hex PANOSE string.
+    #[must_use]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let trimmed = hex.trim();
+        if trimmed.len() != 20 {
+            return None;
+        }
+        let mut bytes = [0u8; 10];
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Returns `true` if all 10 bytes are `0` (unspecified).
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.0 == [0u8; 10]
+    }
+
+    #[must_use]
+    pub const fn family_type(self) -> u8 {
+        self.0[0]
+    }
+    #[must_use]
+    pub const fn serif_style(self) -> u8 {
+        self.0[1]
+    }
+    #[must_use]
+    pub const fn weight(self) -> u8 {
+        self.0[2]
+    }
+    #[must_use]
+    pub const fn proportion(self) -> u8 {
+        self.0[3]
+    }
+}
+
+/// Computes weighted PANOSE perceptual substitution distance (`0` = exact match).
+#[must_use]
+pub fn panose_distance(a: &PanoseClassification, b: &PanoseClassification) -> u32 {
+    if a.is_zero() && b.is_zero() {
+        return 0;
+    }
+    let mut dist = 0u32;
+    // Byte 0 (FamilyType: Latin Text, Script, Decorative, Pictorial)
+    if a.0[0] != b.0[0] {
+        if a.0[0] != 0 && b.0[0] != 0 {
+            dist += 1000;
+        } else {
+            dist += 100;
+        }
+    }
+    // Weights for bytes 1..10: Serif(4), Weight(3), Proportion(5), Contrast(2),
+    // StrokeVar(1), ArmStyle(1), Letterform(2), Midline(1), XHeight(1)
+    const WEIGHTS: [u32; 9] = [4, 3, 5, 2, 1, 1, 2, 1, 1];
+    for (idx, &w) in WEIGHTS.iter().enumerate() {
+        let va = a.0[idx + 1];
+        let vb = b.0[idx + 1];
+        if va == vb {
+            continue;
+        }
+        if va == 0 || vb == 0 {
+            dist += w; // "Any" wildcard
+        } else if va == 1 || vb == 1 {
+            dist += w * 4; // "No Fit"
+        } else {
+            dist += w * u32::from(va.abs_diff(vb));
+        }
+    }
+    dist
+}
+
+/// OpenType `fvar` variable font design axis metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FontVariationAxis {
+    pub tag: String,
+    pub min_value: f32,
+    pub default_value: f32,
+    pub max_value: f32,
+}
+
+/// Stored user/auto font substitution rule in SQLite `font_substitutions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FontSubstitutionRecord {
+    pub missing_family: String,
+    pub substitute_family: String,
+    pub panose: PanoseClassification,
+    pub updated_at: String,
+}
 
 /// Row stored in `font_index`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,13 +141,14 @@ pub struct FontRecord {
     pub is_variable: bool,
     pub supports_arabic_rtl: bool,
     pub supports_kashida: bool,
+    pub panose: PanoseClassification,
     pub collection_tag: String,
     pub favorite: bool,
     pub file_mtime_epoch: i64,
 }
 
 /// Metadata extracted from a single SFNT face inside a `.ttf`, `.otf`, or `.ttc` file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedFontFace {
     pub face_index: u32,
     pub family_name: String,
@@ -50,6 +159,8 @@ pub struct ParsedFontFace {
     pub is_variable: bool,
     pub supports_arabic_rtl: bool,
     pub supports_kashida: bool,
+    pub panose: PanoseClassification,
+    pub variation_axes: Vec<FontVariationAxis>,
 }
 
 /// Filter parameters for [`StorageDb::search_fonts`].
@@ -196,15 +307,16 @@ impl StorageDb {
             for face in &faces {
                 let id = Uuid::new_v4().to_string();
                 let safe_weight = i64::from(face.weight.clamp(100, 1000));
+                let panose_hex = face.panose.to_hex();
                 self.conn.execute(
                     "INSERT INTO font_index (
                          id, file_path, face_index, family_name, subfamily_name, postscript_name,
                          weight, italic, is_variable, supports_arabic_rtl, supports_kashida,
-                         collection_tag, favorite, file_mtime_epoch, indexed_at
+                         panose_hex, collection_tag, favorite, file_mtime_epoch, indexed_at
                      ) VALUES (
                          ?1, ?2, ?3, ?4, ?5, ?6,
                          ?7, ?8, ?9, ?10, ?11,
-                         ?12, 0, ?13, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         ?12, ?13, 0, ?14, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                      )
                      ON CONFLICT(file_path, face_index) DO UPDATE SET
                          family_name         = excluded.family_name,
@@ -215,6 +327,7 @@ impl StorageDb {
                          is_variable         = excluded.is_variable,
                          supports_arabic_rtl = excluded.supports_arabic_rtl,
                          supports_kashida    = excluded.supports_kashida,
+                         panose_hex          = excluded.panose_hex,
                          collection_tag      = excluded.collection_tag,
                          file_mtime_epoch    = excluded.file_mtime_epoch,
                          indexed_at          = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
@@ -230,6 +343,7 @@ impl StorageDb {
                         i64::from(face.is_variable),
                         i64::from(face.supports_arabic_rtl),
                         i64::from(face.supports_kashida),
+                        panose_hex,
                         collection_tag,
                         mtime,
                     ],
@@ -263,7 +377,7 @@ impl StorageDb {
         let mut sql = String::from(
             "SELECT id, file_path, face_index, family_name, subfamily_name, postscript_name,
                     weight, italic, is_variable, supports_arabic_rtl, supports_kashida,
-                    collection_tag, favorite, file_mtime_epoch
+                    panose_hex, collection_tag, favorite, file_mtime_epoch
              FROM font_index WHERE 1=1",
         );
 
@@ -333,9 +447,117 @@ impl StorageDb {
         )?;
         Ok(count > 0)
     }
+
+    /// Finds the closest PANOSE substitute in `font_index` for `target_panose` / style.
+    pub fn find_best_panose_substitute(
+        &self,
+        target_panose: &PanoseClassification,
+        target_weight: u16,
+        target_italic: bool,
+        require_arabic: bool,
+    ) -> StorageResult<Option<(FontRecord, u32)>> {
+        let candidates = self.search_fonts(&FontQuery {
+            arabic_only: require_arabic,
+            ..FontQuery::default()
+        })?;
+        let mut best: Option<(FontRecord, u32)> = None;
+        for rec in candidates {
+            let p_dist = panose_distance(target_panose, &rec.panose);
+            let w_pen = u32::from(rec.weight.abs_diff(target_weight)) / 50;
+            let it_pen = if rec.italic == target_italic { 0 } else { 15 };
+            let score = p_dist + w_pen + it_pen;
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_score)| score < *best_score)
+            {
+                best = Some((rec, score));
+            }
+        }
+        Ok(best)
+    }
+
+    /// Persists a user-selected font substitution mapping for a missing font family.
+    pub fn set_font_substitution(
+        &self,
+        missing_family: &str,
+        substitute_family: &str,
+        panose: Option<&PanoseClassification>,
+    ) -> StorageResult<()> {
+        let m = missing_family.trim();
+        let s = substitute_family.trim();
+        if m.is_empty() || s.is_empty() {
+            return Err(StorageError::InvalidArgument(
+                "missing_family and substitute_family must be non-empty".into(),
+            ));
+        }
+        let hex = panose.copied().unwrap_or_default().to_hex();
+        self.conn.execute(
+            "INSERT INTO font_substitutions (missing_family, substitute_family, panose_hex, updated_at)
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(missing_family) DO UPDATE SET
+                 substitute_family = excluded.substitute_family,
+                 panose_hex        = excluded.panose_hex,
+                 updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            params![m, s, hex],
+        )?;
+        Ok(())
+    }
+
+    /// Looks up a persisted substitution mapping for `missing_family` (case-insensitive).
+    pub fn get_font_substitution(
+        &self,
+        missing_family: &str,
+    ) -> StorageResult<Option<FontSubstitutionRecord>> {
+        self.conn
+            .query_row(
+                "SELECT missing_family, substitute_family, panose_hex, updated_at
+                 FROM font_substitutions WHERE lower(missing_family) = lower(?1)",
+                params![missing_family.trim()],
+                |row| {
+                    let hex: String = row.get(2)?;
+                    Ok(FontSubstitutionRecord {
+                        missing_family: row.get(0)?,
+                        substitute_family: row.get(1)?,
+                        panose: PanoseClassification::from_hex(&hex).unwrap_or_default(),
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// Lists all persisted font substitution rules.
+    pub fn list_font_substitutions(&self) -> StorageResult<Vec<FontSubstitutionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT missing_family, substitute_family, panose_hex, updated_at
+             FROM font_substitutions ORDER BY missing_family COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let hex: String = row.get(2)?;
+            Ok(FontSubstitutionRecord {
+                missing_family: row.get(0)?,
+                substitute_family: row.get(1)?,
+                panose: PanoseClassification::from_hex(&hex).unwrap_or_default(),
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Deletes a persisted font substitution rule.
+    pub fn remove_font_substitution(&self, missing_family: &str) -> StorageResult<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM font_substitutions WHERE lower(missing_family) = lower(?1)",
+            params![missing_family.trim()],
+        )?;
+        Ok(count > 0)
+    }
 }
 
 fn row_to_font(row: &rusqlite::Row<'_>) -> rusqlite::Result<FontRecord> {
+    let panose_hex: String = row.get(11)?;
     Ok(FontRecord {
         id: row.get(0)?,
         file_path: row.get(1)?,
@@ -348,9 +570,10 @@ fn row_to_font(row: &rusqlite::Row<'_>) -> rusqlite::Result<FontRecord> {
         is_variable: row.get::<_, i64>(8)? != 0,
         supports_arabic_rtl: row.get::<_, i64>(9)? != 0,
         supports_kashida: row.get::<_, i64>(10)? != 0,
-        collection_tag: row.get(11)?,
-        favorite: row.get::<_, i64>(12)? != 0,
-        file_mtime_epoch: row.get(13)?,
+        panose: PanoseClassification::from_hex(&panose_hex).unwrap_or_default(),
+        collection_tag: row.get(12)?,
+        favorite: row.get::<_, i64>(13)? != 0,
+        file_mtime_epoch: row.get(14)?,
     })
 }
 
@@ -467,7 +690,7 @@ fn inspect_sfnt_face(
     let mut name_table: Option<&[u8]> = None;
     let mut os2_table: Option<&[u8]> = None;
     let mut cmap_table: Option<&[u8]> = None;
-    let mut is_variable = false;
+    let mut fvar_table: Option<&[u8]> = None;
 
     for i in 0..num_tables.min(256) {
         let rec_off = face_offset.checked_add(12)?.checked_add(i * 16)?;
@@ -488,10 +711,12 @@ fn inspect_sfnt_face(
             b"name" => name_table = Some(slice),
             b"OS/2" => os2_table = Some(slice),
             b"cmap" => cmap_table = Some(slice),
-            b"fvar" => is_variable = true,
+            b"fvar" => fvar_table = Some(slice),
             _ => {}
         }
     }
+    let variation_axes = fvar_table.map(parse_fvar_axes).unwrap_or_default();
+    let is_variable = fvar_table.is_some();
 
     let names = name_table.map(parse_name_table).unwrap_or_default();
     let family_name = names
@@ -505,9 +730,12 @@ fn inspect_sfnt_face(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Regular".to_owned());
 
-    let (weight, os2_italic, os2_arabic) = os2_table
-        .map(parse_os2_table)
-        .unwrap_or((400, false, false));
+    let (weight, os2_italic, os2_arabic, panose) = os2_table.map(parse_os2_table).unwrap_or((
+        400,
+        false,
+        false,
+        PanoseClassification::default(),
+    ));
 
     let italic = os2_italic
         || subfamily_name.to_ascii_lowercase().contains("italic")
@@ -530,6 +758,8 @@ fn inspect_sfnt_face(
         is_variable,
         supports_arabic_rtl,
         supports_kashida,
+        panose,
+        variation_axes,
     })
 }
 
@@ -610,8 +840,52 @@ fn parse_name_table(table: &[u8]) -> NameRecords {
     out
 }
 
-fn parse_os2_table(table: &[u8]) -> (u16, bool, bool) {
+fn parse_fvar_axes(table: &[u8]) -> Vec<FontVariationAxis> {
+    let Some(axes_array_off) = read_u16_be(table, 4).map(usize::from) else {
+        return Vec::new();
+    };
+    let Some(axis_count) = read_u16_be(table, 8).map(usize::from) else {
+        return Vec::new();
+    };
+    let Some(axis_size) = read_u16_be(table, 10).map(usize::from) else {
+        return Vec::new();
+    };
+    if axis_size < 20 {
+        return Vec::new();
+    }
+    let mut axes = Vec::new();
+    for i in 0..axis_count.min(32) {
+        let Some(off) = axes_array_off.checked_add(i * axis_size) else {
+            break;
+        };
+        if off + 20 > table.len() {
+            break;
+        }
+        let tag = String::from_utf8_lossy(&table[off..off + 4]).into_owned();
+        let min_value = read_s16_fixed16(table, off + 4).unwrap_or(0.0);
+        let default_value = read_s16_fixed16(table, off + 8).unwrap_or(0.0);
+        let max_value = read_s16_fixed16(table, off + 12).unwrap_or(0.0);
+        axes.push(FontVariationAxis {
+            tag,
+            min_value,
+            default_value,
+            max_value,
+        });
+    }
+    axes
+}
+
+fn read_s16_fixed16(buf: &[u8], off: usize) -> Option<f32> {
+    let s = buf.get(off..off + 4)?;
+    Some(i32::from_be_bytes([s[0], s[1], s[2], s[3]]) as f32 / 65_536.0)
+}
+
+fn parse_os2_table(table: &[u8]) -> (u16, bool, bool, PanoseClassification) {
     let weight = read_u16_be(table, 4).unwrap_or(400);
+    let mut panose = [0u8; 10];
+    if let Some(p) = table.get(32..42) {
+        panose.copy_from_slice(p);
+    }
     // ulUnicodeRange1 at offset 42 (bit 13 = Arabic U+0600..U+06FF)
     // ulUnicodeRange2 at offset 46 (bit 31 -> bit 63 = Arabic Presentation Forms-A)
     // ulUnicodeRange3 at offset 50 (bit 3 -> bit 67 = Arabic Presentation Forms-B)
@@ -624,7 +898,12 @@ fn parse_os2_table(table: &[u8]) -> (u16, bool, bool) {
     // fsSelection at offset 62: bit 0 = ITALIC, bit 9 = OBLIQUE
     let fs_sel = read_u16_be(table, 62).unwrap_or(0);
     let is_italic = (fs_sel & 0x0001) != 0 || (fs_sel & 0x0200) != 0;
-    (weight, is_italic, has_arabic_range)
+    (
+        weight,
+        is_italic,
+        has_arabic_range,
+        PanoseClassification(panose),
+    )
 }
 
 /// Checks `cmap` Format 4 and Format 12 subtables for Arabic letters (`U+0627` Alef / `U+0628` Beh)
@@ -785,13 +1064,14 @@ mod tests {
     use super::*;
 
     /// Synthesizes a minimal valid SFNT TrueType font in-memory for deterministic testing.
-    fn build_synthetic_ttf(
+    fn build_synthetic_ttf_with_panose(
         family: &str,
         subfamily: &str,
         weight: u16,
         italic: bool,
         arabic: bool,
         kashida: bool,
+        panose: [u8; 10],
     ) -> Vec<u8> {
         // 1. Build `name` table (2 Windows UTF-16BE records: family=1, subfamily=2)
         let fam_u16: Vec<u8> = family.encode_utf16().flat_map(u16::to_be_bytes).collect();
@@ -825,6 +1105,7 @@ mod tests {
         // 2. Build `OS/2` table (78 bytes)
         let mut os2_tbl = vec![0u8; 78];
         os2_tbl[4..6].copy_from_slice(&weight.to_be_bytes());
+        os2_tbl[32..42].copy_from_slice(&panose);
         let ur1: u32 = if arabic { 1 << 13 } else { 1 }; // bit 13 = Arabic, bit 0 = Basic Latin
         os2_tbl[42..46].copy_from_slice(&ur1.to_be_bytes());
         let fs_sel: u16 = if italic { 1 } else { 0x40 };
@@ -880,6 +1161,25 @@ mod tests {
             out.extend_from_slice(&data);
         }
         out
+    }
+
+    fn build_synthetic_ttf(
+        family: &str,
+        subfamily: &str,
+        weight: u16,
+        italic: bool,
+        arabic: bool,
+        kashida: bool,
+    ) -> Vec<u8> {
+        build_synthetic_ttf_with_panose(
+            family,
+            subfamily,
+            weight,
+            italic,
+            arabic,
+            kashida,
+            [2, 11, 6, 4, 2, 2, 2, 2, 2, 4],
+        )
     }
 
     #[test]
@@ -946,5 +1246,81 @@ mod tests {
         assert_eq!(report3.files_failed, 1);
         assert_eq!(report3.quarantined_files.len(), 1);
         assert!(report3.quarantined_files[0].ends_with("Corrupt-Font.ttf"));
+    }
+
+    #[test]
+    fn panose_extraction_similarity_matching_and_sqlite_substitution_prefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sans_p = [2, 11, 5, 3, 2, 2, 2, 2, 2, 4];
+        let serif_p = [2, 2, 6, 3, 5, 4, 5, 2, 3, 4];
+        let mono_p = [2, 11, 5, 9, 2, 2, 3, 2, 2, 4];
+
+        std::fs::write(
+            dir.path().join("CleanSans.ttf"),
+            build_synthetic_ttf_with_panose(
+                "Clean Sans",
+                "Regular",
+                400,
+                false,
+                false,
+                false,
+                sans_p,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("BookSerif.ttf"),
+            build_synthetic_ttf_with_panose(
+                "Book Serif",
+                "Regular",
+                400,
+                false,
+                false,
+                false,
+                serif_p,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("CodeMono.ttf"),
+            build_synthetic_ttf_with_panose(
+                "Code Mono",
+                "Regular",
+                400,
+                false,
+                false,
+                false,
+                mono_p,
+            ),
+        )
+        .unwrap();
+
+        let db = StorageDb::open_in_memory().unwrap();
+        let rep = db
+            .scan_font_directories(&[dir.path().to_path_buf()], "system")
+            .unwrap();
+        assert_eq!(rep.faces_indexed, 3);
+
+        // Query closest substitute for a sans-serif missing font -> selects Clean Sans over Book Serif / Code Mono
+        let target_sans = PanoseClassification([2, 11, 6, 3, 2, 2, 2, 2, 2, 4]);
+        let (best, score) = db
+            .find_best_panose_substitute(&target_sans, 400, false, false)
+            .unwrap()
+            .expect("best PANOSE match");
+        assert_eq!(best.family_name, "Clean Sans");
+        assert!(score < 10);
+
+        // Persist user substitution preference in SQLite and verify CRUD roundtrip
+        db.set_font_substitution("Missing Helv", "Clean Sans", Some(&target_sans))
+            .unwrap();
+        let got = db
+            .get_font_substitution("missing helv")
+            .unwrap()
+            .expect("case-insensitive substitution lookup");
+        assert_eq!(got.substitute_family, "Clean Sans");
+        assert_eq!(got.panose, target_sans);
+        assert_eq!(db.list_font_substitutions().unwrap().len(), 1);
+        assert!(db.remove_font_substitution("Missing Helv").unwrap());
+        assert!(db.list_font_substitutions().unwrap().is_empty());
     }
 }

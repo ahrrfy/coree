@@ -736,11 +736,12 @@ impl StudioApp {
                 }
                 let cw = x1 - x0;
                 let ch = y1 - y0;
+                let filtered_rgba = filtered_asset.to_rgba8_vec();
                 let mut cropped_bytes = Vec::with_capacity((cw * ch * 4) as usize);
                 for row in y0..y1 {
                     let start = ((row * aw + x0) * 4) as usize;
                     let end = ((row * aw + x1) * 4) as usize;
-                    cropped_bytes.extend_from_slice(&filtered_asset.rgba_bytes[start..end]);
+                    cropped_bytes.extend_from_slice(&filtered_rgba[start..end]);
                 }
                 let cropped_asset = RasterAsset::new(
                     cw,
@@ -911,6 +912,17 @@ impl StudioApp {
 
     /// Resamples the selected raster object's underlying bitmap to `(new_w, new_h)`.
     pub fn resample_selected_bitmap(&mut self, new_w: u32, new_h: u32) {
+        let algo = self.bitmap_state.resample_algo;
+        self.resample_selected_bitmap_with_algorithm(new_w, new_h, algo);
+    }
+
+    /// Resamples the selected raster object's underlying bitmap using `algorithm`.
+    pub fn resample_selected_bitmap_with_algorithm(
+        &mut self,
+        new_w: u32,
+        new_h: u32,
+        algorithm: coree_render::ResampleAlgorithm,
+    ) {
         let plan: Result<CommandOp, String> = {
             let Some(tab) = self.tabs.get(self.active_tab) else {
                 return;
@@ -931,7 +943,12 @@ impl StudioApp {
             let Some(orig) = tab.document.asset(data.asset_id) else {
                 return;
             };
-            match resample(orig, new_w.clamp(4, 8192), new_h.clamp(4, 8192)) {
+            match coree_render::resample_with_algorithm(
+                orig,
+                new_w.clamp(4, 8192),
+                new_h.clamp(4, 8192),
+                algorithm,
+            ) {
                 Ok(mut resized) => {
                     let new_asset_id = coree_core::ImageAssetId::new();
                     resized.id = new_asset_id;
@@ -954,6 +971,83 @@ impl StudioApp {
             },
             Err(e) => self.push_toast(e, true),
         }
+    }
+
+    /// Converts the selected raster bitmap between 8-bit (`Bit8`) and 16-bit (`Bit16`) channels.
+    pub fn convert_selected_bitmap_depth(&mut self, depth: coree_core::PixelDepth) {
+        let plan = self.active_tab().and_then(|tab| {
+            let id = tab.selection.objects.iter().copied().find(|id| {
+                tab.document
+                    .object(*id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+            })?;
+            let NodePayload::Raster(mut data) = tab.document.object(id)?.payload.clone() else {
+                return None;
+            };
+            let orig = tab.document.asset(data.asset_id)?;
+            let mut converted = coree_render::convert_raster_depth(orig, depth);
+            let new_id = coree_core::ImageAssetId::new();
+            converted.id = new_id;
+            data.asset_id = new_id;
+            Some(CommandOp::Batch(vec![
+                CommandOp::RegisterAsset { asset: converted },
+                CommandOp::UpdateRaster { id, data },
+            ]))
+        });
+        let Some(cmd) = plan else {
+            self.push_toast("Select a raster bitmap to convert bit depth", false);
+            return;
+        };
+        if self.execute_command(cmd).is_ok() {
+            self.push_toast(format!("Converted bitmap to {:?}", depth), false);
+        }
+    }
+
+    /// Converts the selected raster bitmap's color mode (`Rgb` / `Cmyk`) through the active ICC pipeline.
+    pub fn convert_selected_bitmap_color_mode(&mut self, mode: ColorMode) {
+        let plan = self.active_tab().and_then(|tab| {
+            let id = tab.selection.objects.iter().copied().find(|id| {
+                tab.document
+                    .object(*id)
+                    .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+            })?;
+            let NodePayload::Raster(mut data) = tab.document.object(id)?.payload.clone() else {
+                return None;
+            };
+            let orig = tab.document.asset(data.asset_id)?;
+            let icc = tab.document.icc_pipeline();
+            let mut converted = coree_render::convert_raster_color_mode(orig, mode, Some(&icc));
+            let new_id = coree_core::ImageAssetId::new();
+            converted.id = new_id;
+            data.asset_id = new_id;
+            Some(CommandOp::Batch(vec![
+                CommandOp::RegisterAsset { asset: converted },
+                CommandOp::UpdateRaster { id, data },
+            ]))
+        });
+        let Some(cmd) = plan else {
+            self.push_toast("Select a raster bitmap to convert color mode", false);
+            return;
+        };
+        if self.execute_command(cmd).is_ok() {
+            self.push_toast(format!("Converted bitmap to {mode:?}"), false);
+        }
+    }
+
+    /// Computes a live histogram for the currently selected raster bitmap.
+    #[must_use]
+    pub fn selected_bitmap_histogram(&self, bins: usize) -> Option<coree_render::RasterHistogram> {
+        let tab = self.active_tab()?;
+        let id = tab.selection.objects.iter().copied().find(|id| {
+            tab.document
+                .object(*id)
+                .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
+        })?;
+        let NodePayload::Raster(ref data) = tab.document.object(id)?.payload else {
+            return None;
+        };
+        let asset = tab.document.asset(data.asset_id)?;
+        Some(coree_render::compute_histogram(asset, bins))
     }
 
     /// Builds a [`FindQuery`] from [`FindReplaceState`].
@@ -2739,6 +2833,14 @@ impl StudioApp {
                         metadata: None,
                         custom_icc_profile: None,
                         clear_custom_icc: false,
+                        rgb_icc_profile: None,
+                        clear_rgb_icc: false,
+                        cmyk_icc_profile: None,
+                        clear_cmyk_icc: false,
+                        gray_icc_profile: None,
+                        clear_gray_icc: false,
+                        rendering_intent: None,
+                        black_point_compensation: None,
                     });
                     if let Some(t) = self.active_tab_mut() {
                         t.viewport.multipage_view = next;

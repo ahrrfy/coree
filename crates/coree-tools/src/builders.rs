@@ -1385,6 +1385,7 @@ pub fn build_interactive_effect_output(
                     steps: ts.effect_steps.clamp(1, 100),
                     rotation_deg: 0.0,
                     along_path: None,
+                    rotate_along_path: true,
                 },
             )
         }
@@ -1442,17 +1443,29 @@ pub fn build_interactive_effect_output(
                 .document
                 .local_object_bounds(oid)
                 .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 40.0, 40.0));
-            let cx = local_bb.center().x;
-            let cy = local_bb.center().y;
+            let w = local_bb.width();
+            let h = local_bb.height();
+            let x0 = local_bb.min_x;
+            let x1 = x0 + w / 3.0;
+            let x2 = x0 + 2.0 * w / 3.0;
+            let x3 = local_bb.max_x;
+            let y0 = local_bb.min_y;
+            let y1 = y0 + h / 3.0;
+            let y2 = y0 + 2.0 * h / 3.0;
+            let y3 = local_bb.max_y;
             let mut cage = vec![
-                Point2D::new(local_bb.min_x, local_bb.min_y),
-                Point2D::new(cx, local_bb.min_y),
-                Point2D::new(local_bb.max_x, local_bb.min_y),
-                Point2D::new(local_bb.max_x, cy),
-                Point2D::new(local_bb.max_x, local_bb.max_y),
-                Point2D::new(cx, local_bb.max_y),
-                Point2D::new(local_bb.min_x, local_bb.max_y),
-                Point2D::new(local_bb.min_x, cy),
+                Point2D::new(x0, y0),
+                Point2D::new(x1, y0),
+                Point2D::new(x2, y0),
+                Point2D::new(x3, y0),
+                Point2D::new(x3, y1),
+                Point2D::new(x3, y2),
+                Point2D::new(x3, y3),
+                Point2D::new(x2, y3),
+                Point2D::new(x1, y3),
+                Point2D::new(x0, y3),
+                Point2D::new(x0, y2),
+                Point2D::new(x0, y1),
             ];
             let inv = world_inverse_transform_of(ctx.document, oid);
             let ls = inv.transform_point(start_mm);

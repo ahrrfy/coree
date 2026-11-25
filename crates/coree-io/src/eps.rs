@@ -618,7 +618,7 @@ fn emit_eps_object(
                 }
             }
             NodePayload::ParagraphText(para) => {
-                let pieces = text_engine.layout_paragraph_pieces(para);
+                let pieces = text_engine.layout_paragraph_in_doc(doc, obj.id, para);
                 if parent_persp.is_some() || obj.perspective.is_some() {
                     for piece in &pieces {
                         let bp = if let Some(persp) = obj.perspective {
@@ -993,11 +993,12 @@ fn emit_eps_object(
                     let br =
                         world_xf.transform_point(Point2D::new(raster.width_mm, raster.height_mm));
                     let tl = world_xf.transform_point(Point2D::new(0.0, 0.0));
+                    let rgba8 = asset.to_rgba8_vec();
                     emit_eps_rgba_image(
                         page,
                         asset.width,
                         asset.height,
-                        &asset.rgba_bytes,
+                        &rgba8,
                         bl,
                         br,
                         tl,

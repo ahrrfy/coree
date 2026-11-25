@@ -33,6 +33,10 @@ pub const DEFAULT_SESSION_ID: &str = "default";
 /// Maximum snapshot blob size read during crash recovery (512 MiB).
 pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Number of differential WAL delta snapshots before the background worker compacts
+/// the chain into a fresh baseline snapshot (well below `MAX_DELTA_CHAIN = 512`).
+pub const WAL_COMPACTION_INTERVAL: usize = 128;
+
 /// Metadata row stored in `autosave_snapshots`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutosaveSnapshotInfo {
@@ -131,6 +135,15 @@ enum AutosaveTask {
     DifferentialDelta {
         delta_id: String,
         patch: Box<DifferentialSnapshotPatch>,
+    },
+    CompactBaseline {
+        new_snapshot_id: String,
+        doc_id: String,
+        session_id: String,
+        title: String,
+        source_path: Option<String>,
+        latest_delta_id: String,
+        last_command_seq: u64,
     },
     AppendCommand {
         doc_id: String,
@@ -284,6 +297,101 @@ impl AsyncAutosaveHandle {
                                 }
                             }
                         }
+                        AutosaveTask::CompactBaseline {
+                            new_snapshot_id,
+                            doc_id,
+                            session_id,
+                            title,
+                            source_path,
+                            latest_delta_id,
+                            last_command_seq,
+                        } => {
+                            if let Ok(mut doc) =
+                                materialize_chain_from_dir(&autosave_dir, &latest_delta_id)
+                            {
+                                let mut replay_ok = true;
+                                if let Some(ref conn) = worker_conn {
+                                    let base_seq: i64 = conn
+                                        .query_row(
+                                            "SELECT last_command_seq FROM autosave_snapshots WHERE id = ?1",
+                                            params![latest_delta_id],
+                                            |row| row.get(0),
+                                        )
+                                        .optional()
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(0);
+                                    let target_seq = last_command_seq.min(i64::MAX as u64) as i64;
+                                    if target_seq > base_seq {
+                                        if let Ok(mut stmt) = conn.prepare(
+                                            "SELECT payload_json FROM command_journal
+                                             WHERE document_id = ?1 AND session_id = ?2
+                                               AND seq_no > ?3 AND seq_no <= ?4 AND applied = 1
+                                             ORDER BY seq_no ASC",
+                                        ) {
+                                            if let Ok(rows) = stmt.query_map(
+                                                params![doc_id, session_id, base_seq, target_seq],
+                                                |row| row.get::<_, String>(0),
+                                            ) {
+                                                for row in rows {
+                                                    let Ok(payload_json) = row else {
+                                                        replay_ok = false;
+                                                        break;
+                                                    };
+                                                    let Ok(op) = serde_json::from_str::<CommandOp>(
+                                                        &payload_json,
+                                                    ) else {
+                                                        replay_ok = false;
+                                                        break;
+                                                    };
+                                                    if apply_command(&mut doc, &op).is_err() {
+                                                        replay_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if replay_ok {
+                                    if let Ok((blob_path, sha256, byte_size)) =
+                                        write_baseline_blob(&autosave_dir, &new_snapshot_id, &doc)
+                                    {
+                                        let blob_str = blob_path.to_string_lossy().into_owned();
+                                        if let Some(ref conn) = worker_conn {
+                                            if insert_snapshot_row(
+                                                conn,
+                                                &new_snapshot_id,
+                                                &doc_id,
+                                                &session_id,
+                                                source_path.as_deref(),
+                                                &title,
+                                                &blob_str,
+                                                &sha256,
+                                                last_command_seq as i64,
+                                                byte_size as i64,
+                                            )
+                                            .is_err()
+                                            {
+                                                let _ = std::fs::remove_file(&blob_path);
+                                            }
+                                        } else if let Ok(mut guard) = mem_clone.lock() {
+                                            guard.push(CompletedMemoryRow::Snapshot {
+                                                id: new_snapshot_id,
+                                                doc_id,
+                                                session_id,
+                                                orig_path: source_path,
+                                                title,
+                                                blob_path: blob_str,
+                                                sha256,
+                                                last_command_seq: last_command_seq as i64,
+                                                byte_size: byte_size as i64,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         AutosaveTask::AppendCommand {
                             doc_id,
                             session_id,
@@ -351,6 +459,56 @@ impl AsyncAutosaveHandle {
             let _ = handle.join();
         }
     }
+}
+
+fn read_gz_json_from_path(path: &Path) -> StorageResult<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut blob = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+        .read_to_end(&mut blob)?;
+    if (blob.len() as u64) > MAX_SNAPSHOT_BYTES {
+        return Err(StorageError::RecoveryFailed(
+            "autosave blob exceeds MAX_SNAPSHOT_BYTES".into(),
+        ));
+    }
+    if blob.starts_with(&[0x1F, 0x8B]) {
+        let mut decoded = Vec::new();
+        GzDecoder::new(&blob[..])
+            .take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+            .read_to_end(&mut decoded)?;
+        Ok(decoded)
+    } else {
+        Ok(blob)
+    }
+}
+
+fn materialize_chain_from_dir(autosave_dir: &Path, latest_id: &str) -> StorageResult<Document> {
+    const MAX_DELTA_CHAIN: usize = 512;
+    let mut patches: Vec<DifferentialSnapshotPatch> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut cur_id = latest_id.to_owned();
+    let mut doc = loop {
+        if !visited.insert(cur_id.clone()) || patches.len() >= MAX_DELTA_CHAIN {
+            return Err(StorageError::RecoveryFailed(
+                "compaction chain cycle or depth exceeded".into(),
+            ));
+        }
+        let delta_path = autosave_dir.join(format!("{cur_id}.delta.json.gz"));
+        if delta_path.is_file() {
+            let raw = read_gz_json_from_path(&delta_path)?;
+            let env: DifferentialSnapshotEnvelope = serde_json::from_slice(&raw)?;
+            cur_id = env.patch.base_snapshot_id.clone();
+            patches.push(env.patch);
+            continue;
+        }
+        let snap_path = autosave_dir.join(format!("{cur_id}.snapshot.json.gz"));
+        let raw = read_gz_json_from_path(&snap_path)?;
+        break serde_json::from_slice::<Document>(&raw)?;
+    };
+    for patch in patches.into_iter().rev() {
+        apply_differential_patch(&mut doc, &patch)?;
+    }
+    Ok(doc)
 }
 
 fn write_baseline_blob(
@@ -626,6 +784,61 @@ impl StorageDb {
                 byte_size as i64,
             )?;
             Ok(delta_id)
+        }
+    }
+
+    /// Enqueues a zero-UI-clone background WAL baseline compaction materializing the delta
+    /// chain ending at `latest_delta_id` into a fresh baseline snapshot, returning its ID.
+    pub fn enqueue_compact_baseline(
+        &self,
+        doc_id: &str,
+        session_id: &str,
+        title: &str,
+        source_path: Option<&Path>,
+        latest_delta_id: &str,
+        last_command_seq: u64,
+    ) -> StorageResult<String> {
+        if doc_id.trim().is_empty()
+            || session_id.trim().is_empty()
+            || latest_delta_id.trim().is_empty()
+        {
+            return Err(StorageError::InvalidArgument(
+                "compact baseline requires non-empty doc_id, session_id, and latest_delta_id"
+                    .into(),
+            ));
+        }
+        let new_snapshot_id = Uuid::new_v4().to_string();
+        let orig_path = source_path.map(|p| p.to_string_lossy().into_owned());
+        if let Some(tx) = self.autosave_worker.as_ref().and_then(|w| w.tx.as_ref()) {
+            tx.send(AutosaveTask::CompactBaseline {
+                new_snapshot_id: new_snapshot_id.clone(),
+                doc_id: doc_id.to_owned(),
+                session_id: session_id.to_owned(),
+                title: title.to_owned(),
+                source_path: orig_path,
+                latest_delta_id: latest_delta_id.to_owned(),
+                last_command_seq,
+            })
+            .map_err(|e| StorageError::ThreadPool(format!("autosave queue closed: {e}")))?;
+            Ok(new_snapshot_id)
+        } else {
+            let autosave_dir = self.autosave_dir()?;
+            let doc = materialize_chain_from_dir(&autosave_dir, latest_delta_id)?;
+            let (blob_path, sha256, byte_size) =
+                write_baseline_blob(&autosave_dir, &new_snapshot_id, &doc)?;
+            insert_snapshot_row(
+                &self.conn,
+                &new_snapshot_id,
+                doc_id,
+                session_id,
+                orig_path.as_deref(),
+                title,
+                &blob_path.to_string_lossy(),
+                &sha256,
+                last_command_seq as i64,
+                byte_size as i64,
+            )?;
+            Ok(new_snapshot_id)
         }
     }
 
@@ -1301,7 +1514,7 @@ fn apply_differential_patch(
         doc.set_metadata(meta.clone());
     }
     if let Some(nid) = patch.next_id {
-        doc.ensure_next_id_at_least(nid);
+        doc.restore_next_id_from_snapshot(nid);
     }
     Ok(())
 }
@@ -1789,5 +2002,75 @@ mod tests {
 
         let err = db.recover_document(&doc_id).unwrap_err();
         assert!(matches!(err, StorageError::IntegrityMismatch { .. }));
+    }
+
+    #[test]
+    fn background_wal_baseline_compaction_resets_chain_depth_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StorageDb::open(&dir.path().join("wal_compact.db")).unwrap();
+        let mut doc = Document::new_a4("CompactTest");
+        let doc_id = doc.id().to_string();
+        let lid = doc.pages()[0].layers[0].id;
+        let base = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+        let mut cur_base = base.id;
+        let mut oid = None;
+        for i in 0..5u64 {
+            let id = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        format!("R{i}"),
+                        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                            (i as f64) * 5.0,
+                            0.0,
+                            10.0,
+                            10.0,
+                        ))),
+                    ),
+                    Some(lid),
+                )
+                .unwrap();
+            oid = Some(id);
+            let patch = DifferentialSnapshotPatch {
+                doc_id: doc_id.clone(),
+                session_id: base.session_id.clone(),
+                title: doc.title().to_owned(),
+                source_path: None,
+                base_snapshot_id: cur_base.clone(),
+                last_command_seq: 0,
+                upserted_objects: vec![(id, doc.object(id).unwrap().clone())],
+                deleted_object_ids: Vec::new(),
+                upserted_assets: Vec::new(),
+                deleted_asset_ids: Vec::new(),
+                full_assets: None,
+                pages: Some(doc.pages().to_vec()),
+                active_page_index: None,
+                next_id: Some(doc.next_id()),
+                color_mode: None,
+                default_unit: None,
+                dpi: None,
+                multipage_view: None,
+                palettes: None,
+                document_palette: None,
+                guides: None,
+                grid: None,
+                perspective_grid: None,
+                color_styles: None,
+                object_styles: None,
+                symbols: None,
+                metadata: None,
+            };
+            cur_base = db.enqueue_differential_autosave(patch).unwrap();
+        }
+        let compacted_id = db
+            .enqueue_compact_baseline(&doc_id, &base.session_id, doc.title(), None, &cur_base, 0)
+            .unwrap();
+        db.flush_autosave(Duration::from_secs(5)).unwrap();
+
+        let recovered = db.recover_document(&doc_id).unwrap();
+        assert_eq!(recovered.objects().len(), 5);
+        assert!(recovered.has_object(oid.unwrap()));
+        let info = db.get_snapshot_by_id(&compacted_id).unwrap().unwrap();
+        assert!(info.snapshot_blob_path.ends_with(".snapshot.json.gz"));
     }
 }

@@ -3,9 +3,14 @@
 //! Fill models, outline stroke styling, blend modes, and reusable object styles.
 
 use crate::color::{Color, ColorStyleId};
+use crate::icc::IccColorPipeline;
 use crate::ids::{ImageAssetId, ObjectStyleId, SymbolId};
 use crate::math::{sanitize_f64, Affine2D, Point2D};
 use serde::{Deserialize, Serialize};
+
+const fn default_mesh_alpha() -> f32 {
+    1.0
+}
 
 /// Canonical hairline stroke width in millimeters (`0.003 in = 0.0762 mm`).
 pub const HAIRLINE_WIDTH_MM: f64 = 0.0762;
@@ -40,6 +45,34 @@ pub struct MeshNode {
     pub col: usize,
     pub pos: Point2D,
     pub color: Color,
+    #[serde(default = "default_mesh_alpha")]
+    pub alpha: f32,
+    #[serde(default)]
+    pub handle_n: Option<Point2D>,
+    #[serde(default)]
+    pub handle_s: Option<Point2D>,
+    #[serde(default)]
+    pub handle_e: Option<Point2D>,
+    #[serde(default)]
+    pub handle_w: Option<Point2D>,
+}
+
+impl MeshNode {
+    /// Creates a flat mesh node with `alpha = 1.0` and default Coons tangent handles (`None`).
+    #[must_use]
+    pub const fn new(row: usize, col: usize, pos: Point2D, color: Color) -> Self {
+        Self {
+            row,
+            col,
+            pos,
+            color,
+            alpha: 1.0,
+            handle_n: None,
+            handle_s: None,
+            handle_e: None,
+            handle_w: None,
+        }
+    }
 }
 
 /// Built-in PostScript-style procedural vector/hatching fill presets encoded via
@@ -256,6 +289,34 @@ impl Fill {
                     return b.color.clone();
                 }
                 return a.color.lerp(&b.color, (t - a.offset) / span);
+            }
+        }
+        stops.last().map_or(Color::TRANSPARENT, |s| s.color.clone())
+    }
+
+    /// Evaluates a gradient stop ramp at normalized position `t` in `0.0..=1.0` through `pipeline`.
+    #[must_use]
+    pub fn sample_stops_icc(stops: &[GradientStop], t: f32, pipeline: &IccColorPipeline) -> Color {
+        if stops.is_empty() {
+            return Color::TRANSPARENT;
+        }
+        let t = if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if stops.len() == 1 || t <= stops[0].offset {
+            return stops[0].color.clone();
+        }
+        for win in stops.windows(2) {
+            let a = &win[0];
+            let b = &win[1];
+            if t >= a.offset && t <= b.offset {
+                let span = b.offset - a.offset;
+                if span.abs() <= 1e-6 {
+                    return b.color.clone();
+                }
+                return a.color.lerp_icc(&b.color, (t - a.offset) / span, pipeline);
             }
         }
         stops.last().map_or(Color::TRANSPARENT, |s| s.color.clone())

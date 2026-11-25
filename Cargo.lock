@@ -664,6 +664,7 @@ dependencies = [
  "rayon",
  "resvg",
  "rstar",
+ "swash",
  "thiserror 2.0.21",
  "tiny-skia",
  "usvg",

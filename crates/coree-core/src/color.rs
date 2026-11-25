@@ -6,6 +6,9 @@
 //! No proprietary or licensed third-party color books are included.
 
 use crate::error::{CoreError, CoreResult};
+use crate::icc::{
+    convert_cmyk_to_rgb_icc, BuiltinIccProfile, IccColorPipeline, IccProfile, RenderingIntent,
+};
 use crate::math::sanitize_f32;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -90,6 +93,39 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
     let k = clamp01(k);
     let inv_k = 1.0 - k;
     [(1.0 - c) * inv_k, (1.0 - m) * inv_k, (1.0 - y) * inv_k]
+}
+
+/// Converts CMYK (`0.0..=1.0`) to sRGB (`0.0..=1.0`) through the specified built-in
+/// ICC profile, [`RenderingIntent`], and optional ISO 18619 Black Point Compensation.
+#[must_use]
+pub fn cmyk_to_rgb_icc(
+    c: f32,
+    m: f32,
+    y: f32,
+    k: f32,
+    profile: BuiltinIccProfile,
+    intent: RenderingIntent,
+    bpc: bool,
+) -> [f32; 3] {
+    let cmyk64 = [
+        f64::from(clamp01(c)),
+        f64::from(clamp01(m)),
+        f64::from(clamp01(y)),
+        f64::from(clamp01(k)),
+    ];
+    let prof = IccProfile::builtin(profile);
+    if let Some(rgb) = prof.cmyk_to_srgb_with_intent_bpc(cmyk64, intent, bpc) {
+        return [
+            rgb[0].clamp(0.0, 1.0) as f32,
+            rgb[1].clamp(0.0, 1.0) as f32,
+            rgb[2].clamp(0.0, 1.0) as f32,
+        ];
+    }
+    convert_cmyk_to_rgb_icc(
+        [clamp01(c), clamp01(m), clamp01(y), clamp01(k)],
+        profile,
+        intent,
+    )
 }
 
 fn rgb_to_cmyk(r: f32, g: f32, b: f32) -> [f32; 4] {
@@ -475,6 +511,12 @@ impl Color {
         }
     }
 
+    /// Converts any color variant into normalized `[r, g, b, a]` in `0.0..=1.0` through `pipeline`.
+    #[must_use]
+    pub fn to_rgba_f32_icc(&self, pipeline: &IccColorPipeline) -> [f32; 4] {
+        pipeline.color_to_rgba_f32(self)
+    }
+
     /// Converts any color variant into 8-bit `[r, g, b, a]` (`0..=255`).
     #[must_use]
     pub fn to_rgba8(&self) -> [u8; 4] {
@@ -485,6 +527,12 @@ impl Color {
             (b * 255.0).round() as u8,
             (a * 255.0).round() as u8,
         ]
+    }
+
+    /// Converts any color variant into 8-bit `[r, g, b, a]` (`0..=255`) through `pipeline`.
+    #[must_use]
+    pub fn to_rgba8_icc(&self, pipeline: &IccColorPipeline) -> [u8; 4] {
+        pipeline.color_to_rgba8(self)
     }
 
     /// Converts any color variant into process CMYK `[c, m, y, k]` (`0.0..=1.0`).
@@ -685,6 +733,12 @@ impl Color {
             b: a[2] + (b[2] - a[2]) * t,
             a: a[3] + (b[3] - a[3]) * t,
         }
+    }
+
+    /// ICC-aware color interpolation between `self` (`t = 0.0`) and `other` (`t = 1.0`).
+    #[must_use]
+    pub fn lerp_icc(&self, other: &Self, t: f32, pipeline: &IccColorPipeline) -> Self {
+        pipeline.lerp_color(self, other, t)
     }
 
     /// WCAG relative luminance (`0.0` black .. `1.0` white).

@@ -277,6 +277,7 @@ pub fn generate_sample_document() -> Document {
             frozen: false,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         },
         LensConfig {
             kind: LensKind::ColorAdd {
@@ -286,6 +287,7 @@ pub fn generate_sample_document() -> Document {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         },
         LensConfig {
             kind: LensKind::ColorLimit {
@@ -295,6 +297,7 @@ pub fn generate_sample_document() -> Document {
             frozen: false,
             viewpoint: Some(Point2D::new(40.0, 60.0)),
             remove_face: false,
+            frozen_snapshot: None,
         },
         LensConfig {
             kind: LensKind::CustomColorMap {
@@ -305,6 +308,7 @@ pub fn generate_sample_document() -> Document {
             frozen: false,
             viewpoint: None,
             remove_face: true,
+            frozen_snapshot: None,
         },
         LensConfig::new(LensKind::FishEye { rate_pct: 120.0 }),
         LensConfig::new(LensKind::HeatMap {
@@ -316,6 +320,7 @@ pub fn generate_sample_document() -> Document {
             frozen: true,
             viewpoint: Some(Point2D::new(80.0, 90.0)),
             remove_face: true,
+            frozen_snapshot: None,
         },
         LensConfig::new(LensKind::TintedGrayscale {
             tint: Color::rgb(0.3, 0.2, 0.1),

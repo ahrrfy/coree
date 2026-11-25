@@ -83,6 +83,7 @@ struct ViewportKey {
     gamut_warning: bool,
     proof_profile: BuiltinIccProfile,
     proof_intent: RenderingIntent,
+    icc_hash: u64,
 }
 
 impl ViewportKey {
@@ -123,6 +124,34 @@ impl ViewportKey {
             mix(&mut pages_hash, p.height_mm.to_bits());
             mix(&mut pages_hash, p.bleed_mm.to_bits());
         }
+        let mut icc_hash = 0xcbf2_9ce4_8422_2325_u64;
+        for slot in [
+            doc.rgb_icc_profile(),
+            doc.cmyk_icc_profile(),
+            doc.gray_icc_profile(),
+            doc.custom_icc_profile(),
+        ] {
+            match slot {
+                Some(bytes) => {
+                    mix(&mut icc_hash, 1);
+                    mix(&mut icc_hash, bytes.len() as u64);
+                    for chunk in bytes.chunks(8) {
+                        let mut buf = [0u8; 8];
+                        buf[..chunk.len()].copy_from_slice(chunk);
+                        mix(&mut icc_hash, u64::from_le_bytes(buf));
+                    }
+                }
+                None => mix(&mut icc_hash, 0),
+            }
+        }
+        let intent_code = match doc.rendering_intent() {
+            RenderingIntent::Perceptual => 0u64,
+            RenderingIntent::RelativeColorimetric => 1,
+            RenderingIntent::Saturation => 2,
+            RenderingIntent::AbsoluteColorimetric => 3,
+        };
+        mix(&mut icc_hash, intent_code);
+        mix(&mut icc_hash, u64::from(doc.black_point_compensation()));
         Self {
             width_px: vp.width_px,
             height_px: vp.height_px,
@@ -167,6 +196,7 @@ impl ViewportKey {
             gamut_warning: options.gamut_warning,
             proof_profile: options.proof_profile,
             proof_intent: options.proof_intent,
+            icc_hash,
         }
     }
 }
@@ -708,6 +738,7 @@ mod tests {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         let standalone_id = doc.add_object(standalone_lens, Some(lid)).unwrap();
 
@@ -717,6 +748,7 @@ mod tests {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         let sym = SymbolDef::new("OffTileSym", vec![sym_lens]);
         let sym_id = sym.id;
@@ -735,6 +767,7 @@ mod tests {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         let iso_lens_id = doc.add_object(iso_lens, Some(lid)).unwrap();
         let iso_grp_id = doc.group_objects(&[iso_lens_id], "IsoGrp").unwrap();

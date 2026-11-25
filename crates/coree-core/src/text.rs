@@ -136,6 +136,35 @@ impl Default for OpenTypeFeatures {
     }
 }
 
+/// Horizontal tab-stop alignment within a [`ParagraphText`] frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ParagraphTabAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// Explicit tab-stop position in millimeters within a [`ParagraphText`] frame.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParagraphTabStop {
+    pub position_mm: f64,
+    #[serde(default)]
+    pub align: ParagraphTabAlign,
+}
+
+/// Bulleted or numbered paragraph list formatting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ParagraphListStyle {
+    #[default]
+    None,
+    Bullet(String),
+    Numbered {
+        start: u32,
+        suffix: String,
+    },
+}
+
 /// Character and paragraph formatting attributes applied to a [`TextRun`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
@@ -148,6 +177,9 @@ pub struct TextStyle {
     pub bidi_font_family: Option<String>,
     #[serde(default)]
     pub opentype_features: OpenTypeFeatures,
+    /// OpenType variable-font (`fvar`) axis tag-value overrides (e.g. `("wdth", 125.0)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variation_axes: Vec<(String, f32)>,
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
@@ -169,6 +201,7 @@ impl Default for TextStyle {
             font_weight: 400,
             bidi_font_family: None,
             opentype_features: OpenTypeFeatures::default(),
+            variation_axes: Vec::new(),
             italic: false,
             underline: false,
             strikethrough: false,
@@ -318,6 +351,10 @@ pub struct ParagraphText {
     pub linked_next_frame: Option<ObjectId>,
     pub wrap_mode: TextWrapMode,
     pub drop_cap: Option<DropCapConfig>,
+    #[serde(default)]
+    pub tab_stops_mm: Vec<ParagraphTabStop>,
+    #[serde(default)]
+    pub list_style: Option<ParagraphListStyle>,
     pub direction: TextDirection,
     pub align: TextAlign,
 }
@@ -339,6 +376,8 @@ impl ParagraphText {
             linked_next_frame: None,
             wrap_mode: TextWrapMode::None,
             drop_cap: None,
+            tab_stops_mm: Vec::new(),
+            list_style: None,
             direction,
             align,
         }

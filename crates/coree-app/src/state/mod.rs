@@ -24,10 +24,10 @@ use coree_core::{
     ConnectorStyle, ContourMode, CornerStyle, DimensionKind, DistortKind, DistributeOp, Document,
     DocumentInvalidation, Effect, EllipseMode, EnvelopeMode, FeatherDirection, Fill,
     GuideOrientation, ImageAssetId, ImpactStyle, LayerId, LensConfig, LensKind, MasterLayerScope,
-    MeshNode, NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape,
-    PathNode, Point2D, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent,
-    SceneObject, SelectionState, SnapEngine, Subpath, SymbolId, TextOnPath, TextStyle,
-    TransparencyMode, Unit, Vec2D, VectorTable, ZOrderOp,
+    NodeKind, NodePayload, NodeRef, ObjectId, OutlineStyle, PageId, ParametricShape, PathNode,
+    Point2D, RasterAsset, RasterFilter, RasterLayerData, Rect2D, RenderingIntent, SceneObject,
+    SelectionState, SnapEngine, Subpath, SymbolId, TextOnPath, TextStyle, TransparencyMode, Unit,
+    Vec2D, VectorTable, ZOrderOp,
 };
 use coree_io::import_palette_file;
 use coree_prod::{
@@ -47,7 +47,7 @@ use coree_render::{
     apply_dodge_burn_stroke, apply_healing_stroke, clone_stamp_stroke, compute_page_layouts,
     convert_object_to_bitmap_with_bounds, create_smart_fill_object, erase_stroke, hit_test_point,
     lower_effects_to_primitives, paint_brush_stroke, paint_brush_stroke_masked, raster_flood_fill,
-    resample, smudge_stroke, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
+    smudge_stroke, trace_raster_to_mm, DirtyTileCache, DodgeBurnMode, DynamicGuideLine,
     GlyphBlockFilter, OutlinePreset, RasterMask, RenderOptions, SceneRenderer, SnapOptions,
     TextEngine, ToneRange, TraceConfig, TraceMode, ViewMode, Viewport,
 };
@@ -683,9 +683,8 @@ impl StudioApp {
                 tab.wal_session_open = false;
                 tab.wal_session_id = None;
                 tab.wal_base_snapshot_id = None;
-                tab.autosave_dirty_objects.clear();
-                tab.autosave_dirty_structure = false;
-                tab.autosave_dirty_all = false;
+                tab.wal_delta_count = 0;
+                clear_tab_autosave_dirty(tab);
             }
             let rec = RecentDocumentRecord {
                 id: Uuid::new_v4().to_string(),
@@ -825,56 +824,26 @@ impl StudioApp {
             if let (Some(session_id), Some(base_id)) =
                 (tab.wal_session_id.clone(), tab.wal_base_snapshot_id.clone())
             {
-                let mut upserted_objects = Vec::with_capacity(tab.autosave_dirty_objects.len());
-                let mut deleted_object_ids = Vec::new();
-                for &oid in &tab.autosave_dirty_objects {
-                    if let Some(obj) = tab.document.object(oid) {
-                        upserted_objects.push((oid, obj.clone()));
-                    } else {
-                        deleted_object_ids.push(oid);
-                    }
-                }
-                let struct_dirty = tab.autosave_dirty_structure;
-                let patch = DifferentialSnapshotPatch {
-                    doc_id: doc_id.clone(),
-                    session_id,
-                    title: tab.document.title().to_owned(),
-                    source_path: tab
-                        .source_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned()),
-                    base_snapshot_id: base_id,
-                    last_command_seq: tab.journal_seq,
-                    upserted_objects,
-                    deleted_object_ids,
-                    upserted_assets: Vec::new(),
-                    deleted_asset_ids: Vec::new(),
-                    full_assets: struct_dirty.then(|| tab.document.assets().clone()),
-                    pages: struct_dirty.then(|| tab.document.pages().to_vec()),
-                    active_page_index: struct_dirty.then(|| tab.document.active_page_index()),
-                    next_id: Some(tab.document.next_id()),
-                    color_mode: struct_dirty.then(|| tab.document.color_mode()),
-                    default_unit: struct_dirty.then(|| tab.document.default_unit()),
-                    dpi: struct_dirty.then(|| tab.document.dpi()),
-                    multipage_view: struct_dirty.then(|| tab.document.multipage_view()),
-                    palettes: struct_dirty.then(|| tab.document.palettes().to_vec()),
-                    document_palette: struct_dirty.then(|| tab.document.document_palette().clone()),
-                    guides: struct_dirty.then(|| tab.document.guides().to_vec()),
-                    grid: struct_dirty.then(|| tab.document.grid()),
-                    perspective_grid: struct_dirty.then(|| tab.document.perspective_grid().clone()),
-                    color_styles: struct_dirty.then(|| tab.document.color_styles().to_vec()),
-                    object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
-                    symbols: struct_dirty.then(|| tab.document.symbols().clone()),
-                    metadata: struct_dirty.then(|| tab.document.metadata().clone()),
-                };
+                let patch =
+                    build_differential_patch_from_tab(tab, &doc_id, session_id.clone(), base_id);
                 let delta_id = db
                     .enqueue_differential_autosave(patch)
                     .map_err(|e| format!("autosave failed: {e}"))?;
-                tab.wal_base_snapshot_id = Some(delta_id);
-                tab.autosave_dirty_objects.clear();
-                tab.autosave_dirty_structure = false;
-                tab.autosave_dirty_all = false;
-                tab.last_autosave_at = Instant::now();
+                tab.wal_base_snapshot_id = Some(delta_id.clone());
+                clear_tab_autosave_dirty(tab);
+                if tab.wal_delta_count >= coree_storage::WAL_COMPACTION_INTERVAL {
+                    if let Ok(new_base) = db.enqueue_compact_baseline(
+                        &doc_id,
+                        &session_id,
+                        tab.document.title(),
+                        tab.source_path.as_deref(),
+                        &delta_id,
+                        tab.journal_seq,
+                    ) {
+                        tab.wal_base_snapshot_id = Some(new_base);
+                        tab.wal_delta_count = 0;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -900,10 +869,8 @@ impl StudioApp {
         tab.wal_session_open = true;
         tab.wal_session_id = Some(session_id);
         tab.wal_base_snapshot_id = Some(snap_id);
-        tab.autosave_dirty_objects.clear();
-        tab.autosave_dirty_structure = false;
-        tab.autosave_dirty_all = false;
-        tab.last_autosave_at = Instant::now();
+        tab.wal_delta_count = 0;
+        clear_tab_autosave_dirty(tab);
         Ok(())
     }
 
@@ -1256,10 +1223,8 @@ impl StudioApp {
                         tab.wal_session_open = true;
                         tab.wal_session_id = Some(session_id);
                         tab.wal_base_snapshot_id = Some(base_id);
-                        tab.autosave_dirty_objects.clear();
-                        tab.autosave_dirty_structure = false;
-                        tab.autosave_dirty_all = false;
-                        tab.last_autosave_at = Instant::now();
+                        tab.wal_delta_count = 0;
+                        clear_tab_autosave_dirty(tab);
                     }
                 }
             }
@@ -1270,12 +1235,30 @@ impl StudioApp {
             .map_err(|e| e.to_string())?;
         let pruned_assets = tab.history.take_last_gc_pruned();
         let inv = tab.history.last_invalidation().clone();
+        let wal_hints = tab.history.last_delta_wal_hints().clone();
         tab.journal_seq = tab.journal_seq.saturating_add(1);
         let seq = tab.journal_seq;
         tab.mark_modified_with_invalidation(&inv);
-        if command_op_touches_structure(&op) {
+        if wal_hints.touches_structure || command_op_touches_structure(&op) {
             tab.autosave_dirty_structure = true;
         }
+        tab.autosave_dirty_palette |= wal_hints.touches_palette;
+        for &aid in &wal_hints.upserted_assets {
+            tab.autosave_deleted_assets.remove(&aid);
+            tab.autosave_upserted_assets.insert(aid);
+        }
+        for &aid in &wal_hints.deleted_assets {
+            tab.autosave_upserted_assets.remove(&aid);
+            tab.autosave_deleted_assets.insert(aid);
+        }
+        if !pruned_assets.is_empty() {
+            tab.autosave_dirty_structure = true;
+            for &aid in &pruned_assets {
+                tab.autosave_upserted_assets.remove(&aid);
+                tab.autosave_deleted_assets.insert(aid);
+            }
+        }
+        tab.wal_delta_count = tab.wal_delta_count.saturating_add(1);
 
         match &op {
             CommandOp::TransformObjects { ids, affine } if !ids.is_empty() => {
@@ -1293,19 +1276,64 @@ impl StudioApp {
         }
 
         if let Some(ref db) = self.storage {
-            if let Some(ref sess_id) = tab.wal_session_id {
+            if let Some(sess_id) = tab.wal_session_id.clone() {
                 let base_id = tab.wal_base_snapshot_id.as_deref();
-                let _ = db.enqueue_command_async(&doc_id, sess_id, base_id, seq, op.clone());
+                let _ = db.enqueue_command_async(&doc_id, &sess_id, base_id, seq, op.clone());
                 if !pruned_assets.is_empty() {
                     tab.journal_seq = tab.journal_seq.saturating_add(1);
                     let prune_seq = tab.journal_seq;
                     let _ = db.enqueue_command_async(
                         &doc_id,
-                        sess_id,
+                        &sess_id,
                         base_id,
                         prune_seq,
                         CommandOp::PruneAssets { ids: pruned_assets },
                     );
+                }
+                if tab.wal_delta_count >= coree_storage::WAL_COMPACTION_INTERVAL {
+                    if tab.autosave_dirty_all
+                        || !tab.wal_session_open
+                        || tab.wal_base_snapshot_id.is_none()
+                    {
+                        if let Ok(snap_id) = db.enqueue_baseline_snapshot(
+                            &doc_id,
+                            &sess_id,
+                            tab.document.title(),
+                            tab.source_path.as_deref(),
+                            tab.document.clone(),
+                            tab.journal_seq,
+                        ) {
+                            tab.wal_session_open = true;
+                            tab.wal_base_snapshot_id = Some(snap_id);
+                            tab.wal_delta_count = 0;
+                            clear_tab_autosave_dirty(tab);
+                        }
+                    } else if let Some(latest_id) = tab.wal_base_snapshot_id.clone() {
+                        // Flush accumulated dirty objects/structure/assets/palette into a
+                        // differential delta at `tab.journal_seq` before compacting, so the
+                        // compacted baseline never skips un-materialized `command_journal` edits.
+                        let patch = build_differential_patch_from_tab(
+                            tab,
+                            &doc_id,
+                            sess_id.clone(),
+                            latest_id,
+                        );
+                        if let Ok(delta_id) = db.enqueue_differential_autosave(patch) {
+                            tab.wal_base_snapshot_id = Some(delta_id.clone());
+                            clear_tab_autosave_dirty(tab);
+                            if let Ok(new_base) = db.enqueue_compact_baseline(
+                                &doc_id,
+                                &sess_id,
+                                tab.document.title(),
+                                tab.source_path.as_deref(),
+                                &delta_id,
+                                tab.journal_seq,
+                            ) {
+                                tab.wal_base_snapshot_id = Some(new_base);
+                                tab.wal_delta_count = 0;
+                            }
+                        }
+                    }
                 }
             } else {
                 let _ = db.append_command(&doc_id, seq, &op);
@@ -1363,10 +1391,10 @@ impl StudioApp {
         self.execute_command(cmd).is_ok()
     }
 
-    /// Undoes the last command on the active tab and checkpoints the WAL snapshot
+    /// Undoes the last command on the active tab and streams a targeted zero-clone WAL delta
     /// so a subsequent crash cannot resurrect the undone edit.
     pub fn undo(&mut self) -> Result<String, String> {
-        let label = {
+        let (label, inv, wal_hints) = {
             let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                 return Err("no active document".to_owned());
             };
@@ -1375,22 +1403,34 @@ impl StudioApp {
                 .undo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
             let inv = tab.history.last_invalidation().clone();
+            let wal_hints = tab.history.last_delta_wal_hints().clone();
             tab.last_duplicate_batch = None;
             tab.viewport.multipage_view = tab.document.multipage_view();
             tab.snap_options.grid = tab.document.grid().snap;
             tab.sync_active_layer();
             tab.mark_modified_with_invalidation(&inv);
-            tab.autosave_dirty_all = true;
-            label
+            tab.autosave_dirty_structure |= wal_hints.touches_structure;
+            tab.autosave_dirty_palette |= wal_hints.touches_palette;
+            for &aid in &wal_hints.upserted_assets {
+                tab.autosave_deleted_assets.remove(&aid);
+                tab.autosave_upserted_assets.insert(aid);
+            }
+            for &aid in &wal_hints.deleted_assets {
+                tab.autosave_upserted_assets.remove(&aid);
+                tab.autosave_deleted_assets.insert(aid);
+            }
+            tab.journal_seq = tab.journal_seq.saturating_add(1);
+            tab.wal_delta_count = tab.wal_delta_count.saturating_add(1);
+            (label, inv, wal_hints)
         };
-        self.checkpoint_wal_snapshot_active();
+        self.stream_wal_undo_redo_delta(&inv, &wal_hints);
         self.push_toast(format!("Undo: {label}"), false);
         Ok(label)
     }
 
-    /// Redoes the last undone command on the active tab and checkpoints the WAL snapshot.
+    /// Redoes the last undone command on the active tab and streams a targeted zero-clone WAL delta.
     pub fn redo(&mut self) -> Result<String, String> {
-        let label = {
+        let (label, inv, wal_hints) = {
             let Some(tab) = self.tabs.get_mut(self.active_tab) else {
                 return Err("no active document".to_owned());
             };
@@ -1399,17 +1439,134 @@ impl StudioApp {
                 .redo(&mut tab.document)
                 .map_err(|e| e.to_string())?;
             let inv = tab.history.last_invalidation().clone();
+            let wal_hints = tab.history.last_delta_wal_hints().clone();
             tab.last_duplicate_batch = None;
             tab.viewport.multipage_view = tab.document.multipage_view();
             tab.snap_options.grid = tab.document.grid().snap;
             tab.sync_active_layer();
             tab.mark_modified_with_invalidation(&inv);
-            tab.autosave_dirty_all = true;
-            label
+            tab.autosave_dirty_structure |= wal_hints.touches_structure;
+            tab.autosave_dirty_palette |= wal_hints.touches_palette;
+            for &aid in &wal_hints.upserted_assets {
+                tab.autosave_deleted_assets.remove(&aid);
+                tab.autosave_upserted_assets.insert(aid);
+            }
+            for &aid in &wal_hints.deleted_assets {
+                tab.autosave_upserted_assets.remove(&aid);
+                tab.autosave_deleted_assets.insert(aid);
+            }
+            tab.journal_seq = tab.journal_seq.saturating_add(1);
+            tab.wal_delta_count = tab.wal_delta_count.saturating_add(1);
+            (label, inv, wal_hints)
         };
-        self.checkpoint_wal_snapshot_active();
+        self.stream_wal_undo_redo_delta(&inv, &wal_hints);
         self.push_toast(format!("Redo: {label}"), false);
         Ok(label)
+    }
+
+    fn stream_wal_undo_redo_delta(
+        &mut self,
+        inv: &coree_core::DocumentInvalidation,
+        wal_hints: &coree_core::DeltaWalHints,
+    ) {
+        let full_all = matches!(inv, coree_core::DocumentInvalidation::All);
+        let needs_baseline = self.tabs.get(self.active_tab).is_some_and(|t| {
+            !t.wal_session_open
+                || t.wal_session_id.is_none()
+                || t.wal_base_snapshot_id.is_none()
+                || t.autosave_dirty_all
+                || full_all
+        });
+        if needs_baseline {
+            self.checkpoint_wal_snapshot_active();
+            return;
+        }
+        let Some(ref db) = self.storage else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let (Some(session_id), Some(base_id)) =
+            (tab.wal_session_id.clone(), tab.wal_base_snapshot_id.clone())
+        else {
+            return;
+        };
+        let doc_id = tab.document.id().to_string();
+        let struct_dirty = tab.autosave_dirty_structure || wal_hints.touches_structure;
+        let mut upserted_objects = Vec::new();
+        let mut deleted_object_ids = Vec::new();
+        for &oid in &tab.autosave_dirty_objects {
+            if let Some(obj) = tab.document.object(oid) {
+                upserted_objects.push((oid, obj.clone()));
+            } else {
+                deleted_object_ids.push(oid);
+            }
+        }
+        let mut merged_upserted: HashSet<ImageAssetId> = tab.autosave_upserted_assets.clone();
+        merged_upserted.extend(wal_hints.upserted_assets.iter().copied());
+        let mut merged_deleted: HashSet<ImageAssetId> = tab.autosave_deleted_assets.clone();
+        merged_deleted.extend(wal_hints.deleted_assets.iter().copied());
+        for aid in &merged_deleted {
+            merged_upserted.remove(aid);
+        }
+        let mut upserted_assets = Vec::new();
+        for aid in merged_upserted {
+            if let Some(asset) = tab.document.asset(aid) {
+                upserted_assets.push((aid, asset.clone()));
+            }
+        }
+        let deleted_asset_ids: Vec<ImageAssetId> = merged_deleted.into_iter().collect();
+        let pal_dirty = struct_dirty || tab.autosave_dirty_palette || wal_hints.touches_palette;
+        let patch = DifferentialSnapshotPatch {
+            doc_id: doc_id.clone(),
+            session_id: session_id.clone(),
+            title: tab.document.title().to_owned(),
+            source_path: tab
+                .source_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            base_snapshot_id: base_id,
+            last_command_seq: tab.journal_seq,
+            upserted_objects,
+            deleted_object_ids,
+            upserted_assets,
+            deleted_asset_ids,
+            full_assets: None,
+            pages: struct_dirty.then(|| tab.document.pages().to_vec()),
+            active_page_index: struct_dirty.then(|| tab.document.active_page_index()),
+            next_id: Some(tab.document.next_id()),
+            color_mode: struct_dirty.then(|| tab.document.color_mode()),
+            default_unit: struct_dirty.then(|| tab.document.default_unit()),
+            dpi: struct_dirty.then(|| tab.document.dpi()),
+            multipage_view: struct_dirty.then(|| tab.document.multipage_view()),
+            palettes: pal_dirty.then(|| tab.document.palettes().to_vec()),
+            document_palette: pal_dirty.then(|| tab.document.document_palette().clone()),
+            guides: struct_dirty.then(|| tab.document.guides().to_vec()),
+            grid: struct_dirty.then(|| tab.document.grid()),
+            perspective_grid: struct_dirty.then(|| tab.document.perspective_grid().clone()),
+            color_styles: struct_dirty.then(|| tab.document.color_styles().to_vec()),
+            object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
+            symbols: struct_dirty.then(|| tab.document.symbols().clone()),
+            metadata: struct_dirty.then(|| tab.document.metadata().clone()),
+        };
+        if let Ok(delta_id) = db.enqueue_differential_autosave(patch) {
+            tab.wal_base_snapshot_id = Some(delta_id.clone());
+            clear_tab_autosave_dirty(tab);
+            if tab.wal_delta_count >= coree_storage::WAL_COMPACTION_INTERVAL {
+                if let Ok(new_base) = db.enqueue_compact_baseline(
+                    &doc_id,
+                    &session_id,
+                    tab.document.title(),
+                    tab.source_path.as_deref(),
+                    &delta_id,
+                    tab.journal_seq,
+                ) {
+                    tab.wal_base_snapshot_id = Some(new_base);
+                    tab.wal_delta_count = 0;
+                }
+            }
+        }
     }
 
     /// Builds an immutable [`ToolSettingsSnapshot`] + active lens config for `ToolCore`.
@@ -1939,9 +2096,82 @@ impl StudioApp {
     }
 }
 
+fn build_differential_patch_from_tab(
+    tab: &DocumentTab,
+    doc_id: &str,
+    session_id: String,
+    base_snapshot_id: String,
+) -> DifferentialSnapshotPatch {
+    let mut upserted_objects = Vec::with_capacity(tab.autosave_dirty_objects.len());
+    let mut deleted_object_ids = Vec::new();
+    for &oid in &tab.autosave_dirty_objects {
+        if let Some(obj) = tab.document.object(oid) {
+            upserted_objects.push((oid, obj.clone()));
+        } else {
+            deleted_object_ids.push(oid);
+        }
+    }
+    let struct_dirty = tab.autosave_dirty_structure;
+    let pal_dirty = struct_dirty || tab.autosave_dirty_palette;
+    let mut upserted_assets = Vec::new();
+    let mut deleted_asset_ids = Vec::new();
+    if !struct_dirty {
+        for &aid in &tab.autosave_upserted_assets {
+            if let Some(asset) = tab.document.asset(aid) {
+                upserted_assets.push((aid, asset.clone()));
+            }
+        }
+        deleted_asset_ids.extend(tab.autosave_deleted_assets.iter().copied());
+    }
+    DifferentialSnapshotPatch {
+        doc_id: doc_id.to_owned(),
+        session_id,
+        title: tab.document.title().to_owned(),
+        source_path: tab
+            .source_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        base_snapshot_id,
+        last_command_seq: tab.journal_seq,
+        upserted_objects,
+        deleted_object_ids,
+        upserted_assets,
+        deleted_asset_ids,
+        full_assets: struct_dirty.then(|| tab.document.assets().clone()),
+        pages: struct_dirty.then(|| tab.document.pages().to_vec()),
+        active_page_index: struct_dirty.then(|| tab.document.active_page_index()),
+        next_id: Some(tab.document.next_id()),
+        color_mode: struct_dirty.then(|| tab.document.color_mode()),
+        default_unit: struct_dirty.then(|| tab.document.default_unit()),
+        dpi: struct_dirty.then(|| tab.document.dpi()),
+        multipage_view: struct_dirty.then(|| tab.document.multipage_view()),
+        palettes: pal_dirty.then(|| tab.document.palettes().to_vec()),
+        document_palette: pal_dirty.then(|| tab.document.document_palette().clone()),
+        guides: struct_dirty.then(|| tab.document.guides().to_vec()),
+        grid: struct_dirty.then(|| tab.document.grid()),
+        perspective_grid: struct_dirty.then(|| tab.document.perspective_grid().clone()),
+        color_styles: struct_dirty.then(|| tab.document.color_styles().to_vec()),
+        object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
+        symbols: struct_dirty.then(|| tab.document.symbols().clone()),
+        metadata: struct_dirty.then(|| tab.document.metadata().clone()),
+    }
+}
+
+fn clear_tab_autosave_dirty(tab: &mut DocumentTab) {
+    tab.autosave_dirty_objects.clear();
+    tab.autosave_dirty_structure = false;
+    tab.autosave_dirty_palette = false;
+    tab.autosave_upserted_assets.clear();
+    tab.autosave_deleted_assets.clear();
+    tab.autosave_dirty_all = false;
+    tab.last_autosave_at = Instant::now();
+}
+
 fn command_op_touches_structure(op: &CommandOp) -> bool {
     match op {
         CommandOp::TransformObjects { .. }
+        | CommandOp::SetFill { .. }
+        | CommandOp::SetOutline { .. }
         | CommandOp::EditPath { .. }
         | CommandOp::EditShape { .. }
         | CommandOp::EditBSpline { .. }

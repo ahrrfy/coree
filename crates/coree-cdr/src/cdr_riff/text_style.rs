@@ -281,6 +281,8 @@ pub(crate) fn parse_txsm_chunk(
                     linked_next_frame: text_meta.and_then(|m| m.linked_next_frame),
                     wrap_mode: coree_core::TextWrapMode::None,
                     drop_cap: None,
+                    tab_stops_mm: Vec::new(),
+                    list_style: None,
                     direction,
                     align,
                 }))

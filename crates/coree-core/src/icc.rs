@@ -47,6 +47,69 @@ pub const D50_WHITE: [f64; 3] = [0.964_22, 1.000_00, 0.825_21];
 /// Standard CIE D65 reference white (sRGB / Display P3).
 pub const D65_WHITE: [f64; 3] = [0.950_47, 1.000_00, 1.088_83];
 
+/// Standard Bradford cone-response matrix (`CIE XYZ -> LMS`).
+pub const BRADFORD_M: [[f64; 3]; 3] = [
+    [0.8951, 0.2664, -0.1614],
+    [-0.7502, 1.7135, 0.0367],
+    [0.0389, -0.0685, 1.0296],
+];
+
+/// Inverse Bradford cone-response matrix (`LMS -> CIE XYZ`).
+pub const BRADFORD_M_INV: [[f64; 3]; 3] = [
+    [0.986_992_905_5, -0.147_054_256_4, 0.159_962_651_7],
+    [0.432_305_269_7, 0.518_360_271_5, 0.049_291_228_2],
+    [-0.008_528_664_6, 0.040_042_821_7, 0.968_486_695_8],
+];
+
+/// Computes the 3x3 Bradford chromatic adaptation matrix adapting `src_wp` to `dst_wp`.
+#[must_use]
+pub fn bradford_adaptation_matrix(src_wp: [f64; 3], dst_wp: [f64; 3]) -> [[f64; 3]; 3] {
+    let src_lms = mat3_mul_vec(&BRADFORD_M, src_wp.map(sanitize_finite));
+    let dst_lms = mat3_mul_vec(&BRADFORD_M, dst_wp.map(sanitize_finite));
+    let scale = [
+        if src_lms[0].abs() > 1e-9 {
+            dst_lms[0] / src_lms[0]
+        } else {
+            1.0
+        },
+        if src_lms[1].abs() > 1e-9 {
+            dst_lms[1] / src_lms[1]
+        } else {
+            1.0
+        },
+        if src_lms[2].abs() > 1e-9 {
+            dst_lms[2] / src_lms[2]
+        } else {
+            1.0
+        },
+    ];
+    let scaled_m = [
+        [
+            scale[0] * BRADFORD_M[0][0],
+            scale[0] * BRADFORD_M[0][1],
+            scale[0] * BRADFORD_M[0][2],
+        ],
+        [
+            scale[1] * BRADFORD_M[1][0],
+            scale[1] * BRADFORD_M[1][1],
+            scale[1] * BRADFORD_M[1][2],
+        ],
+        [
+            scale[2] * BRADFORD_M[2][0],
+            scale[2] * BRADFORD_M[2][1],
+            scale[2] * BRADFORD_M[2][2],
+        ],
+    ];
+    mat3_mul_mat3(&BRADFORD_M_INV, &scaled_m)
+}
+
+/// Adapts a CIE XYZ tristimulus value from `src_wp` to `dst_wp` via Bradford chromatic adaptation.
+#[must_use]
+pub fn adapt_xyz_bradford(xyz: [f64; 3], src_wp: [f64; 3], dst_wp: [f64; 3]) -> [f64; 3] {
+    let mat = bradford_adaptation_matrix(src_wp, dst_wp);
+    mat3_mul_vec(&mat, xyz.map(sanitize_finite))
+}
+
 /// CIE Lab constants (`(6/29)^3` and `(29/3)^3`).
 const LAB_EPSILON: f64 = 216.0 / 24_389.0;
 const LAB_KAPPA: f64 = 24_389.0 / 27.0;
@@ -853,6 +916,12 @@ pub struct IccProfile {
     pub description: String,
     pub tags: Vec<IccTagEntry>,
     pub white_point: Option<[f64; 3]>,
+    /// Optional ICC `bkpt` media black point in D50 PCS XYZ.
+    #[serde(default)]
+    pub black_point: Option<[f64; 3]>,
+    /// Optional ICC `chad` (`sf32` 3x3) chromatic adaptation matrix (`media_wp -> D50`).
+    #[serde(default)]
+    pub chad: Option<[[f64; 3]; 3]>,
     /// Matrix columns `[rXYZ, gXYZ, bXYZ]` mapping linear RGB to D50 PCS XYZ.
     pub rgb_to_xyz_matrix: Option<[[f64; 3]; 3]>,
     pub r_trc: Option<IccToneCurve>,
@@ -998,6 +1067,8 @@ impl IccProfile {
             .unwrap_or_default();
 
         let white_point = tag_slice(b"wtpt").and_then(|s| parse_xyz_tag(s).ok());
+        let black_point = tag_slice(b"bkpt").and_then(|s| parse_xyz_tag(s).ok());
+        let chad = tag_slice(b"chad").and_then(|s| parse_sf32_chad_tag(s).ok());
 
         let r_xyz = tag_slice(b"rXYZ").and_then(|s| parse_xyz_tag(s).ok());
         let g_xyz = tag_slice(b"gXYZ").and_then(|s| parse_xyz_tag(s).ok());
@@ -1047,6 +1118,8 @@ impl IccProfile {
             description,
             tags,
             white_point,
+            black_point,
+            chad,
             rgb_to_xyz_matrix,
             r_trc,
             g_trc,
@@ -1082,6 +1155,8 @@ impl IccProfile {
                 description: kind.display_name().to_owned(),
                 tags: Vec::new(),
                 white_point: Some(D65_WHITE),
+                black_point: Some([0.0, 0.0, 0.0]),
+                chad: Some(bradford_adaptation_matrix(D65_WHITE, D50_WHITE)),
                 rgb_to_xyz_matrix: Some(SRGB_TO_XYZ_D50),
                 r_trc: Some(IccToneCurve::srgb()),
                 g_trc: Some(IccToneCurve::srgb()),
@@ -1111,6 +1186,8 @@ impl IccProfile {
                 description: kind.display_name().to_owned(),
                 tags: Vec::new(),
                 white_point: Some(D65_WHITE),
+                black_point: Some([0.0, 0.0, 0.0]),
+                chad: Some(bradford_adaptation_matrix(D65_WHITE, D50_WHITE)),
                 rgb_to_xyz_matrix: Some(DISPLAY_P3_TO_XYZ_D50),
                 r_trc: Some(IccToneCurve::srgb()),
                 g_trc: Some(IccToneCurve::srgb()),
@@ -1142,6 +1219,8 @@ impl IccProfile {
                     description: kind.display_name().to_owned(),
                     tags: Vec::new(),
                     white_point: Some(press.paper_white_xyz()),
+                    black_point: None,
+                    chad: None,
                     rgb_to_xyz_matrix: None,
                     r_trc: None,
                     g_trc: None,
@@ -1204,6 +1283,11 @@ impl IccProfile {
         if intent != RenderingIntent::AbsoluteColorimetric {
             return xyz;
         }
+        if let Some(chad) = self.chad {
+            if let Some(inv_chad) = mat3_invert(&chad) {
+                return mat3_mul_vec(&inv_chad, xyz);
+            }
+        }
         let Some(wp) = self.white_point else {
             return xyz;
         };
@@ -1222,6 +1306,9 @@ impl IccProfile {
         if intent != RenderingIntent::AbsoluteColorimetric {
             return xyz;
         }
+        if let Some(chad) = self.chad {
+            return mat3_mul_vec(&chad, xyz);
+        }
         let Some(wp) = self.white_point else {
             return xyz;
         };
@@ -1232,6 +1319,174 @@ impl IccProfile {
             xyz[0] * (D50_WHITE[0] / wp[0]),
             xyz[1] * (D50_WHITE[1] / wp[1]),
             xyz[2] * (D50_WHITE[2] / wp[2]),
+        ]
+    }
+
+    /// Observer-adapted (`AdaptationState = 1.0`, ICC v4 / LittleCMS `-d1` default) media
+    /// white point in D50 PCS.
+    ///
+    /// - Built-in `Srgb`/`DisplayP3` store unadapted `D65_WHITE` in `white_point` alongside
+    ///   `chad = D65 -> D50`; their D50-adapted white point is `D50_WHITE`.
+    /// - Profiles with a `chad` tag (ICC v4): per ICC.1:2010, `wtpt` is already chromatically
+    ///   adapted into D50 PCS.
+    /// - Display RGB and Gray profiles without `chad` (ICC v2 `mntr` `RGB ` / `GRAY`): `wtpt`
+    ///   is the unadapted monitor illuminant, so under full observer adaptation its D50-adapted
+    ///   white is `D50_WHITE`.
+    /// - Output profiles without `chad` (e.g. `FOGRA39`, `SWOP`): `wtpt` is the D50-relative
+    ///   paper white point.
+    #[inline]
+    fn adapted_white_point(&self) -> Option<[f64; 3]> {
+        if matches!(
+            self.builtin_kind,
+            Some(BuiltinIccProfile::Srgb | BuiltinIccProfile::DisplayP3)
+        ) {
+            return Some(D50_WHITE);
+        }
+        if self.chad.is_some() {
+            return self.white_point;
+        }
+        if self.header.profile_class == IccProfileClass::Display
+            && matches!(
+                self.header.color_space,
+                IccColorSpace::Rgb | IccColorSpace::Gray
+            )
+        {
+            return Some(D50_WHITE);
+        }
+        self.white_point
+    }
+
+    #[inline]
+    fn adapt_rel_xyz_for_intent_adapted(&self, xyz: [f64; 3], intent: RenderingIntent) -> [f64; 3] {
+        if intent != RenderingIntent::AbsoluteColorimetric {
+            return xyz;
+        }
+        let Some(wp) = self.adapted_white_point() else {
+            return xyz;
+        };
+        if wp[0] <= 1e-4 || wp[1] <= 1e-4 || wp[2] <= 1e-4 {
+            return xyz;
+        }
+        [
+            xyz[0] * (wp[0] / D50_WHITE[0]),
+            xyz[1] * (wp[1] / D50_WHITE[1]),
+            xyz[2] * (wp[2] / D50_WHITE[2]),
+        ]
+    }
+
+    #[inline]
+    fn adapt_abs_xyz_to_rel_adapted(&self, xyz: [f64; 3], intent: RenderingIntent) -> [f64; 3] {
+        if intent != RenderingIntent::AbsoluteColorimetric {
+            return xyz;
+        }
+        let Some(wp) = self.adapted_white_point() else {
+            return xyz;
+        };
+        if wp[0] <= 1e-4 || wp[1] <= 1e-4 || wp[2] <= 1e-4 {
+            return xyz;
+        }
+        [
+            xyz[0] * (D50_WHITE[0] / wp[0]),
+            xyz[1] * (D50_WHITE[1] / wp[1]),
+            xyz[2] * (D50_WHITE[2] / wp[2]),
+        ]
+    }
+
+    /// Detects the source black point in D50 PCS XYZ per ISO 18619 / Adobe BPC.
+    #[must_use]
+    pub fn detect_black_point(&self, intent: RenderingIntent) -> Option<[f64; 3]> {
+        match self.header.color_space {
+            IccColorSpace::Cmyk => {
+                if let Some(v4) = self.select_v4_b2a(intent) {
+                    if v4.in_channels == 3 && v4.out_channels == 4 {
+                        let zero_ab = 128.0 / 255.0;
+                        let bp_pcs = if self.header.pcs == IccPcs::Xyz {
+                            [0.0, 0.0, 0.0]
+                        } else {
+                            [0.0, zero_ab, zero_ab]
+                        };
+                        let cmyk_bp = v4.evaluate(&bp_pcs);
+                        if cmyk_bp.len() >= 4 {
+                            if let Some(xyz) = self.cmyk_to_pcs_xyz_with_intent_bpc(
+                                [cmyk_bp[0], cmyk_bp[1], cmyk_bp[2], cmyk_bp[3]],
+                                intent,
+                                false,
+                            ) {
+                                return Some(xyz);
+                            }
+                        }
+                    }
+                }
+                if let Some(lut) = self.select_b2a(intent) {
+                    if lut.in_channels == 3 && lut.out_channels == 4 {
+                        let zero_ab = if lut.is_16bit && self.header.version_major < 4 {
+                            32_768.0 / 65_535.0
+                        } else {
+                            128.0 / 255.0
+                        };
+                        let bp_pcs = if self.header.pcs == IccPcs::Xyz {
+                            [0.0, 0.0, 0.0]
+                        } else {
+                            [0.0, zero_ab, zero_ab]
+                        };
+                        let cmyk_bp = lut.evaluate(&bp_pcs, self.header.pcs == IccPcs::Xyz);
+                        if cmyk_bp.len() >= 4 {
+                            if let Some(xyz) = self.cmyk_to_pcs_xyz_with_intent_bpc(
+                                [cmyk_bp[0], cmyk_bp[1], cmyk_bp[2], cmyk_bp[3]],
+                                intent,
+                                false,
+                            ) {
+                                return Some(xyz);
+                            }
+                        }
+                    }
+                }
+                if let Some(bp) = self.black_point {
+                    return Some(bp);
+                }
+                self.cmyk_to_pcs_xyz_with_intent_bpc([1.0, 1.0, 1.0, 1.0], intent, false)
+            }
+            IccColorSpace::Rgb => {
+                if let Some(bp) = self.black_point {
+                    return Some(bp);
+                }
+                self.rgb_to_pcs_xyz_with_intent_bpc([0.0, 0.0, 0.0], intent, false)
+            }
+            IccColorSpace::Gray => {
+                if let Some(bp) = self.black_point {
+                    return Some(bp);
+                }
+                let g0 = self.gray_to_pcs_xyz_with_intent_bpc(0.0, intent, false)?;
+                let g1 = self.gray_to_pcs_xyz_with_intent_bpc(1.0, intent, false)?;
+                Some(if g0[1] <= g1[1] { g0 } else { g1 })
+            }
+            _ => self.black_point,
+        }
+    }
+
+    /// Applies ISO 18619 linear XYZ Black Point Compensation relative to D50 white point.
+    #[must_use]
+    pub fn apply_bpc(
+        xyz: [f64; 3],
+        src_bp: [f64; 3],
+        dst_bp_y: f64,
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> [f64; 3] {
+        if !bpc || intent == RenderingIntent::AbsoluteColorimetric {
+            return xyz;
+        }
+        let src_y = sanitize_finite(src_bp[1]).clamp(0.0, 0.99);
+        let dst_y = sanitize_finite(dst_bp_y).clamp(0.0, 0.99);
+        if (src_y - dst_y).abs() < 1e-9 {
+            return xyz;
+        }
+        let scale = (1.0 - dst_y) / (1.0 - src_y);
+        let offset = 1.0 - scale;
+        [
+            xyz[0] * scale + D50_WHITE[0] * offset,
+            xyz[1] * scale + D50_WHITE[1] * offset,
+            xyz[2] * scale + D50_WHITE[2] * offset,
         ]
     }
 
@@ -1248,44 +1503,78 @@ impl IccProfile {
         rgb: [f64; 3],
         intent: RenderingIntent,
     ) -> Option<[f64; 3]> {
+        self.rgb_to_pcs_xyz_with_intent_bpc(rgb, intent, false)
+    }
+
+    /// Converts device RGB (`0.0..=1.0`) to D50 PCS CIE XYZ honoring [`RenderingIntent`] and BPC.
+    #[must_use]
+    pub fn rgb_to_pcs_xyz_with_intent_bpc(
+        &self,
+        rgb: [f64; 3],
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> Option<[f64; 3]> {
+        self.rgb_to_pcs_xyz_impl(rgb, intent, bpc, false)
+    }
+
+    fn rgb_to_pcs_xyz_impl(
+        &self,
+        rgb: [f64; 3],
+        intent: RenderingIntent,
+        bpc: bool,
+        adapted_abs: bool,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Rgb {
             return None;
         }
         let r = clamp_unit_finite(rgb[0]);
         let g = clamp_unit_finite(rgb[1]);
         let b = clamp_unit_finite(rgb[2]);
-        if let Some(v4) = self.select_v4_a2b(intent) {
-            if v4.in_channels == 3 && v4.out_channels == 3 {
-                let raw = v4.evaluate(&[r, g, b]);
-                let rel = decode_lut_pcs_to_xyz(
-                    [raw[0], raw[1], raw[2]],
-                    self.header.pcs,
-                    v4.clut_is_16bit,
-                    4,
-                )
-                .map(sanitize_finite);
-                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
+        let rel = if let Some(v4) = self
+            .select_v4_a2b(intent)
+            .filter(|v4| v4.in_channels == 3 && v4.out_channels == 3)
+        {
+            let raw = v4.evaluate(&[r, g, b]);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                v4.clut_is_16bit,
+                4,
+            )
+            .map(sanitize_finite)
+        } else if let Some(lut) = self
+            .select_a2b(intent)
+            .filter(|lut| lut.in_channels == 3 && lut.out_channels == 3)
+        {
+            let raw = lut.evaluate(&[r, g, b], false);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                lut.is_16bit,
+                self.header.version_major,
+            )
+            .map(sanitize_finite)
+        } else {
+            let mat = self.rgb_to_xyz_matrix?;
+            let rl = self.r_trc.as_ref().map_or(r, |t| t.eval(r));
+            let gl = self.g_trc.as_ref().map_or(g, |t| t.eval(g));
+            let bl = self.b_trc.as_ref().map_or(b, |t| t.eval(b));
+            mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite)
+        };
+        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+            if let Some(src_bp) = self.detect_black_point(intent) {
+                Self::apply_bpc(rel, src_bp, 0.0, intent, true)
+            } else {
+                rel
             }
-        }
-        if let Some(lut) = self.select_a2b(intent) {
-            if lut.in_channels == 3 && lut.out_channels == 3 {
-                let raw = lut.evaluate(&[r, g, b], false);
-                let rel = decode_lut_pcs_to_xyz(
-                    [raw[0], raw[1], raw[2]],
-                    self.header.pcs,
-                    lut.is_16bit,
-                    self.header.version_major,
-                )
-                .map(sanitize_finite);
-                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
-            }
-        }
-        let mat = self.rgb_to_xyz_matrix?;
-        let rl = self.r_trc.as_ref().map_or(r, |t| t.eval(r));
-        let gl = self.g_trc.as_ref().map_or(g, |t| t.eval(g));
-        let bl = self.b_trc.as_ref().map_or(b, |t| t.eval(b));
-        let rel = mat3_mul_vec(&mat, [rl, gl, bl]).map(sanitize_finite);
-        Some(self.adapt_rel_xyz_for_intent(rel, intent))
+        } else {
+            rel
+        };
+        Some(if adapted_abs {
+            self.adapt_rel_xyz_for_intent_adapted(bpc_adj, intent)
+        } else {
+            self.adapt_rel_xyz_for_intent(bpc_adj, intent)
+        })
     }
 
     /// Converts D50 PCS CIE XYZ to device RGB (`0.0..=1.0`) using this profile's `B2A*` LUT or inverse Matrix+TRC.
@@ -1301,10 +1590,24 @@ impl IccProfile {
         xyz: [f64; 3],
         intent: RenderingIntent,
     ) -> Option<[f64; 3]> {
+        self.pcs_xyz_to_rgb_impl(xyz, intent, false)
+    }
+
+    fn pcs_xyz_to_rgb_impl(
+        &self,
+        xyz: [f64; 3],
+        intent: RenderingIntent,
+        adapted_abs: bool,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Rgb {
             return None;
         }
-        let rel_xyz = self.adapt_abs_xyz_to_rel(xyz.map(sanitize_finite), intent);
+        let xyz_clean = xyz.map(sanitize_finite);
+        let rel_xyz = if adapted_abs {
+            self.adapt_abs_xyz_to_rel_adapted(xyz_clean, intent)
+        } else {
+            self.adapt_abs_xyz_to_rel(xyz_clean, intent)
+        };
         if let Some(v4) = self.select_v4_b2a(intent) {
             if v4.in_channels == 3 && v4.out_channels == 3 {
                 let encoded = encode_xyz_to_lut_pcs(rel_xyz, self.header.pcs, v4.clut_is_16bit, 4);
@@ -1367,43 +1670,225 @@ impl IccProfile {
         cmyk: [f64; 4],
         intent: RenderingIntent,
     ) -> Option<[f64; 3]> {
+        self.cmyk_to_pcs_xyz_with_intent_bpc(cmyk, intent, false)
+    }
+
+    /// Converts device CMYK (`0.0..=1.0`) to D50 PCS CIE XYZ honoring [`RenderingIntent`] and BPC.
+    #[must_use]
+    pub fn cmyk_to_pcs_xyz_with_intent_bpc(
+        &self,
+        cmyk: [f64; 4],
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> Option<[f64; 3]> {
+        self.cmyk_to_pcs_xyz_impl(cmyk, intent, bpc, false)
+    }
+
+    fn cmyk_to_pcs_xyz_impl(
+        &self,
+        cmyk: [f64; 4],
+        intent: RenderingIntent,
+        bpc: bool,
+        adapted_abs: bool,
+    ) -> Option<[f64; 3]> {
         if self.header.color_space != IccColorSpace::Cmyk {
             return None;
         }
         let clamped = cmyk.map(clamp_unit_finite);
-        if let Some(v4) = self.select_v4_a2b(intent) {
-            if v4.in_channels == 4 && v4.out_channels == 3 {
-                let raw = v4.evaluate(&clamped);
-                let rel = decode_lut_pcs_to_xyz(
-                    [raw[0], raw[1], raw[2]],
-                    self.header.pcs,
-                    v4.clut_is_16bit,
-                    4,
-                )
+        let rel = if let Some(v4) = self
+            .select_v4_a2b(intent)
+            .filter(|v4| v4.in_channels == 4 && v4.out_channels == 3)
+        {
+            let raw = v4.evaluate(&clamped);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                v4.clut_is_16bit,
+                4,
+            )
+            .map(sanitize_finite)
+        } else if let Some(lut) = self
+            .select_a2b(intent)
+            .filter(|lut| lut.in_channels == 4 && lut.out_channels == 3)
+        {
+            let raw = lut.evaluate(&clamped, false);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                lut.is_16bit,
+                self.header.version_major,
+            )
+            .map(sanitize_finite)
+        } else {
+            let builtin = self.builtin_kind.filter(|b| b.is_cmyk())?;
+            let press = builtin.as_cmyk_press();
+            // Compute media-relative PCS first so BPC can operate before Absolute scaling.
+            let rel_press = press
+                .cmyk_to_xyz_d50(clamped, RenderingIntent::RelativeColorimetric)
                 .map(sanitize_finite);
-                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
+            let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+                if let Some(src_bp) = self.detect_black_point(intent) {
+                    Self::apply_bpc(rel_press, src_bp, 0.0, intent, true)
+                } else {
+                    rel_press
+                }
+            } else {
+                rel_press
+            };
+            return Some(if intent == RenderingIntent::AbsoluteColorimetric {
+                press.cmyk_to_xyz_d50(clamped, intent).map(sanitize_finite)
+            } else {
+                bpc_adj
+            });
+        };
+        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+            if let Some(src_bp) = self.detect_black_point(intent) {
+                Self::apply_bpc(rel, src_bp, 0.0, intent, true)
+            } else {
+                rel
             }
+        } else {
+            rel
+        };
+        Some(if adapted_abs {
+            self.adapt_rel_xyz_for_intent_adapted(bpc_adj, intent)
+        } else {
+            self.adapt_rel_xyz_for_intent(bpc_adj, intent)
+        })
+    }
+
+    /// Converts device Gray (`0.0..=1.0`) to D50 PCS CIE XYZ using `kTRC` or `A2B*`.
+    #[must_use]
+    pub fn gray_to_pcs_xyz(&self, gray: f64) -> Option<[f64; 3]> {
+        self.gray_to_pcs_xyz_with_intent(gray, self.header.rendering_intent)
+    }
+
+    /// Converts device Gray (`0.0..=1.0`) to D50 PCS CIE XYZ honoring [`RenderingIntent`].
+    #[must_use]
+    pub fn gray_to_pcs_xyz_with_intent(
+        &self,
+        gray: f64,
+        intent: RenderingIntent,
+    ) -> Option<[f64; 3]> {
+        self.gray_to_pcs_xyz_with_intent_bpc(gray, intent, false)
+    }
+
+    /// Converts device Gray (`0.0..=1.0`) to D50 PCS CIE XYZ honoring [`RenderingIntent`] and BPC.
+    #[must_use]
+    pub fn gray_to_pcs_xyz_with_intent_bpc(
+        &self,
+        gray: f64,
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> Option<[f64; 3]> {
+        self.gray_to_pcs_xyz_impl(gray, intent, bpc, false)
+    }
+
+    fn gray_to_pcs_xyz_impl(
+        &self,
+        gray: f64,
+        intent: RenderingIntent,
+        bpc: bool,
+        adapted_abs: bool,
+    ) -> Option<[f64; 3]> {
+        if self.header.color_space != IccColorSpace::Gray {
+            return None;
         }
-        if let Some(lut) = self.select_a2b(intent) {
-            if lut.in_channels == 4 && lut.out_channels == 3 {
-                let raw = lut.evaluate(&clamped, false);
-                let rel = decode_lut_pcs_to_xyz(
-                    [raw[0], raw[1], raw[2]],
-                    self.header.pcs,
-                    lut.is_16bit,
-                    self.header.version_major,
-                )
-                .map(sanitize_finite);
-                return Some(self.adapt_rel_xyz_for_intent(rel, intent));
+        let g = clamp_unit_finite(gray);
+        let rel = if let Some(trc) = self.k_trc.as_ref() {
+            let y = trc.eval(g);
+            [y * D50_WHITE[0], y * D50_WHITE[1], y * D50_WHITE[2]]
+        } else if let Some(v4) = self
+            .select_v4_a2b(intent)
+            .filter(|v4| v4.in_channels == 1 && v4.out_channels == 3)
+        {
+            let raw = v4.evaluate(&[g]);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                v4.clut_is_16bit,
+                4,
+            )
+            .map(sanitize_finite)
+        } else {
+            let lut = self
+                .select_a2b(intent)
+                .filter(|lut| lut.in_channels == 1 && lut.out_channels == 3)?;
+            let raw = lut.evaluate(&[g], false);
+            decode_lut_pcs_to_xyz(
+                [raw[0], raw[1], raw[2]],
+                self.header.pcs,
+                lut.is_16bit,
+                self.header.version_major,
+            )
+            .map(sanitize_finite)
+        };
+        let bpc_adj = if bpc && intent != RenderingIntent::AbsoluteColorimetric {
+            if let Some(src_bp) = self.detect_black_point(intent) {
+                Self::apply_bpc(rel, src_bp, 0.0, intent, true)
+            } else {
+                rel
             }
+        } else {
+            rel
+        };
+        Some(if adapted_abs {
+            self.adapt_rel_xyz_for_intent_adapted(bpc_adj, intent)
+        } else {
+            self.adapt_rel_xyz_for_intent(bpc_adj, intent)
+        })
+    }
+
+    /// Converts D50 PCS CIE XYZ to device Gray (`0.0..=1.0`) honoring [`RenderingIntent`].
+    #[must_use]
+    pub fn pcs_xyz_to_gray_with_intent(
+        &self,
+        xyz: [f64; 3],
+        intent: RenderingIntent,
+    ) -> Option<f64> {
+        if self.header.color_space != IccColorSpace::Gray {
+            return None;
         }
-        if let Some(builtin) = self.builtin_kind {
-            if builtin.is_cmyk() {
-                let press = builtin.as_cmyk_press();
-                return Some(press.cmyk_to_xyz_d50(clamped, intent).map(sanitize_finite));
-            }
+        let rel_xyz = self.adapt_abs_xyz_to_rel(xyz.map(sanitize_finite), intent);
+        if let Some(trc) = self.k_trc.as_ref() {
+            let y_norm = (rel_xyz[1] / D50_WHITE[1]).clamp(0.0, 1.0);
+            return Some(clamp_unit_finite(trc.eval_inverse(y_norm)));
+        }
+        if let Some(v4) = self
+            .select_v4_b2a(intent)
+            .filter(|v4| v4.in_channels == 3 && v4.out_channels == 1)
+        {
+            let encoded = encode_xyz_to_lut_pcs(rel_xyz, self.header.pcs, v4.clut_is_16bit, 4);
+            let out = v4.evaluate(&encoded);
+            return Some(clamp_unit_finite(out[0]));
+        }
+        if let Some(lut) = self
+            .select_b2a(intent)
+            .filter(|lut| lut.in_channels == 3 && lut.out_channels == 1)
+        {
+            let encoded = encode_xyz_to_lut_pcs(
+                rel_xyz,
+                self.header.pcs,
+                lut.is_16bit,
+                self.header.version_major,
+            );
+            let out = lut.evaluate(&encoded, self.header.pcs == IccPcs::Xyz);
+            return Some(clamp_unit_finite(out[0]));
         }
         None
+    }
+
+    /// Converts device CMYK (`0.0..=1.0`) directly to sRGB (`0.0..=1.0`) using this profile,
+    /// honoring [`RenderingIntent`] and ISO 18619 Black Point Compensation.
+    #[must_use]
+    pub fn cmyk_to_srgb_with_intent_bpc(
+        &self,
+        cmyk: [f64; 4],
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> Option<[f64; 3]> {
+        let xyz = self.cmyk_to_pcs_xyz_impl(cmyk, intent, bpc, true)?;
+        Some(xyz_d50_to_srgb(xyz))
     }
 
     /// Converts D50 PCS CIE XYZ to device CMYK (`0.0..=1.0`) using `B2A*` LUT or built-in press model.
@@ -1419,11 +1904,24 @@ impl IccProfile {
         xyz: [f64; 3],
         intent: RenderingIntent,
     ) -> Option<[f64; 4]> {
+        self.pcs_xyz_to_cmyk_impl(xyz, intent, false)
+    }
+
+    fn pcs_xyz_to_cmyk_impl(
+        &self,
+        xyz: [f64; 3],
+        intent: RenderingIntent,
+        adapted_abs: bool,
+    ) -> Option<[f64; 4]> {
         if self.header.color_space != IccColorSpace::Cmyk {
             return None;
         }
         let xyz_clean = xyz.map(sanitize_finite);
-        let rel_xyz = self.adapt_abs_xyz_to_rel(xyz_clean, intent);
+        let rel_xyz = if adapted_abs {
+            self.adapt_abs_xyz_to_rel_adapted(xyz_clean, intent)
+        } else {
+            self.adapt_abs_xyz_to_rel(xyz_clean, intent)
+        };
         if let Some(v4) = self.select_v4_b2a(intent) {
             if v4.in_channels == 3 && v4.out_channels == 4 {
                 let encoded = encode_xyz_to_lut_pcs(rel_xyz, self.header.pcs, v4.clut_is_16bit, 4);
@@ -1573,6 +2071,264 @@ pub fn convert_rgb_between_builtin_profiles(
         .pcs_xyz_to_rgb(xyz)
         .unwrap_or_else(|| xyz_d50_to_srgb(xyz));
     [out[0] as f32, out[1] as f32, out[2] as f32]
+}
+
+/// Unified 3-slot (RGB / CMYK / Gray) document ICC color management pipeline honoring
+/// explicit [`RenderingIntent`] and ISO 18619 Black Point Compensation.
+#[derive(Debug, Clone)]
+pub struct IccColorPipeline {
+    pub rgb_profile: IccProfile,
+    pub cmyk_profile: Option<IccProfile>,
+    pub gray_profile: Option<IccProfile>,
+    pub intent: RenderingIntent,
+    pub bpc: bool,
+    rgb_is_srgb: bool,
+}
+
+impl Default for IccColorPipeline {
+    fn default() -> Self {
+        Self {
+            rgb_profile: IccProfile::builtin(BuiltinIccProfile::Srgb),
+            cmyk_profile: None,
+            gray_profile: None,
+            intent: RenderingIntent::RelativeColorimetric,
+            bpc: true,
+            rgb_is_srgb: true,
+        }
+    }
+}
+
+impl IccColorPipeline {
+    /// Constructs a pipeline from optional raw binary ICC profiles for RGB, CMYK, and Gray
+    /// slots, plus an optional legacy `custom_icc_profile` fallback routed by `color_space`.
+    #[must_use]
+    pub fn from_document_profiles(
+        rgb_bytes: Option<&[u8]>,
+        cmyk_bytes: Option<&[u8]>,
+        gray_bytes: Option<&[u8]>,
+        legacy_custom: Option<&[u8]>,
+        intent: RenderingIntent,
+        bpc: bool,
+    ) -> Self {
+        let mut rgb_prof = rgb_bytes
+            .and_then(|b| IccProfile::from_bytes(b).ok())
+            .filter(|p| p.header.color_space == IccColorSpace::Rgb);
+        let mut cmyk_prof = cmyk_bytes
+            .and_then(|b| IccProfile::from_bytes(b).ok())
+            .filter(|p| p.header.color_space == IccColorSpace::Cmyk);
+        let mut gray_prof = gray_bytes
+            .and_then(|b| IccProfile::from_bytes(b).ok())
+            .filter(|p| p.header.color_space == IccColorSpace::Gray);
+
+        if let Some(custom) = legacy_custom.and_then(|b| IccProfile::from_bytes(b).ok()) {
+            match custom.header.color_space {
+                IccColorSpace::Rgb if rgb_prof.is_none() => rgb_prof = Some(custom),
+                IccColorSpace::Cmyk if cmyk_prof.is_none() => cmyk_prof = Some(custom),
+                IccColorSpace::Gray if gray_prof.is_none() => gray_prof = Some(custom),
+                _ => {}
+            }
+        }
+
+        let rgb_is_srgb = rgb_prof.is_none();
+        Self {
+            rgb_profile: rgb_prof.unwrap_or_else(|| IccProfile::builtin(BuiltinIccProfile::Srgb)),
+            cmyk_profile: cmyk_prof,
+            gray_profile: gray_prof,
+            intent,
+            bpc,
+            rgb_is_srgb,
+        }
+    }
+
+    /// Converts device CMYK (`0.0..=1.0`) to sRGB (`0.0..=1.0`) using `self.cmyk_profile`,
+    /// `self.intent`, and `self.bpc`. When no CMYK ICC profile is bound, uses the deterministic
+    /// baseline CMYK fallback matching `Color::to_rgba_f32`.
+    #[must_use]
+    pub fn cmyk_to_srgb(&self, cmyk: [f32; 4]) -> [f32; 3] {
+        let c = sanitize_f32(cmyk[0], 0.0).clamp(0.0, 1.0);
+        let m = sanitize_f32(cmyk[1], 0.0).clamp(0.0, 1.0);
+        let y = sanitize_f32(cmyk[2], 0.0).clamp(0.0, 1.0);
+        let k = sanitize_f32(cmyk[3], 0.0).clamp(0.0, 1.0);
+        if let Some(cp) = &self.cmyk_profile {
+            let cmyk64 = [f64::from(c), f64::from(m), f64::from(y), f64::from(k)];
+            if let Some(xyz) = cp.cmyk_to_pcs_xyz_impl(cmyk64, self.intent, self.bpc, true) {
+                let rgb = xyz_d50_to_srgb(xyz);
+                return [
+                    rgb[0].clamp(0.0, 1.0) as f32,
+                    rgb[1].clamp(0.0, 1.0) as f32,
+                    rgb[2].clamp(0.0, 1.0) as f32,
+                ];
+            }
+            return convert_cmyk_to_rgb_icc(
+                [c, m, y, k],
+                BuiltinIccProfile::IsoCoatedV2Cmyk,
+                self.intent,
+            );
+        }
+        let inv_k = 1.0 - k;
+        [(1.0 - c) * inv_k, (1.0 - m) * inv_k, (1.0 - y) * inv_k]
+    }
+
+    /// Converts device Gray (`0.0` black .. `1.0` white) to sRGB (`0.0..=1.0`).
+    #[must_use]
+    pub fn gray_to_srgb(&self, v: f32) -> [f32; 3] {
+        let vf = sanitize_f32(v, 0.0).clamp(0.0, 1.0);
+        if let Some(gp) = &self.gray_profile {
+            if let Some(xyz) = gp.gray_to_pcs_xyz_impl(f64::from(vf), self.intent, self.bpc, true) {
+                let rgb = xyz_d50_to_srgb(xyz);
+                return [
+                    rgb[0].clamp(0.0, 1.0) as f32,
+                    rgb[1].clamp(0.0, 1.0) as f32,
+                    rgb[2].clamp(0.0, 1.0) as f32,
+                ];
+            }
+        }
+        [vf, vf, vf]
+    }
+
+    /// Converts sRGB (`0.0..=1.0`) to device CMYK (`0.0..=1.0`) using `self.cmyk_profile`.
+    #[must_use]
+    pub fn srgb_to_cmyk(&self, rgb: [f32; 3]) -> [f32; 4] {
+        let rgb64 = [
+            f64::from(sanitize_f32(rgb[0], 0.0).clamp(0.0, 1.0)),
+            f64::from(sanitize_f32(rgb[1], 0.0).clamp(0.0, 1.0)),
+            f64::from(sanitize_f32(rgb[2], 0.0).clamp(0.0, 1.0)),
+        ];
+        let xyz = if self.rgb_is_srgb {
+            srgb_to_xyz_d50(rgb64)
+        } else {
+            self.rgb_profile
+                .rgb_to_pcs_xyz_impl(rgb64, self.intent, self.bpc, true)
+                .unwrap_or_else(|| srgb_to_xyz_d50(rgb64))
+        };
+        if let Some(cp) = &self.cmyk_profile {
+            if let Some(cmyk) = cp.pcs_xyz_to_cmyk_impl(xyz, self.intent, true) {
+                return [
+                    cmyk[0].clamp(0.0, 1.0) as f32,
+                    cmyk[1].clamp(0.0, 1.0) as f32,
+                    cmyk[2].clamp(0.0, 1.0) as f32,
+                    cmyk[3].clamp(0.0, 1.0) as f32,
+                ];
+            }
+        }
+        convert_rgb_to_cmyk_icc(rgb, BuiltinIccProfile::IsoCoatedV2Cmyk, self.intent)
+    }
+
+    /// Converts any [`crate::color::Color`] into display sRGB `[r, g, b, a]` through this pipeline.
+    #[must_use]
+    pub fn color_to_rgba_f32(&self, color: &crate::color::Color) -> [f32; 4] {
+        use crate::color::Color;
+        match *color {
+            Color::Rgba { r, g, b, a } => {
+                let a = sanitize_f32(a, 0.0).clamp(0.0, 1.0);
+                if self.rgb_is_srgb {
+                    return [
+                        sanitize_f32(r, 0.0).clamp(0.0, 1.0),
+                        sanitize_f32(g, 0.0).clamp(0.0, 1.0),
+                        sanitize_f32(b, 0.0).clamp(0.0, 1.0),
+                        a,
+                    ];
+                }
+                let rgb64 = [
+                    f64::from(sanitize_f32(r, 0.0).clamp(0.0, 1.0)),
+                    f64::from(sanitize_f32(g, 0.0).clamp(0.0, 1.0)),
+                    f64::from(sanitize_f32(b, 0.0).clamp(0.0, 1.0)),
+                ];
+                let out = self
+                    .rgb_profile
+                    .rgb_to_pcs_xyz_impl(rgb64, self.intent, self.bpc, true)
+                    .map(xyz_d50_to_srgb)
+                    .unwrap_or(rgb64);
+                [
+                    out[0].clamp(0.0, 1.0) as f32,
+                    out[1].clamp(0.0, 1.0) as f32,
+                    out[2].clamp(0.0, 1.0) as f32,
+                    a,
+                ]
+            }
+            Color::Cmyk { c, m, y, k, a } => {
+                let [r, g, b] = self.cmyk_to_srgb([c, m, y, k]);
+                [r, g, b, sanitize_f32(a, 0.0).clamp(0.0, 1.0)]
+            }
+            Color::Spot {
+                tint,
+                fallback_cmyk,
+                alpha,
+                ..
+            } => {
+                let t = sanitize_f32(tint, 0.0).clamp(0.0, 1.0);
+                let [r, g, b] = self.cmyk_to_srgb([
+                    fallback_cmyk[0] * t,
+                    fallback_cmyk[1] * t,
+                    fallback_cmyk[2] * t,
+                    fallback_cmyk[3] * t,
+                ]);
+                [r, g, b, sanitize_f32(alpha, 0.0).clamp(0.0, 1.0)]
+            }
+            Color::Gray { v, a } => {
+                let [r, g, b] = self.gray_to_srgb(v);
+                [r, g, b, sanitize_f32(a, 0.0).clamp(0.0, 1.0)]
+            }
+            Color::Hsl { .. } | Color::Lab { .. } => color.to_rgba_f32(),
+        }
+    }
+
+    /// Converts any [`crate::color::Color`] into 8-bit `[r, g, b, a]` through this pipeline.
+    #[must_use]
+    pub fn color_to_rgba8(&self, color: &crate::color::Color) -> [u8; 4] {
+        let [r, g, b, a] = self.color_to_rgba_f32(color);
+        [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+            (a * 255.0).round() as u8,
+        ]
+    }
+
+    /// ICC-aware color interpolation between `a` (`t = 0.0`) and `b` (`t = 1.0`).
+    #[must_use]
+    pub fn lerp_color(
+        &self,
+        a: &crate::color::Color,
+        b: &crate::color::Color,
+        t: f32,
+    ) -> crate::color::Color {
+        use crate::color::Color;
+        let t = sanitize_f32(t, 0.0).clamp(0.0, 1.0);
+        if let (
+            Color::Cmyk {
+                c: c0,
+                m: m0,
+                y: y0,
+                k: k0,
+                a: a0,
+            },
+            Color::Cmyk {
+                c: c1,
+                m: m1,
+                y: y1,
+                k: k1,
+                a: a1,
+            },
+        ) = (a, b)
+        {
+            return Color::Cmyk {
+                c: c0 + (c1 - c0) * t,
+                m: m0 + (m1 - m0) * t,
+                y: y0 + (y1 - y0) * t,
+                k: k0 + (k1 - k0) * t,
+                a: a0 + (a1 - a0) * t,
+            };
+        }
+        let ca = self.color_to_rgba_f32(a);
+        let cb = self.color_to_rgba_f32(b);
+        Color::rgba(
+            ca[0] + (cb[0] - ca[0]) * t,
+            ca[1] + (cb[1] - ca[1]) * t,
+            ca[2] + (cb[2] - ca[2]) * t,
+            ca[3] + (cb[3] - ca[3]) * t,
+        )
+    }
 }
 
 /// Fast real-time framebuffer CMYK soft-proofing and optional out-of-gamut warning pass
@@ -1750,32 +2506,38 @@ impl SoftProofLut3D {
                     let xyz_in = srgb_to_xyz_d50([r, gv, b]);
                     let lab_in = xyz_d50_to_lab(xyz_in);
                     let xyz_proof = if can_cmyk {
-                        let cmyk = profile.pcs_xyz_to_cmyk_with_intent(xyz_in, intent)?;
-                        profile.cmyk_to_pcs_xyz_with_intent(cmyk, intent)?
+                        let cmyk = profile.pcs_xyz_to_cmyk_impl(xyz_in, intent, true)?;
+                        profile.cmyk_to_pcs_xyz_impl(cmyk, intent, false, true)?
                     } else {
-                        let rgb_dev = profile.pcs_xyz_to_rgb_with_intent(xyz_in, intent)?;
-                        profile.rgb_to_pcs_xyz_with_intent(rgb_dev, intent)?
+                        let rgb_dev = profile.pcs_xyz_to_rgb_impl(xyz_in, intent, true)?;
+                        profile.rgb_to_pcs_xyz_impl(rgb_dev, intent, false, true)?
                     };
                     let proof_rgb = xyz_d50_to_srgb(xyz_proof);
                     let xyz_rel = if intent == RenderingIntent::RelativeColorimetric {
                         xyz_proof
                     } else if can_cmyk {
-                        let cmyk_r = profile.pcs_xyz_to_cmyk_with_intent(
+                        let cmyk_r = profile.pcs_xyz_to_cmyk_impl(
                             xyz_in,
                             RenderingIntent::RelativeColorimetric,
+                            true,
                         )?;
-                        profile.cmyk_to_pcs_xyz_with_intent(
+                        profile.cmyk_to_pcs_xyz_impl(
                             cmyk_r,
                             RenderingIntent::RelativeColorimetric,
+                            false,
+                            true,
                         )?
                     } else {
-                        let rgb_r = profile.pcs_xyz_to_rgb_with_intent(
+                        let rgb_r = profile.pcs_xyz_to_rgb_impl(
                             xyz_in,
                             RenderingIntent::RelativeColorimetric,
+                            true,
                         )?;
-                        profile.rgb_to_pcs_xyz_with_intent(
+                        profile.rgb_to_pcs_xyz_impl(
                             rgb_r,
                             RenderingIntent::RelativeColorimetric,
+                            false,
+                            true,
                         )?
                     };
                     let lab_out = xyz_d50_to_lab(xyz_rel);
@@ -2493,6 +3255,16 @@ fn mat3_mul_vec(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+fn mat3_mul_mat3(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0_f64; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c];
+        }
+    }
+    out
+}
+
 fn mat3_invert(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     let c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
     let c01 = -(m[1][0] * m[2][2] - m[1][2] * m[2][0]);
@@ -2653,6 +3425,25 @@ fn parse_xyz_tag(tag: &[u8]) -> CoreResult<[f64; 3]> {
         read_s15_fixed16(tag, 12)?,
         read_s15_fixed16(tag, 16)?,
     ])
+}
+
+fn parse_sf32_chad_tag(tag: &[u8]) -> CoreResult<[[f64; 3]; 3]> {
+    if tag.len() < 44 || &tag[0..4] != b"sf32" {
+        return Err(CoreError::InvalidColor(
+            "malformed ICC chad sf32 tag".into(),
+        ));
+    }
+    let mut m = [[0.0_f64; 3]; 3];
+    for (r, row) in m.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            let v = read_s15_fixed16(tag, 8 + (r * 3 + c) * 4)?;
+            if !v.is_finite() {
+                return Err(CoreError::InvalidColor("non-finite ICC chad entry".into()));
+            }
+            *cell = v;
+        }
+    }
+    Ok(m)
 }
 
 fn parse_desc_or_mluc_tag(tag: &[u8]) -> CoreResult<String> {
@@ -4142,5 +4933,516 @@ mod tests {
             (xyz_abs[2] - xyz_rel[2]).abs() > 1e-4,
             "AbsoluteColorimetric should apply media white-point scaling"
         );
+    }
+
+    #[test]
+    fn parses_chad_and_bkpt_tags_and_applies_bradford_and_bpc() {
+        let mut chad = Vec::new();
+        chad.extend_from_slice(b"sf32");
+        chad.extend_from_slice(&0u32.to_be_bytes());
+        let bmat = bradford_adaptation_matrix(D65_WHITE, D50_WHITE);
+        for row in &bmat {
+            for &val in row {
+                let fixed = (val * 65_536.0).round() as i32;
+                chad.extend_from_slice(&fixed.to_be_bytes());
+            }
+        }
+        let bkpt = make_xyz_tag([0.02, 0.02, 0.015]);
+        let bytes = build_synthetic_icc_bytes(
+            4,
+            b"mntr",
+            b"RGB ",
+            b"XYZ ",
+            1,
+            &[
+                (b"desc", make_mluc_tag("Bradford Test")),
+                (b"wtpt", make_xyz_tag(D65_WHITE)),
+                (b"bkpt", bkpt),
+                (b"chad", chad),
+                (
+                    b"rXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][0],
+                        SRGB_TO_XYZ_D50[1][0],
+                        SRGB_TO_XYZ_D50[2][0],
+                    ]),
+                ),
+                (
+                    b"gXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][1],
+                        SRGB_TO_XYZ_D50[1][1],
+                        SRGB_TO_XYZ_D50[2][1],
+                    ]),
+                ),
+                (
+                    b"bXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][2],
+                        SRGB_TO_XYZ_D50[1][2],
+                        SRGB_TO_XYZ_D50[2][2],
+                    ]),
+                ),
+                (b"rTRC", make_para_srgb_tag()),
+                (b"gTRC", make_para_srgb_tag()),
+                (b"bTRC", make_para_srgb_tag()),
+            ],
+        );
+        let prof = IccProfile::from_bytes(&bytes).expect("profile with chad + bkpt parses");
+        assert!(prof.chad.is_some());
+        assert!(prof.black_point.is_some());
+
+        let adapted = adapt_xyz_bradford(D65_WHITE, D65_WHITE, D50_WHITE);
+        for i in 0..3 {
+            assert!((adapted[i] - D50_WHITE[i]).abs() < 1e-3);
+        }
+
+        // ISO 18619 BPC maps source black point Y -> 0.0 while keeping D50 white fixed
+        let xyz_no_bpc = prof
+            .rgb_to_pcs_xyz_with_intent_bpc(
+                [0.0, 0.0, 0.0],
+                RenderingIntent::RelativeColorimetric,
+                false,
+            )
+            .unwrap();
+        let xyz_bpc = prof
+            .rgb_to_pcs_xyz_with_intent_bpc(
+                [0.0, 0.0, 0.0],
+                RenderingIntent::RelativeColorimetric,
+                true,
+            )
+            .unwrap();
+        assert!((xyz_no_bpc[1] - 0.0).abs() < 1e-4);
+        assert!(xyz_bpc[1] <= xyz_no_bpc[1] + 1e-6);
+
+        let scaled = IccProfile::apply_bpc(
+            [0.02, 0.02, 0.015],
+            [0.02, 0.02, 0.015],
+            0.0,
+            RenderingIntent::RelativeColorimetric,
+            true,
+        );
+        assert!(scaled[1].abs() < 1e-6);
+        let white_fixed = IccProfile::apply_bpc(
+            D50_WHITE,
+            [0.02, 0.02, 0.015],
+            0.0,
+            RenderingIntent::RelativeColorimetric,
+            true,
+        );
+        for i in 0..3 {
+            assert!((white_fixed[i] - D50_WHITE[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn gray_pcs_roundtrip_and_cmyk_bpc_pipeline() {
+        let mut ktrc = Vec::new();
+        ktrc.extend_from_slice(b"curv\0\0\0\0");
+        ktrc.extend_from_slice(&1u32.to_be_bytes());
+        ktrc.extend_from_slice(&((2.2 * 256.0) as u16).to_be_bytes());
+        let gray_bytes = build_synthetic_icc_bytes(
+            2,
+            b"mntr",
+            b"GRAY",
+            b"XYZ ",
+            1,
+            &[(b"desc", make_mluc_tag("Gray Gamma 2.2")), (b"kTRC", ktrc)],
+        );
+        let gray_prof = IccProfile::from_bytes(&gray_bytes).expect("gray ICC profile parses");
+        assert_eq!(gray_prof.header.color_space, IccColorSpace::Gray);
+        let xyz = gray_prof
+            .gray_to_pcs_xyz_with_intent_bpc(0.5, RenderingIntent::RelativeColorimetric, false)
+            .expect("gray->xyz");
+        let back = gray_prof
+            .pcs_xyz_to_gray_with_intent(xyz, RenderingIntent::RelativeColorimetric)
+            .expect("xyz->gray");
+        assert!((back - 0.5).abs() < 1e-3, "gray roundtrip back={back}");
+
+        let cmyk_prof = IccProfile::builtin(BuiltinIccProfile::IsoCoatedV2Cmyk);
+        let no_bpc = cmyk_prof
+            .cmyk_to_srgb_with_intent_bpc(
+                [1.0, 1.0, 1.0, 1.0],
+                RenderingIntent::RelativeColorimetric,
+                false,
+            )
+            .unwrap();
+        let with_bpc = cmyk_prof
+            .cmyk_to_srgb_with_intent_bpc(
+                [1.0, 1.0, 1.0, 1.0],
+                RenderingIntent::RelativeColorimetric,
+                true,
+            )
+            .unwrap();
+        assert!(with_bpc[1] < no_bpc[1], "BPC must deepen CMYK black point");
+
+        let pipeline = IccColorPipeline::from_document_profiles(
+            None,
+            None,
+            Some(&gray_bytes),
+            None,
+            RenderingIntent::RelativeColorimetric,
+            true,
+        );
+        let gray_srgb = pipeline.color_to_rgba_f32(&crate::color::Color::gray(0.5));
+        assert!(
+            (gray_srgb[0] - 0.503).abs() < 0.02,
+            "gamma 2.2 gray 0.5 -> sRGB ~0.503, got {:?}",
+            gray_srgb
+        );
+    }
+
+    #[test]
+    fn absolute_colorimetric_applies_chad_matrix_when_present() {
+        let mut prof = IccProfile::builtin(BuiltinIccProfile::Srgb);
+        // Set white_point to D50 so any white-point difference in AbsoluteColorimetric
+        // MUST come from `self.chad` (Bradford D65 -> D50), not diagonal white_point scaling.
+        prof.white_point = Some(D50_WHITE);
+        let bradford_d65_to_d50 = bradford_adaptation_matrix(D65_WHITE, D50_WHITE);
+        prof.chad = Some(bradford_d65_to_d50);
+
+        let abs_white = prof
+            .rgb_to_pcs_xyz_with_intent_bpc(
+                [1.0, 1.0, 1.0],
+                RenderingIntent::AbsoluteColorimetric,
+                false,
+            )
+            .expect("rgb->pcs_xyz");
+        for i in 0..3 {
+            assert!(
+                (abs_white[i] - D65_WHITE[i]).abs() < 1e-3,
+                "chad^-1 must recover D65 white at channel {i}: got {}, expected {}",
+                abs_white[i],
+                D65_WHITE[i]
+            );
+        }
+
+        let roundtrip_rgb = prof
+            .pcs_xyz_to_rgb_with_intent(abs_white, RenderingIntent::AbsoluteColorimetric)
+            .expect("pcs_xyz->rgb");
+        for (i, &val) in roundtrip_rgb.iter().enumerate() {
+            assert!(
+                (val - 1.0).abs() < 1e-3,
+                "chad roundtrip must recover white RGB=1.0 at channel {i}: got {val}",
+            );
+        }
+    }
+
+    fn build_synthetic_srgb_v4_with_chad_bytes() -> Vec<u8> {
+        let mut chad = Vec::new();
+        chad.extend_from_slice(b"sf32");
+        chad.extend_from_slice(&0u32.to_be_bytes());
+        let bmat = bradford_adaptation_matrix(D65_WHITE, D50_WHITE);
+        for row in &bmat {
+            for &val in row {
+                let fixed = (val * 65_536.0).round() as i32;
+                chad.extend_from_slice(&fixed.to_be_bytes());
+            }
+        }
+        build_synthetic_icc_bytes(
+            4,
+            b"mntr",
+            b"RGB ",
+            b"XYZ ",
+            1,
+            &[
+                (b"desc", make_mluc_tag("Synthetic sRGB v4 with chad")),
+                (b"wtpt", make_xyz_tag(D50_WHITE)),
+                (b"chad", chad),
+                (
+                    b"rXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][0],
+                        SRGB_TO_XYZ_D50[1][0],
+                        SRGB_TO_XYZ_D50[2][0],
+                    ]),
+                ),
+                (
+                    b"gXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][1],
+                        SRGB_TO_XYZ_D50[1][1],
+                        SRGB_TO_XYZ_D50[2][1],
+                    ]),
+                ),
+                (
+                    b"bXYZ",
+                    make_xyz_tag([
+                        SRGB_TO_XYZ_D50[0][2],
+                        SRGB_TO_XYZ_D50[1][2],
+                        SRGB_TO_XYZ_D50[2][2],
+                    ]),
+                ),
+                (b"rTRC", make_para_srgb_tag()),
+                (b"gTRC", make_para_srgb_tag()),
+                (b"bTRC", make_para_srgb_tag()),
+            ],
+        )
+    }
+
+    #[test]
+    fn absolute_colorimetric_pipeline_chad_rgb_profiles_preserve_white_without_cyan_shift() {
+        use crate::color::Color;
+
+        // 1. Synthetic ICC v4 D65 profile carrying a `chad` matrix and D50-adapted `wtpt`.
+        let srgb_v4_bytes = build_synthetic_srgb_v4_with_chad_bytes();
+        let srgb_v4 = IccProfile::from_bytes(&srgb_v4_bytes).expect("synthetic sRGB v4 parses");
+        assert!(srgb_v4.chad.is_some());
+
+        let pipeline = IccColorPipeline::from_document_profiles(
+            Some(&srgb_v4_bytes),
+            None,
+            None,
+            None,
+            RenderingIntent::AbsoluteColorimetric,
+            false,
+        );
+        let white_f32 = pipeline.color_to_rgba_f32(&Color::rgba(1.0, 1.0, 1.0, 1.0));
+        for (ch, &val) in white_f32.iter().enumerate() {
+            assert!(
+                (val - 1.0).abs() < 1e-3,
+                "synthetic chad sRGB v4 AbsoluteColorimetric white channel {ch} drifted: {white_f32:?}"
+            );
+        }
+        assert_eq!(
+            pipeline.color_to_rgba8(&Color::rgba(1.0, 1.0, 1.0, 1.0)),
+            [255, 255, 255, 255]
+        );
+
+        let mid_f32 = pipeline.color_to_rgba_f32(&Color::rgba(0.5, 0.5, 0.5, 1.0));
+        for (ch, &val) in mid_f32[..3].iter().enumerate() {
+            assert!(
+                (val - 0.5).abs() < 5e-3,
+                "synthetic chad sRGB v4 neutral gray channel {ch} drifted: {mid_f32:?}"
+            );
+        }
+
+        // SoftProofLut3D::build_from_profile must also keep white neutral under AbsoluteColorimetric.
+        let mut proof_px = [255u8, 255, 255, 255];
+        apply_soft_proof_rgba_with_profile(
+            &mut proof_px,
+            Some(&srgb_v4),
+            BuiltinIccProfile::IsoCoatedV2Cmyk,
+            RenderingIntent::AbsoluteColorimetric,
+            true,
+            false,
+        );
+        assert_eq!(
+            proof_px,
+            [255, 255, 255, 255],
+            "SoftProofLut3D turned white to non-white under AbsoluteColorimetric: {proof_px:?}"
+        );
+
+        // 2. Real colord v4 profiles (`sRGB.icc`, `AdobeRGB1998.icc`, `Bluish.icc`) when installed.
+        for name in ["sRGB.icc", "AdobeRGB1998.icc", "Bluish.icc"] {
+            let path = std::path::Path::new("/usr/share/color/icc/colord").join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read colord profile");
+            let parsed = IccProfile::from_bytes(&bytes).expect("parse colord profile");
+            assert!(
+                parsed.chad.is_some(),
+                "{name} should carry a chad tag for regression coverage"
+            );
+            let pipe = IccColorPipeline::from_document_profiles(
+                Some(&bytes),
+                None,
+                None,
+                None,
+                RenderingIntent::AbsoluteColorimetric,
+                false,
+            );
+            let out = pipe.color_to_rgba_f32(&Color::rgba(1.0, 1.0, 1.0, 1.0));
+            for (ch, &val) in out.iter().enumerate() {
+                assert!(
+                    (val - 1.0).abs() < 1e-3,
+                    "{name} AbsoluteColorimetric white channel {ch} shifted (cyan bug?): {out:?}"
+                );
+            }
+            assert_eq!(
+                pipe.color_to_rgba8(&Color::rgba(1.0, 1.0, 1.0, 1.0)),
+                [255, 255, 255, 255],
+                "{name} AbsoluteColorimetric white must render (255,255,255)"
+            );
+
+            let mut px = [255u8, 255, 255, 255];
+            apply_soft_proof_rgba_with_profile(
+                &mut px,
+                Some(&parsed),
+                BuiltinIccProfile::IsoCoatedV2Cmyk,
+                RenderingIntent::AbsoluteColorimetric,
+                true,
+                false,
+            );
+            assert_eq!(
+                px,
+                [255, 255, 255, 255],
+                "{name} SoftProofLut3D white drifted under AbsoluteColorimetric: {px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_colorimetric_pipeline_cmyk_agrees_between_default_and_explicit_srgb_profile() {
+        use crate::color::Color;
+
+        let srgb_v4_bytes = build_synthetic_srgb_v4_with_chad_bytes();
+        let cmyk_v2_bytes =
+            generate_minimal_cmyk_icc_v2("Synth ISO Coated v2", BuiltinIccProfile::IsoCoatedV2Cmyk);
+
+        let pipe_default = IccColorPipeline::from_document_profiles(
+            None,
+            Some(&cmyk_v2_bytes),
+            None,
+            None,
+            RenderingIntent::AbsoluteColorimetric,
+            false,
+        );
+        let pipe_explicit_srgb = IccColorPipeline::from_document_profiles(
+            Some(&srgb_v4_bytes),
+            Some(&cmyk_v2_bytes),
+            None,
+            None,
+            RenderingIntent::AbsoluteColorimetric,
+            false,
+        );
+        for cmyk in [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.65, 0.15, 0.0, 0.0],
+            [0.0, 0.85, 0.05, 0.0],
+            [0.4, 0.7, 0.2, 0.1],
+        ] {
+            let col = Color::cmyk(cmyk[0], cmyk[1], cmyk[2], cmyk[3]);
+            let a = pipe_default.color_to_rgba_f32(&col);
+            let b = pipe_explicit_srgb.color_to_rgba_f32(&col);
+            for ch in 0..4 {
+                assert!(
+                    (a[ch] - b[ch]).abs() < 1e-3,
+                    "CMYK {cmyk:?} default vs explicit sRGB diverged on ch {ch}: {a:?} vs {b:?}"
+                );
+            }
+        }
+
+        // Real FOGRA39L_coated.icc + sRGB.icc when installed on system.
+        let fogra_path = std::path::Path::new("/usr/share/color/icc/colord/FOGRA39L_coated.icc");
+        let srgb_path = std::path::Path::new("/usr/share/color/icc/colord/sRGB.icc");
+        if fogra_path.is_file() && srgb_path.is_file() {
+            let fogra_bytes = std::fs::read(fogra_path).expect("read FOGRA39");
+            let srgb_bytes = std::fs::read(srgb_path).expect("read sRGB.icc");
+            let p_none = IccColorPipeline::from_document_profiles(
+                None,
+                Some(&fogra_bytes),
+                None,
+                None,
+                RenderingIntent::AbsoluteColorimetric,
+                false,
+            );
+            let p_srgb = IccColorPipeline::from_document_profiles(
+                Some(&srgb_bytes),
+                Some(&fogra_bytes),
+                None,
+                None,
+                RenderingIntent::AbsoluteColorimetric,
+                false,
+            );
+            for cmyk in [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.65, 0.15, 0.0, 0.0],
+                [0.0, 0.85, 0.05, 0.0],
+                [0.4, 0.7, 0.2, 0.1],
+            ] {
+                let col = Color::cmyk(cmyk[0], cmyk[1], cmyk[2], cmyk[3]);
+                let a = p_none.color_to_rgba_f32(&col);
+                let b = p_srgb.color_to_rgba_f32(&col);
+                for ch in 0..4 {
+                    assert!(
+                        (a[ch] - b[ch]).abs() < 1e-3,
+                        "FOGRA39 {cmyk:?} rgb=None vs rgb=sRGB.icc diverged on ch {ch}: {a:?} vs {b:?}"
+                    );
+                }
+            }
+            // Paper white (0,0,0,0) under FOGRA39 AbsoluteColorimetric matches transicc (~239, 241, 244).
+            let paper = p_srgb.color_to_rgba8(&Color::cmyk(0.0, 0.0, 0.0, 0.0));
+            assert!(
+                (i32::from(paper[0]) - 239).abs() <= 2
+                    && (i32::from(paper[1]) - 241).abs() <= 2
+                    && (i32::from(paper[2]) - 245).abs() <= 2,
+                "FOGRA39 paper white unexpected: {paper:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_colorimetric_display_gray_v2_without_chad_preserves_white_without_cyan_shift() {
+        use crate::color::Color;
+
+        let mut ktrc = Vec::new();
+        ktrc.extend_from_slice(b"curv\0\0\0\0");
+        ktrc.extend_from_slice(&1u32.to_be_bytes());
+        ktrc.extend_from_slice(&((2.2 * 256.0) as u16).to_be_bytes());
+        let gray_v2_bytes = build_synthetic_icc_bytes(
+            2,
+            b"mntr",
+            b"GRAY",
+            b"XYZ ",
+            1,
+            &[
+                (b"desc", make_mluc_tag("Display Gray v2 D65")),
+                (b"wtpt", make_xyz_tag(D65_WHITE)),
+                (b"kTRC", ktrc),
+            ],
+        );
+        let parsed = IccProfile::from_bytes(&gray_v2_bytes).expect("synthetic display gray parses");
+        assert!(parsed.chad.is_none());
+        assert_eq!(parsed.header.profile_class, IccProfileClass::Display);
+        assert_eq!(parsed.header.color_space, IccColorSpace::Gray);
+
+        let pipe = IccColorPipeline::from_document_profiles(
+            None,
+            None,
+            Some(&gray_v2_bytes),
+            None,
+            RenderingIntent::AbsoluteColorimetric,
+            false,
+        );
+        assert_eq!(
+            pipe.color_to_rgba8(&Color::gray(1.0)),
+            [255, 255, 255, 255],
+            "Display Gray ICC v2 without chad must map white Gray(1.0) to (255,255,255) under AbsCol"
+        );
+        let mid = pipe.color_to_rgba8(&Color::gray(0.5));
+        assert!(
+            mid[0].abs_diff(mid[1]) <= 1 && mid[1].abs_diff(mid[2]) <= 1,
+            "Display Gray ICC v2 without chad must keep Gray(0.5) neutral without cyan shift: {mid:?}"
+        );
+        assert_eq!(pipe.color_to_rgba8(&Color::gray(0.0)), [0, 0, 0, 255]);
+
+        for name in ["sgray.icc", "default_gray.icc"] {
+            let path = std::path::Path::new("/usr/share/color/icc/ghostscript").join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read ghostscript gray icc");
+            let p = IccColorPipeline::from_document_profiles(
+                None,
+                None,
+                Some(&bytes),
+                None,
+                RenderingIntent::AbsoluteColorimetric,
+                false,
+            );
+            assert_eq!(
+                p.color_to_rgba8(&Color::gray(1.0)),
+                [255, 255, 255, 255],
+                "{name} AbsoluteColorimetric Gray(1.0) must render (255,255,255)"
+            );
+            let m = p.color_to_rgba8(&Color::gray(0.5));
+            assert!(
+                m[0].abs_diff(m[1]) <= 1 && m[1].abs_diff(m[2]) <= 1,
+                "{name} AbsoluteColorimetric Gray(0.5) must remain neutral: {m:?}"
+            );
+            assert_eq!(p.color_to_rgba8(&Color::gray(0.0)), [0, 0, 0, 255]);
+        }
     }
 }

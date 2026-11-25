@@ -1814,14 +1814,14 @@ mod tests {
         };
         let a0 = &doc.assets()[&r0.asset_id];
         assert_eq!((a0.width, a0.height), (4, 2));
-        assert_eq!(&a0.rgba_bytes[0..4], &[10, 20, 240, 255]);
+        assert_eq!(&a0.to_rgba8_vec()[0..4], &[10, 20, 240, 255]);
 
         let NodePayload::Raster(r1) = &obj1.payload else {
             panic!("expected raster layer 1");
         };
         let a1 = &doc.assets()[&r1.asset_id];
         assert_eq!((a1.width, a1.height), (2, 2));
-        assert_eq!(&a1.rgba_bytes[0..4], &[250, 30, 40, 200]);
+        assert_eq!(&a1.to_rgba8_vec()[0..4], &[250, 30, 40, 200]);
     }
 
     #[test]
@@ -1860,7 +1860,7 @@ mod tests {
         };
         let asset = &doc.assets()[&r.asset_id];
         // Pure Cyan -> sRGB (0, 255, 255, 255)
-        assert_eq!(&asset.rgba_bytes[0..4], &[0, 255, 255, 255]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[0, 255, 255, 255]);
     }
 
     #[test]
@@ -1884,7 +1884,7 @@ mod tests {
         assert_eq!(doc.pages()[0].layers[0].name, "Composite");
         let asset = doc.assets().values().next().unwrap();
         assert_eq!((asset.width, asset.height), (3, 2));
-        assert_eq!(&asset.rgba_bytes[0..4], &[120, 180, 60, 255]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[120, 180, 60, 255]);
     }
 
     #[test]
@@ -1928,7 +1928,7 @@ mod tests {
         let asset = &doc.assets()[&r.asset_id];
         assert!(asset.width <= MAX_LAYER_OUTPUT_DIM);
         assert!(asset.height <= MAX_LAYER_OUTPUT_DIM);
-        assert_eq!(&asset.rgba_bytes[0..4], &[200, 200, 200, 255]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[200, 200, 200, 255]);
     }
 
     #[test]
@@ -1978,7 +1978,7 @@ mod tests {
             panic!("expected raster");
         };
         let asset = &doc.assets()[&r.asset_id];
-        assert_eq!(&asset.rgba_bytes[0..4], &[15, 230, 45, 255]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[15, 230, 45, 255]);
     }
 
     #[test]

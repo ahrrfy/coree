@@ -2308,6 +2308,70 @@ impl StudioApp {
         self.execute_command(cmd).is_ok()
     }
 
+    /// Copies an [`Effect::Envelope`] from `source_id` onto `target_id` by remapping the
+    /// source envelope cage proportionally into `target_id`'s local bounds via `CommandOp`.
+    pub fn copy_envelope_from_object(&mut self, target_id: ObjectId, source_id: ObjectId) -> bool {
+        if target_id == source_id {
+            return false;
+        }
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        let Some(src_obj) = tab.document.object(source_id) else {
+            return false;
+        };
+        let Some((mode, src_cage)) = src_obj.effects.iter().rev().find_map(|e| match e {
+            Effect::Envelope { mode, cage } if cage.len() >= 4 => Some((*mode, cage.clone())),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(src_bb) = Self::object_local_bounds(&tab.document, source_id) else {
+            return false;
+        };
+        let Some(dst_bb) = Self::object_local_bounds(&tab.document, target_id) else {
+            return false;
+        };
+        let src_w = src_bb.width().max(1e-6);
+        let src_h = src_bb.height().max(1e-6);
+        let dst_w = dst_bb.width().max(1e-6);
+        let dst_h = dst_bb.height().max(1e-6);
+        let remapped: Vec<Point2D> = src_cage
+            .into_iter()
+            .map(|p| {
+                let u = (p.x - src_bb.min_x) / src_w;
+                let v = (p.y - src_bb.min_y) / src_h;
+                Point2D::new(dst_bb.min_x + u * dst_w, dst_bb.min_y + v * dst_h)
+            })
+            .collect();
+        let existing_idx = tab.document.object(target_id).and_then(|o| {
+            o.effects
+                .iter()
+                .position(|e| matches!(e, Effect::Envelope { .. }))
+        });
+        let new_eff = Effect::Envelope {
+            mode,
+            cage: remapped,
+        };
+        let cmd = match existing_idx {
+            Some(idx) => CommandOp::Batch(vec![
+                CommandOp::RemoveEffect {
+                    id: target_id,
+                    effect_index: idx,
+                },
+                CommandOp::AddEffect {
+                    id: target_id,
+                    effect: new_eff,
+                },
+            ]),
+            None => CommandOp::AddEffect {
+                id: target_id,
+                effect: new_eff,
+            },
+        };
+        self.execute_command(cmd).is_ok()
+    }
+
     /// Ensures `object_id` has an 8-point Coons `Effect::Envelope` and returns its index in `obj.effects`.
     pub fn ensure_envelope_on_object(&mut self, object_id: ObjectId) -> Option<usize> {
         let existing = self.active_tab().and_then(|tab| {
@@ -2513,9 +2577,10 @@ impl StudioApp {
                     idx,
                     Effect::Blend {
                         target_id,
-                        steps: es.steps.clamp(1, 100),
+                        steps: es.steps.clamp(1, 200),
                         rotation_deg: 0.0,
                         along_path: None,
+                        rotate_along_path: es.rotate_along_path,
                     },
                 )
             }
@@ -3072,14 +3137,17 @@ impl StudioApp {
             })
             .unwrap_or(Point2D::ZERO);
 
+        let active_mask = mask_rect_mm.map(|mr| {
+            let p0 = to_px(mr.min());
+            let p1 = to_px(mr.max());
+            let px_rect = Rect2D::from_points(p0, p1);
+            RasterMask::from_rectangle(new_asset.width, new_asset.height, px_rect)
+        });
+        let orig_before_mask = active_mask.as_ref().map(|_| new_asset.clone());
+
         match op {
             RasterBrushOp::Paint => {
-                if let Some(mr) = mask_rect_mm {
-                    let p0 = to_px(mr.min());
-                    let p1 = to_px(mr.max());
-                    let px_rect = Rect2D::from_points(p0, p1);
-                    let mask =
-                        RasterMask::from_rectangle(new_asset.width, new_asset.height, px_rect);
+                if let Some(ref mask) = active_mask {
                     paint_brush_stroke_masked(
                         &mut new_asset,
                         &px_pts,
@@ -3087,7 +3155,7 @@ impl StudioApp {
                         hard,
                         col,
                         1.0,
-                        Some(&mask),
+                        Some(mask),
                     );
                 } else {
                     paint_brush_stroke(&mut new_asset, &px_pts, r_px, hard, col, 1.0);
@@ -3134,6 +3202,36 @@ impl StudioApp {
                     let sx = (seed.x.round() as i64).clamp(0, max_x) as u32;
                     let sy = (seed.y.round() as i64).clamp(0, max_y) as u32;
                     let _ = raster_flood_fill(&mut new_asset, sx, sy, col, flood_tol);
+                }
+            }
+        }
+        if !matches!(op, RasterBrushOp::Paint) {
+            if let (Some(mask), Some(orig_asset)) = (&active_mask, &orig_before_mask) {
+                for y in 0..new_asset.height {
+                    for x in 0..new_asset.width {
+                        let m = f32::from(mask.get(x, y)) / 255.0;
+                        if m >= 1.0 - 1e-4 {
+                            continue;
+                        }
+                        if let (Some(orig_px), Some(new_px)) = (
+                            orig_asset.read_pixel_f32(x, y),
+                            new_asset.read_pixel_f32(x, y),
+                        ) {
+                            let blended = if m <= 1e-4 {
+                                orig_px
+                            } else {
+                                [
+                                    orig_px[0] + (new_px[0] - orig_px[0]) * m,
+                                    orig_px[1] + (new_px[1] - orig_px[1]) * m,
+                                    orig_px[2] + (new_px[2] - orig_px[2]) * m,
+                                    orig_px[3] + (new_px[3] - orig_px[3]) * m,
+                                ]
+                            };
+                            if blended != new_px {
+                                new_asset.write_pixel_f32(x, y, blended);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3188,30 +3286,10 @@ impl StudioApp {
     }
 
     /// Helper to build a default `MeshFill` grid in **object-local** coordinates matching
-    /// `coree-render` (`rows` x `cols` node grid, clamped `2..=32`, emitting `rows * cols` nodes).
+    /// `coree-tools` (`rows` x `cols` node grid, clamped `2..=32`, with `1/3`-chord neighbor handles).
     #[must_use]
     pub fn build_mesh_fill_for_bounds(local_bounds: Rect2D, rows: usize, cols: usize) -> Fill {
-        let rows = rows.clamp(2, 32);
-        let cols = cols.clamp(2, 32);
-        let mut nodes = Vec::with_capacity(rows * cols);
-        for r in 0..rows {
-            let v = r as f64 / (rows - 1) as f64;
-            for c in 0..cols {
-                let u = c as f64 / (cols - 1) as f64;
-                let pos = Point2D::new(
-                    local_bounds.min_x + local_bounds.width() * u,
-                    local_bounds.min_y + local_bounds.height() * v,
-                );
-                let color = Color::cmyk(u as f32, v as f32, ((1.0 - u) * 0.4) as f32, 0.0);
-                nodes.push(MeshNode {
-                    row: r,
-                    col: c,
-                    pos,
-                    color,
-                });
-            }
-        }
-        Fill::MeshFill { rows, cols, nodes }
+        coree_tools::build_mesh_fill_for_bounds(local_bounds, rows, cols)
     }
 
     /// Adds a document guide line via undoable [`CommandOp::AddGuide`].
@@ -3245,12 +3323,12 @@ impl StudioApp {
                 dx_mm: es.dx_mm,
                 dy_mm: es.dy_mm,
                 color: es.color.clone(),
-                simplify: true,
+                simplify: es.block_shadow_simplify,
                 overprint: false,
             },
             2 => Effect::Contour {
                 mode: es.contour_mode,
-                steps: es.steps.clamp(1, 50),
+                steps: es.steps.clamp(1, 512),
                 offset_mm: es.offset_mm.max(0.2),
                 fill_color: es.color.clone(),
                 outline_color: Color::BLACK,
@@ -3262,9 +3340,10 @@ impl StudioApp {
                     .unwrap_or(ObjectId(1));
                 Effect::Blend {
                     target_id,
-                    steps: es.steps.clamp(1, 100),
+                    steps: es.steps.clamp(1, 200),
                     rotation_deg: 0.0,
                     along_path: None,
+                    rotate_along_path: es.rotate_along_path,
                 }
             }
             4 => Effect::Distort {
@@ -3274,21 +3353,33 @@ impl StudioApp {
                 center: local_bb.center(),
             },
             5 => {
-                let cx = local_bb.center().x;
-                let cy = local_bb.center().y;
-                let bulge_y = (local_bb.height() * 0.15).clamp(2.0, 12.0);
-                // 8-point Coons cage: [TL, T_mid, TR, R_mid, BR, B_mid, BL, L_mid]
+                let w = local_bb.width();
+                let h = local_bb.height();
+                let x0 = local_bb.min_x;
+                let x1 = x0 + w / 3.0;
+                let x2 = x0 + 2.0 * w / 3.0;
+                let x3 = local_bb.max_x;
+                let y0 = local_bb.min_y;
+                let y1 = y0 + h / 3.0;
+                let y2 = y0 + 2.0 * h / 3.0;
+                let y3 = local_bb.max_y;
+                let bulge_y = (h * 0.15).clamp(2.0, 12.0);
+                // 12-point Coons cubic cage (3 cubic points per edge)
                 Effect::Envelope {
                     mode: es.envelope_mode,
                     cage: vec![
-                        Point2D::new(local_bb.min_x, local_bb.min_y),
-                        Point2D::new(cx, local_bb.min_y - bulge_y),
-                        Point2D::new(local_bb.max_x, local_bb.min_y),
-                        Point2D::new(local_bb.max_x, cy),
-                        Point2D::new(local_bb.max_x, local_bb.max_y),
-                        Point2D::new(cx, local_bb.max_y + bulge_y),
-                        Point2D::new(local_bb.min_x, local_bb.max_y),
-                        Point2D::new(local_bb.min_x, cy),
+                        Point2D::new(x0, y0),
+                        Point2D::new(x1, y0 - bulge_y),
+                        Point2D::new(x2, y0 - bulge_y),
+                        Point2D::new(x3, y0),
+                        Point2D::new(x3, y1),
+                        Point2D::new(x3, y2),
+                        Point2D::new(x3, y3),
+                        Point2D::new(x2, y3 + bulge_y),
+                        Point2D::new(x1, y3 + bulge_y),
+                        Point2D::new(x0, y3),
+                        Point2D::new(x0, y2),
+                        Point2D::new(x0, y1),
                     ],
                 }
             }
@@ -3299,10 +3390,49 @@ impl StudioApp {
                 shade_color: es.color.clone(),
                 light_dir: [0.4, -0.5, 0.75],
             },
-            7 => Effect::Transparency {
-                mode: TransparencyMode::Uniform(es.opacity.clamp(0.0, 1.0)),
-                blend_mode: es.blend_mode,
-            },
+            7 => {
+                let c = local_bb.center();
+                let sz = local_bb.width().min(local_bb.height()).max(10.0);
+                let mode = match es.transp_kind {
+                    1 => TransparencyMode::FountainLinear {
+                        start: Point2D::new(local_bb.min_x, c.y),
+                        end: Point2D::new(local_bb.max_x, c.y),
+                        start_alpha: es.opacity.clamp(0.0, 1.0),
+                        end_alpha: 0.1,
+                    },
+                    2 => TransparencyMode::Pattern {
+                        pattern_name: "checker".to_owned(),
+                        tile_w: 8.0,
+                        tile_h: 8.0,
+                        fg_opacity: es.opacity.clamp(0.0, 1.0),
+                        bg_opacity: 0.1,
+                    },
+                    3 => TransparencyMode::Texture {
+                        preset: "marble".to_owned(),
+                        scale: 6.0,
+                        fg_opacity: es.opacity.clamp(0.0, 1.0),
+                        bg_opacity: 0.1,
+                    },
+                    4 => TransparencyMode::Conical {
+                        center: c,
+                        angle_deg: 0.0,
+                        start_opacity: es.opacity.clamp(0.0, 1.0),
+                        end_opacity: 0.1,
+                    },
+                    5 => TransparencyMode::Square {
+                        center: c,
+                        size: sz,
+                        angle_deg: 0.0,
+                        start_opacity: es.opacity.clamp(0.0, 1.0),
+                        end_opacity: 0.1,
+                    },
+                    _ => TransparencyMode::Uniform(es.opacity.clamp(0.0, 1.0)),
+                };
+                Effect::Transparency {
+                    mode,
+                    blend_mode: es.blend_mode,
+                }
+            }
             8 => Effect::Perspective {
                 quad: [
                     Point2D::new(local_bb.min_x + local_bb.width() * 0.12, local_bb.min_y),

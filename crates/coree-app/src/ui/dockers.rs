@@ -843,6 +843,7 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
         }
         PropertiesSubTab::Text => {
             ui.label(RichText::new("Typography & Arabic RTL / Kashida").strong());
+            let font_records = app.font_manager_state.indexed_fonts.clone();
             let mut edited_selected_text = false;
             if let Some(id) = sel_id {
                 let text_edit_payload = app
@@ -859,6 +860,9 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 &mut run.style,
                                 Some(&mut art.direction),
                                 Some(&mut art.align),
+                                &font_records,
+                                &mut app.properties_state.new_fvar_tag,
+                                &mut app.properties_state.new_fvar_val,
                                 "art",
                             );
                         }
@@ -879,6 +883,9 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 &mut run.style,
                                 Some(&mut para.direction),
                                 Some(&mut para.align),
+                                &font_records,
+                                &mut app.properties_state.new_fvar_tag,
+                                &mut app.properties_state.new_fvar_val,
                                 "para",
                             );
                         }
@@ -915,6 +922,250 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 )
                                 .changed();
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Wrap:");
+                            ComboBox::from_id_salt("para_wrap_combo")
+                                .width(120.0)
+                                .selected_text(format!("{:?}", para.wrap_mode))
+                                .show_ui(ui, |ui| {
+                                    for wm in [
+                                        coree_core::TextWrapMode::None,
+                                        coree_core::TextWrapMode::Straddle,
+                                        coree_core::TextWrapMode::ContourLeft,
+                                        coree_core::TextWrapMode::ContourRight,
+                                        coree_core::TextWrapMode::SquareBoth,
+                                        coree_core::TextWrapMode::AboveBelow,
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut para.wrap_mode,
+                                                wm,
+                                                format!("{wm:?}"),
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            let mut dc = para.drop_cap.unwrap_or_default();
+                            if ui.checkbox(&mut dc.enabled, "Drop Cap").changed() {
+                                para.drop_cap = Some(dc);
+                                changed = true;
+                            }
+                            if dc.enabled
+                                && ui
+                                    .add(
+                                        DragValue::new(&mut dc.lines)
+                                            .range(2..=6)
+                                            .prefix("Lines: "),
+                                    )
+                                    .changed()
+                            {
+                                para.drop_cap = Some(dc);
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("List:");
+                            if ui
+                                .selectable_label(
+                                    para.list_style.is_none()
+                                        || matches!(
+                                            para.list_style,
+                                            Some(coree_core::ParagraphListStyle::None)
+                                        ),
+                                    "None",
+                                )
+                                .clicked()
+                            {
+                                para.list_style = None;
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(
+                                        para.list_style,
+                                        Some(coree_core::ParagraphListStyle::Bullet(_))
+                                    ),
+                                    "• Bullet",
+                                )
+                                .clicked()
+                            {
+                                para.list_style =
+                                    Some(coree_core::ParagraphListStyle::Bullet("•".to_owned()));
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(
+                                        para.list_style,
+                                        Some(coree_core::ParagraphListStyle::Numbered { .. })
+                                    ),
+                                    "1. Num",
+                                )
+                                .clicked()
+                            {
+                                para.list_style = Some(coree_core::ParagraphListStyle::Numbered {
+                                    start: 1,
+                                    suffix: ".".to_owned(),
+                                });
+                                changed = true;
+                            }
+                        });
+                        // Linked Next Frame selector (guards self-links & multi-hop cycles)
+                        let link_candidates: Vec<(ObjectId, String)> = app
+                            .active_tab()
+                            .and_then(|tab| {
+                                let page = tab.document.active_page()?;
+                                let mut out = Vec::new();
+                                for layer in &page.layers {
+                                    for &oid in &layer.objects {
+                                        if oid == id {
+                                            continue;
+                                        }
+                                        if let Some(obj) = tab.document.object(oid) {
+                                            if matches!(obj.payload, NodePayload::ParagraphText(_))
+                                                && !would_create_frame_link_cycle(
+                                                    &tab.document,
+                                                    id,
+                                                    oid,
+                                                )
+                                            {
+                                                out.push((
+                                                    oid,
+                                                    format!("{} (#{})", obj.name, oid.0),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(out)
+                            })
+                            .unwrap_or_default();
+                        let cur_link_label = para
+                            .linked_next_frame
+                            .and_then(|lid| {
+                                link_candidates
+                                    .iter()
+                                    .find(|(oid, _)| *oid == lid)
+                                    .map(|(_, lbl)| lbl.clone())
+                                    .or_else(|| Some(format!("#{}", lid.0)))
+                            })
+                            .unwrap_or_else(|| "(None)".to_owned());
+                        ui.horizontal(|ui| {
+                            ui.label("Linked Next Frame:");
+                            ComboBox::from_id_salt("para_linked_next_frame")
+                                .width(140.0)
+                                .selected_text(cur_link_label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_value(
+                                            &mut para.linked_next_frame,
+                                            None,
+                                            "(None)",
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                    for (cand_id, label) in &link_candidates {
+                                        if ui
+                                            .selectable_value(
+                                                &mut para.linked_next_frame,
+                                                Some(*cand_id),
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                        // Tab Stops (mm) editor
+                        ui.label(RichText::new("Tab Stops (mm):").small());
+                        let mut remove_tab_idx: Option<usize> = None;
+                        for (t_idx, ts) in para.tab_stops_mm.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                changed |= ui
+                                    .add(
+                                        DragValue::new(&mut ts.position_mm)
+                                            .range(0.0..=1000.0)
+                                            .suffix(" mm"),
+                                    )
+                                    .changed();
+                                ComboBox::from_id_salt(("para_tab_align", t_idx))
+                                    .width(72.0)
+                                    .selected_text(format!("{:?}", ts.align))
+                                    .show_ui(ui, |ui| {
+                                        for al in [
+                                            coree_core::ParagraphTabAlign::Left,
+                                            coree_core::ParagraphTabAlign::Center,
+                                            coree_core::ParagraphTabAlign::Right,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut ts.align,
+                                                    al,
+                                                    format!("{al:?}"),
+                                                )
+                                                .changed()
+                                            {
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                if ui.small_button("×").clicked() {
+                                    remove_tab_idx = Some(t_idx);
+                                }
+                            });
+                        }
+                        if let Some(ri) = remove_tab_idx {
+                            para.tab_stops_mm.remove(ri);
+                            changed = true;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                DragValue::new(&mut app.properties_state.new_tab_stop_mm)
+                                    .range(0.0..=1000.0)
+                                    .prefix("Pos: ")
+                                    .suffix(" mm"),
+                            );
+                            ComboBox::from_id_salt("para_new_tab_align")
+                                .width(72.0)
+                                .selected_text(format!(
+                                    "{:?}",
+                                    app.properties_state.new_tab_stop_align
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for al in [
+                                        coree_core::ParagraphTabAlign::Left,
+                                        coree_core::ParagraphTabAlign::Center,
+                                        coree_core::ParagraphTabAlign::Right,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut app.properties_state.new_tab_stop_align,
+                                            al,
+                                            format!("{al:?}"),
+                                        );
+                                    }
+                                });
+                            if ui.small_button("+ Tab").clicked() {
+                                para.tab_stops_mm.push(coree_core::ParagraphTabStop {
+                                    position_mm: app.properties_state.new_tab_stop_mm.max(0.0),
+                                    align: app.properties_state.new_tab_stop_align,
+                                });
+                                para.tab_stops_mm.sort_by(|a, b| {
+                                    a.position_mm
+                                        .partial_cmp(&b.position_mm)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                changed = true;
+                            }
+                        });
                         if changed {
                             let _ = app.execute_command(CommandOp::EditText {
                                 id,
@@ -932,6 +1183,9 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                                 &mut run.style,
                                 Some(&mut top.text.direction),
                                 Some(&mut top.text.align),
+                                &font_records,
+                                &mut app.properties_state.new_fvar_tag,
+                                &mut app.properties_state.new_fvar_val,
                                 "top",
                             );
                         }
@@ -981,6 +1235,9 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     &mut app.default_text_style,
                     None,
                     None,
+                    &font_records,
+                    &mut app.properties_state.new_fvar_tag,
+                    &mut app.properties_state.new_fvar_val,
                     "default_txt",
                 );
             }
@@ -990,11 +1247,34 @@ fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
     }
 }
 
+fn would_create_frame_link_cycle(
+    doc: &coree_core::Document,
+    src_id: ObjectId,
+    target_id: ObjectId,
+) -> bool {
+    let mut visited = std::collections::HashSet::from([src_id]);
+    let mut cur = Some(target_id);
+    while let Some(cid) = cur {
+        if !visited.insert(cid) {
+            return true;
+        }
+        cur = doc.object(cid).and_then(|o| match &o.payload {
+            NodePayload::ParagraphText(p) => p.linked_next_frame,
+            _ => None,
+        });
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_docker_text_style_fields(
     ui: &mut Ui,
     style: &mut coree_core::TextStyle,
     mut direction: Option<&mut TextDirection>,
     mut align: Option<&mut TextAlign>,
+    indexed_fonts: &[coree_storage::FontRecord],
+    new_fvar_tag: &mut String,
+    new_fvar_val: &mut f32,
     salt: &str,
 ) -> bool {
     let mut changed = false;
@@ -1111,6 +1391,105 @@ fn render_docker_text_style_fields(
         changed |= ui
             .checkbox(&mut style.opentype_features.smcp, "smcp")
             .changed();
+    });
+    // OpenType `fvar` Variable Font Axes
+    let fvar_meta: Vec<coree_storage::FontVariationAxis> = indexed_fonts
+        .iter()
+        .find(|rec| {
+            rec.is_variable
+                && rec
+                    .family_name
+                    .eq_ignore_ascii_case(style.font_family.trim())
+        })
+        .and_then(|rec| {
+            let p = std::path::Path::new(&rec.file_path);
+            let meta = std::fs::metadata(p).ok()?;
+            if meta.len() > 32 * 1024 * 1024 {
+                return None;
+            }
+            let bytes = std::fs::read(p).ok()?;
+            let faces = coree_storage::inspect_font_bytes(&bytes, p);
+            faces
+                .into_iter()
+                .find(|f| f.face_index == rec.face_index)
+                .map(|f| f.variation_axes)
+        })
+        .unwrap_or_default();
+    ui.label(RichText::new("Variable Font Axes (fvar):").small());
+    let mut remove_axis_idx: Option<usize> = None;
+    for (ax_idx, (tag, val)) in style.variation_axes.iter_mut().enumerate() {
+        let (min_v, max_v) = fvar_meta
+            .iter()
+            .find(|a| a.tag == *tag)
+            .map(|a| (a.min_value, a.max_value))
+            .unwrap_or_else(|| match tag.as_str() {
+                "wght" => (100.0, 900.0),
+                "wdth" => (50.0, 200.0),
+                "slnt" => (-45.0, 45.0),
+                _ => (0.0, 2000.0),
+            });
+        ui.horizontal(|ui| {
+            ui.label(format!("{tag}:"));
+            changed |= ui
+                .add(egui::Slider::new(val, min_v..=max_v).step_by(1.0))
+                .changed();
+            if ui.small_button("×").clicked() {
+                remove_axis_idx = Some(ax_idx);
+            }
+        });
+    }
+    if let Some(ri) = remove_axis_idx {
+        style.variation_axes.remove(ri);
+        changed = true;
+    }
+    // Quick buttons for discovered fvar axes or standard wght/wdth/slnt
+    ui.horizontal_wrapped(|ui| {
+        for axis in &fvar_meta {
+            if !style.variation_axes.iter().any(|(t, _)| t == &axis.tag)
+                && ui.small_button(format!("+ {}", axis.tag)).clicked()
+            {
+                style
+                    .variation_axes
+                    .push((axis.tag.clone(), axis.default_value));
+                changed = true;
+            }
+        }
+        for (std_tag, def_val) in [
+            ("wght", 600.0_f32),
+            ("wdth", 100.0_f32),
+            ("slnt", -12.0_f32),
+        ] {
+            if !fvar_meta.iter().any(|a| a.tag == std_tag)
+                && !style.variation_axes.iter().any(|(t, _)| t == std_tag)
+                && ui.small_button(format!("+ {std_tag}")).clicked()
+            {
+                style.variation_axes.push((std_tag.to_owned(), def_val));
+                changed = true;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(new_fvar_tag)
+                .desired_width(48.0)
+                .hint_text("wght"),
+        );
+        ui.add(DragValue::new(new_fvar_val).range(-1000.0..=2000.0));
+        if ui.small_button("+ Axis").clicked() {
+            let clean_tag: String = new_fvar_tag.trim().chars().take(4).collect();
+            if !clean_tag.is_empty() && new_fvar_val.is_finite() {
+                if let Some((_, existing)) = style
+                    .variation_axes
+                    .iter_mut()
+                    .find(|(t, _)| *t == clean_tag)
+                {
+                    *existing = *new_fvar_val;
+                } else {
+                    style.variation_axes.push((clean_tag, *new_fvar_val));
+                }
+                changed = true;
+            }
+        }
     });
     changed
 }
@@ -1302,6 +1681,38 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
             }
         });
 
+    let (copy_target_id, envelope_sources): (Option<ObjectId>, Vec<(ObjectId, String)>) =
+        if app.effects_state.selected_effect_kind == 5 {
+            if let Some(tab) = app.active_tab() {
+                let target = tab.selection.objects.first().copied();
+                let mut srcs = Vec::new();
+                if let Some(page) = tab.document.active_page() {
+                    for layer in &page.layers {
+                        for &oid in &layer.objects {
+                            if Some(oid) == target {
+                                continue;
+                            }
+                            if let Some(obj) = tab.document.object(oid) {
+                                if obj
+                                    .effects
+                                    .iter()
+                                    .any(|e| matches!(e, coree_core::Effect::Envelope { .. }))
+                                {
+                                    srcs.push((oid, format!("{} (#{})", obj.name, oid.0)));
+                                }
+                            }
+                        }
+                    }
+                }
+                (target, srcs)
+            } else {
+                (None, Vec::new())
+            }
+        } else {
+            (None, Vec::new())
+        };
+    let mut copy_envelope_from: Option<ObjectId> = None;
+
     let es = &mut app.effects_state;
     match es.selected_effect_kind {
         0 => {
@@ -1313,6 +1724,7 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
         1 => {
             ui.add(egui::Slider::new(&mut es.dx_mm, -40.0..=40.0).text("Depth X (mm)"));
             ui.add(egui::Slider::new(&mut es.dy_mm, -40.0..=40.0).text("Depth Y (mm)"));
+            ui.checkbox(&mut es.block_shadow_simplify, "Simplify Union Silhouette");
         }
         2 => {
             ui.horizontal(|ui| {
@@ -1320,11 +1732,12 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
                 ui.selectable_value(&mut es.contour_mode, ContourMode::Inside, "Inside");
                 ui.selectable_value(&mut es.contour_mode, ContourMode::Outside, "Outside");
             });
-            ui.add(egui::Slider::new(&mut es.steps, 1..=25).text("Steps"));
+            ui.add(egui::Slider::new(&mut es.steps, 1..=512).text("Steps"));
             ui.add(egui::Slider::new(&mut es.offset_mm, 0.5..=20.0).text("Offset (mm)"));
         }
         3 => {
-            ui.add(egui::Slider::new(&mut es.steps, 1..=50).text("Blend Steps"));
+            ui.add(egui::Slider::new(&mut es.steps, 1..=200).text("Blend Steps"));
+            ui.checkbox(&mut es.rotate_along_path, "Rotate Along Path Tangent");
         }
         4 => {
             ui.horizontal(|ui| {
@@ -1340,12 +1753,67 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
                 ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::Straight, "Straight");
                 ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::SingleArc, "Single Arc");
                 ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::DoubleArc, "Double Arc");
+                ui.selectable_value(
+                    &mut es.envelope_mode,
+                    EnvelopeMode::Unconstrained,
+                    "Unconstrained",
+                );
             });
+            if copy_target_id.is_some() && !envelope_sources.is_empty() {
+                if es
+                    .copy_envelope_source
+                    .is_none_or(|s| !envelope_sources.iter().any(|(id, _)| *id == s))
+                {
+                    es.copy_envelope_source = envelope_sources.first().map(|(id, _)| *id);
+                }
+                let sel_label = es
+                    .copy_envelope_source
+                    .and_then(|s| {
+                        envelope_sources
+                            .iter()
+                            .find(|(id, _)| *id == s)
+                            .map(|(_, n)| n.as_str())
+                    })
+                    .unwrap_or("Source");
+                ui.horizontal(|ui| {
+                    ComboBox::from_id_salt("effects_copy_env_src")
+                        .width(120.0)
+                        .selected_text(sel_label)
+                        .show_ui(ui, |ui| {
+                            for (oid, label) in &envelope_sources {
+                                ui.selectable_value(
+                                    &mut es.copy_envelope_source,
+                                    Some(*oid),
+                                    label,
+                                );
+                            }
+                        });
+                    if ui.button("Copy Envelope").clicked() {
+                        copy_envelope_from = es.copy_envelope_source;
+                    }
+                });
+            }
         }
         6 => {
             ui.add(egui::Slider::new(&mut es.extrude_depth, 2.0..=60.0).text("Depth (mm)"));
         }
         7 => {
+            const TRANSP_LABELS: [&str; 6] = [
+                "Uniform",
+                "Fountain Linear",
+                "Pattern (Checker)",
+                "Texture (Marble)",
+                "Conical",
+                "Square",
+            ];
+            ComboBox::from_id_salt("effects_transp_mode")
+                .width(180.0)
+                .selected_text(TRANSP_LABELS[es.transp_kind.min(5)])
+                .show_ui(ui, |ui| {
+                    for (idx, lbl) in TRANSP_LABELS.iter().enumerate() {
+                        ui.selectable_value(&mut es.transp_kind, idx, *lbl);
+                    }
+                });
             ui.add(egui::Slider::new(&mut es.opacity, 0.0..=1.0).text("Alpha"));
         }
         9 => {
@@ -1383,6 +1851,10 @@ fn ui_effects_docker(ui: &mut Ui, app: &mut StudioApp) {
             ui.add(egui::Slider::new(&mut es.extrude3d_light_intensity, 0.0..=2.0).text("Light"));
         }
         _ => {}
+    }
+
+    if let (Some(dst), Some(src)) = (copy_target_id, copy_envelope_from) {
+        app.copy_envelope_from_object(dst, src);
     }
 
     if ui.button("+ Add Effect to Selection").clicked() {
@@ -1747,7 +2219,7 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
     }
 
     ui.separator();
-    ui.label(RichText::new("19 Non-Destructive Filters").strong());
+    ui.label(RichText::new("20 Non-Destructive Filters (8/16-bit CoW)").strong());
     let bm = &mut app.bitmap_state;
     ComboBox::from_id_salt("bitmap_filter_select")
         .width(210.0)
@@ -1783,6 +2255,65 @@ fn ui_bitmap_studio_docker(ui: &mut Ui, app: &mut StudioApp) {
             app.resample_selected_bitmap(w, h);
         }
     });
+    ui.horizontal(|ui| {
+        ui.label("Kernel:");
+        ComboBox::from_id_salt("bitmap_resample_algo")
+            .width(120.0)
+            .selected_text(format!("{:?}", app.bitmap_state.resample_algo))
+            .show_ui(ui, |ui| {
+                for alg in [
+                    coree_render::ResampleAlgorithm::Nearest,
+                    coree_render::ResampleAlgorithm::Bilinear,
+                    coree_render::ResampleAlgorithm::Bicubic,
+                    coree_render::ResampleAlgorithm::Lanczos3,
+                ] {
+                    ui.selectable_value(
+                        &mut app.bitmap_state.resample_algo,
+                        alg,
+                        format!("{alg:?}"),
+                    );
+                }
+            });
+    });
+
+    ui.separator();
+    ui.label(RichText::new("Depth & Color Mode Conversion").strong());
+    ui.horizontal(|ui| {
+        if ui.button("To 16-bit").clicked() {
+            app.convert_selected_bitmap_depth(coree_core::PixelDepth::Bit16);
+        }
+        if ui.button("To 8-bit").clicked() {
+            app.convert_selected_bitmap_depth(coree_core::PixelDepth::Bit8);
+        }
+        if ui.button("To CMYK").clicked() {
+            app.convert_selected_bitmap_color_mode(coree_core::ColorMode::Cmyk);
+        }
+        if ui.button("To RGB").clicked() {
+            app.convert_selected_bitmap_color_mode(coree_core::ColorMode::Rgb);
+        }
+    });
+    if let Some(hist) = app.selected_bitmap_histogram(16) {
+        ui.label(
+            RichText::new(format!(
+                "Histogram ({} px, {} bins)",
+                hist.total_pixels, hist.bins
+            ))
+            .size(11.0),
+        );
+        let peak = hist.luma.iter().copied().max().unwrap_or(1).max(1) as f32;
+        ui.horizontal(|ui| {
+            for &count in &hist.luma {
+                let frac = (count as f32 / peak).clamp(0.05, 1.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 22.0), egui::Sense::hover());
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, rect.max.y - rect.height() * frac),
+                    rect.max,
+                );
+                ui.painter()
+                    .rect_filled(bar, 1.0, app.theme.tokens().accent);
+            }
+        });
+    }
 }
 
 // =============================================================================
@@ -2596,9 +3127,18 @@ fn ui_font_manager_docker(ui: &mut Ui, app: &mut StudioApp) {
     let fonts = app.font_manager_state.indexed_fonts.clone();
     for f in fonts.iter().take(80) {
         ui.horizontal(|ui| {
-            let tag = if f.supports_arabic_rtl { " [AR]" } else { "" };
+            let ar = if f.supports_arabic_rtl { " [AR]" } else { "" };
+            let var = if f.is_variable { " [Var]" } else { "" };
+            let pan = if f.panose.family_type() != 0 {
+                format!(" P:{}", f.panose.family_type())
+            } else {
+                String::new()
+            };
             if ui
-                .button(format!("{} {}{tag}", f.family_name, f.subfamily_name))
+                .button(format!(
+                    "{} {}{ar}{var}{pan}",
+                    f.family_name, f.subfamily_name
+                ))
                 .clicked()
             {
                 app.default_text_style.font_family = f.family_name.clone();

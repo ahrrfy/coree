@@ -250,6 +250,14 @@ impl StudioApp {
                 metadata: None,
                 custom_icc_profile: None,
                 clear_custom_icc: false,
+                rgb_icc_profile: None,
+                clear_rgb_icc: false,
+                cmyk_icc_profile: None,
+                clear_cmyk_icc: false,
+                gray_icc_profile: None,
+                clear_gray_icc: false,
+                rendering_intent: None,
+                black_point_compensation: None,
             });
 
             Some(ops)
@@ -1504,6 +1512,8 @@ impl StudioApp {
     }
 
     /// Applies a [`LensConfig`] (any of the 11 Lenses) to the selected object(s).
+    /// When `frozen` is enabled without a pre-baked snapshot, captures and persists the PNG
+    /// `frozen_snapshot` into the document immediately (`REM-04`).
     pub fn apply_lens_to_selection(&mut self, lens: Option<LensConfig>) {
         let ids = self
             .active_tab()
@@ -1514,8 +1524,55 @@ impl StudioApp {
             return;
         }
         let name = lens.as_ref().map_or("None", |l| l.kind.name());
-        match self.execute_command(CommandOp::SetLens { ids, lens }) {
-            Ok(()) => self.push_toast(format!("Applied Lens: {name}"), false),
+        let needs_snap = lens
+            .as_ref()
+            .is_some_and(|l| l.frozen && l.frozen_snapshot.is_none());
+        match self.execute_command(CommandOp::SetLens {
+            ids: ids.clone(),
+            lens: lens.clone(),
+        }) {
+            Ok(()) => {
+                if needs_snap {
+                    if let Some(mut cfg) = lens {
+                        let snaps: Vec<(ObjectId, Option<Vec<u8>>)> = self
+                            .active_tab()
+                            .map(|tab| {
+                                let dpi = f64::from(tab.document.dpi()).clamp(72.0, 300.0);
+                                ids.iter()
+                                    .map(|&id| {
+                                        (
+                                            id,
+                                            coree_render::capture_frozen_lens_snapshot(
+                                                &tab.document,
+                                                id,
+                                                dpi,
+                                            ),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let ops: Vec<CommandOp> = snaps
+                            .into_iter()
+                            .filter_map(|(id, snap)| {
+                                snap.map(|bytes| {
+                                    let mut c = cfg.clone();
+                                    c.frozen_snapshot = Some(bytes);
+                                    CommandOp::SetLens {
+                                        ids: vec![id],
+                                        lens: Some(c),
+                                    }
+                                })
+                            })
+                            .collect();
+                        if !ops.is_empty() {
+                            cfg.frozen_snapshot = None;
+                            let _ = self.execute_command(CommandOp::Batch(ops));
+                        }
+                    }
+                }
+                self.push_toast(format!("Applied Lens: {name}"), false);
+            }
             Err(e) => self.push_toast(e, true),
         }
     }

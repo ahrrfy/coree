@@ -13,10 +13,25 @@ use crate::backend::{
 use crate::raster_engine::gaussian_blur_rgba;
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
-    offset_polygon, Affine2D, ArtisticMedia, BevelStyle, BezierPath, BlendMode, Color, ContourMode,
-    Document, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection, Fill, NodePayload,
-    OutlineStyle, PathNode, Perspective3x3, Point2D, SceneObject, Subpath, TransparencyMode, Vec2D,
+    apply_boolean_many, offset_polygon, Affine2D, ArtisticMedia, BevelStyle, BezierPath, BlendMode,
+    BooleanOp, Color, ContourMode, Document, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
+    Fill, IccColorPipeline, NodePayload, OutlineStyle, PathNode, Perspective3x3, Point2D,
+    SceneObject, Subpath, TransparencyMode, Vec2D,
 };
+
+#[inline]
+fn icc_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
+    let [r, g, b, a] = color.to_rgba_f32_icc(icc);
+    Color::rgba(r, g, b, a)
+}
+
+#[inline]
+fn icc_lerp_result_to_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
+    match color {
+        Color::Rgba { .. } => color.clone(),
+        _ => icc_srgb(color, icc),
+    }
+}
 
 /// Applies all path-deforming live effects (`Distort`, `Envelope`, `Perspective`)
 /// to a copy of `path` in local object coordinates.
@@ -44,7 +59,9 @@ pub fn apply_geometry_effects_in_bounds(
                 frequency,
                 center,
             } => {
-                let subdivided = subdivide_for_deformation(&current, 3.0);
+                let max_seg =
+                    (2.5 / sanitize_f64(*frequency, 1.0).clamp(1.0, 20.0).sqrt()).clamp(0.35, 2.0);
+                let subdivided = subdivide_for_deformation(&current, max_seg);
                 current = Effect::apply_distort_to_path(
                     &subdivided,
                     *kind,
@@ -53,7 +70,7 @@ pub fn apply_geometry_effects_in_bounds(
                     *center,
                 );
                 if let Some(rbb) = cur_ref {
-                    let ref_sub = subdivide_for_deformation(&BezierPath::from_rect(rbb), 3.0);
+                    let ref_sub = subdivide_for_deformation(&BezierPath::from_rect(rbb), max_seg);
                     cur_ref = Effect::apply_distort_to_path(
                         &ref_sub, *kind, *amplitude, *frequency, *center,
                     )
@@ -101,6 +118,7 @@ pub fn render_underlay_effects(
     page_to_surface: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     if !world_xf.is_finite() || !parent_to_screen.is_finite() || !page_to_surface.is_finite() {
@@ -135,6 +153,7 @@ pub fn render_underlay_effects(
                     color,
                     *feather_direction,
                     px_per_mm,
+                    icc,
                     backend,
                 );
             }
@@ -142,7 +161,7 @@ pub fn render_underlay_effects(
                 dx_mm,
                 dy_mm,
                 color,
-                simplify: _,
+                simplify,
                 overprint,
             } => {
                 render_block_shadow(
@@ -151,9 +170,11 @@ pub fn render_underlay_effects(
                     *dx_mm,
                     *dy_mm,
                     color,
+                    *simplify,
                     *overprint,
                     obj.opacity,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -177,6 +198,7 @@ pub fn render_underlay_effects(
                     px_per_mm,
                     obj.opacity,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -197,6 +219,7 @@ pub fn render_underlay_effects(
                     page_to_surface,
                     obj.opacity,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -205,6 +228,7 @@ pub fn render_underlay_effects(
                 steps,
                 rotation_deg,
                 along_path,
+                rotate_along_path,
             } => {
                 render_blend_effect(
                     doc,
@@ -214,9 +238,11 @@ pub fn render_underlay_effects(
                     *steps,
                     *rotation_deg,
                     *along_path,
+                    *rotate_along_path,
                     page_to_surface,
                     px_per_mm,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -238,6 +264,7 @@ pub fn render_underlay_effects(
                     page_to_surface,
                     obj.opacity,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -256,6 +283,7 @@ pub fn render_overlay_effects(
     page_to_screen: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     if !world_xf.is_finite() || !page_to_screen.is_finite() {
@@ -285,6 +313,7 @@ pub fn render_overlay_effects(
                         px_per_mm,
                         obj.opacity,
                         anti_alias,
+                        icc,
                         backend,
                     );
                 }
@@ -295,9 +324,11 @@ pub fn render_overlay_effects(
                     if let Ok(inner) = offset_polygon(&world_path, -bevel.min(4.0)) {
                         if !inner.is_empty() {
                             let base_color = primary_fill_color(&obj.fill);
-                            let highlight = base_color.lerp(&Color::WHITE, 0.35);
+                            let highlight = base_color.lerp_icc(&Color::WHITE, 0.35, icc);
                             let paint = BackendPaint {
-                                shader: crate::backend::PaintShader::Solid(highlight),
+                                shader: crate::backend::PaintShader::Solid(
+                                    icc_lerp_result_to_srgb(&highlight, icc),
+                                ),
                                 opacity: obj.opacity * 0.75,
                                 blend_mode: BlendMode::Normal,
                                 anti_alias,
@@ -325,6 +356,7 @@ pub fn render_overlay_effects(
                     color,
                     *feather_direction,
                     px_per_mm,
+                    icc,
                     backend,
                 );
             }
@@ -351,6 +383,7 @@ pub fn render_overlay_effects(
                     page_to_screen,
                     px_per_mm,
                     anti_alias,
+                    icc,
                     backend,
                 );
             }
@@ -375,13 +408,30 @@ pub fn symmetry_effect_transforms(effects: &[Effect]) -> Vec<Affine2D> {
 }
 
 /// Modulates an offscreen-rendered `buffer` (located at `rect_px` on screen) with a
-/// [`TransparencyMode`] alpha mask in world coordinates.
+/// [`TransparencyMode`] alpha mask in object-local coordinates.
 pub fn apply_transparency_mask(
     buffer: &mut RgbaBuffer,
     rect_px: PixelRect,
-    screen_to_world: Affine2D,
+    screen_to_local: Affine2D,
     mode: &TransparencyMode,
 ) {
+    let w = buffer.width;
+    let h = buffer.height;
+    let apply_at = |buffer: &mut RgbaBuffer, f: &dyn Fn(Point2D) -> f32| {
+        for ly in 0..h {
+            let sy = f64::from(rect_px.y) + f64::from(ly) + 0.5;
+            for lx in 0..w {
+                let sx = f64::from(rect_px.x) + f64::from(lx) + 0.5;
+                let lp = screen_to_local.transform_point(Point2D::new(sx, sy));
+                let mask_a = f(lp).clamp(0.0, 1.0);
+                let idx = ((ly as usize) * (w as usize) + (lx as usize)) * 4;
+                buffer.rgba[idx + 3] = (f32::from(buffer.rgba[idx + 3]) * mask_a)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    };
+
     match mode {
         TransparencyMode::Uniform(alpha) => {
             let a = sanitize_f32(*alpha, 1.0).clamp(0.0, 1.0);
@@ -399,23 +449,10 @@ pub fn apply_transparency_mask(
             let len_sq = dir.length_sq().max(1e-9);
             let a0 = sanitize_f32(*start_alpha, 1.0).clamp(0.0, 1.0);
             let a1 = sanitize_f32(*end_alpha, 0.0).clamp(0.0, 1.0);
-            let w = buffer.width;
-            let h = buffer.height;
-            for ly in 0..h {
-                for lx in 0..w {
-                    let sp = Point2D::new(
-                        f64::from(rect_px.x) + f64::from(lx) + 0.5,
-                        f64::from(rect_px.y) + f64::from(ly) + 0.5,
-                    );
-                    let wp = screen_to_world.transform_point(sp);
-                    let t = ((wp - *start).dot(dir) / len_sq).clamp(0.0, 1.0) as f32;
-                    let mask_a = a0 + (a1 - a0) * t;
-                    let idx = ((ly as usize) * (w as usize) + (lx as usize)) * 4;
-                    buffer.rgba[idx + 3] = (f32::from(buffer.rgba[idx + 3]) * mask_a)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-            }
+            apply_at(buffer, &|lp| {
+                let t = ((lp - *start).dot(dir) / len_sq).clamp(0.0, 1.0) as f32;
+                a0 + (a1 - a0) * t
+            });
         }
         TransparencyMode::FountainRadial {
             center,
@@ -426,23 +463,114 @@ pub fn apply_transparency_mask(
             let r = sanitize_f64(*radius, 10.0).max(1e-4);
             let a0 = sanitize_f32(*inner_alpha, 1.0).clamp(0.0, 1.0);
             let a1 = sanitize_f32(*outer_alpha, 0.0).clamp(0.0, 1.0);
-            let w = buffer.width;
-            let h = buffer.height;
-            for ly in 0..h {
-                for lx in 0..w {
-                    let sp = Point2D::new(
-                        f64::from(rect_px.x) + f64::from(lx) + 0.5,
-                        f64::from(rect_px.y) + f64::from(ly) + 0.5,
-                    );
-                    let wp = screen_to_world.transform_point(sp);
-                    let t = (wp.distance_to(*center) / r).clamp(0.0, 1.0) as f32;
-                    let mask_a = a0 + (a1 - a0) * t;
-                    let idx = ((ly as usize) * (w as usize) + (lx as usize)) * 4;
-                    buffer.rgba[idx + 3] = (f32::from(buffer.rgba[idx + 3]) * mask_a)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
+            apply_at(buffer, &|lp| {
+                let t = (lp.distance_to(*center) / r).clamp(0.0, 1.0) as f32;
+                a0 + (a1 - a0) * t
+            });
+        }
+        TransparencyMode::Pattern {
+            pattern_name,
+            tile_w,
+            tile_h,
+            fg_opacity,
+            bg_opacity,
+        } => {
+            let tw = sanitize_f64(*tile_w, 10.0).max(0.25);
+            let th = sanitize_f64(*tile_h, 10.0).max(0.25);
+            let fga = sanitize_f32(*fg_opacity, 1.0).clamp(0.0, 1.0);
+            let bga = sanitize_f32(*bg_opacity, 0.0).clamp(0.0, 1.0);
+            let kind = pattern_name.to_ascii_lowercase();
+            apply_at(buffer, &|lp| {
+                let u = lp.x.rem_euclid(tw) / tw;
+                let v = lp.y.rem_euclid(th) / th;
+                let is_fg = if kind.contains("stripe") || kind.contains("line") {
+                    (v * 4.0).fract() < 0.5
+                } else if kind.contains("dot") || kind.contains("polka") {
+                    (u - 0.5).hypot(v - 0.5) <= 0.25
+                } else if kind.contains("cross") || kind.contains("hatch") || kind.contains("grid")
+                {
+                    u < 0.125 || v < 0.125
+                } else if kind.contains("diag") {
+                    ((u + v) * 2.0).fract() < 0.35
+                } else if kind.contains("brick") {
+                    let row = (v * 2.0).floor() as i64;
+                    let off = if (row & 1) != 0 { 0.5 } else { 0.0 };
+                    (v * 2.0).fract() < 0.15 || (u + off).fract() < 0.1
+                } else {
+                    (u < 0.5) ^ (v < 0.5)
+                };
+                if is_fg {
+                    fga
+                } else {
+                    bga
                 }
-            }
+            });
+        }
+        TransparencyMode::Texture {
+            preset,
+            scale,
+            fg_opacity,
+            bg_opacity,
+        } => {
+            let sc = sanitize_f64(*scale, 1.0).abs().max(0.05);
+            let fga = sanitize_f32(*fg_opacity, 1.0).clamp(0.0, 1.0);
+            let bga = sanitize_f32(*bg_opacity, 0.0).clamp(0.0, 1.0);
+            let preset_lc = preset.to_ascii_lowercase();
+            let ps_preset = coree_core::PostScriptFillPreset::from_preset_str(preset);
+            apply_at(buffer, &|lp| {
+                let sx = lp.x / sc;
+                let sy = lp.y / sc;
+                let n = if let Some(ps) = ps_preset {
+                    crate::renderer::eval_postscript_fill(
+                        ps,
+                        0,
+                        Point2D::new(sx, sy),
+                        Point2D::ZERO,
+                        0.05,
+                    )
+                } else {
+                    crate::renderer::eval_procedural_texture(&preset_lc, 0, sx, sy)
+                };
+                bga + (fga - bga) * n.clamp(0.0, 1.0)
+            });
+        }
+        TransparencyMode::Conical {
+            center,
+            angle_deg,
+            start_opacity,
+            end_opacity,
+        } => {
+            let base_deg = sanitize_f64(*angle_deg, 0.0);
+            let a0 = sanitize_f32(*start_opacity, 1.0).clamp(0.0, 1.0);
+            let a1 = sanitize_f32(*end_opacity, 0.0).clamp(0.0, 1.0);
+            apply_at(buffer, &|lp| {
+                let dx = lp.x - center.x;
+                let dy = lp.y - center.y;
+                let deg = dy.atan2(dx).to_degrees();
+                let t = ((deg - base_deg).rem_euclid(360.0) / 360.0) as f32;
+                a0 + (a1 - a0) * t
+            });
+        }
+        TransparencyMode::Square {
+            center,
+            size,
+            angle_deg,
+            start_opacity,
+            end_opacity,
+        } => {
+            let half = (sanitize_f64(*size, 20.0).abs() * 0.5).max(1e-4);
+            let rot = -sanitize_f64(*angle_deg, 0.0).to_radians();
+            let (s, c) = rot.sin_cos();
+            let a0 = sanitize_f32(*start_opacity, 1.0).clamp(0.0, 1.0);
+            let a1 = sanitize_f32(*end_opacity, 0.0).clamp(0.0, 1.0);
+            apply_at(buffer, &|lp| {
+                let dx = lp.x - center.x;
+                let dy = lp.y - center.y;
+                let rx = dx * c - dy * s;
+                let ry = dx * s + dy * c;
+                let cheb = (rx.abs().max(ry.abs()) / half).clamp(0.0, 1.0) as f32;
+                a0 + (a1 - a0) * cheb
+            });
         }
     }
 }
@@ -464,6 +592,7 @@ fn render_drop_shadow(
     color: &Color,
     feather: FeatherDirection,
     px_per_mm: f64,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let op = sanitize_f32(opacity, 0.5).clamp(0.0, 1.0);
@@ -545,7 +674,7 @@ fn render_drop_shadow(
     };
     sub.clear(Color::TRANSPARENT);
     let local_xf = Affine2D::translate(-(work_x as f64), -(work_y as f64)).compose(&page_to_screen);
-    let [cr, cg, cb, ca] = color.to_rgba8();
+    let [cr, cg, cb, ca] = color.to_rgba8_icc(icc);
     let solid = BackendPaint::solid(Color::rgba8(cr, cg, cb, 255));
     sub.fill_path(&shifted_world, &solid, FillRule::Winding, local_xf);
 
@@ -600,9 +729,11 @@ fn render_block_shadow(
     dx_mm: f64,
     dy_mm: f64,
     color: &Color,
+    simplify: bool,
     overprint: bool,
     opacity: f32,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let delta = Vec2D::new(sanitize_f64(dx_mm, 0.0), sanitize_f64(dy_mm, 0.0));
@@ -610,7 +741,7 @@ fn render_block_shadow(
         return;
     }
     let paint = BackendPaint {
-        shader: crate::backend::PaintShader::Solid(color.clone()),
+        shader: crate::backend::PaintShader::Solid(icc_srgb(color, icc)),
         opacity,
         blend_mode: if overprint {
             BlendMode::Multiply
@@ -620,7 +751,26 @@ fn render_block_shadow(
         anti_alias,
     };
 
-    let swept = build_block_shadow_geometry(world_path, delta);
+    let mut swept = build_block_shadow_geometry(world_path, delta);
+    if simplify && !swept.subpaths.is_empty() {
+        let pieces: Vec<BezierPath> = swept
+            .subpaths
+            .iter()
+            .cloned()
+            .map(BezierPath::from_subpath)
+            .collect();
+        if let Ok(welded) = apply_boolean_many(BooleanOp::Weld, &pieces) {
+            if !welded.is_empty() {
+                let mut merged = Vec::new();
+                for w in welded {
+                    merged.extend(w.subpaths);
+                }
+                if !merged.is_empty() {
+                    swept = BezierPath { subpaths: merged };
+                }
+            }
+        }
+    }
     if !swept.is_empty() {
         backend.fill_path(&swept, &paint, FillRule::Winding, page_to_screen);
     }
@@ -683,9 +833,10 @@ fn compute_contour_rings(
     target_fill: &Color,
     base_outline: &OutlineStyle,
     target_outline: &Color,
+    icc: &IccColorPipeline,
 ) -> Vec<(u32, BezierPath, Color, Color)> {
     let step_mm = sanitize_f64(offset_mm, 1.0).abs().max(0.05);
-    let max_steps = steps.clamp(1, 48);
+    let max_steps = steps.clamp(1, 512);
     let sign = match mode {
         ContourMode::Outside => 1.0,
         ContourMode::Inside | ContourMode::ToCenter => -1.0,
@@ -695,14 +846,18 @@ fn compute_contour_rings(
     for k in 1..=max_steps {
         let delta = sign * step_mm * f64::from(k);
         if let Ok(ring) = offset_polygon(world_path, delta) {
-            if ring.is_empty() {
-                if mode == ContourMode::ToCenter {
+            let collapsed = ring.is_empty()
+                || ring
+                    .bounding_box()
+                    .is_none_or(|b| b.width() < 1e-4 || b.height() < 1e-4);
+            if collapsed {
+                if matches!(mode, ContourMode::ToCenter | ContourMode::Inside) {
                     break;
                 }
                 continue;
             }
             rings.push((k, ring));
-        } else if mode == ContourMode::ToCenter {
+        } else if matches!(mode, ContourMode::ToCenter | ContourMode::Inside) {
             break;
         }
     }
@@ -717,8 +872,8 @@ fn compute_contour_rings(
             (
                 k,
                 ring,
-                base_fill.lerp(target_fill, t),
-                base_outline.color.lerp(target_outline, t),
+                base_fill.lerp_icc(target_fill, t, icc),
+                base_outline.color.lerp_icc(target_outline, t, icc),
             )
         })
         .collect()
@@ -738,6 +893,7 @@ fn render_contour_steps(
     px_per_mm: f64,
     opacity: f32,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let rings = compute_contour_rings(
@@ -749,6 +905,7 @@ fn render_contour_steps(
         target_fill,
         base_outline,
         target_outline,
+        icc,
     );
     if rings.is_empty() {
         return;
@@ -762,7 +919,7 @@ fn render_contour_steps(
 
     for (_k, ring, step_fill, out_col) in rings {
         let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(step_fill),
+            shader: crate::backend::PaintShader::Solid(icc_lerp_result_to_srgb(&step_fill, icc)),
             opacity,
             blend_mode: BlendMode::Normal,
             anti_alias,
@@ -777,7 +934,7 @@ fn render_contour_steps(
                 BlendMode::Normal,
                 anti_alias,
             );
-            st.color = out_col;
+            st.color = icc_lerp_result_to_srgb(&out_col, icc);
             backend.stroke_path(&ring, &st, page_to_screen);
         }
     }
@@ -790,6 +947,7 @@ fn compute_extrude_25d_faces(
     depth: f64,
     shade_color: &Color,
     light_dir: [f32; 3],
+    icc: &IccColorPipeline,
 ) -> Vec<([Point2D; 4], Color)> {
     if world_path.is_empty() || !vanishing_point.is_finite() {
         return Vec::new();
@@ -821,7 +979,7 @@ fn compute_extrude_25d_faces(
                 (normal_2d.x as f32 * ldir[0] + normal_2d.y as f32 * ldir[1] + 0.35 * ldir[2])
                     .clamp(-1.0, 1.0);
             let lit_t = (0.5 + 0.5 * ndotl).clamp(0.0, 1.0);
-            let face_col = shade_color.lerp(&base_color, lit_t * 0.85);
+            let face_col = shade_color.lerp_icc(&base_color, lit_t * 0.85, icc);
             let mid = p0.midpoint(p1).midpoint(q0.midpoint(q1));
             faces.push(([p0, p1, q1, q0], mid.distance_to(vanishing_point), face_col));
         }
@@ -841,6 +999,7 @@ fn render_extrude_25d(
     page_to_screen: Affine2D,
     opacity: f32,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     for (quad, color) in compute_extrude_25d_faces(
@@ -850,10 +1009,11 @@ fn render_extrude_25d(
         depth,
         shade_color,
         light_dir,
+        icc,
     ) {
         let quad_path = BezierPath::from_polygon(quad, true);
         let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(color),
+            shader: crate::backend::PaintShader::Solid(icc_lerp_result_to_srgb(&color, icc)),
             opacity,
             blend_mode: BlendMode::Normal,
             anti_alias,
@@ -873,6 +1033,7 @@ fn render_inner_shadow(
     color: &Color,
     feather: FeatherDirection,
     px_per_mm: f64,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let op = sanitize_f32(opacity, 0.5).clamp(0.0, 1.0);
@@ -882,7 +1043,7 @@ fn render_inner_shadow(
     let Some(wb) = world_path.bounding_box() else {
         return;
     };
-    let blur_px = (sanitize_f64(blur_mm, 0.0).max(0.0) * px_per_mm).min(128.0) as f32;
+    let blur_px = (sanitize_f64(blur_mm, 0.0).max(0.0) * px_per_mm * 2.0).min(128.0) as f32;
     let pad_px = ((blur_px.ceil() as i32) * 3 + 2).min(256);
     let sb = page_to_screen.transform_rect(wb);
     let Some(clamped) = PixelRect::from_f64_rect_clamped(sb, 2, backend.width(), backend.height())
@@ -948,7 +1109,7 @@ fn render_inner_shadow(
         cast_buf.rgba.clone()
     };
 
-    let [cr, cg, cb, ca] = color.to_rgba8();
+    let [cr, cg, cb, ca] = color.to_rgba8_icc(icc);
     let eff_alpha_scale = (f32::from(ca) / 255.0) * op;
     let cw = clamped.width as usize;
     let ch = clamped.height as usize;
@@ -1004,6 +1165,7 @@ fn render_bevel_effect(
     page_to_screen: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let inten = sanitize_f32(intensity, 0.75).clamp(0.0, 1.0);
@@ -1069,9 +1231,9 @@ fn render_bevel_effect(
             let raw_dot = outward.dot(light_dir) * alt_boost;
             let (is_hi, strength) = (raw_dot >= 0.0, raw_dot.abs());
             let col = if is_hi {
-                highlight_color.clone()
+                icc_srgb(highlight_color, icc)
             } else {
-                shadow_color.clone()
+                icc_srgb(shadow_color, icc)
             };
             let edge_alpha = (strength as f32 * inten * 0.85).clamp(0.05, 0.95);
             let (q0, q1, q2, q3) = match style {
@@ -1128,8 +1290,13 @@ fn rotate_pt_3d(p: [f64; 3], rot_deg: [f64; 3]) -> [f64; 3] {
     [x3, y3, z2]
 }
 
-fn shade_color_by_lights(base: &Color, normal: [f64; 3], lights: &[ExtrudeLight]) -> Color {
-    let [br, bg, bb, ba] = base.to_rgba8();
+fn shade_color_by_lights(
+    base: &Color,
+    normal: [f64; 3],
+    lights: &[ExtrudeLight],
+    icc: &IccColorPipeline,
+) -> Color {
+    let [br, bg, bb, ba] = base.to_rgba8_icc(icc);
     let mut r_acc = f64::from(br) / 255.0 * 0.22;
     let mut g_acc = f64::from(bg) / 255.0 * 0.22;
     let mut b_acc = f64::from(bb) / 255.0 * 0.22;
@@ -1176,6 +1343,7 @@ fn compute_extrude_3d_faces(
     depth: f64,
     rotation_3d: [f64; 3],
     lights: &[ExtrudeLight],
+    icc: &IccColorPipeline,
 ) -> Vec<(Vec<Point2D>, Color)> {
     let mut out = Vec::new();
     let Some(wb) = world_path.bounding_box() else {
@@ -1220,7 +1388,7 @@ fn compute_extrude_3d_faces(
             .collect();
         let back2: Vec<Point2D> = back3.iter().map(|&p| project_3d(p)).collect();
         let back_avg_z = back3.iter().map(|p| p[2]).sum::<f64>() / back3.len() as f64;
-        let back_col = shade_color_by_lights(base_color, [0.0, 0.0, -1.0], lights);
+        let back_col = shade_color_by_lights(base_color, [0.0, 0.0, -1.0], lights, icc);
         tagged.push((back_avg_z, back2, back_col));
 
         for i in 0..(poly.len() - 1) {
@@ -1242,7 +1410,7 @@ fn compute_extrude_3d_faces(
                 project_3d(b1),
                 project_3d(b0),
             ];
-            let shade = shade_color_by_lights(base_color, n, lights);
+            let shade = shade_color_by_lights(base_color, n, lights, icc);
             tagged.push((avg_z, quad, shade));
         }
     }
@@ -1264,6 +1432,7 @@ fn render_extrude_3d(
     page_to_screen: Affine2D,
     opacity: f32,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     for (quad, color) in compute_extrude_3d_faces(
@@ -1273,10 +1442,11 @@ fn render_extrude_3d(
         depth,
         rotation_3d,
         lights,
+        icc,
     ) {
         let quad_path = BezierPath::from_polygon(quad, true);
         let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(color),
+            shader: crate::backend::PaintShader::Solid(icc_lerp_result_to_srgb(&color, icc)),
             opacity,
             blend_mode: BlendMode::Normal,
             anti_alias,
@@ -1293,6 +1463,7 @@ struct ComputedBlendStep {
     outline_color: Color,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_blend_steps(
     doc: &Document,
     src_obj: &SceneObject,
@@ -1301,6 +1472,8 @@ fn compute_blend_steps(
     steps: u32,
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
+    rotate_along_path: bool,
+    icc: &IccColorPipeline,
 ) -> Vec<ComputedBlendStep> {
     let n_steps = steps.clamp(1, 999);
     let Some(target_obj) = doc.object(target_id) else {
@@ -1311,12 +1484,15 @@ fn compute_blend_steps(
     };
 
     const SAMPLES: usize = 72;
-    let mut contour_pairs: Vec<(Vec<Point2D>, Vec<Point2D>, Point2D, Point2D)> = Vec::new();
+    type BlendContourPair = (Vec<Point2D>, Vec<Point2D>, Point2D, Point2D, bool);
+    let mut contour_pairs: Vec<BlendContourPair> = Vec::new();
     let pair_count = src_world_path
         .subpaths
         .len()
         .min(target_world_path.subpaths.len());
     for s_idx in 0..pair_count {
+        let s_closed = src_world_path.subpaths[s_idx].closed;
+        let t_closed = target_world_path.subpaths[s_idx].closed;
         let s_bp = BezierPath::from_subpath(src_world_path.subpaths[s_idx].clone());
         let t_bp = BezierPath::from_subpath(target_world_path.subpaths[s_idx].clone());
         if let (Some(sr), Some(dr)) = (
@@ -1325,10 +1501,11 @@ fn compute_blend_steps(
         ) {
             let sc = centroid(&sr);
             let dc = centroid(&dr);
-            contour_pairs.push((sr, dr, sc, dc));
+            contour_pairs.push((sr, dr, sc, dc, s_closed && t_closed));
         }
     }
     if contour_pairs.is_empty() {
+        let s_closed = src_world_path.subpaths.first().is_none_or(|s| s.closed);
         let Some(sr) = resample_primary_contour(src_world_path, SAMPLES) else {
             return Vec::new();
         };
@@ -1337,7 +1514,7 @@ fn compute_blend_steps(
         };
         let sc = centroid(&sr);
         let dc = centroid(&dr);
-        contour_pairs.push((sr, dr, sc, dc));
+        contour_pairs.push((sr, dr, sc, dc, s_closed));
     }
 
     let src_root = centroid(&contour_pairs.iter().map(|p| p.2).collect::<Vec<_>>());
@@ -1354,14 +1531,21 @@ fn compute_blend_steps(
         let t = f64::from(i) / f64::from(n_steps + 1);
         let tf = t as f32;
         let center_lerp = src_root.lerp(dst_root, t);
-        let target_center = host_path
+        let (target_center, path_tangent_rad) = host_path
             .as_ref()
             .and_then(|hp| hp.point_and_tangent_at_t(t))
-            .map_or(center_lerp, |(pt, _)| pt);
-        let angle = rot_total_rad * t;
+            .map_or((center_lerp, 0.0), |(pt, tangent)| {
+                let tang_ang = if rotate_along_path && tangent.length_sq() > 1e-12 {
+                    tangent.y.atan2(tangent.x)
+                } else {
+                    0.0
+                };
+                (pt, tang_ang)
+            });
+        let angle = rot_total_rad * t + path_tangent_rad;
 
         let mut step_subpaths = Vec::with_capacity(contour_pairs.len());
-        for (src_ring, dst_ring, _, _) in &contour_pairs {
+        for (src_ring, dst_ring, _, _, is_closed) in &contour_pairs {
             let mut pts = Vec::with_capacity(SAMPLES);
             for k in 0..SAMPLES {
                 let local_src = src_ring[k] - src_root;
@@ -1377,7 +1561,7 @@ fn compute_blend_steps(
                 };
                 pts.push(target_center + rotated);
             }
-            step_subpaths.push(coree_core::fit_cubic_bezier_subpath(&pts, true, 0.03));
+            step_subpaths.push(coree_core::fit_cubic_bezier_subpath(&pts, *is_closed, 0.03));
         }
 
         let w_mm = if has_outline {
@@ -1391,10 +1575,13 @@ fn compute_blend_steps(
             path: BezierPath {
                 subpaths: step_subpaths,
             },
-            fill: src_fill.lerp(&dst_fill, tf),
+            fill: src_fill.lerp_icc(&dst_fill, tf, icc),
             opacity: src_obj.opacity + (target_obj.opacity - src_obj.opacity) * tf,
             outline_width_mm: w_mm,
-            outline_color: src_obj.outline.color.lerp(&target_obj.outline.color, tf),
+            outline_color: src_obj
+                .outline
+                .color
+                .lerp_icc(&target_obj.outline.color, tf, icc),
         });
     }
     out
@@ -1409,9 +1596,11 @@ fn render_blend_effect(
     steps: u32,
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
+    rotate_along_path: bool,
     page_to_screen: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     for step in compute_blend_steps(
@@ -1422,9 +1611,11 @@ fn render_blend_effect(
         steps,
         rotation_deg,
         along_path,
+        rotate_along_path,
+        icc,
     ) {
         let paint = BackendPaint {
-            shader: crate::backend::PaintShader::Solid(step.fill),
+            shader: crate::backend::PaintShader::Solid(icc_lerp_result_to_srgb(&step.fill, icc)),
             opacity: step.opacity,
             blend_mode: src_obj.blend_mode,
             anti_alias,
@@ -1439,10 +1630,93 @@ fn render_blend_effect(
                 src_obj.blend_mode,
                 anti_alias,
             );
-            st.color = step.outline_color;
+            st.color = icc_lerp_result_to_srgb(&step.outline_color, icc);
             backend.stroke_path(&step.path, &st, page_to_screen);
         }
     }
+}
+
+/// Applies Envelope bilinear/Coons cage deformation to `path` (supports 4-point, 8-point
+/// quadratic, and 12-point 4-curve cubic Bézier Coons patch cages).
+#[must_use]
+pub fn apply_envelope_to_path(
+    path: &BezierPath,
+    mode: EnvelopeMode,
+    cage: &[Point2D],
+) -> BezierPath {
+    if cage.len() < 4 || path.is_empty() || !cage.iter().all(|p| p.is_finite()) {
+        return path.clone();
+    }
+    let Some(bb) = path.bounding_box() else {
+        return path.clone();
+    };
+    let w = bb.width().max(1e-6);
+    let h = bb.height().max(1e-6);
+
+    let map_pt = |p: Point2D| -> Point2D {
+        let u = ((p.x - bb.min_x) / w).clamp(0.0, 1.0);
+        let v = ((p.y - bb.min_y) / h).clamp(0.0, 1.0);
+        if cage.len() >= 12 {
+            // 12-point 4-curve cubic Bézier Coons patch:
+            // [0:TL, 1:T1, 2:T2, 3:TR, 4:R1, 5:R2, 6:BR, 7:B1, 8:B2, 9:BL, 10:L1, 11:L2]
+            let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
+            if mode == EnvelopeMode::Straight {
+                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            }
+            let top = eval_cubic(tl, cage[1], cage[2], tr, u);
+            let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
+            let left = eval_cubic(tl, cage[11], cage[10], bl, v);
+            let right = eval_cubic(tr, cage[4], cage[5], br, v);
+            let ruled_u = top.lerp(bottom, v);
+            let ruled_v = left.lerp(right, u);
+            let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            Point2D::new(
+                ruled_u.x + ruled_v.x - bilin.x,
+                ruled_u.y + ruled_v.y - bilin.y,
+            )
+        } else if cage.len() >= 8 {
+            let (tl, tr, br, bl) = (cage[0], cage[2], cage[4], cage[6]);
+            if mode == EnvelopeMode::Straight {
+                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            }
+            let (tm, rm, bm, lm) = (cage[1], cage[3], cage[5], cage[7]);
+            let top = eval_quad(tl, tm, tr, u);
+            let bottom = eval_quad(bl, bm, br, u);
+            let left = eval_quad(tl, lm, bl, v);
+            let right = eval_quad(tr, rm, br, v);
+            let ruled_u = top.lerp(bottom, v);
+            let ruled_v = left.lerp(right, u);
+            let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            Point2D::new(
+                ruled_u.x + ruled_v.x - bilin.x,
+                ruled_u.y + ruled_v.y - bilin.y,
+            )
+        } else {
+            let (tl, tr, br, bl) = (cage[0], cage[1], cage[2], cage[3]);
+            let base = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            match mode {
+                EnvelopeMode::Straight | EnvelopeMode::Unconstrained => base,
+                EnvelopeMode::SingleArc => {
+                    let arc = (u * std::f64::consts::PI).sin() * 0.08 * h;
+                    Point2D::new(base.x, base.y - arc * (1.0 - 2.0 * v))
+                }
+                EnvelopeMode::DoubleArc => {
+                    let wave = (u * std::f64::consts::TAU).sin() * 0.06 * h;
+                    Point2D::new(base.x, base.y + wave)
+                }
+            }
+        }
+    };
+
+    let mut sub = subdivide_for_deformation(path, 2.5);
+    for sp in &mut sub.subpaths {
+        for node in &mut sp.nodes {
+            node.pos = map_pt(node.pos);
+            node.handle_in = node.handle_in.map(map_pt);
+            node.handle_out = node.handle_out.map(map_pt);
+        }
+    }
+    sub
 }
 
 /// Applies Envelope bilinear/Coons cage deformation to `path`.
@@ -1464,24 +1738,34 @@ fn apply_envelope_to_path_in_bounds(
     let w = bb.width().max(1e-6);
     let h = bb.height().max(1e-6);
 
-    // Support 4-corner cage [TL, TR, BR, BL] or 8-point cage [TL, T_mid, TR, R_mid, BR, B_mid, BL, L_mid]
-    let (tl, tr, br, bl, mids) = if cage.len() >= 8 {
-        (
-            cage[0],
-            cage[2],
-            cage[4],
-            cage[6],
-            Some((cage[1], cage[3], cage[5], cage[7])),
-        )
-    } else {
-        (cage[0], cage[1], cage[2], cage[3], None)
-    };
-
     let map_pt = |p: Point2D| -> Point2D {
         let u = ((p.x - bb.min_x) / w).clamp(0.0, 1.0);
         let v = ((p.y - bb.min_y) / h).clamp(0.0, 1.0);
-        if let Some((tm, rm, bm, lm)) = mids {
-            // Quadratic Coons patch through 8-point envelope cage
+        if cage.len() >= 12 {
+            // 12-point 4-curve cubic Bézier Coons patch:
+            // [0:TL, 1:T1, 2:T2, 3:TR, 4:R1, 5:R2, 6:BR, 7:B1, 8:B2, 9:BL, 10:L1, 11:L2]
+            let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
+            if mode == EnvelopeMode::Straight {
+                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            }
+            let top = eval_cubic(tl, cage[1], cage[2], tr, u);
+            let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
+            let left = eval_cubic(tl, cage[11], cage[10], bl, v);
+            let right = eval_cubic(tr, cage[4], cage[5], br, v);
+            let ruled_u = top.lerp(bottom, v);
+            let ruled_v = left.lerp(right, u);
+            let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            Point2D::new(
+                ruled_u.x + ruled_v.x - bilin.x,
+                ruled_u.y + ruled_v.y - bilin.y,
+            )
+        } else if cage.len() >= 8 {
+            // Quadratic Coons patch through 8-point envelope cage [TL, T_mid, TR, R_mid, BR, B_mid, BL, L_mid]
+            let (tl, tr, br, bl) = (cage[0], cage[2], cage[4], cage[6]);
+            if mode == EnvelopeMode::Straight {
+                return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+            }
+            let (tm, rm, bm, lm) = (cage[1], cage[3], cage[5], cage[7]);
             let top = eval_quad(tl, tm, tr, u);
             let bottom = eval_quad(bl, bm, br, u);
             let left = eval_quad(tl, lm, bl, v);
@@ -1494,6 +1778,7 @@ fn apply_envelope_to_path_in_bounds(
                 ruled_u.y + ruled_v.y - bilin.y,
             )
         } else {
+            let (tl, tr, br, bl) = (cage[0], cage[1], cage[2], cage[3]);
             let base = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
             match mode {
                 EnvelopeMode::Straight | EnvelopeMode::Unconstrained => base,
@@ -1593,18 +1878,40 @@ fn eval_quad(p0: Point2D, p1: Point2D, p2: Point2D, t: f64) -> Point2D {
     )
 }
 
+fn eval_cubic(p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64) -> Point2D {
+    let it = 1.0 - t;
+    let it2 = it * it;
+    let t2 = t * t;
+    let b0 = it2 * it;
+    let b1 = 3.0 * it2 * t;
+    let b2 = 3.0 * it * t2;
+    let b3 = t2 * t;
+    Point2D::new(
+        b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
+        b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+    )
+}
+
 fn subdivide_for_deformation(path: &BezierPath, max_seg_mm: f64) -> BezierPath {
     let mut out = path.clone();
-    let max_len = max_seg_mm.max(0.5);
+    let max_len = max_seg_mm.max(0.35);
     for sp_idx in 0..out.subpaths.len() {
         let mut guard = 0usize;
-        while guard < 128 {
+        while guard < 512 {
             guard += 1;
             let seg_opt = {
                 let sp = &out.subpaths[sp_idx];
                 (0..sp.segment_count()).find(|&s| {
                     sp.segment_node_indices(s).is_some_and(|(i0, i1)| {
-                        sp.nodes[i0].pos.distance_to(sp.nodes[i1].pos) > max_len
+                        let a = &sp.nodes[i0];
+                        let b = &sp.nodes[i1];
+                        let chord = a.pos.distance_to(b.pos);
+                        if chord > max_len {
+                            return true;
+                        }
+                        let c1_len = a.handle_out.map_or(0.0, |h| a.pos.distance_to(h));
+                        let c2_len = b.handle_in.map_or(0.0, |h| b.pos.distance_to(h));
+                        c1_len + c2_len > max_len * 1.15
                     })
                 })
             };
@@ -1721,6 +2028,7 @@ pub fn lower_effects_to_primitives(
     };
     let deformed_local = sanitize_bezier_path(apply_geometry_effects(&local_base, &obj.effects));
     let sym_transforms = symmetry_effect_transforms(&obj.effects);
+    let icc = doc.icc_pipeline();
     let mut out = Vec::new();
 
     for (sym_idx, sym_xf) in sym_transforms.into_iter().enumerate() {
@@ -1767,11 +2075,28 @@ pub fn lower_effects_to_primitives(
                     dx_mm,
                     dy_mm,
                     color,
+                    simplify,
                     overprint,
-                    ..
                 } => {
                     let delta = Vec2D::new(sanitize_f64(*dx_mm, 0.0), sanitize_f64(*dy_mm, 0.0));
-                    let swept = build_block_shadow_geometry(&world_path, delta);
+                    let mut swept = build_block_shadow_geometry(&world_path, delta);
+                    if *simplify && !swept.subpaths.is_empty() {
+                        let pieces: Vec<BezierPath> = swept
+                            .subpaths
+                            .iter()
+                            .cloned()
+                            .map(BezierPath::from_subpath)
+                            .collect();
+                        if let Ok(welded) = apply_boolean_many(BooleanOp::Weld, &pieces) {
+                            let mut merged = Vec::new();
+                            for w in welded {
+                                merged.extend(w.subpaths);
+                            }
+                            if !merged.is_empty() {
+                                swept = BezierPath { subpaths: merged };
+                            }
+                        }
+                    }
                     if !swept.is_empty() {
                         let mut bs = SceneObject::new(
                             alloc_id(),
@@ -1803,6 +2128,7 @@ pub fn lower_effects_to_primitives(
                         fill_color,
                         outline_color,
                         &suffix,
+                        &icc,
                         alloc_id,
                         &mut out,
                     );
@@ -1822,6 +2148,7 @@ pub fn lower_effects_to_primitives(
                         shade_color,
                         *light_dir,
                         &suffix,
+                        &icc,
                         alloc_id,
                         &mut out,
                     );
@@ -1841,6 +2168,7 @@ pub fn lower_effects_to_primitives(
                         *depth,
                         *rotation_3d,
                         lights,
+                        &icc,
                     ) {
                         let mut face = SceneObject::new(
                             alloc_id(),
@@ -1858,6 +2186,7 @@ pub fn lower_effects_to_primitives(
                     steps,
                     rotation_deg,
                     along_path,
+                    rotate_along_path,
                 } => {
                     emit_lowered_blend_objects(
                         doc,
@@ -1867,7 +2196,9 @@ pub fn lower_effects_to_primitives(
                         *steps,
                         *rotation_deg,
                         *along_path,
+                        *rotate_along_path,
                         &suffix,
+                        &icc,
                         alloc_id,
                         &mut out,
                     );
@@ -1912,6 +2243,7 @@ pub fn lower_effects_to_primitives(
                         fill_color,
                         outline_color,
                         &suffix,
+                        &icc,
                         alloc_id,
                         &mut out,
                     );
@@ -1927,7 +2259,8 @@ pub fn lower_effects_to_primitives(
                                     format!("{} Bevel{suffix}", obj.name),
                                     NodePayload::Path(inner),
                                 );
-                                bv.fill = Fill::Solid(base_color.lerp(&Color::WHITE, 0.35));
+                                bv.fill =
+                                    Fill::Solid(base_color.lerp_icc(&Color::WHITE, 0.35, &icc));
                                 bv.outline = OutlineStyle::none();
                                 bv.opacity = obj.opacity * 0.75;
                                 out.push(bv);
@@ -1977,6 +2310,7 @@ fn emit_lowered_contour_objects(
     target_fill: &Color,
     target_outline: &Color,
     suffix: &str,
+    icc: &IccColorPipeline,
     alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
     out: &mut Vec<SceneObject>,
 ) {
@@ -1990,6 +2324,7 @@ fn emit_lowered_contour_objects(
         target_fill,
         &obj.outline,
         target_outline,
+        icc,
     ) {
         let mut co = SceneObject::new(
             alloc_id(),
@@ -2019,6 +2354,7 @@ fn emit_lowered_extrude_objects(
     shade_color: &Color,
     light_dir: [f32; 3],
     suffix: &str,
+    icc: &IccColorPipeline,
     alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
     out: &mut Vec<SceneObject>,
 ) {
@@ -2030,6 +2366,7 @@ fn emit_lowered_extrude_objects(
         depth,
         shade_color,
         light_dir,
+        icc,
     )
     .into_iter()
     .enumerate()
@@ -2055,7 +2392,9 @@ fn emit_lowered_blend_objects(
     steps: u32,
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
+    rotate_along_path: bool,
     suffix: &str,
+    icc: &IccColorPipeline,
     alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
     out: &mut Vec<SceneObject>,
 ) {
@@ -2067,6 +2406,8 @@ fn emit_lowered_blend_objects(
         steps,
         rotation_deg,
         along_path,
+        rotate_along_path,
+        icc,
     )
     .into_iter()
     .enumerate()
@@ -2195,6 +2536,7 @@ mod tests {
         });
 
         let xf = Affine2D::scale(2.0, 2.0);
+        let icc = IccColorPipeline::default();
         render_underlay_effects(
             &Document::new_a4("E"),
             &obj,
@@ -2204,6 +2546,7 @@ mod tests {
             xf,
             2.0,
             true,
+            &icc,
             &mut backend,
         );
         backend.fill_path(
@@ -2219,6 +2562,7 @@ mod tests {
             xf,
             2.0,
             true,
+            &icc,
             &mut backend,
         );
         let rgba = backend.into_rgba().rgba;
@@ -2227,5 +2571,90 @@ mod tests {
             .0
             .iter()
             .any(|px| px[0] < 240 && px[3] > 200));
+    }
+
+    #[test]
+    fn w3a_envelope_12pt_blend_tangent_contour_gt48_blockshadow_simplify_and_transparency() {
+        let mut rect = BezierPath::from_rect(coree_core::Rect2D::new(0.0, 0.0, 40.0, 20.0));
+        rect.subpaths[0].closed = true;
+        // 12-pt Coons envelope cage with bowed top curve
+        let cage = vec![
+            Point2D::new(0.0, 0.0),
+            Point2D::new(13.0, -8.0),
+            Point2D::new(27.0, -8.0),
+            Point2D::new(40.0, 0.0),
+            Point2D::new(40.0, 6.0),
+            Point2D::new(40.0, 14.0),
+            Point2D::new(40.0, 20.0),
+            Point2D::new(27.0, 20.0),
+            Point2D::new(13.0, 20.0),
+            Point2D::new(0.0, 20.0),
+            Point2D::new(0.0, 14.0),
+            Point2D::new(0.0, 6.0),
+        ];
+        let env = apply_envelope_to_path(&rect, EnvelopeMode::SingleArc, &cage);
+        let env_bb = env.bounding_box().unwrap();
+        assert!(env_bb.min_y < -2.0, "12pt envelope bow missing: {env_bb:?}");
+
+        // Contour > 48 steps lowers without clamping at 48
+        let mut doc = Document::new_a4("Eff");
+        let r1 = SceneObject::new(
+            ObjectId(1),
+            "R1",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 30.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: coree_core::CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        );
+        let id1 = doc.add_object(r1, None).unwrap();
+        coree_core::apply_command(
+            &mut doc,
+            &coree_core::CommandOp::AddEffect {
+                id: id1,
+                effect: Effect::Contour {
+                    mode: ContourMode::Outside,
+                    steps: 64,
+                    offset_mm: 0.4,
+                    fill_color: Color::rgb(1.0, 0.0, 0.0),
+                    outline_color: Color::BLACK,
+                },
+            },
+        )
+        .unwrap();
+        let mut next = 500u64;
+        let lowered = lower_effects_to_primitives(
+            &doc,
+            doc.object(id1).unwrap(),
+            Affine2D::IDENTITY,
+            &mut || {
+                next += 1;
+                ObjectId(next)
+            },
+        );
+        assert!(
+            lowered.len() >= 64,
+            "expected >= 64 contour steps, got {}",
+            lowered.len()
+        );
+
+        // BlockShadow simplify=true vs simplify=false
+        let bs_plain = Effect::BlockShadow {
+            dx_mm: 6.0,
+            dy_mm: 6.0,
+            color: Color::BLACK,
+            simplify: false,
+            overprint: false,
+        };
+        let bs_simp = Effect::BlockShadow {
+            dx_mm: 6.0,
+            dy_mm: 6.0,
+            color: Color::BLACK,
+            simplify: true,
+            overprint: false,
+        };
+        assert_ne!(bs_plain, bs_simp);
     }
 }

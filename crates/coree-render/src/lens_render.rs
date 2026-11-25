@@ -9,17 +9,23 @@
 
 use crate::backend::{
     validate_surface_dimensions, BackendPaint, CanvasBackend, FillRule, PixelRect, RgbaBuffer,
-    TinySkiaBackend,
+    StrokeParams, TinySkiaBackend,
 };
-use crate::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
+use crate::effects_render::{
+    apply_geometry_effects, apply_geometry_effects_in_bounds, symmetry_effect_transforms,
+};
+use crate::raster_engine::apply_raster_filters;
 use crate::renderer::{
-    apply_deform_chain_in_bounds, render_page_surface, DeformFrame, RenderOptions, SceneRenderer,
+    apply_deform_chain_in_bounds, arrowhead_geometry, icc_srgb, render_page_surface, DeformFrame,
+    RenderOptions, SceneRenderer,
 };
+use crate::text_layout::TextEngine;
 use crate::viewport::ViewMode;
-use coree_core::math::sanitize_f32;
+use coree_core::math::{sanitize_f32, sanitize_f64, MM_PER_INCH};
 use coree_core::{
-    Affine2D, BezierPath, Color, Document, Effect, Fill, LensConfig, LensKind, NodePayload,
-    ObjectId, Page, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolDef, SymbolId,
+    Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, Color, DimensionKind, Document,
+    Effect, Fill, IccColorPipeline, LensConfig, LensKind, NodePayload, ObjectId, OutlineStyle,
+    Page, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolDef, SymbolId, Vec2D,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -515,6 +521,130 @@ impl SampleBackdrop {
     }
 }
 
+fn decode_frozen_snapshot_png(bytes: &[u8]) -> Option<RgbaBuffer> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    RgbaBuffer::from_vec(rgba.width(), rgba.height(), rgba.into_raw()).ok()
+}
+
+/// Captures and PNG-encodes a frozen lens backdrop snapshot for `obj_id` so it can be persisted
+/// inside [`LensConfig::frozen_snapshot`].
+#[must_use]
+pub fn capture_frozen_lens_snapshot(doc: &Document, obj_id: ObjectId, dpi: f64) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+    let obj = doc.object(obj_id)?;
+    let lens = obj.lens.as_ref()?;
+    let local_path = match &obj.payload {
+        NodePayload::Path(p) => Some(p.clone()),
+        NodePayload::Shape(s) => Some(s.to_bezier_path()),
+        NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+        NodePayload::ArtisticMedia { spine, style } => {
+            Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+        }
+        NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+        _ => None,
+    }?;
+    let local_persp = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local_path)
+    } else {
+        local_path
+    };
+    let deformed = apply_geometry_effects(&local_persp, &obj.effects);
+    let local_bounds = deformed.bounding_box()?;
+    let world_xf = doc.world_transform_of(obj_id).unwrap_or(obj.transform);
+    let px_per_mm = (sanitize_f64(dpi, 96.0).clamp(1.0, 2400.0)) / MM_PER_INCH;
+    let page_to_screen = Affine2D::scale_uniform(px_per_mm);
+    let lens_to_screen = page_to_screen.compose(&world_xf);
+    let lens_screen_bounds = lens_to_screen.transform_rect(local_bounds);
+    if !lens_screen_bounds.is_finite()
+        || lens_screen_bounds.is_empty()
+        || lens_screen_bounds.width() <= 1e-6
+        || lens_screen_bounds.height() <= 1e-6
+    {
+        return None;
+    }
+
+    let full_x0 = lens_screen_bounds.min_x.floor();
+    let full_y0 = lens_screen_bounds.min_y.floor();
+    let full_w_f = (lens_screen_bounds.max_x.ceil() - full_x0).max(1.0);
+    let full_h_f = (lens_screen_bounds.max_y.ceil() - full_y0).max(1.0);
+    let snap_scale = (MAX_FROZEN_SNAPSHOT_DIM / full_w_f.max(full_h_f)).min(1.0);
+    let snap_w = (full_w_f * snap_scale)
+        .ceil()
+        .clamp(1.0, MAX_FROZEN_SNAPSHOT_DIM) as u32;
+    let snap_h = (full_h_f * snap_scale)
+        .ceil()
+        .clamp(1.0, MAX_FROZEN_SNAPSHOT_DIM) as u32;
+    let to_snap =
+        Affine2D::scale(snap_scale, snap_scale).compose(&Affine2D::translate(-full_x0, -full_y0));
+    let snap_page_xf = to_snap.compose(&page_to_screen);
+    let snap_lens_xf = to_snap.compose(&lens_to_screen);
+    let snap_lens_bounds = snap_lens_xf.transform_rect(local_bounds);
+    let snap_rect = PixelRect::new(0, 0, snap_w, snap_h);
+
+    let page_idx = crate::export_render::find_object_page_index(doc, obj_id);
+    let page = doc.pages().get(page_idx);
+    let mut underlying = Vec::new();
+    let mut layers: Vec<&coree_core::Layer> = Vec::new();
+    if let Some(p) = page {
+        layers.extend(p.layers.iter());
+    }
+    'layer_loop: for layer in layers {
+        if !layer.visible {
+            continue;
+        }
+        for &oid in &layer.objects {
+            let mut sub_visit = HashSet::new();
+            if crate::export_render::collect_underlying_until(
+                doc,
+                oid,
+                obj_id,
+                &mut underlying,
+                0,
+                &mut sub_visit,
+            ) {
+                break 'layer_loop;
+            }
+        }
+    }
+
+    let mut renderer = SceneRenderer::new();
+    renderer.active_icc = doc.icc_pipeline();
+    renderer.force_offscreen_lens_backdrop = true;
+    let options = RenderOptions::export();
+    let buf = compute_lens_buffer(
+        &mut renderer,
+        doc,
+        page,
+        lens,
+        snap_lens_bounds,
+        snap_rect,
+        snap_page_xf,
+        ViewMode::Enhanced,
+        &options,
+        None,
+        &underlying,
+        0,
+    );
+    if buf.is_empty() {
+        return None;
+    }
+    let mut png_bytes = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+    encoder
+        .write_image(
+            &buf.rgba,
+            buf.width,
+            buf.height,
+            image::ColorType::Rgba8.into(),
+        )
+        .ok()?;
+    Some(png_bytes)
+}
+
 /// Renders an object bearing `lens: Some(lens_cfg)` by sampling the underlying
 /// rendered backdrop (or re-rendering underlying objects for `Wireframe`), applying
 /// the lens transformation, honoring `viewpoint`, `frozen`, and `remove_face`,
@@ -614,6 +744,21 @@ pub(crate) fn render_lens_object_with_backdrop(
 
         let frozen_buf = if let Some(cached) = renderer.get_frozen_lens_key(frozen_key) {
             cached.buffer.clone()
+        } else if let Some(decoded) = lens
+            .frozen_snapshot
+            .as_deref()
+            .and_then(decode_frozen_snapshot_png)
+        {
+            renderer.store_frozen_lens_key(
+                frozen_key,
+                FrozenLensSnapshot {
+                    buffer: decoded.clone(),
+                },
+            );
+            if lens_rect.is_none() {
+                return;
+            }
+            decoded
         } else {
             // Capture the COMPLETE unclipped lens image regardless of which tile renders first!
             let snap_scale = (MAX_FROZEN_SNAPSHOT_DIM / full_w_f.max(full_h_f)).min(1.0);
@@ -770,6 +915,7 @@ fn compute_lens_buffer(
             let mask = lens.remove_face.then(|| {
                 build_underlying_coverage_mask(
                     doc,
+                    renderer.text_engine_mut(),
                     underlying,
                     parent_override,
                     target_rect,
@@ -822,6 +968,7 @@ fn compute_lens_buffer(
             let mask = lens.remove_face.then(|| {
                 let cov_backdrop = build_underlying_coverage_backdrop(
                     doc,
+                    renderer.text_engine_mut(),
                     underlying,
                     parent_override,
                     page_to_target,
@@ -896,6 +1043,7 @@ fn compute_lens_buffer(
             let mask = lens.remove_face.then(|| {
                 let cov_backdrop = build_underlying_coverage_backdrop(
                     doc,
+                    renderer.text_engine_mut(),
                     underlying,
                     parent_override,
                     page_to_target,
@@ -967,13 +1115,14 @@ fn compute_lens_buffer(
                             i64::from(target_rect.y) + i64::from(ly),
                         )
                     };
-                    let mapped = apply_color_lens_pixel(&kind, src_px);
+                    let mapped = apply_color_lens_pixel(&kind, src_px, &renderer.active_icc);
                     buf.set_pixel(lx, ly, mapped);
                 }
             }
             let mask = lens.remove_face.then(|| {
                 build_underlying_coverage_mask(
                     doc,
+                    renderer.text_engine_mut(),
                     underlying,
                     parent_override,
                     target_rect,
@@ -1080,20 +1229,22 @@ fn obtain_sample_backdrop(
                 buffer: backend.snapshot_rgba(),
             };
         }
+        let page_bg_rgba = icc_srgb(&options.page_bg, &renderer.active_icc).to_rgba8();
         return SampleBackdrop {
             origin_x: sx0 as f64,
             origin_y: sy0 as f64,
-            buffer: RgbaBuffer::new_filled(1, 1, options.page_bg.to_rgba8()),
+            buffer: RgbaBuffer::new_filled(1, 1, page_bg_rgba),
         };
     }
 
     let bw = bw_i64 as u32;
     let bh = bh_i64 as u32;
     let Ok(mut sub) = TinySkiaBackend::new(bw, bh) else {
+        let page_bg_rgba = icc_srgb(&options.page_bg, &renderer.active_icc).to_rgba8();
         return SampleBackdrop {
             origin_x: sx0 as f64,
             origin_y: sy0 as f64,
-            buffer: RgbaBuffer::new_filled(1, 1, options.page_bg.to_rgba8()),
+            buffer: RgbaBuffer::new_filled(1, 1, page_bg_rgba),
         };
     };
 
@@ -1102,11 +1253,18 @@ fn obtain_sample_backdrop(
     let anti_alias = view_mode != ViewMode::Pixels;
     let parent_override = renderer.parent_xf_override;
 
-    sub.clear(options.canvas_bg.clone());
+    sub.clear(icc_srgb(&options.canvas_bg, &renderer.active_icc));
     if let Some(p) = page {
-        render_page_surface(p, local_page_xf, px_per_mm, options, &mut sub);
+        render_page_surface(
+            p,
+            local_page_xf,
+            px_per_mm,
+            options,
+            &renderer.active_icc,
+            &mut sub,
+        );
     } else if options.page_bg.alpha() > 1e-6 {
-        sub.clear(options.page_bg.clone());
+        sub.clear(icc_srgb(&options.page_bg, &renderer.active_icc));
     }
 
     let prev_scope_stack = std::mem::take(&mut renderer.frozen_scope_stack);
@@ -1401,6 +1559,7 @@ fn obtain_sample_backdrop(
                             local_page_xf,
                             px_per_mm,
                             anti_alias,
+                            &renderer.active_icc,
                             &mut sub,
                         );
                     }
@@ -1414,6 +1573,7 @@ fn obtain_sample_backdrop(
                             pc_obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &renderer.active_icc,
                             &mut sub,
                         );
                     }
@@ -1449,8 +1609,8 @@ fn obtain_sample_backdrop(
     }
 }
 
-/// Evaluates all color-space lens variants accurately on a single RGBA8 pixel.
-fn apply_color_lens_pixel(kind: &LensKind, px: [u8; 4]) -> [u8; 4] {
+/// Evaluates all color-space lens variants accurately on a single display-sRGB RGBA8 pixel.
+fn apply_color_lens_pixel(kind: &LensKind, px: [u8; 4], icc: &IccColorPipeline) -> [u8; 4] {
     match kind {
         LensKind::HeatMap {
             palette_rotation_deg,
@@ -1465,8 +1625,19 @@ fn apply_color_lens_pixel(kind: &LensKind, px: [u8; 4]) -> [u8; 4] {
             [thermal[0], thermal[1], thermal[2], px[3]]
         }
         other => {
-            let col = Color::rgba8(px[0], px[1], px[2], px[3]);
-            other.apply_color(&col).to_rgba8()
+            let srgb_f32 = [
+                f32::from(px[0]) / 255.0,
+                f32::from(px[1]) / 255.0,
+                f32::from(px[2]) / 255.0,
+                f32::from(px[3]) / 255.0,
+            ];
+            let out = other.apply_color_on_srgb_backdrop(srgb_f32, icc);
+            [
+                (out[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (out[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (out[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (out[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]
         }
     }
 }
@@ -1667,14 +1838,14 @@ fn render_wireframe_lens(
         return RgbaBuffer::new_transparent(target_rect.width, target_rect.height);
     };
     let bg = override_fill
-        .cloned()
-        .unwrap_or_else(|| options.page_bg.clone());
+        .map(|c| icc_srgb(c, &renderer.active_icc))
+        .unwrap_or_else(|| icc_srgb(&options.page_bg, &renderer.active_icc));
     sub_backend.clear(bg);
 
     let mut wire_opts = options.clone();
-    if let Some(ov_out) = override_outline {
-        wire_opts.wireframe_stroke_color = ov_out.clone();
-    }
+    wire_opts.wireframe_stroke_color = override_outline
+        .map(|c| icc_srgb(c, &renderer.active_icc))
+        .unwrap_or_else(|| icc_srgb(&options.wireframe_stroke_color, &renderer.active_icc));
 
     let local_xf = Affine2D::translate(
         -f64::from(target_rect.x) - shift_x,
@@ -1952,6 +2123,7 @@ fn render_wireframe_lens(
 
 fn rasterize_backdrop_coverage(
     doc: &Document,
+    text_engine: &mut TextEngine,
     underlying: &[BackdropItem],
     parent_override: Option<(ObjectId, Affine2D)>,
     local_xf: Affine2D,
@@ -2052,6 +2224,7 @@ fn rasterize_backdrop_coverage(
                             parent_world.compose(&sym_xf).compose(&target_obj.transform);
                         rasterize_silhouette_payload(
                             doc,
+                            text_engine,
                             target_obj,
                             c_xf,
                             obj_world_xf,
@@ -2081,6 +2254,7 @@ fn rasterize_backdrop_coverage(
                             parent_world.compose(&sym_xf).compose(&target_obj.transform);
                         rasterize_silhouette_payload(
                             doc,
+                            text_engine,
                             target_obj,
                             sub_xf,
                             obj_world_xf,
@@ -2123,6 +2297,7 @@ fn rasterize_backdrop_coverage(
                                     parent_world.compose(&sym_xf).compose(&target_obj.transform);
                                 rasterize_silhouette_payload(
                                     doc,
+                                    text_engine,
                                     target_obj,
                                     c_xf,
                                     obj_world_xf,
@@ -2146,6 +2321,7 @@ fn rasterize_backdrop_coverage(
                                     .compose(&target_obj.transform);
                                 rasterize_silhouette_payload(
                                     doc,
+                                    text_engine,
                                     target_obj,
                                     sub_xf,
                                     obj_world_xf,
@@ -2244,8 +2420,10 @@ fn rasterize_backdrop_coverage(
 
 /// Rasterizes the silhouette coverage of all underlying objects (strictly below the lens)
 /// into a 1-channel coverage mask so `LensConfig::remove_face` hides empty page background.
+#[allow(clippy::too_many_arguments)]
 fn build_underlying_coverage_mask(
     doc: &Document,
+    text_engine: &mut TextEngine,
     underlying: &[BackdropItem],
     parent_override: Option<(ObjectId, Affine2D)>,
     target_rect: PixelRect,
@@ -2266,6 +2444,7 @@ fn build_underlying_coverage_mask(
     .compose(&page_to_target);
     rasterize_backdrop_coverage(
         doc,
+        text_engine,
         underlying,
         parent_override,
         local_xf,
@@ -2280,6 +2459,7 @@ fn build_underlying_coverage_mask(
 #[allow(clippy::too_many_arguments)]
 fn build_underlying_coverage_backdrop(
     doc: &Document,
+    text_engine: &mut TextEngine,
     underlying: &[BackdropItem],
     parent_override: Option<(ObjectId, Affine2D)>,
     page_to_target: Affine2D,
@@ -2313,6 +2493,7 @@ fn build_underlying_coverage_backdrop(
     let local_xf = Affine2D::translate(-(sx0 as f64), -(sy0 as f64)).compose(&page_to_target);
     rasterize_backdrop_coverage(
         doc,
+        text_engine,
         underlying,
         parent_override,
         local_xf,
@@ -2345,6 +2526,7 @@ fn fill_is_visible(fill: &Fill) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn rasterize_silhouette_payload(
     doc: &Document,
+    text_engine: &mut TextEngine,
     obj: &SceneObject,
     world_xf: Affine2D,
     obj_world_xf: Affine2D,
@@ -2374,41 +2556,60 @@ fn rasterize_silhouette_payload(
     } else {
         obj
     };
-    let mut fill_geom = |base_path: &BezierPath| {
-        let persp_geom = if let Some(persp) = obj_eff.perspective {
-            persp.transform_bezier_path(base_path)
-        } else {
-            base_path.clone()
-        };
-        let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
-        if deform_frames.is_empty() {
-            backend.fill_path(&local_geom, paint, FillRule::EvenOdd, world_xf);
-        } else {
-            let deformed = apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
-            backend.fill_path(&deformed, paint, FillRule::EvenOdd, outer_to_sub);
-        }
-    };
-    let own_fill_or_outline =
-        fill_is_visible(&obj_eff.fill) || obj_eff.outline.is_visible() || obj_eff.lens.is_some();
+    macro_rules! fill_geom {
+        ($base_path:expr) => {{
+            let persp_geom = if let Some(persp) = obj_eff.perspective {
+                persp.transform_bezier_path($base_path)
+            } else {
+                ($base_path).clone()
+            };
+            let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
+            if deform_frames.is_empty() {
+                backend.fill_path(&local_geom, paint, FillRule::EvenOdd, world_xf);
+            } else {
+                let deformed = apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
+                backend.fill_path(&deformed, paint, FillRule::EvenOdd, outer_to_sub);
+            }
+        }};
+    }
+    macro_rules! fill_winding {
+        ($base_path:expr) => {{
+            let persp_geom = if let Some(persp) = obj_eff.perspective {
+                persp.transform_bezier_path($base_path)
+            } else {
+                ($base_path).clone()
+            };
+            let local_geom = apply_geometry_effects(&persp_geom, &obj_eff.effects);
+            if deform_frames.is_empty() {
+                backend.fill_path(&local_geom, paint, FillRule::Winding, world_xf);
+            } else {
+                let deformed = apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
+                backend.fill_path(&deformed, paint, FillRule::Winding, outer_to_sub);
+            }
+        }};
+    }
+    let own_fill_or_outline = fill_is_visible(&obj_eff.fill)
+        || obj_eff.outline.is_visible()
+        || obj_eff.lens.as_ref().is_some_and(|l| !l.remove_face);
     match &obj_eff.payload {
         NodePayload::Path(p) => {
             if own_fill_or_outline {
-                fill_geom(p);
+                fill_geom!(p);
             }
         }
         NodePayload::Shape(s) => {
             if own_fill_or_outline {
-                fill_geom(&s.to_bezier_path());
+                fill_geom!(&s.to_bezier_path());
             }
         }
         NodePayload::BSpline(bs) => {
             if own_fill_or_outline {
-                fill_geom(&bs.to_bezier_path());
+                fill_geom!(&bs.to_bezier_path());
             }
         }
         NodePayload::ArtisticMedia { spine, style } => {
             if own_fill_or_outline {
-                fill_geom(&coree_core::ArtisticMedia::expand_stroke(spine, style));
+                fill_geom!(&coree_core::ArtisticMedia::expand_stroke(spine, style));
             }
         }
         NodePayload::Clone { .. } => {}
@@ -2418,9 +2619,30 @@ fn rasterize_silhouette_payload(
             ..
         } => {
             if own_fill_or_outline {
-                fill_geom(container);
+                fill_geom!(&**container);
             } else if !contents.is_empty() {
-                let local_geom = apply_geometry_effects(container, &obj.effects);
+                let pc_has_deform = obj_eff.perspective.is_some()
+                    || obj_eff.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::Distort { .. }
+                                | Effect::Envelope { .. }
+                                | Effect::Perspective { .. }
+                        )
+                    });
+                let persp_container = if let Some(persp) = obj_eff.perspective {
+                    persp.transform_bezier_path(container)
+                } else {
+                    (**container).clone()
+                };
+                let pc_local_bb = pc_has_deform
+                    .then(|| persp_container.bounding_box())
+                    .flatten();
+                let local_geom = apply_geometry_effects_in_bounds(
+                    &persp_container,
+                    pc_local_bb,
+                    &obj_eff.effects,
+                );
                 if deform_frames.is_empty() {
                     backend.push_clip(&local_geom, FillRule::Winding, world_xf);
                 } else {
@@ -2428,50 +2650,117 @@ fn rasterize_silhouette_payload(
                         apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
                     backend.push_clip(&deformed, FillRule::Winding, outer_to_sub);
                 }
-                for &cid in contents {
-                    if let Some((map, _, _)) = sym_ctx {
-                        if let Some(sub) = map.get(&cid).copied() {
-                            let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
-                            if sub.visible && sub_opacity > 1e-6 {
-                                for sym_xf in symmetry_effect_transforms(&sub.effects) {
-                                    let c_xf = world_xf.compose(&sym_xf).compose(&sub.transform);
-                                    let child_world =
-                                        obj_world_xf.compose(&sym_xf).compose(&sub.transform);
-                                    rasterize_silhouette_payload(
-                                        doc,
-                                        sub,
-                                        c_xf,
-                                        child_world,
-                                        deform_frames,
-                                        outer_to_sub,
-                                        sym_ctx,
-                                        paint,
-                                        backend,
-                                        depth + 1,
-                                    );
+                if pc_has_deform {
+                    let (next_outer_to_sub, rel_to_outer) = if deform_frames.is_empty() {
+                        (world_xf, Affine2D::IDENTITY)
+                    } else {
+                        (outer_to_sub, world_xf)
+                    };
+                    let mut extended = Vec::with_capacity(deform_frames.len() + 1);
+                    extended.extend_from_slice(deform_frames);
+                    extended.push(DeformFrame {
+                        pre_perspective: obj_eff.perspective,
+                        group_local_bb: pc_local_bb,
+                        group_effects: &obj_eff.effects,
+                        rel_to_outer,
+                    });
+                    for &cid in contents {
+                        if let Some((map, _, _)) = sym_ctx {
+                            if let Some(sub) = map.get(&cid).copied() {
+                                let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
+                                if sub.visible && sub_opacity > 1e-6 {
+                                    for sym_xf in symmetry_effect_transforms(&sub.effects) {
+                                        let c_xf = sym_xf.compose(&sub.transform);
+                                        let child_world =
+                                            obj_world_xf.compose(&sym_xf).compose(&sub.transform);
+                                        rasterize_silhouette_payload(
+                                            doc,
+                                            text_engine,
+                                            sub,
+                                            c_xf,
+                                            child_world,
+                                            &extended,
+                                            next_outer_to_sub,
+                                            sym_ctx,
+                                            paint,
+                                            backend,
+                                            depth + 1,
+                                        );
+                                    }
                                 }
                             }
+                        } else {
+                            rasterize_object_silhouette_with_deforms(
+                                doc,
+                                text_engine,
+                                cid,
+                                Affine2D::IDENTITY,
+                                obj_world_xf,
+                                &extended,
+                                next_outer_to_sub,
+                                paint,
+                                backend,
+                                depth + 1,
+                            );
                         }
-                    } else {
-                        rasterize_object_silhouette_with_deforms(
-                            doc,
-                            cid,
-                            world_xf,
-                            obj_world_xf,
-                            deform_frames,
-                            outer_to_sub,
-                            paint,
-                            backend,
-                            depth + 1,
-                        );
+                    }
+                } else {
+                    for &cid in contents {
+                        if let Some((map, _, _)) = sym_ctx {
+                            if let Some(sub) = map.get(&cid).copied() {
+                                let sub_opacity = sanitize_f32(sub.opacity, 1.0).clamp(0.0, 1.0);
+                                if sub.visible && sub_opacity > 1e-6 {
+                                    for sym_xf in symmetry_effect_transforms(&sub.effects) {
+                                        let c_xf =
+                                            world_xf.compose(&sym_xf).compose(&sub.transform);
+                                        let child_world =
+                                            obj_world_xf.compose(&sym_xf).compose(&sub.transform);
+                                        rasterize_silhouette_payload(
+                                            doc,
+                                            text_engine,
+                                            sub,
+                                            c_xf,
+                                            child_world,
+                                            deform_frames,
+                                            outer_to_sub,
+                                            sym_ctx,
+                                            paint,
+                                            backend,
+                                            depth + 1,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            rasterize_object_silhouette_with_deforms(
+                                doc,
+                                text_engine,
+                                cid,
+                                world_xf,
+                                obj_world_xf,
+                                deform_frames,
+                                outer_to_sub,
+                                paint,
+                                backend,
+                                depth + 1,
+                            );
+                        }
                     }
                 }
                 backend.pop_clip();
             }
         }
         NodePayload::Table(t) => {
-            let obj_fill_vis = fill_is_visible(&obj.fill);
+            let obj_fill_vis = fill_is_visible(&obj_eff.fill);
             let border_vis = t.border_style.is_visible();
+            let stroke_w = t.border_style.effective_width_mm().max(0.2) as f32;
+            let border_st = StrokeParams::from_outline(
+                &OutlineStyle::solid(Color::WHITE, f64::from(stroke_w)),
+                stroke_w,
+                1.0,
+                BlendMode::Normal,
+                true,
+            );
             for r in 0..t.rows {
                 for c in 0..t.cols {
                     let Some(cell) = t.cell(r, c) else {
@@ -2480,45 +2769,311 @@ fn rasterize_silhouette_payload(
                     let Some(rect) = t.cell_rect(r, c) else {
                         continue;
                     };
-                    let cell_vis = obj_fill_vis
-                        || border_vis
-                        || fill_is_visible(&cell.fill)
-                        || (!cell.text.trim().is_empty() && cell.text_style.fill.alpha() > 1e-6);
-                    if cell_vis {
-                        fill_geom(&BezierPath::from_rect(rect));
+                    if obj_fill_vis || fill_is_visible(&cell.fill) {
+                        fill_geom!(&BezierPath::from_rect(rect));
+                    } else if border_vis {
+                        let cell_path = BezierPath::from_rect(rect);
+                        let local_geom = apply_geometry_effects(&cell_path, &obj_eff.effects);
+                        if deform_frames.is_empty() {
+                            backend.stroke_path(&local_geom, &border_st, world_xf);
+                        } else {
+                            let deformed =
+                                apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
+                            backend.stroke_path(&deformed, &border_st, outer_to_sub);
+                        }
+                    }
+                    if !cell.text.trim().is_empty() && cell.text_style.fill.alpha() > 1e-6 {
+                        let pad = sanitize_f64(cell.padding_mm, 1.5).max(0.0);
+                        let at =
+                            ArtisticText::from_plain(cell.text.clone(), cell.text_style.clone());
+                        let pieces = text_engine.layout_artistic_pieces(&at);
+                        let off = Affine2D::translate(rect.min_x + pad, rect.min_y + pad);
+                        for piece in &pieces {
+                            fill_winding!(&piece.path.transformed(&off));
+                        }
                     }
                 }
             }
         }
-        NodePayload::Dimension(d) => fill_geom(&BezierPath::from_rect(d.bounding_box())),
+        NodePayload::Dimension(d) => {
+            let dim_outline = if obj_eff.outline.is_visible() {
+                obj_eff.outline.clone()
+            } else {
+                OutlineStyle::solid(Color::WHITE, 0.25)
+            };
+            let stroke_w = dim_outline.effective_width_mm().max(0.2) as f32;
+            let st = StrokeParams::from_outline(
+                &OutlineStyle::solid(Color::WHITE, f64::from(stroke_w)),
+                stroke_w,
+                1.0,
+                BlendMode::Normal,
+                true,
+            );
+            let mut stroke_paths = Vec::new();
+            let mut arrow_paths = Vec::new();
+            let label_anchor = match d.kind {
+                DimensionKind::Parallel
+                | DimensionKind::Horizontal
+                | DimensionKind::Vertical
+                | DimensionKind::Segment => {
+                    let (d1, d2, ext_dir) = match d.kind {
+                        DimensionKind::Horizontal => {
+                            let y_line = d.p1.y.min(d.p2.y) - d.offset_mm;
+                            (
+                                Point2D::new(d.p1.x, y_line),
+                                Point2D::new(d.p2.x, y_line),
+                                Vec2D::new(0.0, -1.0),
+                            )
+                        }
+                        DimensionKind::Vertical => {
+                            let x_line = d.p1.x.min(d.p2.x) - d.offset_mm;
+                            (
+                                Point2D::new(x_line, d.p1.y),
+                                Point2D::new(x_line, d.p2.y),
+                                Vec2D::new(-1.0, 0.0),
+                            )
+                        }
+                        _ => {
+                            let dir = (d.p2 - d.p1).normalized().unwrap_or(Vec2D::new(1.0, 0.0));
+                            let perp = Vec2D::new(dir.y, -dir.x);
+                            let off = perp * d.offset_mm;
+                            (d.p1 + off, d.p2 + off, perp)
+                        }
+                    };
+                    let overshoot = ext_dir * 1.5;
+                    stroke_paths.push(BezierPath::from_line(d.p1, d1 + overshoot));
+                    stroke_paths.push(BezierPath::from_line(d.p2, d2 + overshoot));
+                    stroke_paths.push(BezierPath::from_line(d1, d2));
+                    if let Some(dir) = (d2 - d1).normalized() {
+                        if let Some((g, filled)) = arrowhead_geometry(
+                            d1,
+                            -dir,
+                            &ArrowheadStyle::Triangle,
+                            stroke_w.max(0.35),
+                        ) {
+                            arrow_paths.push((g, filled));
+                        }
+                        if let Some((g, filled)) = arrowhead_geometry(
+                            d2,
+                            dir,
+                            &ArrowheadStyle::Triangle,
+                            stroke_w.max(0.35),
+                        ) {
+                            arrow_paths.push((g, filled));
+                        }
+                    }
+                    d1.midpoint(d2) + ext_dir * 1.2
+                }
+                DimensionKind::Angular => {
+                    let v = d.p1;
+                    let r1 = (d.p2 - v).normalized().unwrap_or(Vec2D::new(1.0, 0.0));
+                    let r2 =
+                        d.p3.map_or(Vec2D::new(1.0, 0.0), |p| (p - v).normalize_or_zero());
+                    let rad = d.offset_mm.abs().max(5.0);
+                    stroke_paths.push(BezierPath::from_line(v, v + r1 * (rad + 2.0)));
+                    stroke_paths.push(BezierPath::from_line(v, v + r2 * (rad + 2.0)));
+                    let a1 = r1.angle_rad();
+                    let mut sweep = r2.angle_rad() - a1;
+                    while sweep > std::f64::consts::PI {
+                        sweep -= std::f64::consts::TAU;
+                    }
+                    while sweep < -std::f64::consts::PI {
+                        sweep += std::f64::consts::TAU;
+                    }
+                    let a2 = a1 + sweep;
+                    let arc_pts: Vec<Point2D> = (0..=24)
+                        .map(|i| v + Vec2D::from_angle(a1 + (a2 - a1) * (i as f64 / 24.0)) * rad)
+                        .collect();
+                    stroke_paths.push(BezierPath::from_polygon(arc_pts, false));
+                    v + Vec2D::from_angle(0.5 * (a1 + a2)) * (rad + 3.0)
+                }
+                DimensionKind::Callout3Pt => {
+                    let mut pts = vec![d.p1, d.p2];
+                    let anchor = if let Some(p3) = d.p3 {
+                        pts.push(p3);
+                        p3
+                    } else {
+                        d.p2
+                    };
+                    stroke_paths.push(BezierPath::from_polygon(pts, false));
+                    anchor
+                }
+            };
+            for sp in stroke_paths {
+                let persp = obj_eff
+                    .perspective
+                    .map_or_else(|| sp.clone(), |p| p.transform_bezier_path(&sp));
+                let local_geom = apply_geometry_effects(&persp, &obj_eff.effects);
+                if deform_frames.is_empty() {
+                    backend.stroke_path(&local_geom, &st, world_xf);
+                } else {
+                    let deformed =
+                        apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
+                    backend.stroke_path(&deformed, &st, outer_to_sub);
+                }
+            }
+            for (ap, filled) in arrow_paths {
+                if filled {
+                    fill_winding!(&ap);
+                } else {
+                    let local_geom = apply_geometry_effects(&ap, &obj_eff.effects);
+                    if deform_frames.is_empty() {
+                        backend.stroke_path(&local_geom, &st, world_xf);
+                    } else {
+                        let deformed =
+                            apply_deform_chain_in_bounds(&local_geom, world_xf, deform_frames);
+                        backend.stroke_path(&deformed, &st, outer_to_sub);
+                    }
+                }
+            }
+            let label_text =
+                d.compute_measurement_with_dpi(doc.default_unit(), f64::from(doc.dpi()));
+            if !label_text.trim().is_empty() {
+                let at = ArtisticText::from_plain(label_text, d.text_style.clone());
+                let pieces = text_engine.layout_artistic_pieces(&at);
+                let off = Affine2D::translate(
+                    label_anchor.x,
+                    label_anchor.y - d.text_style.font_size_mm(),
+                );
+                for piece in &pieces {
+                    fill_winding!(&piece.path.transformed(&off));
+                }
+            }
+        }
         NodePayload::Raster(r) => {
-            if doc.asset(r.asset_id).is_some() {
-                let rect = BezierPath::from_rect(r.crop_rect.unwrap_or_else(|| {
-                    coree_core::Rect2D::from_xywh(0.0, 0.0, r.width_mm, r.height_mm)
-                }));
-                fill_geom(&rect);
+            if let Some(asset) = doc.asset(r.asset_id) {
+                let filtered =
+                    (!r.filters.is_empty()).then(|| apply_raster_filters(asset, &r.filters));
+                let active_asset = filtered.as_ref().unwrap_or(asset);
+                let mut mask_rgba = active_asset.to_rgba8_vec();
+                for px in mask_rgba.as_chunks_mut::<4>().0 {
+                    px[0] = 255;
+                    px[1] = 255;
+                    px[2] = 255;
+                }
+                if let Ok(mask_buf) =
+                    RgbaBuffer::from_vec(active_asset.width, active_asset.height, mask_rgba)
+                {
+                    let w_mm = r.width_mm.max(0.05);
+                    let h_mm = r.height_mm.max(0.05);
+                    let sx = w_mm / f64::from(active_asset.width.max(1));
+                    let sy = h_mm / f64::from(active_asset.height.max(1));
+                    let raster_xf = if deform_frames.is_empty() {
+                        world_xf
+                    } else {
+                        let inner_to_outer = deform_frames
+                            .iter()
+                            .skip(1)
+                            .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
+                        outer_to_sub.compose(&inner_to_outer).compose(&world_xf)
+                    };
+                    let img_xf = raster_xf.compose(&Affine2D::scale(sx, sy));
+                    if let Some(cr) = r.crop_rect.filter(|c| c.is_finite()) {
+                        let crop_path = BezierPath::from_rect(cr);
+                        backend.push_clip(&crop_path, FillRule::Winding, raster_xf);
+                        backend.draw_pixmap(
+                            &mask_buf,
+                            img_xf,
+                            obj_opacity,
+                            BlendMode::Normal,
+                            true,
+                        );
+                        backend.pop_clip();
+                    } else {
+                        backend.draw_pixmap(
+                            &mask_buf,
+                            img_xf,
+                            obj_opacity,
+                            BlendMode::Normal,
+                            true,
+                        );
+                    }
+                }
             }
         }
         NodePayload::ArtisticText(t) => {
-            let has_visible_text = !t.plain_text().trim().is_empty()
-                && (obj.outline.is_visible()
-                    || fill_is_visible(&obj.fill)
+            if !t.plain_text().trim().is_empty()
+                && (obj_eff.outline.is_visible()
+                    || fill_is_visible(&obj_eff.fill)
                     || t.runs
                         .iter()
-                        .any(|r| !r.text.trim().is_empty() && r.style.fill.alpha() > 1e-6));
-            if has_visible_text {
-                fill_geom(&BezierPath::from_rect(t.estimated_bounds()));
+                        .any(|r| !r.text.trim().is_empty() && r.style.fill.alpha() > 1e-6))
+            {
+                for piece in text_engine.layout_artistic_pieces(t) {
+                    fill_winding!(&piece.path);
+                }
             }
         }
         NodePayload::ParagraphText(t) => {
-            let has_visible_text = !t.plain_text().trim().is_empty()
-                && (obj.outline.is_visible()
-                    || fill_is_visible(&obj.fill)
-                    || t.runs
-                        .iter()
-                        .any(|r| !r.text.trim().is_empty() && r.style.fill.alpha() > 1e-6));
-            if has_visible_text {
-                fill_geom(&BezierPath::from_rect(t.bounding_box()));
+            if obj_eff.outline.is_visible()
+                || fill_is_visible(&obj_eff.fill)
+                || t.linked_next_frame.is_some()
+                || !t.plain_text().trim().is_empty()
+            {
+                let frame_rect = BezierPath::from_rect(t.bounding_box());
+                let persp_frame = obj_eff.perspective.map_or_else(
+                    || frame_rect.clone(),
+                    |p| p.transform_bezier_path(&frame_rect),
+                );
+                let clip_geom = apply_geometry_effects(&persp_frame, &obj_eff.effects);
+                if deform_frames.is_empty() {
+                    backend.push_clip(&clip_geom, FillRule::Winding, world_xf);
+                } else {
+                    let deformed_clip =
+                        apply_deform_chain_in_bounds(&clip_geom, world_xf, deform_frames);
+                    backend.push_clip(&deformed_clip, FillRule::Winding, outer_to_sub);
+                }
+                for piece in text_engine.layout_paragraph_in_doc(doc, obj_eff.id, t) {
+                    fill_winding!(&piece.path);
+                }
+                backend.pop_clip();
+            }
+        }
+        NodePayload::TextOnPath(top) => {
+            if !top.text.plain_text().trim().is_empty() {
+                if let Some(host_path) = doc.world_path_of(top.path_id) {
+                    let inv_world = obj_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+                    for piece in text_engine.layout_text_on_path_pieces(top, &host_path) {
+                        fill_winding!(&piece.path.transformed(&inv_world));
+                    }
+                } else {
+                    for piece in text_engine.layout_artistic_pieces(&top.text) {
+                        fill_winding!(&piece.path);
+                    }
+                }
+            }
+        }
+        NodePayload::Connector(conn) => {
+            let stroke_w = obj_eff.outline.effective_width_mm().max(0.25) as f32;
+            let st = StrokeParams::from_outline(
+                &OutlineStyle::solid(Color::WHITE, f64::from(stroke_w)),
+                stroke_w,
+                1.0,
+                BlendMode::Normal,
+                true,
+            );
+            let mut sym_visiting = HashMap::new();
+            let mut sym_visited_syms = HashSet::new();
+            let mut sym_cache = HashMap::new();
+            let ((a, b), _) = crate::hit_test::resolve_connector_endpoints_with_sym(
+                doc,
+                conn,
+                &Affine2D::IDENTITY,
+                sym_ctx.map(|(m, _, xf)| (m, xf)),
+                &mut sym_visiting,
+                &mut sym_visited_syms,
+                &mut sym_cache,
+                depth + 1,
+            );
+            let route = conn.route_path(a, b);
+            let inv_world = obj_world_xf.inverse().unwrap_or(Affine2D::IDENTITY);
+            let local_route =
+                apply_geometry_effects(&route.transformed(&inv_world), &obj_eff.effects);
+            if deform_frames.is_empty() {
+                backend.stroke_path(&local_route, &st, world_xf);
+            } else {
+                let deformed = apply_deform_chain_in_bounds(&local_route, world_xf, deform_frames);
+                backend.stroke_path(&deformed, &st, outer_to_sub);
             }
         }
         NodePayload::Group(children) => {
@@ -2575,6 +3130,7 @@ fn rasterize_silhouette_payload(
                                         obj_world_xf.compose(&sym_xf).compose(&sub.transform);
                                     rasterize_silhouette_payload(
                                         doc,
+                                        text_engine,
                                         sub,
                                         c_xf,
                                         child_world,
@@ -2591,6 +3147,7 @@ fn rasterize_silhouette_payload(
                     } else {
                         rasterize_object_silhouette_with_deforms(
                             doc,
+                            text_engine,
                             cid,
                             Affine2D::IDENTITY,
                             obj_world_xf,
@@ -2614,6 +3171,7 @@ fn rasterize_silhouette_payload(
                                         obj_world_xf.compose(&sym_xf).compose(&sub.transform);
                                     rasterize_silhouette_payload(
                                         doc,
+                                        text_engine,
                                         sub,
                                         c_xf,
                                         child_world,
@@ -2630,6 +3188,7 @@ fn rasterize_silhouette_payload(
                     } else {
                         rasterize_object_silhouette_with_deforms(
                             doc,
+                            text_engine,
                             cid,
                             world_xf,
                             obj_world_xf,
@@ -2672,6 +3231,7 @@ fn rasterize_silhouette_payload(
                         let child_world = obj_world_xf.compose(&sym_xf).compose(&sub.transform);
                         rasterize_silhouette_payload(
                             doc,
+                            text_engine,
                             sub,
                             sub_xf,
                             child_world,
@@ -2686,13 +3246,13 @@ fn rasterize_silhouette_payload(
                 }
             }
         }
-        _ => {}
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn rasterize_object_silhouette_with_deforms(
     doc: &Document,
+    text_engine: &mut TextEngine,
     id: ObjectId,
     parent_xf: Affine2D,
     parent_world_xf: Affine2D,
@@ -2718,6 +3278,7 @@ fn rasterize_object_silhouette_with_deforms(
         let obj_world_xf = parent_world_xf.compose(&sym_xf).compose(&obj.transform);
         rasterize_silhouette_payload(
             doc,
+            text_engine,
             obj,
             world_xf,
             obj_world_xf,
@@ -2754,4 +3315,718 @@ fn estimate_scale_xf(xf: &Affine2D) -> f64 {
     let sx = xf.m[0].hypot(xf.m[1]);
     let sy = xf.m[2].hypot(xf.m[3]);
     (0.5 * (sx + sy)).max(1e-4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coree_core::{ArtisticText, CommandOp, CornerStyle, ParametricShape, TextStyle};
+
+    #[test]
+    fn w3a_frozen_snapshot_survives_backdrop_removal_and_remove_face_masks_text() {
+        let mut doc = Document::new_a4("LensTest");
+        let bg = SceneObject::new(
+            ObjectId(1),
+            "BG",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 40.0,
+                height: 40.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgb(1.0, 0.0, 0.0)))
+        .with_transform(Affine2D::translate(10.0, 10.0));
+        let bg_id = doc.add_object(bg, None).unwrap();
+
+        let mut lens_obj = SceneObject::new(
+            ObjectId(2),
+            "Lens",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 20.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_transform(Affine2D::translate(15.0, 15.0));
+        let mut cfg = LensConfig::new(LensKind::Invert);
+        cfg.frozen = true;
+        lens_obj.lens = Some(cfg.clone());
+        let lens_id = doc.add_object(lens_obj, None).unwrap();
+
+        let snap = capture_frozen_lens_snapshot(&doc, lens_id, 72.0)
+            .expect("snapshot should encode valid PNG");
+        assert!(snap.starts_with(b"\x89PNG"));
+        cfg.frozen_snapshot = Some(snap);
+        coree_core::apply_command(
+            &mut doc,
+            &CommandOp::SetLens {
+                ids: vec![lens_id],
+                lens: Some(cfg),
+            },
+        )
+        .unwrap();
+
+        // Delete backdrop object; frozen lens snapshot must still render inverted cyan!
+        doc.remove_object(bg_id).unwrap();
+        let img = crate::render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+        let px_per_mm = 72.0 / 25.4;
+        let sx = (25.0 * px_per_mm) as usize;
+        let sy = (25.0 * px_per_mm) as usize;
+        let idx = (sy * img.width as usize + sx) * 4;
+        assert!(
+            img.rgba[idx] < 40 && img.rgba[idx + 1] > 200 && img.rgba[idx + 2] > 200,
+            "frozen snapshot must survive backdrop removal: {:?}",
+            &img.rgba[idx..idx + 4]
+        );
+
+        // Text with Invert + remove_face=true should render glyph silhouette, not empty/box
+        let mut doc2 = Document::new_a4("RFText");
+        let bg2 = SceneObject::new(
+            ObjectId(1),
+            "BG2",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 60.0,
+                height: 40.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_fill(Fill::Solid(Color::rgb(1.0, 0.0, 0.0)))
+        .with_transform(Affine2D::translate(5.0, 5.0));
+        doc2.add_object(bg2, None).unwrap();
+
+        let mut txt = SceneObject::new(
+            ObjectId(2),
+            "Txt",
+            NodePayload::ArtisticText(ArtisticText::from_plain(
+                "M",
+                TextStyle {
+                    font_size_pt: 48.0,
+                    ..TextStyle::default()
+                },
+            )),
+        )
+        .with_transform(Affine2D::translate(12.0, 12.0));
+        let mut rf = LensConfig::new(LensKind::Invert);
+        rf.remove_face = true;
+        txt.lens = Some(rf);
+        doc2.add_object(txt, None).unwrap();
+        let img2 = crate::render_page_to_rgba(&doc2, 0, 72.0, ViewMode::Enhanced).unwrap();
+        let cyan_count = img2
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 40 && p[1] > 200 && p[2] > 200)
+            .count();
+        assert!(
+            cyan_count > 10,
+            "text lens over red bg expected cyan pixels, got {cyan_count}"
+        );
+
+        // Shape lens with remove_face=true over colored ArtisticText on white background
+        let mut doc3 = Document::new_a4("RFOverText");
+        let under_txt = SceneObject::new(
+            ObjectId(1),
+            "UnderTxt",
+            NodePayload::ArtisticText(ArtisticText::from_plain(
+                "M",
+                TextStyle {
+                    font_size_pt: 48.0,
+                    fill: Color::rgb(1.0, 0.0, 0.0),
+                    ..TextStyle::default()
+                },
+            )),
+        )
+        .with_transform(Affine2D::translate(15.0, 15.0));
+        doc3.add_object(under_txt, None).unwrap();
+
+        let mut ov_lens = SceneObject::new(
+            ObjectId(2),
+            "OvLens",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 40.0,
+                height: 40.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+        .with_transform(Affine2D::translate(5.0, 5.0));
+        let mut rf2 = LensConfig::new(LensKind::Invert);
+        rf2.remove_face = true;
+        ov_lens.lens = Some(rf2);
+        doc3.add_object(ov_lens, None).unwrap();
+        let img3 = crate::render_page_to_rgba(&doc3, 0, 72.0, ViewMode::Enhanced).unwrap();
+        let cyan3 = img3
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 40 && p[1] > 200 && p[2] > 200)
+            .count();
+        let dark3 = img3
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 40 && p[1] < 40 && p[2] < 40)
+            .count();
+        assert!(
+            cyan3 > 10,
+            "remove_face over ArtisticText must invert glyph ink ({cyan3})"
+        );
+        assert_eq!(
+            dark3, 0,
+            "remove_face must not invert blank white background into black"
+        );
+    }
+
+    #[test]
+    fn remove_face_powerclip_propagates_perspective_deform_frame_to_contents() {
+        use coree_core::{Effect, Fill, OutlineStyle, Perspective3x3};
+
+        for use_effect_persp in [false, true] {
+            let mut doc_no_lens = Document::new_a4("PcNoLens");
+            let mut doc_with_lens = Document::new_a4("PcWithLens");
+
+            for (has_lens, doc) in [(false, &mut doc_no_lens), (true, &mut doc_with_lens)] {
+                let child = SceneObject::new(
+                    ObjectId(1),
+                    "BlueChild",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 60.0,
+                        height: 60.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::Solid(Color::rgb(0.0, 0.0, 1.0)))
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(20.0, 20.0));
+                let child_id = doc.add_object(child, None).unwrap();
+
+                let mut pc_container = SceneObject::new(
+                    ObjectId(2),
+                    "DeformedPowerClip",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 40.0,
+                        height: 40.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(30.0, 30.0));
+                if use_effect_persp {
+                    pc_container.effects.push(Effect::Perspective {
+                        quad: [
+                            Point2D::new(15.0, 0.0),
+                            Point2D::new(25.0, 0.0),
+                            Point2D::new(40.0, 40.0),
+                            Point2D::new(0.0, 40.0),
+                        ],
+                    });
+                } else {
+                    let h = Perspective3x3::from_unit_square_to_quad(&[
+                        Point2D::new(15.0, 0.0),
+                        Point2D::new(25.0, 0.0),
+                        Point2D::new(40.0, 40.0),
+                        Point2D::new(0.0, 40.0),
+                    ])
+                    .map(|u| {
+                        // Compose inverse scale (1/40) to map [0..40]^2 -> [0..1]^2
+                        Perspective3x3 {
+                            m: [
+                                u.m[0] / 40.0,
+                                u.m[1] / 40.0,
+                                u.m[2],
+                                u.m[3] / 40.0,
+                                u.m[4] / 40.0,
+                                u.m[5],
+                                u.m[6] / 40.0,
+                                u.m[7] / 40.0,
+                                u.m[8],
+                            ],
+                        }
+                    })
+                    .unwrap();
+                    pc_container.perspective = Some(h);
+                }
+                let container_id = doc.add_object(pc_container, None).unwrap();
+                let _pc_id = doc.create_powerclip(container_id, &[child_id]).unwrap();
+
+                if has_lens {
+                    let mut lens_obj = SceneObject::new(
+                        ObjectId(3),
+                        "RemoveFaceInvert",
+                        NodePayload::Shape(ParametricShape::Rectangle {
+                            width: 120.0,
+                            height: 120.0,
+                            corner_radii: [0.0; 4],
+                            corner_style: CornerStyle::Rounded,
+                            lock_corners: true,
+                        }),
+                    )
+                    .with_outline(OutlineStyle::none());
+                    let mut lc = LensConfig::new(LensKind::Invert);
+                    lc.remove_face = true;
+                    lens_obj.lens = Some(lc);
+                    doc.add_object(lens_obj, None).unwrap();
+                }
+            }
+
+            let base_img =
+                crate::render_page_to_rgba(&doc_no_lens, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let lens_img =
+                crate::render_page_to_rgba(&doc_with_lens, 0, 72.0, ViewMode::Enhanced).unwrap();
+            assert_eq!(base_img.rgba.len(), lens_img.rgba.len());
+
+            let mut false_inv_of_white = 0usize;
+            let mut missed_inv_of_blue = 0usize;
+            let mut inverted_blue_count = 0usize;
+            for (bp, lp) in base_img
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(lens_img.rgba.as_chunks::<4>().0.iter())
+            {
+                let is_white_bg = bp[0] >= 250 && bp[1] >= 250 && bp[2] >= 250;
+                let is_blue_interior = bp[0] < 10 && bp[1] < 10 && bp[2] > 245;
+                let inverted_to_dark = lp[0] < 40 && lp[1] < 40 && lp[2] < 40;
+                let inverted_to_yellow = lp[0] > 200 && lp[1] > 200 && lp[2] < 60;
+                if is_white_bg && inverted_to_dark {
+                    false_inv_of_white += 1;
+                }
+                if is_blue_interior {
+                    if inverted_to_yellow {
+                        inverted_blue_count += 1;
+                    } else {
+                        missed_inv_of_blue += 1;
+                    }
+                }
+            }
+            assert!(
+                inverted_blue_count > 100,
+                "use_effect_persp={use_effect_persp}: expected >100 inverted yellow interior pixels, got {inverted_blue_count}"
+            );
+            assert_eq!(
+                false_inv_of_white, 0,
+                "use_effect_persp={use_effect_persp}: remove_face falsely inverted {false_inv_of_white} white background pixels"
+            );
+            assert_eq!(
+                missed_inv_of_blue, 0,
+                "use_effect_persp={use_effect_persp}: remove_face missed {missed_inv_of_blue} blue PowerClip interior pixels"
+            );
+        }
+    }
+
+    fn build_wide_gamut_rgb_icc_v2() -> Vec<u8> {
+        let mut tags: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        let xyz_tag = |xyz: [f64; 3]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(20);
+            v.extend_from_slice(b"XYZ ");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            for c in xyz {
+                v.extend_from_slice(&((c * 65536.0).round() as i32).to_be_bytes());
+            }
+            v
+        };
+        let curv_gamma = |gamma: f64| -> Vec<u8> {
+            let mut v = Vec::with_capacity(14);
+            v.extend_from_slice(b"curv");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&((gamma * 256.0).round() as u16).to_be_bytes());
+            v
+        };
+        let mut desc = Vec::new();
+        let label = b"WideGamutAdobeRenderTest";
+        desc.extend_from_slice(b"desc");
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&((label.len() + 1) as u32).to_be_bytes());
+        desc.extend_from_slice(label);
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.push(0);
+        desc.resize(desc.len() + 67, 0);
+
+        tags.push((b"desc", desc));
+        tags.push((b"wtpt", xyz_tag([0.95047, 1.0, 1.08883])));
+        // Adobe RGB (1998) D50-adapted column primaries
+        tags.push((b"rXYZ", xyz_tag([0.60974, 0.31111, 0.01947])));
+        tags.push((b"gXYZ", xyz_tag([0.20528, 0.62567, 0.06087])));
+        tags.push((b"bXYZ", xyz_tag([0.14919, 0.06322, 0.74457])));
+        tags.push((b"rTRC", curv_gamma(2.19921875)));
+        tags.push((b"gTRC", curv_gamma(2.19921875)));
+        tags.push((b"bTRC", curv_gamma(2.19921875)));
+
+        let header_size = 128usize;
+        let tag_table_size = 4 + tags.len() * 12;
+        let mut data_offset = (header_size + tag_table_size + 3) & !3;
+        let mut table = Vec::with_capacity(tag_table_size);
+        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let mut body = Vec::new();
+        for (sig, payload) in &tags {
+            let aligned_off = data_offset + body.len();
+            table.extend_from_slice(*sig);
+            table.extend_from_slice(&(aligned_off as u32).to_be_bytes());
+            table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        data_offset = (header_size + table.len() + 3) & !3;
+        let total_size = data_offset + body.len();
+        let mut out = vec![0u8; 128];
+        out[0..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[4..8].copy_from_slice(b"core");
+        out[8] = 2;
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"RGB ");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&((0.9642_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[72..76].copy_from_slice(&((1.0_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[76..80].copy_from_slice(&((0.8249_f64 * 65536.0).round() as i32).to_be_bytes());
+        out.extend_from_slice(&table);
+        out.resize(data_offset, 0);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn color_lenses_do_not_double_convert_srgb_backdrop_with_wide_gamut_rgb_profile() {
+        use coree_core::{
+            generate_minimal_cmyk_icc_v2, BuiltinIccProfile, ColorMapMode, CornerStyle,
+            OutlineStyle, ParametricShape, RenderingIntent,
+        };
+
+        let sample_px = |buf: &crate::RenderedImage, x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px_per_mm = 72.0 / MM_PER_INCH;
+            let sx = (x_mm * px_per_mm) as usize;
+            let sy = (y_mm * px_per_mm) as usize;
+            let idx = (sy * buf.width as usize + sx) * 4;
+            [
+                buf.rgba[idx],
+                buf.rgba[idx + 1],
+                buf.rgba[idx + 2],
+                buf.rgba[idx + 3],
+            ]
+        };
+
+        let run_case = |rgb_icc: Vec<u8>, cmyk_icc: Vec<u8>, label: &str| {
+            let mut doc = Document::new_a4(label);
+            doc.set_rendering_intent(RenderingIntent::RelativeColorimetric);
+            doc.set_black_point_compensation(true);
+            doc.set_rgb_icc_profile(rgb_icc).unwrap();
+            doc.set_cmyk_icc_profile(cmyk_icc).unwrap();
+
+            let cmyk_rect = SceneObject::new(
+                ObjectId(1),
+                "CMYK_BG",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 140.0,
+                    height: 50.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(0.7, 0.2, 0.1, 0.1)))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(10.0, 10.0));
+            doc.add_object(cmyk_rect, None).unwrap();
+
+            let rgb_rect = SceneObject::new(
+                ObjectId(2),
+                "RGB_BG",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 140.0,
+                    height: 50.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::rgb(0.8, 0.3, 0.2)))
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(10.0, 70.0));
+            doc.add_object(rgb_rect, None).unwrap();
+
+            let add_lens_strip = |doc: &mut Document, id: u64, x_mm: f64, kind: LensKind| {
+                let mut l = SceneObject::new(
+                    ObjectId(id),
+                    "Lens",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 20.0,
+                        height: 110.0,
+                        corner_radii: [0.0; 4],
+                        corner_style: CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_outline(OutlineStyle::none())
+                .with_transform(Affine2D::translate(x_mm, 10.0));
+                l.lens = Some(LensConfig::new(kind));
+                doc.add_object(l, None).unwrap();
+            };
+
+            // x=15..25: unlensed reference
+            // x=30..50: Brighten(0%)
+            add_lens_strip(&mut doc, 3, 30.0, LensKind::Brighten { rate_pct: 0.0 });
+            // x=55..75: ColorAdd(0%)
+            add_lens_strip(
+                &mut doc,
+                4,
+                55.0,
+                LensKind::ColorAdd {
+                    color: Color::rgb(1.0, 0.0, 0.0),
+                    rate_pct: 0.0,
+                },
+            );
+            // x=80..100: Transparency(0%)
+            add_lens_strip(
+                &mut doc,
+                5,
+                80.0,
+                LensKind::Transparency {
+                    color: Color::rgb(0.0, 0.0, 1.0),
+                    rate_pct: 0.0,
+                },
+            );
+            // x=105..125: ColorAdd(CMYK(0.1, 0.8, 0.2, 0.0), 50%)
+            let lens_cmyk = Color::cmyk(0.1, 0.8, 0.2, 0.0);
+            add_lens_strip(
+                &mut doc,
+                6,
+                105.0,
+                LensKind::ColorAdd {
+                    color: lens_cmyk.clone(),
+                    rate_pct: 50.0,
+                },
+            );
+            // x=130..148: Transparency(CMYK(0.1, 0.8, 0.2, 0.0), 50%)
+            add_lens_strip(
+                &mut doc,
+                7,
+                130.0,
+                LensKind::Transparency {
+                    color: lens_cmyk.clone(),
+                    rate_pct: 50.0,
+                },
+            );
+
+            let img = crate::render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let icc = doc.icc_pipeline();
+
+            for (row_name, y_mm) in [("CMYK", 35.0), ("RGB", 95.0)] {
+                let unlensed = sample_px(&img, 20.0, y_mm);
+                let bright0 = sample_px(&img, 40.0, y_mm);
+                let add0 = sample_px(&img, 65.0, y_mm);
+                let transp0 = sample_px(&img, 90.0, y_mm);
+                assert_eq!(
+                    bright0, unlensed,
+                    "{label}/{row_name}: Brighten(0%) drifted: {bright0:?} vs {unlensed:?}"
+                );
+                assert_eq!(
+                    add0, unlensed,
+                    "{label}/{row_name}: ColorAdd(0%) drifted: {add0:?} vs {unlensed:?}"
+                );
+                assert_eq!(
+                    transp0, unlensed,
+                    "{label}/{row_name}: Transparency(0%) drifted: {transp0:?} vs {unlensed:?}"
+                );
+
+                // Also verify active ColorAdd/Transparency convert lens-owned CMYK via `icc`
+                let lens_srgb = lens_cmyk.to_rgba_f32_icc(&icc);
+                let base_f = [
+                    f32::from(unlensed[0]) / 255.0,
+                    f32::from(unlensed[1]) / 255.0,
+                    f32::from(unlensed[2]) / 255.0,
+                ];
+                let exp_add = [
+                    ((base_f[0] + lens_srgb[0] * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ((base_f[1] + lens_srgb[1] * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ((base_f[2] + lens_srgb[2] * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    255,
+                ];
+                let exp_transp = [
+                    ((base_f[0] + (lens_srgb[0] - base_f[0]) * 0.5).clamp(0.0, 1.0) * 255.0).round()
+                        as u8,
+                    ((base_f[1] + (lens_srgb[1] - base_f[1]) * 0.5).clamp(0.0, 1.0) * 255.0).round()
+                        as u8,
+                    ((base_f[2] + (lens_srgb[2] - base_f[2]) * 0.5).clamp(0.0, 1.0) * 255.0).round()
+                        as u8,
+                    255,
+                ];
+                let add50 = sample_px(&img, 115.0, y_mm);
+                let transp50 = sample_px(&img, 140.0, y_mm);
+                for c in 0..4 {
+                    assert!(
+                        add50[c].abs_diff(exp_add[c]) <= 1,
+                        "{label}/{row_name}: ColorAdd(50%) channel {c}: {add50:?} vs {exp_add:?}"
+                    );
+                    assert!(
+                        transp50[c].abs_diff(exp_transp[c]) <= 1,
+                        "{label}/{row_name}: Transparency(50%) channel {c}: {transp50:?} vs {exp_transp:?}"
+                    );
+                }
+            }
+
+            // Also verify TintedGrayscale, ColorLimit, CustomColorMap, and Wireframe
+            // convert their own lens-owned Color parameters through `icc`.
+            let mut doc2 = Document::new_a4("LensParamIcc");
+            doc2.set_rendering_intent(RenderingIntent::RelativeColorimetric);
+            doc2.set_black_point_compensation(true);
+            let _ = doc2.set_rgb_icc_profile(doc.rgb_icc_profile().unwrap().to_vec());
+            let _ = doc2.set_cmyk_icc_profile(doc.cmyk_icc_profile().unwrap().to_vec());
+            let bg2 = SceneObject::new(
+                ObjectId(1),
+                "GrayBg",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(0.0, 0.0, 0.0, 1.0)))
+            .with_outline(OutlineStyle::none());
+            doc2.add_object(bg2, None).unwrap();
+
+            let mut tint_lens = SceneObject::new(
+                ObjectId(2),
+                "TintLens",
+                NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 40.0,
+                    height: 40.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_outline(OutlineStyle::none());
+            let cmyk_red = Color::cmyk(0.0, 0.9, 0.9, 0.0);
+            tint_lens.lens = Some(LensConfig::new(LensKind::CustomColorMap {
+                from_color: cmyk_red.clone(),
+                to_color: cmyk_red.clone(),
+                palette_mode: ColorMapMode::Direct,
+            }));
+            doc2.add_object(tint_lens, None).unwrap();
+            let img2 = crate::render_page_to_rgba(&doc2, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let px2 = sample_px(&img2, 20.0, 20.0);
+            let exp_cmyk_red = cmyk_red.to_rgba8_icc(&doc2.icc_pipeline());
+            for c in 0..4 {
+                assert!(
+                    px2[c].abs_diff(exp_cmyk_red[c]) <= 1,
+                    "{label}: CustomColorMap CMYK param mismatch: {px2:?} vs {exp_cmyk_red:?}"
+                );
+            }
+
+            // Also verify TintedGrayscale, ColorLimit, and Wireframe convert their Color params via `icc`
+            coree_core::apply_command(
+                &mut doc2,
+                &CommandOp::SetLens {
+                    ids: vec![ObjectId(2)],
+                    lens: Some(LensConfig::new(LensKind::TintedGrayscale {
+                        tint: cmyk_red.clone(),
+                    })),
+                },
+            )
+            .unwrap();
+            let img_tint = crate::render_page_to_rgba(&doc2, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let px_tint = sample_px(&img_tint, 20.0, 20.0);
+            let bg_k_srgb = Color::cmyk(0.0, 0.0, 0.0, 1.0).to_rgba_f32_icc(&doc2.icc_pipeline());
+            let k_lum = (0.2126 * bg_k_srgb[0] + 0.7152 * bg_k_srgb[1] + 0.0722 * bg_k_srgb[2])
+                .clamp(0.0, 1.0);
+            let red_f = cmyk_red.to_rgba_f32_icc(&doc2.icc_pipeline());
+            let exp_tint = [
+                ((red_f[0] + (1.0 - red_f[0]) * k_lum) * 255.0).round() as u8,
+                ((red_f[1] + (1.0 - red_f[1]) * k_lum) * 255.0).round() as u8,
+                ((red_f[2] + (1.0 - red_f[2]) * k_lum) * 255.0).round() as u8,
+                255,
+            ];
+            for c in 0..4 {
+                assert!(
+                    px_tint[c].abs_diff(exp_tint[c]) <= 1,
+                    "{label}: TintedGrayscale CMYK param mismatch: {px_tint:?} vs {exp_tint:?}"
+                );
+            }
+
+            coree_core::apply_command(
+                &mut doc2,
+                &CommandOp::SetLens {
+                    ids: vec![ObjectId(2)],
+                    lens: Some(LensConfig::new(LensKind::ColorLimit {
+                        color: cmyk_red.clone(),
+                        rate_pct: 100.0,
+                    })),
+                },
+            )
+            .unwrap();
+            let img_lim = crate::render_page_to_rgba(&doc2, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let px_lim = sample_px(&img_lim, 20.0, 20.0);
+            let exp_lim = [
+                ((bg_k_srgb[0] * red_f[0]) * 255.0).round() as u8,
+                ((bg_k_srgb[1] * red_f[1]) * 255.0).round() as u8,
+                ((bg_k_srgb[2] * red_f[2]) * 255.0).round() as u8,
+                255,
+            ];
+            for c in 0..4 {
+                assert!(
+                    px_lim[c].abs_diff(exp_lim[c]) <= 1,
+                    "{label}: ColorLimit CMYK param mismatch: {px_lim:?} vs {exp_lim:?}"
+                );
+            }
+
+            coree_core::apply_command(
+                &mut doc2,
+                &CommandOp::SetLens {
+                    ids: vec![ObjectId(2)],
+                    lens: Some(LensConfig::new(LensKind::Wireframe {
+                        override_outline: Some(Color::cmyk(1.0, 0.0, 0.0, 0.0)),
+                        override_fill: Some(cmyk_red.clone()),
+                    })),
+                },
+            )
+            .unwrap();
+            let img_wire = crate::render_page_to_rgba(&doc2, 0, 72.0, ViewMode::Enhanced).unwrap();
+            let px_wire = sample_px(&img_wire, 20.0, 20.0);
+            for c in 0..4 {
+                assert!(
+                    px_wire[c].abs_diff(exp_cmyk_red[c]) <= 1,
+                    "{label}: Wireframe override_fill CMYK param mismatch: {px_wire:?} vs {exp_cmyk_red:?}"
+                );
+            }
+        };
+
+        // 1. Always-available offline wide-gamut RGB + CMYK ICC v2 profiles
+        run_case(
+            build_wide_gamut_rgb_icc_v2(),
+            generate_minimal_cmyk_icc_v2("TestISO", BuiltinIccProfile::IsoCoatedV2Cmyk),
+            "OfflineWideGamut",
+        );
+
+        // 2. Real system colord AdobeRGB1998 + FOGRA39 profiles when installed
+        if let (Ok(adobe), Ok(fogra)) = (
+            std::fs::read("/usr/share/color/icc/colord/AdobeRGB1998.icc"),
+            std::fs::read("/usr/share/color/icc/colord/FOGRA39L_coated.icc"),
+        ) {
+            run_case(adobe, fogra, "SystemAdobeRGB_FOGRA39");
+        }
+    }
 }

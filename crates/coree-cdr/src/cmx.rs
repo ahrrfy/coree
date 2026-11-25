@@ -1362,7 +1362,8 @@ impl CmxWriteTables {
         if self.images.len() >= MAX_CMX_TABLE_ENTRIES {
             return Err(CdrError::ArithmeticOverflow("CMX rimg table overflow"));
         }
-        let dib = encode_dib_rgba(asset.width, asset.height, &asset.rgba_bytes)?;
+        let rgba = asset.to_rgba8_vec();
+        let dib = encode_dib_rgba(asset.width, asset.height, &rgba)?;
         let dpi_x100 = (sanitize_f32(asset.source_dpi, 300.0).max(1.0) * 100.0).round() as u32;
         let idx = self.images.len() as u16;
         self.images.push((dpi_x100, asset.color_mode, dib));
@@ -2442,6 +2443,7 @@ mod tests {
             frozen: false,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         tbl.outline.end_arrow = ArrowheadStyle::Stealth;
         let oid1 = doc.add_object(tbl, Some(lid)).unwrap();
@@ -2603,6 +2605,7 @@ mod tests {
             frozen: false,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         doc.add_object(grp, Some(lid)).unwrap();
 
@@ -2694,6 +2697,7 @@ mod tests {
             steps: 5,
             rotation_deg: 15.0,
             along_path: Some(path_oid),
+            rotate_along_path: true,
         });
         doc.add_object(src, Some(lid)).unwrap();
 
@@ -2816,6 +2820,7 @@ mod tests {
             steps: 3,
             rotation_deg: 0.0,
             along_path: None,
+            rotate_along_path: true,
         });
         let inner_p2 = doc.insert_loaded_object(inner_p2_obj).unwrap();
         let inner_top = doc
@@ -2933,6 +2938,7 @@ mod tests {
                 steps: 3,
                 rotation_deg: 0.0,
                 along_path: None,
+                rotate_along_path: true,
             })
         );
         match &rt.object(new_top).unwrap().payload {

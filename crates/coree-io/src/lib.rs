@@ -108,11 +108,20 @@ pub(crate) fn resolve_export_world_path(
                 coree_core::NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
-            let warped = if let Some(persp) = sub.perspective {
+            let mut warped = if let Some(persp) = sub.perspective {
                 persp.transform_bezier_path(&local)
             } else {
                 local
             };
+            for eff in &sub.effects {
+                if let coree_core::Effect::Perspective { quad } = eff {
+                    if let Some(bb) = warped.bounding_box() {
+                        if let Some(h) = coree_core::Perspective3x3::from_rect_to_quad(bb, quad) {
+                            warped = h.transform_bezier_path(&warped);
+                        }
+                    }
+                }
+            }
             return Some(warped.transformed(&p_xf));
         }
     }

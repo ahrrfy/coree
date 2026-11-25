@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Current local SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Exact offline-first SQLite DDL from `replica/schema.sql` (all 10 tables,
 /// CHECK constraints, foreign keys, and indexes).
@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS font_index (
     is_variable         INTEGER NOT NULL DEFAULT 0 CHECK (is_variable IN (0, 1)),
     supports_arabic_rtl INTEGER NOT NULL DEFAULT 0 CHECK (supports_arabic_rtl IN (0, 1)),
     supports_kashida    INTEGER NOT NULL DEFAULT 0 CHECK (supports_kashida IN (0, 1)),
+    panose_hex          TEXT NOT NULL DEFAULT '00000000000000000000',
     collection_tag      TEXT NOT NULL DEFAULT 'system',
     favorite            INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1)),
     file_mtime_epoch    INTEGER NOT NULL DEFAULT 0,
@@ -236,6 +237,14 @@ CREATE TABLE IF NOT EXISTS app_preferences (
 
 CREATE INDEX IF NOT EXISTS idx_app_preferences_category
     ON app_preferences (category);
+
+-- 11. User-confirmed PANOSE font substitution overrides (REQ-07)
+CREATE TABLE IF NOT EXISTS font_substitutions (
+    missing_family    TEXT PRIMARY KEY NOT NULL,
+    substitute_family TEXT NOT NULL,
+    panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
 "#;
 
 /// Local offline SQLite storage handle for `coree`.
@@ -546,8 +555,33 @@ pub(crate) fn configure_and_migrate(conn: &Connection, enable_wal: bool) -> Stor
         |row| row.get(0),
     )?;
 
-    if current < SCHEMA_VERSION {
+    if current == 0 {
         conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version) VALUES (?1)",
+            [SCHEMA_VERSION],
+        )?;
+    } else if current < SCHEMA_VERSION {
+        if current < 2 {
+            let mut stmt = conn.prepare("PRAGMA table_info(font_index)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            if !cols.iter().any(|c| c == "panose_hex") {
+                conn.execute_batch(
+                    "ALTER TABLE font_index ADD COLUMN panose_hex TEXT NOT NULL DEFAULT '00000000000000000000';",
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS font_substitutions (
+                     missing_family    TEXT PRIMARY KEY NOT NULL,
+                     substitute_family TEXT NOT NULL,
+                     panose_hex        TEXT NOT NULL DEFAULT '00000000000000000000',
+                     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );",
+            )?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO schema_migrations (version) VALUES (?1)",
             [SCHEMA_VERSION],

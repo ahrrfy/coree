@@ -1231,7 +1231,9 @@ fn emit_pdf_object(
             }
             NodePayload::ParagraphText(para) => {
                 if parent_persp.is_some() || obj.perspective.is_some() {
-                    let pieces = emit.text_engine.layout_paragraph_pieces(para);
+                    let pieces = emit
+                        .text_engine
+                        .layout_paragraph_in_doc(ctx.doc, obj.id, para);
                     for piece in &pieces {
                         let bp = if let Some(persp) = obj.perspective {
                             persp.transform_bezier_path(&piece.path)
@@ -1256,6 +1258,7 @@ fn emit_pdf_object(
                 } else {
                     emit_pdf_paragraph_text(
                         ctx,
+                        obj.id,
                         para,
                         &obj.outline,
                         &obj.effects,
@@ -1988,6 +1991,7 @@ fn emit_pdf_artistic_text(
 #[allow(clippy::too_many_arguments)]
 fn emit_pdf_paragraph_text(
     ctx: &PageRenderCtx<'_>,
+    obj_id: ObjectId,
     para: &coree_core::ParagraphText,
     outline: &OutlineStyle,
     effects: &[Effect],
@@ -1997,7 +2001,9 @@ fn emit_pdf_paragraph_text(
     emit: &mut PdfPageEmit<'_>,
     out: &mut String,
 ) {
-    let pieces = emit.text_engine.layout_paragraph_pieces(para);
+    let pieces = emit
+        .text_engine
+        .layout_paragraph_in_doc(ctx.doc, obj_id, para);
     if has_geometry_effect(effects) {
         let deformed_pieces: Vec<_> = pieces
             .into_iter()
@@ -2477,13 +2483,8 @@ fn add_raster_xobject(
     asset: &coree_core::RasterAsset,
     use_cmyk: bool,
 ) -> IoResult<usize> {
-    add_rgba_bytes_xobject(
-        store,
-        asset.width,
-        asset.height,
-        &asset.rgba_bytes,
-        use_cmyk,
-    )
+    let rgba8 = asset.to_rgba8_vec();
+    add_rgba_bytes_xobject(store, asset.width, asset.height, &rgba8, use_cmyk)
 }
 
 fn add_rgba_bytes_xobject(

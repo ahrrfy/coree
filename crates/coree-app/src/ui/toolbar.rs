@@ -280,6 +280,14 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                 metadata: None,
                                 custom_icc_profile: None,
                                 clear_custom_icc: false,
+                                rgb_icc_profile: None,
+                                clear_rgb_icc: false,
+                                cmyk_icc_profile: None,
+                                clear_cmyk_icc: false,
+                                gray_icc_profile: None,
+                                clear_gray_icc: false,
+                                rendering_intent: None,
+                                black_point_compensation: None,
                             });
                         }
                         if let Some(config) = pending_grid {
@@ -785,6 +793,40 @@ fn show_interactive_effect_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens
             .strong(),
     );
 
+    let (copy_target_id, envelope_sources): (
+        Option<coree_core::ObjectId>,
+        Vec<(coree_core::ObjectId, String)>,
+    ) = if app.active_tool == ToolId::Envelope {
+        if let Some(tab) = app.active_tab() {
+            let target = tab.selection.objects.first().copied();
+            let mut srcs = Vec::new();
+            if let Some(page) = tab.document.active_page() {
+                for layer in &page.layers {
+                    for &oid in &layer.objects {
+                        if Some(oid) == target {
+                            continue;
+                        }
+                        if let Some(obj) = tab.document.object(oid) {
+                            if obj
+                                .effects
+                                .iter()
+                                .any(|e| matches!(e, coree_core::Effect::Envelope { .. }))
+                            {
+                                srcs.push((oid, format!("{} (#{})", obj.name, oid.0)));
+                            }
+                        }
+                    }
+                }
+            }
+            (target, srcs)
+        } else {
+            (None, Vec::new())
+        }
+    } else {
+        (None, Vec::new())
+    };
+    let mut copy_envelope_from: Option<coree_core::ObjectId> = None;
+
     let es = &mut app.effects_state;
     match app.active_tool {
         ToolId::DropShadow => {
@@ -869,6 +911,39 @@ fn show_interactive_effect_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens
             ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::Straight, "Straight");
             ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::SingleArc, "Single Arc");
             ui.selectable_value(&mut es.envelope_mode, EnvelopeMode::DoubleArc, "Double Arc");
+            ui.selectable_value(
+                &mut es.envelope_mode,
+                EnvelopeMode::Unconstrained,
+                "Unconstrained",
+            );
+            if copy_target_id.is_some() && !envelope_sources.is_empty() {
+                if es
+                    .copy_envelope_source
+                    .is_none_or(|s| !envelope_sources.iter().any(|(id, _)| *id == s))
+                {
+                    es.copy_envelope_source = envelope_sources.first().map(|(id, _)| *id);
+                }
+                let sel_label = es
+                    .copy_envelope_source
+                    .and_then(|s| {
+                        envelope_sources
+                            .iter()
+                            .find(|(id, _)| *id == s)
+                            .map(|(_, n)| n.as_str())
+                    })
+                    .unwrap_or("Source");
+                ComboBox::from_id_salt("prop_copy_env_src")
+                    .width(120.0)
+                    .selected_text(sel_label)
+                    .show_ui(ui, |ui| {
+                        for (oid, label) in &envelope_sources {
+                            ui.selectable_value(&mut es.copy_envelope_source, Some(*oid), label);
+                        }
+                    });
+                if ui.small_button("Copy Envelope").clicked() {
+                    copy_envelope_from = es.copy_envelope_source;
+                }
+            }
         }
         ToolId::Extrude25D => {
             ui.add(
@@ -902,6 +977,10 @@ fn show_interactive_effect_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens
                 });
         }
         _ => {}
+    }
+
+    if let (Some(dst), Some(src)) = (copy_target_id, copy_envelope_from) {
+        app.copy_envelope_from_object(dst, src);
     }
 
     if ui.small_button("Apply Effect").clicked() {
@@ -941,6 +1020,38 @@ fn show_fill_tool_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &ThemeT
                     app.properties_state.mesh_cols,
                 );
                 app.apply_fill(fill);
+            }
+            let selected_mesh_info = app.active_tab().and_then(|tab| {
+                let (oid, n_idx) = tab.selected_mesh_node?;
+                let obj = tab.document.object(oid)?;
+                if let Fill::MeshFill { nodes, .. } = &obj.fill {
+                    nodes
+                        .get(n_idx)
+                        .map(|n| (oid, n_idx, obj.fill.clone(), n.alpha))
+                } else {
+                    None
+                }
+            });
+            if let Some((oid, n_idx, mut mesh_fill, mut node_alpha)) = selected_mesh_info {
+                if ui
+                    .add(
+                        DragValue::new(&mut node_alpha)
+                            .range(0.0..=1.0)
+                            .speed(0.02)
+                            .prefix("Node Alpha: "),
+                    )
+                    .changed()
+                {
+                    if let Fill::MeshFill { ref mut nodes, .. } = mesh_fill {
+                        if let Some(node) = nodes.get_mut(n_idx) {
+                            node.alpha = node_alpha.clamp(0.0, 1.0);
+                        }
+                    }
+                    let _ = app.execute_command(CommandOp::SetFill {
+                        ids: vec![oid],
+                        fill: mesh_fill,
+                    });
+                }
             }
         }
         ToolId::InteractiveFill => {
@@ -1560,6 +1671,14 @@ fn show_page_defaults_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &Th
                 metadata: None,
                 custom_icc_profile: None,
                 clear_custom_icc: false,
+                rgb_icc_profile: None,
+                clear_rgb_icc: false,
+                cmyk_icc_profile: None,
+                clear_cmyk_icc: false,
+                gray_icc_profile: None,
+                clear_gray_icc: false,
+                rendering_intent: None,
+                black_point_compensation: None,
             });
         }
         ui.separator();

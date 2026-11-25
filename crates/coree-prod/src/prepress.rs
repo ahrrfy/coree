@@ -856,14 +856,9 @@ fn paint_raster_object(
             let v = ((local.y / raster.height_mm) * f64::from(asset.height))
                 .floor()
                 .clamp(0.0, f64::from(asset.height - 1)) as usize;
-            let offset = (v * (asset.width as usize) + u) * 4;
-            if offset + 3 >= asset.rgba_bytes.len() {
+            let Some([r, g, b, a]) = asset.read_pixel_rgba8(u as u32, v as u32) else {
                 continue;
-            }
-            let r = asset.rgba_bytes[offset];
-            let g = asset.rgba_bytes[offset + 1];
-            let b = asset.rgba_bytes[offset + 2];
-            let a = asset.rgba_bytes[offset + 3];
+            };
             if a == 0 {
                 continue;
             }

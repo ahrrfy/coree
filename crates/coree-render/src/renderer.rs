@@ -19,16 +19,30 @@ use crate::effects_render::{
 use crate::hit_test::resolve_connector_endpoints_with_sym;
 use crate::lens_render::{render_lens_object_with_backdrop, BackdropItem, FrozenLensSnapshot};
 use crate::raster_engine::apply_raster_filters;
-use crate::text_layout::{draw_text_pieces, ShapedGlyphDraw, TextEngine};
+use crate::text_layout::{draw_text_pieces_icc, ShapedGlyphDraw, TextEngine};
 use crate::viewport::{ViewMode, Viewport};
 use coree_core::math::{sanitize_f32, sanitize_f64};
 use coree_core::{
     Affine2D, ArrowheadStyle, ArtisticText, BezierPath, BlendMode, BuiltinIccProfile, Color,
-    DimensionKind, DimensionObject, Document, Effect, Fill, GuideOrientation, IccProfile, Layer,
-    MasterLayerScope, MeshNode, NodePayload, ObjectId, OutlineStyle, Page, Perspective3x3,
-    PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D, RenderingIntent, SceneObject,
-    SoftProofLut3D, SpatialIndex, Subpath, SymbolDef, SymbolId, Vec2D, VectorTable,
+    DimensionKind, DimensionObject, Document, Effect, Fill, GradientStop, GuideOrientation,
+    IccColorPipeline, IccProfile, Layer, MasterLayerScope, MeshNode, NodePayload, ObjectId,
+    OutlineStyle, Page, Perspective3x3, PerspectiveGridMode, Point2D, PostScriptFillPreset, Rect2D,
+    RenderingIntent, SceneObject, SoftProofLut3D, SpatialIndex, Subpath, SymbolDef, SymbolId,
+    Vec2D, VectorTable,
 };
+
+#[inline]
+pub(crate) fn icc_srgb(color: &Color, icc: &IccColorPipeline) -> Color {
+    let [r, g, b, a] = color.to_rgba_f32_icc(icc);
+    Color::rgba(r, g, b, a)
+}
+
+#[inline]
+fn icc_outline(outline: &OutlineStyle, icc: &IccColorPipeline) -> OutlineStyle {
+    let mut out = outline.clone();
+    out.color = icc_srgb(&outline.color, icc);
+    out
+}
 use std::collections::{HashMap, HashSet};
 
 /// Maximum scene recursion depth matching `coree-core`.
@@ -148,11 +162,20 @@ fn resolve_sym_world_path(
                 NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
-            let warped = if let Some(persp) = sub.perspective {
+            let mut warped = if let Some(persp) = sub.perspective {
                 persp.transform_bezier_path(&local)
             } else {
                 local
             };
+            for eff in &sub.effects {
+                if let Effect::Perspective { quad } = eff {
+                    if let Some(bb) = warped.bounding_box() {
+                        if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
+                            warped = h.transform_bezier_path(&warped);
+                        }
+                    }
+                }
+            }
             return Some(warped.transformed(&p_xf));
         }
     }
@@ -338,6 +361,7 @@ pub struct SceneRenderer {
         RenderingIntent,
         SoftProofLut3D,
     )>,
+    pub(crate) active_icc: IccColorPipeline,
     pub(crate) force_offscreen_lens_backdrop: bool,
     pub(crate) parent_xf_override: Option<(ObjectId, Affine2D)>,
     pub(crate) frozen_scope_stack: Vec<u64>,
@@ -359,6 +383,7 @@ impl SceneRenderer {
             text_engine: TextEngine::new(),
             frozen_lenses: HashMap::new(),
             soft_proof_cache: None,
+            active_icc: IccColorPipeline::default(),
             force_offscreen_lens_backdrop: false,
             parent_xf_override: None,
             frozen_scope_stack: Vec::new(),
@@ -369,6 +394,7 @@ impl SceneRenderer {
 
     pub(crate) fn copy_frozen_lenses_from(&mut self, other: &Self) {
         self.frozen_lenses = other.frozen_lenses.clone();
+        self.active_icc = other.active_icc.clone();
         self.force_offscreen_lens_backdrop = other.force_offscreen_lens_backdrop;
         self.parent_xf_override = other.parent_xf_override;
     }
@@ -487,10 +513,17 @@ impl SceneRenderer {
                     branch_idx as u64,
                 ]);
             }
-            if obj.lens.as_ref().is_some_and(|l| l.frozen)
+            if obj
+                .lens
+                .as_ref()
+                .is_some_and(|l| l.frozen && l.frozen_snapshot.is_none())
                 && matches!(
                     obj.payload,
-                    NodePayload::Path(_) | NodePayload::Shape(_) | NodePayload::PowerClip { .. }
+                    NodePayload::Path(_)
+                        | NodePayload::Shape(_)
+                        | NodePayload::BSpline(_)
+                        | NodePayload::ArtisticMedia { .. }
+                        | NodePayload::PowerClip { .. }
                 )
             {
                 let key = FrozenLensKey {
@@ -736,8 +769,9 @@ impl SceneRenderer {
         cull_world_rect: Option<Rect2D>,
         page_spatial_indices: Option<&HashMap<usize, SpatialIndex>>,
     ) {
+        self.active_icc = doc.icc_pipeline();
         backend.set_flatten_tolerance(viewport.lod_flatten_tolerance_mm());
-        backend.clear(options.canvas_bg.clone());
+        backend.clear(icc_srgb(&options.canvas_bg, &self.active_icc));
 
         let multipage = viewport.multipage_view || doc.multipage_view();
         let layouts = compute_page_layouts(doc, multipage, options.multipage_gap_mm);
@@ -751,7 +785,14 @@ impl SceneRenderer {
                 .compose(&Affine2D::translate(layout.origin_mm.x, layout.origin_mm.y));
 
             // 1. Page drop shadow & paper surface
-            render_page_surface(page, page_to_surface, px_per_mm, options, backend);
+            render_page_surface(
+                page,
+                page_to_surface,
+                px_per_mm,
+                options,
+                &self.active_icc,
+                backend,
+            );
 
             // 2. Collect ordered layers: applicable master layers + page's own layers
             let layers = collect_effective_layers(doc, layout.page_index);
@@ -824,7 +865,7 @@ impl SceneRenderer {
             let mut buf = backend.snapshot_rgba();
             if !buf.is_empty() {
                 let lut = self.get_or_build_soft_proof_lut(
-                    doc.custom_icc_profile(),
+                    doc.cmyk_icc_profile().or(doc.custom_icc_profile()),
                     options.proof_profile,
                     options.proof_intent,
                 );
@@ -866,6 +907,7 @@ impl SceneRenderer {
         options: &RenderOptions,
         backend: &mut dyn CanvasBackend,
     ) {
+        self.active_icc = doc.icc_pipeline();
         let xf = viewport.world_to_screen_transform();
         let parent_world = doc
             .parent_container_of(obj_id)
@@ -1308,20 +1350,7 @@ impl SceneRenderer {
             )
             .transformed(&obj_to_screen)
             .bounding_box(),
-            NodePayload::Clone { .. } => {
-                doc.resolve_clone_payload_and_style(obj)
-                    .and_then(|(p, f, o)| {
-                        let mut tmp = obj.clone();
-                        tmp.payload = p;
-                        tmp.fill = f;
-                        tmp.outline = o;
-                        crate::effects_render::extract_local_geometry_path(&tmp).and_then(|geom| {
-                            apply_geometry_effects(&apply_persp(&geom), &tmp.effects)
-                                .transformed(&obj_to_screen)
-                                .bounding_box()
-                        })
-                    })
-            }
+            NodePayload::Clone { .. } => None,
             NodePayload::PowerClip { container, .. } => {
                 apply_geometry_effects(&apply_persp(container), &obj.effects)
                     .transformed(&obj_to_screen)
@@ -1819,6 +1848,45 @@ impl SceneRenderer {
         }
     }
 
+    fn extract_lens_local_path(&mut self, doc: &Document, obj: &SceneObject) -> Option<BezierPath> {
+        match &obj.payload {
+            NodePayload::Path(p) => Some(p.clone()),
+            NodePayload::Shape(s) => Some(s.to_bezier_path()),
+            NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
+            NodePayload::ArtisticMedia { spine, style } => {
+                Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
+            }
+            NodePayload::PowerClip { container, .. } => Some((**container).clone()),
+            NodePayload::ArtisticText(t) => {
+                let mut combined = BezierPath::new();
+                for piece in self.text_engine.layout_artistic_pieces(t) {
+                    combined.subpaths.extend(piece.path.subpaths);
+                }
+                (!combined.subpaths.is_empty()).then_some(combined)
+            }
+            NodePayload::ParagraphText(t) => {
+                let mut combined = BezierPath::new();
+                for piece in self.text_engine.layout_paragraph_in_doc(doc, obj.id, t) {
+                    combined.subpaths.extend(piece.path.subpaths);
+                }
+                (!combined.subpaths.is_empty()).then_some(combined)
+            }
+            NodePayload::TextOnPath(top) => {
+                let mut combined = BezierPath::new();
+                if let Some(host) = doc.world_path_of(top.path_id) {
+                    let inv = obj.transform.inverse().unwrap_or(Affine2D::IDENTITY);
+                    for piece in self.text_engine.layout_text_on_path_pieces(top, &host) {
+                        combined
+                            .subpaths
+                            .extend(piece.path.transformed(&inv).subpaths);
+                    }
+                }
+                (!combined.subpaths.is_empty()).then_some(combined)
+            }
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_scene_object_core(
         &mut self,
@@ -1856,17 +1924,8 @@ impl SceneRenderer {
 
         // Handle Lens objects first (all 11 optical & color lenses)
         if view_mode != ViewMode::Wireframe {
-            if let Some(lens_cfg) = &obj.lens {
-                if let Some(local_path) = match &obj.payload {
-                    NodePayload::Path(p) => Some(p.clone()),
-                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                    NodePayload::ArtisticMedia { spine, style } => {
-                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
-                    }
-                    NodePayload::PowerClip { container, .. } => Some((**container).clone()),
-                    _ => None,
-                } {
+            if let Some(lens_cfg) = obj.lens.clone() {
+                if let Some(local_path) = self.extract_lens_local_path(doc, obj) {
                     let local_persp = if let Some(persp) = obj.perspective {
                         persp.transform_bezier_path(&local_path)
                     } else {
@@ -1878,7 +1937,7 @@ impl SceneRenderer {
                         doc,
                         page,
                         obj,
-                        lens_cfg,
+                        &lens_cfg,
                         &deformed,
                         obj_to_screen,
                         page_to_surface,
@@ -1898,6 +1957,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -1966,33 +2026,12 @@ impl SceneRenderer {
                     depth,
                 );
             }
-            NodePayload::Clone { .. } => {
-                if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(obj) {
-                    let mut tmp = obj.clone();
-                    tmp.payload = p;
-                    tmp.fill = f;
-                    tmp.outline = o;
-                    if let Some(geom) = crate::effects_render::extract_local_geometry_path(&tmp) {
-                        self.render_vector_geometry(
-                            doc,
-                            &tmp,
-                            &geom,
-                            page_to_surface,
-                            parent_to_screen,
-                            px_per_mm,
-                            view_mode,
-                            options,
-                            backend,
-                            depth,
-                        );
-                    }
-                }
-            }
+            NodePayload::Clone { .. } => {}
             NodePayload::ArtisticText(text) => {
                 if (obj.effects.is_empty() && obj.perspective.is_none())
                     || view_mode == ViewMode::Wireframe
                 {
-                    self.text_engine.render_artistic_text(
+                    self.text_engine.render_artistic_text_icc(
                         backend,
                         text,
                         obj_to_screen,
@@ -2001,11 +2040,12 @@ impl SceneRenderer {
                         obj.blend_mode,
                         view_mode,
                         px_per_mm,
+                        &self.active_icc,
                     );
                 } else {
                     let mut pieces = self.text_engine.layout_artistic_pieces(text);
                     if pieces.is_empty() && !text.plain_text().trim().is_empty() {
-                        self.text_engine.render_artistic_text(
+                        self.text_engine.render_artistic_text_icc(
                             backend,
                             text,
                             obj_to_screen,
@@ -2014,6 +2054,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             view_mode,
                             px_per_mm,
+                            &self.active_icc,
                         );
                     } else {
                         if let Some(persp) = obj.perspective {
@@ -2022,7 +2063,7 @@ impl SceneRenderer {
                             }
                         }
                         if obj.effects.is_empty() {
-                            draw_text_pieces(
+                            draw_text_pieces_icc(
                                 backend,
                                 &pieces,
                                 obj_to_screen,
@@ -2031,6 +2072,7 @@ impl SceneRenderer {
                                 obj.blend_mode,
                                 view_mode,
                                 px_per_mm,
+                                &self.active_icc,
                             );
                         } else {
                             self.render_text_pieces_with_effects(
@@ -2053,8 +2095,10 @@ impl SceneRenderer {
                 if (obj.effects.is_empty() && obj.perspective.is_none())
                     || view_mode == ViewMode::Wireframe
                 {
-                    self.text_engine.render_paragraph_text(
+                    self.text_engine.render_paragraph_text_in_doc_icc(
                         backend,
+                        doc,
+                        obj.id,
                         para,
                         obj_to_screen,
                         &obj.outline,
@@ -2062,16 +2106,17 @@ impl SceneRenderer {
                         obj.blend_mode,
                         view_mode,
                         px_per_mm,
+                        &self.active_icc,
                     );
                 } else {
-                    let mut pieces = self.text_engine.layout_paragraph_pieces(para);
+                    let mut pieces = self.text_engine.layout_paragraph_in_doc(doc, obj.id, para);
                     if let Some(persp) = obj.perspective {
                         for piece in &mut pieces {
                             piece.path = persp.transform_bezier_path(&piece.path);
                         }
                     }
                     if obj.effects.is_empty() {
-                        draw_text_pieces(
+                        draw_text_pieces_icc(
                             backend,
                             &pieces,
                             obj_to_screen,
@@ -2080,6 +2125,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             view_mode,
                             px_per_mm,
+                            &self.active_icc,
                         );
                     } else {
                         self.render_text_pieces_with_effects(
@@ -2123,7 +2169,7 @@ impl SceneRenderer {
                 {
                     if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
                         let text_surface_xf = page_to_surface.compose(&delta_xf);
-                        self.text_engine.render_text_on_path(
+                        self.text_engine.render_text_on_path_icc(
                             backend,
                             top,
                             &host_path,
@@ -2133,9 +2179,10 @@ impl SceneRenderer {
                             obj.blend_mode,
                             view_mode,
                             px_per_mm,
+                            &self.active_icc,
                         );
                     } else {
-                        self.text_engine.render_artistic_text(
+                        self.text_engine.render_artistic_text_icc(
                             backend,
                             &top.text,
                             obj_to_screen,
@@ -2144,6 +2191,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             view_mode,
                             px_per_mm,
+                            &self.active_icc,
                         );
                     }
                 } else if let Some(host_path) = resolve_sym_world_path(doc, top.path_id, sym_ctx) {
@@ -2160,7 +2208,7 @@ impl SceneRenderer {
                             piece.path = persp.transform_bezier_path(&local_piece);
                         }
                         if obj.effects.is_empty() {
-                            draw_text_pieces(
+                            draw_text_pieces_icc(
                                 backend,
                                 &pieces,
                                 parent_to_screen,
@@ -2169,6 +2217,7 @@ impl SceneRenderer {
                                 obj.blend_mode,
                                 view_mode,
                                 px_per_mm,
+                                &self.active_icc,
                             );
                         } else {
                             self.render_text_pieces_with_effects(
@@ -2206,7 +2255,7 @@ impl SceneRenderer {
                         }
                     }
                     if obj.effects.is_empty() {
-                        draw_text_pieces(
+                        draw_text_pieces_icc(
                             backend,
                             &pieces,
                             obj_to_screen,
@@ -2215,6 +2264,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             view_mode,
                             px_per_mm,
+                            &self.active_icc,
                         );
                     } else {
                         self.render_text_pieces_with_effects(
@@ -2327,6 +2377,7 @@ impl SceneRenderer {
                             page_to_surface,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -2340,6 +2391,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -2351,6 +2403,7 @@ impl SceneRenderer {
                             draw_parent_to_screen,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -2631,6 +2684,7 @@ impl SceneRenderer {
                         page_to_surface,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -2646,6 +2700,7 @@ impl SceneRenderer {
                         obj.blend_mode,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -2772,6 +2827,7 @@ impl SceneRenderer {
                         parent_to_screen,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -2787,6 +2843,7 @@ impl SceneRenderer {
                         obj.blend_mode,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -3126,7 +3183,61 @@ impl SceneRenderer {
                             c_max_y = c_max_y.max(p.y);
                         }
                     }
-                    if cage.len() >= 8 {
+                    if cage.len() >= 12 {
+                        let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
+                        if cage[..12].iter().all(|p| p.is_finite()) {
+                            let eval_cubic =
+                                |p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64| {
+                                    let mt = 1.0 - t;
+                                    let mt2 = mt * mt;
+                                    let t2 = t * t;
+                                    let b0 = mt2 * mt;
+                                    let b1 = 3.0 * mt2 * t;
+                                    let b2 = 3.0 * mt * t2;
+                                    let b3 = t2 * t;
+                                    Point2D::new(
+                                        b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
+                                        b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+                                    )
+                                };
+                            let eval_coons12 = |u: f64, v: f64| -> Point2D {
+                                if *mode == coree_core::EnvelopeMode::Straight {
+                                    return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+                                }
+                                let top = eval_cubic(tl, cage[1], cage[2], tr, u);
+                                let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
+                                let left = eval_cubic(tl, cage[11], cage[10], bl, v);
+                                let right = eval_cubic(tr, cage[4], cage[5], br, v);
+                                let ruled_u = top.lerp(bottom, v);
+                                let ruled_v = left.lerp(right, u);
+                                let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+                                Point2D::new(
+                                    ruled_u.x + ruled_v.x - bilin.x,
+                                    ruled_u.y + ruled_v.y - bilin.y,
+                                )
+                            };
+                            let (mut s_min_y, mut s_max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                            for iu in 0..=16 {
+                                let u = f64::from(iu) * 0.0625;
+                                for iv in 0..=16 {
+                                    let v = f64::from(iv) * 0.0625;
+                                    let pt = eval_coons12(u, v);
+                                    if pt.is_finite() {
+                                        s_min_y = s_min_y.min(pt.y);
+                                        s_max_y = s_max_y.max(pt.y);
+                                        union_pt(pt, acc);
+                                    }
+                                }
+                            }
+                            if s_min_y.is_finite() && s_max_y.is_finite() {
+                                let env_h = (s_max_y - s_min_y).max(1e-6);
+                                cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                            }
+                        } else if c_min_y.is_finite() && c_max_y.is_finite() {
+                            let env_h = (c_max_y - c_min_y).max(1e-6);
+                            cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                        }
+                    } else if cage.len() >= 8 {
                         let (tl, tm, tr, rm, br, bm, bl, lm) = (
                             cage[0], cage[1], cage[2], cage[3], cage[4], cage[5], cage[6], cage[7],
                         );
@@ -3384,6 +3495,7 @@ impl SceneRenderer {
                     page_to_surface,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -3470,6 +3582,7 @@ impl SceneRenderer {
                     parent_to_screen,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -3586,6 +3699,7 @@ impl SceneRenderer {
                     page_to_surface,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -3694,6 +3808,7 @@ impl SceneRenderer {
                     parent_to_screen,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -3814,13 +3929,29 @@ impl SceneRenderer {
             let cobj = sym_ctx
                 .and_then(|(m, _, _)| m.get(&cid).copied())
                 .or_else(|| doc.object(cid));
-            if let Some(obj) = cobj {
+            if let Some(raw_obj) = cobj {
+                let resolved_clone;
+                let obj = if matches!(raw_obj.payload, NodePayload::Clone { .. }) {
+                    if let Some((p, f, o)) = doc.resolve_clone_payload_and_style(raw_obj) {
+                        let mut c = raw_obj.clone();
+                        c.payload = p;
+                        c.fill = f;
+                        c.outline = o;
+                        resolved_clone = c;
+                        &resolved_clone
+                    } else {
+                        raw_obj
+                    }
+                } else {
+                    raw_obj
+                };
                 let apply_obj_persp = |bp: BezierPath| {
-                    if let Some(persp) = obj.perspective {
+                    let p = if let Some(persp) = obj.perspective {
                         persp.transform_bezier_path(&bp)
                     } else {
                         bp
-                    }
+                    };
+                    apply_geometry_effects(&p, &obj.effects)
                 };
                 for sxf in symmetry_effect_transforms(&obj.effects) {
                     let c_xf = rel_xf.compose(&sxf).compose(&obj.transform);
@@ -3831,6 +3962,14 @@ impl SceneRenderer {
                         NodePayload::Shape(s) => apply_obj_persp(s.to_bezier_path())
                             .transformed(&c_xf)
                             .bounding_box(),
+                        NodePayload::BSpline(bs) => apply_obj_persp(bs.to_bezier_path())
+                            .transformed(&c_xf)
+                            .bounding_box(),
+                        NodePayload::ArtisticMedia { spine, style } => {
+                            apply_obj_persp(coree_core::ArtisticMedia::expand_stroke(spine, style))
+                                .transformed(&c_xf)
+                                .bounding_box()
+                        }
                         NodePayload::PowerClip { container, .. } => {
                             apply_obj_persp((**container).clone())
                                 .transformed(&c_xf)
@@ -3924,16 +4063,6 @@ impl SceneRenderer {
                             depth + 1,
                             visiting,
                         ),
-                        NodePayload::BSpline(bs) => inv_target_world.and_then(|_| {
-                            apply_obj_persp(bs.to_bezier_path())
-                                .transformed(&c_xf)
-                                .bounding_box()
-                        }),
-                        NodePayload::ArtisticMedia { spine, style } => {
-                            apply_obj_persp(coree_core::ArtisticMedia::expand_stroke(spine, style))
-                                .transformed(&c_xf)
-                                .bounding_box()
-                        }
                         NodePayload::Clone { .. } => cobj.and_then(|co| {
                             doc.resolve_clone_payload_and_style(co)
                                 .and_then(|(p, _, _)| {
@@ -4729,7 +4858,10 @@ impl SceneRenderer {
             NodePayload::Table(t) => {
                 let r = t.to_bounding_box();
                 let mut bb = apply_deform_chain_in_bounds(
-                    &apply_own_persp(&BezierPath::from_rect(r)),
+                    &apply_geometry_effects(
+                        &apply_own_persp(&BezierPath::from_rect(r)),
+                        &obj.effects,
+                    ),
                     c_xf,
                     deform_frames,
                 )
@@ -4747,7 +4879,10 @@ impl SceneRenderer {
             NodePayload::Dimension(d) => {
                 let r = d.bounding_box();
                 let mut bb = apply_deform_chain_in_bounds(
-                    &apply_own_persp(&BezierPath::from_rect(r)),
+                    &apply_geometry_effects(
+                        &apply_own_persp(&BezierPath::from_rect(r)),
+                        &obj.effects,
+                    ),
                     c_xf,
                     deform_frames,
                 )
@@ -5112,17 +5247,8 @@ impl SceneRenderer {
             }
         };
         if view_mode != ViewMode::Wireframe {
-            if let Some(lens_cfg) = &obj.lens {
-                if let Some(local_path) = match &obj.payload {
-                    NodePayload::Path(p) => Some(p.clone()),
-                    NodePayload::Shape(s) => Some(s.to_bezier_path()),
-                    NodePayload::BSpline(bs) => Some(bs.to_bezier_path()),
-                    NodePayload::ArtisticMedia { spine, style } => {
-                        Some(coree_core::ArtisticMedia::expand_stroke(spine, style))
-                    }
-                    NodePayload::PowerClip { container, .. } => Some((**container).clone()),
-                    _ => None,
-                } {
+            if let Some(lens_cfg) = obj.lens.clone() {
+                if let Some(local_path) = self.extract_lens_local_path(doc, obj) {
                     let deformed = apply_deform_chain_in_bounds(
                         &apply_geometry_effects(&apply_own_persp(&local_path), &obj.effects),
                         c_xf,
@@ -5138,6 +5264,7 @@ impl SceneRenderer {
                             page_to_surface,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5146,7 +5273,7 @@ impl SceneRenderer {
                         doc,
                         page,
                         obj,
-                        lens_cfg,
+                        &lens_cfg,
                         &deformed,
                         group_to_screen,
                         page_to_surface,
@@ -5164,6 +5291,7 @@ impl SceneRenderer {
                             group_to_screen,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5177,6 +5305,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5328,7 +5457,7 @@ impl SceneRenderer {
                 );
             }
             NodePayload::ParagraphText(para) => {
-                let mut pieces = self.text_engine.layout_paragraph_pieces(para);
+                let mut pieces = self.text_engine.layout_paragraph_in_doc(doc, obj.id, para);
                 if let Some(persp) = obj.perspective {
                     for piece in &mut pieces {
                         piece.path = persp.transform_bezier_path(&piece.path);
@@ -5417,7 +5546,7 @@ impl SceneRenderer {
             NodePayload::Table(table) => {
                 let deform_path = |p: &BezierPath, local_xf: Affine2D| -> BezierPath {
                     apply_deform_chain_in_bounds(
-                        &apply_geometry_effects(p, &obj.effects),
+                        &apply_geometry_effects(&apply_own_persp(p), &obj.effects),
                         local_xf,
                         deform_frames,
                     )
@@ -5437,6 +5566,7 @@ impl SceneRenderer {
                         page_to_surface,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -5485,13 +5615,14 @@ impl SceneRenderer {
                             } else {
                                 table.border_style.effective_width_mm() as f32
                             };
-                            let st = StrokeParams::from_outline(
+                            let mut st = StrokeParams::from_outline(
                                 &table.border_style,
                                 w,
                                 obj.opacity,
                                 obj.blend_mode,
                                 anti_alias,
                             );
+                            st.color = icc_srgb(&table.border_style.color, &self.active_icc);
                             backend.stroke_path(&deformed_cell, &st, group_to_screen);
                         }
                         if !cell.text.trim().is_empty() {
@@ -5531,6 +5662,7 @@ impl SceneRenderer {
                         group_to_screen,
                         px_per_mm,
                         anti_alias,
+                        &self.active_icc,
                         backend,
                     );
                 }
@@ -5538,13 +5670,13 @@ impl SceneRenderer {
             NodePayload::Dimension(dim) => {
                 let deform_path = |p: &BezierPath, local_xf: Affine2D| -> BezierPath {
                     apply_deform_chain_in_bounds(
-                        &apply_geometry_effects(p, &obj.effects),
+                        &apply_geometry_effects(&apply_own_persp(p), &obj.effects),
                         local_xf,
                         deform_frames,
                     )
                 };
                 let dim_outline = if obj.outline.is_visible() {
-                    obj.outline.clone()
+                    icc_outline(&obj.outline, &self.active_icc)
                 } else {
                     OutlineStyle::solid(Color::BLACK, 0.25)
                 };
@@ -5756,6 +5888,7 @@ impl SceneRenderer {
                             page_to_surface,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5769,6 +5902,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5780,6 +5914,7 @@ impl SceneRenderer {
                             group_to_screen,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5898,6 +6033,7 @@ impl SceneRenderer {
                             page_to_surface,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -5951,6 +6087,7 @@ impl SceneRenderer {
                             group_to_screen,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -6074,6 +6211,7 @@ impl SceneRenderer {
                             page_to_surface,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -6087,6 +6225,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -6138,6 +6277,7 @@ impl SceneRenderer {
                             group_to_screen,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -6151,6 +6291,7 @@ impl SceneRenderer {
                             obj.blend_mode,
                             px_per_mm,
                             anti_alias,
+                            &self.active_icc,
                             backend,
                         );
                     }
@@ -6286,6 +6427,7 @@ impl SceneRenderer {
                                     page_to_surface,
                                     px_per_mm,
                                     anti_alias,
+                                    &self.active_icc,
                                     backend,
                                 );
                             }
@@ -6387,6 +6529,7 @@ impl SceneRenderer {
                                     group_to_screen,
                                     px_per_mm,
                                     anti_alias,
+                                    &self.active_icc,
                                     backend,
                                 );
                             }
@@ -6453,6 +6596,7 @@ impl SceneRenderer {
                 page_to_surface,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6466,6 +6610,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6490,6 +6635,7 @@ impl SceneRenderer {
                 group_to_screen,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6503,6 +6649,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6562,6 +6709,7 @@ impl SceneRenderer {
                 page_to_surface,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6588,6 +6736,7 @@ impl SceneRenderer {
                     obj.blend_mode,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -6600,6 +6749,7 @@ impl SceneRenderer {
                 group_to_screen,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6644,6 +6794,7 @@ impl SceneRenderer {
                 page_to_surface,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6659,6 +6810,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6687,6 +6839,7 @@ impl SceneRenderer {
                 parent_to_screen,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6702,6 +6855,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 px_per_mm,
                 anti_alias,
+                &self.active_icc,
                 backend,
             );
         }
@@ -6777,13 +6931,14 @@ impl SceneRenderer {
                     } else {
                         table.border_style.effective_width_mm() as f32
                     };
-                    let st = StrokeParams::from_outline(
+                    let mut st = StrokeParams::from_outline(
                         &table.border_style,
                         w,
                         obj.opacity,
                         obj.blend_mode,
                         anti_alias,
                     );
+                    st.color = icc_srgb(&table.border_style.color, &self.active_icc);
                     backend.stroke_path(&cell_path, &st, obj_to_screen);
                 }
 
@@ -6793,7 +6948,7 @@ impl SceneRenderer {
                         .compose(&Affine2D::translate(rect.min_x + pad, rect.min_y + pad));
                     let at = ArtisticText::from_plain(cell.text.clone(), cell.text_style.clone());
                     backend.push_clip(&cell_path, FillRule::Winding, obj_to_screen);
-                    self.text_engine.render_artistic_text(
+                    self.text_engine.render_artistic_text_icc(
                         backend,
                         &at,
                         text_xf,
@@ -6802,6 +6957,7 @@ impl SceneRenderer {
                         obj.blend_mode,
                         view_mode,
                         px_per_mm,
+                        &self.active_icc,
                     );
                     backend.pop_clip();
                 }
@@ -6823,7 +6979,7 @@ impl SceneRenderer {
     ) {
         let anti_alias = view_mode != ViewMode::Pixels;
         let dim_outline = if obj.outline.is_visible() {
-            obj.outline.clone()
+            icc_outline(&obj.outline, &self.active_icc)
         } else {
             OutlineStyle::solid(Color::BLACK, 0.25)
         };
@@ -6980,7 +7136,7 @@ impl SceneRenderer {
                 label_anchor.x,
                 label_anchor.y - dim.text_style.font_size_mm(),
             ));
-            self.text_engine.render_artistic_text(
+            self.text_engine.render_artistic_text_icc(
                 backend,
                 &at,
                 label_xf,
@@ -6989,6 +7145,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 view_mode,
                 px_per_mm,
+                &self.active_icc,
             );
         }
     }
@@ -7029,6 +7186,7 @@ impl SceneRenderer {
             page_to_surface,
             px_per_mm,
             anti_alias,
+            &self.active_icc,
             backend,
         );
 
@@ -7072,11 +7230,12 @@ impl SceneRenderer {
                     obj.blend_mode,
                     px_per_mm,
                     anti_alias,
+                    &self.active_icc,
                     backend,
                 );
             }
         } else {
-            draw_text_pieces(
+            draw_text_pieces_icc(
                 backend,
                 pieces,
                 draw_xf,
@@ -7085,6 +7244,7 @@ impl SceneRenderer {
                 obj.blend_mode,
                 view_mode,
                 px_per_mm,
+                &self.active_icc,
             );
         }
 
@@ -7099,6 +7259,7 @@ impl SceneRenderer {
             parent_to_screen,
             px_per_mm,
             anti_alias,
+            &self.active_icc,
             backend,
         );
     }
@@ -7127,7 +7288,7 @@ impl SceneRenderer {
             Fill::None => {}
             Fill::Solid(color) => {
                 let paint = BackendPaint {
-                    shader: PaintShader::Solid(color.clone()),
+                    shader: PaintShader::Solid(icc_srgb(color, &self.active_icc)),
                     opacity: op,
                     blend_mode,
                     anti_alias,
@@ -7135,11 +7296,18 @@ impl SceneRenderer {
                 backend.fill_path(local_path, &paint, FillRule::Winding, local_to_screen);
             }
             Fill::LinearGradient { start, end, stops } => {
+                let resolved_stops: Vec<GradientStop> = stops
+                    .iter()
+                    .map(|s| GradientStop {
+                        offset: s.offset,
+                        color: icc_srgb(&s.color, &self.active_icc),
+                    })
+                    .collect();
                 let paint = BackendPaint {
                     shader: PaintShader::LinearGradient {
                         start: *start,
                         end: *end,
-                        stops: stops.clone(),
+                        stops: resolved_stops,
                     },
                     opacity: op,
                     blend_mode,
@@ -7153,12 +7321,19 @@ impl SceneRenderer {
                 focal,
                 stops,
             } => {
+                let resolved_stops: Vec<GradientStop> = stops
+                    .iter()
+                    .map(|s| GradientStop {
+                        offset: s.offset,
+                        color: icc_srgb(&s.color, &self.active_icc),
+                    })
+                    .collect();
                 let paint = BackendPaint {
                     shader: PaintShader::RadialGradient {
                         focal: *focal,
                         center: *center,
                         radius: *radius,
-                        stops: stops.clone(),
+                        stops: resolved_stops,
                     },
                     opacity: op,
                     blend_mode,
@@ -7171,6 +7346,20 @@ impl SceneRenderer {
                 angle_deg,
                 stops,
             } => {
+                let icc = self.active_icc.clone();
+                let all_cmyk = !stops.is_empty()
+                    && stops.iter().all(|s| matches!(s.color, Color::Cmyk { .. }));
+                let resolved_stops = if all_cmyk {
+                    Vec::new()
+                } else {
+                    stops
+                        .iter()
+                        .map(|s| GradientStop {
+                            offset: s.offset,
+                            color: icc_srgb(&s.color, &icc),
+                        })
+                        .collect()
+                };
                 render_pixel_shader_fill(
                     local_path,
                     local_to_screen,
@@ -7182,7 +7371,11 @@ impl SceneRenderer {
                         let dy = local_pt.y - center.y;
                         let deg = dy.atan2(dx).to_degrees();
                         let t = (deg - sanitize_f64(*angle_deg, 0.0)).rem_euclid(360.0) / 360.0;
-                        Fill::sample_stops(stops, t as f32).to_rgba8()
+                        if all_cmyk {
+                            Fill::sample_stops_icc(stops, t as f32, &icc).to_rgba8_icc(&icc)
+                        } else {
+                            Fill::sample_stops(&resolved_stops, t as f32).to_rgba8()
+                        }
                     },
                 );
             }
@@ -7195,6 +7388,20 @@ impl SceneRenderer {
                 let half = (sanitize_f64(*size, 20.0).abs() * 0.5).max(1e-4);
                 let rot = -sanitize_f64(*angle_deg, 0.0).to_radians();
                 let (s, c) = rot.sin_cos();
+                let icc = self.active_icc.clone();
+                let all_cmyk = !stops.is_empty()
+                    && stops.iter().all(|s| matches!(s.color, Color::Cmyk { .. }));
+                let resolved_stops = if all_cmyk {
+                    Vec::new()
+                } else {
+                    stops
+                        .iter()
+                        .map(|s| GradientStop {
+                            offset: s.offset,
+                            color: icc_srgb(&s.color, &icc),
+                        })
+                        .collect()
+                };
                 render_pixel_shader_fill(
                     local_path,
                     local_to_screen,
@@ -7207,7 +7414,11 @@ impl SceneRenderer {
                         let rx = dx * c - dy * s;
                         let ry = dx * s + dy * c;
                         let cheb = (rx.abs().max(ry.abs()) / half).clamp(0.0, 1.0);
-                        Fill::sample_stops(stops, cheb as f32).to_rgba8()
+                        if all_cmyk {
+                            Fill::sample_stops_icc(stops, cheb as f32, &icc).to_rgba8_icc(&icc)
+                        } else {
+                            Fill::sample_stops(&resolved_stops, cheb as f32).to_rgba8()
+                        }
                     },
                 );
             }
@@ -7221,7 +7432,10 @@ impl SceneRenderer {
                 let tw = sanitize_f64(*tile_w, 10.0).max(0.5);
                 let th = sanitize_f64(*tile_h, 10.0).max(0.5);
                 let tile_px = 64u32;
-                let tile = generate_two_color_pattern_tile(pattern_name, fg, bg, tile_px);
+                let fg_srgb = icc_srgb(fg, &self.active_icc);
+                let bg_srgb = icc_srgb(bg, &self.active_icc);
+                let tile =
+                    generate_two_color_pattern_tile(pattern_name, &fg_srgb, &bg_srgb, tile_px);
                 let tile_xf = Affine2D::scale(tw / f64::from(tile_px), th / f64::from(tile_px));
                 let paint = BackendPaint {
                     shader: PaintShader::PixmapPattern {
@@ -7264,7 +7478,7 @@ impl SceneRenderer {
             } => {
                 if let Some(asset) = doc.asset(*image_id) {
                     if let Ok(tile) =
-                        RgbaBuffer::from_vec(asset.width, asset.height, asset.rgba_bytes.clone())
+                        RgbaBuffer::from_vec(asset.width, asset.height, asset.to_rgba8_vec())
                     {
                         let tw = sanitize_f64(*tile_w, 20.0).max(0.5);
                         let th = sanitize_f64(*tile_h, 20.0).max(0.5);
@@ -7291,8 +7505,8 @@ impl SceneRenderer {
                 fg,
                 bg,
             } => {
-                let fg_rgba = fg.to_rgba_f32();
-                let bg_rgba = bg.to_rgba_f32();
+                let fg_rgba = fg.to_rgba_f32_icc(&self.active_icc);
+                let bg_rgba = bg.to_rgba_f32_icc(&self.active_icc);
                 let seed_val = *seed;
                 if let Some(ps_preset) = PostScriptFillPreset::from_preset_str(preset) {
                     let aa_mm = (1.0 / estimate_scale(&local_to_screen)).clamp(1e-4, 2.0);
@@ -7363,6 +7577,7 @@ impl SceneRenderer {
                     local_to_screen,
                     op,
                     blend_mode,
+                    &self.active_icc,
                     backend,
                 );
             }
@@ -7446,11 +7661,8 @@ fn render_pixel_shader_fill<F>(
     backend.pop_clip();
 }
 
-/// True Coons-patch / bilinear-bicubic subdivided MeshFill rasterizer!
-///
-/// Builds a `(rows x cols)` grid of control nodes, subdivides each quad patch into
-/// fine smooth micro-triangles with bilinear/smoothstep color interpolation across all
-/// 4 corner colors, rasterizes into an `RgbaBuffer`, and composites clipped to `local_path`.
+/// True bicubic Coons-patch subdivided MeshFill rasterizer with tangent handles, per-node alpha,
+/// CMYK/Lab color interpolation, `1x1` guard, adaptive subdivision, and seam-free triangle coverage.
 #[allow(clippy::too_many_arguments)]
 fn render_mesh_fill(
     local_path: &BezierPath,
@@ -7460,6 +7672,7 @@ fn render_mesh_fill(
     local_to_screen: Affine2D,
     opacity: f32,
     blend_mode: BlendMode,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let Some(lb) = local_path.bounding_box() else {
@@ -7471,13 +7684,32 @@ fn render_mesh_fill(
         return;
     };
 
+    // Guard degenerate <= 1x1 mesh grids cleanly
+    if rows <= 1 && cols <= 1 {
+        let solid_col = nodes.first().map_or(Color::WHITE, |n| {
+            let [r, g, b, a] = n.color.to_rgba_f32_icc(icc);
+            let na = sanitize_f32(n.alpha, 1.0).clamp(0.0, 1.0);
+            Color::rgba(r, g, b, (a * na).clamp(0.0, 1.0))
+        });
+        let paint = BackendPaint {
+            shader: PaintShader::Solid(solid_col),
+            opacity,
+            blend_mode,
+            anti_alias: true,
+        };
+        backend.fill_path(local_path, &paint, FillRule::Winding, local_to_screen);
+        return;
+    }
+
     let r_cnt = rows.clamp(2, 32);
     let c_cnt = cols.clamp(2, 32);
 
-    // Build complete (r_cnt x c_cnt) lookup grid with automatic fallback placement if sparse
     let mut grid_pos = vec![vec![Point2D::ZERO; c_cnt]; r_cnt];
-    let mut grid_col = vec![vec![[1.0_f32, 1.0, 1.0, 1.0]; c_cnt]; r_cnt];
+    let mut grid_handles: Vec<Vec<[Option<Point2D>; 4]>> = vec![vec![[None; 4]; c_cnt]; r_cnt];
+    let mut grid_color: Vec<Vec<Color>> = vec![vec![Color::WHITE; c_cnt]; r_cnt];
+    let mut grid_alpha: Vec<Vec<f32>> = vec![vec![1.0_f32; c_cnt]; r_cnt];
     let mut populated = vec![vec![false; c_cnt]; r_cnt];
+
     for (r, pos_row) in grid_pos.iter_mut().enumerate() {
         let v = r as f64 / (r_cnt - 1) as f64;
         for (c, slot) in pos_row.iter_mut().enumerate() {
@@ -7485,125 +7717,325 @@ fn render_mesh_fill(
             *slot = Point2D::new(lb.min_x + u * lb.width(), lb.min_y + v * lb.height());
         }
     }
+    let margin = lb.width().max(lb.height()).max(1.0) * 4.0;
+    let clamp_pt = |p: Point2D| -> Option<Point2D> {
+        p.is_finite().then(|| {
+            Point2D::new(
+                p.x.clamp(lb.min_x - margin, lb.max_x + margin),
+                p.y.clamp(lb.min_y - margin, lb.max_y + margin),
+            )
+        })
+    };
     for node in nodes {
         let r_idx = node.row.min(r_cnt - 1);
         let c_idx = node.col.min(c_cnt - 1);
         if node.row < r_cnt && node.col < c_cnt {
-            if node.pos.is_finite() {
-                // Clamp runaway control nodes to a generous envelope around the object bounds
-                let margin = lb.width().max(lb.height()).max(1.0) * 4.0;
-                grid_pos[r_idx][c_idx] = Point2D::new(
-                    node.pos.x.clamp(lb.min_x - margin, lb.max_x + margin),
-                    node.pos.y.clamp(lb.min_y - margin, lb.max_y + margin),
-                );
-            }
-            grid_col[r_idx][c_idx] = node.color.to_rgba_f32();
+            let base = clamp_pt(node.pos).unwrap_or(grid_pos[r_idx][c_idx]);
+            grid_pos[r_idx][c_idx] = base;
+            // Relative tangent offsets [N, S, E, W] -> absolute control points in local space.
+            let abs_handle = |h: Point2D| -> Option<Point2D> {
+                h.is_finite()
+                    .then(|| Point2D::new(base.x + h.x, base.y + h.y))
+            };
+            grid_handles[r_idx][c_idx] = [
+                node.handle_n.and_then(abs_handle),
+                node.handle_s.and_then(abs_handle),
+                node.handle_e.and_then(abs_handle),
+                node.handle_w.and_then(abs_handle),
+            ];
+            grid_color[r_idx][c_idx] = node.color.clone();
+            grid_alpha[r_idx][c_idx] = sanitize_f32(node.alpha, 1.0).clamp(0.0, 1.0);
             populated[r_idx][c_idx] = true;
         }
     }
-    // Fill any unpopulated sparse grid cells from the nearest supplied mesh node instead of opaque white
+    // Fill any unpopulated sparse grid cells from nearest supplied node
     if !nodes.is_empty() {
         for r in 0..r_cnt {
             for c in 0..c_cnt {
                 if populated[r][c] {
                     continue;
                 }
-                let mut best: Option<(usize, [f32; 4])> = None;
-                for sr in 0..r_cnt {
-                    for sc in 0..c_cnt {
-                        if !populated[sr][sc] {
+                let mut best: Option<(usize, usize, usize)> = None;
+                for (sr, pop_row) in populated.iter().enumerate().take(r_cnt) {
+                    for (sc, &is_pop) in pop_row.iter().enumerate().take(c_cnt) {
+                        if !is_pop {
                             continue;
                         }
                         let dist_sq = sr.abs_diff(r).pow(2) + sc.abs_diff(c).pow(2);
-                        if best.is_none_or(|(bd, _)| dist_sq < bd) {
-                            best = Some((dist_sq, grid_col[sr][sc]));
+                        if best.is_none_or(|(bd, _, _)| dist_sq < bd) {
+                            best = Some((dist_sq, sr, sc));
                         }
                     }
                 }
-                if let Some((_, col)) = best {
-                    grid_col[r][c] = col;
+                if let Some((_, sr, sc)) = best {
+                    grid_color[r][c] = grid_color[sr][sc].clone();
+                    grid_alpha[r][c] = grid_alpha[sr][sc];
                 }
             }
         }
     }
 
     let mut buf = RgbaBuffer::new_transparent(clamped.width, clamped.height);
-    let sub_divs = 10usize; // Smooth 10x10 bicubic Catmull-Rom / Coons subdivisions per mesh cell
-
-    // Project all mesh control points into local buffer pixel space
     let to_buf_px = |p: Point2D| -> Point2D {
         let s = local_to_screen.transform_point(p);
         Point2D::new(s.x - f64::from(clamped.x), s.y - f64::from(clamped.y))
     };
 
-    let sample_grid_pt = |rr: isize, cc: isize| -> Point2D {
-        let rc = rr.clamp(0, (r_cnt - 1) as isize) as usize;
-        let cc = cc.clamp(0, (c_cnt - 1) as isize) as usize;
-        to_buf_px(grid_pos[rc][cc])
+    let mut px_pos = vec![vec![Point2D::ZERO; c_cnt]; r_cnt];
+    for r in 0..r_cnt {
+        for c in 0..c_cnt {
+            px_pos[r][c] = to_buf_px(grid_pos[r][c]);
+        }
+    }
+
+    let eval_cubic_pt = |c0: Point2D, c1: Point2D, c2: Point2D, c3: Point2D, t: f64| -> Point2D {
+        let it = 1.0 - t;
+        let it2 = it * it;
+        let t2 = t * t;
+        let b0 = it2 * it;
+        let b1 = 3.0 * it2 * t;
+        let b2 = 3.0 * it * t2;
+        let b3 = t2 * t;
+        Point2D::new(
+            b0 * c0.x + b1 * c1.x + b2 * c2.x + b3 * c3.x,
+            b0 * c0.y + b1 * c1.y + b2 * c2.y + b3 * c3.y,
+        )
     };
 
-    for r in 0..(r_cnt - 1) {
-        let ri = r as isize;
-        for c in 0..(c_cnt - 1) {
-            let ci = c as isize;
-            // 4x4 neighborhood stencil for C1 Catmull-Rom curved mesh patch interpolation
-            let patch_pts: [[Point2D; 4]; 4] = [
-                [
-                    sample_grid_pt(ri - 1, ci - 1),
-                    sample_grid_pt(ri - 1, ci),
-                    sample_grid_pt(ri - 1, ci + 1),
-                    sample_grid_pt(ri - 1, ci + 2),
-                ],
-                [
-                    sample_grid_pt(ri, ci - 1),
-                    sample_grid_pt(ri, ci),
-                    sample_grid_pt(ri, ci + 1),
-                    sample_grid_pt(ri, ci + 2),
-                ],
-                [
-                    sample_grid_pt(ri + 1, ci - 1),
-                    sample_grid_pt(ri + 1, ci),
-                    sample_grid_pt(ri + 1, ci + 1),
-                    sample_grid_pt(ri + 1, ci + 2),
-                ],
-                [
-                    sample_grid_pt(ri + 2, ci - 1),
-                    sample_grid_pt(ri + 2, ci),
-                    sample_grid_pt(ri + 2, ci + 1),
-                    sample_grid_pt(ri + 2, ci + 2),
-                ],
-            ];
+    let catmull_tangent = |prev: Point2D, next: Point2D| -> Vec2D { (next - prev) * (1.0 / 6.0) };
 
-            let c00 = grid_col[r][c];
-            let c10 = grid_col[r][c + 1];
-            let c01 = grid_col[r + 1][c];
-            let c11 = grid_col[r + 1][c + 1];
+    for r in 0..(r_cnt - 1) {
+        for c in 0..(c_cnt - 1) {
+            let p00 = px_pos[r][c];
+            let p10 = px_pos[r][c + 1];
+            let p01 = px_pos[r + 1][c];
+            let p11 = px_pos[r + 1][c + 1];
+
+            // Neighbor Catmull-Rom chords in pixel space when explicit handles are absent
+            let p_l0 = px_pos[r][c.saturating_sub(1)];
+            let p_r0 = px_pos[r][(c + 2).min(c_cnt - 1)];
+            let p_l1 = px_pos[r + 1][c.saturating_sub(1)];
+            let p_r1 = px_pos[r + 1][(c + 2).min(c_cnt - 1)];
+            let p_u0 = px_pos[r.saturating_sub(1)][c];
+            let p_d0 = px_pos[(r + 2).min(r_cnt - 1)][c];
+            let p_u1 = px_pos[r.saturating_sub(1)][c + 1];
+            let p_d1 = px_pos[(r + 2).min(r_cnt - 1)][c + 1];
+
+            // Edge cubic control points: [N:0, S:1, E:2, W:3].
+            // Boundary endpoints use 1/3 chord for uniform straight parameterization;
+            // interior endpoints use Catmull-Rom (next - prev) / 6 for C1 continuity.
+            let t_c1 = grid_handles[r][c][2].map(to_buf_px).unwrap_or_else(|| {
+                if c > 0 {
+                    p00 + catmull_tangent(p_l0, p10)
+                } else {
+                    p00 + (p10 - p00) * (1.0 / 3.0)
+                }
+            });
+            let t_c2 = grid_handles[r][c + 1][3].map(to_buf_px).unwrap_or_else(|| {
+                if c + 2 < c_cnt {
+                    p10 - catmull_tangent(p00, p_r0)
+                } else {
+                    p10 - (p10 - p00) * (1.0 / 3.0)
+                }
+            });
+            let b_c1 = grid_handles[r + 1][c][2].map(to_buf_px).unwrap_or_else(|| {
+                if c > 0 {
+                    p01 + catmull_tangent(p_l1, p11)
+                } else {
+                    p01 + (p11 - p01) * (1.0 / 3.0)
+                }
+            });
+            let b_c2 = grid_handles[r + 1][c + 1][3]
+                .map(to_buf_px)
+                .unwrap_or_else(|| {
+                    if c + 2 < c_cnt {
+                        p11 - catmull_tangent(p01, p_r1)
+                    } else {
+                        p11 - (p11 - p01) * (1.0 / 3.0)
+                    }
+                });
+            let l_c1 = grid_handles[r][c][1].map(to_buf_px).unwrap_or_else(|| {
+                if r > 0 {
+                    p00 + catmull_tangent(p_u0, p01)
+                } else {
+                    p00 + (p01 - p00) * (1.0 / 3.0)
+                }
+            });
+            let l_c2 = grid_handles[r + 1][c][0].map(to_buf_px).unwrap_or_else(|| {
+                if r + 2 < r_cnt {
+                    p01 - catmull_tangent(p00, p_d0)
+                } else {
+                    p01 - (p01 - p00) * (1.0 / 3.0)
+                }
+            });
+            let r_c1 = grid_handles[r][c + 1][1].map(to_buf_px).unwrap_or_else(|| {
+                if r > 0 {
+                    p10 + catmull_tangent(p_u1, p11)
+                } else {
+                    p10 + (p11 - p10) * (1.0 / 3.0)
+                }
+            });
+            let r_c2 = grid_handles[r + 1][c + 1][0]
+                .map(to_buf_px)
+                .unwrap_or_else(|| {
+                    if r + 2 < r_cnt {
+                        p11 - catmull_tangent(p10, p_d1)
+                    } else {
+                        p11 - (p11 - p10) * (1.0 / 3.0)
+                    }
+                });
 
             let eval_pos = |u: f64, v: f64| -> Point2D {
-                let mut rows_u = [Point2D::ZERO; 4];
-                for k in 0..4 {
-                    rows_u[k] = catmull_rom_pt(
-                        patch_pts[k][0],
-                        patch_pts[k][1],
-                        patch_pts[k][2],
-                        patch_pts[k][3],
-                        u,
-                    );
-                }
-                catmull_rom_pt(rows_u[0], rows_u[1], rows_u[2], rows_u[3], v)
+                let top = eval_cubic_pt(p00, t_c1, t_c2, p10, u);
+                let bot = eval_cubic_pt(p01, b_c1, b_c2, p11, u);
+                let left = eval_cubic_pt(p00, l_c1, l_c2, p01, v);
+                let right = eval_cubic_pt(p10, r_c1, r_c2, p11, v);
+                let ruled_u = top.lerp(bot, v);
+                let ruled_v = left.lerp(right, u);
+                let bilin = p00.lerp(p10, u).lerp(p01.lerp(p11, u), v);
+                let coons = |a: f64, b: f64, c: f64| a + b - c;
+                Point2D::new(
+                    coons(ruled_u.x, ruled_v.x, bilin.x),
+                    coons(ruled_u.y, ruled_v.y, bilin.y),
+                )
             };
-            // Smooth cubic Hermite (bicubic smoothstep) color interpolation for silky mesh blends
+
+            let col00 = &grid_color[r][c];
+            let col10 = &grid_color[r][c + 1];
+            let col01 = &grid_color[r + 1][c];
+            let col11 = &grid_color[r + 1][c + 1];
+            let na00 = grid_alpha[r][c];
+            let na10 = grid_alpha[r][c + 1];
+            let na01 = grid_alpha[r + 1][c];
+            let na11 = grid_alpha[r + 1][c + 1];
+
+            let all_cmyk = matches!(
+                (col00, col10, col01, col11),
+                (
+                    Color::Cmyk { .. },
+                    Color::Cmyk { .. },
+                    Color::Cmyk { .. },
+                    Color::Cmyk { .. }
+                )
+            );
+            let lab_corners = if all_cmyk {
+                None
+            } else {
+                Some([
+                    icc_srgb(col00, icc).to_lab(),
+                    icc_srgb(col10, icc).to_lab(),
+                    icc_srgb(col01, icc).to_lab(),
+                    icc_srgb(col11, icc).to_lab(),
+                ])
+            };
+            let rgba_corners = [
+                col00.to_rgba_f32_icc(icc),
+                col10.to_rgba_f32_icc(icc),
+                col01.to_rgba_f32_icc(icc),
+                col11.to_rgba_f32_icc(icc),
+            ];
+
             let eval_col = |u: f64, v: f64| -> [f32; 4] {
                 let su = (u * u * (3.0 - 2.0 * u)) as f32;
                 let sv = (v * v * (3.0 - 2.0 * v)) as f32;
-                let mut out = [0.0_f32; 4];
-                for ch in 0..4 {
-                    let top = c00[ch] + (c10[ch] - c00[ch]) * su;
-                    let bot = c01[ch] + (c11[ch] - c01[ch]) * su;
-                    out[ch] = (top + (bot - top) * sv).clamp(0.0, 1.0);
+                let bilerp = |k00: f32, k10: f32, k01: f32, k11: f32| -> f32 {
+                    let top = k00 + (k10 - k00) * su;
+                    let bot = k01 + (k11 - k01) * su;
+                    top + (bot - top) * sv
+                };
+                let eff_a = bilerp(
+                    rgba_corners[0][3] * na00,
+                    rgba_corners[1][3] * na10,
+                    rgba_corners[2][3] * na01,
+                    rgba_corners[3][3] * na11,
+                )
+                .clamp(0.0, 1.0);
+                if all_cmyk {
+                    if let (
+                        Color::Cmyk {
+                            c: c00,
+                            m: m00,
+                            y: y00,
+                            k: k00,
+                            ..
+                        },
+                        Color::Cmyk {
+                            c: c10,
+                            m: m10,
+                            y: y10,
+                            k: k10,
+                            ..
+                        },
+                        Color::Cmyk {
+                            c: c01,
+                            m: m01,
+                            y: y01,
+                            k: k01,
+                            ..
+                        },
+                        Color::Cmyk {
+                            c: c11,
+                            m: m11,
+                            y: y11,
+                            k: k11,
+                            ..
+                        },
+                    ) = (col00, col10, col01, col11)
+                    {
+                        let cc = bilerp(*c00, *c10, *c01, *c11).clamp(0.0, 1.0);
+                        let mm = bilerp(*m00, *m10, *m01, *m11).clamp(0.0, 1.0);
+                        let yy = bilerp(*y00, *y10, *y01, *y11).clamp(0.0, 1.0);
+                        let kk = bilerp(*k00, *k10, *k01, *k11).clamp(0.0, 1.0);
+                        let rgb = icc.cmyk_to_srgb([cc, mm, yy, kk]);
+                        return [rgb[0], rgb[1], rgb[2], eff_a];
+                    }
                 }
-                out
+                if let Some(labs) = &lab_corners {
+                    let l =
+                        bilerp(labs[0][0], labs[1][0], labs[2][0], labs[3][0]).clamp(0.0, 100.0);
+                    let a = bilerp(labs[0][1], labs[1][1], labs[2][1], labs[3][1]);
+                    let b = bilerp(labs[0][2], labs[1][2], labs[2][2], labs[3][2]);
+                    let rgb = Color::Lab {
+                        l,
+                        a_ch: a,
+                        b_ch: b,
+                        alpha: eff_a,
+                    }
+                    .to_rgba_f32();
+                    return [rgb[0], rgb[1], rgb[2], eff_a];
+                }
+                [
+                    bilerp(
+                        rgba_corners[0][0],
+                        rgba_corners[1][0],
+                        rgba_corners[2][0],
+                        rgba_corners[3][0],
+                    )
+                    .clamp(0.0, 1.0),
+                    bilerp(
+                        rgba_corners[0][1],
+                        rgba_corners[1][1],
+                        rgba_corners[2][1],
+                        rgba_corners[3][1],
+                    )
+                    .clamp(0.0, 1.0),
+                    bilerp(
+                        rgba_corners[0][2],
+                        rgba_corners[1][2],
+                        rgba_corners[2][2],
+                        rgba_corners[3][2],
+                    )
+                    .clamp(0.0, 1.0),
+                    eff_a,
+                ]
             };
+
+            let patch_px_span = p00
+                .distance_to(p10)
+                .max(p01.distance_to(p11))
+                .max(p00.distance_to(p01))
+                .max(p10.distance_to(p11));
+            let sub_divs = (patch_px_span / 4.0).ceil().clamp(10.0, 24.0) as usize;
 
             for sv in 0..sub_divs {
                 let v0 = sv as f64 / sub_divs as f64;
@@ -7662,7 +8094,7 @@ fn rasterize_gouraud_triangle(
             let w0 = ((p1.x - px) * (p2.y - py) - (p2.x - px) * (p1.y - py)) * inv_area;
             let w1 = ((p2.x - px) * (p0.y - py) - (p0.x - px) * (p2.y - py)) * inv_area;
             let w2 = 1.0 - w0 - w1;
-            if w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4 {
+            if w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3 {
                 let raw0 = w0.clamp(0.0, 1.0) as f32;
                 let raw1 = w1.clamp(0.0, 1.0) as f32;
                 let raw2 = w2.clamp(0.0, 1.0) as f32;
@@ -7700,11 +8132,14 @@ pub(crate) fn draw_outline_styled(
     blend_mode: BlendMode,
     px_per_mm: f64,
     anti_alias: bool,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     if !outline.is_visible() || opacity <= 1e-6 || local_path.is_empty() {
         return;
     }
+    let resolved_outline = icc_outline(outline, icc);
+    let outline = &resolved_outline;
 
     // Choose whether stroke width scales with object transform or stays constant in page mm
     let (draw_path, draw_xf, effective_scale) = if outline.scale_with_object {
@@ -7975,7 +8410,7 @@ fn render_raster_object(
     let Ok(buf) = RgbaBuffer::from_vec(
         active_asset.width,
         active_asset.height,
-        active_asset.rgba_bytes.clone(),
+        active_asset.to_rgba8_vec(),
     ) else {
         return;
     };
@@ -8000,6 +8435,7 @@ pub(crate) fn render_page_surface(
     page_to_surface: Affine2D,
     px_per_mm: f64,
     options: &RenderOptions,
+    icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
     let page_rect = page.trim_rect();
@@ -8019,7 +8455,7 @@ pub(crate) fn render_page_surface(
     }
 
     if options.page_bg.alpha() > 1e-6 {
-        let page_paint = BackendPaint::solid(options.page_bg.clone());
+        let page_paint = BackendPaint::solid(icc_srgb(&options.page_bg, icc));
         backend.fill_path(&page_path, &page_paint, FillRule::Winding, page_to_surface);
     }
 
@@ -8648,7 +9084,7 @@ fn generate_two_color_pattern_tile(name: &str, fg: &Color, bg: &Color, size: u32
 
 /// Analytic resolution-independent PostScript procedural fill evaluator returning `0.0..=1.0`
 /// (`0.0` = background color, `1.0` = foreground color) with smooth `aa_mm` anti-aliased edges.
-fn eval_postscript_fill(
+pub(crate) fn eval_postscript_fill(
     preset: PostScriptFillPreset,
     seed: u64,
     pt: Point2D,
@@ -8812,7 +9248,7 @@ fn eval_postscript_fill(
 }
 
 /// Deterministic 2D value-noise FBM procedural texture evaluator returning `0.0..=1.0`.
-fn eval_procedural_texture(preset: &str, seed: u64, x: f64, y: f64) -> f32 {
+pub(crate) fn eval_procedural_texture(preset: &str, seed: u64, x: f64, y: f64) -> f32 {
     let fx = x * 0.15;
     let fy = y * 0.15;
     let n = fbm2d(fx, fy, seed, 4);
@@ -8875,23 +9311,6 @@ fn hash_grid(ix: i64, iy: i64, seed: u64) -> f64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^= z >> 31;
     (z as f64) / (u64::MAX as f64)
-}
-
-#[inline]
-fn catmull_rom_pt(p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64) -> Point2D {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let x = 0.5
-        * ((2.0 * p1.x)
-            + (-p0.x + p2.x) * t
-            + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
-            + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
-    let y = 0.5
-        * ((2.0 * p1.y)
-            + (-p0.y + p2.y) * t
-            + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
-            + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
-    Point2D::new(x, y)
 }
 
 #[inline]
@@ -9028,6 +9447,7 @@ mod tests {
                     steps: 120,
                     rotation_deg: 0.0,
                     along_path: None,
+                    rotate_along_path: true,
                 },
             },
         )

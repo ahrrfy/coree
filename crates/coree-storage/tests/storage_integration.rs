@@ -169,10 +169,20 @@ fn sqlite_schema_matches_all_tables_columns_constraints_and_cascades() {
                 "is_variable",
                 "supports_arabic_rtl",
                 "supports_kashida",
+                "panose_hex",
                 "collection_tag",
                 "favorite",
                 "file_mtime_epoch",
                 "indexed_at",
+            ],
+        ),
+        (
+            "font_substitutions",
+            &[
+                "missing_family",
+                "substitute_family",
+                "panose_hex",
+                "updated_at",
             ],
         ),
         (
@@ -878,6 +888,14 @@ fn w1b_wal_snapshot_and_command_journal_replay_new_ops() {
             metadata: None,
             custom_icc_profile: None,
             clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
         },
         CommandOp::SetPageProperties {
             page_id: p1_id,
@@ -1355,6 +1373,7 @@ fn wal_delete_page_cross_page_relational_cleanup_parity() {
         steps: 5,
         rotation_deg: 0.0,
         along_path: Some(p2_path),
+        rotate_along_path: true,
     });
     let blend_id = base.add_object(blend_obj, Some(p1_layer)).unwrap();
     let top_id = base

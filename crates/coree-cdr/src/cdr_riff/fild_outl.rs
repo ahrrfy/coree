@@ -407,12 +407,7 @@ pub(crate) fn parse_real_fild_v16(data: &[u8]) -> CdrResult<(u32, Fill, bool)> {
                     .map(|(i, (_, color))| {
                         let r = i / 2;
                         let c = i % 2;
-                        MeshNode {
-                            row: r,
-                            col: c,
-                            pos: Point2D::new(c as f64, r as f64),
-                            color,
-                        }
+                        MeshNode::new(r, c, Point2D::new(c as f64, r as f64), color)
                     })
                     .collect();
                 Fill::MeshFill {
@@ -562,12 +557,46 @@ fn parse_fild_chunk_clean(
                 let x = cdr32_to_mm(r.read_i32_le("mesh x")?);
                 let y = cdr32_to_mm(r.read_i32_le("mesh y")?);
                 let color = read_tagged_color(&mut r, "mesh color")?;
-                nodes.push(MeshNode {
-                    row,
-                    col,
-                    pos: Point2D::new(x, y),
-                    color,
-                });
+                nodes.push(MeshNode::new(row, col, Point2D::new(x, y), color));
+            }
+            // Optional MSH2 extension block storing per-node `alpha` + `handle_n/s/e/w`
+            // (preserving full backward compatibility with legacy type-9 chunks).
+            if r.remaining() >= 4 + count.saturating_mul(5) {
+                let tag = r.read_array::<4>("mesh ext tag")?;
+                if &tag == b"MSH2" {
+                    for node in &mut nodes {
+                        if r.remaining() < 5 {
+                            break;
+                        }
+                        let raw_alpha = f32::from_le_bytes(r.read_array::<4>("mesh alpha")?);
+                        node.alpha = if raw_alpha.is_finite() {
+                            raw_alpha.clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let mask = r.read_u8("mesh handle mask")?;
+                        if (mask & 0x01) != 0 && r.remaining() >= 8 {
+                            let hx = cdr32_to_mm(r.read_i32_le("mesh handle_n x")?);
+                            let hy = cdr32_to_mm(r.read_i32_le("mesh handle_n y")?);
+                            node.handle_n = Some(Point2D::new(hx, hy));
+                        }
+                        if (mask & 0x02) != 0 && r.remaining() >= 8 {
+                            let hx = cdr32_to_mm(r.read_i32_le("mesh handle_s x")?);
+                            let hy = cdr32_to_mm(r.read_i32_le("mesh handle_s y")?);
+                            node.handle_s = Some(Point2D::new(hx, hy));
+                        }
+                        if (mask & 0x04) != 0 && r.remaining() >= 8 {
+                            let hx = cdr32_to_mm(r.read_i32_le("mesh handle_e x")?);
+                            let hy = cdr32_to_mm(r.read_i32_le("mesh handle_e y")?);
+                            node.handle_e = Some(Point2D::new(hx, hy));
+                        }
+                        if (mask & 0x08) != 0 && r.remaining() >= 8 {
+                            let hx = cdr32_to_mm(r.read_i32_le("mesh handle_w x")?);
+                            let hy = cdr32_to_mm(r.read_i32_le("mesh handle_w y")?);
+                            node.handle_w = Some(Point2D::new(hx, hy));
+                        }
+                    }
+                }
             }
             Fill::MeshFill { rows, cols, nodes }
         }
@@ -1120,6 +1149,27 @@ pub(crate) fn encode_fild_chunk(
                 out.extend_from_slice(&mm_to_cdr32(n.pos.x).to_le_bytes());
                 out.extend_from_slice(&mm_to_cdr32(n.pos.y).to_le_bytes());
                 write_tagged_color(&mut out, &n.color);
+            }
+            out.extend_from_slice(b"MSH2");
+            for n in &nodes[..count] {
+                let alpha = if n.alpha.is_finite() {
+                    n.alpha.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                out.extend_from_slice(&alpha.to_le_bytes());
+                let mask = u8::from(n.handle_n.is_some())
+                    | (u8::from(n.handle_s.is_some()) << 1)
+                    | (u8::from(n.handle_e.is_some()) << 2)
+                    | (u8::from(n.handle_w.is_some()) << 3);
+                out.push(mask);
+                for h in [n.handle_n, n.handle_s, n.handle_e, n.handle_w]
+                    .into_iter()
+                    .flatten()
+                {
+                    out.extend_from_slice(&mm_to_cdr32(h.x).to_le_bytes());
+                    out.extend_from_slice(&mm_to_cdr32(h.y).to_le_bytes());
+                }
             }
         }
         Fill::VectorPattern {

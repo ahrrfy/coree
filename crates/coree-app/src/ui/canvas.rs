@@ -535,6 +535,14 @@ fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                     metadata: None,
                     custom_icc_profile: None,
                     clear_custom_icc: false,
+                    rgb_icc_profile: None,
+                    clear_rgb_icc: false,
+                    cmyk_icc_profile: None,
+                    clear_cmyk_icc: false,
+                    gray_icc_profile: None,
+                    clear_gray_icc: false,
+                    rendering_intent: None,
+                    black_point_compensation: None,
                 });
             }
             if let Some(idx) = duplicate_page_req {
@@ -2008,7 +2016,8 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
         }
     } else if app.active_tool == ToolId::MeshFill && !tab.selection.objects.is_empty() {
         let active_mesh_drag_oid = match &tab.tool_core.drag_state {
-            ActiveDragState::DraggingMeshNode { object_id, .. } => Some(*object_id),
+            ActiveDragState::DraggingMeshNode { object_id, .. }
+            | ActiveDragState::DraggingMeshHandle { object_id, .. } => Some(*object_id),
             _ => None,
         };
         for oid in collect_editable_fillable_targets(&tab.document, &tab.selection.objects) {
@@ -2041,6 +2050,33 @@ fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect: Rect) {
                     }
                     for (idx, (mn, &sp)) in nodes.iter().zip(spts.iter()).enumerate() {
                         let is_sel = tab.selected_mesh_node == Some((oid, idx));
+                        if is_sel {
+                            for rel in [mn.handle_n, mn.handle_s, mn.handle_e, mn.handle_w]
+                                .into_iter()
+                                .flatten()
+                            {
+                                let h_world = world_xf.transform_point(Point2D::new(
+                                    mn.pos.x + rel.x,
+                                    mn.pos.y + rel.y,
+                                ));
+                                let hsp = world_to_screen(canvas_rect, tab, h_world);
+                                painter.line_segment(
+                                    [sp, hsp],
+                                    Stroke::new(1.2, tokens.accent_secondary),
+                                );
+                                let diamond = vec![
+                                    hsp + vec2(0.0, -5.0),
+                                    hsp + vec2(5.0, 0.0),
+                                    hsp + vec2(0.0, 5.0),
+                                    hsp + vec2(-5.0, 0.0),
+                                ];
+                                painter.add(Shape::convex_polygon(
+                                    diamond,
+                                    Color32::WHITE,
+                                    Stroke::new(1.4, tokens.accent_secondary),
+                                ));
+                            }
+                        }
                         painter.circle(
                             sp,
                             if is_sel { 5.5 } else { 4.2 },

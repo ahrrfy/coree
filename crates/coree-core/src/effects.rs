@@ -62,6 +62,10 @@ pub struct ExtrudeLight {
     pub intensity: f32,
 }
 
+const fn default_true_blend() -> bool {
+    true
+}
+
 /// Transparency alpha distribution across an object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransparencyMode {
@@ -77,6 +81,32 @@ pub enum TransparencyMode {
         radius: f64,
         inner_alpha: f32,
         outer_alpha: f32,
+    },
+    Pattern {
+        pattern_name: String,
+        tile_w: f64,
+        tile_h: f64,
+        fg_opacity: f32,
+        bg_opacity: f32,
+    },
+    Texture {
+        preset: String,
+        scale: f64,
+        fg_opacity: f32,
+        bg_opacity: f32,
+    },
+    Conical {
+        center: Point2D,
+        angle_deg: f64,
+        start_opacity: f32,
+        end_opacity: f32,
+    },
+    Square {
+        center: Point2D,
+        size: f64,
+        angle_deg: f64,
+        start_opacity: f32,
+        end_opacity: f32,
     },
 }
 
@@ -110,6 +140,8 @@ pub enum Effect {
         steps: u32,
         rotation_deg: f64,
         along_path: Option<ObjectId>,
+        #[serde(default = "default_true_blend")]
+        rotate_along_path: bool,
     },
     Distort {
         kind: DistortKind,
@@ -389,6 +421,12 @@ pub enum RasterFilter {
     EdgeDetect {
         sensitivity: f32,
     },
+    ChannelMixer {
+        red: [f32; 3],
+        green: [f32; 3],
+        blue: [f32; 3],
+        monochrome: bool,
+    },
 }
 
 #[cfg(test)]
@@ -426,6 +464,7 @@ mod tests {
                 steps: 10,
                 rotation_deg: 0.0,
                 along_path: None,
+                rotate_along_path: true,
             },
             Effect::Distort {
                 kind: DistortKind::Twister,

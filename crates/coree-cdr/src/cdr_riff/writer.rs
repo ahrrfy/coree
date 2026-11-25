@@ -304,7 +304,8 @@ pub(crate) fn render_doc_mini_thumbnail_rgba(doc: &Document, w: u32, h: u32) -> 
 }
 
 fn encode_bmp_chunk_payload(bmp_id: u32, asset: &RasterAsset) -> CdrResult<Vec<u8>> {
-    let dib = encode_dib_rgba(asset.width, asset.height, &asset.rgba_bytes)?;
+    let rgba = asset.to_rgba8_vec();
+    let dib = encode_dib_rgba(asset.width, asset.height, &rgba)?;
     let dpi_x100 = (sanitize_f32(asset.source_dpi, 300.0).max(1.0) * 100.0).round() as u32;
     let cm_byte = if asset.color_mode == ColorMode::Rgb {
         1u8
@@ -783,6 +784,9 @@ fn encode_lens_chunk(lens: &LensConfig) -> Vec<u8> {
     if lens.viewpoint.is_some() {
         flags |= 0x04;
     }
+    if lens.frozen_snapshot.is_some() {
+        flags |= 0x08;
+    }
     out.push(flags);
     if let Some(vp) = lens.viewpoint {
         out.extend_from_slice(&mm_to_cdr32(vp.x).to_le_bytes());
@@ -848,6 +852,13 @@ fn encode_lens_chunk(lens: &LensConfig) -> Vec<u8> {
             } else {
                 out.push(0);
             }
+        }
+    }
+    if let Some(ref snap) = lens.frozen_snapshot {
+        let len_u32 = u32::try_from(snap.len()).unwrap_or(0);
+        out.extend_from_slice(&len_u32.to_le_bytes());
+        if len_u32 as usize == snap.len() {
+            out.extend_from_slice(snap);
         }
     }
     out

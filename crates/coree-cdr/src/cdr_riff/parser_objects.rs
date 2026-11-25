@@ -812,6 +812,7 @@ pub(super) fn parse_lens_chunk(data: &[u8]) -> CdrResult<LensConfig> {
     let frozen = (flags & 0x01) != 0;
     let remove_face = (flags & 0x02) != 0;
     let has_viewpoint = (flags & 0x04) != 0;
+    let has_frozen_snapshot = (flags & 0x08) != 0;
     let viewpoint = if has_viewpoint {
         let vx = cdr32_to_mm(r.read_i32_le("lens vp x")?);
         let vy = cdr32_to_mm(r.read_i32_le("lens vp y")?);
@@ -892,10 +893,22 @@ pub(super) fn parse_lens_chunk(data: &[u8]) -> CdrResult<LensConfig> {
         }
     };
 
+    let frozen_snapshot = if has_frozen_snapshot && r.remaining() >= 4 {
+        let snap_len = r.read_u32_le("lens frozen_snapshot len")? as usize;
+        if snap_len > 0 && snap_len <= r.remaining() && snap_len <= 32 * 1024 * 1024 {
+            Some(r.read_bytes(snap_len, "lens frozen_snapshot")?.to_vec())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(LensConfig {
         kind: kind.clamped(),
         frozen,
         viewpoint,
         remove_face,
+        frozen_snapshot,
     })
 }

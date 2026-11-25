@@ -1157,11 +1157,14 @@ pub fn find_nearest_object_anchor_in_doc(
         .map(|(anc, pos)| (oid, anc, pos))
 }
 
-/// Builds a default `MeshFill` grid in object-local coordinates (`rows` x `cols`, clamped `2..=32`).
+/// Builds a default `MeshFill` grid in object-local coordinates (`rows` x `cols`, clamped `2..=32`)
+/// with default `1/3`-chord neighbor Coons tangent handles (`N`/`S`/`E`/`W`).
 #[must_use]
 pub fn build_mesh_fill_for_bounds(local_bounds: Rect2D, rows: usize, cols: usize) -> Fill {
     let rows = rows.clamp(2, 32);
     let cols = cols.clamp(2, 32);
+    let dx = local_bounds.width() / (cols - 1) as f64;
+    let dy = local_bounds.height() / (rows - 1) as f64;
     let mut nodes = Vec::with_capacity(rows * cols);
     for r in 0..rows {
         let v = r as f64 / (rows - 1) as f64;
@@ -1177,6 +1180,11 @@ pub fn build_mesh_fill_for_bounds(local_bounds: Rect2D, rows: usize, cols: usize
                 col: c,
                 pos,
                 color,
+                alpha: 1.0,
+                handle_n: (r > 0).then(|| Point2D::new(0.0, -dy / 3.0)),
+                handle_s: (r + 1 < rows).then(|| Point2D::new(0.0, dy / 3.0)),
+                handle_e: (c + 1 < cols).then(|| Point2D::new(dx / 3.0, 0.0)),
+                handle_w: (c > 0).then(|| Point2D::new(-dx / 3.0, 0.0)),
             });
         }
     }

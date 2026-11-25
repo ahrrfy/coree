@@ -1375,8 +1375,8 @@ mod tests {
         .unwrap();
         let pg = parse_cpt_bytes(&b_gray, &CodecLimits::default()).unwrap();
         let a_g = pg.document.assets().values().next().unwrap();
-        assert_eq!(&a_g.rgba_bytes[0..4], &[255, 255, 255, 255]);
-        assert_eq!(&a_g.rgba_bytes[4..8], &[128, 128, 128, 255]);
+        assert_eq!(&a_g.to_rgba8_vec()[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&a_g.to_rgba8_vec()[4..8], &[128, 128, 128, 255]);
 
         // 2) Rgb48
         let rgb48: Vec<u8> = [0xFFFFu16, 0x0000u16, 0x4000u16]
@@ -1410,7 +1410,7 @@ mod tests {
         .unwrap();
         let pr = parse_cpt_bytes(&b_rgb, &CodecLimits::default()).unwrap();
         let a_r = pr.document.assets().values().next().unwrap();
-        assert_eq!(&a_r.rgba_bytes[0..4], &[255, 0, 64, 255]);
+        assert_eq!(&a_r.to_rgba8_vec()[0..4], &[255, 0, 64, 255]);
 
         // 3) Rgba64 & Cmyk64
         let rgba64: Vec<u8> = [0x8000u16, 0x4000u16, 0x2000u16, 0xC000u16]
@@ -1443,7 +1443,7 @@ mod tests {
         .unwrap();
         let pra = parse_cpt_bytes(&b_rgba, &CodecLimits::default()).unwrap();
         let a_ra = pra.document.assets().values().next().unwrap();
-        assert_eq!(&a_ra.rgba_bytes[0..4], &[128, 64, 32, 192]);
+        assert_eq!(&a_ra.to_rgba8_vec()[0..4], &[128, 64, 32, 192]);
 
         let cmyk64: Vec<u8> = [0x0000u16, 0xFFFFu16, 0xFFFFu16, 0x0000u16]
             .iter()

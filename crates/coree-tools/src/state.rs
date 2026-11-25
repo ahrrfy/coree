@@ -219,6 +219,13 @@ pub enum ActiveDragState {
         orig_fill: Fill,
         draft_fill: Fill,
     },
+    DraggingMeshHandle {
+        object_id: ObjectId,
+        node_index: usize,
+        handle_slot: u8, // 0=N, 1=S, 2=E, 3=W
+        orig_fill: Fill,
+        draft_fill: Fill,
+    },
     DrawingBox {
         start_mm: Point2D,
         current_mm: Point2D,
@@ -1525,6 +1532,43 @@ impl ToolCore {
                         if let Fill::MeshFill { nodes, .. } = &obj.fill {
                             let world_xf = world_transform_of_or_local(ctx.document, oid);
                             let node_tol = ctx.hit_tol_mm(9.0, 0.8);
+                            if let Some((sel_oid, sel_idx)) = self.selected_mesh_node {
+                                if sel_oid == oid {
+                                    if let Some(mnode) = nodes.get(sel_idx) {
+                                        for (slot, opt_h) in [
+                                            (0u8, mnode.handle_n),
+                                            (1u8, mnode.handle_s),
+                                            (2u8, mnode.handle_e),
+                                            (3u8, mnode.handle_w),
+                                        ] {
+                                            if let Some(rel) = opt_h {
+                                                let abs_h = Point2D::new(
+                                                    mnode.pos.x + rel.x,
+                                                    mnode.pos.y + rel.y,
+                                                );
+                                                if world_xf.transform_point(abs_h).distance_to(pt)
+                                                    <= node_tol
+                                                {
+                                                    self.drag_state =
+                                                        ActiveDragState::DraggingMeshHandle {
+                                                            object_id: oid,
+                                                            node_index: sel_idx,
+                                                            handle_slot: slot,
+                                                            orig_fill: obj.fill.clone(),
+                                                            draft_fill: obj.fill.clone(),
+                                                        };
+                                                    let overlay = self
+                                                        .finalize_overlay(self.build_overlay(ctx));
+                                                    return ToolOutput::Consumed {
+                                                        overlay: Some(overlay),
+                                                        actions,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             for (n_idx, mnode) in nodes.iter().enumerate() {
                                 if world_xf.transform_point(mnode.pos).distance_to(pt) <= node_tol {
                                     self.selected_mesh_node = Some((oid, n_idx));
@@ -2117,6 +2161,29 @@ impl ToolCore {
                     }
                 }
             }
+            ActiveDragState::DraggingMeshHandle {
+                object_id,
+                node_index,
+                handle_slot,
+                draft_fill,
+                ..
+            } => {
+                if is_object_editable_in_doc(ctx.document, *object_id) {
+                    let inv = world_inverse_transform_of(ctx.document, *object_id);
+                    let local_pt = inv.transform_point(pt);
+                    if let Fill::MeshFill { nodes, .. } = draft_fill {
+                        if let Some(mn) = nodes.get_mut(*node_index) {
+                            let rel = Point2D::new(local_pt.x - mn.pos.x, local_pt.y - mn.pos.y);
+                            match *handle_slot {
+                                0 => mn.handle_n = Some(rel),
+                                1 => mn.handle_s = Some(rel),
+                                2 => mn.handle_e = Some(rel),
+                                _ => mn.handle_w = Some(rel),
+                            }
+                        }
+                    }
+                }
+            }
             ActiveDragState::DraggingEffectHandle {
                 object_id,
                 draft_effect,
@@ -2616,6 +2683,12 @@ impl ToolCore {
                 ..
             }
             | ActiveDragState::DraggingMeshNode {
+                object_id,
+                orig_fill,
+                mut draft_fill,
+                ..
+            }
+            | ActiveDragState::DraggingMeshHandle {
                 object_id,
                 orig_fill,
                 mut draft_fill,
@@ -3541,7 +3614,17 @@ impl ToolCore {
                 node_index,
                 draft_fill,
                 ..
+            }
+            | ActiveDragState::DraggingMeshHandle {
+                object_id,
+                node_index,
+                draft_fill,
+                ..
             } => {
+                let active_handle_slot = match &self.drag_state {
+                    ActiveDragState::DraggingMeshHandle { handle_slot, .. } => Some(*handle_slot),
+                    _ => None,
+                };
                 let xf = world_transform_of_or_local(ctx.document, *object_id);
                 if let Fill::MeshFill { rows, cols, nodes } = draft_fill {
                     let wpts: Vec<Point2D> =
@@ -3560,6 +3643,33 @@ impl ToolCore {
                                     BezierPath::from_line(wpts[idx], wpts[idx + cols]),
                                     OverlayStrokeKind::Accent,
                                 ));
+                            }
+                        }
+                    }
+                    if let (Some(sel_mn), Some(&node_wpt)) =
+                        (nodes.get(*node_index), wpts.get(*node_index))
+                    {
+                        for (slot, opt_h) in [
+                            (0u8, sel_mn.handle_n),
+                            (1u8, sel_mn.handle_s),
+                            (2u8, sel_mn.handle_e),
+                            (3u8, sel_mn.handle_w),
+                        ] {
+                            if let Some(rel) = opt_h {
+                                let h_wpt = xf.transform_point(Point2D::new(
+                                    sel_mn.pos.x + rel.x,
+                                    sel_mn.pos.y + rel.y,
+                                ));
+                                preview_paths.push(OverlayPath::stroke(
+                                    BezierPath::from_line(node_wpt, h_wpt),
+                                    OverlayStrokeKind::Secondary,
+                                ));
+                                preview_handles.push(OverlayHandle {
+                                    pos_mm: h_wpt,
+                                    shape: HandleShape::Diamond,
+                                    selected: active_handle_slot == Some(slot),
+                                    color_hint: None,
+                                });
                             }
                         }
                     }

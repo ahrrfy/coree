@@ -17,6 +17,7 @@ use crate::find_replace::{find_and_replace, FindQuery, ReplaceAction};
 use crate::geometry::{
     ArtisticMedia, ArtisticMediaStyle, BSplineCurve, BezierPath, ParametricShape,
 };
+use crate::icc::RenderingIntent;
 use crate::ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 use crate::lens::{LensConfig, LensKind};
 use crate::math::{Affine2D, Perspective3x3, Point2D, Rect2D, Unit, Vec2D};
@@ -247,6 +248,22 @@ pub enum CommandOp {
         custom_icc_profile: Option<Vec<u8>>,
         #[serde(default)]
         clear_custom_icc: bool,
+        #[serde(default)]
+        rgb_icc_profile: Option<Vec<u8>>,
+        #[serde(default)]
+        clear_rgb_icc: bool,
+        #[serde(default)]
+        cmyk_icc_profile: Option<Vec<u8>>,
+        #[serde(default)]
+        clear_cmyk_icc: bool,
+        #[serde(default)]
+        gray_icc_profile: Option<Vec<u8>>,
+        #[serde(default)]
+        clear_gray_icc: bool,
+        #[serde(default)]
+        rendering_intent: Option<RenderingIntent>,
+        #[serde(default)]
+        black_point_compensation: Option<bool>,
     },
     SetPageProperties {
         page_id: PageId,
@@ -564,9 +581,15 @@ fn fill_is_finite(fill: &Fill) -> bool {
             tile_w.is_finite() && tile_h.is_finite()
         }
         Fill::TextureFill { fg, bg, .. } => color_is_finite(fg) && color_is_finite(bg),
-        Fill::MeshFill { nodes, .. } => nodes
-            .iter()
-            .all(|n| n.pos.is_finite() && color_is_finite(&n.color)),
+        Fill::MeshFill { nodes, .. } => nodes.iter().all(|n| {
+            n.pos.is_finite()
+                && color_is_finite(&n.color)
+                && n.alpha.is_finite()
+                && n.handle_n.is_none_or(Point2D::is_finite)
+                && n.handle_s.is_none_or(Point2D::is_finite)
+                && n.handle_e.is_none_or(Point2D::is_finite)
+                && n.handle_w.is_none_or(Point2D::is_finite)
+        }),
     }
 }
 
@@ -607,11 +630,18 @@ fn text_style_is_finite(s: &TextStyle) -> bool {
         && s.letter_spacing_mm.is_finite()
         && s.line_height_ratio.is_finite()
         && s.kashida_stretch.is_finite()
+        && s.variation_axes.iter().all(|(_, v)| v.is_finite())
         && color_is_finite(&s.fill)
 }
 
 fn lens_is_finite(l: &LensConfig) -> bool {
     if !l.viewpoint.is_none_or(Point2D::is_finite) {
+        return false;
+    }
+    if l.frozen_snapshot
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > 32 * 1024 * 1024)
+    {
         return false;
     }
     match &l.kind {
@@ -714,6 +744,48 @@ fn effect_is_finite(e: &Effect) -> bool {
                     && radius.is_finite()
                     && inner_alpha.is_finite()
                     && outer_alpha.is_finite()
+            }
+            TransparencyMode::Pattern {
+                tile_w,
+                tile_h,
+                fg_opacity,
+                bg_opacity,
+                ..
+            } => {
+                tile_w.is_finite()
+                    && tile_h.is_finite()
+                    && fg_opacity.is_finite()
+                    && bg_opacity.is_finite()
+            }
+            TransparencyMode::Texture {
+                scale,
+                fg_opacity,
+                bg_opacity,
+                ..
+            } => scale.is_finite() && fg_opacity.is_finite() && bg_opacity.is_finite(),
+            TransparencyMode::Conical {
+                center,
+                angle_deg,
+                start_opacity,
+                end_opacity,
+            } => {
+                center.is_finite()
+                    && angle_deg.is_finite()
+                    && start_opacity.is_finite()
+                    && end_opacity.is_finite()
+            }
+            TransparencyMode::Square {
+                center,
+                size,
+                angle_deg,
+                start_opacity,
+                end_opacity,
+            } => {
+                center.is_finite()
+                    && size.is_finite()
+                    && angle_deg.is_finite()
+                    && start_opacity.is_finite()
+                    && end_opacity.is_finite()
             }
         },
         Effect::Perspective { quad } => quad.iter().all(|p| p.is_finite()),
@@ -828,6 +900,13 @@ fn raster_filter_is_finite(f: &RasterFilter) -> bool {
         } => strength.is_finite() && radius.is_finite() && feather.is_finite(),
         RasterFilter::Emboss { angle_deg, depth } => angle_deg.is_finite() && depth.is_finite(),
         RasterFilter::EdgeDetect { sensitivity } => sensitivity.is_finite(),
+        RasterFilter::ChannelMixer {
+            red, green, blue, ..
+        } => red
+            .iter()
+            .chain(green.iter())
+            .chain(blue.iter())
+            .all(|v| v.is_finite()),
     }
 }
 
@@ -838,6 +917,7 @@ fn text_payload_is_finite(payload: &NodePayload) -> bool {
             p.frame_size.is_finite()
                 && p.column_gutter_mm.is_finite()
                 && p.drop_cap.is_none_or(|dc| dc.gap_mm.is_finite())
+                && p.tab_stops_mm.iter().all(|ts| ts.position_mm.is_finite())
                 && p.runs.iter().all(|r| text_style_is_finite(&r.style))
         }
         NodePayload::TextOnPath(top) => {
@@ -1296,8 +1376,17 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                             transform_angle_deg(angle_deg);
                         }
                         Fill::MeshFill { nodes, .. } => {
+                            let xform_vec = |v: Point2D| {
+                                let origin = bake_xf.transform_point(Point2D::ZERO);
+                                let d = bake_xf.transform_point(v) - origin;
+                                Point2D::new(d.x, d.y)
+                            };
                             for node in nodes {
                                 node.pos = bake_xf.transform_point(node.pos);
+                                node.handle_n = node.handle_n.map(xform_vec);
+                                node.handle_s = node.handle_s.map(xform_vec);
+                                node.handle_e = node.handle_e.map(xform_vec);
+                                node.handle_w = node.handle_w.map(xform_vec);
                             }
                         }
                         _ => {}
@@ -1326,6 +1415,35 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                                     *center = bake_xf.transform_point(*center);
                                     if avg_scale.is_finite() && avg_scale > 1e-9 {
                                         *radius *= avg_scale;
+                                    }
+                                }
+                                TransparencyMode::Conical {
+                                    center, angle_deg, ..
+                                } => {
+                                    *center = bake_xf.transform_point(*center);
+                                    transform_angle_deg(angle_deg);
+                                }
+                                TransparencyMode::Square {
+                                    center,
+                                    size,
+                                    angle_deg,
+                                    ..
+                                } => {
+                                    *center = bake_xf.transform_point(*center);
+                                    if avg_scale.is_finite() && avg_scale > 1e-9 {
+                                        *size *= avg_scale;
+                                    }
+                                    transform_angle_deg(angle_deg);
+                                }
+                                TransparencyMode::Pattern { tile_w, tile_h, .. } => {
+                                    if avg_scale.is_finite() && avg_scale > 1e-9 {
+                                        *tile_w *= avg_scale;
+                                        *tile_h *= avg_scale;
+                                    }
+                                }
+                                TransparencyMode::Texture { scale, .. } => {
+                                    if avg_scale.is_finite() && avg_scale > 1e-9 {
+                                        *scale *= avg_scale;
                                     }
                                 }
                                 TransparencyMode::Uniform(_) => {}
@@ -1880,6 +1998,14 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
             metadata,
             custom_icc_profile,
             clear_custom_icc,
+            rgb_icc_profile,
+            clear_rgb_icc,
+            cmyk_icc_profile,
+            clear_cmyk_icc,
+            gray_icc_profile,
+            clear_gray_icc,
+            rendering_intent,
+            black_point_compensation,
         } => {
             if let Some(d) = dpi {
                 if !d.is_finite() || *d < 1.0 || *d > 2400.0 {
@@ -1898,6 +2024,27 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                 doc.set_custom_icc_profile(bytes.clone())?;
             } else if *clear_custom_icc {
                 doc.clear_custom_icc_profile();
+            }
+            if let Some(bytes) = rgb_icc_profile {
+                doc.set_rgb_icc_profile(bytes.clone())?;
+            } else if *clear_rgb_icc {
+                doc.clear_rgb_icc_profile();
+            }
+            if let Some(bytes) = cmyk_icc_profile {
+                doc.set_cmyk_icc_profile(bytes.clone())?;
+            } else if *clear_cmyk_icc {
+                doc.clear_cmyk_icc_profile();
+            }
+            if let Some(bytes) = gray_icc_profile {
+                doc.set_gray_icc_profile(bytes.clone())?;
+            } else if *clear_gray_icc {
+                doc.clear_gray_icc_profile();
+            }
+            if let Some(intent) = rendering_intent {
+                doc.set_rendering_intent(*intent);
+            }
+            if let Some(bpc) = black_point_compensation {
+                doc.set_black_point_compensation(*bpc);
             }
             if let Some(t) = title {
                 doc.set_title(t.clone());
@@ -2405,13 +2552,13 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
         CommandOp::RegisterAsset { asset } => {
             let expected = (asset.width as usize)
                 .checked_mul(asset.height as usize)
-                .and_then(|px| px.checked_mul(4));
-            if expected != Some(asset.rgba_bytes.len()) {
+                .and_then(|px| px.checked_mul(asset.pixel_depth().bytes_per_pixel()));
+            if expected != Some(asset.byte_len()) || !asset.has_valid_layout() {
                 return Err(CoreError::InvalidParameter(format!(
-                    "raster asset RGBA byte length mismatch for {}x{}: got {}",
+                    "raster asset byte length/layout mismatch for {}x{}: got {}",
                     asset.width,
                     asset.height,
-                    asset.rgba_bytes.len()
+                    asset.byte_len()
                 )));
             }
             if !asset.source_dpi.is_finite() || asset.source_dpi <= 0.0 {
@@ -2557,6 +2704,14 @@ struct DocumentDelta {
     unknown_data_files: UnknownDataFilesDelta,
     custom_icc_profile: CustomIccBytesDelta,
     custom_icc_name: Option<(Option<String>, Option<String>)>,
+    rgb_icc_profile: CustomIccBytesDelta,
+    rgb_icc_name: Option<(Option<String>, Option<String>)>,
+    cmyk_icc_profile: CustomIccBytesDelta,
+    cmyk_icc_name: Option<(Option<String>, Option<String>)>,
+    gray_icc_profile: CustomIccBytesDelta,
+    gray_icc_name: Option<(Option<String>, Option<String>)>,
+    rendering_intent: Option<(RenderingIntent, RenderingIntent)>,
+    black_point_compensation: Option<(bool, bool)>,
     next_id: Option<(u64, u64)>,
 }
 
@@ -2588,6 +2743,14 @@ struct DocumentStateSnapshot {
     unknown_data_files: BTreeMap<String, Vec<u8>>,
     custom_icc_profile: Option<Vec<u8>>,
     custom_icc_name: Option<String>,
+    rgb_icc_profile: Option<Vec<u8>>,
+    rgb_icc_name: Option<String>,
+    cmyk_icc_profile: Option<Vec<u8>>,
+    cmyk_icc_name: Option<String>,
+    gray_icc_profile: Option<Vec<u8>>,
+    gray_icc_name: Option<String>,
+    rendering_intent: RenderingIntent,
+    black_point_compensation: bool,
     next_id: u64,
 }
 
@@ -2616,6 +2779,14 @@ impl DocumentStateSnapshot {
             unknown_data_files: doc.unknown_data_files().clone(),
             custom_icc_profile: doc.custom_icc_profile().map(<[u8]>::to_vec),
             custom_icc_name: doc.custom_icc_name().map(str::to_owned),
+            rgb_icc_profile: doc.rgb_icc_profile().map(<[u8]>::to_vec),
+            rgb_icc_name: doc.rgb_icc_name().map(str::to_owned),
+            cmyk_icc_profile: doc.cmyk_icc_profile().map(<[u8]>::to_vec),
+            cmyk_icc_name: doc.cmyk_icc_name().map(str::to_owned),
+            gray_icc_profile: doc.gray_icc_profile().map(<[u8]>::to_vec),
+            gray_icc_name: doc.gray_icc_name().map(str::to_owned),
+            rendering_intent: doc.rendering_intent(),
+            black_point_compensation: doc.black_point_compensation(),
             next_id: doc.next_id(),
         }
     }
@@ -2644,6 +2815,11 @@ impl DocumentStateSnapshot {
             self.custom_icc_profile.clone(),
             self.custom_icc_name.clone(),
         );
+        doc.set_rgb_icc_raw(self.rgb_icc_profile.clone(), self.rgb_icc_name.clone());
+        doc.set_cmyk_icc_raw(self.cmyk_icc_profile.clone(), self.cmyk_icc_name.clone());
+        doc.set_gray_icc_raw(self.gray_icc_profile.clone(), self.gray_icc_name.clone());
+        doc.set_rendering_intent_raw(self.rendering_intent);
+        doc.set_bpc_raw(self.black_point_compensation);
         doc.set_next_id_raw(self.next_id);
         // Restore exact metadata (including `modified_at`) last so setters above do not perturb it.
         *doc.metadata_mut() = self.metadata.clone();
@@ -2730,6 +2906,12 @@ impl DocumentStateSnapshot {
 
         let after_icc_profile = after.custom_icc_profile().map(<[u8]>::to_vec);
         let after_icc_name = after.custom_icc_name().map(str::to_owned);
+        let after_rgb_prof = after.rgb_icc_profile().map(<[u8]>::to_vec);
+        let after_rgb_name = after.rgb_icc_name().map(str::to_owned);
+        let after_cmyk_prof = after.cmyk_icc_profile().map(<[u8]>::to_vec);
+        let after_cmyk_name = after.cmyk_icc_name().map(str::to_owned);
+        let after_gray_prof = after.gray_icc_profile().map(<[u8]>::to_vec);
+        let after_gray_name = after.gray_icc_name().map(str::to_owned);
 
         DocumentDelta {
             title: (self.title != after.title()).then(|| (self.title, after.title().to_owned())),
@@ -2768,6 +2950,26 @@ impl DocumentStateSnapshot {
                 .then_some((self.custom_icc_profile, after_icc_profile)),
             custom_icc_name: (self.custom_icc_name != after_icc_name)
                 .then_some((self.custom_icc_name, after_icc_name)),
+            rgb_icc_profile: (self.rgb_icc_profile != after_rgb_prof)
+                .then_some((self.rgb_icc_profile, after_rgb_prof)),
+            rgb_icc_name: (self.rgb_icc_name != after_rgb_name)
+                .then_some((self.rgb_icc_name, after_rgb_name)),
+            cmyk_icc_profile: (self.cmyk_icc_profile != after_cmyk_prof)
+                .then_some((self.cmyk_icc_profile, after_cmyk_prof)),
+            cmyk_icc_name: (self.cmyk_icc_name != after_cmyk_name)
+                .then_some((self.cmyk_icc_name, after_cmyk_name)),
+            gray_icc_profile: (self.gray_icc_profile != after_gray_prof)
+                .then_some((self.gray_icc_profile, after_gray_prof)),
+            gray_icc_name: (self.gray_icc_name != after_gray_name)
+                .then_some((self.gray_icc_name, after_gray_name)),
+            rendering_intent: (self.rendering_intent != after.rendering_intent())
+                .then_some((self.rendering_intent, after.rendering_intent())),
+            black_point_compensation: (self.black_point_compensation
+                != after.black_point_compensation())
+            .then_some((
+                self.black_point_compensation,
+                after.black_point_compensation(),
+            )),
             next_id: (self.next_id != after.next_id()).then_some((self.next_id, after.next_id())),
         }
     }
@@ -2863,6 +3065,45 @@ impl DocumentDelta {
                 |(b, _)| b.clone(),
             );
             doc.set_custom_icc_raw(prof, name);
+        }
+        if self.rgb_icc_profile.is_some() || self.rgb_icc_name.is_some() {
+            let prof = self.rgb_icc_profile.as_ref().map_or_else(
+                || doc.rgb_icc_profile().map(<[u8]>::to_vec),
+                |(b, _)| b.clone(),
+            );
+            let name = self
+                .rgb_icc_name
+                .as_ref()
+                .map_or_else(|| doc.rgb_icc_name().map(str::to_owned), |(b, _)| b.clone());
+            doc.set_rgb_icc_raw(prof, name);
+        }
+        if self.cmyk_icc_profile.is_some() || self.cmyk_icc_name.is_some() {
+            let prof = self.cmyk_icc_profile.as_ref().map_or_else(
+                || doc.cmyk_icc_profile().map(<[u8]>::to_vec),
+                |(b, _)| b.clone(),
+            );
+            let name = self.cmyk_icc_name.as_ref().map_or_else(
+                || doc.cmyk_icc_name().map(str::to_owned),
+                |(b, _)| b.clone(),
+            );
+            doc.set_cmyk_icc_raw(prof, name);
+        }
+        if self.gray_icc_profile.is_some() || self.gray_icc_name.is_some() {
+            let prof = self.gray_icc_profile.as_ref().map_or_else(
+                || doc.gray_icc_profile().map(<[u8]>::to_vec),
+                |(b, _)| b.clone(),
+            );
+            let name = self.gray_icc_name.as_ref().map_or_else(
+                || doc.gray_icc_name().map(str::to_owned),
+                |(b, _)| b.clone(),
+            );
+            doc.set_gray_icc_raw(prof, name);
+        }
+        if let Some((b, _)) = self.rendering_intent {
+            doc.set_rendering_intent_raw(b);
+        }
+        if let Some((b, _)) = self.black_point_compensation {
+            doc.set_bpc_raw(b);
         }
         if let Some((b, _)) = self.next_id {
             doc.set_next_id_raw(b);
@@ -2962,6 +3203,45 @@ impl DocumentDelta {
             );
             doc.set_custom_icc_raw(prof, name);
         }
+        if self.rgb_icc_profile.is_some() || self.rgb_icc_name.is_some() {
+            let prof = self.rgb_icc_profile.as_ref().map_or_else(
+                || doc.rgb_icc_profile().map(<[u8]>::to_vec),
+                |(_, a)| a.clone(),
+            );
+            let name = self
+                .rgb_icc_name
+                .as_ref()
+                .map_or_else(|| doc.rgb_icc_name().map(str::to_owned), |(_, a)| a.clone());
+            doc.set_rgb_icc_raw(prof, name);
+        }
+        if self.cmyk_icc_profile.is_some() || self.cmyk_icc_name.is_some() {
+            let prof = self.cmyk_icc_profile.as_ref().map_or_else(
+                || doc.cmyk_icc_profile().map(<[u8]>::to_vec),
+                |(_, a)| a.clone(),
+            );
+            let name = self.cmyk_icc_name.as_ref().map_or_else(
+                || doc.cmyk_icc_name().map(str::to_owned),
+                |(_, a)| a.clone(),
+            );
+            doc.set_cmyk_icc_raw(prof, name);
+        }
+        if self.gray_icc_profile.is_some() || self.gray_icc_name.is_some() {
+            let prof = self.gray_icc_profile.as_ref().map_or_else(
+                || doc.gray_icc_profile().map(<[u8]>::to_vec),
+                |(_, a)| a.clone(),
+            );
+            let name = self.gray_icc_name.as_ref().map_or_else(
+                || doc.gray_icc_name().map(str::to_owned),
+                |(_, a)| a.clone(),
+            );
+            doc.set_gray_icc_raw(prof, name);
+        }
+        if let Some((_, a)) = self.rendering_intent {
+            doc.set_rendering_intent_raw(a);
+        }
+        if let Some((_, a)) = self.black_point_compensation {
+            doc.set_bpc_raw(a);
+        }
         if let Some((_, a)) = self.next_id {
             doc.set_next_id_raw(a);
         }
@@ -3044,6 +3324,11 @@ fn delta_requires_full_invalidation(
         || delta.grid.is_some()
         || delta.perspective_grid.is_some()
         || delta.custom_icc_profile.is_some()
+        || delta.rgb_icc_profile.is_some()
+        || delta.cmyk_icc_profile.is_some()
+        || delta.gray_icc_profile.is_some()
+        || delta.rendering_intent.is_some()
+        || delta.black_point_compensation.is_some()
     {
         return true;
     }
@@ -3070,6 +3355,78 @@ struct ActiveTransaction {
     ops: Vec<CommandOp>,
 }
 
+/// Summary of structural/palette/asset deltas produced by the most recent
+/// `execute`, `commit_transaction`, `undo`, or `redo` (used by incremental WAL autosave).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeltaWalHints {
+    pub touches_structure: bool,
+    pub touches_palette: bool,
+    pub upserted_assets: Vec<ImageAssetId>,
+    pub deleted_assets: Vec<ImageAssetId>,
+}
+
+impl DocumentDelta {
+    fn wal_hints(&self, undo_direction: bool) -> DeltaWalHints {
+        let touches_structure = self.title.is_some()
+            || self.color_mode.is_some()
+            || self.default_unit.is_some()
+            || self.dpi.is_some()
+            || self.pages.is_some()
+            || self.active_page_index.is_some()
+            || self.multipage_view.is_some()
+            || self.palettes.is_some()
+            || self.color_styles.is_some()
+            || self.object_styles.is_some()
+            || !self.symbols.is_empty()
+            || self.guides.is_some()
+            || self.grid.is_some()
+            || self.perspective_grid.is_some()
+            || self.metadata.as_ref().is_some_and(|(b, a)| {
+                b.author != a.author
+                    || b.subject != a.subject
+                    || b.keywords != a.keywords
+                    || b.notes != a.notes
+                    || b.created_at != a.created_at
+                    || b.source_format != a.source_format
+                    || b.app_version != a.app_version
+            })
+            || self.unknown_doc_chunks.is_some()
+            || self.unknown_data_files.is_some()
+            || self.custom_icc_profile.is_some()
+            || self.custom_icc_name.is_some()
+            || self.rgb_icc_profile.is_some()
+            || self.rgb_icc_name.is_some()
+            || self.cmyk_icc_profile.is_some()
+            || self.cmyk_icc_name.is_some()
+            || self.gray_icc_profile.is_some()
+            || self.gray_icc_name.is_some()
+            || self.rendering_intent.is_some()
+            || self.black_point_compensation.is_some()
+            || self.next_id.is_some();
+        let touches_palette = self.document_palette.is_some();
+        let mut upserted_assets = Vec::new();
+        let mut deleted_assets = Vec::new();
+        for ad in &self.assets {
+            let target = if undo_direction {
+                &ad.before
+            } else {
+                &ad.after
+            };
+            if target.is_some() {
+                upserted_assets.push(ad.id);
+            } else {
+                deleted_assets.push(ad.id);
+            }
+        }
+        DeltaWalHints {
+            touches_structure,
+            touches_palette,
+            upserted_assets,
+            deleted_assets,
+        }
+    }
+}
+
 /// Transactional Undo/Redo stack, deterministic command journal, and Rhai macro recorder.
 #[derive(Debug, Clone)]
 pub struct CommandHistory {
@@ -3085,6 +3442,8 @@ pub struct CommandHistory {
     last_gc_pruned: Vec<ImageAssetId>,
     /// Targeted or full invalidation emitted by the most recent `execute`/`undo`/`redo`.
     last_invalidation: DocumentInvalidation,
+    /// WAL structural/palette/asset hints from the most recent `execute`/`commit`/`undo`/`redo`.
+    last_wal_hints: DeltaWalHints,
     /// When `true`, every committed command is recorded for Rhai macro export.
     pub recording_macro: bool,
     recorded_ops: Vec<CommandOp>,
@@ -3108,6 +3467,7 @@ impl CommandHistory {
             pending_gc_on_last_entry: false,
             last_gc_pruned: Vec::new(),
             last_invalidation: DocumentInvalidation::All,
+            last_wal_hints: DeltaWalHints::default(),
             recording_macro: false,
             recorded_ops: Vec::new(),
         }
@@ -3118,6 +3478,12 @@ impl CommandHistory {
     #[must_use]
     pub const fn last_invalidation(&self) -> &DocumentInvalidation {
         &self.last_invalidation
+    }
+
+    /// Returns incremental WAL sync hints from the most recent `execute`/`commit`/`undo`/`redo`.
+    #[must_use]
+    pub const fn last_delta_wal_hints(&self) -> &DeltaWalHints {
+        &self.last_wal_hints
     }
 
     /// Returns the configured undo stack retention limit.
@@ -3296,6 +3662,7 @@ impl CommandHistory {
         let delta = before.into_delta(doc);
         let invalidation = Self::compute_invalidation_with_doc_and_delta(doc, &delta);
         self.last_invalidation = invalidation.clone();
+        self.last_wal_hints = delta.wal_hints(false);
         if self.recording_macro {
             self.recorded_ops.push(op.clone());
         }
@@ -4207,6 +4574,7 @@ impl CommandHistory {
         let delta = tx.before.into_delta(doc);
         let invalidation = Self::compute_invalidation_with_doc_and_delta(doc, &delta);
         self.last_invalidation = invalidation.clone();
+        self.last_wal_hints = delta.wal_hints(false);
         self.push_entry(HistoryEntry {
             label: tx.label,
             op: merged_op,
@@ -4249,6 +4617,7 @@ impl CommandHistory {
         let label = entry.label.clone();
         entry.delta.apply_before(doc);
         self.last_invalidation = entry.invalidation.clone();
+        self.last_wal_hints = entry.delta.wal_hints(true);
         self.redo_stack.push(entry);
         self.pending_gc_on_last_entry = false;
         self.last_gc_pruned.clear();
@@ -4266,6 +4635,7 @@ impl CommandHistory {
         let label = entry.label.clone();
         entry.delta.apply_after(doc);
         self.last_invalidation = entry.invalidation.clone();
+        self.last_wal_hints = entry.delta.wal_hints(false);
         self.undo_stack.push(entry);
         self.pending_gc_on_last_entry = false;
         self.last_gc_pruned.clear();

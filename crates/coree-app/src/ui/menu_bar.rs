@@ -401,6 +401,14 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             metadata: None,
                             custom_icc_profile: None,
                             clear_custom_icc: false,
+                            rgb_icc_profile: None,
+                            clear_rgb_icc: false,
+                            cmyk_icc_profile: None,
+                            clear_cmyk_icc: false,
+                            gray_icc_profile: None,
+                            clear_gray_icc: false,
+                            rendering_intent: None,
+                            black_point_compensation: None,
                         });
                     }
                     if let Some(config) = pending_grid {

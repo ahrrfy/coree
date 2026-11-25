@@ -6,12 +6,12 @@
 use crate::atomic::atomic_write_with;
 use crate::error::{sanitize_zip_path, IoError, IoLimits, IoResult};
 use crate::raster::{
-    decode_raster_bytes_with_limits, export_raster_to_bytes, validate_raster_dimensions,
+    decode_raster_bytes_with_limits, export_raster_asset_to_bytes, validate_raster_dimensions,
     RasterExportOptions, RasterFormat,
 };
 use chrono::{DateTime, Utc};
 use coree_core::brand::{APP_NAME, VERSION};
-use coree_core::{ColorMode, Document, ImageAssetId, RasterAsset};
+use coree_core::{ColorMode, Document, ImageAssetId, PixelDepth, RasterAsset};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -51,6 +51,8 @@ struct AssetIndexEntry {
     height: u32,
     source_dpi: f32,
     color_mode: ColorMode,
+    #[serde(default)]
+    bit_depth: PixelDepth,
     path: String,
 }
 
@@ -75,10 +77,8 @@ pub fn save_coree_with_preview(
 
     for (asset_id, asset) in &externalized_assets {
         let entry_path = format!("assets/{}.png", asset_id.0);
-        let png_bytes = export_raster_to_bytes(
-            asset.width,
-            asset.height,
-            &asset.rgba_bytes,
+        let png_bytes = export_raster_asset_to_bytes(
+            asset,
             &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
         )?;
         asset_entries.push(AssetIndexEntry {
@@ -87,6 +87,7 @@ pub fn save_coree_with_preview(
             height: asset.height,
             source_dpi: asset.source_dpi,
             color_mode: asset.color_mode,
+            bit_depth: asset.pixel_depth,
             path: entry_path.clone(),
         });
         encoded_assets.push((entry_path, png_bytes));
@@ -222,18 +223,12 @@ pub fn load_coree_from_reader<R: Read + Seek>(
     let mut total_rgba_bytes: u64 = 0;
     for asset in restored_assets.values() {
         validate_raster_dimensions(asset.width, asset.height, limits)?;
-        let expected_len = u64::from(asset.width)
-            .saturating_mul(u64::from(asset.height))
-            .saturating_mul(4);
-        if (asset.rgba_bytes.len() as u64) != expected_len {
+        if !asset.has_valid_layout() {
             return Err(IoError::InvalidFormat {
                 format: "coree".into(),
                 message: format!(
-                    "inline asset {} rgba_bytes length {} does not match {}x{}x4",
-                    asset.id,
-                    asset.rgba_bytes.len(),
-                    asset.width,
-                    asset.height
+                    "inline asset {} tile storage does not match {}x{}",
+                    asset.id, asset.width, asset.height
                 ),
             });
         }
@@ -628,6 +623,7 @@ mod tests {
             frozen: false,
             viewpoint: None,
             remove_face: false,
+            frozen_snapshot: None,
         });
         shape.effects.push(Effect::DropShadow {
             dx_mm: 2.0,
@@ -712,7 +708,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("project.coree");
         let doc = build_rich_document();
-        let preview = export_raster_to_bytes(
+        let preview = crate::raster::export_raster_to_bytes(
             2,
             2,
             &[255, 0, 0, 255].repeat(4),

@@ -981,24 +981,44 @@ fn w1c_r2_grouped_world_transform_handles_across_interactive_tools() {
                 col: 0,
                 pos: Point2D::new(0.0, 0.0),
                 color: Color::CYAN,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: Some(Point2D::new(12.0, 4.0)),
+                handle_w: None,
             },
             MeshNode {
                 row: 0,
                 col: 1,
                 pos: Point2D::new(40.0, 0.0),
                 color: Color::MAGENTA,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 0,
                 pos: Point2D::new(0.0, 20.0),
                 color: Color::YELLOW,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 1,
                 pos: Point2D::new(40.0, 20.0),
                 color: Color::BLACK,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
         ],
     };
@@ -5127,4 +5147,177 @@ fn w2_exit_r8_freehand_pick_lasso_powerclip_persp_edit_and_group_effect_persp() 
             "FreehandPick lasso on Group(Effect::Perspective) must select gid, got {out:?}"
         );
     }
+}
+
+#[test]
+fn w3a_mesh_handle_drag_and_12pt_envelope_initialization() {
+    use coree_core::MeshNode;
+    let mut h = Harness::new();
+    let id = h.add_rect("MeshBox", 0.0, 0.0, 40.0, 40.0);
+    h.selection.select_single(&h.doc, id);
+    let mesh = Fill::MeshFill {
+        rows: 2,
+        cols: 2,
+        nodes: vec![
+            MeshNode {
+                row: 0,
+                col: 0,
+                pos: Point2D::new(0.0, 0.0),
+                color: Color::CYAN,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: Some(Point2D::new(12.0, 2.0)),
+                handle_w: None,
+            },
+            MeshNode {
+                row: 0,
+                col: 1,
+                pos: Point2D::new(40.0, 0.0),
+                color: Color::MAGENTA,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
+            },
+            MeshNode {
+                row: 1,
+                col: 0,
+                pos: Point2D::new(0.0, 40.0),
+                color: Color::YELLOW,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
+            },
+            MeshNode {
+                row: 1,
+                col: 1,
+                pos: Point2D::new(40.0, 40.0),
+                color: Color::BLACK,
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
+            },
+        ],
+    };
+    h.history
+        .execute(
+            &mut h.doc,
+            CommandOp::SetFill {
+                ids: vec![id],
+                fill: mesh,
+            },
+        )
+        .unwrap();
+
+    let mut tc = ToolCore::new(ToolId::MeshFill);
+    // Select node 0 first
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(0.0, 0.0), [0.0, 0.0]),
+    );
+    tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(0.0, 0.0), [0.0, 0.0]),
+    );
+    // Drag handle_e from (12, 2) to (18, 10)
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(12.0, 2.0), [0.0, 0.0]),
+    );
+    let move_out = tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(18.0, 10.0), [0.0, 0.0]),
+    );
+    if let ToolOutput::Continue { overlay: ov } = move_out {
+        assert!(
+            ov.preview_handles
+                .iter()
+                .any(|hd| hd.shape == coree_tools::HandleShape::Diamond && hd.selected),
+            "DraggingMeshHandle overlay must render selected N/S/E/W diamond tangent handle"
+        );
+    } else {
+        panic!("Expected Continue overlay during DraggingMeshHandle move");
+    }
+    let out = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(18.0, 10.0), [0.0, 0.0]),
+    );
+    match out {
+        ToolOutput::Commit { ops, .. } => {
+            assert_eq!(ops.len(), 1);
+            h.history.execute(&mut h.doc, ops[0].clone()).unwrap();
+        }
+        other => panic!("Expected Commit on handle_e drag, got {other:?}"),
+    }
+    if let Fill::MeshFill { nodes, .. } = &h.doc.object(id).unwrap().fill {
+        assert_eq!(nodes[0].handle_e, Some(Point2D::new(18.0, 10.0)));
+    } else {
+        panic!("expected MeshFill");
+    }
+
+    // Verify build_mesh_fill_for_bounds initializes default 1/3-chord neighbor tangent handles
+    let default_mesh = coree_tools::build_mesh_fill_for_bounds(
+        coree_core::Rect2D::from_xywh(0.0, 0.0, 60.0, 30.0),
+        3,
+        3,
+    );
+    if let Fill::MeshFill { nodes, .. } = default_mesh {
+        // Corner (0,0) has E (+10, 0) and S (0, +5), no N/W
+        assert_eq!(nodes[0].handle_n, None);
+        assert_eq!(nodes[0].handle_w, None);
+        assert!(
+            nodes[0]
+                .handle_e
+                .unwrap()
+                .distance_to(Point2D::new(10.0, 0.0))
+                < 1e-6
+        );
+        assert!(
+            nodes[0]
+                .handle_s
+                .unwrap()
+                .distance_to(Point2D::new(0.0, 5.0))
+                < 1e-6
+        );
+        // Center (1,1) at idx 4 has all 4 N/S/E/W tangent handles
+        assert!(nodes[4].handle_n.is_some());
+        assert!(nodes[4].handle_s.is_some());
+        assert!(nodes[4].handle_e.is_some());
+        assert!(nodes[4].handle_w.is_some());
+    } else {
+        panic!("expected MeshFill");
+    }
+
+    // Envelope tool drag on rect initializes 12-point cubic cage
+    let eid = h.add_rect("EnvInit", 60.0, 0.0, 30.0, 30.0);
+    h.selection.select_single(&h.doc, eid);
+    tc.set_active_tool(ToolId::Envelope);
+    tc.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(60.0, 0.0), [0.0, 0.0]),
+    );
+    tc.on_pointer_move(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(55.0, -5.0), [0.0, 0.0]),
+    );
+    let e_out = tc.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(55.0, -5.0), [0.0, 0.0]),
+    );
+    match e_out {
+        ToolOutput::Commit { ops, .. } => {
+            h.history.execute(&mut h.doc, ops[0].clone()).unwrap();
+        }
+        other => panic!("Expected Commit on Envelope drag, got {other:?}"),
+    }
+    assert!(matches!(
+        h.doc.object(eid).unwrap().effects.first(),
+        Some(Effect::Envelope { cage, .. }) if cage.len() == 12
+    ));
 }

@@ -432,6 +432,10 @@ pub struct PropertiesDockerState {
     pub grad_end_color: Color,
     pub mesh_rows: usize,
     pub mesh_cols: usize,
+    pub new_tab_stop_mm: f64,
+    pub new_tab_stop_align: coree_core::ParagraphTabAlign,
+    pub new_fvar_tag: String,
+    pub new_fvar_val: f32,
 }
 
 impl Default for PropertiesDockerState {
@@ -446,6 +450,10 @@ impl Default for PropertiesDockerState {
             grad_end_color: Color::MAGENTA,
             mesh_rows: 2,
             mesh_cols: 2,
+            new_tab_stop_mm: 20.0,
+            new_tab_stop_align: coree_core::ParagraphTabAlign::Left,
+            new_fvar_tag: "wght".to_owned(),
+            new_fvar_val: 500.0,
         }
     }
 }
@@ -559,6 +567,7 @@ impl LensDockerState {
                 .use_viewpoint
                 .then(|| Point2D::new(self.viewpoint_x, self.viewpoint_y)),
             remove_face: self.remove_face,
+            frozen_snapshot: None,
         }
     }
 
@@ -675,6 +684,10 @@ pub struct EffectsDockerState {
     pub extrude3d_rotation: [f64; 3],
     pub extrude3d_light_dir: [f32; 3],
     pub extrude3d_light_intensity: f32,
+    pub rotate_along_path: bool,
+    pub block_shadow_simplify: bool,
+    pub transp_kind: usize,
+    pub copy_envelope_source: Option<ObjectId>,
 }
 
 impl Default for EffectsDockerState {
@@ -709,6 +722,10 @@ impl Default for EffectsDockerState {
             extrude3d_rotation: [12.0, -18.0, 0.0],
             extrude3d_light_dir: [0.45, -0.6, 0.65],
             extrude3d_light_intensity: 0.9,
+            rotate_along_path: true,
+            block_shadow_simplify: true,
+            transp_kind: 0,
+            copy_envelope_source: None,
         }
     }
 }
@@ -787,7 +804,8 @@ impl TraceDockerState {
     }
 }
 
-/// Bitmap Studio Docker state (`S10`) covering all 19 non-destructive `RasterFilter` variants.
+/// Bitmap Studio Docker state (`S10`) covering all 20 non-destructive `RasterFilter` variants,
+/// CoW 8/16-bit depth conversion, resampling kernel selection, and live histogram analysis.
 #[derive(Debug, Clone)]
 pub struct BitmapDockerState {
     pub filter_idx: usize,
@@ -796,6 +814,9 @@ pub struct BitmapDockerState {
     pub param_c: f32,
     pub resample_w: u32,
     pub resample_h: u32,
+    pub resample_algo: coree_render::ResampleAlgorithm,
+    pub target_depth: coree_core::PixelDepth,
+    pub target_color_mode: ColorMode,
     pub convert_dpi: f64,
 }
 
@@ -808,14 +829,17 @@ impl Default for BitmapDockerState {
             param_c: 1.0,
             resample_w: 512,
             resample_h: 512,
+            resample_algo: coree_render::ResampleAlgorithm::Bicubic,
+            target_depth: coree_core::PixelDepth::Bit16,
+            target_color_mode: ColorMode::Cmyk,
             convert_dpi: 300.0,
         }
     }
 }
 
 impl BitmapDockerState {
-    /// All 19 non-destructive raster filters.
-    pub const FILTER_NAMES: [&'static str; 19] = [
+    /// All 20 non-destructive raster filters.
+    pub const FILTER_NAMES: [&'static str; 20] = [
         "Brightness / Contrast",
         "Tone Curve",
         "Levels",
@@ -835,6 +859,7 @@ impl BitmapDockerState {
         "Vignette",
         "Emboss",
         "Edge Detect",
+        "Channel Mixer",
     ];
 
     /// Builds a [`RasterFilter`] matching the selected index and slider parameters.
@@ -914,8 +939,14 @@ impl BitmapDockerState {
                 angle_deg: self.param_a * 180.0,
                 depth: self.param_c.clamp(0.5, 5.0),
             },
-            _ => RasterFilter::EdgeDetect {
+            18 => RasterFilter::EdgeDetect {
                 sensitivity: self.param_c.clamp(0.2, 4.0),
+            },
+            _ => RasterFilter::ChannelMixer {
+                red: [self.param_c.clamp(-2.0, 2.0), self.param_a, 0.0],
+                green: [0.0, self.param_c.clamp(-2.0, 2.0), self.param_b],
+                blue: [self.param_a * 0.5, 0.0, self.param_c.clamp(-2.0, 2.0)],
+                monochrome: self.param_b < -0.5,
             },
         }
     }

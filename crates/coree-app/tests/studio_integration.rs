@@ -830,16 +830,16 @@ fn studio_app_vector_effects_bitmap_studio_trace_macros_and_async_jobs() {
         NodePayload::Raster(_)
     ));
 
-    // Exercise all 19 Bitmap Studio filters!
-    assert_eq!(BitmapDockerState::FILTER_NAMES.len(), 19);
-    for filter_idx in 0..19 {
+    // Exercise all 20 Bitmap Studio filters (including ChannelMixer)!
+    assert_eq!(BitmapDockerState::FILTER_NAMES.len(), 20);
+    for filter_idx in 0..20 {
         app.bitmap_state.filter_idx = filter_idx;
         let filter = app.bitmap_state.build_filter();
         app.apply_raster_filter_to_selection(filter);
     }
-    // Undo the trailing destructive edge-collapse filters (Emboss/EdgeDetect/Threshold/etc.)
+    // Undo the trailing destructive edge-collapse filters (Emboss/EdgeDetect/ChannelMixer/Threshold/etc.)
     // so the filtered bitmap retains traceable foreground contours, then resample & trace.
-    for _ in 0..10 {
+    for _ in 0..11 {
         app.undo().expect("undo raster filter");
     }
     app.resample_selected_bitmap(64, 48);
@@ -1081,13 +1081,13 @@ fn regression_local_coords_mesh_envelope_and_bitmap_padding() {
         Effect::Envelope { cage, .. } => {
             assert_eq!(
                 cage.len(),
-                8,
-                "Envelope must emit 8-point [TL,T_mid,TR,R_mid,BR,B_mid,BL,L_mid] Coons cage"
+                12,
+                "Envelope must emit 12-point Coons cubic cage"
             );
             assert!((cage[0].x - 0.0).abs() < 1e-6 && (cage[0].y - 0.0).abs() < 1e-6); // TL
-            assert!((cage[2].x - 40.0).abs() < 1e-6 && (cage[2].y - 0.0).abs() < 1e-6); // TR
-            assert!((cage[4].x - 40.0).abs() < 1e-6 && (cage[4].y - 20.0).abs() < 1e-6); // BR
-            assert!((cage[6].x - 0.0).abs() < 1e-6 && (cage[6].y - 20.0).abs() < 1e-6);
+            assert!((cage[3].x - 40.0).abs() < 1e-6 && (cage[3].y - 0.0).abs() < 1e-6); // TR
+            assert!((cage[6].x - 40.0).abs() < 1e-6 && (cage[6].y - 20.0).abs() < 1e-6); // BR
+            assert!((cage[9].x - 0.0).abs() < 1e-6 && (cage[9].y - 20.0).abs() < 1e-6);
             // BL
         }
         other => panic!("expected Envelope, got {other:?}"),
@@ -1202,6 +1202,8 @@ fn regression_import_cycle_guard_symbols_and_id_remapping() {
                     steps: 5,
                     rotation_deg: 0.0,
                     along_path: Some(host_id),
+
+                    rotate_along_path: true,
                 },
             },
         )
@@ -2834,6 +2836,15 @@ fn w1b_r2_app_wiring_shape_close_align_print_marks_trace_bitmap_and_resample() {
         metadata: None,
         custom_icc_profile: Some(icc),
         clear_custom_icc: false,
+
+        rgb_icc_profile: None,
+        clear_rgb_icc: false,
+        cmyk_icc_profile: None,
+        clear_cmyk_icc: false,
+        gray_icc_profile: None,
+        clear_gray_icc: false,
+        rendering_intent: None,
+        black_point_compensation: None,
     })
     .unwrap();
     assert_eq!(
@@ -4342,6 +4353,8 @@ fn w1b_r10_cross_tab_paste_clipboard_sanitizes_styles_symbols_and_object_refs() 
         steps: 3,
         rotation_deg: 0.0,
         along_path: Some(host_curve_id),
+
+        rotate_along_path: true,
     });
 
     app.execute_command(CommandOp::Batch(vec![
@@ -4399,6 +4412,8 @@ fn w1b_r10_cross_tab_paste_clipboard_sanitizes_styles_symbols_and_object_refs() 
         steps: 4,
         rotation_deg: 0.0,
         along_path: Some(host_curve_id),
+
+        rotate_along_path: true,
     });
     app.execute_command(CommandOp::create_object(blend_partial, Some(layer1)))
         .unwrap();
@@ -4835,6 +4850,15 @@ fn w1b_r11_paste_clipboard_respects_locked_hidden_layers_and_active_page() {
         metadata: None,
         custom_icc_profile: None,
         clear_custom_icc: false,
+
+        rgb_icc_profile: None,
+        clear_rgb_icc: false,
+        cmyk_icc_profile: None,
+        clear_cmyk_icc: false,
+        gray_icc_profile: None,
+        clear_gray_icc: false,
+        rendering_intent: None,
+        black_point_compensation: None,
     })
     .unwrap();
 
@@ -5059,6 +5083,8 @@ fn w1b_r11_import_document_into_sanitizes_cross_page_refs_and_symbol_styles() {
         steps: 3,
         rotation_deg: 0.0,
         along_path: Some(p2_curve),
+
+        rotate_along_path: true,
     });
     src.add_object(blend_obj, Some(p1_l)).unwrap();
 
@@ -6144,7 +6170,7 @@ fn w1b_r14_import_sanitizes_invalid_symbols_and_assets_on_valid_styles_and_objec
     src.insert_symbol(bad_sym);
 
     let mut bad_asset = RasterAsset::new(2, 2, vec![255; 16], 72.0, ColorMode::Rgb).unwrap();
-    bad_asset.rgba_bytes.pop(); // invalid length
+    bad_asset.tiles[0].make_mut().pop(); // invalid length
     let bad_asset_id = bad_asset.id;
     src.insert_asset_if_absent(bad_asset);
 
@@ -6565,7 +6591,7 @@ fn w1b_r15_convert_to_bitmap_and_trace_raster_preserve_nested_world_coords() {
             .unwrap();
         assert!(
             asset
-                .rgba_bytes
+                .to_rgba8_vec()
                 .as_chunks::<4>()
                 .0
                 .iter()
@@ -8106,6 +8132,8 @@ fn w1b_r19_convert_selection_to_bitmap_lens_and_group_child_symmetry() {
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     app.execute_command(CommandOp::create_object(lens_obj, Some(lid)))
         .unwrap();
@@ -8128,7 +8156,7 @@ fn w1b_r19_convert_selection_to_bitmap_lens_and_group_child_symmetry() {
     let asset = tab.document.assets().get(&aid).unwrap();
     let center_idx =
         (((asset.height / 2) as usize) * (asset.width as usize) + ((asset.width / 2) as usize)) * 4;
-    let center_px = &asset.rgba_bytes[center_idx..center_idx + 4];
+    let center_px = &asset.to_rgba8_vec()[center_idx..center_idx + 4];
     assert!(
         center_px[3] > 240 && center_px[0] < 15 && center_px[1] > 240 && center_px[2] > 240,
         "convert_selection_to_bitmap on non-frozen Invert lens over Red must produce opaque Cyan, got {center_px:?}"
@@ -8876,4 +8904,954 @@ fn w2_exit_r6_studio_convert_selection_to_curves_on_clone_of_text() {
             .payload,
         NodePayload::Path(_)
     ));
+}
+
+#[test]
+fn w3a_frozen_lens_capture_masked_brushes_16bit_convert_and_wal_compaction() {
+    let dir = TempTestDir::new("w3a-app");
+    let db = StorageDb::open(&dir.path().join("wal_w3a.db")).unwrap();
+    let mut app = StudioApp::new_with_storage(db);
+
+    // 1. Frozen lens snapshot auto-captured in apply_lens_to_selection
+    app.select_tool(ToolId::Rectangle);
+    app.commit_drawn_box(Rect2D::from_xywh(10.0, 10.0, 50.0, 50.0));
+    app.commit_drawn_box(Rect2D::from_xywh(20.0, 20.0, 20.0, 20.0));
+    let ids: Vec<ObjectId> = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .copied()
+        .collect();
+    let lens_id = *ids.last().unwrap();
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, lens_id);
+    }
+    let mut cfg = coree_core::LensConfig::new(LensKind::Invert);
+    cfg.frozen = true;
+    app.apply_lens_to_selection(Some(cfg));
+    let snap_present = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(lens_id)
+        .and_then(|o| o.lens.as_ref())
+        .and_then(|l| l.frozen_snapshot.as_ref())
+        .is_some_and(|b| b.starts_with(b"\x89PNG"));
+    assert!(
+        snap_present,
+        "apply_lens_to_selection must bake PNG frozen_snapshot"
+    );
+
+    // 2. Masked Eraser & 16-bit depth conversion
+    let raw = coree_core::RasterAsset::new(32, 32, vec![220u8; 32 * 32 * 4], 96.0, ColorMode::Rgb)
+        .unwrap();
+    let raw_aid = raw.id;
+    let ras_obj = SceneObject::new(
+        ObjectId(0),
+        "Ras",
+        NodePayload::Raster(coree_core::RasterLayerData {
+            asset_id: raw_aid,
+            width_mm: 32.0,
+            height_mm: 32.0,
+            filters: Vec::new(),
+            crop_rect: None,
+        }),
+    )
+    .with_transform(Affine2D::translate(10.0, 80.0));
+    app.execute_command(CommandOp::Batch(vec![
+        CommandOp::RegisterAsset { asset: raw },
+        CommandOp::CreateObject {
+            object: Box::new(ras_obj),
+            layer_id: None,
+        },
+    ]))
+    .unwrap();
+    let rid = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .max()
+        .unwrap();
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, rid);
+        tab.raster_mask_rect_mm = Some(Rect2D::new(10.0, 80.0, 26.0, 112.0));
+    }
+    app.tool_settings.brush_radius_px = 6.0;
+    app.tool_settings.brush_hardness = 1.0;
+    app.tool_settings.raster_op = coree_app::state::RasterBrushOp::Eraser;
+    assert!(app.apply_raster_tool_stroke(ToolId::BitmapEraser, &[Point2D::new(26.0, 96.0)]));
+    let ras_aid = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(rid)
+        .unwrap()
+        .payload
+    {
+        NodePayload::Raster(r) => r.asset_id,
+        _ => panic!("expected raster"),
+    };
+    let after_erase = app.active_tab().unwrap().document.asset(ras_aid).unwrap();
+    // Masked right half (x >= 16) stays protected!
+    assert_eq!(after_erase.read_pixel_rgba8(20, 16).unwrap()[3], 220);
+    assert_eq!(after_erase.read_pixel_rgba8(12, 16).unwrap()[3], 0);
+
+    app.convert_selected_bitmap_depth(coree_core::PixelDepth::Bit16);
+    let aid16 = match &app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(rid)
+        .unwrap()
+        .payload
+    {
+        NodePayload::Raster(r) => r.asset_id,
+        _ => panic!("expected raster"),
+    };
+    assert_eq!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .asset(aid16)
+            .unwrap()
+            .pixel_depth(),
+        coree_core::PixelDepth::Bit16
+    );
+    let hist = app.selected_bitmap_histogram(32).unwrap();
+    assert_eq!(hist.total_pixels, 32 * 32);
+
+    // 3. Carryover #12: zero-clone undo/redo delta streaming + WAL_COMPACTION_INTERVAL compaction
+    let xf = Affine2D::translate(0.5, 0.0);
+    for _ in 0..(coree_storage::WAL_COMPACTION_INTERVAL + 4) {
+        app.execute_command(CommandOp::TransformObjects {
+            ids: vec![ids[0]],
+            affine: xf,
+        })
+        .unwrap();
+    }
+    assert!(
+        app.active_tab().unwrap().wal_delta_count < coree_storage::WAL_COMPACTION_INTERVAL,
+        "WAL delta count must reset on periodic baseline compaction"
+    );
+    app.undo().unwrap();
+    app.redo().unwrap();
+}
+
+#[test]
+fn w3a_r2_wal_compaction_128_deltas_recovers_without_data_loss() {
+    let tmp = TempTestDir::new("wal-compact-128");
+    let db_path = tmp.0.join("studio.db");
+    let db = StorageDb::open(&db_path).expect("open storage db");
+    let mut app = StudioApp::new_with_storage(db);
+    let doc_id = app.active_tab().unwrap().document.id().to_string();
+
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "MovedBox",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(obj),
+        layer_id: None,
+    })
+    .unwrap();
+    let oid = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .copied()
+        .next()
+        .unwrap();
+    app.perform_autosave_active().unwrap();
+    assert!(
+        (app.active_tab()
+            .unwrap()
+            .document
+            .object(oid)
+            .unwrap()
+            .transform
+            .m[4]
+            - 0.0)
+            .abs()
+            < 1e-9
+    );
+
+    // Execute exactly WAL_COMPACTION_INTERVAL (128) commands without intermediate undo/redo/autosave
+    for _ in 0..coree_storage::WAL_COMPACTION_INTERVAL {
+        app.execute_command(CommandOp::TransformObjects {
+            ids: vec![oid],
+            affine: Affine2D::translate(1.0, 0.0),
+        })
+        .unwrap();
+    }
+    let mut live_doc = app.active_tab().unwrap().document.clone();
+    let live_tx = live_doc.object(oid).unwrap().transform.m[4];
+    assert!((live_tx - 128.0).abs() < 1e-6, "live_tx={live_tx}");
+
+    let db_ref = app.storage.as_ref().unwrap();
+    db_ref
+        .flush_autosave(std::time::Duration::from_secs(5))
+        .unwrap();
+    let recovered = db_ref.recover_document(&doc_id).unwrap();
+    let rec_tx = recovered.object(oid).unwrap().transform.m[4];
+    assert!(
+        (rec_tx - 128.0).abs() < 1e-6,
+        "128-delta WAL compaction must recover exact tx=128.0, got rec_tx={rec_tx}"
+    );
+    live_doc.metadata_mut().modified_at = recovered.metadata().modified_at;
+    assert_eq!(
+        live_doc, recovered,
+        "recovered document must match live_doc exactly"
+    );
+}
+
+#[test]
+fn w3a_r2_set_fill_outline_non_structural_palette_sync_and_prune_assets_dirty() {
+    let tmp = TempTestDir::new("wal-nonstruct-prune");
+    let db = StorageDb::open(&tmp.0.join("studio.db")).expect("open storage db");
+    let mut app = StudioApp::new_with_storage(db);
+    let doc_id = app.active_tab().unwrap().document.id().to_string();
+
+    let rect = SceneObject::new(
+        ObjectId(0),
+        "FillBox",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(rect),
+        layer_id: None,
+    })
+    .unwrap();
+    let oid = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .copied()
+        .next()
+        .unwrap();
+
+    // Register an unused raster asset and baseline-autosave
+    let asset = coree_core::RasterAsset::new(2, 2, vec![255u8; 16], 72.0, ColorMode::Rgb).unwrap();
+    let aid = asset.id;
+    app.execute_command(CommandOp::RegisterAsset { asset })
+        .unwrap();
+    app.perform_autosave_active().unwrap();
+    assert!(!app.active_tab().unwrap().autosave_dirty_structure);
+
+    // 1. SetFill(Solid) must leave autosave_dirty_structure == false and set autosave_dirty_palette == true
+    let custom_fill_col = Color::rgb(0.15, 0.85, 0.35);
+    app.execute_command(CommandOp::SetFill {
+        ids: vec![oid],
+        fill: Fill::Solid(custom_fill_col.clone()),
+    })
+    .unwrap();
+    assert!(
+        !app.active_tab().unwrap().autosave_dirty_structure,
+        "SetFill(Solid) must NOT set autosave_dirty_structure"
+    );
+    assert!(
+        app.active_tab().unwrap().autosave_dirty_palette,
+        "SetFill(Solid) must set autosave_dirty_palette"
+    );
+
+    // 2. SetOutline must also leave autosave_dirty_structure == false
+    let custom_outline = OutlineStyle::solid(Color::MAGENTA, 2.25);
+    app.execute_command(CommandOp::SetOutline {
+        ids: vec![oid],
+        outline: custom_outline.clone(),
+    })
+    .unwrap();
+    assert!(
+        !app.active_tab().unwrap().autosave_dirty_structure,
+        "SetOutline must NOT set autosave_dirty_structure"
+    );
+
+    // Flush differential autosave and verify document_palette + fill + outline survive recovery
+    app.perform_autosave_active().unwrap();
+    let db_ref = app.storage.as_ref().unwrap();
+    db_ref
+        .flush_autosave(std::time::Duration::from_secs(5))
+        .unwrap();
+    let rec1 = db_ref.recover_document(&doc_id).unwrap();
+    assert_eq!(
+        rec1.object(oid).unwrap().fill,
+        Fill::Solid(custom_fill_col.clone())
+    );
+    assert_eq!(rec1.object(oid).unwrap().outline, custom_outline);
+    assert!(
+        rec1.document_palette()
+            .swatches
+            .iter()
+            .any(|s| s.color == custom_fill_col),
+        "document_palette must preserve SetFill swatch across non-structural autosave recovery"
+    );
+
+    // 3. PruneAssets must set autosave_dirty_structure == true and persist asset deletion on recovery
+    app.execute_command(CommandOp::PruneAssets { ids: vec![aid] })
+        .unwrap();
+    assert!(
+        app.active_tab().unwrap().autosave_dirty_structure,
+        "PruneAssets must mark autosave_dirty_structure = true"
+    );
+    app.perform_autosave_active().unwrap();
+    let db_ref = app.storage.as_ref().unwrap();
+    db_ref
+        .flush_autosave(std::time::Duration::from_secs(5))
+        .unwrap();
+    let rec2 = db_ref.recover_document(&doc_id).unwrap();
+    assert!(
+        rec2.asset(aid).is_none(),
+        "PruneAssets asset deletion must persist across differential autosave + recovery"
+    );
+}
+
+#[test]
+fn w3a_r2_copy_envelope_unconstrained_mesh_handles_and_add10_text_controls() {
+    use coree_core::{EnvelopeMode, ParagraphTabAlign, ParagraphTabStop, ParagraphText};
+
+    let mut app = StudioApp::new_headless();
+    // 1. Copy Envelope remaps source cage into target object local bounds + Undo/Redo
+    let src_rect = SceneObject::new(
+        ObjectId(0),
+        "EnvSrc",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 40.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    let dst_rect = SceneObject::new(
+        ObjectId(0),
+        "EnvDst",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 80.0,
+            height: 60.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    )
+    .with_transform(Affine2D::translate(100.0, 20.0));
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(src_rect),
+        layer_id: None,
+    })
+    .unwrap();
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(dst_rect),
+        layer_id: None,
+    })
+    .unwrap();
+    let ids: Vec<ObjectId> = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .copied()
+        .collect();
+    let (src_id, dst_id) = (ids[0], ids[1]);
+    let src_cage = vec![
+        Point2D::new(0.0, 0.0),
+        Point2D::new(20.0, -5.0),
+        Point2D::new(40.0, 0.0),
+        Point2D::new(45.0, 10.0),
+        Point2D::new(40.0, 20.0),
+        Point2D::new(20.0, 25.0),
+        Point2D::new(0.0, 20.0),
+        Point2D::new(-5.0, 10.0),
+    ];
+    app.execute_command(CommandOp::AddEffect {
+        id: src_id,
+        effect: Effect::Envelope {
+            mode: EnvelopeMode::Unconstrained,
+            cage: src_cage,
+        },
+    })
+    .unwrap();
+    assert!(app.copy_envelope_from_object(dst_id, src_id));
+    match app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(dst_id)
+        .unwrap()
+        .effects
+        .first()
+    {
+        Some(Effect::Envelope { mode, cage }) => {
+            assert_eq!(*mode, EnvelopeMode::Unconstrained);
+            assert_eq!(cage.len(), 8);
+            // Midpoint (20, -5) in [0..40, 0..20] -> (40, -15) in [0..80, 0..60]
+            assert!(cage[1].distance_to(Point2D::new(40.0, -15.0)) < 1e-6);
+            // Midpoint (45, 10) -> (90, 30)
+            assert!(cage[3].distance_to(Point2D::new(90.0, 30.0)) < 1e-6);
+        }
+        other => panic!("expected copied Envelope, got {other:?}"),
+    }
+    app.undo().unwrap();
+    assert!(app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(dst_id)
+        .unwrap()
+        .effects
+        .is_empty());
+    app.redo().unwrap();
+    assert_eq!(
+        app.active_tab()
+            .unwrap()
+            .document
+            .object(dst_id)
+            .unwrap()
+            .effects
+            .len(),
+        1
+    );
+
+    // 2. MeshFill build_mesh_fill_for_bounds initializes 1/3-chord handles & alpha via SetFill
+    let mesh = StudioApp::build_mesh_fill_for_bounds(Rect2D::from_xywh(0.0, 0.0, 80.0, 60.0), 3, 3);
+    if let Fill::MeshFill { ref nodes, .. } = mesh {
+        assert!(nodes[4].handle_n.is_some());
+        assert!(nodes[4].handle_s.is_some());
+        assert!(nodes[4].handle_e.is_some());
+        assert!(nodes[4].handle_w.is_some());
+    } else {
+        panic!("expected MeshFill");
+    }
+    app.execute_command(CommandOp::SetFill {
+        ids: vec![dst_id],
+        fill: mesh.clone(),
+    })
+    .unwrap();
+    if let Some(tab) = app.active_tab_mut() {
+        tab.selection.select_single(&tab.document, dst_id);
+        tab.selected_mesh_node = Some((dst_id, 4));
+    }
+    app.active_tool = ToolId::MeshFill;
+
+    // 3. ADD-10 ParagraphText linked_next_frame, tab_stops_mm, and TextStyle variation_axes via CommandOp::EditText + Undo/Redo
+    let mut p1 = ParagraphText::new(
+        "First frame overflow",
+        Vec2D::new(50.0, 20.0),
+        TextStyle::default(),
+    );
+    let p2 = ParagraphText::new("", Vec2D::new(50.0, 30.0), TextStyle::default());
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(SceneObject::new(
+            ObjectId(0),
+            "Para1",
+            NodePayload::ParagraphText(p1.clone()),
+        )),
+        layer_id: None,
+    })
+    .unwrap();
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(SceneObject::new(
+            ObjectId(0),
+            "Para2",
+            NodePayload::ParagraphText(p2),
+        )),
+        layer_id: None,
+    })
+    .unwrap();
+    let para_ids: Vec<ObjectId> = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .iter()
+        .filter_map(|(&id, o)| matches!(o.payload, NodePayload::ParagraphText(_)).then_some(id))
+        .collect();
+    let (p1_id, p2_id) = (para_ids[0], para_ids[1]);
+
+    p1.linked_next_frame = Some(p2_id);
+    p1.tab_stops_mm.push(ParagraphTabStop {
+        position_mm: 24.0,
+        align: ParagraphTabAlign::Center,
+    });
+    p1.runs[0]
+        .style
+        .variation_axes
+        .push(("wght".to_owned(), 720.0));
+    app.execute_command(CommandOp::EditText {
+        id: p1_id,
+        payload: NodePayload::ParagraphText(p1),
+    })
+    .unwrap();
+
+    if let NodePayload::ParagraphText(ref pt) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(p1_id)
+        .unwrap()
+        .payload
+    {
+        assert_eq!(pt.linked_next_frame, Some(p2_id));
+        assert_eq!(pt.tab_stops_mm.len(), 1);
+        assert_eq!(pt.tab_stops_mm[0].align, ParagraphTabAlign::Center);
+        assert_eq!(
+            pt.runs[0].style.variation_axes,
+            vec![("wght".to_owned(), 720.0)]
+        );
+    } else {
+        panic!("expected ParagraphText");
+    }
+    app.undo().unwrap();
+    if let NodePayload::ParagraphText(ref pt) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(p1_id)
+        .unwrap()
+        .payload
+    {
+        assert_eq!(pt.linked_next_frame, None);
+        assert!(pt.tab_stops_mm.is_empty());
+        assert!(pt.runs[0].style.variation_axes.is_empty());
+    }
+    app.redo().unwrap();
+    if let NodePayload::ParagraphText(ref pt) = app
+        .active_tab()
+        .unwrap()
+        .document
+        .object(p1_id)
+        .unwrap()
+        .payload
+    {
+        assert_eq!(pt.linked_next_frame, Some(p2_id));
+        assert_eq!(pt.tab_stops_mm.len(), 1);
+        assert_eq!(
+            pt.runs[0].style.variation_axes,
+            vec![("wght".to_owned(), 720.0)]
+        );
+    }
+
+    // Exercise egui UI rendering across Properties Text, Effects Envelope, and MeshFill Toolbar
+    if let Some(tab) = app.active_tab_mut() {
+        tab.selection.select_single(&tab.document, p1_id);
+    }
+    app.properties_state.active_tab = coree_app::state::PropertiesSubTab::Text;
+    app.effects_state.selected_effect_kind = 5;
+    let ctx = egui::Context::default();
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    app.show_welcome = false;
+    app.focus_docker(DockerTab::Properties);
+    let mut out_props = ctx.run_ui(raw.clone(), |ui| app.render_ui(ui));
+    out_props.textures_delta.clear();
+    app.focus_docker(DockerTab::Effects);
+    let mut out_eff = ctx.run_ui(raw, |ui| app.render_ui(ui));
+    out_eff.textures_delta.clear();
+}
+
+#[test]
+fn w3a_r9_wal_inval_all_then_targeted_undo_preserves_objects() {
+    for pre_autosave in [false, true] {
+        let tmp = TempTestDir::new("wal-r9-case2");
+        let db = StorageDb::open(&tmp.0.join("studio.db")).expect("open storage db");
+        let mut app = StudioApp::new_with_storage(db);
+        let doc_id = app.active_tab().unwrap().document.id().to_string();
+        let page_id = app.active_tab().unwrap().document.pages()[0].id;
+
+        let obj1 = SceneObject::new(
+            ObjectId(0),
+            "Obj1",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 20.0,
+                height: 20.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        );
+        app.execute_command(CommandOp::CreateObject {
+            object: Box::new(obj1),
+            layer_id: None,
+        })
+        .unwrap();
+        let oid1 = *app
+            .active_tab()
+            .unwrap()
+            .document
+            .objects()
+            .keys()
+            .next()
+            .unwrap();
+
+        if pre_autosave {
+            app.perform_autosave_active().unwrap();
+        }
+
+        let obj2 = SceneObject::new(
+            ObjectId(0),
+            "Obj2",
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 15.0,
+                height: 15.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        );
+        app.execute_command(CommandOp::Batch(vec![
+            CommandOp::AddLayer {
+                page_id,
+                name: "Layer2".to_owned(),
+                is_cut_layer: false,
+                master_scope: coree_core::MasterLayerScope::None,
+            },
+            CommandOp::CreateObject {
+                object: Box::new(obj2),
+                layer_id: None,
+            },
+        ]))
+        .unwrap();
+        let oid2 = *app
+            .active_tab()
+            .unwrap()
+            .document
+            .objects()
+            .keys()
+            .find(|&&id| id != oid1)
+            .unwrap();
+
+        app.execute_command(CommandOp::SetFill {
+            ids: vec![oid1],
+            fill: Fill::Solid(Color::rgb(1.0, 0.0, 0.0)),
+        })
+        .unwrap();
+
+        // Undo Targeted SetFill while Inval::All dirty flag is still pending
+        app.undo().unwrap();
+
+        let mut live_doc = app.active_tab().unwrap().document.clone();
+        let db_ref = app.storage.as_ref().unwrap();
+        db_ref
+            .flush_autosave(std::time::Duration::from_secs(5))
+            .unwrap();
+        let recovered = db_ref.recover_document(&doc_id).unwrap();
+
+        assert!(recovered.object(oid1).is_some());
+        assert!(
+            recovered.object(oid2).is_some(),
+            "pre_autosave={pre_autosave}: Obj2 from earlier Inval::All must not be dropped on Targeted undo()"
+        );
+        assert_eq!(recovered.objects().len(), 2);
+        assert_eq!(recovered.pages()[0].layers.len(), 2);
+        live_doc.metadata_mut().modified_at = recovered.metadata().modified_at;
+        assert_eq!(live_doc, recovered);
+    }
+}
+
+#[test]
+fn w3a_r9_wal_inval_all_delete_undo_redo_prevents_resurrection() {
+    let tmp = TempTestDir::new("wal-r9-case3");
+    let db = StorageDb::open(&tmp.0.join("studio.db")).expect("open storage db");
+    let mut app = StudioApp::new_with_storage(db);
+    let doc_id = app.active_tab().unwrap().document.id().to_string();
+    let page_id = app.active_tab().unwrap().document.pages()[0].id;
+
+    let obj1 = SceneObject::new(
+        ObjectId(0),
+        "Obj1",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 25.0,
+            height: 25.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(obj1),
+        layer_id: None,
+    })
+    .unwrap();
+    let oid1 = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+    app.perform_autosave_active().unwrap();
+
+    app.execute_command(CommandOp::Batch(vec![
+        CommandOp::AddLayer {
+            page_id,
+            name: "LayerDel".to_owned(),
+            is_cut_layer: false,
+            master_scope: coree_core::MasterLayerScope::None,
+        },
+        CommandOp::DeleteObjects { ids: vec![oid1] },
+    ]))
+    .unwrap();
+
+    app.undo().unwrap();
+    let mut live_undo = app.active_tab().unwrap().document.clone();
+    {
+        let db_ref = app.storage.as_ref().unwrap();
+        db_ref
+            .flush_autosave(std::time::Duration::from_secs(5))
+            .unwrap();
+        let rec_undo = db_ref.recover_document(&doc_id).unwrap();
+        assert!(rec_undo.object(oid1).is_some());
+        live_undo.metadata_mut().modified_at = rec_undo.metadata().modified_at;
+        assert_eq!(live_undo, rec_undo);
+    }
+
+    app.redo().unwrap();
+    let mut live_redo = app.active_tab().unwrap().document.clone();
+    {
+        let db_ref = app.storage.as_ref().unwrap();
+        db_ref
+            .flush_autosave(std::time::Duration::from_secs(5))
+            .unwrap();
+        let rec_redo = db_ref.recover_document(&doc_id).unwrap();
+        assert!(
+            rec_redo.object(oid1).is_none(),
+            "deleted object must not resurrect on recovery after Inval::All redo()"
+        );
+        live_redo.metadata_mut().modified_at = rec_redo.metadata().modified_at;
+        assert_eq!(live_redo, rec_redo);
+    }
+}
+
+#[test]
+fn w3a_r9_wal_delete_page_and_icc_undo_redo_recovery() {
+    use coree_core::{
+        generate_minimal_cmyk_icc_v2, generate_minimal_srgb_icc_v2, BuiltinIccProfile,
+        RenderingIntent,
+    };
+
+    let tmp = TempTestDir::new("wal-r9-delpage-icc");
+    let db = StorageDb::open(&tmp.0.join("studio.db")).expect("open storage db");
+    let mut app = StudioApp::new_with_storage(db);
+    let doc_id = app.active_tab().unwrap().document.id().to_string();
+
+    let obj1 = SceneObject::new(
+        ObjectId(0),
+        "P1Obj",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 20.0,
+            height: 20.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(obj1),
+        layer_id: None,
+    })
+    .unwrap();
+    let oid1 = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .next()
+        .unwrap();
+
+    app.execute_command(CommandOp::AddPage {
+        name: "Page 2".to_owned(),
+        width_mm: 210.0,
+        height_mm: 297.0,
+        bleed_mm: 3.0,
+    })
+    .unwrap();
+    let page2_id = app.active_tab().unwrap().document.pages()[1].id;
+    let page2_layer_id = app.active_tab().unwrap().document.pages()[1].layers[0].id;
+
+    let obj2 = SceneObject::new(
+        ObjectId(0),
+        "P2Obj",
+        NodePayload::Shape(ParametricShape::Rectangle {
+            width: 30.0,
+            height: 30.0,
+            corner_radii: [0.0; 4],
+            corner_style: CornerStyle::Rounded,
+            lock_corners: true,
+        }),
+    );
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(obj2),
+        layer_id: Some(page2_layer_id),
+    })
+    .unwrap();
+    let oid2 = *app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .keys()
+        .find(|&&id| id != oid1)
+        .unwrap();
+
+    let rgb_icc = generate_minimal_srgb_icc_v2("TestSRGB");
+    let cmyk_icc = generate_minimal_cmyk_icc_v2("TestSWOP", BuiltinIccProfile::UsWebCoatedSwopCmyk);
+    app.execute_command(CommandOp::SetDocumentProperties {
+        title: None,
+        color_mode: None,
+        default_unit: None,
+        dpi: None,
+        multipage_view: None,
+        active_page_index: None,
+        metadata: None,
+        custom_icc_profile: None,
+        clear_custom_icc: false,
+        rgb_icc_profile: Some(rgb_icc.clone()),
+        clear_rgb_icc: false,
+        cmyk_icc_profile: Some(cmyk_icc.clone()),
+        clear_cmyk_icc: false,
+        gray_icc_profile: None,
+        clear_gray_icc: false,
+        rendering_intent: Some(RenderingIntent::Perceptual),
+        black_point_compensation: None,
+    })
+    .unwrap();
+    app.perform_autosave_active().unwrap();
+
+    app.execute_command(CommandOp::DeletePage { page_id: page2_id })
+        .unwrap();
+    app.execute_command(CommandOp::TransformObjects {
+        ids: vec![oid1],
+        affine: Affine2D::translate(5.0, 0.0),
+    })
+    .unwrap();
+
+    app.undo().unwrap(); // Targeted TransformObjects
+    app.undo().unwrap(); // DeletePage (Inval::All)
+    let mut live_undo = app.active_tab().unwrap().document.clone();
+    {
+        let db_ref = app.storage.as_ref().unwrap();
+        db_ref
+            .flush_autosave(std::time::Duration::from_secs(5))
+            .unwrap();
+        let rec_undo = db_ref.recover_document(&doc_id).unwrap();
+        assert_eq!(rec_undo.pages().len(), 2);
+        assert!(rec_undo.object(oid2).is_some());
+        assert_eq!(rec_undo.rgb_icc_profile(), Some(rgb_icc.as_slice()));
+        assert_eq!(rec_undo.cmyk_icc_profile(), Some(cmyk_icc.as_slice()));
+        assert_eq!(rec_undo.rendering_intent(), RenderingIntent::Perceptual);
+        live_undo.metadata_mut().modified_at = rec_undo.metadata().modified_at;
+        assert_eq!(live_undo, rec_undo);
+    }
+
+    app.redo().unwrap(); // DeletePage
+    let mut live_redo = app.active_tab().unwrap().document.clone();
+    {
+        let db_ref = app.storage.as_ref().unwrap();
+        db_ref
+            .flush_autosave(std::time::Duration::from_secs(5))
+            .unwrap();
+        let rec_redo = db_ref.recover_document(&doc_id).unwrap();
+        assert_eq!(rec_redo.pages().len(), 1);
+        assert!(rec_redo.object(oid2).is_none());
+        live_redo.metadata_mut().modified_at = rec_redo.metadata().modified_at;
+        assert_eq!(live_redo, rec_redo);
+    }
+}
+
+#[test]
+fn w3a_r9_wal_targeted_undo_next_id_rollback_recovers_new_object_journal() {
+    let tmp = TempTestDir::new("wal-r9-case4-nextid");
+    let db = StorageDb::open(&tmp.0.join("studio.db")).expect("open storage db");
+    let mut app = StudioApp::new_with_storage(db);
+    let doc_id = app.active_tab().unwrap().document.id().to_string();
+
+    let make_box = |name: &str| {
+        SceneObject::new(
+            ObjectId(0),
+            name,
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: 10.0,
+                height: 10.0,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            }),
+        )
+    };
+
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(make_box("R1")),
+        layer_id: None,
+    })
+    .unwrap();
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(make_box("R2")),
+        layer_id: None,
+    })
+    .unwrap();
+    app.perform_autosave_active().unwrap();
+
+    // Undo R2 -> live_doc.next_id rolls back; WAL delta saves patch.next_id
+    app.undo().unwrap();
+
+    // Create R3 and mutate it by ID without an intermediate autosave (only in command_journal)
+    app.execute_command(CommandOp::CreateObject {
+        object: Box::new(make_box("R3")),
+        layer_id: None,
+    })
+    .unwrap();
+    let r3_id = app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .iter()
+        .find(|(_, o)| o.name == "R3")
+        .map(|(&id, _)| id)
+        .unwrap();
+    app.execute_command(CommandOp::SetFill {
+        ids: vec![r3_id],
+        fill: Fill::Solid(Color::rgb(0.0, 0.0, 1.0)),
+    })
+    .unwrap();
+
+    let mut live_doc = app.active_tab().unwrap().document.clone();
+    let db_ref = app.storage.as_ref().unwrap();
+    db_ref
+        .flush_autosave(std::time::Duration::from_secs(5))
+        .unwrap();
+    let recovered = db_ref
+        .recover_document(&doc_id)
+        .expect("recover_document must roll back next_id cleanly before replaying journal");
+    live_doc.metadata_mut().modified_at = recovered.metadata().modified_at;
+    assert_eq!(live_doc, recovered);
 }

@@ -916,7 +916,7 @@ fn fit_png_bytes_to_max(png_bytes: &[u8], limit: u32) -> Result<Vec<u8>, String>
     export_raster_to_bytes(
         resized.width,
         resized.height,
-        &resized.rgba_bytes,
+        &resized.to_rgba8_vec(),
         &RasterExportOptions::new(RasterFormat::Png, 96.0),
     )
     .map_err(|e| format!("failed to encode thumbnail PNG: {e}"))

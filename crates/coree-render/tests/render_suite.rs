@@ -510,6 +510,8 @@ fn lens_frozen_viewpoint_and_remove_face_work_accurately() {
         frozen: false,
         viewpoint: None,
         remove_face: true,
+
+        frozen_snapshot: None,
     });
     doc.add_object(rf_lens, None).unwrap();
 
@@ -542,6 +544,8 @@ fn lens_frozen_viewpoint_and_remove_face_work_accurately() {
         frozen: false,
         viewpoint: Some(Point2D::new(25.0, 50.0)),
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     doc_vp.add_object(vp_lens, None).unwrap();
     let img_vp = render_page_to_rgba(&doc_vp, 0, 72.0, ViewMode::Enhanced).unwrap();
@@ -571,6 +575,8 @@ fn lens_frozen_viewpoint_and_remove_face_work_accurately() {
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let lens_id = doc_fr.add_object(fr_lens, None).unwrap();
 
@@ -627,24 +633,48 @@ fn mesh_fill_effects_powerclip_and_blendmodes_render_cleanly() {
                 col: 0,
                 pos: Point2D::new(0.0, 0.0),
                 color: Color::rgba8(255, 0, 0, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 0,
                 col: 1,
                 pos: Point2D::new(60.0, 0.0),
                 color: Color::rgba8(0, 255, 0, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 0,
                 pos: Point2D::new(0.0, 60.0),
                 color: Color::rgba8(0, 0, 255, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 1,
                 pos: Point2D::new(60.0, 60.0),
                 color: Color::rgba8(255, 255, 0, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
         ],
     })
@@ -735,6 +765,8 @@ fn mesh_fill_effects_powerclip_and_blendmodes_render_cleanly() {
         steps: 4,
         rotation_deg: 0.0,
         along_path: None,
+
+        rotate_along_path: true,
     });
     doc2.add_object(b_src, None).unwrap();
 
@@ -1147,7 +1179,7 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
         1.0,
     );
     let idx = (16 * 64 + 32) * 4;
-    assert!(asset.rgba_bytes[idx] > 220 && asset.rgba_bytes[idx + 1] < 40);
+    assert!(asset.to_rgba8_vec()[idx] > 220 && asset.to_rgba8_vec()[idx + 1] < 40);
 
     // 2. Clone stamp copies red band down to y=44
     clone_stamp_stroke(
@@ -1158,7 +1190,7 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
         0.9,
     );
     let clone_idx = (44 * 64 + 32) * 4;
-    assert!(asset.rgba_bytes[clone_idx] > 200 && asset.rgba_bytes[clone_idx + 1] < 50);
+    assert!(asset.to_rgba8_vec()[clone_idx] > 200 && asset.to_rgba8_vec()[clone_idx + 1] < 50);
 
     // 3. Smudge pulls red from y=16 downward toward y=24
     smudge_stroke(
@@ -1169,14 +1201,14 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
     );
     let smudge_idx = (23 * 64 + 20) * 4;
     assert!(
-        asset.rgba_bytes[smudge_idx + 1] < 245,
+        asset.to_rgba8_vec()[smudge_idx + 1] < 245,
         "Smudge must drag red pigment downward"
     );
 
     // 4. Erase reduces alpha to 0 at (48, 16)
     erase_stroke(&mut asset, &[Point2D::new(48.0, 16.0)], 4.0, 1.0);
     let erase_idx = (16 * 64 + 48) * 4;
-    assert_eq!(asset.rgba_bytes[erase_idx + 3], 0);
+    assert_eq!(asset.to_rgba8_vec()[erase_idx + 3], 0);
 
     // 5. Masks: Rectangle, Lasso, Magic Wand + Cutout background removal
     let rect_mask = RasterMask::from_rectangle(64, 64, Rect2D::from_xywh(10.0, 10.0, 20.0, 20.0));
@@ -1211,11 +1243,12 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
     bg_mask.invert(); // now foreground mask!
     apply_cutout_background_removal(&mut wand_asset, &bg_mask, 1.0);
     assert_eq!(
-        wand_asset.rgba_bytes[3], 0,
+        wand_asset.to_rgba8_vec()[3],
+        0,
         "Cutout must remove background pixel (0,0)"
     );
     assert!(
-        wand_asset.rgba_bytes[(16 * 32 + 16) * 4 + 3] > 200,
+        wand_asset.to_rgba8_vec()[(16 * 32 + 16) * 4 + 3] > 200,
         "Cutout must keep foreground"
     );
 
@@ -1230,21 +1263,21 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
             } else {
                 [40, 120, 220, 255]
             };
-            test_img.rgba_bytes[idx..idx + 4].copy_from_slice(&px);
+            test_img.tiles[0].make_mut()[idx..idx + 4].copy_from_slice(&px);
         }
     }
 
     // Exact assertions on key filters
     let inv = apply_raster_filter(&test_img, &RasterFilter::Invert);
-    assert_eq!(&inv.rgba_bytes[0..4], &[55, 195, 215, 255]);
+    assert_eq!(&inv.to_rgba8_vec()[0..4], &[55, 195, 215, 255]);
 
     let blurred = apply_raster_filter(&test_img, &RasterFilter::GaussianBlur { radius_px: 3.0 });
     // Boundary column x=15 blends red (200) toward blue (40)
     let b_idx = (16 * 32 + 15) * 4;
     assert!(
-        blurred.rgba_bytes[b_idx] < 180 && blurred.rgba_bytes[b_idx] > 80,
+        blurred.to_rgba8_vec()[b_idx] < 180 && blurred.to_rgba8_vec()[b_idx] > 80,
         "GaussianBlur must smooth sharp step edge: {:?}",
-        &blurred.rgba_bytes[b_idx..b_idx + 4]
+        &blurred.to_rgba8_vec()[b_idx..b_idx + 4]
     );
 
     let hsl = apply_raster_filter(
@@ -1256,9 +1289,9 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
         },
     );
     assert!(
-        hsl.rgba_bytes[1] > hsl.rgba_bytes[0],
+        hsl.to_rgba8_vec()[1] > hsl.to_rgba8_vec()[0],
         "HSL +120° hue shift should shift red into green: {:?}",
-        &hsl.rgba_bytes[0..4]
+        &hsl.to_rgba8_vec()[0..4]
     );
 
     let curve = apply_raster_filter(
@@ -1268,7 +1301,7 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
         },
     );
     assert!(
-        curve.rgba_bytes[0] < 80 && curve.rgba_bytes[2] > 180,
+        curve.to_rgba8_vec()[0] < 80 && curve.to_rgba8_vec()[2] > 180,
         "Inverting ToneCurve failed"
     );
 
@@ -1327,9 +1360,10 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
     ];
     for f in &all_other_filters {
         let out = apply_raster_filter(&test_img, f);
-        assert_eq!(out.rgba_bytes.len(), test_img.rgba_bytes.len());
+        assert_eq!(out.to_rgba8_vec().len(), test_img.to_rgba8_vec().len());
         assert_ne!(
-            out.rgba_bytes, test_img.rgba_bytes,
+            out.to_rgba8_vec(),
+            test_img.to_rgba8_vec(),
             "filter {f:?} had no effect"
         );
     }
@@ -1348,7 +1382,7 @@ fn raster_studio_brushes_masks_all_19_filters_and_vector_to_bitmap() {
     let bmp = convert_object_to_bitmap(&doc, obj_id, 150.0).unwrap();
     assert!(bmp.width > 100 && bmp.height > 100);
     let green_px = bmp
-        .rgba_bytes
+        .to_rgba8_vec()
         .as_chunks::<4>()
         .0
         .iter()
@@ -1915,6 +1949,8 @@ fn edge_cases_nan_safety_viewport_math_and_remaining_variants() {
         steps: 5,
         rotation_deg: 90.0,
         along_path: Some(guide_path_id),
+
+        rotate_along_path: true,
     });
     doc2.add_object(start_b, None).unwrap();
 
@@ -2049,24 +2085,48 @@ fn regression_2_pixel_rect_extreme_zoom_no_overflow() {
                 col: 0,
                 pos: Point2D::new(0.0, 0.0),
                 color: Color::rgba8(220, 40, 40, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 0,
                 col: 1,
                 pos: Point2D::new(3_000_000.0, 0.0),
                 color: Color::rgba8(40, 60, 220, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 0,
                 pos: Point2D::new(0.0, 3_000_000.0),
                 color: Color::rgba8(40, 200, 60, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
             MeshNode {
                 row: 1,
                 col: 1,
                 pos: Point2D::new(3_000_000.0, 3_000_000.0),
                 color: Color::rgba8(200, 40, 200, 255),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             },
         ],
     };
@@ -2274,6 +2334,8 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     compare_direct_vs_tiled(&build_lens_doc(fisheye_obj), "Cross-tile FishEye");
 
@@ -2284,6 +2346,8 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     compare_direct_vs_tiled(&build_lens_doc(mag_obj), "Cross-tile Magnify");
 
@@ -2294,6 +2358,8 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         frozen: false,
         viewpoint: Some(Point2D::new(27.5, 40.0)),
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let (_, tiled_vp) = compare_direct_vs_tiled(&build_lens_doc(vp_lens), "Cross-tile Viewpoint");
     // Center of lens at x=100mm (~378px), y=40mm (~151px) must show inverted blue = yellow!
@@ -2311,6 +2377,8 @@ fn regression_3_tile_cache_invalidation_and_cross_tile_lenses_and_dropshadow() {
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let mut frozen_doc = build_lens_doc(frozen_obj);
     let frozen_id = *frozen_doc.pages()[0].layers[0].objects.last().unwrap();
@@ -2389,6 +2457,8 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let wf_id = doc.add_object(wf_lens, None).unwrap();
     let grp_id = doc.group_objects(&[wf_id], "LensGroup").unwrap();
@@ -2425,6 +2495,8 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
                 frozen: false,
                 viewpoint: None,
                 remove_face: true,
+
+                frozen_snapshot: None,
             }),
         },
     )
@@ -2452,6 +2524,8 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
                 frozen: false,
                 viewpoint: Some(Point2D::new(22.5, 22.5)),
                 remove_face: false,
+
+                frozen_snapshot: None,
             }),
         },
     )
@@ -2478,6 +2552,8 @@ fn regression_4_grouped_and_symmetry_lenses_no_double_transform() {
         frozen: false,
         viewpoint: Some(Point2D::new(22.5, 22.5)),
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     sym_lens.effects.push(Effect::Symmetry {
         axes: 2,
@@ -2529,7 +2605,7 @@ fn regression_5_adversarial_malformed_inputs_no_oom_or_panic() {
     let mut malformed = RasterAsset::new(2, 2, vec![255u8; 16], 96.0, ColorMode::Rgb).unwrap();
     malformed.width = 64;
     malformed.height = 64;
-    malformed.rgba_bytes.truncate(12); // len 12 != 64*64*4
+    malformed.tiles[0].make_mut().truncate(12); // len 12 != 64*64*4
 
     paint_brush_stroke(
         &mut malformed,
@@ -3059,8 +3135,8 @@ fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
     for y in 12..20 {
         for x in 44..52 {
             let idx = ((y * w + x) * 4) as usize;
-            let r = heal_asset.rgba_bytes[idx];
-            let b = heal_asset.rgba_bytes[idx + 2];
+            let r = heal_asset.to_rgba8_vec()[idx];
+            let b = heal_asset.to_rgba8_vec()[idx + 2];
             min_r = min_r.min(r);
             max_r = max_r.max(r);
             sum_r += u32::from(r);
@@ -3107,8 +3183,8 @@ fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
         ToneRange::Shadows,
         0.8,
     );
-    let sh_delta = i32::from(dodge_sh.rgba_bytes[(10 * 60 + 10) * 4]) - 35;
-    let hi_delta = i32::from(dodge_sh.rgba_bytes[(10 * 60 + 50) * 4]) - 225;
+    let sh_delta = i32::from(dodge_sh.to_rgba8_vec()[(10 * 60 + 10) * 4]) - 35;
+    let hi_delta = i32::from(dodge_sh.to_rgba8_vec()[(10 * 60 + 50) * 4]) - 225;
     assert!(
         sh_delta > 30 && sh_delta > hi_delta * 5,
         "Dodge(Shadows) must strongly lift shadows vs highlights: sh_delta={sh_delta}, hi_delta={hi_delta}"
@@ -3125,8 +3201,8 @@ fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
         ToneRange::Highlights,
         0.8,
     );
-    let burn_hi_delta = 225 - i32::from(burn_hi.rgba_bytes[(10 * 60 + 50) * 4]);
-    let burn_sh_delta = 35 - i32::from(burn_hi.rgba_bytes[(10 * 60 + 10) * 4]);
+    let burn_hi_delta = 225 - i32::from(burn_hi.to_rgba8_vec()[(10 * 60 + 50) * 4]);
+    let burn_sh_delta = 35 - i32::from(burn_hi.to_rgba8_vec()[(10 * 60 + 10) * 4]);
     assert!(
         burn_hi_delta > 40 && burn_hi_delta > burn_sh_delta * 5,
         "Burn(Highlights) must strongly darken highlights vs shadows: hi={burn_hi_delta}, sh={burn_sh_delta}"
@@ -3143,7 +3219,7 @@ fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
         ToneRange::Midtones,
         0.7,
     );
-    assert!(dodge_mid.rgba_bytes[(10 * 60 + 30) * 4] > 165);
+    assert!(dodge_mid.to_rgba8_vec()[(10 * 60 + 30) * 4] > 165);
 
     // 3. Contiguous Scanline Flood Fill (Paint Bucket) with tolerance & large image stress test
     let fw = 64u32;
@@ -3187,12 +3263,12 @@ fn raster_studio_healing_dodge_burn_and_scanline_flood_fill() {
         "Exact enclosed 30x30 pocket must be filled"
     );
     assert_eq!(
-        &bucket_asset.rgba_bytes[n_idx..n_idx + 4],
+        &bucket_asset.to_rgba8_vec()[n_idx..n_idx + 4],
         &[220, 40, 80, 255],
         "Pixel within tolerance=20 must be filled"
     );
     // Exterior pixel outside border must stay untouched (240, 240, 240)
-    assert_eq!(&bucket_asset.rgba_bytes[0..4], &[240, 240, 240, 255]);
+    assert_eq!(&bucket_asset.to_rgba8_vec()[0..4], &[240, 240, 240, 255]);
 
     // Large 512x512 flood fill confirms zero stack overflow
     let mut big =
@@ -3341,6 +3417,8 @@ fn regression_8_audit_fixes_lenses_effects_arabic_diacritics_mesh_powerclip_and_
         frozen: false,
         viewpoint: None,
         remove_face: true,
+
+        frozen_snapshot: None,
     });
     doc.add_object(mag_lens, None).unwrap();
 
@@ -3427,6 +3505,12 @@ fn regression_8_audit_fixes_lenses_effects_arabic_diacritics_mesh_powerclip_and_
             col: 0,
             pos: Point2D::new(0.0, 0.0),
             color: Color::rgba8(200, 30, 30, 255),
+
+            alpha: 1.0,
+            handle_n: None,
+            handle_s: None,
+            handle_e: None,
+            handle_w: None,
         }],
     };
     mesh_doc
@@ -3561,7 +3645,7 @@ fn r16_text_on_path_nested_group_and_convert_to_bitmap() {
 
     let bmp = convert_object_to_bitmap(&doc, top_id, 96.0).unwrap();
     let non_zero_bmp = bmp
-        .rgba_bytes
+        .to_rgba8_vec()
         .as_chunks::<4>()
         .0
         .iter()
@@ -3625,7 +3709,7 @@ fn r16_text_on_path_nested_group_and_convert_to_bitmap() {
     .unwrap();
     let eff_bmp = convert_object_to_bitmap(&doc, eff_top, 96.0).unwrap();
     let eff_ink = eff_bmp
-        .rgba_bytes
+        .to_rgba8_vec()
         .as_chunks::<4>()
         .0
         .iter()
@@ -3676,7 +3760,7 @@ fn r16_isolated_group_and_transparency_with_connector_and_symbol() {
 
     let bmp = convert_object_to_bitmap(&doc, inner_id, 96.0).unwrap();
     let max_alpha = bmp
-        .rgba_bytes
+        .to_rgba8_vec()
         .as_chunks::<4>()
         .0
         .iter()
@@ -3740,7 +3824,7 @@ fn r16_isolated_group_and_transparency_with_connector_and_symbol() {
         .unwrap();
     let sym_bmp = convert_object_to_bitmap(&sdoc, inst_id, 96.0).unwrap();
     let sym_max_alpha = sym_bmp
-        .rgba_bytes
+        .to_rgba8_vec()
         .as_chunks::<4>()
         .0
         .iter()
@@ -4382,6 +4466,8 @@ fn r17_convert_object_to_bitmap_captures_blend_and_wide_drop_shadow() {
         steps: 6,
         rotation_deg: 0.0,
         along_path: None,
+
+        rotate_along_path: true,
     });
     let src_id = bdoc.add_object(src, Some(lid)).unwrap();
 
@@ -4403,7 +4489,7 @@ fn r17_convert_object_to_bitmap_captures_blend_and_wide_drop_shadow() {
     let mid_ink = ((mid_x.saturating_sub(25))..=(mid_x + 25).min(blend_asset.width - 1))
         .filter(|&x| {
             let idx = ((mid_y as usize) * (blend_asset.width as usize) + (x as usize)) * 4;
-            blend_asset.rgba_bytes[idx + 3] > 30
+            blend_asset.to_rgba8_vec()[idx + 3] > 30
         })
         .count();
     assert!(
@@ -4439,9 +4525,9 @@ fn r17_convert_object_to_bitmap_captures_blend_and_wide_drop_shadow() {
     let sy = ((45.0 - sh_bounds.min_y) * px_per_mm).round() as u32;
     let sidx = ((sy as usize) * (sh_asset.width as usize) + (sx as usize)) * 4;
     assert!(
-        sh_asset.rgba_bytes[sidx + 3] > 20,
+        sh_asset.to_rgba8_vec()[sidx + 3] > 20,
         "DropShadow bitmap must contain visible shadow pixel at (50, 45), got alpha={}",
-        sh_asset.rgba_bytes[sidx + 3]
+        sh_asset.to_rgba8_vec()[sidx + 3]
     );
 }
 
@@ -4632,6 +4718,8 @@ fn w1b_r18_render_isolated_object_non_frozen_lens_master_and_grouped_top_connect
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let lens_id = doc.add_object(lens_obj, Some(p2_lid)).unwrap();
 
@@ -5178,6 +5266,8 @@ fn w1b_r19_intra_group_lens_isolated_render_and_convert_object_to_bitmap_and_hit
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let lens_id = doc.add_object(lens_obj, Some(lid)).unwrap();
     let grp_id = doc
@@ -5207,7 +5297,7 @@ fn w1b_r19_intra_group_lens_isolated_render_and_convert_object_to_bitmap_and_hit
     let bcy = (((40.0 - bmp_lens_bb.min_y) / bmp_lens_bb.height()) * f64::from(bmp_lens.height))
         .floor() as u32;
     let bidx = ((bcy as usize) * (bmp_lens.width as usize) + (bcx as usize)) * 4;
-    let bpx = &bmp_lens.rgba_bytes[bidx..bidx + 4];
+    let bpx = &bmp_lens.to_rgba8_vec()[bidx..bidx + 4];
     assert!(
         bpx[3] > 240 && bpx[0] < 15 && bpx[1] > 240 && bpx[2] > 240,
         "convert_object_to_bitmap_with_bounds on non-frozen Invert lens must be opaque Cyan, got {bpx:?}"
@@ -5413,7 +5503,7 @@ fn w1b_r20_isolated_group_and_powerclip_lens_and_explicit_parent_xf() {
         let (bmp, _bb) = convert_object_to_bitmap_with_bounds(&doc, lens_id, 96.0).unwrap();
         let bidx =
             (((bmp.height / 2) as usize) * (bmp.width as usize) + (bmp.width / 2) as usize) * 4;
-        let bpx = &bmp.rgba_bytes[bidx..bidx + 4];
+        let bpx = &bmp.to_rgba8_vec()[bidx..bidx + 4];
         assert_eq!(
             bpx,
             [0, 255, 255, 255],
@@ -5612,6 +5702,8 @@ fn w1b_r20_dirty_tile_cache_dependents_and_group_deform_effects() {
             steps: 5,
             rotation_deg: 0.0,
             along_path: None,
+
+            rotate_along_path: true,
         });
         doc.add_object(b_src, Some(lid)).unwrap();
 
@@ -5800,7 +5892,7 @@ fn w1b_r20_dirty_tile_cache_dependents_and_group_deform_effects() {
                     continue;
                 }
                 let idx = ((y as usize) * (bmp.width as usize) + (x as usize)) * 4;
-                if bmp.rgba_bytes[idx + 3] > 200 {
+                if bmp.to_rgba8_vec()[idx + 3] > 200 {
                     corner_ink_px += 1;
                 }
             }
@@ -6834,6 +6926,8 @@ fn w1b_r23_symbol_lens_backdrop_scaled_distort_tiles_connector_effects_and_top_p
                 frozen,
                 viewpoint: None,
                 remove_face,
+
+                frozen_snapshot: None,
             });
             let objs = if use_deformed_group {
                 let mut grp = SceneObject::new(
@@ -6943,7 +7037,7 @@ fn w1b_r23_symbol_lens_backdrop_scaled_distort_tiles_connector_effects_and_top_p
             if !use_deformed_group && frozen {
                 let (bmp, _) = convert_object_to_bitmap_with_bounds(&doc, inst, 96.0).unwrap();
                 assert!(
-                    bmp.rgba_bytes
+                    bmp.to_rgba8_vec()
                         .as_chunks::<4>()
                         .0
                         .iter()
@@ -7317,6 +7411,8 @@ fn w1b_r24_frozen_lens_key_isolation_for_symbols_zero_ids_and_symmetry() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let sym = SymbolDef::new("FrozenLensSym", vec![sym_lens]);
         let sym_id = sym.id;
@@ -7370,6 +7466,8 @@ fn w1b_r24_frozen_lens_key_isolation_for_symbols_zero_ids_and_symmetry() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let mut lens2 = make_rect(ObjectId(0), 70.0, 10.0, 30.0, 30.0, &Color::TRANSPARENT);
         lens2.lens = Some(LensConfig {
@@ -7377,6 +7475,8 @@ fn w1b_r24_frozen_lens_key_isolation_for_symbols_zero_ids_and_symmetry() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let sym = SymbolDef::new("DualZeroIdFrozenSym", vec![lens1, lens2]);
         let sym_id = sym.id;
@@ -7419,6 +7519,8 @@ fn w1b_r24_frozen_lens_key_isolation_for_symbols_zero_ids_and_symmetry() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         sym_lens.effects.push(Effect::Symmetry {
             axes: 1,
@@ -7607,6 +7709,8 @@ fn w1b_r24_symbol_instance_opacity_blend_mode_and_deformed_zero_id_roots() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let sym_lens = SymbolDef::new(
             "ZeroRedFrozenLensSym",
@@ -7791,6 +7895,8 @@ fn w1b_r25_symmetry_container_chained_frozen_lenses_and_isolated_backdrop() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let mut l2 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
         l2.lens = Some(LensConfig {
@@ -7798,6 +7904,8 @@ fn w1b_r25_symmetry_container_chained_frozen_lenses_and_isolated_backdrop() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let sym = SymbolDef::new("ChainedFrozenSym", vec![l1, l2]);
         let sym_id = sym.id;
@@ -7862,6 +7970,8 @@ fn w1b_r25_symmetry_container_chained_frozen_lenses_and_isolated_backdrop() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let mut l2 = make_rect(ObjectId(0), 15.0, 15.0, 35.0, 35.0, &Color::TRANSPARENT);
         l2.lens = Some(LensConfig {
@@ -7869,6 +7979,8 @@ fn w1b_r25_symmetry_container_chained_frozen_lenses_and_isolated_backdrop() {
             frozen: false,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let l1_id = doc.add_object(l1, Some(lid)).unwrap();
         let l2_id = doc.add_object(l2, Some(lid)).unwrap();
@@ -7993,6 +8105,8 @@ fn w1b_r25_symbol_def_zero_id_powerclip_and_group_containers() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let pc = SceneObject::new(
             ObjectId(0),
@@ -8045,6 +8159,8 @@ fn w1b_r25_symbol_def_zero_id_powerclip_and_group_containers() {
             frozen,
             viewpoint: None,
             remove_face,
+
+            frozen_snapshot: None,
         });
         let mut def_grp = SceneObject::new(
             ObjectId(0),
@@ -8097,6 +8213,8 @@ fn w1b_r25_symbol_def_zero_id_powerclip_and_group_containers() {
             frozen,
             viewpoint: None,
             remove_face,
+
+            frozen_snapshot: None,
         });
         let trans_grp = SceneObject::new(
             ObjectId(0),
@@ -8175,6 +8293,8 @@ fn w1b_r25_dirty_tile_cache_warms_off_tile_frozen_lenses_and_persists_on_move() 
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let standalone_id = doc.add_object(standalone, Some(lid)).unwrap();
 
@@ -8184,6 +8304,8 @@ fn w1b_r25_dirty_tile_cache_warms_off_tile_frozen_lenses_and_persists_on_move() 
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let sym = SymbolDef::new("OffTileMoveSym", vec![sym_lens]);
     let sym_id = sym.id;
@@ -8333,6 +8455,8 @@ fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let l_id = doc.add_object(lens, Some(lid)).unwrap();
         coree_core::apply_command(
@@ -8455,6 +8579,8 @@ fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let l_id = doc.add_object(lens, Some(lid)).unwrap();
         let pc_id = doc
@@ -8597,6 +8723,8 @@ fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated
             frozen: false,
             viewpoint: None,
             remove_face: true,
+
+            frozen_snapshot: None,
         });
         let mut sym_inner = SceneObject::new(
             ObjectId(3),
@@ -8685,6 +8813,8 @@ fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated
             frozen: false,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let wl_id = wf_doc.add_object(wl, Some(wlid)).unwrap();
         coree_core::apply_command(
@@ -8780,6 +8910,8 @@ fn w1b_r26_deformed_outer_group_wrapping_symmetry_containers_and_off_vp_isolated
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let l_id = doc.add_object(lens, Some(lid)).unwrap();
         coree_core::apply_command(
@@ -8861,6 +8993,8 @@ fn w1b_r27_zero_opacity_frozen_lens_does_not_stay_unwarmed() {
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let zero_lens_id = doc.add_object(zero_lens, Some(lid)).unwrap();
 
@@ -8871,6 +9005,8 @@ fn w1b_r27_zero_opacity_frozen_lens_does_not_stay_unwarmed() {
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     let child_lens_id = doc.add_object(child_lens, Some(lid)).unwrap();
     coree_core::apply_command(
@@ -8939,6 +9075,8 @@ fn w1b_r28_powerclip_with_lens_ignores_child_frozen_lens_warm_check() {
             frozen: true,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let child_id = doc.add_object(child_lens, Some(lid)).unwrap();
 
@@ -8949,6 +9087,8 @@ fn w1b_r28_powerclip_with_lens_ignores_child_frozen_lens_warm_check() {
             frozen: pc_frozen,
             viewpoint: None,
             remove_face: false,
+
+            frozen_snapshot: None,
         });
         let pc_id = doc.add_object(pc, Some(lid)).unwrap();
         coree_core::apply_command(
@@ -9049,6 +9189,8 @@ fn w1b_r28_remove_face_ignores_invisible_and_zero_opacity_artwork() {
         frozen: false,
         viewpoint: None,
         remove_face: true,
+
+        frozen_snapshot: None,
     });
     doc.add_object(lens, Some(lid)).unwrap();
 
@@ -9078,6 +9220,8 @@ fn w1b_r28_remove_face_ignores_invisible_and_zero_opacity_artwork() {
         frozen: false,
         viewpoint: None,
         remove_face: true,
+
+        frozen_snapshot: None,
     });
     let sym_lens_id = doc.add_object(sym_lens, Some(lid)).unwrap();
     coree_core::apply_command(
@@ -9723,4 +9867,612 @@ fn w2_exit_r8_symbol_zero_id_persp_group_text_on_path_pixel_parity() {
         red_min_x >= 128.0 && red_max_x <= 212.0 && red_min_y >= 130.0 && red_max_y <= 155.0,
         "ObjectId(0) Group(translate, persp) + TextOnPath(sub.persp) must render inside (128..212, 130..155) matching bounds {wb:?}, got ({red_min_x:.2}..{red_max_x:.2}, {red_min_y:.2}..{red_max_y:.2})"
     );
+}
+
+#[test]
+fn cmyk_icc_pipeline_respected_by_conical_square_blend_contour_extrude_and_lenses() {
+    use coree_core::{generate_minimal_cmyk_icc_v2, RenderingIntent};
+
+    let cmyk_bytes =
+        generate_minimal_cmyk_icc_v2("ISO Coated v2", BuiltinIccProfile::IsoCoatedV2Cmyk);
+    let fogra_path = std::path::Path::new("/usr/share/color/icc/colord/FOGRA39L_coated.icc");
+    let active_cmyk_bytes = if fogra_path.is_file() {
+        std::fs::read(fogra_path).unwrap_or(cmyk_bytes)
+    } else {
+        cmyk_bytes
+    };
+
+    let cyan = Color::cmyk(1.0, 0.0, 0.0, 0.0);
+    let magenta = Color::cmyk(0.0, 1.0, 0.0, 0.0);
+    let mid_cm = Color::cmyk(0.5, 0.5, 0.0, 0.0);
+
+    for intent in [
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::AbsoluteColorimetric,
+    ] {
+        let mut doc = Document::new("CmykIccCallers", 140.0, 100.0, ColorMode::Cmyk, 72.0);
+        doc.set_cmyk_icc_profile(active_cmyk_bytes.clone()).unwrap();
+        doc.set_rendering_intent(intent);
+        let icc = doc.icc_pipeline();
+        let expected_cyan = icc.color_to_rgba8(&cyan);
+        let expected_magenta = icc.color_to_rgba8(&magenta);
+        let expected_mid_cm = icc.color_to_rgba8(&mid_cm);
+
+        assert_ne!(
+            [expected_cyan[0], expected_cyan[1], expected_cyan[2]],
+            [0, 255, 255],
+            "ICC profile must not map CMYK cyan to naive (0,255,255)"
+        );
+
+        let assert_px_close = |label: &str, got: [u8; 4], exp: [u8; 4]| {
+            let dr = i32::from(got[0]).abs_diff(i32::from(exp[0]));
+            let dg = i32::from(got[1]).abs_diff(i32::from(exp[1]));
+            let db = i32::from(got[2]).abs_diff(i32::from(exp[2]));
+            assert!(
+                dr <= 2 && dg <= 2 && db <= 2,
+                "{intent:?} {label}: got {got:?}, expected {exp:?} (ICC bypass?)"
+            );
+        };
+
+        // 1. ConicalGradient (all stops CMYK cyan)
+        doc.add_object(
+            rect_obj(
+                5.0,
+                5.0,
+                20.0,
+                20.0,
+                Fill::ConicalGradient {
+                    center: Point2D::new(10.0, 10.0),
+                    angle_deg: 0.0,
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: cyan.clone(),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: cyan.clone(),
+                        },
+                    ],
+                },
+            ),
+            None,
+        )
+        .unwrap();
+
+        // 2. SquareGradient (all stops CMYK cyan)
+        doc.add_object(
+            rect_obj(
+                30.0,
+                5.0,
+                20.0,
+                20.0,
+                Fill::SquareGradient {
+                    center: Point2D::new(10.0, 10.0),
+                    size: 20.0,
+                    angle_deg: 0.0,
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: cyan.clone(),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: cyan.clone(),
+                        },
+                    ],
+                },
+            ),
+            None,
+        )
+        .unwrap();
+
+        // 3. Contour::Outside (cyan base -> magenta target, 1 step)
+        let mut contour_obj = make_rect(60.0, 10.0, 10.0, 10.0, cyan.clone());
+        contour_obj.effects.push(Effect::Contour {
+            mode: ContourMode::Outside,
+            steps: 1,
+            offset_mm: 5.0,
+            fill_color: magenta.clone(),
+            outline_color: Color::TRANSPARENT,
+        });
+        doc.add_object(contour_obj, None).unwrap();
+
+        // 4. Blend (cyan -> magenta, 1 step, midpoint CMYK(0.5, 0.5, 0, 0))
+        let dst_id = doc
+            .add_object(make_rect(115.0, 5.0, 20.0, 20.0, magenta.clone()), None)
+            .unwrap();
+        let mut src_blend = make_rect(85.0, 5.0, 20.0, 20.0, cyan.clone());
+        src_blend.effects.push(Effect::Blend {
+            target_id: dst_id,
+            steps: 1,
+            rotation_deg: 0.0,
+            along_path: None,
+            rotate_along_path: false,
+        });
+        doc.add_object(src_blend, None).unwrap();
+
+        // 5. Extrude25D (CMYK cyan base + CMYK cyan shade)
+        let mut ext_obj = make_rect(5.0, 40.0, 20.0, 20.0, cyan.clone());
+        ext_obj.effects.push(Effect::Extrude25D {
+            vanishing_point: Point2D::new(50.0, 80.0),
+            depth: 20.0,
+            bevel_depth: 0.0,
+            shade_color: cyan.clone(),
+            light_dir: [0.0, 0.0, 1.0],
+        });
+        doc.add_object(ext_obj, None).unwrap();
+
+        // 6. CustomColorMap::Direct lens over a white rect -> maps white to CMYK cyan
+        doc.add_object(make_rect(35.0, 40.0, 20.0, 20.0, Color::WHITE), None)
+            .unwrap();
+        let mut cmap_lens = make_rect(35.0, 40.0, 20.0, 20.0, Color::TRANSPARENT);
+        cmap_lens.lens = Some(LensConfig {
+            kind: LensKind::CustomColorMap {
+                from_color: cyan.clone(),
+                to_color: cyan.clone(),
+                palette_mode: ColorMapMode::Direct,
+            },
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        });
+        doc.add_object(cmap_lens, None).unwrap();
+
+        // 7. Wireframe lens with override_fill = CMYK cyan
+        let mut wire_lens = make_rect(65.0, 40.0, 20.0, 20.0, Color::TRANSPARENT);
+        wire_lens.lens = Some(LensConfig {
+            kind: LensKind::Wireframe {
+                override_outline: None,
+                override_fill: Some(cyan.clone()),
+            },
+            frozen: false,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        });
+        doc.add_object(wire_lens, None).unwrap();
+
+        let img = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+        assert_px_close(
+            "ConicalGradient",
+            pixel_at_mm(&img, 15.0, 15.0),
+            expected_cyan,
+        );
+        assert_px_close(
+            "SquareGradient",
+            pixel_at_mm(&img, 40.0, 15.0),
+            expected_cyan,
+        );
+        assert_px_close(
+            "Contour::Outside",
+            pixel_at_mm(&img, 57.5, 15.0),
+            expected_magenta,
+        );
+        assert_px_close(
+            "Blend midpoint",
+            pixel_at_mm(&img, 110.0, 15.0),
+            expected_mid_cm,
+        );
+
+        // Extrude25D side face under center-bottom (15mm, 62mm) should not be naive cyan (0, 255, 255)
+        let ext_px = pixel_at_mm(&img, 15.0, 62.0);
+        assert!(
+            ext_px[1] < 200,
+            "{intent:?} Extrude25D side face bypassed CMYK ICC pipeline: {ext_px:?}"
+        );
+        assert_px_close(
+            "CustomColorMap::Direct",
+            pixel_at_mm(&img, 45.0, 50.0),
+            expected_cyan,
+        );
+        assert_px_close(
+            "Wireframe override_fill",
+            pixel_at_mm(&img, 75.0, 50.0),
+            expected_cyan,
+        );
+    }
+}
+
+#[test]
+fn w3a_r9_isolated_object_render_matches_page_under_custom_3slot_icc() {
+    use coree_core::{generate_minimal_cmyk_icc_v2, RenderingIntent};
+    use coree_render::render_isolated_object_to_rgba;
+
+    fn build_adobe_wide_rgb_icc_v2() -> Vec<u8> {
+        let mut tags: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        let xyz_tag = |xyz: [f64; 3]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(20);
+            v.extend_from_slice(b"XYZ ");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            for c in xyz {
+                v.extend_from_slice(&((c * 65536.0).round() as i32).to_be_bytes());
+            }
+            v
+        };
+        let curv_gamma = |gamma: f64| -> Vec<u8> {
+            let mut v = Vec::with_capacity(14);
+            v.extend_from_slice(b"curv");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&((gamma * 256.0).round() as u16).to_be_bytes());
+            v
+        };
+        let mut desc = Vec::new();
+        let label = b"WideGamutAdobeRenderTest";
+        desc.extend_from_slice(b"desc");
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&((label.len() + 1) as u32).to_be_bytes());
+        desc.extend_from_slice(label);
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.push(0);
+        desc.resize(desc.len() + 67, 0);
+
+        tags.push((b"desc", desc));
+        tags.push((b"wtpt", xyz_tag([0.95047, 1.0, 1.08883])));
+        tags.push((b"rXYZ", xyz_tag([0.60974, 0.31111, 0.01947])));
+        tags.push((b"gXYZ", xyz_tag([0.20528, 0.62567, 0.06087])));
+        tags.push((b"bXYZ", xyz_tag([0.14919, 0.06322, 0.74457])));
+        tags.push((b"rTRC", curv_gamma(2.19921875)));
+        tags.push((b"gTRC", curv_gamma(2.19921875)));
+        tags.push((b"bTRC", curv_gamma(2.19921875)));
+
+        let header_size = 128usize;
+        let tag_table_size = 4 + tags.len() * 12;
+        let mut data_offset = (header_size + tag_table_size + 3) & !3;
+        let mut table = Vec::with_capacity(tag_table_size);
+        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let mut body = Vec::new();
+        for (sig, payload) in &tags {
+            let aligned_off = data_offset + body.len();
+            table.extend_from_slice(*sig);
+            table.extend_from_slice(&(aligned_off as u32).to_be_bytes());
+            table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        data_offset = (header_size + table.len() + 3) & !3;
+        let total_size = data_offset + body.len();
+        let mut out = vec![0u8; 128];
+        out[0..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[4..8].copy_from_slice(b"core");
+        out[8] = 2;
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"RGB ");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&((0.9642_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[72..76].copy_from_slice(&((1.0_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[76..80].copy_from_slice(&((0.8249_f64 * 65536.0).round() as i32).to_be_bytes());
+        out.extend_from_slice(&table);
+        out.resize(data_offset, 0);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn build_gray_gamma10_icc_v2() -> Vec<u8> {
+        let mut tags: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        let mut desc = Vec::new();
+        let label = b"LinearGrayGamma1.0";
+        desc.extend_from_slice(b"desc");
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&((label.len() + 1) as u32).to_be_bytes());
+        desc.extend_from_slice(label);
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.push(0);
+        desc.resize(desc.len() + 67, 0);
+
+        let mut ktrc = Vec::with_capacity(14);
+        ktrc.extend_from_slice(b"curv");
+        ktrc.extend_from_slice(&0u32.to_be_bytes());
+        ktrc.extend_from_slice(&1u32.to_be_bytes());
+        ktrc.extend_from_slice(&((1.0_f64 * 256.0).round() as u16).to_be_bytes());
+
+        tags.push((b"desc", desc));
+        tags.push((b"kTRC", ktrc));
+
+        let header_size = 128usize;
+        let tag_table_size = 4 + tags.len() * 12;
+        let data_offset = (header_size + tag_table_size + 3) & !3;
+        let mut table = Vec::with_capacity(tag_table_size);
+        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let mut body = Vec::new();
+        for (sig, payload) in &tags {
+            let aligned_off = data_offset + body.len();
+            table.extend_from_slice(*sig);
+            table.extend_from_slice(&(aligned_off as u32).to_be_bytes());
+            table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let total_size = data_offset + body.len();
+        let mut out = vec![0u8; 128];
+        out[0..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[4..8].copy_from_slice(b"core");
+        out[8] = 2;
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"GRAY");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&((0.9642_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[72..76].copy_from_slice(&((1.0_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[76..80].copy_from_slice(&((0.8249_f64 * 65536.0).round() as i32).to_be_bytes());
+        out.extend_from_slice(&table);
+        out.resize(data_offset, 0);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    struct IccProfileSet<'a> {
+        label: &'a str,
+        rgb: Vec<u8>,
+        cmyk: Vec<u8>,
+        gray: Vec<u8>,
+        intent: RenderingIntent,
+    }
+
+    let mut profile_sets = vec![IccProfileSet {
+        label: "OfflineSynthetic3Slot",
+        rgb: build_adobe_wide_rgb_icc_v2(),
+        cmyk: generate_minimal_cmyk_icc_v2("TestSWOP", BuiltinIccProfile::UsWebCoatedSwopCmyk),
+        gray: build_gray_gamma10_icc_v2(),
+        intent: RenderingIntent::RelativeColorimetric,
+    }];
+
+    let prophoto = std::path::Path::new("/usr/share/color/icc/colord/ProPhotoRGB.icc");
+    let swop = std::path::Path::new("/usr/share/color/icc/colord/SWOP_TR003_coated_3.icc");
+    let sgray = std::path::Path::new("/usr/share/color/icc/ghostscript/sgray.icc");
+    if prophoto.is_file() && swop.is_file() && sgray.is_file() {
+        profile_sets.push(IccProfileSet {
+            label: "SystemProPhotoSwopSGray",
+            rgb: std::fs::read(prophoto).unwrap(),
+            cmyk: std::fs::read(swop).unwrap(),
+            gray: std::fs::read(sgray).unwrap(),
+            intent: RenderingIntent::RelativeColorimetric,
+        });
+    }
+    let adobe_sys = std::path::Path::new("/usr/share/color/icc/colord/AdobeRGB1998.icc");
+    let fogra_sys = std::path::Path::new("/usr/share/color/icc/colord/FOGRA39L_coated.icc");
+    if adobe_sys.is_file() && fogra_sys.is_file() && sgray.is_file() {
+        profile_sets.push(IccProfileSet {
+            label: "SystemAdobeFograSGray",
+            rgb: std::fs::read(adobe_sys).unwrap(),
+            cmyk: std::fs::read(fogra_sys).unwrap(),
+            gray: std::fs::read(sgray).unwrap(),
+            intent: RenderingIntent::Perceptual,
+        });
+    }
+
+    let dpi = 150.0;
+    let px_per_mm = dpi / 25.4;
+
+    for IccProfileSet {
+        label,
+        rgb: rgb_icc,
+        cmyk: cmyk_icc,
+        gray: gray_icc,
+        intent,
+    } in profile_sets
+    {
+        for color_mode in [ColorMode::Rgb, ColorMode::Cmyk] {
+            let mut doc = Document::new(label, 160.0, 120.0, color_mode, dpi as f32);
+            doc.set_rendering_intent(intent);
+            doc.set_black_point_compensation(true);
+            doc.set_rgb_icc_profile(rgb_icc.clone()).unwrap();
+            doc.set_cmyk_icc_profile(cmyk_icc.clone()).unwrap();
+            doc.set_gray_icc_profile(gray_icc.clone()).unwrap();
+
+            // 3 distinct color-space backdrop rows (CMYK, RGB, Gray) covering x=10..128 (leaving x=130..150 over white paper)
+            doc.add_object(
+                make_rect(10.0, 10.0, 118.0, 30.0, Color::cmyk(0.65, 0.15, 0.25, 0.08)),
+                None,
+            )
+            .unwrap();
+            doc.add_object(
+                make_rect(10.0, 45.0, 118.0, 30.0, Color::rgb(0.72, 0.45, 0.18)),
+                None,
+            )
+            .unwrap();
+            doc.add_object(make_rect(10.0, 80.0, 118.0, 30.0, Color::gray(0.45)), None)
+                .unwrap();
+
+            let lens_specs: Vec<(&str, f64, LensConfig)> = vec![
+                (
+                    "BrightenLive",
+                    12.0,
+                    LensConfig::new(LensKind::Brighten { rate_pct: 0.0 }),
+                ),
+                (
+                    "BrightenFrozen",
+                    32.0,
+                    LensConfig {
+                        kind: LensKind::Brighten { rate_pct: 0.0 },
+                        frozen: true,
+                        viewpoint: None,
+                        remove_face: false,
+                        frozen_snapshot: None,
+                    },
+                ),
+                (
+                    "ColorAdd",
+                    52.0,
+                    LensConfig::new(LensKind::ColorAdd {
+                        color: Color::cmyk(0.1, 0.8, 0.2, 0.0),
+                        rate_pct: 40.0,
+                    }),
+                ),
+                (
+                    "Transparency",
+                    72.0,
+                    LensConfig::new(LensKind::Transparency {
+                        color: Color::rgb(0.15, 0.80, 0.35),
+                        rate_pct: 60.0,
+                    }),
+                ),
+                (
+                    "CustomColorMap",
+                    92.0,
+                    LensConfig::new(LensKind::CustomColorMap {
+                        from_color: Color::cmyk(0.8, 0.1, 0.1, 0.0),
+                        to_color: Color::rgb(0.9, 0.2, 0.5),
+                        palette_mode: ColorMapMode::Direct,
+                    }),
+                ),
+                (
+                    "TintedGrayscale",
+                    112.0,
+                    LensConfig::new(LensKind::TintedGrayscale {
+                        tint: Color::cmyk(0.0, 0.85, 0.75, 0.0),
+                    }),
+                ),
+            ];
+
+            let mut check_points: Vec<(&str, ObjectId, f64, f64)> = Vec::new();
+            for (name, x_mm, cfg) in lens_specs {
+                let mut obj = make_rect(x_mm, 10.0, 16.0, 100.0, Color::TRANSPARENT);
+                obj.lens = Some(cfg);
+                let oid = doc.add_object(obj, None).unwrap();
+                check_points.push((name, oid, x_mm + 8.0, 25.0));
+                check_points.push((name, oid, x_mm + 8.0, 60.0));
+                check_points.push((name, oid, x_mm + 8.0, 95.0));
+            }
+
+            // ConicalGradient + InnerShadow + Effect::Transparency isolated effect object
+            let mut eff_obj = rect_obj(
+                130.0,
+                10.0,
+                20.0,
+                30.0,
+                Fill::ConicalGradient {
+                    center: Point2D::new(10.0, 15.0),
+                    angle_deg: 0.0,
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: Color::cmyk(0.9, 0.1, 0.1, 0.0),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: Color::cmyk(0.1, 0.8, 0.6, 0.0),
+                        },
+                    ],
+                },
+            );
+            eff_obj.effects.push(Effect::InnerShadow {
+                dx_mm: 2.0,
+                dy_mm: 2.0,
+                blur_mm: 1.5,
+                opacity: 0.75,
+                color: Color::cmyk(0.8, 0.2, 0.1, 0.3),
+                feather_direction: FeatherDirection::Inside,
+            });
+            eff_obj.effects.push(Effect::Transparency {
+                mode: TransparencyMode::Uniform(0.65),
+                blend_mode: BlendMode::Normal,
+            });
+            let eff_oid = doc.add_object(eff_obj, None).unwrap();
+
+            let page_img = render_page_to_rgba(&doc, 0, dpi, ViewMode::Enhanced).unwrap();
+
+            // Control doc with default ICC profiles to confirm active ICC changes pixel outputs
+            let mut default_doc = doc.clone();
+            default_doc.clear_rgb_icc_profile();
+            default_doc.clear_cmyk_icc_profile();
+            default_doc.clear_gray_icc_profile();
+            default_doc.clear_custom_icc_profile();
+
+            let mut max_default_diff = 0u8;
+            let mut iso_cache: std::collections::HashMap<ObjectId, (Rect2D, RgbaBuffer)> =
+                std::collections::HashMap::new();
+            for (name, oid, x_mm, y_mm) in check_points {
+                let (rect_mm, iso_buf) = iso_cache.entry(oid).or_insert_with(|| {
+                    render_isolated_object_to_rgba(&doc, 0, oid, Affine2D::IDENTITY, dpi)
+                        .unwrap()
+                        .unwrap()
+                });
+                let sx = ((x_mm - rect_mm.min_x) * px_per_mm).round() as u32;
+                let sy = ((y_mm - rect_mm.min_y) * px_per_mm).round() as u32;
+                let iso_px = iso_buf.get_pixel(sx, sy).unwrap();
+                let page_px = pixel_at_mm(&page_img, x_mm, y_mm);
+                for c in 0..4 {
+                    assert!(
+                        iso_px[c].abs_diff(page_px[c]) <= 1,
+                        "{label}/{color_mode:?} {name} @ ({x_mm},{y_mm}) ch {c}: iso={iso_px:?} vs page={page_px:?}"
+                    );
+                }
+
+                let (def_rect, def_buf) =
+                    render_isolated_object_to_rgba(&default_doc, 0, oid, Affine2D::IDENTITY, dpi)
+                        .unwrap()
+                        .unwrap();
+                let dsx = ((x_mm - def_rect.min_x) * px_per_mm).round() as u32;
+                let dsy = ((y_mm - def_rect.min_y) * px_per_mm).round() as u32;
+                let def_px = def_buf.get_pixel(dsx, dsy).unwrap();
+                for c in 0..3 {
+                    max_default_diff = max_default_diff.max(iso_px[c].abs_diff(def_px[c]));
+                }
+            }
+            assert!(
+                max_default_diff >= 8,
+                "{label}/{color_mode:?} isolated lens renders must diverge from default ICC (max_diff={max_default_diff})"
+            );
+
+            // Also verify effect object (ConicalGradient + InnerShadow + Transparency) matches page when composited over white
+            // Sample at (145.0, 25.0), away from the ConicalGradient center singularity at (140.0, 25.0) and InnerShadow edge
+            let (eff_rect, eff_buf) =
+                render_isolated_object_to_rgba(&doc, 0, eff_oid, Affine2D::IDENTITY, dpi)
+                    .unwrap()
+                    .unwrap();
+            let esx = ((145.0 - eff_rect.min_x) * px_per_mm).round() as u32;
+            let esy = ((25.0 - eff_rect.min_y) * px_per_mm).round() as u32;
+            let eff_iso = eff_buf.get_pixel(esx, esy).unwrap();
+            // Composite straight-alpha eff_iso over white background (matching RenderOptions::export() white page)
+            let a = f32::from(eff_iso[3]) / 255.0;
+            let eff_over_white = [
+                (f32::from(eff_iso[0]) * a + 255.0 * (1.0 - a)).round() as u8,
+                (f32::from(eff_iso[1]) * a + 255.0 * (1.0 - a)).round() as u8,
+                (f32::from(eff_iso[2]) * a + 255.0 * (1.0 - a)).round() as u8,
+                255,
+            ];
+            let eff_page = pixel_at_mm(&page_img, 145.0, 25.0);
+            for c in 0..4 {
+                assert!(
+                    eff_over_white[c].abs_diff(eff_page[c]) <= 2,
+                    "{label}/{color_mode:?} EffectObj ch {c}: iso_over_white={eff_over_white:?} vs page={eff_page:?}"
+                );
+            }
+
+            // Verify DirtyTileCache ViewportKey hashes document ICC changes without mark_all_dirty()
+            let mut cache = DirtyTileCache::new(240, 180);
+            let mut renderer = SceneRenderer::new();
+            let vp = Viewport::new(240, 180);
+            let opts = RenderOptions::export();
+            let _ = cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+            assert_eq!(
+                cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer),
+                0
+            );
+            assert!(
+                cache.render_dirty_tiles(
+                    &default_doc,
+                    &vp,
+                    ViewMode::Enhanced,
+                    &opts,
+                    &mut renderer
+                ) > 0,
+                "ViewportKey must invalidate DirtyTileCache when document ICC profiles change"
+            );
+        }
+    }
 }

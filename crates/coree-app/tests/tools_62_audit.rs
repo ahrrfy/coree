@@ -287,7 +287,11 @@ fn audit_raster_studio_all_8_ops_and_auto_create_layer() {
         let NodePayload::Raster(ref r) = tab.document.object(oid).unwrap().payload else {
             panic!("expected raster object {oid:?}");
         };
-        tab.document.asset(r.asset_id).unwrap().rgba_bytes.clone()
+        tab.document
+            .asset(r.asset_id)
+            .unwrap()
+            .to_rgba8_vec()
+            .clone()
     };
 
     let raster_oid = *app
@@ -1771,7 +1775,10 @@ fn regression_raster_zero_dim_floodfill_no_panic() {
         id: ImageAssetId::new(),
         width: 0,
         height: 0,
-        rgba_bytes: Vec::new(),
+        pixel_depth: coree_core::PixelDepth::Bit8,
+        tiles_x: 0,
+        tiles_y: 0,
+        tiles: Vec::new(),
         source_dpi: 150.0,
         color_mode: ColorMode::Rgb,
     };

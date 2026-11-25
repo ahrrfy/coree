@@ -1233,7 +1233,7 @@ fn optional_external_real_file_smoke_check() {
         assert_eq!(doc.pages().len(), 1);
         assert!(!doc.objects().is_empty());
         assert!(!doc.assets().is_empty());
-        let total_rgba: usize = doc.assets().values().map(|a| a.rgba_bytes.len()).sum();
+        let total_rgba: usize = doc.assets().values().map(|a| a.to_rgba8_vec().len()).sum();
         eprintln!(
             "[VERIFY PSD] layers={} objects={} assets={} page={:.2}x{:.2}mm dpi={:.1} total_rgba={:.1}MiB elapsed={:.2?}",
             doc.pages()[0].layers.len(),
@@ -3882,5 +3882,514 @@ fn w2_exit_r8_symbol_zero_id_persp_group_text_on_path_svg_pdf_eps_parity() {
             min_x >= 128.0,
             "EPS gs red glyph min_x={min_x:.2} must include ObjectId(0) Group transform"
         );
+    }
+}
+
+#[test]
+fn w3a_r9_svg_pdf_eps_export_honors_3slot_icc_for_lenses_and_effects() {
+    use coree_core::{
+        decode_base64, generate_minimal_cmyk_icc_v2, BuiltinIccProfile, FeatherDirection,
+        RenderingIntent,
+    };
+    use coree_io::{export_eps_to_string, export_svg_to_string};
+    use coree_render::{render_page_to_rgba, render_svg_to_rgba, ViewMode};
+
+    fn build_wide_rgb_icc() -> Vec<u8> {
+        let mut tags: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        let xyz_tag = |xyz: [f64; 3]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(20);
+            v.extend_from_slice(b"XYZ ");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            for c in xyz {
+                v.extend_from_slice(&((c * 65536.0).round() as i32).to_be_bytes());
+            }
+            v
+        };
+        let curv_gamma = |gamma: f64| -> Vec<u8> {
+            let mut v = Vec::with_capacity(14);
+            v.extend_from_slice(b"curv");
+            v.extend_from_slice(&0u32.to_be_bytes());
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v.extend_from_slice(&((gamma * 256.0).round() as u16).to_be_bytes());
+            v
+        };
+        let mut desc = Vec::new();
+        let label = b"WideGamutAdobeIOTest";
+        desc.extend_from_slice(b"desc");
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&((label.len() + 1) as u32).to_be_bytes());
+        desc.extend_from_slice(label);
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.push(0);
+        desc.resize(desc.len() + 67, 0);
+
+        tags.push((b"desc", desc));
+        tags.push((b"wtpt", xyz_tag([0.95047, 1.0, 1.08883])));
+        tags.push((b"rXYZ", xyz_tag([0.60974, 0.31111, 0.01947])));
+        tags.push((b"gXYZ", xyz_tag([0.20528, 0.62567, 0.06087])));
+        tags.push((b"bXYZ", xyz_tag([0.14919, 0.06322, 0.74457])));
+        tags.push((b"rTRC", curv_gamma(2.19921875)));
+        tags.push((b"gTRC", curv_gamma(2.19921875)));
+        tags.push((b"bTRC", curv_gamma(2.19921875)));
+
+        let header_size = 128usize;
+        let tag_table_size = 4 + tags.len() * 12;
+        let data_offset = (header_size + tag_table_size + 3) & !3;
+        let mut table = Vec::with_capacity(tag_table_size);
+        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let mut body = Vec::new();
+        for (sig, payload) in &tags {
+            let aligned_off = data_offset + body.len();
+            table.extend_from_slice(*sig);
+            table.extend_from_slice(&(aligned_off as u32).to_be_bytes());
+            table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let total_size = data_offset + body.len();
+        let mut out = vec![0u8; 128];
+        out[0..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[4..8].copy_from_slice(b"core");
+        out[8] = 2;
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"RGB ");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&((0.9642_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[72..76].copy_from_slice(&((1.0_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[76..80].copy_from_slice(&((0.8249_f64 * 65536.0).round() as i32).to_be_bytes());
+        out.extend_from_slice(&table);
+        out.resize(data_offset, 0);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn build_gray_gamma10_icc() -> Vec<u8> {
+        let mut tags: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        let mut desc = Vec::new();
+        let label = b"LinearGrayGamma1.0";
+        desc.extend_from_slice(b"desc");
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&((label.len() + 1) as u32).to_be_bytes());
+        desc.extend_from_slice(label);
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.push(0);
+        desc.resize(desc.len() + 67, 0);
+
+        let mut ktrc = Vec::with_capacity(14);
+        ktrc.extend_from_slice(b"curv");
+        ktrc.extend_from_slice(&0u32.to_be_bytes());
+        ktrc.extend_from_slice(&1u32.to_be_bytes());
+        ktrc.extend_from_slice(&((1.0_f64 * 256.0).round() as u16).to_be_bytes());
+
+        tags.push((b"desc", desc));
+        tags.push((b"kTRC", ktrc));
+
+        let header_size = 128usize;
+        let tag_table_size = 4 + tags.len() * 12;
+        let data_offset = (header_size + tag_table_size + 3) & !3;
+        let mut table = Vec::with_capacity(tag_table_size);
+        table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let mut body = Vec::new();
+        for (sig, payload) in &tags {
+            let aligned_off = data_offset + body.len();
+            table.extend_from_slice(*sig);
+            table.extend_from_slice(&(aligned_off as u32).to_be_bytes());
+            table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let total_size = data_offset + body.len();
+        let mut out = vec![0u8; 128];
+        out[0..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[4..8].copy_from_slice(b"core");
+        out[8] = 2;
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(b"GRAY");
+        out[20..24].copy_from_slice(b"XYZ ");
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&((0.9642_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[72..76].copy_from_slice(&((1.0_f64 * 65536.0).round() as i32).to_be_bytes());
+        out[76..80].copy_from_slice(&((0.8249_f64 * 65536.0).round() as i32).to_be_bytes());
+        out.extend_from_slice(&table);
+        out.resize(data_offset, 0);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    let build_scene = |color_mode: ColorMode,
+                       rgb_icc: &[u8],
+                       cmyk_icc: &[u8],
+                       gray_icc: &[u8]|
+     -> (Document, ObjectId) {
+        let mut doc = Document::new("W3aR9IoIcc", 120.0, 90.0, color_mode, 150.0);
+        doc.set_rendering_intent(RenderingIntent::RelativeColorimetric);
+        doc.set_black_point_compensation(true);
+        doc.set_rgb_icc_profile(rgb_icc.to_vec()).unwrap();
+        doc.set_cmyk_icc_profile(cmyk_icc.to_vec()).unwrap();
+        doc.set_gray_icc_profile(gray_icc.to_vec()).unwrap();
+
+        let rect_shape = |w: f64, h: f64| {
+            NodePayload::Shape(ParametricShape::Rectangle {
+                width: w,
+                height: h,
+                corner_radii: [0.0; 4],
+                corner_style: CornerStyle::Rounded,
+                lock_corners: true,
+            })
+        };
+
+        // CMYK backdrop (10..110, 10..40)
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "BgCmyk", rect_shape(100.0, 30.0))
+                .with_fill(Fill::Solid(Color::cmyk(0.65, 0.15, 0.25, 0.08)))
+                .with_outline(OutlineStyle::none())
+                .with_transform(coree_core::Affine2D::translate(10.0, 10.0)),
+            None,
+        )
+        .unwrap();
+
+        // Gray backdrop (10..110, 45..75)
+        doc.add_object(
+            SceneObject::new(ObjectId(0), "BgGray", rect_shape(100.0, 30.0))
+                .with_fill(Fill::Solid(Color::gray(0.45)))
+                .with_outline(OutlineStyle::none())
+                .with_transform(coree_core::Affine2D::translate(10.0, 45.0)),
+            None,
+        )
+        .unwrap();
+
+        // Transparency lens covering (20..50, 15..70)
+        let mut lens_obj = SceneObject::new(ObjectId(0), "LensTransp", rect_shape(30.0, 55.0))
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none())
+            .with_transform(coree_core::Affine2D::translate(20.0, 15.0));
+        lens_obj.lens = Some(LensConfig::new(LensKind::Transparency {
+            color: Color::rgb(0.15, 0.80, 0.35),
+            rate_pct: 60.0,
+        }));
+        let lens_id = doc.add_object(lens_obj, None).unwrap();
+
+        // Effect object covering (65..95, 15..70) with CMYK Solid + InnerShadow
+        let mut eff_obj = SceneObject::new(ObjectId(0), "EffInner", rect_shape(30.0, 55.0))
+            .with_fill(Fill::Solid(Color::cmyk(0.1, 0.8, 0.2, 0.0)))
+            .with_outline(OutlineStyle::none())
+            .with_transform(coree_core::Affine2D::translate(65.0, 15.0));
+        eff_obj.effects.push(Effect::InnerShadow {
+            dx_mm: 2.0,
+            dy_mm: 2.0,
+            blur_mm: 1.5,
+            opacity: 0.75,
+            color: Color::cmyk(0.8, 0.2, 0.1, 0.3),
+            feather_direction: FeatherDirection::Inside,
+        });
+        doc.add_object(eff_obj, None).unwrap();
+        (doc, lens_id)
+    };
+
+    struct IoIccProfileSet<'a> {
+        label: &'a str,
+        rgb: Vec<u8>,
+        cmyk: Vec<u8>,
+        gray: Vec<u8>,
+    }
+
+    let mut profile_sets = vec![IoIccProfileSet {
+        label: "OfflineSynthetic",
+        rgb: build_wide_rgb_icc(),
+        cmyk: generate_minimal_cmyk_icc_v2("TestSWOP", BuiltinIccProfile::UsWebCoatedSwopCmyk),
+        gray: build_gray_gamma10_icc(),
+    }];
+    let prophoto = std::path::Path::new("/usr/share/color/icc/colord/ProPhotoRGB.icc");
+    let swop = std::path::Path::new("/usr/share/color/icc/colord/SWOP_TR003_coated_3.icc");
+    let sgray = std::path::Path::new("/usr/share/color/icc/ghostscript/sgray.icc");
+    if prophoto.is_file() && swop.is_file() && sgray.is_file() {
+        profile_sets.push(IoIccProfileSet {
+            label: "SystemProPhotoSwopSGray",
+            rgb: std::fs::read(prophoto).unwrap(),
+            cmyk: std::fs::read(swop).unwrap(),
+            gray: std::fs::read(sgray).unwrap(),
+        });
+    }
+
+    let dpi = 150.0;
+    let px_per_mm = dpi / 25.4;
+    let sample_rendered = |img: &coree_render::RenderedImage, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let sx = (x_mm * px_per_mm).round() as u32;
+        let sy = (y_mm * px_per_mm).round() as u32;
+        img.pixel(sx, sy)
+    };
+    let sample_rgba_buf = |buf: &coree_render::RgbaBuffer, x_mm: f64, y_mm: f64| -> [u8; 4] {
+        let sx = (x_mm * px_per_mm).round() as u32;
+        let sy = (y_mm * px_per_mm).round() as u32;
+        buf.get_pixel(sx, sy).unwrap()
+    };
+
+    for IoIccProfileSet {
+        label,
+        rgb: rgb_icc,
+        cmyk: cmyk_icc,
+        gray: gray_icc,
+    } in profile_sets
+    {
+        // Case 1: ColorMode::Rgb — SVG <image>, resvg, PDF (pdftoppm/gs), and EPS (gs) all honor 3-slot ICC
+        let (doc_rgb, lens_id) = build_scene(ColorMode::Rgb, &rgb_icc, &cmyk_icc, &gray_icc);
+        let page_img = render_page_to_rgba(&doc_rgb, 0, dpi, ViewMode::Enhanced).unwrap();
+
+        let mut default_doc = doc_rgb.clone();
+        default_doc.clear_rgb_icc_profile();
+        default_doc.clear_cmyk_icc_profile();
+        default_doc.clear_gray_icc_profile();
+        let default_svg = export_svg_to_string(&default_doc, 0).unwrap();
+
+        let svg = export_svg_to_string(&doc_rgb, 0).expect("SVG export");
+        let extract_obj_png = |svg_str: &str, oid: ObjectId| -> image::RgbaImage {
+            let needle = format!("id=\"obj-{}\"", oid.0);
+            let line = svg_str
+                .lines()
+                .find(|l| l.contains(&needle))
+                .expect("expected embedded <image> for lens object");
+            let b64_marker = "data:image/png;base64,";
+            let start = line.find(b64_marker).unwrap() + b64_marker.len();
+            let end = line[start..].find('"').unwrap() + start;
+            let png_bytes = decode_base64(&line[start..end]).unwrap();
+            image::load_from_memory(&png_bytes).unwrap().to_rgba8()
+        };
+
+        let svg_lens_png = extract_obj_png(&svg, lens_id);
+        let def_lens_png = extract_obj_png(&default_svg, lens_id);
+        let l_cx = svg_lens_png.width() / 2;
+        let l_cy_cmyk = ((27.5 - 15.0) / 55.0 * f64::from(svg_lens_png.height())).round() as u32;
+        let embedded_px = svg_lens_png.get_pixel(l_cx, l_cy_cmyk).0;
+        let def_embedded_px = def_lens_png.get_pixel(l_cx, l_cy_cmyk).0;
+        let ref_cmyk_lens = sample_rendered(&page_img, 35.0, 27.5);
+        let ref_gray_lens = sample_rendered(&page_img, 35.0, 60.0);
+        let ref_eff = sample_rendered(&page_img, 80.0, 27.5);
+
+        for c in 0..4 {
+            assert!(
+                embedded_px[c].abs_diff(ref_cmyk_lens[c]) <= 1,
+                "{label} SVG <image> ch {c}: got {embedded_px:?} vs page {ref_cmyk_lens:?}"
+            );
+        }
+        let max_svg_def_diff = (0..3)
+            .map(|c| embedded_px[c].abs_diff(def_embedded_px[c]))
+            .max()
+            .unwrap();
+        assert!(
+            max_svg_def_diff >= 10,
+            "{label} SVG <image> must diverge from default ICC (diff={max_svg_def_diff})"
+        );
+
+        let svg_rast = render_svg_to_rgba(svg.as_bytes(), page_img.width, page_img.height).unwrap();
+        for (pt_name, (x_mm, y_mm), exp) in [
+            ("CMYK+Lens", (35.0, 27.5), ref_cmyk_lens),
+            ("Gray+Lens", (35.0, 60.0), ref_gray_lens),
+            ("EffectObj", (80.0, 27.5), ref_eff),
+        ] {
+            let got = sample_rgba_buf(&svg_rast, x_mm, y_mm);
+            for c in 0..4 {
+                assert!(
+                    got[c].abs_diff(exp[c]) <= 2,
+                    "{label} resvg {pt_name} ch {c}: got {got:?} vs page {exp:?}"
+                );
+            }
+        }
+
+        // PDF export + guarded pdftoppm / gs external oracles
+        let pdf_bytes = export_pdf_to_bytes(
+            &doc_rgb,
+            &PdfExportOptions {
+                color_space: PdfColorSpace::DocumentDefault,
+                include_bleed: false,
+                ..PdfExportOptions::default()
+            },
+        )
+        .unwrap();
+        if std::path::Path::new("/usr/bin/pdftoppm").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_path = dir.path().join("icc.pdf");
+            let png_prefix = dir.path().join("icc_ppm");
+            std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/pdftoppm")
+                .args([
+                    "-png",
+                    "-r",
+                    "150",
+                    "-cropbox",
+                    "-singlefile",
+                    &pdf_path.display().to_string(),
+                    &png_prefix.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(dir.path().join("icc_ppm.png"))
+                .unwrap()
+                .to_rgba8();
+            for (pt_name, (x_mm, y_mm), exp) in [
+                ("CMYK+Lens", (35.0, 27.5), ref_cmyk_lens),
+                ("Gray+Lens", (35.0, 60.0), ref_gray_lens),
+                ("EffectObj", (80.0, 27.5), ref_eff),
+            ] {
+                let sx = (x_mm * px_per_mm).round() as u32;
+                let sy = (y_mm * px_per_mm).round() as u32;
+                let got = img.get_pixel(sx, sy).0;
+                for c in 0..3 {
+                    assert!(
+                        got[c].abs_diff(exp[c]) <= 2,
+                        "{label} pdftoppm {pt_name} ch {c}: got {got:?} vs page {exp:?}"
+                    );
+                }
+            }
+        }
+        if std::path::Path::new("/usr/bin/gs").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_path = dir.path().join("icc_gs.pdf");
+            let png_path = dir.path().join("icc_gs_pdf.png");
+            std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+            let st = std::process::Command::new("/usr/bin/gs")
+                .args([
+                    "-q",
+                    "-dNOPAUSE",
+                    "-dBATCH",
+                    "-sDEVICE=png16m",
+                    "-r150",
+                    &format!("-sOutputFile={}", png_path.display()),
+                    &pdf_path.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let img = image::open(&png_path).unwrap().to_rgba8();
+            for (pt_name, (x_mm, y_mm), exp) in [
+                ("CMYK+Lens", (35.0, 27.5), ref_cmyk_lens),
+                ("Gray+Lens", (35.0, 60.0), ref_gray_lens),
+                ("EffectObj", (80.0, 27.5), ref_eff),
+            ] {
+                let sx = (x_mm * px_per_mm).round() as u32;
+                let sy = (y_mm * px_per_mm).round() as u32;
+                let got = img.get_pixel(sx, sy).0;
+                for c in 0..3 {
+                    assert!(
+                        got[c].abs_diff(exp[c]) <= 2,
+                        "{label} gs(PDF) {pt_name} ch {c}: got {got:?} vs page {exp:?}"
+                    );
+                }
+            }
+
+            // EPS export + gs oracle
+            let eps = export_eps_to_string(&doc_rgb, 0).unwrap();
+            let eps_path = dir.path().join("icc_gs.eps");
+            let eps_png_path = dir.path().join("icc_gs_eps.png");
+            std::fs::write(&eps_path, eps.as_bytes()).unwrap();
+            let st_eps = std::process::Command::new("/usr/bin/gs")
+                .args([
+                    "-q",
+                    "-dNOPAUSE",
+                    "-dBATCH",
+                    "-dEPSCrop",
+                    "-sDEVICE=png16m",
+                    "-r150",
+                    &format!("-sOutputFile={}", eps_png_path.display()),
+                    &eps_path.display().to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st_eps.success());
+            let eps_img = image::open(&eps_png_path).unwrap().to_rgba8();
+            for (pt_name, (x_mm, y_mm), exp) in [
+                ("CMYK+Lens", (35.0, 27.5), ref_cmyk_lens),
+                ("Gray+Lens", (35.0, 60.0), ref_gray_lens),
+                ("EffectObj", (80.0, 27.5), ref_eff),
+            ] {
+                let sx = (x_mm * px_per_mm).round() as u32;
+                let sy = (y_mm * px_per_mm).round() as u32;
+                let got = eps_img.get_pixel(sx, sy).0;
+                for c in 0..3 {
+                    assert!(
+                        got[c].abs_diff(exp[c]) <= 2,
+                        "{label} gs(EPS) {pt_name} ch {c}: got {got:?} vs page {exp:?}"
+                    );
+                }
+            }
+        }
+
+        // Case 2: ColorMode::Cmyk — SVG <image> + resvg parity with render_page_to_rgba & valid PDF/EPS
+        let (doc_cmyk, cmyk_lens_id) = build_scene(ColorMode::Cmyk, &rgb_icc, &cmyk_icc, &gray_icc);
+        let cmyk_page_img = render_page_to_rgba(&doc_cmyk, 0, dpi, ViewMode::Enhanced).unwrap();
+        let cmyk_svg = export_svg_to_string(&doc_cmyk, 0).unwrap();
+        let cmyk_svg_lens_png = extract_obj_png(&cmyk_svg, cmyk_lens_id);
+        let cmyk_embedded_px = cmyk_svg_lens_png
+            .get_pixel(
+                cmyk_svg_lens_png.width() / 2,
+                ((27.5 - 15.0) / 55.0 * f64::from(cmyk_svg_lens_png.height())).round() as u32,
+            )
+            .0;
+        let cmyk_ref_cmyk = sample_rendered(&cmyk_page_img, 35.0, 27.5);
+        let cmyk_ref_gray = sample_rendered(&cmyk_page_img, 35.0, 60.0);
+        for c in 0..4 {
+            assert!(
+                cmyk_embedded_px[c].abs_diff(cmyk_ref_cmyk[c]) <= 1,
+                "{label} CMYK SVG <image> ch {c}: got {cmyk_embedded_px:?} vs page {cmyk_ref_cmyk:?}"
+            );
+        }
+        let cmyk_svg_rast = render_svg_to_rgba(
+            cmyk_svg.as_bytes(),
+            cmyk_page_img.width,
+            cmyk_page_img.height,
+        )
+        .unwrap();
+        for (pt_name, (x_mm, y_mm), exp) in [
+            ("CMYK+Lens", (35.0, 27.5), cmyk_ref_cmyk),
+            ("Gray+Lens", (35.0, 60.0), cmyk_ref_gray),
+        ] {
+            let got = sample_rgba_buf(&cmyk_svg_rast, x_mm, y_mm);
+            for c in 0..4 {
+                assert!(
+                    got[c].abs_diff(exp[c]) <= 2,
+                    "{label} CMYK resvg {pt_name} ch {c}: got {got:?} vs page {exp:?}"
+                );
+            }
+        }
+        let cmyk_pdf_bytes = export_pdf_to_bytes(
+            &doc_cmyk,
+            &PdfExportOptions {
+                color_space: PdfColorSpace::DocumentDefault,
+                include_bleed: false,
+                ..PdfExportOptions::default()
+            },
+        )
+        .unwrap();
+        let cmyk_eps = export_eps_to_string(&doc_cmyk, 0).unwrap();
+        if std::path::Path::new("/usr/bin/gs").exists() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf_p = dir.path().join("cmyk.pdf");
+            let eps_p = dir.path().join("cmyk.eps");
+            std::fs::write(&pdf_p, &cmyk_pdf_bytes).unwrap();
+            std::fs::write(&eps_p, cmyk_eps.as_bytes()).unwrap();
+            assert!(std::process::Command::new("/usr/bin/gs")
+                .args(["-dNODISPLAY", "-dBATCH", "-dNOPAUSE", "-q"])
+                .arg(&pdf_p)
+                .status()
+                .unwrap()
+                .success());
+            assert!(std::process::Command::new("/usr/bin/gs")
+                .args(["-dNODISPLAY", "-dBATCH", "-dNOPAUSE", "-q"])
+                .arg(&eps_p)
+                .status()
+                .unwrap()
+                .success());
+        }
     }
 }

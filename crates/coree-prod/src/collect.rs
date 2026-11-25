@@ -152,7 +152,7 @@ pub fn collect_for_output(
             let rel = format!("images/{file_name}");
             let full = images_dir.join(&file_name);
 
-            let img = RgbaImage::from_raw(asset.width, asset.height, asset.rgba_bytes.clone())
+            let img = RgbaImage::from_raw(asset.width, asset.height, asset.to_rgba8_vec())
                 .ok_or_else(|| {
                     ProdError::ImageError(format!(
                         "invalid RGBA buffer length for asset {asset_id} ({}x{})",

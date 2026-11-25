@@ -254,7 +254,30 @@ pub fn offset_polygon(path: &BezierPath, delta_mm: f64) -> CoreResult<BezierPath
         ));
     }
     let style = IoOutlineStyle::new(delta);
-    let shapes = contours.outline_as::<i64>(&style);
+    let mut shapes = contours.outline_as::<i64>(&style);
+    if shapes.is_empty() && !contours.is_empty() {
+        let scale = compute_safe_scale(&contours, &[]);
+        let int_contours = to_int_contours(&contours, scale);
+        if !int_contours.is_empty() {
+            let inv = 1.0 / scale;
+            let empty_clip: &[IntContour<i64>] = &[];
+            let clean_int = Overlay::<i64>::from_subj_and_clip(&int_contours, empty_clip)
+                .overlay(OverlayRule::Subject, FillRule::EvenOdd);
+            let clean_float: Vec<Vec<[f64; 2]>> = clean_int
+                .into_iter()
+                .flatten()
+                .filter(|c| c.len() >= 3)
+                .map(|c| {
+                    c.into_iter()
+                        .map(|p| [(p.x as f64) * inv, (p.y as f64) * inv])
+                        .collect()
+                })
+                .collect();
+            if !clean_float.is_empty() {
+                shapes = clean_float.outline_as::<i64>(&style);
+            }
+        }
+    }
     let mut subpaths = Vec::new();
     for shape in shapes {
         for contour in shape {

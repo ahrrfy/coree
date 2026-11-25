@@ -38,19 +38,20 @@ pub use brand::{
     BrandInfo, APP_NAME, DISPLAY_NAME, LICENSE, NATIVE_EXT, REPO_URL, TRADEMARK_NOTICE,
 };
 pub use color::{
-    default_cmyk_palette, default_rgb_palette, Color, ColorHarmony, ColorMode, ColorPalette,
-    ColorStyle, ColorStyleId, ColorSwatch,
+    cmyk_to_rgb_icc, default_cmyk_palette, default_rgb_palette, Color, ColorHarmony, ColorMode,
+    ColorPalette, ColorStyle, ColorStyleId, ColorSwatch,
 };
 pub use command::{
-    apply_command, rhai_array_to_ids, run_rhai_macro, CommandHistory, CommandOp,
+    apply_command, rhai_array_to_ids, run_rhai_macro, CommandHistory, CommandOp, DeltaWalHints,
     DocumentInvalidation,
 };
 pub use dimension::{AnchorPoint, ConnectorObject, ConnectorStyle, DimensionKind, DimensionObject};
 pub use document::{
-    decode_base64, encode_base64, AlignOp, DistributeOp, Document, DocumentMetadata, GridConfig,
-    Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload, Page, PathMetrics,
-    PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, PowerClipFitMode, RasterAsset,
-    RasterLayerData, SceneObject, SpatialIndex, SymbolDef, UnknownCdrChunk, ZOrderOp,
+    decode_base64, encode_base64, AlignOp, ClipMask, CowTile, DistributeOp, Document,
+    DocumentMetadata, GridConfig, Guide, GuideOrientation, Layer, MasterLayerScope, NodePayload,
+    Page, PathMetrics, PerspectiveGridConfig, PerspectiveGridMode, PerspectivePlane, PixelDepth,
+    PixelLayer, PowerClipFitMode, RasterAsset, RasterLayerData, SceneObject, SpatialIndex,
+    SymbolDef, UnknownCdrChunk, ZOrderOp, RASTER_TILE_DIM,
 };
 pub use effects::{
     BevelStyle, ContourMode, DistortKind, Effect, EnvelopeMode, ExtrudeLight, FeatherDirection,
@@ -75,11 +76,12 @@ pub use hit_test::{
     DynamicGuideKind, DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
 pub use icc::{
-    apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile, convert_cmyk_to_rgb_icc,
-    convert_rgb_between_builtin_profiles, convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2,
-    generate_minimal_srgb_icc_v2, is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk,
-    BuiltinIccProfile, IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass,
-    IccProfileHeader, IccTagEntry, IccToneCurve, IccV4Lut, RenderingIntent, SoftProofLut3D,
+    adapt_xyz_bradford, apply_soft_proof_rgba, apply_soft_proof_rgba_with_profile,
+    bradford_adaptation_matrix, convert_cmyk_to_rgb_icc, convert_rgb_between_builtin_profiles,
+    convert_rgb_to_cmyk_icc, generate_minimal_cmyk_icc_v2, generate_minimal_srgb_icc_v2,
+    is_out_of_cmyk_gamut, soft_proof_srgb_through_cmyk, BuiltinIccProfile, IccColorPipeline,
+    IccColorSpace, IccLut, IccPcs, IccProfile, IccProfileClass, IccProfileHeader, IccTagEntry,
+    IccToneCurve, IccV4Lut, RenderingIntent, SoftProofLut3D, BRADFORD_M, BRADFORD_M_INV,
     MAX_ICC_PROFILE_BYTES,
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
@@ -92,8 +94,9 @@ pub use style::{
 };
 pub use table::{TableCell, VectorTable};
 pub use text::{
-    ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphText, TextAlign, TextDirection,
-    TextOnPath, TextRun, TextStyle, TextWrapMode,
+    ArtisticText, DropCapConfig, OpenTypeFeatures, ParagraphListStyle, ParagraphTabAlign,
+    ParagraphTabStop, ParagraphText, TextAlign, TextDirection, TextOnPath, TextRun, TextStyle,
+    TextWrapMode,
 };
 pub use viewport::{ViewMode, Viewport};
 

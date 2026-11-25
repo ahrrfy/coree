@@ -5,11 +5,14 @@
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{IoError, IoLimits, IoResult};
-use coree_core::{ColorMode, RasterAsset};
+use coree_core::{ColorMode, PixelDepth, RasterAsset};
 use flate2::Crc;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
-use image::{ColorType, ImageEncoder, ImageFormat, ImageReader, Limits, RgbImage, RgbaImage};
+use image::{
+    ColorType, DynamicImage, ImageBuffer, ImageEncoder, ImageFormat, ImageReader, Limits, RgbImage,
+    Rgba, RgbaImage,
+};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -130,24 +133,42 @@ pub fn decode_raster_bytes_with_limits(bytes: &[u8], limits: &IoLimits) -> IoRes
     let mut img_limits = Limits::default();
     img_limits.max_image_width = Some(limits.max_raster_dimension);
     img_limits.max_image_height = Some(limits.max_raster_dimension);
-    img_limits.max_alloc = Some(limits.max_raster_pixels.saturating_mul(4).max(64 * 1024));
+    img_limits.max_alloc = Some(limits.max_raster_pixels.saturating_mul(8).max(64 * 1024));
     decode_reader.limits(img_limits);
 
     let decoded = decode_reader.decode()?;
-    let rgba = decoded.to_rgba8();
     let dpi = if format == Some(ImageFormat::Png) {
         parse_png_phys_dpi(bytes).unwrap_or(96.0)
     } else {
         96.0
     };
 
-    let asset = RasterAsset::new(
-        rgba.width(),
-        rgba.height(),
-        rgba.into_raw(),
-        dpi,
-        ColorMode::Rgb,
-    )?;
+    let is_16bit = matches!(
+        decoded,
+        DynamicImage::ImageLuma16(_)
+            | DynamicImage::ImageLumaA16(_)
+            | DynamicImage::ImageRgb16(_)
+            | DynamicImage::ImageRgba16(_)
+    );
+    let asset = if is_16bit {
+        let rgba16 = decoded.to_rgba16();
+        RasterAsset::new_16bit(
+            rgba16.width(),
+            rgba16.height(),
+            rgba16.into_raw(),
+            dpi,
+            ColorMode::Rgb,
+        )?
+    } else {
+        let rgba = decoded.to_rgba8();
+        RasterAsset::new(
+            rgba.width(),
+            rgba.height(),
+            rgba.into_raw(),
+            dpi,
+            ColorMode::Rgb,
+        )?
+    };
     Ok(asset)
 }
 
@@ -250,6 +271,57 @@ pub fn export_raster_to_bytes(
     }
 
     Ok(out)
+}
+
+/// Encodes a 16-bit RGBA pixel buffer (`u16` per channel) into a 16-bit PNG with embedded `pHYs` DPI.
+pub fn export_raster_16_png_to_bytes(
+    width: u32,
+    height: u32,
+    rgba16: &[u16],
+    dpi: f32,
+) -> IoResult<Vec<u8>> {
+    validate_raster_dimensions(width, height, &IoLimits::default())?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| IoError::InvalidFormat {
+            format: "raster".into(),
+            message: "16-bit pixel buffer size overflow".into(),
+        })?;
+    if rgba16.len() != expected {
+        return Err(IoError::InvalidFormat {
+            format: "raster".into(),
+            message: format!("expected {expected} RGBA16 channels, got {}", rgba16.len()),
+        });
+    }
+    let img: ImageBuffer<Rgba<u16>, Vec<u16>> =
+        ImageBuffer::from_raw(width, height, rgba16.to_vec()).ok_or_else(|| {
+            IoError::InvalidFormat {
+                format: "png".into(),
+                message: "failed to build RGBA16 image".into(),
+            }
+        })?;
+    let mut out = Vec::new();
+    let mut cursor = Cursor::new(&mut out);
+    img.write_to(&mut cursor, ImageFormat::Png)?;
+    let valid_dpi = if dpi.is_finite() && dpi > 0.0 {
+        dpi
+    } else {
+        300.0
+    };
+    inject_png_phys_chunk(&out, valid_dpi)
+}
+
+/// Encodes a [`RasterAsset`] preserving 16-bit PNG depth when `asset.pixel_depth == PixelDepth::Bit16`.
+pub fn export_raster_asset_to_bytes(
+    asset: &RasterAsset,
+    opts: &RasterExportOptions,
+) -> IoResult<Vec<u8>> {
+    if asset.pixel_depth == PixelDepth::Bit16 && opts.format == RasterFormat::Png {
+        export_raster_16_png_to_bytes(asset.width, asset.height, &asset.to_rgba16_vec(), opts.dpi)
+    } else {
+        export_raster_to_bytes(asset.width, asset.height, &asset.to_rgba8_vec(), opts)
+    }
 }
 
 /// Atomically exports an RGBA8 pixel buffer to `path`.
@@ -428,7 +500,7 @@ mod tests {
         let imported = import_raster(&path).unwrap();
         assert_eq!(imported.width, 8);
         assert_eq!(imported.height, 6);
-        assert_eq!(imported.rgba_bytes, rgba);
+        assert_eq!(imported.to_rgba8_vec(), rgba);
         assert!((imported.source_dpi - 300.0).abs() <= 1.0);
     }
 

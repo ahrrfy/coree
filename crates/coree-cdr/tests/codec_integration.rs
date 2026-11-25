@@ -200,7 +200,7 @@ fn assert_showcase_cdr_fidelity(orig: &Document, restored: &Document) {
             let asset = restored.asset(r.asset_id).expect("restored asset");
             assert_eq!(asset.width, orig_asset.width);
             assert_eq!(asset.height, orig_asset.height);
-            assert_eq!(asset.rgba_bytes, orig_asset.rgba_bytes);
+            assert_eq!(asset.to_rgba8_vec(), orig_asset.to_rgba8_vec());
             assert!((r.width_mm - 24.0).abs() < 0.01);
         }
         other => panic!("expected Raster, got {other:?}"),
@@ -440,7 +440,7 @@ fn cmx_16bit_and_32bit_roundtrip() {
                 assert_eq!(asset.width, 4);
                 assert_eq!(asset.height, 4);
                 let orig_asset = orig.assets().values().next().unwrap();
-                assert_eq!(asset.rgba_bytes, orig_asset.rgba_bytes);
+                assert_eq!(asset.to_rgba8_vec(), orig_asset.to_rgba8_vec());
             }
             other => panic!("expected Raster in CMX, got {other:?}"),
         }
@@ -472,8 +472,9 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     if let NodePayload::Raster(r) = &bg.payload {
         let asset = &doc.assets()[&r.asset_id];
         assert_eq!((asset.width, asset.height), (8, 6));
-        assert_eq!(&asset.rgba_bytes[0..4], &[0, 0, 220, 255]);
-        assert_eq!(&asset.rgba_bytes[4..8], &[30, 0, 220, 255]);
+        let rgba = asset.to_rgba8_vec();
+        assert_eq!(&rgba[0..4], &[0, 0, 220, 255]);
+        assert_eq!(&rgba[4..8], &[30, 0, 220, 255]);
     } else {
         panic!("expected Raster layer 1");
     }
@@ -487,7 +488,7 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
         let asset = &doc.assets()[&r.asset_id];
         assert_eq!(asset.color_mode, ColorMode::Cmyk);
         // Process Magenta CMYK(0,1,0,0) -> RGB(255, 0, 255), alpha = 128 from Zlib mask
-        assert_eq!(&asset.rgba_bytes[0..4], &[255, 0, 255, 128]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[255, 0, 255, 128]);
     } else {
         panic!("expected Raster layer 2");
     }
@@ -498,8 +499,9 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     assert!(gray.locked);
     if let NodePayload::Raster(r) = &gray.payload {
         let asset = &doc.assets()[&r.asset_id];
-        assert_eq!(&asset.rgba_bytes[0..4], &[200, 200, 200, 255]);
-        assert_eq!(&asset.rgba_bytes[4..8], &[200, 200, 200, 64]);
+        let rgba = asset.to_rgba8_vec();
+        assert_eq!(&rgba[0..4], &[200, 200, 200, 255]);
+        assert_eq!(&rgba[4..8], &[200, 200, 200, 64]);
     } else {
         panic!("expected Raster layer 3");
     }
@@ -510,7 +512,7 @@ fn cpt_multilayer_raster_and_alpha_mask_import() {
     let riff_obj = find_obj_by_name(&riff_cpt.document, "RIFF Raster");
     if let NodePayload::Raster(r) = &riff_obj.payload {
         let asset = &riff_cpt.document.assets()[&r.asset_id];
-        assert_eq!(&asset.rgba_bytes[0..4], &[100, 150, 200, 180]);
+        assert_eq!(&asset.to_rgba8_vec()[0..4], &[100, 150, 200, 180]);
     } else {
         panic!("expected RIFF CPT raster");
     }
@@ -673,18 +675,8 @@ fn powerclip_all_parametric_shapes_and_advanced_fills_roundtrip() {
             rows: 2,
             cols: 2,
             nodes: vec![
-                MeshNode {
-                    row: 0,
-                    col: 0,
-                    pos: Point2D::new(0.0, 0.0),
-                    color: Color::CYAN,
-                },
-                MeshNode {
-                    row: 1,
-                    col: 1,
-                    pos: Point2D::new(40.0, 30.0),
-                    color: Color::YELLOW,
-                },
+                MeshNode::new(0, 0, Point2D::new(0.0, 0.0), Color::CYAN),
+                MeshNode::new(1, 1, Point2D::new(40.0, 30.0), Color::YELLOW),
             ],
         }),
         None,
@@ -1161,8 +1153,14 @@ fn cdr_zip_x6_multiple_external_bitmaps_roundtrip() {
     let o1 = find_obj_by_name(&restored, "Img One");
     let o2 = find_obj_by_name(&restored, "Img Two");
     if let (NodePayload::Raster(r1), NodePayload::Raster(r2)) = (&o1.payload, &o2.payload) {
-        assert_eq!(restored.assets()[&r1.asset_id].rgba_bytes, a1.rgba_bytes);
-        assert_eq!(restored.assets()[&r2.asset_id].rgba_bytes, a2.rgba_bytes);
+        assert_eq!(
+            restored.assets()[&r1.asset_id].to_rgba8_vec(),
+            a1.to_rgba8_vec()
+        );
+        assert_eq!(
+            restored.assets()[&r2.asset_id].to_rgba8_vec(),
+            a2.to_rgba8_vec()
+        );
     } else {
         panic!("expected both raster objects");
     }
@@ -3130,6 +3128,7 @@ fn group_loda_unknown_args_and_cdr_shifted_blend_linked_frame_round_trip() {
         steps: 6,
         rotation_deg: 0.0,
         along_path: Some(spine_oid),
+        rotate_along_path: true,
     });
     doc.add_object(blend_src, Some(lid)).unwrap();
 
@@ -3355,7 +3354,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
             .asset(r_pc.asset_id)
             .expect("PowerClip Raster asset must resolve");
         assert_eq!((a_pc_r.width, a_pc_r.height), (2, 2));
-        assert_eq!(a_pc_r.rgba_bytes, px_pc_raster);
+        assert_eq!(a_pc_r.to_rgba8_vec(), px_pc_raster);
 
         let rt_pc_p = rt.document.object(contents[1]).unwrap();
         let Fill::BitmapPattern {
@@ -3370,7 +3369,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
             .asset(pc_pat_id)
             .expect("PowerClip BitmapPattern asset must resolve");
         assert_eq!((a_pc_p.width, a_pc_p.height), (2, 2));
-        assert_eq!(a_pc_p.rgba_bytes, px_pc_pat);
+        assert_eq!(a_pc_p.to_rgba8_vec(), px_pc_pat);
 
         let rt_top = find_obj_by_name(&rt.document, "TopBitmapPat");
         let Fill::BitmapPattern {
@@ -3385,7 +3384,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
             .asset(top_pat_id)
             .expect("top-level BitmapPattern asset must resolve");
         assert_eq!((a_top.width, a_top.height), (2, 2));
-        assert_eq!(a_top.rgba_bytes, px_top_pat);
+        assert_eq!(a_top.to_rgba8_vec(), px_top_pat);
 
         let rt_tbl = find_obj_by_name(&rt.document, "TableBitmapPat");
         let NodePayload::Table(tbl_rt) = &rt_tbl.payload else {
@@ -3403,7 +3402,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
             .asset(tbl_pat_id)
             .expect("Table cell BitmapPattern asset must resolve");
         assert_eq!((a_tbl.width, a_tbl.height), (2, 2));
-        assert_eq!(a_tbl.rgba_bytes, px_tbl_pat);
+        assert_eq!(a_tbl.to_rgba8_vec(), px_tbl_pat);
 
         let rt_sym = rt
             .document
@@ -3417,7 +3416,7 @@ fn cmx_interns_and_remaps_assets_across_powerclip_bitmap_pattern_table_and_symbo
             .asset(r_sym.asset_id)
             .expect("SymbolDef Raster asset must resolve");
         assert_eq!((a_sym.width, a_sym.height), (2, 2));
-        assert_eq!(a_sym.rgba_bytes, px_sym_raster);
+        assert_eq!(a_sym.to_rgba8_vec(), px_sym_raster);
     }
 }
 
@@ -3496,7 +3495,7 @@ fn cdr_riff_and_zip_remap_symbol_raster_and_table_cell_bitmap_pattern() {
             .asset(r_sym.asset_id)
             .expect("SymbolDef Raster ImageAssetId must resolve");
         assert_eq!((a_sym.width, a_sym.height), (2, 2));
-        assert_eq!(a_sym.rgba_bytes, px_sym);
+        assert_eq!(a_sym.to_rgba8_vec(), px_sym);
 
         let rt_tbl = find_obj_by_name(&rt.document, "TblWithBmp");
         let NodePayload::Table(t_rt) = &rt_tbl.payload else {
@@ -3513,7 +3512,7 @@ fn cdr_riff_and_zip_remap_symbol_raster_and_table_cell_bitmap_pattern() {
             .asset(tbl_id)
             .expect("Table cell BitmapPattern ImageAssetId must resolve");
         assert_eq!((a_tbl.width, a_tbl.height), (2, 2));
-        assert_eq!(a_tbl.rgba_bytes, px_tbl);
+        assert_eq!(a_tbl.to_rgba8_vec(), px_tbl);
     }
 }
 
@@ -3574,7 +3573,7 @@ fn cdr_zip_x6_raster_and_colliding_unknown_0001_dat_both_survive_without_duplica
         .asset(r.asset_id)
         .expect("Raster asset must survive collision avoidance");
     assert_eq!((asset.width, asset.height), (2, 2));
-    assert_eq!(asset.rgba_bytes, px);
+    assert_eq!(asset.to_rgba8_vec(), px);
 }
 
 #[test]
@@ -3879,7 +3878,7 @@ fn cmx_roundtrip_preserves_group_transform_and_object_flags_opacity_blend() {
             panic!("expected RasterWithAttrs to be Raster");
         };
         let asset_rt = rt.document.asset(r_rt.asset_id).unwrap();
-        assert_eq!(asset_rt.rgba_bytes, px);
+        assert_eq!(asset_rt.to_rgba8_vec(), px);
 
         let rt_art = find_obj_by_name(&rt.document, "ArtisticWithAttrs");
         assert!(xf_err(&rt_art.transform, &art_xf) < 1e-3);
@@ -4023,7 +4022,7 @@ fn cmx_roundtrip_preserves_color_styles_object_styles_live_cascade_and_perspecti
                 .document
                 .asset(image_id)
                 .expect("remapped BitmapPattern asset in ObjectStyle");
-            assert_eq!(asset.rgba_bytes, pattern_px);
+            assert_eq!(asset.to_rgba8_vec(), pattern_px);
         } else {
             panic!("expected Fill::BitmapPattern on ObjectStyle");
         }
@@ -4057,5 +4056,108 @@ fn cmx_roundtrip_preserves_color_styles_object_styles_live_cascade_and_perspecti
         );
         let cascaded_os = rt.document.object_style(os_solid_id).unwrap();
         assert_eq!(cascaded_os.fill, Some(Fill::Solid(updated_color)));
+    }
+}
+
+#[test]
+fn cdr_mesh_fill_preserves_alpha_and_nsew_handles_across_riff_and_x6() {
+    let mut doc = Document::new("MeshExtCdr", 120.0, 100.0, ColorMode::Rgb, 300.0);
+    let n0 = MeshNode {
+        row: 0,
+        col: 0,
+        pos: Point2D::new(10.0, 10.0),
+        color: Color::CYAN,
+        alpha: 0.35,
+        handle_n: Some(Point2D::new(1.5, -6.25)),
+        handle_s: Some(Point2D::new(-2.0, 12.5)),
+        handle_e: Some(Point2D::new(15.0, 3.0)),
+        handle_w: None,
+    };
+    let n1 = MeshNode {
+        row: 0,
+        col: 1,
+        pos: Point2D::new(70.0, 10.0),
+        color: Color::MAGENTA,
+        alpha: 0.8,
+        handle_n: None,
+        handle_s: Some(Point2D::new(0.0, 14.0)),
+        handle_e: None,
+        handle_w: Some(Point2D::new(-16.0, -4.5)),
+    };
+    let n2 = MeshNode {
+        row: 1,
+        col: 0,
+        pos: Point2D::new(10.0, 60.0),
+        color: Color::YELLOW,
+        alpha: 1.0,
+        handle_n: Some(Point2D::new(0.0, -14.0)),
+        handle_s: None,
+        handle_e: Some(Point2D::new(18.0, 0.0)),
+        handle_w: None,
+    };
+    let n3 = MeshNode::new(1, 1, Point2D::new(70.0, 60.0), Color::KEY_BLACK);
+
+    let obj = SceneObject::new(
+        ObjectId(0),
+        "MeshWithHandles",
+        NodePayload::Shape(ParametricShape::GraphPaper {
+            cols: 2,
+            rows: 2,
+            width: 60.0,
+            height: 50.0,
+        }),
+    )
+    .with_fill(Fill::MeshFill {
+        rows: 2,
+        cols: 2,
+        nodes: vec![n0, n1, n2, n3],
+    });
+    doc.add_object(obj, None).unwrap();
+
+    for ver in [CdrWriteVersion::RiffV12, CdrWriteVersion::ZipX6] {
+        let bytes = export_cdr_bytes(&doc, ver).unwrap();
+        let restored = import_cdr_bytes(&bytes).unwrap().document;
+        let rt = find_obj_by_name(&restored, "MeshWithHandles");
+        let Fill::MeshFill { rows, cols, nodes } = &rt.fill else {
+            panic!("expected MeshFill after {ver:?} roundtrip");
+        };
+        assert_eq!((*rows, *cols, nodes.len()), (2, 2, 4));
+        assert!(
+            (nodes[0].alpha - 0.35).abs() < 1e-5,
+            "node 0 alpha mismatch: {}",
+            nodes[0].alpha
+        );
+        assert!((nodes[1].alpha - 0.8).abs() < 1e-5);
+        assert!((nodes[3].alpha - 1.0).abs() < 1e-5);
+        assert!(
+            nodes[0]
+                .handle_n
+                .unwrap()
+                .distance_to(Point2D::new(1.5, -6.25))
+                < 1e-3
+        );
+        assert!(
+            nodes[0]
+                .handle_s
+                .unwrap()
+                .distance_to(Point2D::new(-2.0, 12.5))
+                < 1e-3
+        );
+        assert!(
+            nodes[0]
+                .handle_e
+                .unwrap()
+                .distance_to(Point2D::new(15.0, 3.0))
+                < 1e-3
+        );
+        assert!(nodes[0].handle_w.is_none());
+        assert!(
+            nodes[1]
+                .handle_w
+                .unwrap()
+                .distance_to(Point2D::new(-16.0, -4.5))
+                < 1e-3
+        );
+        assert!(nodes[3].handle_n.is_none());
     }
 }

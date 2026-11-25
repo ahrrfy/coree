@@ -684,7 +684,7 @@ fn parse_bmpt_list(
                     ctx.limits,
                     ctx.budget_remaining,
                 ) {
-                    let mut new_rgba = asset.rgba_bytes.clone();
+                    let mut new_rgba = asset.to_rgba8_vec();
                     for (px, &a) in new_rgba.as_chunks_mut::<4>().0.iter_mut().zip(alpha.iter()) {
                         px[3] = a;
                     }

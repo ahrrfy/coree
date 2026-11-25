@@ -465,6 +465,8 @@ fn e2e_f08_all_eleven_lenses_headless_render_and_controls() {
         frozen: true,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     doc_vp_default.add_object(host_default, None).unwrap();
 
@@ -488,6 +490,8 @@ fn e2e_f08_all_eleven_lenses_headless_render_and_controls() {
         frozen: true,
         viewpoint: Some(Point2D::new(10.0, 10.0)),
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     doc_vp_shifted.add_object(host_shifted, None).unwrap();
 
@@ -541,6 +545,8 @@ fn e2e_f08_all_eleven_lenses_headless_render_and_controls() {
         frozen: false,
         viewpoint: None,
         remove_face: false,
+
+        frozen_snapshot: None,
     });
     sparse_full.add_object(l_full, None).unwrap();
 
@@ -567,6 +573,8 @@ fn e2e_f08_all_eleven_lenses_headless_render_and_controls() {
         frozen: false,
         viewpoint: None,
         remove_face: true,
+
+        frozen_snapshot: None,
     });
     sparse_rf.add_object(l_rf, None).unwrap();
 
@@ -646,6 +654,8 @@ fn e2e_f02_f04_f06_f07_effects_mesh_smartfill_knife_vsd_and_all_9_booleans() {
                 steps: 5,
                 rotation_deg: 15.0,
                 along_path: None,
+
+                rotate_along_path: true,
             },
         ),
         (
@@ -792,6 +802,12 @@ fn e2e_f02_f04_f06_f07_effects_mesh_smartfill_knife_vsd_and_all_9_booleans() {
                 col: c,
                 pos: Point2D::new((c as f64) * 20.0, (r as f64) * 14.0),
                 color,
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             });
         }
     }
@@ -1130,7 +1146,7 @@ fn e2e_f09_f10_bitmap_studio_and_vector_trace() {
         Color::rgb(0.15, 0.45, 0.92),
         1.0,
     );
-    let after_paint = asset.rgba_bytes.clone();
+    let after_paint = asset.to_rgba8_vec().clone();
 
     // Clone stamp + smudge + eraser
     clone_stamp_stroke(
@@ -1141,21 +1157,26 @@ fn e2e_f09_f10_bitmap_studio_and_vector_trace() {
         0.8,
     );
     assert_ne!(
-        asset.rgba_bytes, after_paint,
+        asset.to_rgba8_vec(),
+        after_paint,
         "clone stamp must modify pixels"
     );
 
-    let before_smudge = asset.rgba_bytes.clone();
+    let before_smudge = asset.to_rgba8_vec().clone();
     smudge_stroke(
         &mut asset,
         &[Point2D::new(12.0, 12.0), Point2D::new(26.0, 26.0)],
         4.0,
         0.7,
     );
-    assert_ne!(asset.rgba_bytes, before_smudge, "smudge must blend pixels");
+    assert_ne!(
+        asset.to_rgba8_vec(),
+        before_smudge,
+        "smudge must blend pixels"
+    );
 
     erase_stroke(&mut asset, &[Point2D::new(32.0, 32.0)], 4.0, 1.0);
-    let center_alpha = asset.rgba_bytes[(32 * 64 + 32) * 4 + 3];
+    let center_alpha = asset.to_rgba8_vec()[(32 * 64 + 32) * 4 + 3];
     assert!(
         center_alpha < 128,
         "eraser must reduce alpha at stroke center"
@@ -1163,17 +1184,18 @@ fn e2e_f09_f10_bitmap_studio_and_vector_trace() {
 
     // Raster Filters + Cutout + Resample
     let blurred = apply_raster_filter(&asset, &RasterFilter::GaussianBlur { radius_px: 2.0 });
-    assert_ne!(blurred.rgba_bytes, asset.rgba_bytes);
+    assert_ne!(blurred.to_rgba8_vec(), asset.to_rgba8_vec());
     let inverted = apply_raster_filter(&asset, &RasterFilter::Invert);
-    assert_ne!(inverted.rgba_bytes, asset.rgba_bytes);
+    assert_ne!(inverted.to_rgba8_vec(), asset.to_rgba8_vec());
     let posterized = apply_raster_filter(&asset, &RasterFilter::Posterize { levels: 4 });
-    assert_ne!(posterized.rgba_bytes, asset.rgba_bytes);
+    assert_ne!(posterized.to_rgba8_vec(), asset.to_rgba8_vec());
 
     let mut cutout = asset.clone();
     let fg_mask = RasterMask::from_rectangle(64, 64, Rect2D::from_xywh(8.0, 8.0, 48.0, 48.0));
     apply_cutout_background_removal(&mut cutout, &fg_mask, 1.5);
     assert_eq!(
-        cutout.rgba_bytes[3], 0,
+        cutout.to_rgba8_vec()[3],
+        0,
         "corner pixel outside mask must become transparent"
     );
 
@@ -1222,7 +1244,7 @@ fn e2e_f09_f10_bitmap_studio_and_vector_trace() {
     coree_io::export_raster(
         logo_asset.width,
         logo_asset.height,
-        &logo_asset.rgba_bytes,
+        &logo_asset.to_rgba8_vec(),
         &coree_io::RasterExportOptions::new(coree_io::RasterFormat::Png, 150.0),
         &logo_png,
     )
@@ -1823,6 +1845,12 @@ fn build_showcase_lenses_vectors_doc() -> Document {
                 col: c,
                 pos: Point2D::new(c as f64 * 22.0, r as f64 * 14.0),
                 color: col.clone(),
+
+                alpha: 1.0,
+                handle_n: None,
+                handle_s: None,
+                handle_e: None,
+                handle_w: None,
             });
         }
     }

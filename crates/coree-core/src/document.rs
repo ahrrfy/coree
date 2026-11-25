@@ -14,6 +14,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::geometry::{
     ArtisticMedia, ArtisticMediaStyle, BSplineCurve, BezierPath, ParametricShape,
 };
+use crate::icc::{IccColorPipeline, IccColorSpace, IccProfile, RenderingIntent};
 pub use crate::ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 use crate::lens::LensConfig;
 use crate::math::{
@@ -167,20 +168,238 @@ mod serde_bytes_base64 {
     }
 }
 
-/// Embedded raster bitmap image stored in the document's asset table.
+/// Canonical tile dimension (pixels) for Copy-on-Write [`RasterAsset`] storage.
+pub const RASTER_TILE_DIM: u32 = 256;
+
+/// Channel bit depth of a [`RasterAsset`] or [`CowTile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PixelDepth {
+    #[default]
+    Bit8,
+    Bit16,
+}
+
+impl PixelDepth {
+    #[must_use]
+    pub const fn bytes_per_channel(self) -> usize {
+        match self {
+            Self::Bit8 => 1,
+            Self::Bit16 => 2,
+        }
+    }
+
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> usize {
+        self.bytes_per_channel() * 4
+    }
+}
+
+/// Copy-on-write RGBA tile (`256×256` max) backed by [`std::sync::Arc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CowTile {
+    pub width: u32,
+    pub height: u32,
+    pub depth: PixelDepth,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
+impl CowTile {
+    #[must_use]
+    pub fn new(width: u32, height: u32, depth: PixelDepth, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            depth,
+            data: std::sync::Arc::new(data),
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Returns mutable byte storage, cloning only this tile's buffer when shared (`Arc::make_mut`).
+    pub fn make_mut(&mut self) -> &mut Vec<u8> {
+        std::sync::Arc::make_mut(&mut self.data)
+    }
+
+    /// Raw allocation address of the backing `Vec<u8>` inside `Arc` (for CoW sharing checks).
+    #[must_use]
+    pub fn arc_ptr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.data) as usize
+    }
+
+    #[must_use]
+    pub fn expected_byte_len(&self) -> Option<usize> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|px| px.checked_mul(self.depth.bytes_per_pixel()))
+    }
+}
+
+/// Non-destructive pixel clip mask referencing a mask raster asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipMask {
+    pub mask_asset_id: ImageAssetId,
+    #[serde(default)]
+    pub inverted: bool,
+    #[serde(default = "default_true_lock")]
+    pub enabled: bool,
+}
+
+/// Layered pixel-studio metadata descriptor for compositing raster layers and clip masks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PixelLayer {
+    pub object_id: ObjectId,
+    pub name: String,
+    #[serde(default)]
+    pub blend_mode: BlendMode,
+    #[serde(default = "default_one_f32")]
+    pub opacity: f32,
+    #[serde(default = "default_true_lock")]
+    pub visible: bool,
+    #[serde(default)]
+    pub clip_mask: Option<ClipMask>,
+}
+
+const fn default_one_f32() -> f32 {
+    1.0
+}
+
+const fn is_bit8(d: &PixelDepth) -> bool {
+    matches!(d, PixelDepth::Bit8)
+}
+
+/// Embedded raster bitmap image stored in the document's asset table using
+/// Copy-on-Write `256×256` [`CowTile`] storage supporting both 8-bit and 16-bit channels.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RasterAsset {
     pub id: ImageAssetId,
     pub width: u32,
     pub height: u32,
-    #[serde(with = "serde_bytes_base64")]
-    pub rgba_bytes: Vec<u8>,
     pub source_dpi: f32,
     pub color_mode: ColorMode,
+    pub pixel_depth: PixelDepth,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub tiles: Vec<CowTile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RasterAssetSerde {
+    id: ImageAssetId,
+    width: u32,
+    height: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_serde_bytes_base64"
+    )]
+    rgba_bytes: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_serde_bytes_base64"
+    )]
+    rgba16_bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "is_bit8")]
+    bit_depth: PixelDepth,
+    source_dpi: f32,
+    color_mode: ColorMode,
+}
+
+impl Serialize for RasterAsset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (rgba_bytes, rgba16_bytes) = match self.pixel_depth {
+            PixelDepth::Bit8 => (Some(self.to_rgba8_vec()), None),
+            PixelDepth::Bit16 => (None, Some(self.to_rgba16_le_bytes())),
+        };
+        RasterAssetSerde {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            rgba_bytes,
+            rgba16_bytes,
+            bit_depth: self.pixel_depth,
+            source_dpi: self.source_dpi,
+            color_mode: self.color_mode,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RasterAsset {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RasterAssetSerde::deserialize(deserializer)?;
+        let mut asset = match (raw.bit_depth, raw.rgba16_bytes, raw.rgba_bytes) {
+            (PixelDepth::Bit16, Some(b16), _) => {
+                Self::new_16bit_bytes(raw.width, raw.height, b16, raw.source_dpi, raw.color_mode)
+                    .map_err(serde::de::Error::custom)?
+            }
+            (_, _, Some(b8)) => {
+                Self::new(raw.width, raw.height, b8, raw.source_dpi, raw.color_mode)
+                    .map_err(serde::de::Error::custom)?
+            }
+            (_, Some(b16), None) => {
+                Self::new_16bit_bytes(raw.width, raw.height, b16, raw.source_dpi, raw.color_mode)
+                    .map_err(serde::de::Error::custom)?
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "RasterAsset missing rgba_bytes / rgba16_bytes",
+                ));
+            }
+        };
+        asset.id = raw.id;
+        Ok(asset)
+    }
 }
 
 impl RasterAsset {
-    /// Creates a new raster asset verifying byte buffer dimensions (`width * height * 4`).
+    fn build_tiles_from_flat(
+        width: u32,
+        height: u32,
+        depth: PixelDepth,
+        flat_bytes: &[u8],
+    ) -> CoreResult<(u32, u32, Vec<CowTile>)> {
+        let bpp = depth.bytes_per_pixel();
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(bpp))
+            .ok_or_else(|| CoreError::InvalidParameter("raster dimensions overflow".into()))?;
+        if flat_bytes.len() != expected {
+            return Err(CoreError::InvalidParameter(format!(
+                "expected {expected} RGBA bytes for {width}x{height} ({depth:?}), got {}",
+                flat_bytes.len()
+            )));
+        }
+        if width == 0 || height == 0 {
+            return Ok((0, 0, Vec::new()));
+        }
+        let tiles_x = width.div_ceil(RASTER_TILE_DIM);
+        let tiles_y = height.div_ceil(RASTER_TILE_DIM);
+        let mut tiles = Vec::with_capacity((tiles_x as usize) * (tiles_y as usize));
+        let full_stride = (width as usize) * bpp;
+        for ty in 0..tiles_y {
+            let y0 = ty * RASTER_TILE_DIM;
+            let th = (height - y0).min(RASTER_TILE_DIM);
+            for tx in 0..tiles_x {
+                let x0 = tx * RASTER_TILE_DIM;
+                let tw = (width - x0).min(RASTER_TILE_DIM);
+                let row_bytes = (tw as usize) * bpp;
+                let mut tbuf = Vec::with_capacity((th as usize) * row_bytes);
+                for dy in 0..th {
+                    let src_off = ((y0 + dy) as usize) * full_stride + (x0 as usize) * bpp;
+                    tbuf.extend_from_slice(&flat_bytes[src_off..src_off + row_bytes]);
+                }
+                tiles.push(CowTile::new(tw, th, depth, tbuf));
+            }
+        }
+        Ok((tiles_x, tiles_y, tiles))
+    }
+
+    /// Creates a new 8-bit raster asset verifying byte buffer dimensions (`width * height * 4`).
     pub fn new(
         width: u32,
         height: u32,
@@ -188,24 +407,432 @@ impl RasterAsset {
         source_dpi: f32,
         color_mode: ColorMode,
     ) -> CoreResult<Self> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|px| px.checked_mul(4))
-            .ok_or_else(|| CoreError::InvalidParameter("raster dimensions overflow".into()))?;
-        if rgba_bytes.len() != expected {
-            return Err(CoreError::InvalidParameter(format!(
-                "expected {expected} RGBA bytes for {width}x{height}, got {}",
-                rgba_bytes.len()
-            )));
-        }
+        let (tiles_x, tiles_y, tiles) =
+            Self::build_tiles_from_flat(width, height, PixelDepth::Bit8, &rgba_bytes)?;
         Ok(Self {
             id: ImageAssetId::new(),
             width,
             height,
-            rgba_bytes,
             source_dpi: sanitize_f32(source_dpi, 300.0).max(1.0),
             color_mode,
+            pixel_depth: PixelDepth::Bit8,
+            tiles_x,
+            tiles_y,
+            tiles,
         })
+    }
+
+    /// Creates a new 16-bit per channel raster asset from `Vec<u16>` (`width * height * 4` u16s).
+    pub fn new_16bit(
+        width: u32,
+        height: u32,
+        rgba16: Vec<u16>,
+        source_dpi: f32,
+        color_mode: ColorMode,
+    ) -> CoreResult<Self> {
+        let expected_u16 = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| CoreError::InvalidParameter("raster dimensions overflow".into()))?;
+        if rgba16.len() != expected_u16 {
+            return Err(CoreError::InvalidParameter(format!(
+                "expected {expected_u16} u16 samples for {width}x{height}, got {}",
+                rgba16.len()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(expected_u16 * 2);
+        for v in rgba16 {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Self::new_16bit_bytes(width, height, bytes, source_dpi, color_mode)
+    }
+
+    /// Creates a new 16-bit per channel raster asset from little-endian `u16` bytes (`width * height * 8`).
+    pub fn new_16bit_bytes(
+        width: u32,
+        height: u32,
+        rgba16_le_bytes: Vec<u8>,
+        source_dpi: f32,
+        color_mode: ColorMode,
+    ) -> CoreResult<Self> {
+        let (tiles_x, tiles_y, tiles) =
+            Self::build_tiles_from_flat(width, height, PixelDepth::Bit16, &rgba16_le_bytes)?;
+        Ok(Self {
+            id: ImageAssetId::new(),
+            width,
+            height,
+            source_dpi: sanitize_f32(source_dpi, 300.0).max(1.0),
+            color_mode,
+            pixel_depth: PixelDepth::Bit16,
+            tiles_x,
+            tiles_y,
+            tiles,
+        })
+    }
+
+    /// Constructs a [`RasterAsset`] directly from pre-built [`CowTile`]s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_tiles(
+        id: ImageAssetId,
+        width: u32,
+        height: u32,
+        source_dpi: f32,
+        color_mode: ColorMode,
+        pixel_depth: PixelDepth,
+        tiles_x: u32,
+        tiles_y: u32,
+        tiles: Vec<CowTile>,
+    ) -> CoreResult<Self> {
+        let asset = Self {
+            id,
+            width,
+            height,
+            source_dpi: sanitize_f32(source_dpi, 300.0).max(1.0),
+            color_mode,
+            pixel_depth,
+            tiles_x,
+            tiles_y,
+            tiles,
+        };
+        if !asset.has_valid_layout() {
+            return Err(CoreError::InvalidParameter(
+                "invalid tiled RasterAsset layout".into(),
+            ));
+        }
+        Ok(asset)
+    }
+
+    /// Returns the channel bit depth (`Bit8` or `Bit16`).
+    #[must_use]
+    pub const fn pixel_depth(&self) -> PixelDepth {
+        self.pixel_depth
+    }
+
+    /// Returns total byte size across all tiles (`width * height * bpp`).
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.tiles.iter().map(|t| t.data.len()).sum()
+    }
+
+    /// Validates that tile grid dimensions and every tile's byte length match `width * height * bpp`.
+    #[must_use]
+    pub fn has_valid_layout(&self) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return self.tiles_x == 0 && self.tiles_y == 0 && self.tiles.is_empty();
+        }
+        let exp_tx = self.width.div_ceil(RASTER_TILE_DIM);
+        let exp_ty = self.height.div_ceil(RASTER_TILE_DIM);
+        if self.tiles_x != exp_tx || self.tiles_y != exp_ty {
+            return false;
+        }
+        let Some(exp_tiles) = (exp_tx as usize).checked_mul(exp_ty as usize) else {
+            return false;
+        };
+        if self.tiles.len() != exp_tiles {
+            return false;
+        }
+        for ty in 0..self.tiles_y {
+            let th = (self.height - ty * RASTER_TILE_DIM).min(RASTER_TILE_DIM);
+            for tx in 0..self.tiles_x {
+                let tw = (self.width - tx * RASTER_TILE_DIM).min(RASTER_TILE_DIM);
+                let tile = &self.tiles[(ty * self.tiles_x + tx) as usize];
+                if tile.width != tw || tile.height != th || tile.depth != self.pixel_depth {
+                    return false;
+                }
+                if tile.expected_byte_len() != Some(tile.data.len()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Corrupts the last tile's byte length by 1 byte (for validation unit tests).
+    pub fn truncate_last_tile_for_test(&mut self) {
+        if let Some(tile) = self.tiles.last_mut() {
+            tile.make_mut().pop();
+        }
+    }
+
+    /// Immutable reference to tile `(tx, ty)`.
+    #[must_use]
+    pub fn tile(&self, tx: u32, ty: u32) -> Option<&CowTile> {
+        if tx >= self.tiles_x || ty >= self.tiles_y {
+            return None;
+        }
+        self.tiles.get((ty * self.tiles_x + tx) as usize)
+    }
+
+    /// Mutable reference to tile `(tx, ty)` (triggers CoW clone only on that tile when needed).
+    #[must_use]
+    pub fn tile_mut(&mut self, tx: u32, ty: u32) -> Option<&mut CowTile> {
+        if tx >= self.tiles_x || ty >= self.tiles_y {
+            return None;
+        }
+        self.tiles.get_mut((ty * self.tiles_x + tx) as usize)
+    }
+
+    /// Returns the raw `Arc` buffer pointer addresses for all tiles (for CoW tests).
+    #[must_use]
+    pub fn shared_tile_ptrs(&self) -> Vec<usize> {
+        self.tiles.iter().map(CowTile::arc_ptr).collect()
+    }
+
+    /// Materializes a contiguous 8-bit RGBA buffer (`width * height * 4`).
+    #[must_use]
+    pub fn to_rgba8_vec(&self) -> Vec<u8> {
+        if self.width == 0 || self.height == 0 || !self.has_valid_layout() {
+            return Vec::new();
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mut out = vec![0u8; w * h * 4];
+        let bpp = self.pixel_depth.bytes_per_pixel();
+        for ty in 0..self.tiles_y {
+            let y0 = (ty * RASTER_TILE_DIM) as usize;
+            for tx in 0..self.tiles_x {
+                let x0 = (tx * RASTER_TILE_DIM) as usize;
+                let tile = &self.tiles[(ty * self.tiles_x + tx) as usize];
+                let tw = tile.width as usize;
+                let th = tile.height as usize;
+                let tdata = tile.as_slice();
+                match self.pixel_depth {
+                    PixelDepth::Bit8 => {
+                        let row_bytes = tw * 4;
+                        for dy in 0..th {
+                            let src = dy * row_bytes;
+                            let dst = ((y0 + dy) * w + x0) * 4;
+                            out[dst..dst + row_bytes].copy_from_slice(&tdata[src..src + row_bytes]);
+                        }
+                    }
+                    PixelDepth::Bit16 => {
+                        for dy in 0..th {
+                            for dx in 0..tw {
+                                let src = (dy * tw + dx) * bpp;
+                                let dst = ((y0 + dy) * w + (x0 + dx)) * 4;
+                                for c in 0..4 {
+                                    let v = u16::from_le_bytes([
+                                        tdata[src + c * 2],
+                                        tdata[src + c * 2 + 1],
+                                    ]);
+                                    out[dst + c] = ((u32::from(v) * 255 + 32_767) / 65_535) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Materializes a contiguous 16-bit RGBA `Vec<u16>` (`width * height * 4`).
+    #[must_use]
+    pub fn to_rgba16_vec(&self) -> Vec<u16> {
+        if self.width == 0 || self.height == 0 || !self.has_valid_layout() {
+            return Vec::new();
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mut out = vec![0u16; w * h * 4];
+        let bpp = self.pixel_depth.bytes_per_pixel();
+        for ty in 0..self.tiles_y {
+            let y0 = (ty * RASTER_TILE_DIM) as usize;
+            for tx in 0..self.tiles_x {
+                let x0 = (tx * RASTER_TILE_DIM) as usize;
+                let tile = &self.tiles[(ty * self.tiles_x + tx) as usize];
+                let tw = tile.width as usize;
+                let th = tile.height as usize;
+                let tdata = tile.as_slice();
+                for dy in 0..th {
+                    for dx in 0..tw {
+                        let src = (dy * tw + dx) * bpp;
+                        let dst = ((y0 + dy) * w + (x0 + dx)) * 4;
+                        match self.pixel_depth {
+                            PixelDepth::Bit8 => {
+                                for c in 0..4 {
+                                    out[dst + c] = u16::from(tdata[src + c]) * 257;
+                                }
+                            }
+                            PixelDepth::Bit16 => {
+                                for c in 0..4 {
+                                    out[dst + c] = u16::from_le_bytes([
+                                        tdata[src + c * 2],
+                                        tdata[src + c * 2 + 1],
+                                    ]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Materializes little-endian 16-bit RGBA bytes (`width * height * 8`).
+    #[must_use]
+    pub fn to_rgba16_le_bytes(&self) -> Vec<u8> {
+        let u16s = self.to_rgba16_vec();
+        let mut out = Vec::with_capacity(u16s.len() * 2);
+        for v in u16s {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reads one pixel at `(x, y)` as 8-bit `[r, g, b, a]`.
+    #[must_use]
+    pub fn read_pixel_rgba8(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let tx = x / RASTER_TILE_DIM;
+        let ty = y / RASTER_TILE_DIM;
+        let lx = (x % RASTER_TILE_DIM) as usize;
+        let ly = (y % RASTER_TILE_DIM) as usize;
+        let tile = self.tile(tx, ty)?;
+        let off = (ly * (tile.width as usize) + lx) * self.pixel_depth.bytes_per_pixel();
+        let data = tile.as_slice();
+        match self.pixel_depth {
+            PixelDepth::Bit8 => Some([data[off], data[off + 1], data[off + 2], data[off + 3]]),
+            PixelDepth::Bit16 => {
+                let c = |idx: usize| -> u8 {
+                    let v = u16::from_le_bytes([data[off + idx * 2], data[off + idx * 2 + 1]]);
+                    ((u32::from(v) * 255 + 32_767) / 65_535) as u8
+                };
+                Some([c(0), c(1), c(2), c(3)])
+            }
+        }
+    }
+
+    /// Reads one pixel at `(x, y)` as normalized `[r, g, b, a]` in `0.0..=1.0`.
+    #[must_use]
+    pub fn read_pixel_f32(&self, x: u32, y: u32) -> Option<[f32; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let tx = x / RASTER_TILE_DIM;
+        let ty = y / RASTER_TILE_DIM;
+        let lx = (x % RASTER_TILE_DIM) as usize;
+        let ly = (y % RASTER_TILE_DIM) as usize;
+        let tile = self.tile(tx, ty)?;
+        let off = (ly * (tile.width as usize) + lx) * self.pixel_depth.bytes_per_pixel();
+        let data = tile.as_slice();
+        match self.pixel_depth {
+            PixelDepth::Bit8 => Some([
+                f32::from(data[off]) / 255.0,
+                f32::from(data[off + 1]) / 255.0,
+                f32::from(data[off + 2]) / 255.0,
+                f32::from(data[off + 3]) / 255.0,
+            ]),
+            PixelDepth::Bit16 => {
+                let c = |idx: usize| -> f32 {
+                    let v = u16::from_le_bytes([data[off + idx * 2], data[off + idx * 2 + 1]]);
+                    f32::from(v) / 65_535.0
+                };
+                Some([c(0), c(1), c(2), c(3)])
+            }
+        }
+    }
+
+    /// Writes one normalized `[r, g, b, a]` pixel at `(x, y)` triggering CoW only on the touched tile.
+    pub fn write_pixel_f32(&mut self, x: u32, y: u32, rgba: [f32; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let tx = x / RASTER_TILE_DIM;
+        let ty = y / RASTER_TILE_DIM;
+        let lx = (x % RASTER_TILE_DIM) as usize;
+        let ly = (y % RASTER_TILE_DIM) as usize;
+        let depth = self.pixel_depth;
+        let Some(tile) = self.tile_mut(tx, ty) else {
+            return;
+        };
+        let off = (ly * (tile.width as usize) + lx) * depth.bytes_per_pixel();
+        let buf = tile.make_mut();
+        if off + depth.bytes_per_pixel() > buf.len() {
+            return;
+        }
+        match depth {
+            PixelDepth::Bit8 => {
+                for c in 0..4 {
+                    buf[off + c] =
+                        (sanitize_f32(rgba[c], 0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+            PixelDepth::Bit16 => {
+                for c in 0..4 {
+                    let v = (sanitize_f32(rgba[c], 0.0).clamp(0.0, 1.0) * 65_535.0).round() as u16;
+                    let le = v.to_le_bytes();
+                    buf[off + c * 2] = le[0];
+                    buf[off + c * 2 + 1] = le[1];
+                }
+            }
+        }
+    }
+
+    /// Reads one pixel at `(x, y)` as 16-bit `[r, g, b, a]` (`0..=65535`).
+    #[must_use]
+    pub fn read_pixel_u16(&self, x: u32, y: u32) -> Option<[u16; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let tx = x / RASTER_TILE_DIM;
+        let ty = y / RASTER_TILE_DIM;
+        let lx = (x % RASTER_TILE_DIM) as usize;
+        let ly = (y % RASTER_TILE_DIM) as usize;
+        let tile = self.tile(tx, ty)?;
+        let off = (ly * (tile.width as usize) + lx) * self.pixel_depth.bytes_per_pixel();
+        let data = tile.as_slice();
+        match self.pixel_depth {
+            PixelDepth::Bit8 => Some([
+                u16::from(data[off]) * 257,
+                u16::from(data[off + 1]) * 257,
+                u16::from(data[off + 2]) * 257,
+                u16::from(data[off + 3]) * 257,
+            ]),
+            PixelDepth::Bit16 => Some([
+                u16::from_le_bytes([data[off], data[off + 1]]),
+                u16::from_le_bytes([data[off + 2], data[off + 3]]),
+                u16::from_le_bytes([data[off + 4], data[off + 5]]),
+                u16::from_le_bytes([data[off + 6], data[off + 7]]),
+            ]),
+        }
+    }
+
+    /// Writes one 16-bit `[r, g, b, a]` pixel at `(x, y)` triggering CoW only on the touched tile.
+    pub fn write_pixel_u16(&mut self, x: u32, y: u32, rgba: [u16; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let tx = x / RASTER_TILE_DIM;
+        let ty = y / RASTER_TILE_DIM;
+        let lx = (x % RASTER_TILE_DIM) as usize;
+        let ly = (y % RASTER_TILE_DIM) as usize;
+        let depth = self.pixel_depth;
+        let Some(tile) = self.tile_mut(tx, ty) else {
+            return;
+        };
+        let off = (ly * (tile.width as usize) + lx) * depth.bytes_per_pixel();
+        let buf = tile.make_mut();
+        if off + depth.bytes_per_pixel() > buf.len() {
+            return;
+        }
+        match depth {
+            PixelDepth::Bit8 => {
+                for c in 0..4 {
+                    buf[off + c] = ((u32::from(rgba[c]) * 255 + 32_767) / 65_535) as u8;
+                }
+            }
+            PixelDepth::Bit16 => {
+                for c in 0..4 {
+                    let le = rgba[c].to_le_bytes();
+                    buf[off + c * 2] = le[0];
+                    buf[off + c * 2 + 1] = le[1];
+                }
+            }
+        }
     }
 }
 
@@ -399,8 +1026,8 @@ const fn default_true_lock() -> bool {
     true
 }
 
-/// Optional base64 serde wrapper for `Option<Vec<u8>>` ICC binary profile bytes.
-mod opt_serde_bytes_base64 {
+/// Optional base64 serde wrapper for `Option<Vec<u8>>` binary payloads.
+pub(crate) mod opt_serde_bytes_base64 {
     use super::serde_bytes_base64;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -1010,6 +1637,10 @@ struct SymBoundsCtx<'a, 'b> {
     sym_bounds_cache: &'b mut HashMap<(ObjectId, [u64; 6]), Option<Rect2D>>,
 }
 
+const fn default_rendering_intent() -> RenderingIntent {
+    RenderingIntent::RelativeColorimetric
+}
+
 /// Root headless document model for `coree`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -1039,6 +1670,22 @@ pub struct Document {
     custom_icc_profile: Option<Vec<u8>>,
     #[serde(default)]
     custom_icc_name: Option<String>,
+    #[serde(default, with = "opt_serde_bytes_base64")]
+    rgb_icc_profile: Option<Vec<u8>>,
+    #[serde(default)]
+    rgb_icc_name: Option<String>,
+    #[serde(default, with = "opt_serde_bytes_base64")]
+    cmyk_icc_profile: Option<Vec<u8>>,
+    #[serde(default)]
+    cmyk_icc_name: Option<String>,
+    #[serde(default, with = "opt_serde_bytes_base64")]
+    gray_icc_profile: Option<Vec<u8>>,
+    #[serde(default)]
+    gray_icc_name: Option<String>,
+    #[serde(default = "default_rendering_intent")]
+    rendering_intent: RenderingIntent,
+    #[serde(default = "default_true_lock")]
+    black_point_compensation: bool,
     next_id: u64,
 }
 
@@ -1089,6 +1736,14 @@ impl Document {
             unknown_data_files: BTreeMap::new(),
             custom_icc_profile: None,
             custom_icc_name: None,
+            rgb_icc_profile: None,
+            rgb_icc_name: None,
+            cmyk_icc_profile: None,
+            cmyk_icc_name: None,
+            gray_icc_profile: None,
+            gray_icc_name: None,
+            rendering_intent: RenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
             next_id,
         }
     }
@@ -1324,6 +1979,68 @@ impl Document {
         self.custom_icc_name.as_deref()
     }
 
+    /// Attached RGB working-space ICC profile bytes, if any.
+    #[must_use]
+    pub fn rgb_icc_profile(&self) -> Option<&[u8]> {
+        self.rgb_icc_profile.as_deref()
+    }
+
+    /// Description name of the attached RGB ICC profile, if any.
+    #[must_use]
+    pub fn rgb_icc_name(&self) -> Option<&str> {
+        self.rgb_icc_name.as_deref()
+    }
+
+    /// Attached CMYK press-space ICC profile bytes, if any.
+    #[must_use]
+    pub fn cmyk_icc_profile(&self) -> Option<&[u8]> {
+        self.cmyk_icc_profile.as_deref()
+    }
+
+    /// Description name of the attached CMYK ICC profile, if any.
+    #[must_use]
+    pub fn cmyk_icc_name(&self) -> Option<&str> {
+        self.cmyk_icc_name.as_deref()
+    }
+
+    /// Attached Gray ICC profile bytes, if any.
+    #[must_use]
+    pub fn gray_icc_profile(&self) -> Option<&[u8]> {
+        self.gray_icc_profile.as_deref()
+    }
+
+    /// Description name of the attached Gray ICC profile, if any.
+    #[must_use]
+    pub fn gray_icc_name(&self) -> Option<&str> {
+        self.gray_icc_name.as_deref()
+    }
+
+    /// Document default ICC rendering intent.
+    #[must_use]
+    pub const fn rendering_intent(&self) -> RenderingIntent {
+        self.rendering_intent
+    }
+
+    /// Whether ISO 18619 Black Point Compensation is enabled on this document.
+    #[must_use]
+    pub const fn black_point_compensation(&self) -> bool {
+        self.black_point_compensation
+    }
+
+    /// Builds a unified 3-slot [`IccColorPipeline`] from the document's RGB/CMYK/Gray
+    /// ICC profiles, legacy `custom_icc_profile`, `rendering_intent`, and `black_point_compensation`.
+    #[must_use]
+    pub fn icc_pipeline(&self) -> IccColorPipeline {
+        IccColorPipeline::from_document_profiles(
+            self.rgb_icc_profile.as_deref(),
+            self.cmyk_icc_profile.as_deref(),
+            self.gray_icc_profile.as_deref(),
+            self.custom_icc_profile.as_deref(),
+            self.rendering_intent,
+            self.black_point_compensation,
+        )
+    }
+
     /// Next monotonic ID counter value.
     #[must_use]
     pub fn next_id(&self) -> u64 {
@@ -1399,6 +2116,93 @@ impl Document {
     pub fn clear_custom_icc_profile(&mut self) {
         self.custom_icc_profile = None;
         self.custom_icc_name = None;
+        self.touch();
+    }
+
+    /// Sets the document's ICC rendering intent.
+    pub fn set_rendering_intent(&mut self, intent: RenderingIntent) {
+        self.rendering_intent = intent;
+        self.touch();
+    }
+
+    /// Enables or disables ISO 18619 Black Point Compensation on this document.
+    pub fn set_black_point_compensation(&mut self, enabled: bool) {
+        self.black_point_compensation = enabled;
+        self.touch();
+    }
+
+    /// Validates and attaches an RGB ICC profile to the RGB slot.
+    pub fn set_rgb_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<IccProfile> {
+        let prof = IccProfile::from_bytes(&bytes)?;
+        if prof.header.color_space != IccColorSpace::Rgb {
+            return Err(CoreError::InvalidColor(
+                "expected RGB ICC profile for RGB slot".into(),
+            ));
+        }
+        let desc = if prof.description.trim().is_empty() {
+            "Custom RGB ICC".to_owned()
+        } else {
+            prof.description.clone()
+        };
+        self.rgb_icc_name = Some(desc);
+        self.rgb_icc_profile = Some(bytes);
+        self.touch();
+        Ok(prof)
+    }
+
+    pub fn clear_rgb_icc_profile(&mut self) {
+        self.rgb_icc_profile = None;
+        self.rgb_icc_name = None;
+        self.touch();
+    }
+
+    /// Validates and attaches a CMYK ICC profile to the CMYK slot.
+    pub fn set_cmyk_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<IccProfile> {
+        let prof = IccProfile::from_bytes(&bytes)?;
+        if prof.header.color_space != IccColorSpace::Cmyk {
+            return Err(CoreError::InvalidColor(
+                "expected CMYK ICC profile for CMYK slot".into(),
+            ));
+        }
+        let desc = if prof.description.trim().is_empty() {
+            "Custom CMYK ICC".to_owned()
+        } else {
+            prof.description.clone()
+        };
+        self.cmyk_icc_name = Some(desc);
+        self.cmyk_icc_profile = Some(bytes);
+        self.touch();
+        Ok(prof)
+    }
+
+    pub fn clear_cmyk_icc_profile(&mut self) {
+        self.cmyk_icc_profile = None;
+        self.cmyk_icc_name = None;
+        self.touch();
+    }
+
+    /// Validates and attaches a Gray ICC profile to the Gray slot.
+    pub fn set_gray_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<IccProfile> {
+        let prof = IccProfile::from_bytes(&bytes)?;
+        if prof.header.color_space != IccColorSpace::Gray {
+            return Err(CoreError::InvalidColor(
+                "expected Gray ICC profile for Gray slot".into(),
+            ));
+        }
+        let desc = if prof.description.trim().is_empty() {
+            "Custom Gray ICC".to_owned()
+        } else {
+            prof.description.clone()
+        };
+        self.gray_icc_name = Some(desc);
+        self.gray_icc_profile = Some(bytes);
+        self.touch();
+        Ok(prof)
+    }
+
+    pub fn clear_gray_icc_profile(&mut self) {
+        self.gray_icc_profile = None;
+        self.gray_icc_name = None;
         self.touch();
     }
 
@@ -1621,6 +2425,22 @@ impl Document {
         self.next_id = self.next_id.max(min_next_id);
     }
 
+    /// Restores `next_id` from a snapshot/delta during recovery, allowing rollback on `undo()`
+    /// while clamping above all existing page, layer, and object IDs to avoid aliasing.
+    pub fn restore_next_id_from_snapshot(&mut self, next_id: u64) {
+        let mut min_id = 1u64;
+        for p in &self.pages {
+            min_id = min_id.max(p.id.0.saturating_add(1));
+            for l in &p.layers {
+                min_id = min_id.max(l.id.0.saturating_add(1));
+            }
+        }
+        for &oid in self.objects.keys() {
+            min_id = min_id.max(oid.0.saturating_add(1));
+        }
+        self.next_id = next_id.max(min_id);
+    }
+
     /// Inserts `asset` only if its [`ImageAssetId`] is not already present.
     pub fn insert_asset_if_absent(&mut self, asset: RasterAsset) {
         self.assets.entry(asset.id).or_insert(asset);
@@ -1671,6 +2491,14 @@ impl Document {
         self.unknown_data_files = src.unknown_data_files.clone();
         self.custom_icc_profile = src.custom_icc_profile.clone();
         self.custom_icc_name = src.custom_icc_name.clone();
+        self.rgb_icc_profile = src.rgb_icc_profile.clone();
+        self.rgb_icc_name = src.rgb_icc_name.clone();
+        self.cmyk_icc_profile = src.cmyk_icc_profile.clone();
+        self.cmyk_icc_name = src.cmyk_icc_name.clone();
+        self.gray_icc_profile = src.gray_icc_profile.clone();
+        self.gray_icc_name = src.gray_icc_name.clone();
+        self.rendering_intent = src.rendering_intent;
+        self.black_point_compensation = src.black_point_compensation;
     }
 
     /// Updates `id`'s transform directly (intended for headless builders/imposition helpers).
@@ -2026,6 +2854,29 @@ impl Document {
     pub(crate) fn set_custom_icc_raw(&mut self, profile: Option<Vec<u8>>, name: Option<String>) {
         self.custom_icc_profile = profile;
         self.custom_icc_name = name;
+    }
+
+    pub(crate) fn set_rgb_icc_raw(&mut self, profile: Option<Vec<u8>>, name: Option<String>) {
+        self.rgb_icc_profile = profile;
+        self.rgb_icc_name = name;
+    }
+
+    pub(crate) fn set_cmyk_icc_raw(&mut self, profile: Option<Vec<u8>>, name: Option<String>) {
+        self.cmyk_icc_profile = profile;
+        self.cmyk_icc_name = name;
+    }
+
+    pub(crate) fn set_gray_icc_raw(&mut self, profile: Option<Vec<u8>>, name: Option<String>) {
+        self.gray_icc_profile = profile;
+        self.gray_icc_name = name;
+    }
+
+    pub(crate) fn set_rendering_intent_raw(&mut self, intent: RenderingIntent) {
+        self.rendering_intent = intent;
+    }
+
+    pub(crate) fn set_bpc_raw(&mut self, bpc: bool) {
+        self.black_point_compensation = bpc;
     }
 
     /// Returns a reference to the active page.
@@ -4928,7 +5779,61 @@ impl Document {
                             c_max_y = c_max_y.max(p.y);
                         }
                     }
-                    if cage.len() >= 8 {
+                    if cage.len() >= 12 {
+                        let (tl, tr, br, bl) = (cage[0], cage[3], cage[6], cage[9]);
+                        if cage[..12].iter().all(|p| p.is_finite()) {
+                            let eval_cubic =
+                                |p0: Point2D, p1: Point2D, p2: Point2D, p3: Point2D, t: f64| {
+                                    let mt = 1.0 - t;
+                                    let mt2 = mt * mt;
+                                    let t2 = t * t;
+                                    let b0 = mt2 * mt;
+                                    let b1 = 3.0 * mt2 * t;
+                                    let b2 = 3.0 * mt * t2;
+                                    let b3 = t2 * t;
+                                    Point2D::new(
+                                        b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
+                                        b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+                                    )
+                                };
+                            let eval_coons12 = |u: f64, v: f64| -> Point2D {
+                                if *mode == EnvelopeMode::Straight {
+                                    return tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+                                }
+                                let top = eval_cubic(tl, cage[1], cage[2], tr, u);
+                                let bottom = eval_cubic(bl, cage[8], cage[7], br, u);
+                                let left = eval_cubic(tl, cage[11], cage[10], bl, v);
+                                let right = eval_cubic(tr, cage[4], cage[5], br, v);
+                                let ruled_u = top.lerp(bottom, v);
+                                let ruled_v = left.lerp(right, u);
+                                let bilin = tl.lerp(tr, u).lerp(bl.lerp(br, u), v);
+                                Point2D::new(
+                                    ruled_u.x + ruled_v.x - bilin.x,
+                                    ruled_u.y + ruled_v.y - bilin.y,
+                                )
+                            };
+                            let (mut s_min_y, mut s_max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                            for iu in 0..=16 {
+                                let u = f64::from(iu) * 0.0625;
+                                for iv in 0..=16 {
+                                    let v = f64::from(iv) * 0.0625;
+                                    let pt = eval_coons12(u, v);
+                                    if pt.is_finite() {
+                                        s_min_y = s_min_y.min(pt.y);
+                                        s_max_y = s_max_y.max(pt.y);
+                                        union_pt(pt, acc);
+                                    }
+                                }
+                            }
+                            if s_min_y.is_finite() && s_max_y.is_finite() {
+                                let env_h = (s_max_y - s_min_y).max(1e-6);
+                                cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                            }
+                        } else if c_min_y.is_finite() && c_max_y.is_finite() {
+                            let env_h = (c_max_y - c_min_y).max(1e-6);
+                            cur_local_h = Some(cur_local_h.unwrap_or(0.0).max(env_h));
+                        }
+                    } else if cage.len() >= 8 {
                         let (tl, tm, tr, rm, br, bm, bl, lm) = (
                             cage[0], cage[1], cage[2], cage[3], cage[4], cage[5], cage[6], cage[7],
                         );
@@ -7618,7 +8523,8 @@ impl Document {
         Ok(desktop_id)
     }
 
-    /// Validates and attaches a custom binary ICC profile (`.icc` / `.icm`) to this document.
+    /// Validates and attaches a custom binary ICC profile (`.icc` / `.icm`) to this document
+    /// and routes it into the matching RGB / CMYK / Gray slot.
     pub fn set_custom_icc_profile(&mut self, bytes: Vec<u8>) -> CoreResult<crate::icc::IccProfile> {
         let prof = crate::icc::IccProfile::from_bytes(&bytes)?;
         let desc = if prof.description.trim().is_empty() {
@@ -7626,6 +8532,21 @@ impl Document {
         } else {
             prof.description.clone()
         };
+        match prof.header.color_space {
+            IccColorSpace::Rgb => {
+                self.rgb_icc_name = Some(desc.clone());
+                self.rgb_icc_profile = Some(bytes.clone());
+            }
+            IccColorSpace::Cmyk => {
+                self.cmyk_icc_name = Some(desc.clone());
+                self.cmyk_icc_profile = Some(bytes.clone());
+            }
+            IccColorSpace::Gray => {
+                self.gray_icc_name = Some(desc.clone());
+                self.gray_icc_profile = Some(bytes.clone());
+            }
+            _ => {}
+        }
         self.custom_icc_name = Some(desc);
         self.custom_icc_profile = Some(bytes);
         self.touch();
@@ -7829,12 +8750,39 @@ mod tests {
 
         let json = serde_json::to_string(&doc).unwrap();
         let back: Document = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.assets[&asset_id].rgba_bytes, vec![255; 16]);
+        assert_eq!(back.assets[&asset_id].to_rgba8_vec(), vec![255; 16]);
         assert_eq!(back.unknown_doc_chunks[0].fourcc_str(), "vrsn");
         assert_eq!(
             back.unknown_doc_chunks[0].raw_bytes,
             vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01]
         );
+
+        // CoW tile sharing: 512x512 = 4 tiles of 256x256
+        let big =
+            RasterAsset::new(512, 512, vec![128u8; 512 * 512 * 4], 300.0, ColorMode::Rgb).unwrap();
+        let mut big_clone = big.clone();
+        assert_eq!(big.shared_tile_ptrs(), big_clone.shared_tile_ptrs());
+        big_clone.write_pixel_f32(10, 10, [1.0, 0.0, 0.0, 1.0]);
+        let ptrs_a = big.shared_tile_ptrs();
+        let ptrs_b = big_clone.shared_tile_ptrs();
+        assert_ne!(ptrs_a[0], ptrs_b[0], "touched tile 0 must copy-on-write");
+        assert_eq!(ptrs_a[1], ptrs_b[1], "untouched tile 1 stays shared");
+        assert_eq!(ptrs_a[2], ptrs_b[2], "untouched tile 2 stays shared");
+        assert_eq!(ptrs_a[3], ptrs_b[3], "untouched tile 3 stays shared");
+
+        // 16-bit RasterAsset round-trip preserves full 16-bit precision
+        let a16 = RasterAsset::new_16bit(
+            2,
+            2,
+            [12345u16, 45678, 65535, 32768].repeat(4),
+            300.0,
+            ColorMode::Rgb,
+        )
+        .unwrap();
+        let j16 = serde_json::to_string(&a16).unwrap();
+        let b16: RasterAsset = serde_json::from_str(&j16).unwrap();
+        assert_eq!(b16.pixel_depth(), PixelDepth::Bit16);
+        assert_eq!(b16.read_pixel_u16(0, 0), Some([12345, 45678, 65535, 32768]));
     }
 
     #[test]
@@ -8186,5 +9134,52 @@ mod tests {
         );
         hist.undo(&mut doc).unwrap();
         assert_eq!(doc.object(txt).unwrap().fill, Fill::Solid(red));
+    }
+
+    #[test]
+    fn envelope_12_point_cubic_coons_world_bounds_includes_interior_overshoot() {
+        let mut doc = Document::new("Envelope12Bounds", 210.0, 297.0, ColorMode::Rgb, 300.0);
+        // 12-point cubic Coons cage [TL, T1, T2, TR, R1, R2, BR, B1, B2, BL, L1, L2]
+        // All edge handles bow upward to y=-80 while BR=(100,100), so Coons
+        // ruled_u + ruled_v - bilin = -53.75 - 53.75 - 25 = -132.5 overshoots every cage point!
+        let overshoot_cage = vec![
+            Point2D::new(0.0, 0.0),     // 0: TL
+            Point2D::new(30.0, -80.0),  // 1: T1
+            Point2D::new(70.0, -80.0),  // 2: T2
+            Point2D::new(100.0, 0.0),   // 3: TR
+            Point2D::new(100.0, -80.0), // 4: R1
+            Point2D::new(100.0, -80.0), // 5: R2
+            Point2D::new(100.0, 100.0), // 6: BR
+            Point2D::new(70.0, -80.0),  // 7: B1
+            Point2D::new(30.0, -80.0),  // 8: B2
+            Point2D::new(0.0, 0.0),     // 9: BL
+            Point2D::new(0.0, -80.0),   // 10: L1
+            Point2D::new(0.0, -80.0),   // 11: L2
+        ];
+
+        let mut rect_obj = make_rect_obj(0.0, 0.0, 100.0, 100.0, Color::CYAN);
+        rect_obj.outline = OutlineStyle::none();
+        rect_obj.effects.push(Effect::Envelope {
+            mode: EnvelopeMode::Unconstrained,
+            cage: overshoot_cage.clone(),
+        });
+        let id = doc.add_object(rect_obj, None).unwrap();
+        let wb = doc.visual_world_bounds(id).unwrap();
+        let min_cage_y = overshoot_cage
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            wb.min_y < min_cage_y - 40.0,
+            "12-pt cubic Coons bounds must include interior overshoot (~-132.5) below min_cage_y={min_cage_y}, got min_y={}",
+            wb.min_y
+        );
+        // Verify Straight mode does not add Coons overshoot beyond the cage control hull
+        doc.object_mut(id).unwrap().effects[0] = Effect::Envelope {
+            mode: EnvelopeMode::Straight,
+            cage: overshoot_cage,
+        };
+        let straight_wb = doc.visual_world_bounds(id).unwrap();
+        assert!((straight_wb.min_y - min_cage_y).abs() < 1e-6);
     }
 }

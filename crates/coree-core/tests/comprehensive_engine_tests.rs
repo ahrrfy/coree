@@ -1479,6 +1479,14 @@ fn w1b_all_25_new_command_ops_lossless_execute_undo_redo() {
                 "Test Custom Profile",
             )),
             clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
         },
         "SetDocumentProperties(set)",
     );
@@ -1495,6 +1503,14 @@ fn w1b_all_25_new_command_ops_lossless_execute_undo_redo() {
             metadata: None,
             custom_icc_profile: None,
             clear_custom_icc: true,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
         },
         "SetDocumentProperties(clear_icc)",
     );
@@ -2019,6 +2035,7 @@ fn w1b_edit_path_guard_rejects_all_non_path_payloads_and_boolean_preserves_metad
         frozen: false,
         viewpoint: Some(Point2D::ZERO),
         remove_face: false,
+        frozen_snapshot: None,
     });
     b1.unknown_chunks.push(UnknownCdrChunk {
         fourcc: *b"META",
@@ -3051,7 +3068,7 @@ fn w1b_r4_edit_shape_delete_layer_register_asset_and_create_detached_object() {
 
     // 3. RegisterAsset validation & Batch with CreateObject
     let mut bad_asset = RasterAsset::new(2, 2, vec![255u8; 16], 72.0, ColorMode::Rgb).unwrap();
-    bad_asset.rgba_bytes.pop();
+    bad_asset.truncate_last_tile_for_test();
     assert!(matches!(
         hist.execute(&mut doc, CommandOp::RegisterAsset { asset: bad_asset }),
         Err(CoreError::InvalidParameter(_))
@@ -3516,6 +3533,7 @@ fn w1b_r6_container_guards_style_finiteness_locked_descendants_and_table_dim_col
         frozen: false,
         viewpoint: None,
         remove_face: false,
+        frozen_snapshot: None,
     });
     assert!(matches!(
         hist.execute(&mut doc, CommandOp::create_detached_object(nan_lens)),
@@ -3577,12 +3595,12 @@ fn w1b_r6_container_guards_style_finiteness_locked_descendants_and_table_dim_col
     tbl.cells[1].fill = Fill::MeshFill {
         rows: 1,
         cols: 1,
-        nodes: vec![MeshNode {
-            row: 0,
-            col: 0,
-            pos: Point2D::ZERO,
-            color: Color::rgb(0.2, 0.4, 0.8),
-        }],
+        nodes: vec![MeshNode::new(
+            0,
+            0,
+            Point2D::ZERO,
+            Color::rgb(0.2, 0.4, 0.8),
+        )],
     };
     tbl.border_style = OutlineStyle::solid(Color::rgb(1.0, 0.0, 0.0), 0.5);
     let tbl_id = doc
@@ -3728,6 +3746,7 @@ fn w1b_r6_delete_page_cross_page_relational_cleanup_undo_redo_replay() {
         steps: 4,
         rotation_deg: 0.0,
         along_path: Some(p2_path),
+        rotate_along_path: true,
     });
     let blend_src_id = doc.add_object(blend_src, Some(p1_layer)).unwrap();
 
@@ -3738,6 +3757,7 @@ fn w1b_r6_delete_page_cross_page_relational_cleanup_undo_redo_replay() {
         steps: 3,
         rotation_deg: 0.0,
         along_path: Some(p2_path),
+        rotate_along_path: true,
     });
     let blend_along_id = doc.add_object(blend_along_only, Some(p1_layer)).unwrap();
 
@@ -3808,6 +3828,7 @@ fn w1b_r6_delete_page_cross_page_relational_cleanup_undo_redo_replay() {
             steps: 3,
             rotation_deg: 0.0,
             along_path: None,
+            rotate_along_path: true,
         }]
     );
     assert!(matches!(
@@ -5361,6 +5382,7 @@ fn w1b_r11_command_op_finiteness_domain_guards_and_rollback() {
                 frozen: false,
                 viewpoint: None,
                 remove_face: false,
+                frozen_snapshot: None,
             }),
         },
         CommandOp::AddEffect {
@@ -6385,6 +6407,7 @@ fn w1b_r14_ungroup_cleans_dangling_connector_and_blend() {
         steps: 4,
         rotation_deg: 0.0,
         along_path: Some(grp),
+        rotate_along_path: true,
     });
     let blend_id = doc.add_object(blend_src, None).unwrap();
 
@@ -7988,6 +8011,7 @@ fn w1b_r19_symbol_visual_bounds_group_extrude_blend_and_envelope_perspective() {
         steps: 4,
         rotation_deg: 0.0,
         along_path: Some(doc_along),
+        rotate_along_path: true,
     });
     let bl_sym_id = SymbolId::new();
     doc.upsert_symbol(SymbolDef {
@@ -10179,6 +10203,7 @@ fn w1c_r3_grouped_and_powerclip_dependents_targeted_invalidation_exec_undo_redo(
         steps: 4,
         rotation_deg: 0.0,
         along_path: None,
+        rotate_along_path: true,
     });
     hist.execute(&mut doc, CommandOp::create_object(blend_src, Some(lid)))
         .unwrap();
@@ -10536,6 +10561,7 @@ fn w1c_r6_nested_group_ancestor_invalidation_move_edit_reorder_delete_exec_undo_
         steps: 3,
         rotation_deg: 0.0,
         along_path: None,
+        rotate_along_path: true,
     });
     hist.execute(&mut doc, CommandOp::create_object(blend_src, Some(lid)))
         .unwrap();

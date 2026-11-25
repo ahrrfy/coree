@@ -806,9 +806,23 @@ pub(crate) fn container_own_persp(
     if has_eff_persp {
         let raw_bb = match &obj.payload {
             NodePayload::SymbolInstance(sym_id) => {
-                let space_world = (sym_ctx.is_none() && obj.id.0 != 0)
-                    .then(|| doc.world_transform_of(obj.id))
-                    .flatten();
+                let space_world = if let Some(ctx) = sym_ctx {
+                    if obj.id.0 != 0 {
+                        sym_world_transform_of(
+                            obj.id,
+                            ctx.root_xf,
+                            ctx.sym_objects,
+                            ctx.sym_map,
+                            ctx.sym_parent_map,
+                        )
+                    } else {
+                        Some(ctx.root_xf.compose(&obj.transform))
+                    }
+                } else if obj.id.0 != 0 {
+                    doc.world_transform_of(obj.id)
+                } else {
+                    None
+                };
                 doc.symbol_bounds_with_xf_and_space(
                     *sym_id,
                     &Affine2D::IDENTITY,
@@ -816,26 +830,33 @@ pub(crate) fn container_own_persp(
                 )
             }
             NodePayload::PowerClip { container, .. } => container.bounding_box(),
-            NodePayload::Group(children) if sym_ctx.is_some() => {
+            _ if sym_ctx.is_none() && obj.id.0 != 0 => doc.local_object_bounds(obj.id),
+            NodePayload::Group(children) => {
                 let mut acc: Option<Rect2D> = None;
-                if let Some(ctx) = sym_ctx {
-                    for &cid in children {
-                        if let Some(child) = ctx.sym_map.get(&cid).copied() {
-                            if let Some(cb) = world_bounds_with_sym_xf(
-                                doc,
-                                cid,
-                                child,
-                                &child.transform,
-                                Some(ctx),
-                            ) {
-                                acc = Some(acc.map_or(cb, |prev| prev.union(cb)));
-                            }
+                for &cid in children {
+                    let child_opt = sym_ctx
+                        .and_then(|ctx| ctx.sym_map.get(&cid).copied())
+                        .or_else(|| (cid.0 != 0).then(|| doc.object(cid)).flatten());
+                    if let Some(child) = child_opt {
+                        let local_sym_ctx = sym_ctx.map(|ctx| SymBoundsCtx {
+                            root_xf: &Affine2D::IDENTITY,
+                            sym_objects: ctx.sym_objects,
+                            sym_map: ctx.sym_map,
+                            sym_parent_map: ctx.sym_parent_map,
+                        });
+                        if let Some(cb) = world_bounds_with_sym_xf(
+                            doc,
+                            cid,
+                            child,
+                            &child.transform,
+                            local_sym_ctx.as_ref(),
+                        ) {
+                            acc = Some(acc.map_or(cb, |prev| prev.union(cb)));
                         }
                     }
                 }
                 acc
             }
-            _ if sym_ctx.is_none() && obj.id.0 != 0 => doc.local_object_bounds(obj.id),
             _ => None,
         };
         let mut cur_bb = match (own, raw_bb) {

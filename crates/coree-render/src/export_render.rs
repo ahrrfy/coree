@@ -118,7 +118,8 @@ pub fn render_page_to_rgba_with_options(
 /// using `usvg` + `resvg` (useful for SVG preview thumbnails & visual regression checks).
 pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> RenderResult<RgbaBuffer> {
     validate_surface_dimensions(width, height)?;
-    let opts = usvg::Options::default();
+    let mut opts = usvg::Options::default();
+    opts.fontdb_mut().load_system_fonts();
     let tree = usvg::Tree::from_data(svg_bytes, &opts)
         .map_err(|e| RenderError::Raster(format!("SVG parse failed: {e}")))?;
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
@@ -481,6 +482,7 @@ pub fn render_isolated_object_to_rgba(
 
     // Estimate object-local bounds including vector geometry deformations & Blends
     let mut renderer = SceneRenderer::new();
+    renderer.active_icc = doc.icc_pipeline();
     renderer.force_offscreen_lens_backdrop = true;
     if parent_xf != Affine2D::IDENTITY {
         renderer.parent_xf_override = doc

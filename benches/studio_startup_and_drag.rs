@@ -34,7 +34,7 @@ fn main() {
     let mut tile_cache = DirtyTileCache::new(1280, 720);
     let mut renderer = SceneRenderer::new();
     let db = StorageDb::open_in_memory().expect("in-memory StorageDb");
-    assert_eq!(db.schema_version().unwrap(), 1);
+    assert_eq!(db.schema_version().unwrap(), coree_storage::SCHEMA_VERSION);
     let mut viewport = Viewport::new(1280, 720);
     viewport.fit_rect(Rect2D::from_xywh(0.0, 0.0, 210.0, 297.0), 20.0);
     let render_opts = RenderOptions::interactive();

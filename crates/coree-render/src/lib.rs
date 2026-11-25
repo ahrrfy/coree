@@ -39,12 +39,14 @@ pub use hit_test::{
     hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,
     DynamicGuideLine, NodeHit, SnapEngine, SnapOptions,
 };
+pub use lens_render::capture_frozen_lens_snapshot;
 pub use raster_engine::{
     apply_cutout_background_removal, apply_dodge_burn_stroke, apply_healing_stroke,
-    apply_raster_filter, apply_raster_filters, clone_stamp_stroke, convert_object_to_bitmap,
-    convert_object_to_bitmap_with_bounds, erase_stroke, paint_brush_stroke,
-    paint_brush_stroke_masked, raster_flood_fill, resample, smudge_stroke, DodgeBurnMode,
-    RasterMask, ToneRange,
+    apply_raster_filter, apply_raster_filters, clone_stamp_stroke, compute_histogram,
+    convert_object_to_bitmap, convert_object_to_bitmap_with_bounds, convert_raster_color_mode,
+    convert_raster_depth, erase_stroke, paint_brush_stroke, paint_brush_stroke_masked,
+    raster_flood_fill, resample, resample_with_algorithm, smudge_stroke, DodgeBurnMode,
+    RasterHistogram, RasterMask, ResampleAlgorithm, ToneRange,
 };
 pub use renderer::{
     arrowhead_geometry, compute_page_layouts, outline_arrowhead_geometries, PageLayout,

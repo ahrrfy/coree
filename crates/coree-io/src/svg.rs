@@ -1696,9 +1696,27 @@ fn write_svg_object(
                 }
             }
             NodePayload::ParagraphText(para) => {
-                if parent_persp.is_some() || obj.perspective.is_some() {
+                let is_linked_target = doc.objects().values().any(|other| {
+                    matches!(
+                        &other.payload,
+                        NodePayload::ParagraphText(p) if p.linked_next_frame == Some(obj.id)
+                    )
+                });
+                let needs_doc_flow = parent_persp.is_some()
+                    || obj.perspective.is_some()
+                    || para.linked_next_frame.is_some()
+                    || is_linked_target
+                    || para.wrap_mode != coree_core::TextWrapMode::None
+                    || para.drop_cap.as_ref().is_some_and(|d| d.enabled)
+                    || para
+                        .list_style
+                        .as_ref()
+                        .is_some_and(|l| !matches!(l, coree_core::ParagraphListStyle::None))
+                    || !para.tab_stops_mm.is_empty()
+                    || para.runs.iter().any(|r| !r.style.variation_axes.is_empty());
+                if needs_doc_flow {
                     let te = text_engine.get_or_insert_with(TextEngine::new);
-                    let pieces = te.layout_paragraph_pieces(para);
+                    let pieces = te.layout_paragraph_in_doc(doc, obj.id, para);
                     for (p_idx, piece) in pieces.iter().enumerate() {
                         let bp = if let Some(persp) = obj.perspective {
                             persp.transform_bezier_path(&piece.path)
@@ -1857,7 +1875,7 @@ fn write_svg_object(
                     if let Ok(png) = export_raster_to_bytes(
                         asset.width,
                         asset.height,
-                        &asset.rgba_bytes,
+                        &asset.to_rgba8_vec(),
                         &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
                     ) {
                         let b64 = encode_base64(&png);
@@ -2395,7 +2413,7 @@ fn format_svg_paint_attrs_with_doc(
                 if let Ok(png) = export_raster_to_bytes(
                     asset.width,
                     asset.height,
-                    &asset.rgba_bytes,
+                    &asset.to_rgba8_vec(),
                     &RasterExportOptions::new(RasterFormat::Png, asset.source_dpi),
                 ) {
                     *def_counter += 1;

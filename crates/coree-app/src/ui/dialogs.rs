@@ -1242,6 +1242,14 @@ fn show_options_general_nudge(
             metadata: None,
             custom_icc_profile: None,
             clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: None,
         });
     }
 
@@ -1350,7 +1358,196 @@ fn show_options_color_management(
 
     ui.add_space(8.0);
     ui.separator();
-    ui.label(RichText::new("Document Embedded / Custom ICC Profile (.icc / .icm)").strong());
+    ui.label(RichText::new("Document ICC Working Spaces (RGB / CMYK / Gray) + BPC").strong());
+    let doc_intent = app
+        .active_tab()
+        .map(|t| t.document.rendering_intent())
+        .unwrap_or(RenderingIntent::RelativeColorimetric);
+    let mut next_doc_intent = doc_intent;
+    ui.horizontal(|ui| {
+        ui.label("Document Intent:");
+        ComboBox::from_id_salt("opt_doc_icc_intent")
+            .width(200.0)
+            .selected_text(rendering_intent_label(next_doc_intent))
+            .show_ui(ui, |ui| {
+                for intent in [
+                    RenderingIntent::Perceptual,
+                    RenderingIntent::RelativeColorimetric,
+                    RenderingIntent::Saturation,
+                    RenderingIntent::AbsoluteColorimetric,
+                ] {
+                    ui.selectable_value(
+                        &mut next_doc_intent,
+                        intent,
+                        rendering_intent_label(intent),
+                    );
+                }
+            });
+    });
+    if next_doc_intent != doc_intent {
+        let _ = app.execute_command(CommandOp::SetDocumentProperties {
+            title: None,
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: Some(next_doc_intent),
+            black_point_compensation: None,
+        });
+        if let Some(tab) = app.active_tab_mut() {
+            tab.needs_rerender = true;
+        }
+    }
+    let doc_bpc = app
+        .active_tab()
+        .map(|t| t.document.black_point_compensation())
+        .unwrap_or(true);
+    let mut next_bpc = doc_bpc;
+    if ui
+        .checkbox(&mut next_bpc, "ISO 18619 Black Point Compensation (BPC)")
+        .changed()
+        && next_bpc != doc_bpc
+    {
+        let _ = app.execute_command(CommandOp::SetDocumentProperties {
+            title: None,
+            color_mode: None,
+            default_unit: None,
+            dpi: None,
+            multipage_view: None,
+            active_page_index: None,
+            metadata: None,
+            custom_icc_profile: None,
+            clear_custom_icc: false,
+            rgb_icc_profile: None,
+            clear_rgb_icc: false,
+            cmyk_icc_profile: None,
+            clear_cmyk_icc: false,
+            gray_icc_profile: None,
+            clear_gray_icc: false,
+            rendering_intent: None,
+            black_point_compensation: Some(next_bpc),
+        });
+        if let Some(tab) = app.active_tab_mut() {
+            tab.needs_rerender = true;
+        }
+    }
+
+    let (rgb_name, cmyk_name, gray_name) = app
+        .active_tab()
+        .map(|t| {
+            (
+                t.document.rgb_icc_name().map(str::to_owned),
+                t.document.cmyk_icc_name().map(str::to_owned),
+                t.document.gray_icc_name().map(str::to_owned),
+            )
+        })
+        .unwrap_or((None, None, None));
+    ui.label(
+        RichText::new(format!(
+            "Slots — RGB: {} · CMYK: {} · Gray: {}",
+            rgb_name.as_deref().unwrap_or("Built-in sRGB"),
+            cmyk_name.as_deref().unwrap_or("Built-in CMYK LUT"),
+            gray_name.as_deref().unwrap_or("Built-in Gray"),
+        ))
+        .size(11.0)
+        .color(tokens.text_muted),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (slot_idx, label) in [
+            (0, "Load RGB ICC..."),
+            (1, "Load CMYK ICC..."),
+            (2, "Load Gray ICC..."),
+        ] {
+            if ui.button(label).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(label)
+                    .add_filter("ICC Profiles", &["icc", "ICC", "icm", "ICM"])
+                    .pick_file()
+                {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if bytes.len() <= 16 * 1024 * 1024 {
+                            let mut cmd = CommandOp::SetDocumentProperties {
+                                title: None,
+                                color_mode: None,
+                                default_unit: None,
+                                dpi: None,
+                                multipage_view: None,
+                                active_page_index: None,
+                                metadata: None,
+                                custom_icc_profile: None,
+                                clear_custom_icc: false,
+                                rgb_icc_profile: None,
+                                clear_rgb_icc: false,
+                                cmyk_icc_profile: None,
+                                clear_cmyk_icc: false,
+                                gray_icc_profile: None,
+                                clear_gray_icc: false,
+                                rendering_intent: None,
+                                black_point_compensation: None,
+                            };
+                            if let CommandOp::SetDocumentProperties {
+                                rgb_icc_profile,
+                                cmyk_icc_profile,
+                                gray_icc_profile,
+                                ..
+                            } = &mut cmd
+                            {
+                                match slot_idx {
+                                    0 => *rgb_icc_profile = Some(bytes),
+                                    1 => *cmyk_icc_profile = Some(bytes),
+                                    _ => *gray_icc_profile = Some(bytes),
+                                }
+                            }
+                            if let Err(err) = app.execute_command(cmd) {
+                                app.push_toast(format!("Invalid ICC profile: {err}"), true);
+                            } else if let Some(tab) = app.active_tab_mut() {
+                                tab.needs_rerender = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (rgb_name.is_some() || cmyk_name.is_some() || gray_name.is_some())
+            && ui.small_button("Reset 3 Slots").clicked()
+        {
+            let _ = app.execute_command(CommandOp::SetDocumentProperties {
+                title: None,
+                color_mode: None,
+                default_unit: None,
+                dpi: None,
+                multipage_view: None,
+                active_page_index: None,
+                metadata: None,
+                custom_icc_profile: None,
+                clear_custom_icc: false,
+                rgb_icc_profile: None,
+                clear_rgb_icc: true,
+                cmyk_icc_profile: None,
+                clear_cmyk_icc: true,
+                gray_icc_profile: None,
+                clear_gray_icc: true,
+                rendering_intent: None,
+                black_point_compensation: None,
+            });
+            if let Some(tab) = app.active_tab_mut() {
+                tab.needs_rerender = true;
+            }
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Legacy Custom ICC Profile (.icc / .icm)").strong());
     let custom_desc = app
         .active_tab()
         .and_then(|t| t.document.custom_icc_name().map(str::to_owned));
@@ -1407,6 +1604,14 @@ fn show_options_color_management(
                             metadata: None,
                             custom_icc_profile: Some(bytes),
                             clear_custom_icc: false,
+                            rgb_icc_profile: None,
+                            clear_rgb_icc: false,
+                            cmyk_icc_profile: None,
+                            clear_cmyk_icc: false,
+                            gray_icc_profile: None,
+                            clear_gray_icc: false,
+                            rendering_intent: None,
+                            black_point_compensation: None,
                         }) {
                             Ok(()) => {
                                 let desc = app
@@ -1443,6 +1648,14 @@ fn show_options_color_management(
                 metadata: None,
                 custom_icc_profile: None,
                 clear_custom_icc: true,
+                rgb_icc_profile: None,
+                clear_rgb_icc: false,
+                cmyk_icc_profile: None,
+                clear_cmyk_icc: false,
+                gray_icc_profile: None,
+                clear_gray_icc: false,
+                rendering_intent: None,
+                black_point_compensation: None,
             }) {
                 app.push_toast(format!("Clear ICC failed: {err}"), true);
             } else {
