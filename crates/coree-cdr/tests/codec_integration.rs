@@ -4299,3 +4299,65 @@ fn w5a_cdr_read_options_codepage_and_inspector_hex_dump() {
     assert!(hex_dump.contains("00000000: 03 00 00 00 0C 00"));
     assert!(hex_dump.contains('|'));
 }
+
+#[test]
+fn tier5_cdr_malformed_loda_trfd_wi_bounds() {
+    use coree_cdr::cdr_riff::decode_wi_to_rgba_with_budget;
+
+    // 1. Malformed ZCF trfd/loda with num_args = u32::MAX + overlapping loda arg ranges
+    let mut bad_loda = vec![0u8; 32];
+    bad_loda[0..4].copy_from_slice(&32u32.to_le_bytes());
+    bad_loda[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); // num_args = u32::MAX
+    bad_loda[8..12].copy_from_slice(&20u32.to_le_bytes());
+    bad_loda[12..16].copy_from_slice(&24u32.to_le_bytes());
+    bad_loda[16..20].copy_from_slice(&0x0003u32.to_le_bytes());
+
+    let mut bad_trfd = vec![0u8; 40];
+    bad_trfd[0..4].copy_from_slice(&40u32.to_le_bytes());
+    bad_trfd[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); // num_args = u32::MAX
+
+    let malformed_riff = write_riff(&RiffDocument::new(
+        *b"CDRC",
+        vec![
+            RiffNode::chunk(*b"vrsn", 1200u16.to_le_bytes().to_vec()),
+            RiffNode::list(
+                *b"doc ",
+                vec![RiffNode::list(
+                    *b"page",
+                    vec![RiffNode::list(
+                        *b"layr",
+                        vec![RiffNode::list(
+                            *b"obj ",
+                            vec![
+                                RiffNode::chunk(*b"loda", bad_loda),
+                                RiffNode::chunk(*b"trfd", bad_trfd),
+                            ],
+                        )],
+                    )],
+                )],
+            ),
+        ],
+    ))
+    .unwrap();
+    // Must not OOM or panic on malformed num_args=u32::MAX (returns either Err or bounded empty object)
+    let _ = import_cdr_bytes(&malformed_riff);
+
+    // 2. Wavelet .wi 11312x11312 subband allocation budget rejection BEFORE allocation
+    let mut wi_bomb = Vec::new();
+    wi_bomb.extend_from_slice(b"WI1\0");
+    wi_bomb.extend_from_slice(&11_312u32.to_le_bytes());
+    wi_bomb.extend_from_slice(&11_312u32.to_le_bytes());
+    wi_bomb.extend_from_slice(&1u16.to_le_bytes());
+    wi_bomb.extend_from_slice(&4u16.to_le_bytes());
+    let mut budget = CodecLimits::default().max_uncompressed_bytes;
+    let wi_err =
+        decode_wi_to_rgba_with_budget(&wi_bomb, &CodecLimits::default(), &mut budget).unwrap_err();
+    assert!(
+        matches!(
+            wi_err,
+            CdrError::InvalidBitmapDimensions { .. }
+                | CdrError::UncompressedSizeLimitExceeded { .. }
+        ),
+        "expected clean pre-allocation limit rejection on 11312x11312 .wi, got {wi_err:?}"
+    );
+}

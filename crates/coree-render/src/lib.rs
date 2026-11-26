@@ -34,7 +34,7 @@ pub use error::{RenderError, RenderResult};
 pub use export_render::{
     render_isolated_object_to_rgba, render_isolated_object_to_rgba_with_options,
     render_page_to_rgba, render_page_to_rgba_with_backend, render_page_to_rgba_with_options,
-    render_svg_to_rgba, RenderedImage,
+    render_svg_to_rgba, ExportIsolationSession, RenderedImage,
 };
 pub use hit_test::{
     hit_test_node, hit_test_point, hit_test_powerclip_contents, hit_test_rect, DynamicGuideKind,

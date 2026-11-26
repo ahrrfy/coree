@@ -8,13 +8,16 @@
 //!   `ER`, `PW`, `LB` at `1 mm = 40 HPGL units`) for Roland / Graphtec vinyl cutting plotters.
 
 use crate::atomic::atomic_write_bytes;
+use crate::display_list::{compose_world_persp, transform_world_path};
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
 use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
     Affine2D, ArtisticText, BezierPath, Color, ColorMode, DimensionKind, DimensionObject, Document,
     EllipseMode, Fill, Layer, LayerId, MasterLayerScope, NodePayload, ObjectId, OutlineStyle, Page,
-    ParametricShape, Point2D, Rect2D, SceneObject, SymbolDef, TextDirection, TextStyle, Vec2D,
+    ParametricShape, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolDef, TextDirection,
+    TextStyle, Vec2D,
 };
+use coree_render::effects_render::apply_geometry_effects;
 use kurbo::{BezPath, PathSeg};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -25,7 +28,8 @@ use std::path::Path;
 pub const HPGL_UNITS_PER_MM: f64 = 40.0;
 const MAX_CAD_DEPTH: usize = 64;
 const MAX_DXF_INSERT_DEPTH: usize = 32;
-const MAX_DXF_EXPANDED_ENTITIES: usize = 250_000;
+const MAX_DXF_EXPANDED_ENTITIES: usize = 100_000;
+const MAX_DXF_EXPANDED_VERTICES: usize = 2_000_000;
 const MAX_DXF_EXPAND_STEPS: usize = 1_000_000;
 const MAX_CAD_INPUT_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
 
@@ -158,6 +162,7 @@ pub fn export_dxf_to_string_with_options(
                     obj,
                     Affine2D::IDENTITY,
                     None,
+                    None,
                     &layer_name,
                     opts,
                     &mut out,
@@ -243,12 +248,29 @@ fn emit_dxf_text_entity(
     }
 }
 
+#[inline]
+fn warp_cad_world_path(
+    local_bp: BezierPath,
+    obj: &SceneObject,
+    world_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    let bp = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local_bp)
+    } else {
+        local_bp
+    };
+    let deformed = apply_geometry_effects(&bp, &obj.effects);
+    transform_world_path(&deformed, obj.transform, world_xf, parent_persp)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_dxf_object_entities(
     doc: &Document,
     page: &Page,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<ExportSymCtx<'_>>,
     layer_name: &str,
     opts: &DxfExportOptions,
@@ -269,7 +291,7 @@ fn emit_dxf_object_entities(
 
     // Native exact CAD CIRCLE & ARC export when shape is a uniformly-scaled circular arc/circle
     // (avoids segmented/splined circles on CNC, plasma & laser cutters).
-    if obj.effects.is_empty() {
+    if obj.effects.is_empty() && obj.perspective.is_none() && parent_persp.is_none() {
         if let NodePayload::Shape(ParametricShape::Ellipse {
             rx,
             ry,
@@ -291,12 +313,18 @@ fn emit_dxf_object_entities(
 
     match &obj.payload {
         NodePayload::Path(p) => {
-            emit_dxf_path(page, &p.transformed(&world_xf), layer_name, opts, out);
+            emit_dxf_path(
+                page,
+                &warp_cad_world_path(p.clone(), obj, world_xf, parent_persp),
+                layer_name,
+                opts,
+                out,
+            );
         }
         NodePayload::Shape(s) => {
             emit_dxf_path(
                 page,
-                &s.to_bezier_path().transformed(&world_xf),
+                &warp_cad_world_path(s.to_bezier_path(), obj, world_xf, parent_persp),
                 layer_name,
                 opts,
                 out,
@@ -305,7 +333,7 @@ fn emit_dxf_object_entities(
         NodePayload::BSpline(bs) => {
             emit_dxf_path(
                 page,
-                &bs.to_bezier_path().transformed(&world_xf),
+                &warp_cad_world_path(bs.to_bezier_path(), obj, world_xf, parent_persp),
                 layer_name,
                 opts,
                 out,
@@ -314,7 +342,12 @@ fn emit_dxf_object_entities(
         NodePayload::ArtisticMedia { spine, style } => {
             emit_dxf_path(
                 page,
-                &coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf),
+                &warp_cad_world_path(
+                    coree_core::ArtisticMedia::expand_stroke(spine, style),
+                    obj,
+                    world_xf,
+                    parent_persp,
+                ),
                 layer_name,
                 opts,
                 out,
@@ -336,6 +369,7 @@ fn emit_dxf_object_entities(
                     page,
                     &resolved,
                     parent_xf,
+                    parent_persp,
                     sym_ctx,
                     layer_name,
                     opts,
@@ -348,7 +382,7 @@ fn emit_dxf_object_entities(
         NodePayload::Table(t) => {
             emit_dxf_path(
                 page,
-                &t.to_grid_paths().transformed(&world_xf),
+                &warp_cad_world_path(t.to_grid_paths(), obj, world_xf, parent_persp),
                 layer_name,
                 opts,
                 out,
@@ -361,13 +395,15 @@ fn emit_dxf_object_entities(
         NodePayload::PowerClip { container, .. } => {
             emit_dxf_path(
                 page,
-                &container.transformed(&world_xf),
+                &warp_cad_world_path((**container).clone(), obj, world_xf, parent_persp),
                 layer_name,
                 opts,
                 out,
             );
         }
         NodePayload::Group(children) => {
+            let child_persp =
+                compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
             for &cid in children {
                 let child_opt = sym_ctx
                     .and_then(|(m, _, _)| m.get(&cid).copied())
@@ -378,6 +414,7 @@ fn emit_dxf_object_entities(
                         page,
                         child,
                         world_xf,
+                        child_persp,
                         sym_ctx,
                         layer_name,
                         opts,
@@ -392,6 +429,8 @@ fn emit_dxf_object_entities(
             if let Some(sym) = doc.symbol(*sym_id) {
                 let (child_map, referenced) = build_cad_symbol_maps(sym);
                 let mut sym_visited = HashSet::new();
+                let child_persp =
+                    compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
                 for sub in &sym.objects {
                     if sub.id.0 != 0 && referenced.contains(&sub.id) {
                         continue;
@@ -401,6 +440,7 @@ fn emit_dxf_object_entities(
                         page,
                         sub,
                         world_xf,
+                        child_persp,
                         Some((&child_map, &sym.objects, world_xf)),
                         layer_name,
                         opts,
@@ -787,6 +827,7 @@ pub fn export_plt_to_string_with_options(
                     obj,
                     Affine2D::IDENTITY,
                     None,
+                    None,
                     &mut ops,
                     0,
                     &mut visited,
@@ -810,8 +851,13 @@ pub fn export_plt_to_string_with_options(
                     emit_plt_path_with_arcs(page, path, safe_tol, &mut out);
                 }
                 PltOp::Circle { center, radius_mm } => {
+                    if !center.is_finite() || !radius_mm.is_finite() || *radius_mm <= 0.0 {
+                        continue;
+                    }
                     let (cx, cy) = to_hpgl_units(page, *center);
-                    let r_units = (radius_mm * HPGL_UNITS_PER_MM).round().max(1.0) as i64;
+                    let r_units = (radius_mm * HPGL_UNITS_PER_MM)
+                        .round()
+                        .clamp(1.0, i32::MAX as f64) as i64;
                     let _ = write!(out, "PU{cx},{cy};CI{r_units};PU;");
                 }
                 PltOp::Arc {
@@ -990,6 +1036,34 @@ fn try_fit_cubic_circular_arc(
 fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut String) {
     use kurbo::{flatten, CubicBez, PathEl, QuadBez};
 
+    const MAX_PLT_FLATTEN_VERTICES: usize = 1_000_000;
+
+    if path.subpaths.iter().any(|sp| {
+        sp.nodes.iter().any(|n| {
+            !n.pos.is_finite()
+                || n.handle_in.is_some_and(|h| !h.is_finite())
+                || n.handle_out.is_some_and(|h| !h.is_finite())
+        })
+    }) {
+        return;
+    }
+    let Some(bb) = path.bounding_box() else {
+        return;
+    };
+    if !bb.is_finite() {
+        return;
+    }
+    let max_span = bb.width().max(bb.height());
+    if !max_span.is_finite() {
+        return;
+    }
+    let base_tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        0.05
+    };
+    let eff_tol = base_tol.max(1e-4).max(max_span * 1e-5);
+
     let flush_pd = |out: &mut String, pts: &mut Vec<Point2D>| {
         if pts.is_empty() {
             return;
@@ -1011,6 +1085,7 @@ fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut S
     let mut sub_start = Point2D::ZERO;
     let mut subpath_open = false;
     let mut pen_down = false;
+    let mut total_verts: usize = 0;
 
     for el in path.to_kurbo().elements() {
         match el {
@@ -1035,7 +1110,10 @@ fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut S
             PathEl::LineTo(p) => {
                 let pt = Point2D::from_kurbo(*p);
                 if subpath_open && pt.is_finite() {
-                    pd_pts.push(pt);
+                    if total_verts < MAX_PLT_FLATTEN_VERTICES {
+                        pd_pts.push(pt);
+                        total_verts += 1;
+                    }
                     cur_pt = pt;
                     pen_down = true;
                 }
@@ -1051,12 +1129,16 @@ fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut S
                             PathEl::MoveTo(cur_pt.to_kurbo()),
                             PathEl::CurveTo(cb.p1, cb.p2, cb.p3),
                         ],
-                        tol,
+                        eff_tol,
                         |seg| {
+                            if total_verts >= MAX_PLT_FLATTEN_VERTICES {
+                                return;
+                            }
                             if let PathEl::LineTo(lp) = seg {
                                 let pt = Point2D::from_kurbo(lp);
                                 if pt.is_finite() {
                                     pd_pts.push(pt);
+                                    total_verts += 1;
                                 }
                             }
                         },
@@ -1096,12 +1178,16 @@ fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut S
                             PathEl::MoveTo(cur_pt.to_kurbo()),
                             PathEl::CurveTo(cb.p1, cb.p2, cb.p3),
                         ],
-                        tol,
+                        eff_tol,
                         |seg| {
+                            if total_verts >= MAX_PLT_FLATTEN_VERTICES {
+                                return;
+                            }
                             if let PathEl::LineTo(lp) = seg {
                                 let pt = Point2D::from_kurbo(lp);
                                 if pt.is_finite() {
                                     pd_pts.push(pt);
+                                    total_verts += 1;
                                 }
                             }
                         },
@@ -1112,8 +1198,11 @@ fn emit_plt_path_with_arcs(page: &Page, path: &BezierPath, tol: f64, out: &mut S
             }
             PathEl::ClosePath => {
                 if subpath_open {
-                    if cur_pt.distance_to(sub_start) > 1e-4 {
+                    if cur_pt.distance_to(sub_start) > 1e-4
+                        && total_verts < MAX_PLT_FLATTEN_VERTICES
+                    {
                         pd_pts.push(sub_start);
+                        total_verts += 1;
                     }
                     flush_pd(out, &mut pd_pts);
                     out.push_str("PU;");
@@ -1207,10 +1296,12 @@ fn try_collect_plt_circle_or_arc(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_plt_ops(
     doc: &Document,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<ExportSymCtx<'_>>,
     out: &mut Vec<PltOp>,
     depth: usize,
@@ -1226,7 +1317,7 @@ fn collect_plt_ops(
         }
         return;
     }
-    if obj.effects.is_empty() {
+    if obj.effects.is_empty() && obj.perspective.is_none() && parent_persp.is_none() {
         if let NodePayload::Shape(ParametricShape::Ellipse {
             rx,
             ry,
@@ -1244,14 +1335,30 @@ fn collect_plt_ops(
         }
     }
     match &obj.payload {
-        NodePayload::Path(p) => out.push(PltOp::Path(p.transformed(&world_xf))),
-        NodePayload::Shape(s) => out.push(PltOp::Path(s.to_bezier_path().transformed(&world_xf))),
-        NodePayload::BSpline(bs) => {
-            out.push(PltOp::Path(bs.to_bezier_path().transformed(&world_xf)))
-        }
-        NodePayload::ArtisticMedia { spine, style } => out.push(PltOp::Path(
-            coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf),
-        )),
+        NodePayload::Path(p) => out.push(PltOp::Path(warp_cad_world_path(
+            p.clone(),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
+        NodePayload::Shape(s) => out.push(PltOp::Path(warp_cad_world_path(
+            s.to_bezier_path(),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
+        NodePayload::BSpline(bs) => out.push(PltOp::Path(warp_cad_world_path(
+            bs.to_bezier_path(),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
+        NodePayload::ArtisticMedia { spine, style } => out.push(PltOp::Path(warp_cad_world_path(
+            coree_core::ArtisticMedia::expand_stroke(spine, style),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
         NodePayload::Clone { .. } => {
             if let Some((p, f, o)) = crate::display_list::resolve_display_list_clone(
                 doc,
@@ -1263,24 +1370,52 @@ fn collect_plt_ops(
                 resolved.payload = p;
                 resolved.fill = f;
                 resolved.outline = o;
-                collect_plt_ops(doc, &resolved, parent_xf, sym_ctx, out, depth + 1, visited);
+                collect_plt_ops(
+                    doc,
+                    &resolved,
+                    parent_xf,
+                    parent_persp,
+                    sym_ctx,
+                    out,
+                    depth + 1,
+                    visited,
+                );
             }
         }
-        NodePayload::Table(t) => out.push(PltOp::Path(t.to_grid_paths().transformed(&world_xf))),
+        NodePayload::Table(t) => out.push(PltOp::Path(warp_cad_world_path(
+            t.to_grid_paths(),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
         NodePayload::Connector(c) => {
             let (a, b) = resolve_export_connector_endpoints(doc, c, &world_xf, sym_ctx);
             out.push(PltOp::Path(c.route_path(a, b)));
         }
-        NodePayload::PowerClip { container, .. } => {
-            out.push(PltOp::Path(container.transformed(&world_xf)))
-        }
+        NodePayload::PowerClip { container, .. } => out.push(PltOp::Path(warp_cad_world_path(
+            (**container).clone(),
+            obj,
+            world_xf,
+            parent_persp,
+        ))),
         NodePayload::Group(children) => {
+            let child_persp =
+                compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
             for &cid in children {
                 let child_opt = sym_ctx
                     .and_then(|(m, _, _)| m.get(&cid).copied())
                     .or_else(|| doc.object(cid));
                 if let Some(child) = child_opt {
-                    collect_plt_ops(doc, child, world_xf, sym_ctx, out, depth + 1, visited);
+                    collect_plt_ops(
+                        doc,
+                        child,
+                        world_xf,
+                        child_persp,
+                        sym_ctx,
+                        out,
+                        depth + 1,
+                        visited,
+                    );
                 }
             }
         }
@@ -1288,6 +1423,8 @@ fn collect_plt_ops(
             if let Some(sym) = doc.symbol(*sym_id) {
                 let (child_map, referenced) = build_cad_symbol_maps(sym);
                 let mut sym_visited = HashSet::new();
+                let child_persp =
+                    compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
                 for sub in &sym.objects {
                     if sub.id.0 != 0 && referenced.contains(&sub.id) {
                         continue;
@@ -1296,6 +1433,7 @@ fn collect_plt_ops(
                         doc,
                         sub,
                         world_xf,
+                        child_persp,
                         Some((&child_map, &sym.objects, world_xf)),
                         out,
                         depth + 1,
@@ -1454,100 +1592,115 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         });
     }
 
-    let text = String::from_utf8_lossy(bytes);
-    let pairs = parse_dxf_pairs(&text)?;
-    if pairs.is_empty() {
-        return Err(IoError::InvalidFormat {
-            format: "dxf".into(),
-            message: "no DXF group-code pairs found".into(),
-        });
-    }
-
-    let mut unit_scale_mm = 1.0_f64;
-    let mut ext_min: Option<Point2D> = None;
-    let mut ext_max: Option<Point2D> = None;
-    let mut dxf_layers: HashMap<String, DxfLayerInfo> = HashMap::new();
-    let mut layer_order: Vec<String> = Vec::new();
-    let mut blocks: HashMap<String, DxfBlock> = HashMap::new();
-    let mut entities: Vec<DxfEntity> = Vec::new();
-    let mut saw_section = false;
-
-    let mut i = 0usize;
-    while i < pairs.len() {
-        let (code, ref val) = pairs[i];
-        if code == 0 && val.eq_ignore_ascii_case("EOF") {
-            break;
+    let (unit_scale_mm, ext_min, ext_max, dxf_layers, layer_order, mut resolved) = {
+        let text = String::from_utf8_lossy(bytes);
+        let pairs = parse_dxf_pairs(&text)?;
+        drop(text);
+        if pairs.is_empty() {
+            return Err(IoError::InvalidFormat {
+                format: "dxf".into(),
+                message: "no DXF group-code pairs found".into(),
+            });
         }
-        if code == 0 && val.eq_ignore_ascii_case("SECTION") {
-            saw_section = true;
-            i += 1;
-            let section_name = if i < pairs.len() && pairs[i].0 == 2 {
-                let s = pairs[i].1.trim().to_ascii_uppercase();
-                i += 1;
-                s
-            } else {
-                String::new()
-            };
 
-            match section_name.as_str() {
-                "HEADER" => {
-                    parse_dxf_header(
-                        &pairs,
-                        &mut i,
-                        &mut unit_scale_mm,
-                        &mut ext_min,
-                        &mut ext_max,
-                    );
-                }
-                "TABLES" => {
-                    parse_dxf_tables(&pairs, &mut i, &mut dxf_layers, &mut layer_order);
-                }
-                "BLOCKS" => {
-                    parse_dxf_blocks(&pairs, &mut i, &mut blocks);
-                }
-                "ENTITIES" => {
-                    entities.extend(parse_dxf_entity_list(&pairs, &mut i, "ENDSEC"));
-                }
-                _ => {
-                    while i < pairs.len() {
-                        let is_end = pairs[i].0 == 0 && pairs[i].1.eq_ignore_ascii_case("ENDSEC");
-                        i += 1;
-                        if is_end {
-                            break;
+        let mut unit_scale_mm = 1.0_f64;
+        let mut ext_min: Option<Point2D> = None;
+        let mut ext_max: Option<Point2D> = None;
+        let mut dxf_layers: HashMap<String, DxfLayerInfo> = HashMap::new();
+        let mut layer_order: Vec<String> = Vec::new();
+        let mut blocks: HashMap<String, DxfBlock> = HashMap::new();
+        let mut entities: Vec<DxfEntity> = Vec::new();
+        let mut saw_section = false;
+
+        let mut i = 0usize;
+        while i < pairs.len() {
+            let (code, ref val) = pairs[i];
+            if code == 0 && val.eq_ignore_ascii_case("EOF") {
+                break;
+            }
+            if code == 0 && val.eq_ignore_ascii_case("SECTION") {
+                saw_section = true;
+                i += 1;
+                let section_name = if i < pairs.len() && pairs[i].0 == 2 {
+                    let s = pairs[i].1.trim().to_ascii_uppercase();
+                    i += 1;
+                    s
+                } else {
+                    String::new()
+                };
+
+                match section_name.as_str() {
+                    "HEADER" => {
+                        parse_dxf_header(
+                            &pairs,
+                            &mut i,
+                            &mut unit_scale_mm,
+                            &mut ext_min,
+                            &mut ext_max,
+                        );
+                    }
+                    "TABLES" => {
+                        parse_dxf_tables(&pairs, &mut i, &mut dxf_layers, &mut layer_order);
+                    }
+                    "BLOCKS" => {
+                        parse_dxf_blocks(&pairs, &mut i, &mut blocks);
+                    }
+                    "ENTITIES" => {
+                        entities.extend(parse_dxf_entity_list(&pairs, &mut i, "ENDSEC"));
+                    }
+                    _ => {
+                        while i < pairs.len() {
+                            let is_end =
+                                pairs[i].0 == 0 && pairs[i].1.eq_ignore_ascii_case("ENDSEC");
+                            i += 1;
+                            if is_end {
+                                break;
+                            }
                         }
                     }
                 }
+            } else {
+                i += 1;
             }
-        } else {
-            i += 1;
         }
-    }
 
-    if !saw_section {
-        return Err(IoError::InvalidFormat {
-            format: "dxf".into(),
-            message: "missing DXF SECTION markers".into(),
-        });
-    }
+        if !saw_section {
+            return Err(IoError::InvalidFormat {
+                format: "dxf".into(),
+                message: "missing DXF SECTION markers".into(),
+            });
+        }
+        drop(pairs);
 
-    // Flatten all entities (resolving BLOCK/INSERT recursively with cycle & DAG fanout guards) into Y-up mm space.
-    let mut resolved = Vec::new();
-    let scale_xf = Affine2D::scale_uniform(unit_scale_mm);
-    let mut visited_blocks = HashSet::new();
-    let mut expand_steps = 0usize;
-    for ent in &entities {
-        expand_dxf_entity(
-            ent,
-            &blocks,
-            &dxf_layers,
-            scale_xf,
-            None,
-            0,
-            &mut visited_blocks,
-            &mut expand_steps,
-            &mut resolved,
-        )?;
-    }
+        // Flatten all entities (resolving BLOCK/INSERT recursively with cycle & DAG fanout guards) into Y-up mm space.
+        let mut resolved = Vec::new();
+        let scale_xf = Affine2D::scale_uniform(unit_scale_mm);
+        let mut visited_blocks = HashSet::new();
+        let mut expand_steps = 0usize;
+        let mut expanded_vertices = 0usize;
+        for ent in &entities {
+            expand_dxf_entity(
+                ent,
+                &blocks,
+                &dxf_layers,
+                scale_xf,
+                None,
+                0,
+                &mut visited_blocks,
+                &mut expand_steps,
+                &mut expanded_vertices,
+                &mut resolved,
+            )?;
+        }
+        (
+            unit_scale_mm,
+            ext_min,
+            ext_max,
+            dxf_layers,
+            layer_order,
+            resolved,
+        )
+    };
 
     // Determine page bounds in DXF Y-up millimeter coordinates.
     let valid_ext = ext_min.zip(ext_max).and_then(|(lo, hi)| {
@@ -1612,7 +1765,7 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         layer_ids.insert(lname.clone(), lid);
     }
 
-    for (idx, item) in resolved.into_iter().enumerate() {
+    for (idx, item) in resolved.drain(..).enumerate() {
         let lid = if let Some(&existing) = layer_ids.get(&item.layer) {
             existing
         } else {
@@ -1710,6 +1863,7 @@ pub fn import_dxf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
             }
         }
     }
+    drop(resolved);
 
     // Remove unused empty placeholder "Layer 1" when DXF layers were created.
     if !layer_ids.is_empty() && doc.pages()[0].layers.len() > 1 {
@@ -2569,6 +2723,26 @@ impl ResolvedCadItem {
     }
 }
 
+fn dxf_path_node_count(path: &BezierPath) -> usize {
+    path.subpaths
+        .iter()
+        .map(|sp| sp.nodes.len())
+        .sum::<usize>()
+        .max(1)
+}
+
+fn record_dxf_vertices(expanded_vertices: &mut usize, add: usize) -> IoResult<()> {
+    let next = expanded_vertices.saturating_add(add);
+    if next > MAX_DXF_EXPANDED_VERTICES {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_dxf_vertices={MAX_DXF_EXPANDED_VERTICES}"),
+            actual: format!("DXF expanded vertex/node count {next} exceeds cap"),
+        });
+    }
+    *expanded_vertices = next;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_dxf_entity(
     ent: &DxfEntity,
@@ -2579,6 +2753,7 @@ fn expand_dxf_entity(
     depth: usize,
     visited_blocks: &mut HashSet<String>,
     expand_steps: &mut usize,
+    expanded_vertices: &mut usize,
     out: &mut Vec<ResolvedCadItem>,
 ) -> IoResult<()> {
     *expand_steps = expand_steps.saturating_add(1);
@@ -2640,6 +2815,7 @@ fn expand_dxf_entity(
                         depth + 1,
                         visited_blocks,
                         expand_steps,
+                        expanded_vertices,
                         out,
                     )?;
                 }
@@ -2647,6 +2823,7 @@ fn expand_dxf_entity(
             visited_blocks.remove(block_name);
         }
         DxfEntityKind::Line { p0, p1 } => {
+            record_dxf_vertices(expanded_vertices, 2)?;
             let path = BezierPath::from_line(*p0, *p1).transformed(&xf);
             out.push(ResolvedCadItem {
                 layer: eff_layer,
@@ -2658,9 +2835,14 @@ fn expand_dxf_entity(
             });
         }
         DxfEntityKind::Polyline { vertices, closed } => {
+            // Pre-check raw vertex count before allocating BezPath / BezierPath
+            if expanded_vertices.saturating_add(vertices.len()) > MAX_DXF_EXPANDED_VERTICES {
+                return record_dxf_vertices(expanded_vertices, vertices.len());
+            }
             let kb = build_dxf_bulge_polyline(vertices, *closed);
             let path = BezierPath::from_kurbo(&kb).transformed(&xf);
             if !path.is_empty() {
+                record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
                 out.push(ResolvedCadItem {
                     layer: eff_layer,
                     kind: ResolvedCadItemKind::Path {
@@ -2674,6 +2856,7 @@ fn expand_dxf_entity(
         DxfEntityKind::Circle { center, radius } => {
             let kb = build_circular_arc_bezpath(*center, *radius, 0.0, std::f64::consts::TAU, true);
             let path = BezierPath::from_kurbo(&kb).transformed(&xf);
+            record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
             out.push(ResolvedCadItem {
                 layer: eff_layer,
                 kind: ResolvedCadItemKind::Path {
@@ -2701,6 +2884,7 @@ fn expand_dxf_entity(
             let a1 = a0 + sweep_deg.to_radians();
             let kb = build_circular_arc_bezpath(*center, *radius, a0, a1, false);
             let path = BezierPath::from_kurbo(&kb).transformed(&xf);
+            record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
             out.push(ResolvedCadItem {
                 layer: eff_layer,
                 kind: ResolvedCadItemKind::Path {
@@ -2738,6 +2922,7 @@ fn expand_dxf_entity(
                 center.y,
             );
             let path = BezierPath::from_kurbo(&unit_arc).transformed(&xf.compose(&ellipse_xf));
+            record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
             out.push(ResolvedCadItem {
                 layer: eff_layer,
                 kind: ResolvedCadItemKind::Path {
@@ -2754,9 +2939,20 @@ fn expand_dxf_entity(
             ctrl_pts,
             fit_pts,
         } => {
+            let est_pts = if ctrl_pts.len() > *degree {
+                (ctrl_pts.len() * 12).clamp(16, 512)
+            } else if fit_pts.len() >= 2 {
+                fit_pts.len()
+            } else {
+                ctrl_pts.len()
+            };
+            if expanded_vertices.saturating_add(est_pts) > MAX_DXF_EXPANDED_VERTICES {
+                return record_dxf_vertices(expanded_vertices, est_pts);
+            }
             let kb = build_dxf_spline_bezpath(*degree, *closed, knots, ctrl_pts, fit_pts);
             let path = BezierPath::from_kurbo(&kb).transformed(&xf);
             if !path.is_empty() {
+                record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
                 out.push(ResolvedCadItem {
                     layer: eff_layer,
                     kind: ResolvedCadItemKind::Path {
@@ -2769,6 +2965,7 @@ fn expand_dxf_entity(
         }
         DxfEntityKind::Solid { corners } => {
             let path = BezierPath::from_polygon(corners.iter().copied(), true).transformed(&xf);
+            record_dxf_vertices(expanded_vertices, dxf_path_node_count(&path))?;
             out.push(ResolvedCadItem {
                 layer: eff_layer,
                 kind: ResolvedCadItemKind::Path {
@@ -2784,6 +2981,7 @@ fn expand_dxf_entity(
             height,
             rotation_deg,
         } => {
+            record_dxf_vertices(expanded_vertices, 1)?;
             let world_pos = xf.transform_point(*pos);
             let scale = 0.5 * (xf.m[0].hypot(xf.m[1]) + xf.m[2].hypot(xf.m[3]));
             let xf_rot = xf.m[1].atan2(xf.m[0]).to_degrees();
@@ -2804,6 +3002,7 @@ fn expand_dxf_entity(
             text_pos,
             label,
         } => {
+            record_dxf_vertices(expanded_vertices, 2)?;
             out.push(ResolvedCadItem {
                 layer: eff_layer,
                 kind: ResolvedCadItemKind::Dimension {
@@ -4313,6 +4512,206 @@ mod tests {
             plt.matches(";CI").count(),
             3,
             "expected 3 HPGL CI circles (SymUnlinked skipped), got:\n{plt}"
+        );
+    }
+
+    #[test]
+    fn plt_export_1e15_single_cubic_curve_and_full_sample_do_not_oom() {
+        use coree_core::{NodeKind, PathNode, Subpath};
+
+        // 1. Minimal 1-object cubic curve ("Hero Curve") scaled by 1e15
+        let mut doc = Document::new("Plt1e15Curve", 210.0, 297.0, ColorMode::Rgb, 72.0);
+        let l0 = doc.pages()[0].layers[0].id;
+        let curve = BezierPath::from_subpath(Subpath {
+            closed: true,
+            nodes: vec![
+                PathNode::new(
+                    Point2D::new(10.0, 10.0),
+                    Some(Point2D::new(5.0, 15.0)),
+                    Some(Point2D::new(15.0, 5.0)),
+                    NodeKind::Symmetrical,
+                ),
+                PathNode::new(
+                    Point2D::new(50.0, 10.0),
+                    Some(Point2D::new(40.0, 5.0)),
+                    Some(Point2D::new(60.0, 15.0)),
+                    NodeKind::Smooth,
+                ),
+                PathNode::new(Point2D::new(50.0, 45.0), None, None, NodeKind::Cusp),
+                PathNode::new(
+                    Point2D::new(10.0, 45.0),
+                    Some(Point2D::new(20.0, 50.0)),
+                    Some(Point2D::new(5.0, 35.0)),
+                    NodeKind::Cusp,
+                ),
+            ],
+        });
+        let curve_obj = SceneObject::new(ObjectId(0), "Hero Curve", NodePayload::Path(curve))
+            .with_transform(Affine2D::new(1e15, 0.0, 0.0, 1e15, 0.0, 0.0));
+        doc.add_object(curve_obj, Some(l0)).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let plt_one = export_plt_to_string(&doc, 0).unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "1e15 single-curve PLT export took {:?}",
+            t0.elapsed()
+        );
+        assert!(plt_one.starts_with("IN;") && plt_one.contains("SP0;"));
+        assert!(
+            plt_one.len() < 1024 * 1024,
+            "1e15 PLT output must remain bounded, got {} bytes",
+            plt_one.len()
+        );
+
+        // 2. Full 1e15-transformed multi-object showcase (curves, shapes, ellipses, text)
+        let mut full_doc = Document::new("Plt1e15Full", 210.0, 297.0, ColorMode::Rgb, 72.0);
+        let fl0 = full_doc.pages()[0].layers[0].id;
+        let xf_1e15 = Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, 1e15);
+        let mut quad_path = BezierPath::new();
+        quad_path.subpaths.push(Subpath {
+            closed: false,
+            nodes: vec![
+                PathNode::new(
+                    Point2D::new(0.0, 0.0),
+                    None,
+                    Some(Point2D::new(20.0, 40.0)),
+                    NodeKind::Cusp,
+                ),
+                PathNode::new(
+                    Point2D::new(40.0, 0.0),
+                    Some(Point2D::new(20.0, 40.0)),
+                    None,
+                    NodeKind::Cusp,
+                ),
+            ],
+        });
+        full_doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "ScaledQuadCurve", NodePayload::Path(quad_path))
+                    .with_transform(xf_1e15),
+                Some(fl0),
+            )
+            .unwrap();
+        full_doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "ScaledEllipse",
+                    NodePayload::Shape(ParametricShape::Ellipse {
+                        rx: 6.0,
+                        ry: 6.0,
+                        mode: EllipseMode::Full,
+                        start_deg: 0.0,
+                        end_deg: 360.0,
+                    }),
+                )
+                .with_transform(xf_1e15),
+                Some(fl0),
+            )
+            .unwrap();
+        full_doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "ScaledRoundRect",
+                    NodePayload::Shape(ParametricShape::Rectangle {
+                        width: 85.0,
+                        height: 55.0,
+                        corner_radii: [4.0; 4],
+                        corner_style: coree_core::CornerStyle::Rounded,
+                        lock_corners: true,
+                    }),
+                )
+                .with_transform(xf_1e15),
+                Some(fl0),
+            )
+            .unwrap();
+
+        let t1 = std::time::Instant::now();
+        let plt_full = export_plt_to_string(&full_doc, 0).unwrap();
+        let dxf_full = export_dxf_to_string(&full_doc, 0).unwrap();
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(2),
+            "1e15 full-sample CAD export took {:?}",
+            t1.elapsed()
+        );
+        assert!(plt_full.contains("CI") && plt_full.contains("SP0;"));
+        assert!(dxf_full.contains("EOF"));
+
+        // 3. Non-finite coordinates must safely skip without panic
+        let mut nan_doc = Document::new("PltNaN", 210.0, 297.0, ColorMode::Rgb, 72.0);
+        let nl0 = nan_doc.pages()[0].layers[0].id;
+        let nan_path = BezierPath::from_subpath(Subpath::from_points(
+            vec![Point2D::new(f64::NAN, 0.0), Point2D::new(10.0, 10.0)],
+            false,
+        ));
+        nan_doc
+            .add_object(
+                SceneObject::new(ObjectId(0), "NaNPath", NodePayload::Path(nan_path)),
+                Some(nl0),
+            )
+            .unwrap();
+        let plt_nan = export_plt_to_string(&nan_doc, 0).unwrap();
+        assert!(plt_nan.starts_with("IN;") && plt_nan.contains("SP0;"));
+    }
+
+    #[test]
+    fn dxf_insert_bomb_12_pow_5_and_vertex_budget_reject_cleanly() {
+        // 1. 12^5 = 248,832 entities (previously bypassed MAX_DXF_EXPANDED_ENTITIES=250_000) -> LimitExceeded!
+        let mut bomb = String::from("0\nSECTION\n2\nBLOCKS\n");
+        bomb.push_str(
+            "0\nBLOCK\n2\nB0\n10\n0\n20\n0\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n1\n21\n1\n0\nENDBLK\n",
+        );
+        for lvl in 1..=5 {
+            let prev = lvl - 1;
+            let _ = writeln!(bomb, "0\nBLOCK\n2\nB{lvl}\n10\n0\n20\n0");
+            for _ in 0..12 {
+                let _ = writeln!(bomb, "0\nINSERT\n8\n0\n2\nB{prev}\n10\n0\n20\n0");
+            }
+            bomb.push_str("0\nENDBLK\n");
+        }
+        bomb.push_str(
+            "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n8\n0\n2\nB5\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n",
+        );
+
+        let t0 = std::time::Instant::now();
+        let err = import_dxf_bytes(bomb.as_bytes(), "Dxf12Pow5Bomb").unwrap_err();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "12^5 DXF bomb rejection took {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            matches!(err, IoError::LimitExceeded { ref limit, .. } if limit.contains("max_dxf_entities")),
+            "expected max_dxf_entities LimitExceeded, got {err:?}"
+        );
+
+        // 2. Dense polyline INSERT tree (2,500 entities << 100,000, but 2,500 * 1,000 = 2.5M vertices > 2M) -> LimitExceeded!
+        let mut poly_bomb = String::from("0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nP0\n10\n0\n20\n0\n0\nLWPOLYLINE\n8\n0\n90\n1000\n70\n0\n");
+        for v in 0..1000 {
+            let _ = writeln!(poly_bomb, "10\n{v}\n20\n{}", v % 10);
+        }
+        poly_bomb.push_str("0\nENDBLK\n0\nBLOCK\n2\nP1\n10\n0\n20\n0\n");
+        for _ in 0..50 {
+            poly_bomb.push_str("0\nINSERT\n8\n0\n2\nP0\n10\n0\n20\n0\n");
+        }
+        poly_bomb.push_str("0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n");
+        for _ in 0..50 {
+            poly_bomb.push_str("0\nINSERT\n8\n0\n2\nP1\n10\n0\n20\n0\n");
+        }
+        poly_bomb.push_str("0\nENDSEC\n0\nEOF\n");
+
+        let t1 = std::time::Instant::now();
+        let verr = import_dxf_bytes(poly_bomb.as_bytes(), "DxfVertexBomb").unwrap_err();
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(2),
+            "dense polyline vertex bomb rejection took {:?}",
+            t1.elapsed()
+        );
+        assert!(
+            matches!(verr, IoError::LimitExceeded { ref limit, .. } if limit.contains("max_dxf_vertices")),
+            "expected max_dxf_vertices LimitExceeded, got {verr:?}"
         );
     }
 }

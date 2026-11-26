@@ -16,7 +16,9 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_METAFILE_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
-const MAX_WMF_RECORDS: usize = 500_000;
+const MAX_WMF_RECORDS: usize = 150_000;
+const MAX_WMF_OBJECTS: usize = 100_000;
+const MAX_WMF_VERTICES: usize = 2_000_000;
 const ALDUS_KEY: u32 = 0x9AC6_CDD7;
 const TWIPS_PER_INCH: f64 = 1440.0;
 const MM_PER_INCH: f64 = 25.4;
@@ -379,6 +381,18 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     let mut emitted_objs: Vec<SceneObject> = Vec::new();
     let mut pending_rasters: Vec<(coree_core::RasterAsset, Rect2D)> = Vec::new();
     let mut rec_count = 0usize;
+    let mut total_vertices = 0usize;
+
+    let push_wmf_obj = |emitted: &mut Vec<SceneObject>, obj: SceneObject| -> IoResult<()> {
+        if emitted.len() >= MAX_WMF_OBJECTS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_wmf_objects={MAX_WMF_OBJECTS}"),
+                actual: "WMF emitted object count exceeded".into(),
+            });
+        }
+        emitted.push(obj);
+        Ok(())
+    };
 
     let map_pt = |lx: i16, ly: i16, ox: f64, oy: f64, ex: f64, ey: f64| -> Point2D {
         let sx = page_w / ex.abs().max(1.0);
@@ -480,17 +494,21 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 )
                 .with_fill(Fill::None)
                 .with_outline(cur_outline.clone());
-                emitted_objs.push(obj);
+                push_wmf_obj(&mut emitted_objs, obj)?;
                 cur_pos = next;
             }
             META_POLYGON | META_POLYLINE if params.len() >= 2 => {
-                let count = usize::from(read_u16_le(params, 0)).min(100_000);
+                let count = usize::from(read_u16_le(params, 0)).min((params.len() - 2) / 4);
+                total_vertices = total_vertices.saturating_add(count);
+                if total_vertices > MAX_WMF_VERTICES {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_wmf_vertices={MAX_WMF_VERTICES}"),
+                        actual: format!("WMF vertex count {total_vertices} exceeded cap"),
+                    });
+                }
                 let mut pts = Vec::with_capacity(count);
                 for i in 0..count {
                     let p_off = 2 + i * 4;
-                    if p_off + 4 > params.len() {
-                        break;
-                    }
                     let px = read_i16_le(params, p_off);
                     let py = read_i16_le(params, p_off + 2);
                     pts.push(map_pt(px, py, win_ox, win_oy, win_ex, win_ey));
@@ -509,7 +527,7 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                     )
                     .with_fill(fill)
                     .with_outline(cur_outline.clone());
-                    emitted_objs.push(obj);
+                    push_wmf_obj(&mut emitted_objs, obj)?;
                 }
             }
             META_POLYPOLYGON if params.len() >= 2 => {
@@ -519,12 +537,17 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                     let mut p_off = counts_end;
                     let mut bp = BezierPath::new();
                     for pi in 0..n_polys {
-                        let cnt = usize::from(read_u16_le(params, 2 + pi * 2)).min(50_000);
+                        let avail = (params.len().saturating_sub(p_off)) / 4;
+                        let cnt = usize::from(read_u16_le(params, 2 + pi * 2)).min(avail);
+                        total_vertices = total_vertices.saturating_add(cnt);
+                        if total_vertices > MAX_WMF_VERTICES {
+                            return Err(IoError::LimitExceeded {
+                                limit: format!("max_wmf_vertices={MAX_WMF_VERTICES}"),
+                                actual: format!("WMF vertex count {total_vertices} exceeded cap"),
+                            });
+                        }
                         let mut pts = Vec::with_capacity(cnt);
                         for _ in 0..cnt {
-                            if p_off + 4 > params.len() {
-                                break;
-                            }
                             let px = read_i16_le(params, p_off);
                             let py = read_i16_le(params, p_off + 2);
                             p_off += 4;
@@ -536,11 +559,12 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                         }
                     }
                     if !bp.is_empty() {
-                        emitted_objs.push(
+                        push_wmf_obj(
+                            &mut emitted_objs,
                             SceneObject::new(ObjectId(0), "WMF PolyPolygon", NodePayload::Path(bp))
                                 .with_fill(cur_fill.clone())
                                 .with_outline(cur_outline.clone()),
-                        );
+                        )?;
                     }
                 }
             }
@@ -552,7 +576,8 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 let p0 = map_pt(l, t, win_ox, win_oy, win_ex, win_ey);
                 let p1 = map_pt(r, b, win_ox, win_oy, win_ex, win_ey);
                 let rect = Rect2D::from_points(p0, p1);
-                emitted_objs.push(
+                push_wmf_obj(
+                    &mut emitted_objs,
                     SceneObject::new(
                         ObjectId(0),
                         "WMF Rect",
@@ -560,7 +585,7 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                     )
                     .with_fill(cur_fill.clone())
                     .with_outline(cur_outline.clone()),
-                );
+                )?;
             }
             META_ELLIPSE if params.len() >= 8 => {
                 let b = read_i16_le(params, 0);
@@ -577,7 +602,8 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                     start_deg: 0.0,
                     end_deg: 360.0,
                 };
-                emitted_objs.push(
+                push_wmf_obj(
+                    &mut emitted_objs,
                     SceneObject::new(ObjectId(0), "WMF Ellipse", NodePayload::Shape(shape))
                         .with_fill(cur_fill.clone())
                         .with_outline(cur_outline.clone())
@@ -585,9 +611,9 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                             rect.min_x + rect.width() * 0.5,
                             rect.min_y + rect.height() * 0.5,
                         )),
-                );
+                )?;
             }
-            META_TEXTOUT | META_EXTTEXTOUT if func == META_TEXTOUT && params.len() >= 2 => {
+            META_TEXTOUT if params.len() >= 2 => {
                 let len = usize::from(read_u16_le(params, 0));
                 if 2 + len <= params.len() {
                     let txt = String::from_utf8_lossy(&params[2..2 + len]).into_owned();
@@ -596,7 +622,8 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                         let y = read_i16_le(params, y_off);
                         let x = read_i16_le(params, y_off + 2);
                         let pt = map_pt(x, y, win_ox, win_oy, win_ex, win_ey);
-                        emitted_objs.push(
+                        push_wmf_obj(
+                            &mut emitted_objs,
                             SceneObject::new(
                                 ObjectId(0),
                                 "WMF Text",
@@ -606,7 +633,35 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                                 )),
                             )
                             .with_transform(Affine2D::translate(pt.x, pt.y)),
-                        );
+                        )?;
+                    }
+                }
+            }
+            META_EXTTEXTOUT if params.len() >= 8 => {
+                let y = read_i16_le(params, 0);
+                let x = read_i16_le(params, 2);
+                let len = usize::from(read_u16_le(params, 4));
+                let options = read_u16_le(params, 6);
+                let rect_bytes = if (options & 0x0006) != 0 { 8 } else { 0 };
+                let text_off = 8 + rect_bytes;
+                if len > 0 && text_off + len <= params.len() {
+                    let txt = String::from_utf8_lossy(&params[text_off..text_off + len])
+                        .trim_end_matches('\0')
+                        .to_owned();
+                    if !txt.trim().is_empty() {
+                        let pt = map_pt(x, y, win_ox, win_oy, win_ex, win_ey);
+                        push_wmf_obj(
+                            &mut emitted_objs,
+                            SceneObject::new(
+                                ObjectId(0),
+                                "WMF ExtText",
+                                NodePayload::ArtisticText(ArtisticText::from_plain(
+                                    txt,
+                                    TextStyle::default(),
+                                )),
+                            )
+                            .with_transform(Affine2D::translate(pt.x, pt.y)),
+                        )?;
                     }
                 }
             }
@@ -627,6 +682,12 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                 );
                 let rect = Rect2D::from_points(p0, p1);
                 if let Some(asset) = parse_dib_24bpp_to_asset(&params[22..]) {
+                    if emitted_objs.len() + pending_rasters.len() >= MAX_WMF_OBJECTS {
+                        return Err(IoError::LimitExceeded {
+                            limit: format!("max_wmf_objects={MAX_WMF_OBJECTS}"),
+                            actual: "WMF emitted object count exceeded".into(),
+                        });
+                    }
                     pending_rasters.push((asset, rect));
                 }
             }
@@ -636,9 +697,10 @@ pub fn import_wmf_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
 
     let mut doc = Document::new(title, page_w, page_h, ColorMode::Rgb, 96.0);
     doc.metadata_mut().source_format = Some("wmf".to_owned());
-    for obj in emitted_objs {
+    for obj in emitted_objs.drain(..) {
         doc.add_object(obj, None)?;
     }
+    drop(emitted_objs);
     for (idx, (asset, rect)) in pending_rasters.into_iter().enumerate() {
         let asset_id = doc.register_asset(asset);
         let obj = SceneObject::new(
@@ -664,9 +726,11 @@ fn insert_wmf_gdi(table: &mut Vec<Option<WmfGdiObj>>, obj: WmfGdiObj) -> u16 {
     if let Some(pos) = table.iter().position(Option::is_none) {
         table[pos] = Some(obj);
         pos as u16
-    } else {
+    } else if table.len() < u16::MAX as usize {
         table.push(Some(obj));
         (table.len() - 1) as u16
+    } else {
+        0
     }
 }
 
@@ -968,5 +1032,125 @@ mod tests {
 
         let doc = import_emf_bytes(&minimal, "Minimal EMF").unwrap();
         assert_eq!(doc.pages().len(), 1);
+    }
+
+    #[test]
+    fn tier5_wmf_import_decodes_meta_exttextout_with_and_without_clip_rect() {
+        let build_exttext_wmf = |with_clip_rect: bool, txt: &[u8]| -> Vec<u8> {
+            let mut body = Vec::new();
+            // META_SETWINDOWORG (y=0, x=0)
+            body.extend_from_slice(&5u32.to_le_bytes());
+            body.extend_from_slice(&0x020Bu16.to_le_bytes());
+            body.extend_from_slice(&0i16.to_le_bytes());
+            body.extend_from_slice(&0i16.to_le_bytes());
+            // META_SETWINDOWEXT (cy=1000, cx=1000)
+            body.extend_from_slice(&5u32.to_le_bytes());
+            body.extend_from_slice(&0x020Cu16.to_le_bytes());
+            body.extend_from_slice(&1000i16.to_le_bytes());
+            body.extend_from_slice(&1000i16.to_le_bytes());
+
+            // META_EXTTEXTOUT (0x0A32): y, x, count, options, [optional 8B rect], text (padded to even)
+            let mut params = Vec::new();
+            params.extend_from_slice(&250i16.to_le_bytes()); // y
+            params.extend_from_slice(&120i16.to_le_bytes()); // x
+            params.extend_from_slice(&(txt.len() as u16).to_le_bytes());
+            let opts: u16 = if with_clip_rect { 0x0002 } else { 0 };
+            params.extend_from_slice(&opts.to_le_bytes());
+            if with_clip_rect {
+                for v in [100i16, 200, 500, 400] {
+                    params.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            params.extend_from_slice(txt);
+            if params.len() % 2 == 1 {
+                params.push(0);
+            }
+            let rec_words = (3 + params.len() / 2) as u32;
+            body.extend_from_slice(&rec_words.to_le_bytes());
+            body.extend_from_slice(&META_EXTTEXTOUT.to_le_bytes());
+            body.extend_from_slice(&params);
+
+            // META_EOF
+            body.extend_from_slice(&3u32.to_le_bytes());
+            body.extend_from_slice(&META_EOF.to_le_bytes());
+
+            // 22-byte Aldus placeable + 18-byte standard WMF header
+            let mut wmf = Vec::new();
+            wmf.extend_from_slice(&ALDUS_KEY.to_le_bytes());
+            wmf.extend_from_slice(&0u16.to_le_bytes());
+            for v in [0i16, 0, 1000, 1000] {
+                wmf.extend_from_slice(&v.to_le_bytes());
+            }
+            wmf.extend_from_slice(&1440u16.to_le_bytes());
+            wmf.extend_from_slice(&0u32.to_le_bytes());
+            let mut csum = 0u16;
+            for i in 0..10 {
+                csum ^= u16::from_le_bytes([wmf[i * 2], wmf[i * 2 + 1]]);
+            }
+            wmf.extend_from_slice(&csum.to_le_bytes());
+            wmf.extend_from_slice(&1u16.to_le_bytes()); // memory WMF
+            wmf.extend_from_slice(&9u16.to_le_bytes()); // header size = 9 words
+            wmf.extend_from_slice(&0x0300u16.to_le_bytes());
+            wmf.extend_from_slice(&((9 + body.len() / 2) as u32).to_le_bytes());
+            wmf.extend_from_slice(&0u16.to_le_bytes());
+            wmf.extend_from_slice(&0u32.to_le_bytes());
+            wmf.extend_from_slice(&0u16.to_le_bytes());
+            wmf.extend_from_slice(&body);
+            wmf
+        };
+
+        for (with_rect, label) in [(false, b"HELLO" as &[u8]), (true, b"CLIPPED")] {
+            let bytes = build_exttext_wmf(with_rect, label);
+            let doc = import_wmf_bytes(&bytes, "ExtText").unwrap();
+            let found = doc.objects().values().find_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) => Some(at.plain_text()),
+                _ => None,
+            });
+            assert_eq!(
+                found.as_deref(),
+                Some(std::str::from_utf8(label).unwrap()),
+                "META_EXTTEXTOUT with_clip_rect={with_rect} must import ArtisticText"
+            );
+        }
+    }
+
+    #[test]
+    fn wmf_record_and_object_caps_reject_bomb() {
+        let mut wmf = Vec::new();
+        wmf.extend_from_slice(&ALDUS_KEY.to_le_bytes());
+        wmf.extend_from_slice(&0u16.to_le_bytes());
+        for v in [0i16, 0, 1000, 1000] {
+            wmf.extend_from_slice(&v.to_le_bytes());
+        }
+        wmf.extend_from_slice(&1440u16.to_le_bytes());
+        wmf.extend_from_slice(&0u32.to_le_bytes());
+        let mut csum = 0u16;
+        for i in 0..10 {
+            csum ^= u16::from_le_bytes([wmf[i * 2], wmf[i * 2 + 1]]);
+        }
+        wmf.extend_from_slice(&csum.to_le_bytes());
+        let n_rects = 105_000usize;
+        wmf.extend_from_slice(&1u16.to_le_bytes());
+        wmf.extend_from_slice(&9u16.to_le_bytes());
+        wmf.extend_from_slice(&0x0300u16.to_le_bytes());
+        wmf.extend_from_slice(&((9 + n_rects * 7 + 3) as u32).to_le_bytes());
+        wmf.extend_from_slice(&0u16.to_le_bytes());
+        wmf.extend_from_slice(&7u32.to_le_bytes());
+        wmf.extend_from_slice(&0u16.to_le_bytes());
+        for _ in 0..n_rects {
+            wmf.extend_from_slice(&7u32.to_le_bytes());
+            wmf.extend_from_slice(&META_RECTANGLE.to_le_bytes());
+            for v in [100i16, 100, 0, 0] {
+                wmf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        wmf.extend_from_slice(&3u32.to_le_bytes());
+        wmf.extend_from_slice(&META_EOF.to_le_bytes());
+
+        let err = import_wmf_bytes(&wmf, "WmfBomb").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on 105k META_RECTANGLE bomb, got {err:?}"
+        );
     }
 }

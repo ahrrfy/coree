@@ -409,16 +409,26 @@ impl StudioApp {
             .as_ref()
             .and_then(|db| db.list_templates(None).ok())
             .unwrap_or_default();
-        if templates.is_empty() {
-            let defaults = templates_autosave::builtin_default_templates();
-            if let Some(ref db) = storage {
-                for tpl in &defaults {
-                    let _ = db.upsert_template(tpl);
+        let mut template_errors = Vec::new();
+        let defaults = templates_autosave::builtin_default_templates();
+        if let Some(ref db) = storage {
+            let mut repaired = false;
+            for tpl in &defaults {
+                if !templates.iter().any(|existing| existing.id == tpl.id) {
+                    match db.upsert_template(tpl) {
+                        Ok(()) => repaired = true,
+                        Err(err) => template_errors.push(format!(
+                            "Failed to store built-in template '{}': {err}",
+                            tpl.id
+                        )),
+                    }
                 }
-                templates = db.list_templates(None).unwrap_or(defaults);
-            } else {
-                templates = defaults;
             }
+            if repaired || templates.is_empty() {
+                templates = db.list_templates(None).unwrap_or(defaults);
+            }
+        } else if templates.is_empty() {
+            templates = defaults;
         }
         let saved_toolbar_config = saved_toolbox
             .as_ref()
@@ -549,6 +559,10 @@ impl StudioApp {
             status_message: "Ready · 100% Offline Local Studio".to_owned(),
             toasts: Vec::new(),
         };
+
+        for err in template_errors {
+            app.push_toast(err, true);
+        }
 
         for path in initial_files {
             if let Err(err) = app.open_file_path(&path) {

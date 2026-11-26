@@ -1691,20 +1691,34 @@ fn encode_pdf417(data: &str) -> ProdResult<(String, Vec<bool>, usize, usize, f64
     let body = pdf417_compact_codewords(data.as_bytes());
     let ec_level: u8 = if body.len() <= 40 { 2 } else { 3 };
     let ecc_len = 1usize << (ec_level + 1);
+    if 1 + body.len() > 928 {
+        return Err(ProdError::BarcodeError(format!(
+            "PDF417 data payload exceeds ISO/IEC 15438 928-codeword data limit ({} > 928)",
+            1 + body.len()
+        )));
+    }
     let total_raw = 1 + body.len() + ecc_len;
-    if total_raw > 90 * 12 {
+    if total_raw > 928 + ecc_len {
         return Err(ProdError::BarcodeError(format!(
-            "PDF417 payload exceeds maximum 1080-codeword matrix capacity ({total_raw} > 1080)"
+            "PDF417 payload exceeds maximum 928 data codewords ({total_raw} > {})",
+            928 + ecc_len
         )));
     }
-    let cols = (total_raw.div_ceil(12)).clamp(2, 12);
-    let rows = total_raw.div_ceil(cols).clamp(3, 90);
-    let total_cells = rows * cols;
-    if total_cells < total_raw {
-        return Err(ProdError::BarcodeError(format!(
-            "PDF417 matrix capacity {total_cells} insufficient for {total_raw} codewords"
-        )));
+    let base_cols = (total_raw.div_ceil(12)).clamp(2, 12);
+    let mut chosen = None;
+    for c in base_cols..=30 {
+        let r = total_raw.div_ceil(c).clamp(3, 90);
+        let cells = r * c;
+        if cells >= total_raw && cells - ecc_len <= 928 {
+            chosen = Some((c, r, cells));
+            break;
+        }
     }
+    let (cols, rows, total_cells) = chosen.ok_or_else(|| {
+        ProdError::BarcodeError(format!(
+            "PDF417 matrix capacity invalid for {total_raw} codewords (max data=928)"
+        ))
+    })?;
     let pad_len = total_cells - ecc_len - 1 - body.len();
 
     let mut data_cw = Vec::with_capacity(total_cells - ecc_len);
@@ -2369,5 +2383,35 @@ mod tests {
             .collect();
         // FNC1 pattern "411131" => 11110101110
         assert_eq!(fnc1_bits, "11110101110");
+    }
+
+    #[test]
+    fn tier5_pdf417_rejects_payload_exceeding_928_data_codewords() {
+        // 1115 bytes in compact byte mode = ~930 codewords -> 1 + 930 = 931 > 928 ISO/IEC 15438 data limit
+        let too_long: String = (0..1115)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let err = generate_barcode(
+            BarcodeSymbology::Pdf417,
+            &too_long,
+            &BarcodeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ProdError::BarcodeError(_)),
+            "expected BarcodeError for >928 PDF417 data codewords, got {err:?}"
+        );
+
+        // Near-limit boundary: 1110 bytes (~926 body cw, 1 + 926 = 927 <= 928) encodes cleanly without SLD >= 929 wrap!
+        let near_limit: String = (0..1110)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let ok = generate_barcode(
+            BarcodeSymbology::Pdf417,
+            &near_limit,
+            &BarcodeOptions::default(),
+        )
+        .expect("927 data codewords must encode within <= 928 ISO/IEC 15438 limit");
+        assert!(!ok.modules.is_empty());
     }
 }

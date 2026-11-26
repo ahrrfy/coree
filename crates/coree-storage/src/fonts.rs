@@ -687,6 +687,15 @@ fn inspect_sfnt_face(
     }
 
     let num_tables = usize::from(read_u16_be(bytes, face_offset + 4)?);
+    if num_tables == 0 {
+        return None;
+    }
+    let dir_end = face_offset
+        .checked_add(12)?
+        .checked_add(num_tables.min(256).checked_mul(16)?)?;
+    if dir_end > bytes.len() {
+        return None;
+    }
     let mut name_table: Option<&[u8]> = None;
     let mut os2_table: Option<&[u8]> = None;
     let mut cmap_table: Option<&[u8]> = None;

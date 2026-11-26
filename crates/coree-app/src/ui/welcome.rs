@@ -250,10 +250,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                             Some("packaging"),
                             I18nKey::TemplateCategoryPackaging.tr_ui(lang),
                         ),
-                        (
-                            Some("digital"),
-                            I18nKey::TemplateCategoryDigital.tr_ui(lang),
-                        ),
+                        (Some("web-ui"), I18nKey::TemplateCategoryDigital.tr_ui(lang)),
                         (Some("custom"), I18nKey::TemplateCategoryLaser.tr_ui(lang)),
                     ] {
                         let active = app.template_category_filter.as_deref() == cat;

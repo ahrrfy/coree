@@ -282,10 +282,19 @@ pub fn parse_cmx_bytes_with_options(
     };
 
     let mut oid_remap: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let mut total_vertices = 0usize;
     for node in &riff_tree.children {
         if let RiffNode::Chunk { fourcc, data, .. } = node {
             if fourcc == b"page" {
-                parse_cmx_page_chunk(data, &res, limits, &mut doc, &mut oid_remap, &mut warnings)?;
+                parse_cmx_page_chunk(
+                    data,
+                    &res,
+                    limits,
+                    &mut doc,
+                    &mut oid_remap,
+                    &mut total_vertices,
+                    &mut warnings,
+                )?;
             }
         }
     }
@@ -681,6 +690,7 @@ fn parse_cmx_page_chunk(
     limits: &CodecLimits,
     doc: &mut Document,
     oid_remap: &mut HashMap<ObjectId, ObjectId>,
+    total_vertices: &mut usize,
     warnings: &mut Vec<String>,
 ) -> CdrResult<()> {
     let endian = res.endian;
@@ -867,6 +877,26 @@ fn parse_cmx_page_chunk(
 
                 let pt_count = usize::try_from(endian.read_u32(&mut cr, "PolyCurve pt_count")?)
                     .map_err(|_| CdrError::ArithmeticOverflow("PolyCurve pt_count"))?;
+                if pt_count > crate::limits::MAX_CDR_VERTICES
+                    || total_vertices.saturating_add(pt_count) > crate::limits::MAX_CDR_VERTICES
+                {
+                    return Err(CdrError::InvalidChunk {
+                        fourcc: "page".to_owned(),
+                        reason: format!(
+                            "CMX PolyCurve vertex count exceeds limit {}",
+                            crate::limits::MAX_CDR_VERTICES
+                        ),
+                    });
+                }
+                if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+                    return Err(CdrError::InvalidChunk {
+                        fourcc: "page".to_owned(),
+                        reason: format!(
+                            "CMX object count exceeds limit {}",
+                            crate::limits::MAX_CDR_OBJECTS
+                        ),
+                    });
+                }
                 let per_pt = match res.precision {
                     CmxPrecision::Bit16 => 5usize,
                     CmxPrecision::Bit32 => 9usize,
@@ -889,6 +919,7 @@ fn parse_cmx_page_chunk(
                 }
                 let node_flags = cr.read_bytes(pt_count, "PolyCurve flags")?;
                 let path = decode_curve_points(&pts, node_flags);
+                *total_vertices = total_vertices.saturating_add(path.node_count());
 
                 let oid = doc.alloc_object_id();
                 let mut obj =
@@ -976,6 +1007,15 @@ fn parse_cmx_page_chunk(
                 obj.transform = transform;
                 obj.fill = Fill::None;
                 obj.outline = OutlineStyle::none();
+                if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+                    return Err(CdrError::InvalidChunk {
+                        fourcc: "page".to_owned(),
+                        reason: format!(
+                            "CMX object count exceeds limit {}",
+                            crate::limits::MAX_CDR_OBJECTS
+                        ),
+                    });
+                }
                 let _ = doc.insert_loaded_object(obj);
                 attach_object(
                     oid,
@@ -1014,6 +1054,15 @@ fn parse_cmx_page_chunk(
                     obj.transform = transform;
                     obj.fill = Fill::None;
                     obj.outline = OutlineStyle::none();
+                    if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+                        return Err(CdrError::InvalidChunk {
+                            fourcc: "page".to_owned(),
+                            reason: format!(
+                                "CMX object count exceeds limit {}",
+                                crate::limits::MAX_CDR_OBJECTS
+                            ),
+                        });
+                    }
                     let _ = doc.insert_loaded_object(obj);
                     attach_object(
                         oid,
@@ -1102,6 +1151,15 @@ fn parse_cmx_page_chunk(
                         let new_oid = doc.alloc_object_id();
                         oid_remap.insert(ext.source_oid, new_oid);
                         ext.object.id = new_oid;
+                        if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+                            return Err(CdrError::InvalidChunk {
+                                fourcc: "page".to_owned(),
+                                reason: format!(
+                                    "CMX object count exceeds limit {}",
+                                    crate::limits::MAX_CDR_OBJECTS
+                                ),
+                            });
+                        }
                         let _ = doc.insert_loaded_object(ext.object);
                         attach_object(
                             new_oid,

@@ -80,6 +80,7 @@ pub(crate) struct ParseContext<'a> {
     pub color_styles: HashMap<u32, Color>,
     pub text_streams: HashMap<u32, Vec<u8>>,
     pub master_layers: Vec<Layer>,
+    pub total_vertices: usize,
     pub warnings: Vec<String>,
 }
 
@@ -164,6 +165,7 @@ pub(crate) fn parse_cdr_riff_tree_with_options(
         color_styles: HashMap::new(),
         text_streams: HashMap::new(),
         master_layers: Vec::new(),
+        total_vertices: 0,
         warnings: Vec::new(),
     };
 
@@ -1527,6 +1529,15 @@ pub(super) fn parse_group_list(
         grp.color_style_slot = cs_slot;
     }
     grp.unknown_chunks = unknown_chunks;
+    if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+        return Err(CdrError::InvalidChunk {
+            fourcc: "grp ".to_owned(),
+            reason: format!(
+                "CDR object count exceeds limit {}",
+                crate::limits::MAX_CDR_OBJECTS
+            ),
+        });
+    }
     let _ = doc.insert_loaded_object(grp);
     Ok(Some(gid))
 }

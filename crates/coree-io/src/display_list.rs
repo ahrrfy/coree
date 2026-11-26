@@ -18,8 +18,8 @@ use coree_core::{
 };
 use coree_render::effects_render::{apply_geometry_effects, symmetry_effect_transforms};
 use coree_render::{
-    render_isolated_object_to_rgba_with_options, FillRule, ShapedGlyphDraw, ShapedPdfRun,
-    TextEngine,
+    render_isolated_object_to_rgba_with_options, ExportIsolationSession, FillRule, ShapedGlyphDraw,
+    ShapedPdfRun, TextEngine,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -252,6 +252,7 @@ impl ExportDisplayList {
                 &mut has_transparency,
                 0,
                 &mut visited,
+                None,
             );
         }
         ops
@@ -286,6 +287,7 @@ pub fn build_display_list(
     let ordered_layers = collect_ordered_layers(doc, page, page_index, opts);
     let mut ops = Vec::with_capacity(64);
     let mut has_transparency = false;
+    let mut iso_session = ExportIsolationSession::new();
 
     if page.printable_background && page.background_fill.is_visible() {
         let bg_rect =
@@ -341,6 +343,7 @@ pub fn build_display_list(
                     &mut has_transparency,
                     0,
                     &mut visited,
+                    Some(&mut iso_session),
                 );
             }
         }
@@ -611,7 +614,7 @@ fn object_requires_raster_composite_inner(
     result
 }
 
-fn compose_world_persp(
+pub(crate) fn compose_world_persp(
     parent_persp: Option<Perspective3x3>,
     effective_local_xf: Affine2D,
     world_xf: Affine2D,
@@ -644,7 +647,7 @@ fn compose_svg_persp(
     }
 }
 
-fn transform_world_path(
+pub(crate) fn transform_world_path(
     local_deformed: &BezierPath,
     effective_local_xf: Affine2D,
     world_xf: Affine2D,
@@ -981,6 +984,7 @@ fn emit_object(
     has_transparency: &mut bool,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
+    mut iso_session: Option<&mut ExportIsolationSession>,
 ) {
     if depth > MAX_DISPLAY_DEPTH
         || (!opts.include_hidden_objects && !obj.visible)
@@ -1008,63 +1012,103 @@ fn emit_object(
         && obj.id.0 != 0
         && parent_world_persp.is_none()
     {
-        if let Ok(Some((rect_mm, rgba_buf))) = render_isolated_object_to_rgba_with_options(
-            doc,
-            page_index,
-            obj.id,
-            parent_xf,
-            opts.raster_dpi,
-            opts.suppress_cutcontour_in_raster,
-        ) {
-            let rgba_has_alpha = rgba_buf
-                .rgba
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|px| px[3] < 255);
-            if rgba_has_alpha || parent_opacity < 1.0 - 1e-4 || obj.blend_mode != BlendMode::Normal
-            {
-                *has_transparency = true;
+        let iso_res = if let Some(session) = iso_session.as_deref_mut() {
+            session.render_isolated_object_with_options(
+                doc,
+                page_index,
+                obj.id,
+                parent_xf,
+                opts.raster_dpi,
+                opts.suppress_cutcontour_in_raster,
+            )
+        } else {
+            render_isolated_object_to_rgba_with_options(
+                doc,
+                page_index,
+                obj.id,
+                parent_xf,
+                opts.raster_dpi,
+                opts.suppress_cutcontour_in_raster,
+            )
+        };
+        match iso_res {
+            Ok(Some((rect_mm, rgba_buf))) => {
+                let rgba_has_alpha = rgba_buf
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|px| px[3] < 255);
+                if rgba_has_alpha
+                    || parent_opacity < 1.0 - 1e-4
+                    || obj.blend_mode != BlendMode::Normal
+                {
+                    *has_transparency = true;
+                }
+                let bl = Point2D::new(rect_mm.min_x, rect_mm.max_y);
+                let br = Point2D::new(rect_mm.max_x, rect_mm.max_y);
+                let tl = Point2D::new(rect_mm.min_x, rect_mm.min_y);
+                ops.push(DisplayOp::DrawRaster {
+                    id: obj.id,
+                    id_suffix: format!("obj-{}", obj.id.0),
+                    asset_id: None,
+                    inline_rgba: Some(Arc::new((rgba_buf.width, rgba_buf.height, rgba_buf.rgba))),
+                    rect_mm: Some(rect_mm),
+                    bl,
+                    br,
+                    tl,
+                    local_xf: parent_xf.inverse().unwrap_or(Affine2D::IDENTITY),
+                    world_xf: Affine2D::IDENTITY,
+                    width_mm: rect_mm.width(),
+                    height_mm: rect_mm.height(),
+                    opacity: parent_opacity,
+                    blend_mode: obj.blend_mode,
+                    visible: obj.visible,
+                });
+                if opts.emit_cutcontour_overlays {
+                    let mut cut_visited = HashSet::new();
+                    emit_cutcontour_overlays(
+                        doc,
+                        obj,
+                        parent_xf,
+                        parent_world_persp,
+                        parent_svg_persp,
+                        parent_opacity,
+                        sym_ctx.map(|(m, _, _)| m),
+                        opts,
+                        ops,
+                        has_transparency,
+                        depth,
+                        &mut cut_visited,
+                    );
+                }
+                visited.remove(&obj.id);
+                return;
             }
-            let bl = Point2D::new(rect_mm.min_x, rect_mm.max_y);
-            let br = Point2D::new(rect_mm.max_x, rect_mm.max_y);
-            let tl = Point2D::new(rect_mm.min_x, rect_mm.min_y);
-            ops.push(DisplayOp::DrawRaster {
-                id: obj.id,
-                id_suffix: format!("obj-{}", obj.id.0),
-                asset_id: None,
-                inline_rgba: Some(Arc::new((rgba_buf.width, rgba_buf.height, rgba_buf.rgba))),
-                rect_mm: Some(rect_mm),
-                bl,
-                br,
-                tl,
-                local_xf: parent_xf.inverse().unwrap_or(Affine2D::IDENTITY),
-                world_xf: Affine2D::IDENTITY,
-                width_mm: rect_mm.width(),
-                height_mm: rect_mm.height(),
-                opacity: parent_opacity,
-                blend_mode: obj.blend_mode,
-                visible: obj.visible,
-            });
-            if opts.emit_cutcontour_overlays {
-                let mut cut_visited = HashSet::new();
-                emit_cutcontour_overlays(
-                    doc,
-                    obj,
-                    parent_xf,
-                    parent_world_persp,
-                    parent_svg_persp,
-                    parent_opacity,
-                    sym_ctx.map(|(m, _, _)| m),
-                    opts,
-                    ops,
-                    has_transparency,
-                    depth,
-                    &mut cut_visited,
-                );
+            Ok(None) if obj.lens.is_some() => {
+                // Off-page or extreme-scale (`1e15`) Lens skipped rasterization: do not fall through
+                // to emit an artificial vector `Fill` for the lens carrier.
+                if opts.emit_cutcontour_overlays {
+                    let mut cut_visited = HashSet::new();
+                    emit_cutcontour_overlays(
+                        doc,
+                        obj,
+                        parent_xf,
+                        parent_world_persp,
+                        parent_svg_persp,
+                        parent_opacity,
+                        sym_ctx.map(|(m, _, _)| m),
+                        opts,
+                        ops,
+                        has_transparency,
+                        depth,
+                        &mut cut_visited,
+                    );
+                }
+                visited.remove(&obj.id);
+                return;
             }
-            visited.remove(&obj.id);
-            return;
+            _ => {}
         }
     }
 
@@ -1746,6 +1790,7 @@ fn emit_object(
                             has_transparency,
                             depth + 1,
                             visited,
+                            iso_session.as_deref_mut(),
                         );
                     }
                 }
@@ -1848,6 +1893,7 @@ fn emit_object(
                             has_transparency,
                             depth + 1,
                             visited,
+                            iso_session.as_deref_mut(),
                         );
                     }
                 }
@@ -1931,6 +1977,7 @@ fn emit_object(
                             has_transparency,
                             depth + 1,
                             &mut sym_visited,
+                            iso_session.as_deref_mut(),
                         );
                     }
                     ops.push(DisplayOp::PopGroup);
@@ -2684,6 +2731,202 @@ mod tests {
             found.as_deref(),
             Some("2"),
             "Unattached TextOnPath AutoPageNumber on page 2 must resolve to '2'"
+        );
+    }
+
+    #[test]
+    fn display_list_1e15_stacked_lenses_and_normal_stacked_lenses() {
+        use coree_core::{
+            Affine2D, Color, ColorMapMode, ColorMode, Document, EllipseMode, Fill, LensConfig,
+            LensKind, NodePayload, ObjectId, OutlineStyle, ParametricShape, Point2D, Rect2D,
+            SceneObject,
+        };
+
+        // 1. 1e15-transformed stacked Lens scene (all 11 lens variants incl. frozen + remove_face)
+        // must export through ExportDisplayList + PDF/SVG/EPS without OOM or timeout.
+        let mut doc_1e15 = Document::new("Lens1e15", 210.0, 297.0, ColorMode::Rgb, 72.0);
+        let l0 = doc_1e15.pages()[0].layers[0].id;
+        let xf_1e15 = Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, 1e15);
+        doc_1e15
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "BgRect",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        0.0, 0.0, 50.0, 50.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(Color::rgba8(220, 40, 40, 255)))
+                .with_transform(xf_1e15),
+                Some(l0),
+            )
+            .unwrap();
+        let kinds = [
+            LensConfig::new(LensKind::Brighten { rate_pct: 35.0 }),
+            LensConfig {
+                kind: LensKind::ColorAdd {
+                    color: Color::rgb(0.2, 0.5, 0.8),
+                    rate_pct: 45.0,
+                },
+                frozen: true,
+                viewpoint: None,
+                remove_face: false,
+                frozen_snapshot: None,
+            },
+            LensConfig {
+                kind: LensKind::ColorLimit {
+                    color: Color::cmyk(0.0, 0.8, 0.5, 0.0),
+                    rate_pct: 70.0,
+                },
+                frozen: false,
+                viewpoint: Some(Point2D::new(40.0, 60.0)),
+                remove_face: false,
+                frozen_snapshot: None,
+            },
+            LensConfig {
+                kind: LensKind::CustomColorMap {
+                    from_color: Color::rgb(0.1, 0.0, 0.4),
+                    to_color: Color::rgb(1.0, 0.9, 0.2),
+                    palette_mode: ColorMapMode::ForwardRainbow,
+                },
+                frozen: false,
+                viewpoint: None,
+                remove_face: true,
+                frozen_snapshot: None,
+            },
+            LensConfig::new(LensKind::FishEye { rate_pct: 120.0 }),
+            LensConfig::new(LensKind::HeatMap {
+                palette_rotation_deg: 60.0,
+            }),
+            LensConfig::new(LensKind::Invert),
+            LensConfig {
+                kind: LensKind::Magnify { amount: 2.5 },
+                frozen: true,
+                viewpoint: Some(Point2D::new(80.0, 90.0)),
+                remove_face: true,
+                frozen_snapshot: None,
+            },
+            LensConfig::new(LensKind::TintedGrayscale {
+                tint: Color::rgb(0.3, 0.2, 0.1),
+            }),
+            LensConfig::new(LensKind::Transparency {
+                color: Color::CYAN,
+                rate_pct: 40.0,
+            }),
+            LensConfig::new(LensKind::Wireframe {
+                override_outline: Some(Color::BLACK),
+                override_fill: Some(Color::WHITE),
+            }),
+        ];
+        for (idx, cfg) in kinds.into_iter().enumerate() {
+            let mut lens_obj = SceneObject::new(
+                ObjectId(0),
+                format!("Lens{}", idx + 1),
+                NodePayload::Shape(ParametricShape::Ellipse {
+                    rx: 6.0,
+                    ry: 6.0,
+                    mode: EllipseMode::Full,
+                    start_deg: 0.0,
+                    end_deg: 360.0,
+                }),
+            )
+            .with_transform(xf_1e15);
+            lens_obj.lens = Some(cfg);
+            doc_1e15.add_object(lens_obj, Some(l0)).unwrap();
+        }
+
+        let t0 = std::time::Instant::now();
+        let mut te = TextEngine::new();
+        let dl_pdf =
+            ExportDisplayList::build(&doc_1e15, 0, &DisplayListOptions::pdf(), &mut te).unwrap();
+        let pdf_bytes =
+            crate::pdf::export_pdf_to_bytes(&doc_1e15, &crate::pdf::PdfExportOptions::default())
+                .unwrap();
+        let svg_str = crate::svg::export_svg_to_string(&doc_1e15, 0).unwrap();
+        let eps_str = crate::eps::export_eps_to_string(&doc_1e15, 0).unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "1e15 stacked-lens display_list + PDF/SVG/EPS took {:?}",
+            t0.elapsed()
+        );
+        assert!(!dl_pdf.ops.is_empty());
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+        assert!(svg_str.contains("<svg"));
+        assert!(eps_str.starts_with("%!PS-Adobe-3.0 EPSF-3.0"));
+
+        // 2. Normal in-page stacked Lens scene must still evaluate faithfully:
+        // Red (255,0,0) -> Brighten(50%) -> (~255, 128, 128) -> Invert -> (~0, 127, 127)
+        let mut normal_doc = Document::new("StackedLenses", 100.0, 100.0, ColorMode::Rgb, 72.0);
+        let nl0 = normal_doc.pages()[0].layers[0].id;
+        normal_doc
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "RedBg",
+                    NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                        10.0, 10.0, 80.0, 80.0,
+                    ))),
+                )
+                .with_fill(Fill::Solid(Color::rgba8(255, 0, 0, 255)))
+                .with_outline(OutlineStyle::none()),
+                Some(nl0),
+            )
+            .unwrap();
+        let mut lens1 = SceneObject::new(
+            ObjectId(0),
+            "Brighten",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                20.0, 20.0, 60.0, 60.0,
+            ))),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        lens1.lens = Some(LensConfig::new(LensKind::Brighten { rate_pct: 50.0 }));
+        normal_doc.add_object(lens1, Some(nl0)).unwrap();
+
+        let mut lens2 = SceneObject::new(
+            ObjectId(0),
+            "Invert",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                30.0, 30.0, 40.0, 40.0,
+            ))),
+        )
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+        lens2.lens = Some(LensConfig {
+            kind: LensKind::Invert,
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        });
+        let lens2_id = normal_doc.add_object(lens2, Some(nl0)).unwrap();
+
+        let dl_norm =
+            ExportDisplayList::build(&normal_doc, 0, &DisplayListOptions::pdf(), &mut te).unwrap();
+        let center_px = dl_norm
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DisplayOp::DrawRaster {
+                    id,
+                    inline_rgba: Some(arc),
+                    ..
+                } if *id == lens2_id => {
+                    let (w, h, ref bytes) = **arc;
+                    let idx = (((h / 2) * w + (w / 2)) * 4) as usize;
+                    Some([bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]])
+                }
+                _ => None,
+            })
+            .expect("top stacked lens DrawRaster present");
+        assert!(
+            center_px[0] <= 10
+                && center_px[1] >= 110
+                && center_px[1] <= 145
+                && center_px[2] >= 110
+                && center_px[2] <= 145,
+            "stacked Red -> Brighten(50%) -> Invert must yield ~[0,127,127,255], got {center_px:?}"
         );
     }
 }

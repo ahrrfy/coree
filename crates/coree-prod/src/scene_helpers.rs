@@ -8,7 +8,6 @@ use coree_core::{
     Affine2D, BezierPath, Document, Effect, Layer, LayerId, MasterLayerScope, NodePayload,
     ObjectId, Page, PageId, Perspective3x3, Rect2D, SceneObject, SymbolId,
 };
-use kurbo::PathEl;
 use std::collections::{HashMap, HashSet};
 
 /// Maximum recursion depth for nested groups / PowerClips.
@@ -756,51 +755,6 @@ fn world_bounds_with_xf_inner(
     bounds
         .filter(|r| r.is_finite())
         .map(|r| if eff_pad > 0.0 { r.expand(eff_pad) } else { r })
-}
-
-/// Converts a `coree_core::BezierPath` in millimeters into a `tiny_skia::Path` scaled to pixels.
-pub(crate) fn bezier_to_skia_path(
-    path: &BezierPath,
-    scale_x: f32,
-    scale_y: f32,
-) -> Option<tiny_skia::Path> {
-    if path.is_empty() || !scale_x.is_finite() || !scale_y.is_finite() {
-        return None;
-    }
-    let kb = path.to_kurbo();
-    let mut pb = tiny_skia::PathBuilder::new();
-    let sx = f64::from(scale_x);
-    let sy = f64::from(scale_y);
-    let to_f32 = |x: f64, y: f64| -> Option<(f32, f32)> {
-        let fx = (x * sx) as f32;
-        let fy = (y * sy) as f32;
-        (fx.is_finite() && fy.is_finite()).then_some((fx, fy))
-    };
-    for el in kb.elements() {
-        match *el {
-            PathEl::MoveTo(p) => {
-                let (x, y) = to_f32(p.x, p.y)?;
-                pb.move_to(x, y);
-            }
-            PathEl::LineTo(p) => {
-                let (x, y) = to_f32(p.x, p.y)?;
-                pb.line_to(x, y);
-            }
-            PathEl::QuadTo(p1, p2) => {
-                let (x1, y1) = to_f32(p1.x, p1.y)?;
-                let (x2, y2) = to_f32(p2.x, p2.y)?;
-                pb.quad_to(x1, y1, x2, y2);
-            }
-            PathEl::CurveTo(p1, p2, p3) => {
-                let (x1, y1) = to_f32(p1.x, p1.y)?;
-                let (x2, y2) = to_f32(p2.x, p2.y)?;
-                let (x3, y3) = to_f32(p3.x, p3.y)?;
-                pb.cubic_to(x1, y1, x2, y2, x3, y3);
-            }
-            PathEl::ClosePath => pb.close(),
-        }
-    }
-    pb.finish()
 }
 
 pub(crate) fn apply_obj_perspective_to_local_path(

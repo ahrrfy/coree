@@ -6,18 +6,20 @@
 
 use crate::error::{ProdError, ProdResult};
 use crate::scene_helpers::{
-    apply_obj_perspective_to_local_path, bezier_to_skia_path, clone_document_shell,
-    clone_page_contents_into, collect_effective_layers, compose_prod_parent_persp,
-    container_own_persp, find_or_create_layer, get_page, warp_local_to_world, SymBoundsCtx,
-    SymParentRef, MAX_SCENE_DEPTH,
+    apply_obj_perspective_to_local_path, clone_document_shell, clone_page_contents_into,
+    collect_effective_layers, compose_prod_parent_persp, container_own_persp, find_or_create_layer,
+    get_page, warp_local_to_world, SymBoundsCtx, SymParentRef, MAX_SCENE_DEPTH,
 };
 use coree_core::{
     apply_boolean, Affine2D, ArtisticText, BezierPath, BlendMode, BooleanOp, Color, Document,
-    Effect, EllipseMode, Fill, LayerId, LineCap, LineJoin, NodePayload, ObjectId, OutlineStyle,
-    PageId, ParametricShape, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId, TextStyle,
+    Effect, EllipseMode, Fill, LayerId, NodePayload, ObjectId, OutlineStyle, PageId,
+    ParametricShape, Perspective3x3, Point2D, Rect2D, SceneObject, SymbolId, TextStyle,
 };
 use coree_io::display_list::{DisplayListOptions, DisplayOp, ExportDisplayList};
-use coree_render::{render_isolated_object_to_rgba_with_options, TextEngine};
+use coree_render::{
+    render_isolated_object_to_rgba_with_options, BackendPaint, CanvasBackend, FillRule,
+    StrokeParams, TextEngine, TinySkiaBackend,
+};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use kurbo::PathEl;
@@ -101,6 +103,8 @@ pub struct VectorPlatePrimitive {
     #[serde(default)]
     pub clip_paths: Vec<BezierPath>,
     #[serde(default)]
+    pub clip_even_odd: Vec<bool>,
+    #[serde(default)]
     pub z_order: usize,
 }
 
@@ -119,6 +123,8 @@ pub struct RasterPlatePrimitive {
     pub overprint: bool,
     #[serde(default)]
     pub clip_paths: Vec<BezierPath>,
+    #[serde(default)]
+    pub clip_even_odd: Vec<bool>,
     #[serde(default)]
     pub z_order: usize,
 }
@@ -527,7 +533,8 @@ pub fn compute_vector_separations(
          stroke_col: Option<(&Color, f64)>,
          opacity: f32,
          overprint: bool,
-         clip_stack: &[BezierPath]| {
+         clip_stack: &[BezierPath],
+         clip_rules: &[bool]| {
             if path.is_empty() {
                 return;
             }
@@ -566,6 +573,7 @@ pub fn compute_vector_separations(
                             stroke_width_mm: stroke_w,
                             overprint,
                             clip_paths: clip_stack.to_vec(),
+                            clip_even_odd: clip_rules.to_vec(),
                             z_order: z,
                         });
                     plate_has_content.insert(ch, true);
@@ -586,6 +594,7 @@ pub fn compute_vector_separations(
                             stroke_width_mm: stroke_w,
                             overprint: false,
                             clip_paths: clip_stack.to_vec(),
+                            clip_even_odd: clip_rules.to_vec(),
                             z_order: z,
                         });
                 }
@@ -594,13 +603,20 @@ pub fn compute_vector_separations(
 
     let icc = doc.icc_pipeline();
     let mut clip_stack: Vec<BezierPath> = Vec::new();
+    let mut clip_rule_stack: Vec<bool> = Vec::new();
     let mut clip_pushed_stack: Vec<bool> = Vec::new();
 
     for op in &active_ops {
         match op {
-            DisplayOp::PushClip { path, visible, .. } => {
+            DisplayOp::PushClip {
+                path,
+                fill_rule,
+                visible,
+                ..
+            } => {
                 if *visible && !path.is_empty() {
                     clip_stack.push(path.clone());
+                    clip_rule_stack.push(*fill_rule == coree_render::FillRule::EvenOdd);
                     clip_pushed_stack.push(true);
                 } else {
                     clip_pushed_stack.push(false);
@@ -609,6 +625,7 @@ pub fn compute_vector_separations(
             DisplayOp::PopClip => {
                 if clip_pushed_stack.pop().unwrap_or(false) {
                     clip_stack.pop();
+                    clip_rule_stack.pop();
                 }
             }
             DisplayOp::DrawVector {
@@ -652,6 +669,7 @@ pub fn compute_vector_separations(
                     *opacity,
                     overprint,
                     &clip_stack,
+                    &clip_rule_stack,
                 );
             }
             DisplayOp::DrawTextRuns {
@@ -688,6 +706,7 @@ pub fn compute_vector_separations(
                         *opacity,
                         overprint,
                         &clip_stack,
+                        &clip_rule_stack,
                     );
                 }
             }
@@ -796,6 +815,7 @@ pub fn compute_vector_separations(
                                 tl: *tl,
                                 overprint,
                                 clip_paths: clip_stack.clone(),
+                                clip_even_odd: clip_rule_stack.clone(),
                                 z_order: z,
                             },
                         );
@@ -819,6 +839,7 @@ pub fn compute_vector_separations(
                                     tl: *tl,
                                     overprint: false,
                                     clip_paths: clip_stack.clone(),
+                                    clip_even_odd: clip_rule_stack.clone(),
                                     z_order: z,
                                 },
                             );
@@ -1127,11 +1148,12 @@ pub fn export_separated_plates_pdf_bytes(
                         continue;
                     }
                     stream.push_str("q\n");
-                    for cp in &prim.clip_paths {
+                    for (idx_cp, cp) in prim.clip_paths.iter().enumerate() {
                         let cp_ops = encode_path(cp);
                         if !cp_ops.is_empty() {
+                            let is_eo = prim.clip_even_odd.get(idx_cp).copied().unwrap_or(true);
                             stream.push_str(&cp_ops);
-                            stream.push_str("W* n\n");
+                            stream.push_str(if is_eo { "W* n\n" } else { "W n\n" });
                         }
                     }
                     stream.push_str(if prim.overprint {
@@ -1226,11 +1248,12 @@ pub fn export_separated_plates_pdf_bytes(
                     let (x1, y1) = to_pdf_xy(rprim.br);
                     let (x2, y2) = to_pdf_xy(rprim.tl);
                     stream.push_str("q\n");
-                    for cp in &rprim.clip_paths {
+                    for (idx_cp, cp) in rprim.clip_paths.iter().enumerate() {
                         let cp_ops = encode_path(cp);
                         if !cp_ops.is_empty() {
+                            let is_eo = rprim.clip_even_odd.get(idx_cp).copied().unwrap_or(true);
                             stream.push_str(&cp_ops);
-                            stream.push_str("W* n\n");
+                            stream.push_str(if is_eo { "W* n\n" } else { "W n\n" });
                         }
                     }
                     stream.push_str(if rprim.overprint {
@@ -1692,6 +1715,11 @@ fn rasterize_scene_obj_separation(
                 ctx.height,
                 ctx.scale_x,
                 ctx.scale_y,
+                if obj.clip_even_odd {
+                    coree_render::FillRule::EvenOdd
+                } else {
+                    coree_render::FillRule::Winding
+                },
             ) {
                 let combined_mask: Vec<f32> = match clip_mask {
                     Some(outer) => container_mask
@@ -2081,9 +2109,14 @@ fn paint_fill(
     overprint: bool,
     clip_mask: Option<&[f32]>,
 ) {
-    let Some(mask) =
-        rasterize_fill_mask(world_path, ctx.width, ctx.height, ctx.scale_x, ctx.scale_y)
-    else {
+    let Some(mask) = rasterize_fill_mask(
+        world_path,
+        ctx.width,
+        ctx.height,
+        ctx.scale_x,
+        ctx.scale_y,
+        coree_render::FillRule::EvenOdd,
+    ) else {
         return;
     };
 
@@ -2371,21 +2404,27 @@ fn rasterize_fill_mask(
     height: u32,
     scale_x: f32,
     scale_y: f32,
+    fill_rule: FillRule,
 ) -> Option<Vec<f32>> {
-    let sk_path = bezier_to_skia_path(path, scale_x, scale_y)?;
-    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color_rgba8(255, 255, 255, 255);
-    paint.anti_alias = true;
-    pixmap.fill_path(
-        &sk_path,
+    if path.is_empty()
+        || !scale_x.is_finite()
+        || !scale_y.is_finite()
+        || scale_x <= 0.0
+        || scale_y <= 0.0
+    {
+        return None;
+    }
+    let mut backend = TinySkiaBackend::new(width, height).ok()?;
+    let paint = BackendPaint::solid(Color::WHITE);
+    backend.fill_path(
+        path,
         &paint,
-        tiny_skia::FillRule::EvenOdd,
-        tiny_skia::Transform::identity(),
-        None,
+        fill_rule,
+        Affine2D::scale(f64::from(scale_x), f64::from(scale_y)),
     );
     Some(
-        pixmap
+        backend
+            .as_pixmap_ref()
             .pixels()
             .iter()
             .map(|p| f32::from(p.alpha()) / 255.0)
@@ -2401,49 +2440,47 @@ fn rasterize_stroke_mask(
     scale_x: f32,
     scale_y: f32,
 ) -> Option<Vec<f32>> {
-    let sk_path = bezier_to_skia_path(path, scale_x, scale_y)?;
-    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color_rgba8(255, 255, 255, 255);
-    paint.anti_alias = true;
-
-    let avg_scale = 0.5 * (scale_x + scale_y);
-    let mut stroke = tiny_skia::Stroke {
-        width: ((outline.effective_width_mm() as f32) * avg_scale).max(1.0),
-        miter_limit: (outline.miter_limit as f32).max(1.0),
-        line_cap: match outline.cap {
-            LineCap::Butt => tiny_skia::LineCap::Butt,
-            LineCap::Round => tiny_skia::LineCap::Round,
-            LineCap::Square => tiny_skia::LineCap::Square,
-        },
-        line_join: match outline.join {
-            LineJoin::Miter => tiny_skia::LineJoin::Miter,
-            LineJoin::Round => tiny_skia::LineJoin::Round,
-            LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
-        },
-        dash: None,
-    };
-    if !outline.dash_pattern.is_empty() {
-        let dashes: Vec<f32> = outline
-            .dash_pattern
-            .iter()
-            .filter(|d| d.is_finite() && **d > 0.0)
-            .map(|&d| ((d as f32) * avg_scale).clamp(0.5, 10_000.0))
-            .collect();
-        if !dashes.is_empty() {
-            stroke.dash = tiny_skia::StrokeDash::new(dashes, 0.0);
-        }
+    if path.is_empty()
+        || !scale_x.is_finite()
+        || !scale_y.is_finite()
+        || scale_x <= 0.0
+        || scale_y <= 0.0
+    {
+        return None;
     }
-
-    pixmap.stroke_path(
-        &sk_path,
-        &paint,
-        &stroke,
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    let mut backend = TinySkiaBackend::new(width, height).ok()?;
+    let sx = f64::from(scale_x);
+    let sy = f64::from(scale_y);
+    let avg_scale = 0.5 * (sx + sy);
+    let min_width_mm = (1.0 / avg_scale.max(1e-6)) as f32;
+    let width_mm = if outline.effective_width_mm().is_finite() {
+        (outline.effective_width_mm() as f32).max(min_width_mm)
+    } else {
+        return None;
+    };
+    let avg_f32 = avg_scale.max(1e-6) as f32;
+    let dash_pattern: Vec<f32> = outline
+        .dash_pattern
+        .iter()
+        .filter(|d| d.is_finite() && **d > 0.0)
+        .map(|&d| (d as f32).clamp(0.5 / avg_f32, 10_000.0 / avg_f32))
+        .collect();
+    let params = StrokeParams {
+        color: Color::WHITE,
+        width: width_mm,
+        cap: outline.cap,
+        join: outline.join,
+        miter_limit: (outline.miter_limit as f32).max(1.0),
+        dash_pattern,
+        dash_offset: 0.0,
+        opacity: 1.0,
+        blend_mode: BlendMode::Normal,
+        anti_alias: true,
+    };
+    backend.stroke_path(path, &params, Affine2D::scale(sx, sy));
     Some(
-        pixmap
+        backend
+            .as_pixmap_ref()
             .pixels()
             .iter()
             .map(|p| f32::from(p.alpha()) / 255.0)
@@ -5535,6 +5572,169 @@ mod tests {
         assert_ne!(
             pdf_plates_id, pdf_plates_fx,
             "separated PDF plates must differ when RasterFilters are applied"
+        );
+    }
+
+    #[test]
+    fn tier5_vector_separations_respect_winding_vs_evenodd_clip_rule() {
+        let mut outer = BezierPath::from_rect(Rect2D::from_xywh(10.0, 10.0, 80.0, 80.0));
+        let inner = BezierPath::from_rect(Rect2D::from_xywh(30.0, 30.0, 40.0, 40.0));
+        outer.subpaths.extend(inner.subpaths);
+
+        for (clip_even_odd, expected_op, forbidden_op) in
+            [(false, "W n\n", "W* n\n"), (true, "W* n\n", "W n\n")]
+        {
+            let mut doc = Document::new(
+                "ClipRuleSep",
+                100.0,
+                100.0,
+                coree_core::ColorMode::Cmyk,
+                300.0,
+            );
+            let child = doc
+                .add_object(
+                    SceneObject::new(
+                        ObjectId(0),
+                        "CyanBlock",
+                        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                            0.0, 0.0, 100.0, 100.0,
+                        ))),
+                    )
+                    .with_fill(Fill::Solid(Color::CYAN))
+                    .with_outline(OutlineStyle::none()),
+                    None,
+                )
+                .unwrap();
+            let mut host =
+                SceneObject::new(ObjectId(0), "DonutClip", NodePayload::Path(outer.clone()))
+                    .with_fill(Fill::None)
+                    .with_outline(OutlineStyle::none());
+            host.clip_even_odd = clip_even_odd;
+            let host_id = doc.add_object(host, None).unwrap();
+            doc.create_powerclip(host_id, &[child]).unwrap();
+
+            let vec_plates = compute_vector_separations(&doc, 0, true).unwrap();
+            let c_plate = vec_plates
+                .iter()
+                .find(|p| p.channel == SeparationChannel::Cyan)
+                .expect("Cyan vector plate");
+            assert!(
+                c_plate
+                    .vector_ops
+                    .iter()
+                    .any(|op| op.clip_even_odd == vec![clip_even_odd]),
+                "clip_even_odd={clip_even_odd} must propagate into VectorPlatePrimitive"
+            );
+
+            let (pdf, _) =
+                export_separated_plates_pdf_bytes(&doc, 0, &SeparationOptions::default()).unwrap();
+            let mut decoded_streams = String::new();
+            let mut search_pos = 0usize;
+            while let Some(s_rel) = pdf[search_pos..].windows(7).position(|w| w == b"stream\n") {
+                let start = search_pos + s_rel + 7;
+                if let Some(e_rel) = pdf[start..].windows(10).position(|w| w == b"\nendstream") {
+                    let end = start + e_rel;
+                    let mut dec = flate2::read::ZlibDecoder::new(&pdf[start..end]);
+                    let mut out = String::new();
+                    if std::io::Read::read_to_string(&mut dec, &mut out).is_ok() {
+                        decoded_streams.push_str(&out);
+                    }
+                    search_pos = end + 10;
+                } else {
+                    break;
+                }
+            }
+            assert!(
+                decoded_streams.contains(expected_op),
+                "clip_even_odd={clip_even_odd} must emit {expected_op:?} in separated PDF stream"
+            );
+            assert!(
+                !decoded_streams.contains(forbidden_op),
+                "clip_even_odd={clip_even_odd} must NOT emit {forbidden_op:?} in separated PDF stream"
+            );
+
+            let sep = compute_separations(
+                &doc,
+                0,
+                &SeparationOptions {
+                    dpi: 72.0,
+                    ..SeparationOptions::default()
+                },
+            )
+            .unwrap();
+            let raster_cyan = sep.plate(&SeparationChannel::Cyan).unwrap();
+            let cx = (raster_cyan.width as usize) / 2;
+            let cy = (raster_cyan.height as usize) / 2;
+            let center_ink = raster_cyan.ink_map[cy * (raster_cyan.width as usize) + cx];
+            if clip_even_odd {
+                assert_eq!(
+                    center_ink, 0,
+                    "EvenOdd donut PowerClip center must have 0 Cyan ink"
+                );
+            } else {
+                assert!(
+                    center_ink > 200,
+                    "Winding donut PowerClip center must have full Cyan ink, got {center_ink}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tier5_vector_separations_and_stroke_mask_1e15_intersecting_stroked_dashed_cubic() {
+        let mut kb = kurbo::BezPath::new();
+        kb.move_to((0.0, 0.0));
+        kb.curve_to((10.0, 20.0), (40.0, 30.0), (50.0, 50.0));
+        kb.close_path();
+        let curve = BezierPath::from_kurbo(&kb);
+
+        let mut doc = Document::new(
+            "Sep1e15Stroke",
+            100.0,
+            100.0,
+            coree_core::ColorMode::Cmyk,
+            300.0,
+        );
+        let mut outline = OutlineStyle::solid(Color::BLACK, 1.0);
+        outline.dash_pattern = vec![4.0, 2.0];
+        let obj = SceneObject::new(
+            ObjectId(0),
+            "ExtremeCubic",
+            NodePayload::Path(curve.clone()),
+        )
+        .with_fill(Fill::None)
+        .with_outline(outline.clone())
+        .with_transform(Affine2D::new(1e15, 0.0, 0.0, 1e15, 0.0, 0.0));
+        doc.add_object(obj, None).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let vec_plates = compute_vector_separations(&doc, 0, true).unwrap();
+        assert!(!vec_plates.is_empty());
+
+        let sep = compute_separations(
+            &doc,
+            0,
+            &SeparationOptions {
+                dpi: 72.0,
+                ..SeparationOptions::default()
+            },
+        )
+        .unwrap();
+        let k_plate = sep.plate(&SeparationChannel::Black).expect("Black plate");
+        assert!(
+            k_plate.ink_map.iter().any(|&v| v > 0),
+            "1e15 intersecting stroked+dashed cubic must ink the Black separation plate without panicking"
+        );
+
+        let transformed = curve.transformed(&Affine2D::new(1e15, 0.0, 0.0, 1e15, 0.0, 0.0));
+        let mask = rasterize_stroke_mask(&transformed, &outline, 100, 100, 1.0, 1.0)
+            .expect("rasterize_stroke_mask");
+        assert_eq!(mask.len(), 100 * 100);
+        assert!(mask.iter().any(|&v| v > 0.0));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "1e15 separation & stroke mask took {:?}",
+            t0.elapsed()
         );
     }
 }

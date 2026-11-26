@@ -12001,3 +12001,619 @@ fn autopagenumber_expanded_width_not_culled_by_placeholder_bbox() {
         "Page 100 AutoPageNumber ('100') must render full 3-digit width without culling: px_1={px_1}, px_100={px_100}"
     );
 }
+
+#[test]
+fn extreme_scale_bezier_curve_1e15_renders_and_flattens_under_budget() {
+    let mut kb = kurbo::BezPath::new();
+    kb.move_to((0.0, 0.0));
+    kb.curve_to((0.0, 10.0), (10.0, 10.0), (10.0, 0.0));
+    kb.close_path();
+    let curve = BezierPath::from_kurbo(&kb);
+
+    let t0 = std::time::Instant::now();
+    let mut backend = TinySkiaBackend::new(256, 256).unwrap();
+    backend.clear(Color::WHITE);
+    let paint = BackendPaint {
+        shader: coree_render::PaintShader::Solid(Color::BLACK),
+        opacity: 1.0,
+        blend_mode: BlendMode::Normal,
+        anti_alias: true,
+    };
+    // 1. Disjoint 1e15 transform (like extreme_xf.coree)
+    backend.fill_path(
+        &curve,
+        &paint,
+        FillRule::Winding,
+        Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, -1e15),
+    );
+    // 2. Viewport-intersecting 1e14 transform
+    backend.fill_path(
+        &curve,
+        &paint,
+        FillRule::Winding,
+        Affine2D::new(1e14, 0.0, 0.0, 1e14, -1e14, 0.0),
+    );
+    backend.push_clip(
+        &curve,
+        FillRule::EvenOdd,
+        Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, -1e15),
+    );
+    backend.pop_clip();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "extreme 1e15 fill_path/push_clip took {elapsed:?}"
+    );
+    let buf = backend.into_rgba();
+    assert_eq!(buf.rgba.len(), 256 * 256 * 4);
+}
+
+#[test]
+fn symbol_powerclip_blend_under_lens_backdrop_renders_all_blend_steps() {
+    let mut doc = Document::new("SymPCBlendLens", 120.0, 120.0, ColorMode::Rgb, 72.0);
+    let src_id = ObjectId(301);
+    let dst_id = ObjectId(302);
+    let mut s_obj = SceneObject::new(
+        src_id,
+        "BlendStart",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 20.0, 12.0, 12.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(240, 20, 20, 255)))
+    .with_outline(OutlineStyle::none());
+    s_obj.effects.push(Effect::Blend {
+        target_id: dst_id,
+        steps: 5,
+        rotation_deg: 0.0,
+        along_path: None,
+        rotate_along_path: false,
+    });
+    let d_obj = SceneObject::new(
+        dst_id,
+        "BlendEnd",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            70.0, 20.0, 12.0, 12.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(20, 40, 240, 255)))
+    .with_outline(OutlineStyle::none());
+    let pc_obj = SceneObject::new(
+        ObjectId(303),
+        "SymPC",
+        NodePayload::PowerClip {
+            container: Box::new(BezierPath::from_rect(Rect2D::from_xywh(
+                0.0, 0.0, 100.0, 60.0,
+            ))),
+            container_parametric: None,
+            lock_contents: true,
+            contents: vec![src_id, dst_id],
+        },
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    // Also a PowerClip whose container itself carries the Blend inside a SymbolDef
+    let sym = SymbolDef::new("PCSym", vec![s_obj, d_obj, pc_obj]);
+    let sym_id = sym.id;
+    let mut hist = coree_core::CommandHistory::new(16);
+    hist.execute(
+        &mut doc,
+        coree_core::CommandOp::UpsertSymbol { symbol: sym },
+    )
+    .unwrap();
+
+    let l0 = doc.pages()[0].layers[0].id;
+    doc.add_object(
+        SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+            .with_transform(Affine2D::translate(5.0, 10.0)),
+        Some(l0),
+    )
+    .unwrap();
+
+    // Cover entire page with a Brighten lens so backdrop renderer renders PowerClip inside Symbol!
+    let mut lens_obj = SceneObject::new(
+        ObjectId(0),
+        "BrightenLens",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 120.0, 120.0,
+        ))),
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    lens_obj.lens = Some(LensConfig::new(LensKind::Brighten { rate_pct: 5.0 }));
+    doc.add_object(lens_obj, Some(l0)).unwrap();
+
+    let img = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    // Middle of the blend at x = 45..55 mm, y = 36 mm (10+20+6=36) must be non-white!
+    let mid_px = pixel_at_mm(&img, 51.0, 36.0);
+    assert!(
+        mid_px[0] < 245 || mid_px[1] < 245 || mid_px[2] < 245,
+        "Blend step inside Symbol->PowerClip under Lens backdrop must render, got {mid_px:?}"
+    );
+}
+
+#[test]
+fn deformed_symbol_instance_blend_warps_intermediate_steps() {
+    let mut doc = Document::new("DeformedSymBlend", 140.0, 140.0, ColorMode::Rgb, 72.0);
+    let src_id = ObjectId(401);
+    let dst_id = ObjectId(402);
+    let mut s_obj = SceneObject::new(
+        src_id,
+        "S",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            10.0, 10.0, 10.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(200, 30, 30, 255)))
+    .with_outline(OutlineStyle::none());
+    s_obj.effects.push(Effect::Blend {
+        target_id: dst_id,
+        steps: 3,
+        rotation_deg: 0.0,
+        along_path: None,
+        rotate_along_path: false,
+    });
+    let d_obj = SceneObject::new(
+        dst_id,
+        "D",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            50.0, 10.0, 10.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(30, 30, 220, 255)))
+    .with_outline(OutlineStyle::none());
+
+    let sym = SymbolDef::new("BlendSym", vec![s_obj, d_obj]);
+    let sym_id = sym.id;
+    let mut hist = coree_core::CommandHistory::new(16);
+    hist.execute(
+        &mut doc,
+        coree_core::CommandOp::UpsertSymbol { symbol: sym },
+    )
+    .unwrap();
+
+    // Shift destination downward heavily via Envelope on the SymbolInstance so blend steps shift down!
+    let mut inst = SceneObject::new(
+        ObjectId(0),
+        "WarpedInst",
+        NodePayload::SymbolInstance(sym_id),
+    );
+    inst.effects.push(Effect::Envelope {
+        mode: EnvelopeMode::Unconstrained,
+        cage: vec![
+            Point2D::new(10.0, 60.0),
+            Point2D::new(60.0, 60.0),
+            Point2D::new(60.0, 80.0),
+            Point2D::new(10.0, 80.0),
+        ],
+    });
+    let l0 = doc.pages()[0].layers[0].id;
+    doc.add_object(inst, Some(l0)).unwrap();
+
+    let img = render_page_to_rgba(&doc, 0, 72.0, ViewMode::Enhanced).unwrap();
+    // Original undeformed y = 15 mm must be white; deformed y = 70 mm at x = 35 mm must be painted!
+    let old_mid = pixel_at_mm(&img, 35.0, 15.0);
+    let warped_mid = pixel_at_mm(&img, 35.0, 70.0);
+    assert_eq!(
+        old_mid,
+        [255, 255, 255, 255],
+        "undeformed y=15 must stay white"
+    );
+    assert!(
+        warped_mid[0] < 245 || warped_mid[1] < 245 || warped_mid[2] < 245,
+        "deformed SymbolInstance blend midpoint at y=70 must be painted, got {warped_mid:?}"
+    );
+}
+
+#[test]
+fn extreme_numeric_zoom256_zero_font_huge_steps_and_singular_transparency_mask() {
+    let mut doc = Document::new("ExtremeNumeric", 100.0, 100.0, ColorMode::Rgb, 72.0);
+    let l0 = doc.pages()[0].layers[0].id;
+
+    // 1. InnerShadow blur_mm = 1e6 + degenerate FountainLinear (start == end) + singular transform
+    let mut sh = make_rect(10.0, 10.0, 20.0, 20.0, Color::rgba8(240, 20, 20, 255));
+    sh.effects.push(Effect::InnerShadow {
+        dx_mm: 2.0,
+        dy_mm: 2.0,
+        blur_mm: 1e6,
+        opacity: 0.5,
+        color: Color::BLACK,
+        feather_direction: FeatherDirection::Middle,
+    });
+    sh.effects.push(Effect::Transparency {
+        mode: TransparencyMode::FountainLinear {
+            start: Point2D::new(5.0, 5.0),
+            end: Point2D::new(5.0, 5.0),
+            start_alpha: 0.2,
+            end_alpha: 0.9,
+        },
+        blend_mode: BlendMode::Multiply,
+    });
+    doc.add_object(sh, Some(l0)).unwrap();
+
+    let mut sing = make_rect(0.0, 0.0, 10.0, 10.0, Color::rgba8(20, 40, 240, 255));
+    sing.transform = Affine2D::new(0.0, 0.0, 0.0, 0.0, 30.0, 30.0);
+    sing.effects.push(Effect::Transparency {
+        mode: TransparencyMode::FountainLinear {
+            start: Point2D::ZERO,
+            end: Point2D::ZERO,
+            start_alpha: 0.5,
+            end_alpha: 0.5,
+        },
+        blend_mode: BlendMode::Normal,
+    });
+    doc.add_object(sing, Some(l0)).unwrap();
+
+    // 2. 0.0pt RTL self-cyclic ParagraphText
+    let rtl_style = TextStyle {
+        font_size_pt: 0.0,
+        fill: Color::BLACK,
+        ..TextStyle::default()
+    };
+    let mut pt_cyc = ParagraphText::new("مرحبا", Vec2D::new(20.0, 20.0), rtl_style);
+    pt_cyc.direction = TextDirection::Rtl;
+    let p_id = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "CyclicZeroPtRTL",
+                NodePayload::ParagraphText(pt_cyc.clone()),
+            )
+            .with_transform(Affine2D::translate(10.0, 50.0)),
+            Some(l0),
+        )
+        .unwrap();
+    pt_cyc.linked_next_frame = Some(p_id);
+    let mut hist = coree_core::CommandHistory::new(4);
+    hist.execute(
+        &mut doc,
+        coree_core::CommandOp::EditText {
+            id: p_id,
+            payload: NodePayload::ParagraphText(pt_cyc),
+        },
+    )
+    .unwrap();
+
+    let mut vp = Viewport::for_export(256, 256, 96.0);
+    vp.zoom = 256.0;
+    vp.pan_mm = Point2D::new(20.0, 20.0);
+    let mut renderer = SceneRenderer::new();
+    let mut backend = TinySkiaBackend::new(256, 256).unwrap();
+    let t0 = std::time::Instant::now();
+    renderer.render_document(
+        &doc,
+        &vp,
+        ViewMode::Enhanced,
+        &RenderOptions::export(),
+        &mut backend,
+    );
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "extreme numeric stress took too long: {elapsed:?}"
+    );
+    let buf = backend.into_rgba();
+    assert_eq!(buf.rgba.len(), 256 * 256 * 4);
+}
+
+#[test]
+fn extreme_1e15_stacked_lenses_and_export_session_stacked_lens_parity() {
+    use coree_core::{ColorMapMode, EllipseMode, LensConfig, LensKind, ParametricShape};
+    use coree_render::{
+        render_isolated_object_to_rgba_with_options, render_page_to_rgba, ExportIsolationSession,
+    };
+
+    // 1. Extreme 1e15-transformed stacked lenses (incl. frozen + remove_face + FishEye + Magnify)
+    // must complete well under 1s in both render_page_to_rgba and ExportIsolationSession.
+    let mut doc_1e15 = Document::new("Render1e15Lens", 210.0, 297.0, ColorMode::Rgb, 72.0);
+    let l0 = doc_1e15.pages()[0].layers[0].id;
+    let xf_1e15 = Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, 1e15);
+    doc_1e15
+        .add_object(
+            make_rect(0.0, 0.0, 50.0, 50.0, Color::rgba8(220, 40, 40, 255)).with_transform(xf_1e15),
+            Some(l0),
+        )
+        .unwrap();
+    let lens_cfgs = [
+        LensConfig::new(LensKind::Brighten { rate_pct: 35.0 }),
+        LensConfig {
+            kind: LensKind::ColorAdd {
+                color: Color::rgb(0.2, 0.5, 0.8),
+                rate_pct: 45.0,
+            },
+            frozen: true,
+            viewpoint: None,
+            remove_face: false,
+            frozen_snapshot: None,
+        },
+        LensConfig {
+            kind: LensKind::CustomColorMap {
+                from_color: Color::rgb(0.1, 0.0, 0.4),
+                to_color: Color::rgb(1.0, 0.9, 0.2),
+                palette_mode: ColorMapMode::ForwardRainbow,
+            },
+            frozen: false,
+            viewpoint: None,
+            remove_face: true,
+            frozen_snapshot: None,
+        },
+        LensConfig::new(LensKind::FishEye { rate_pct: 120.0 }),
+        LensConfig {
+            kind: LensKind::Magnify { amount: 2.5 },
+            frozen: true,
+            viewpoint: Some(Point2D::new(80.0, 90.0)),
+            remove_face: true,
+            frozen_snapshot: None,
+        },
+        LensConfig::new(LensKind::Invert),
+    ];
+    let mut lens_ids = Vec::new();
+    for (idx, cfg) in lens_cfgs.into_iter().enumerate() {
+        let mut obj = SceneObject::new(
+            ObjectId(0),
+            format!("Lens{}", idx + 1),
+            NodePayload::Shape(ParametricShape::Ellipse {
+                rx: 6.0,
+                ry: 6.0,
+                mode: EllipseMode::Full,
+                start_deg: 0.0,
+                end_deg: 360.0,
+            }),
+        )
+        .with_transform(xf_1e15);
+        obj.lens = Some(cfg);
+        lens_ids.push(doc_1e15.add_object(obj, Some(l0)).unwrap());
+    }
+
+    let t0 = std::time::Instant::now();
+    let rendered = render_page_to_rgba(&doc_1e15, 0, 96.0, ViewMode::Enhanced).unwrap();
+    assert!(!rendered.rgba.is_empty());
+    let mut session = ExportIsolationSession::new();
+    for &oid in &lens_ids {
+        let res = session
+            .render_isolated_object_with_options(
+                &doc_1e15,
+                0,
+                oid,
+                Affine2D::IDENTITY,
+                300.0,
+                false,
+            )
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "1e15 off-scale Lens must skip isolated 2048px rasterization"
+        );
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "1e15 stacked-lens render + isolation took {:?}",
+        t0.elapsed()
+    );
+
+    // 2. Normal in-page stacked Lenses: ExportIsolationSession (cached O(N)) must be pixel-identical
+    // to uncached render_isolated_object_to_rgba_with_options across stacked overlapping lenses.
+    let mut norm_doc = Document::new("StackedParity", 100.0, 100.0, ColorMode::Rgb, 72.0);
+    let nl0 = norm_doc.pages()[0].layers[0].id;
+    norm_doc
+        .add_object(
+            make_rect(10.0, 10.0, 80.0, 80.0, Color::rgba8(240, 20, 40, 255)),
+            Some(nl0),
+        )
+        .unwrap();
+    let mut l1 = make_rect(20.0, 20.0, 60.0, 60.0, Color::TRANSPARENT);
+    l1.fill = Fill::None;
+    l1.lens = Some(LensConfig::new(LensKind::Brighten { rate_pct: 40.0 }));
+    let l1_id = norm_doc.add_object(l1, Some(nl0)).unwrap();
+
+    let mut l2 = make_rect(25.0, 25.0, 50.0, 50.0, Color::TRANSPARENT);
+    l2.fill = Fill::None;
+    l2.lens = Some(LensConfig {
+        kind: LensKind::ColorAdd {
+            color: Color::rgb(0.0, 0.5, 0.8),
+            rate_pct: 50.0,
+        },
+        frozen: true,
+        viewpoint: None,
+        remove_face: false,
+        frozen_snapshot: None,
+    });
+    let l2_id = norm_doc.add_object(l2, Some(nl0)).unwrap();
+
+    let mut l3 = make_rect(30.0, 30.0, 40.0, 40.0, Color::TRANSPARENT);
+    l3.fill = Fill::None;
+    l3.lens = Some(LensConfig::new(LensKind::Invert));
+    let l3_id = norm_doc.add_object(l3, Some(nl0)).unwrap();
+
+    let mut norm_session = ExportIsolationSession::new();
+    for oid in [l1_id, l2_id, l3_id] {
+        let (r_sess, b_sess) = norm_session
+            .render_isolated_object_with_options(&norm_doc, 0, oid, Affine2D::IDENTITY, 150.0, true)
+            .unwrap()
+            .expect("normal lens rendered");
+        let (r_uncached, b_uncached) = render_isolated_object_to_rgba_with_options(
+            &norm_doc,
+            0,
+            oid,
+            Affine2D::IDENTITY,
+            150.0,
+            true,
+        )
+        .unwrap()
+        .expect("uncached lens rendered");
+        assert_eq!(r_sess, r_uncached);
+        assert_eq!(b_sess.width, b_uncached.width);
+        assert_eq!(b_sess.height, b_uncached.height);
+        assert_eq!(
+            b_sess.rgba, b_uncached.rgba,
+            "ExportIsolationSession must match uncached render_isolated_object_to_rgba_with_options for lens {oid:?}"
+        );
+    }
+}
+
+#[test]
+fn extreme_scale_1e15_intersecting_stroke_and_clip_tinyskia_and_wgpu() {
+    use coree_core::{LineCap, LineJoin};
+    use coree_render::{PaintShader, WgpuBackend};
+
+    let mut kb_closed = kurbo::BezPath::new();
+    kb_closed.move_to((0.0, 0.0));
+    kb_closed.curve_to((10.0, 20.0), (40.0, 30.0), (50.0, 50.0));
+    kb_closed.close_path();
+    let closed_curve = BezierPath::from_kurbo(&kb_closed);
+
+    let mut kb_open = kurbo::BezPath::new();
+    kb_open.move_to((0.0, 0.0));
+    kb_open.curve_to((10.0, 20.0), (40.0, 30.0), (50.0, 50.0));
+    let open_curve = BezierPath::from_kurbo(&kb_open);
+
+    let dpi_xf = Affine2D::scale_uniform(150.0 / 25.4);
+    let xf_origin = Affine2D::new(1e15, 0.0, 0.0, 1e15, 0.0, 0.0);
+    let xf_straddle = Affine2D::new(1e15, 0.0, 0.0, 1e15, -2.5e16, -2.5e16);
+    let xf_cancel = Affine2D::translate(-1e15, 0.0);
+    let pre_closed = closed_curve.transformed(&xf_origin);
+    let pre_open = open_curve.transformed(&xf_origin);
+    let pre_offset = closed_curve.transformed(&Affine2D::translate(1e15, 0.0));
+
+    let t0 = std::time::Instant::now();
+    for use_wgpu in [false, true] {
+        let mut backend: Box<dyn CanvasBackend> = if use_wgpu {
+            Box::new(WgpuBackend::new(128, 128).unwrap())
+        } else {
+            Box::new(TinySkiaBackend::new(128, 128).unwrap())
+        };
+        backend.clear(Color::WHITE);
+
+        let stroke_cases = [
+            // Thick AA
+            StrokeParams {
+                color: Color::BLACK,
+                width: 2.0,
+                cap: LineCap::Butt,
+                join: LineJoin::Miter,
+                miter_limit: 4.0,
+                dash_pattern: vec![],
+                dash_offset: 0.0,
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                anti_alias: true,
+            },
+            // Thin AA (effective_px <= 1.05 in pre-transformed regime)
+            StrokeParams {
+                color: Color::BLACK,
+                width: 0.1,
+                cap: LineCap::Round,
+                join: LineJoin::Round,
+                miter_limit: 4.0,
+                dash_pattern: vec![],
+                dash_offset: 0.0,
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                anti_alias: true,
+            },
+            // Non-AA
+            StrokeParams {
+                color: Color::BLACK,
+                width: 2.0,
+                cap: LineCap::Square,
+                join: LineJoin::Bevel,
+                miter_limit: 4.0,
+                dash_pattern: vec![],
+                dash_offset: 0.0,
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                anti_alias: false,
+            },
+            // Dashed AA
+            StrokeParams {
+                color: Color::BLACK,
+                width: 2.0,
+                cap: LineCap::Butt,
+                join: LineJoin::Miter,
+                miter_limit: 4.0,
+                dash_pattern: vec![4.0, 2.0],
+                dash_offset: 1.0,
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                anti_alias: true,
+            },
+            // Dashed Non-AA
+            StrokeParams {
+                color: Color::BLACK,
+                width: 2.0,
+                cap: LineCap::Butt,
+                join: LineJoin::Miter,
+                miter_limit: 4.0,
+                dash_pattern: vec![4.0, 2.0],
+                dash_offset: 1.0,
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                anti_alias: false,
+            },
+        ];
+
+        for st in &stroke_cases {
+            // (a) Local path + intersecting 1e15 transforms
+            backend.stroke_path(&closed_curve, st, xf_origin);
+            backend.stroke_path(&open_curve, st, xf_origin);
+            backend.stroke_path(&closed_curve, st, xf_straddle);
+            // (b) Pre-transformed 1e15 path + normal DPI transform (scale_with_object = false)
+            backend.stroke_path(&pre_closed, st, dpi_xf);
+            backend.stroke_path(&pre_open, st, dpi_xf);
+            // (c) 1e15 local path + translate(-1e15, 0) cancellation guard
+            backend.stroke_path(&pre_offset, st, xf_cancel);
+        }
+
+        // Active 1e15 intersecting push_clip wrapping stroke_path
+        backend.push_clip(&closed_curve, FillRule::EvenOdd, xf_origin);
+        backend.stroke_path(&pre_closed, &stroke_cases[0], dpi_xf);
+        backend.pop_clip();
+
+        // draw_pixmap with 1e15 transform
+        let img = RgbaBuffer::new_filled(4, 4, [20, 40, 220, 255]);
+        backend.draw_pixmap(&img, xf_origin, 0.8, BlendMode::Normal, true);
+
+        // LinearGradient at 1e20 scale (must not drop or panic)
+        let grad_paint = BackendPaint {
+            shader: PaintShader::LinearGradient {
+                start: Point2D::new(0.0, 0.0),
+                end: Point2D::new(50.0, 50.0),
+                stops: vec![
+                    GradientStop::new(0.0, Color::rgba8(200, 10, 10, 255)),
+                    GradientStop::new(1.0, Color::rgba8(10, 10, 200, 255)),
+                ],
+            },
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            anti_alias: true,
+        };
+        backend.fill_path(
+            &closed_curve,
+            &grad_paint,
+            FillRule::Winding,
+            Affine2D::new(1e20, 0.0, 0.0, 1e20, 0.0, 0.0),
+        );
+
+        let buf = backend.snapshot_rgba();
+        assert_eq!(buf.rgba.len(), 128 * 128 * 4);
+        assert!(
+            buf.rgba.as_chunks::<4>().0.iter().any(|p| p[0] < 240 || p[1] < 240 || p[2] < 240),
+            "intersecting 1e15 stroke/pixmap/gradient must render non-white pixels (use_wgpu={use_wgpu})"
+        );
+    }
+
+    // Direct render_svg_to_rgba on the exact 171-byte 1e15 stroked SVG
+    let svg_171 = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M 0 0 C 10 20 40 30 50 50 Z" transform="matrix(1e15 0 0 1e15 0 0)" stroke="black" fill="none"/></svg>"#;
+    let svg_buf = render_svg_to_rgba(svg_171, 100, 100).expect("render_svg_to_rgba on 1e15 SVG");
+    assert_eq!(svg_buf.rgba.len(), 100 * 100 * 4);
+    assert!(
+        svg_buf.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
+        "1e15 stroked SVG must produce visible non-transparent stroke pixels"
+    );
+
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1000),
+        "1e15 intersecting stroke & clip suite took {elapsed:?}"
+    );
+}

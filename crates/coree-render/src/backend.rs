@@ -588,6 +588,7 @@ impl CanvasBackend for TinySkiaBackend {
         } else {
             ts::Transform::identity()
         };
+        let xf_scale = estimate_scale_2d(transform);
         let ts_rule = match rule {
             FillRule::Winding => ts::FillRule::Winding,
             FillRule::EvenOdd => ts::FillRule::EvenOdd,
@@ -619,6 +620,22 @@ impl CanvasBackend for TinySkiaBackend {
                 }
                 if sk_stops.len() == 1 || start.distance_to(*end) <= 1e-6 {
                     ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
+                } else if use_device_clip {
+                    let p0 = transform.transform_point(*start);
+                    let p1 = transform.transform_point(*end);
+                    if xf_scale >= 1e18 || !p0.is_finite() || !p1.is_finite() {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
+                    } else if let Some(shader) = ts::LinearGradient::new(
+                        ts::Point::from_xy(p0.x as f32, p0.y as f32),
+                        ts::Point::from_xy(p1.x as f32, p1.y as f32),
+                        sk_stops,
+                        ts::SpreadMode::Pad,
+                        ts::Transform::identity(),
+                    ) {
+                        ts_paint.shader = shader;
+                    } else {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
+                    }
                 } else if let Some(shader) = ts::LinearGradient::new(
                     ts::Point::from_xy(start.x as f32, start.y as f32),
                     ts::Point::from_xy(end.x as f32, end.y as f32),
@@ -657,7 +674,9 @@ impl CanvasBackend for TinySkiaBackend {
                             center.y + (f.y - center.y) * scale,
                         );
                     }
-                    if let Some(shader) = ts::RadialGradient::new(
+                    if use_device_clip && xf_scale >= 1e18 {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
+                    } else if let Some(shader) = ts::RadialGradient::new(
                         ts::Point::from_xy(f.x as f32, f.y as f32),
                         0.0,
                         ts::Point::from_xy(center.x as f32, center.y as f32),
@@ -667,6 +686,8 @@ impl CanvasBackend for TinySkiaBackend {
                         shader_xf,
                     ) {
                         ts_paint.shader = shader;
+                    } else if use_device_clip {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
                     } else {
                         return;
                     }
@@ -693,7 +714,9 @@ impl CanvasBackend for TinySkiaBackend {
                     } else {
                         affine_to_skia(rot)
                     };
-                    if let Some(shader) = ts::SweepGradient::new(
+                    if use_device_clip && (xf_scale >= 1e18 || sweep_xf.invert().is_none()) {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
+                    } else if let Some(shader) = ts::SweepGradient::new(
                         ts::Point::from_xy(center.x as f32, center.y as f32),
                         0.0,
                         360.0,
@@ -702,6 +725,8 @@ impl CanvasBackend for TinySkiaBackend {
                         sweep_xf,
                     ) {
                         ts_paint.shader = shader;
+                    } else if use_device_clip {
+                        ts_paint.set_color(color_to_skia(&stops[0].color, opacity));
                     } else {
                         return;
                     }
@@ -722,13 +747,21 @@ impl CanvasBackend for TinySkiaBackend {
                 } else {
                     affine_to_skia(*tile_transform)
                 };
-                ts_paint.shader = ts::Pattern::new(
-                    pm.as_ref(),
-                    ts::SpreadMode::Repeat,
-                    ts::FilterQuality::Bilinear,
-                    opacity,
-                    pat_xf,
-                );
+                if use_device_clip && pat_xf.invert().is_none() {
+                    let avg = tile.get_pixel(0, 0).unwrap_or([0, 0, 0, 0]);
+                    ts_paint.set_color(color_to_skia(
+                        &Color::rgba8(avg[0], avg[1], avg[2], avg[3]),
+                        opacity,
+                    ));
+                } else {
+                    ts_paint.shader = ts::Pattern::new(
+                        pm.as_ref(),
+                        ts::SpreadMode::Repeat,
+                        ts::FilterQuality::Bilinear,
+                        opacity,
+                        pat_xf,
+                    );
+                }
                 self.pixmap
                     .fill_path(&ts_path, &ts_paint, ts_rule, ts_xf, self.clip_stack.last());
             }
@@ -738,18 +771,69 @@ impl CanvasBackend for TinySkiaBackend {
     fn stroke_path(&mut self, path: &BezierPath, stroke: &StrokeParams, transform: Affine2D) {
         if !transform.is_finite()
             || transform.determinant().abs() <= 1e-12
+            || !stroke.width.is_finite()
             || stroke.width <= 1e-6
+            || !stroke.opacity.is_finite()
             || stroke.opacity <= 1e-6
         {
             return;
         }
+        let scale = estimate_scale_2d(transform);
+        let effective_px = stroke.width * (scale as f32);
+        let (expanded_width, eff_opacity) = if effective_px < 1.0 {
+            let min_w = (1.0 / scale.max(1e-6)) as f32;
+            let op = if stroke.anti_alias {
+                (stroke.opacity * effective_px).clamp(0.0, 1.0)
+            } else {
+                stroke.opacity
+            };
+            (min_w.max(stroke.width), op)
+        } else {
+            (stroke.width, stroke.opacity)
+        };
+        if !eff_opacity.is_finite() || eff_opacity <= 1e-6 {
+            return;
+        }
+
+        if needs_f64_device_clip_for_stroke(
+            path,
+            stroke,
+            expanded_width,
+            transform,
+            self.pixmap.width(),
+            self.pixmap.height(),
+        ) {
+            if let Some(dev_path) = build_clipped_device_stroke_skia_path(
+                path,
+                stroke,
+                expanded_width,
+                transform,
+                self.pixmap.width(),
+                self.pixmap.height(),
+                self.flatten_tolerance,
+            ) {
+                let mut ts_paint = ts::Paint {
+                    anti_alias: stroke.anti_alias,
+                    blend_mode: blend_mode_to_skia(stroke.blend_mode),
+                    ..ts::Paint::default()
+                };
+                ts_paint.set_color(color_to_skia(&stroke.color, eff_opacity));
+                self.pixmap.fill_path(
+                    &dev_path,
+                    &ts_paint,
+                    ts::FillRule::Winding,
+                    ts::Transform::identity(),
+                    self.clip_stack.last(),
+                );
+            }
+            return;
+        }
+
         let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) else {
             return;
         };
-        let scale = estimate_scale_2d(transform);
-        let effective_px = stroke.width * (scale as f32);
         let dash = build_stroke_dash(&stroke.dash_pattern, stroke.dash_offset);
-        let ts_stroke = ts::Stroke {
+        let mut ts_stroke = ts::Stroke {
             width: stroke.width,
             miter_limit: stroke.miter_limit.max(1.0),
             line_cap: match stroke.cap {
@@ -786,20 +870,6 @@ impl CanvasBackend for TinySkiaBackend {
                 None
             };
             let source_path = dashed.as_ref().unwrap_or(&ts_path);
-            let (expanded_width, eff_opacity) = if effective_px < 1.0 {
-                let min_w = (1.0 / scale.max(1e-6)) as f32;
-                let op = if stroke.anti_alias {
-                    (stroke.opacity * effective_px).clamp(0.0, 1.0)
-                } else {
-                    stroke.opacity
-                };
-                (min_w.max(stroke.width), op)
-            } else {
-                (stroke.width, stroke.opacity)
-            };
-            if eff_opacity <= 1e-6 {
-                return;
-            }
             let expand_stroke = ts::Stroke {
                 width: expanded_width,
                 miter_limit: ts_stroke.miter_limit,
@@ -826,6 +896,12 @@ impl CanvasBackend for TinySkiaBackend {
                     return;
                 }
             }
+        }
+
+        if ts_stroke.dash.is_some()
+            && estimate_dash_count(&ts_path, &stroke.dash_pattern) > MAX_LOCAL_DASH_SEGMENTS
+        {
+            ts_stroke.dash = None;
         }
 
         let ts_xf = affine_to_skia(transform);
@@ -859,6 +935,98 @@ impl CanvasBackend for TinySkiaBackend {
             || opacity <= 1e-6
             || image.is_empty()
         {
+            return;
+        }
+        let img_rect = BezierPath::from_rect(Rect2D::from_xywh(
+            0.0,
+            0.0,
+            f64::from(image.width),
+            f64::from(image.height),
+        ));
+        if needs_f64_device_clip(
+            &img_rect,
+            transform,
+            self.pixmap.width(),
+            self.pixmap.height(),
+        ) {
+            let Some(dev_path) = build_clipped_device_skia_path(
+                &img_rect,
+                transform,
+                self.pixmap.width(),
+                self.pixmap.height(),
+                self.flatten_tolerance,
+            ) else {
+                return;
+            };
+            let pat_xf = affine_to_skia(transform);
+            let [a, b, c, d, _, _] = transform.m;
+            let det_f32 = (a as f32) * (d as f32) - (b as f32) * (c as f32);
+            if det_f32.is_finite() && det_f32.abs() > 1e-30 && pat_xf.invert().is_some() {
+                let Some(pm) = image.to_premultiplied_pixmap() else {
+                    return;
+                };
+                let quality = if smooth {
+                    ts::FilterQuality::Bilinear
+                } else {
+                    ts::FilterQuality::Nearest
+                };
+                let ts_paint = ts::Paint {
+                    anti_alias: smooth,
+                    blend_mode: blend_mode_to_skia(blend_mode),
+                    shader: ts::Pattern::new(
+                        pm.as_ref(),
+                        ts::SpreadMode::Pad,
+                        quality,
+                        opacity,
+                        pat_xf,
+                    ),
+                    ..ts::Paint::default()
+                };
+                self.pixmap.fill_path(
+                    &dev_path,
+                    &ts_paint,
+                    ts::FillRule::Winding,
+                    ts::Transform::identity(),
+                    self.clip_stack.last(),
+                );
+            } else if let Some(inv) = transform.inverse() {
+                let sb = transform.transform_rect(Rect2D::from_xywh(
+                    0.0,
+                    0.0,
+                    f64::from(image.width),
+                    f64::from(image.height),
+                ));
+                if let Some(px_rect) = PixelRect::from_f64_rect_clamped(
+                    sb,
+                    1,
+                    self.pixmap.width(),
+                    self.pixmap.height(),
+                ) {
+                    let mut sub = RgbaBuffer::new_transparent(px_rect.width, px_rect.height);
+                    for ry in 0..px_rect.height {
+                        let dy = f64::from(px_rect.y) + f64::from(ry) + 0.5;
+                        for rx in 0..px_rect.width {
+                            let dx = f64::from(px_rect.x) + f64::from(rx) + 0.5;
+                            let sp = inv.transform_point(Point2D::new(dx, dy));
+                            if sp.x >= 0.0
+                                && sp.y >= 0.0
+                                && sp.x < f64::from(image.width)
+                                && sp.y < f64::from(image.height)
+                            {
+                                let px = if smooth {
+                                    image.sample_bilinear(sp.x - 0.5, sp.y - 0.5)
+                                } else {
+                                    image
+                                        .get_pixel(sp.x.floor() as u32, sp.y.floor() as u32)
+                                        .unwrap_or([0; 4])
+                                };
+                                sub.set_pixel(rx, ry, px);
+                            }
+                        }
+                    }
+                    self.composite_region(px_rect, &sub, opacity, blend_mode);
+                }
+            }
             return;
         }
         let Some(pm) = image.to_premultiplied_pixmap() else {
@@ -1016,21 +1184,63 @@ pub fn affine_to_skia(affine: Affine2D) -> ts::Transform {
     ts::Transform::from_row(a as f32, b as f32, c as f32, d as f32, tx as f32, ty as f32)
 }
 
-/// Returns `true` when `path` transformed to device coordinates exceeds safe `f32`/fixed-point
-/// limits for `tiny-skia` rasterization, requiring `f64` Sutherland-Hodgman viewport clipping.
+/// Returns `true` when `path` (either in local or device coordinates) exceeds safe
+/// `f32`/fixed-point limits for `tiny-skia` rasterization, requiring `f64` clipping.
 fn needs_f64_device_clip(path: &BezierPath, transform: Affine2D, w: u32, h: u32) -> bool {
     let Some(bb) = path.bounding_box() else {
         return false;
     };
+    if !bb.is_finite() {
+        return true;
+    }
     let sb = transform.transform_rect(bb);
     if !sb.is_finite() {
         return true;
     }
     const LIMIT: f64 = 1_000_000.0;
-    sb.min_x < -LIMIT
+    bb.min_x < -LIMIT
+        || bb.min_y < -LIMIT
+        || bb.max_x > LIMIT
+        || bb.max_y > LIMIT
+        || sb.min_x < -LIMIT
         || sb.min_y < -LIMIT
         || sb.max_x > f64::from(w) + LIMIT
         || sb.max_y > f64::from(h) + LIMIT
+}
+
+/// Computes `f64` Sutherland-Hodgman clipped device polygons for a filled path.
+fn build_clipped_device_fill_polygons(
+    path: &BezierPath,
+    transform: Affine2D,
+    w: u32,
+    h: u32,
+    flatten_tol: Option<f64>,
+) -> Vec<Vec<Point2D>> {
+    if path.is_empty() || !transform.is_finite() {
+        return Vec::new();
+    }
+    let clip_rect = Rect2D::new(-4.0, -4.0, f64::from(w) + 4.0, f64::from(h) + 4.0);
+    let dev_path = path.transformed(&transform);
+    let Some(dev_bb) = dev_path.bounding_box() else {
+        return Vec::new();
+    };
+    if !dev_bb.is_finite() || !dev_bb.intersects(clip_rect) {
+        return Vec::new();
+    }
+    let max_span = dev_bb.width().max(dev_bb.height());
+    if !max_span.is_finite() {
+        return Vec::new();
+    }
+    let tol = flatten_tol.unwrap_or(0.25).max(0.25).max(max_span * 1e-5);
+    let mut out = Vec::new();
+    for poly in dev_path.flatten(tol) {
+        let finite: Vec<Point2D> = poly.into_iter().filter(|p| p.is_finite()).collect();
+        let clipped = clip_polygon_to_rect_f64(&finite, clip_rect);
+        if clipped.len() >= 3 {
+            out.push(clipped);
+        }
+    }
+    out
 }
 
 /// Transforms `path` to device space in full `f64` precision, clips polygons against an
@@ -1042,33 +1252,640 @@ fn build_clipped_device_skia_path(
     h: u32,
     flatten_tol: Option<f64>,
 ) -> Option<ts::Path> {
-    if path.is_empty() {
+    let polygons = build_clipped_device_fill_polygons(path, transform, w, h, flatten_tol);
+    if polygons.is_empty() {
         return None;
     }
-    let dev_path = path.transformed(&transform);
-    let tol = flatten_tol.unwrap_or(0.25).max(0.25);
-    let clip_rect = Rect2D::new(-4.0, -4.0, f64::from(w) + 4.0, f64::from(h) + 4.0);
-
     let mut pb = ts::PathBuilder::new();
-    let mut any = false;
-    for poly in dev_path.flatten(tol) {
-        let finite: Vec<Point2D> = poly.into_iter().filter(|p| p.is_finite()).collect();
-        let clipped = clip_polygon_to_rect_f64(&finite, clip_rect);
-        if clipped.len() < 3 {
-            continue;
-        }
-        any = true;
+    for clipped in polygons {
         pb.move_to(clipped[0].x as f32, clipped[0].y as f32);
         for pt in &clipped[1..] {
             pb.line_to(pt.x as f32, pt.y as f32);
         }
         pb.close();
     }
-    if any {
-        pb.finish()
+    pb.finish()
+}
+
+fn stroke_reach_local_f64(stroke: &StrokeParams, expanded_width: f32) -> f64 {
+    let miter = if stroke.join == LineJoin::Miter {
+        f64::from(sanitize_f32(stroke.miter_limit, 4.0).max(1.0))
     } else {
-        None
+        1.0
+    };
+    let cap = if stroke.cap == LineCap::Square {
+        std::f64::consts::SQRT_2
+    } else {
+        1.0
+    };
+    let w = f64::from(sanitize_f32(expanded_width, 0.0).max(0.0));
+    0.5 * w * miter.max(cap)
+}
+
+fn needs_f64_device_clip_for_stroke(
+    path: &BezierPath,
+    stroke: &StrokeParams,
+    expanded_width: f32,
+    transform: Affine2D,
+    w: u32,
+    h: u32,
+) -> bool {
+    let Some(bb) = path.bounding_box() else {
+        return false;
+    };
+    let local_pad = stroke_reach_local_f64(stroke, expanded_width);
+    let stroked_local = bb.expand(local_pad);
+    if !bb.is_finite() || !local_pad.is_finite() || !stroked_local.is_finite() {
+        return true;
     }
+    let sb = transform.transform_rect(stroked_local);
+    if !sb.is_finite() {
+        return true;
+    }
+    const LIMIT: f64 = 1_000_000.0;
+    bb.min_x < -LIMIT
+        || bb.min_y < -LIMIT
+        || bb.max_x > LIMIT
+        || bb.max_y > LIMIT
+        || stroked_local.min_x < -LIMIT
+        || stroked_local.min_y < -LIMIT
+        || stroked_local.max_x > LIMIT
+        || stroked_local.max_y > LIMIT
+        || sb.min_x < -LIMIT
+        || sb.min_y < -LIMIT
+        || sb.max_x > f64::from(w) + LIMIT
+        || sb.max_y > f64::from(h) + LIMIT
+}
+
+/// Exact `f64` Liang-Barsky segment clipper against an axis-aligned rectangle.
+/// Returns `(clipped_p0, clipped_p1, p0_was_clipped, p1_was_clipped)`.
+fn clip_segment_to_rect_f64(
+    p0: Point2D,
+    p1: Point2D,
+    rect: Rect2D,
+) -> Option<(Point2D, Point2D, bool, bool)> {
+    if !p0.is_finite() || !p1.is_finite() || !rect.is_finite() {
+        return None;
+    }
+    let dx = p1.x - p0.x;
+    let dy = p1.y - p0.y;
+    let mut t0 = 0.0_f64;
+    let mut t1 = 1.0_f64;
+    let checks = [
+        (-dx, p0.x - rect.min_x),
+        (dx, rect.max_x - p0.x),
+        (-dy, p0.y - rect.min_y),
+        (dy, rect.max_y - p0.y),
+    ];
+    for (p, q) in checks {
+        if p.abs() <= 1e-18 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let c0 = Point2D::new(p0.x + t0 * dx, p0.y + t0 * dy);
+    let c1 = Point2D::new(p0.x + t1 * dx, p0.y + t1 * dy);
+    Some((c0, c1, t0 > 0.0, t1 < 1.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clip_cubic_to_rect_f64(
+    p0: Point2D,
+    c0: Point2D,
+    c1: Point2D,
+    p1: Point2D,
+    rect: Rect2D,
+    depth: usize,
+    pieces: &mut usize,
+    out: &mut Vec<(Point2D, Point2D, bool, bool)>,
+) {
+    if !p0.is_finite() || !c0.is_finite() || !c1.is_finite() || !p1.is_finite() {
+        return;
+    }
+    let Some(cb_bb) = Rect2D::from_iter_points([p0, c0, c1, p1]) else {
+        return;
+    };
+    if !cb_bb.intersects(rect) {
+        return;
+    }
+    let span = cb_bb.width().max(cb_bb.height());
+    if span > 4096.0 && depth < 64 && *pieces < 4096 {
+        let q0 = p0.midpoint(c0);
+        let q1 = c0.midpoint(c1);
+        let q2 = c1.midpoint(p1);
+        let r0 = q0.midpoint(q1);
+        let r1 = q1.midpoint(q2);
+        let mid = r0.midpoint(r1);
+        clip_cubic_to_rect_f64(p0, q0, r0, mid, rect, depth + 1, pieces, out);
+        clip_cubic_to_rect_f64(mid, r1, q2, p1, rect, depth + 1, pieces, out);
+        return;
+    }
+    *pieces += 1;
+    let tol = 0.25_f64.max(span * 1e-5);
+    let mut kb = kurbo::BezPath::new();
+    kb.move_to((p0.x, p0.y));
+    kb.curve_to((c0.x, c0.y), (c1.x, c1.y), (p1.x, p1.y));
+    let mut cur = p0;
+    let mut leaf_verts = 0usize;
+    kurbo::flatten(kb, tol, |el| {
+        if leaf_verts >= 16_384 {
+            return;
+        }
+        match el {
+            kurbo::PathEl::MoveTo(p) => {
+                cur = Point2D::new(p.x, p.y);
+            }
+            kurbo::PathEl::LineTo(p) => {
+                leaf_verts += 1;
+                let next = Point2D::new(p.x, p.y);
+                if let Some(clipped) = clip_segment_to_rect_f64(cur, next, rect) {
+                    out.push(clipped);
+                }
+                cur = next;
+            }
+            _ => {}
+        }
+    });
+}
+
+fn clip_bezier_centerline_to_rect_f64(path: &BezierPath, rect: Rect2D) -> kurbo::BezPath {
+    let mut out = kurbo::BezPath::new();
+    let mut pieces = 0usize;
+    for sp in &path.subpaths {
+        if sp.nodes.len() < 2 {
+            continue;
+        }
+        let mut segs: Vec<(Point2D, Point2D, bool, bool)> = Vec::new();
+        let seg_count = sp.segment_count();
+        for seg_idx in 0..seg_count {
+            let Some((i0, i1)) = sp.segment_node_indices(seg_idx) else {
+                continue;
+            };
+            let n0 = sp.nodes[i0];
+            let n1 = sp.nodes[i1];
+            if !n0.pos.is_finite() || !n1.pos.is_finite() {
+                continue;
+            }
+            match (n0.handle_out, n1.handle_in) {
+                (None, None) => {
+                    if let Some(clipped) = clip_segment_to_rect_f64(n0.pos, n1.pos, rect) {
+                        segs.push(clipped);
+                    }
+                }
+                (h0, h1) => {
+                    let c0 = h0.filter(|p| p.is_finite()).unwrap_or(n0.pos);
+                    let c1 = h1.filter(|p| p.is_finite()).unwrap_or(n1.pos);
+                    clip_cubic_to_rect_f64(n0.pos, c0, c1, n1.pos, rect, 0, &mut pieces, &mut segs);
+                }
+            }
+        }
+        if segs.is_empty() {
+            continue;
+        }
+
+        // Stitch contiguous segments: (pts, start_clipped, end_clipped, closed)
+        let mut runs: Vec<(Vec<Point2D>, bool, bool, bool)> = Vec::new();
+        for (a, b, a_clipped, b_clipped) in segs {
+            let can_merge = if !a_clipped {
+                if let Some(last_run) = runs.last() {
+                    !last_run.2
+                        && last_run
+                            .0
+                            .last()
+                            .is_some_and(|prev| prev.distance_to(a) <= 1e-9)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if can_merge {
+                let last_run = runs.last_mut().expect("checked non-empty");
+                last_run.0.push(b);
+                last_run.2 = b_clipped;
+            } else {
+                runs.push((vec![a, b], a_clipped, b_clipped, false));
+            }
+        }
+
+        // Preserve corner join across closed-subpath wraparound at sp.nodes[0]
+        if sp.closed && runs.len() >= 2 {
+            let can_wrap = {
+                let first_unclipped = !runs[0].1;
+                let last = runs.last().expect("len >= 2");
+                let last_unclipped = !last.2;
+                let seam_match = match (last.0.last(), runs[0].0.first()) {
+                    (Some(le), Some(fs)) => le.distance_to(*fs) <= 1e-9,
+                    _ => false,
+                };
+                first_unclipped && last_unclipped && seam_match
+            };
+            if can_wrap {
+                let tail = runs.pop().expect("len >= 2");
+                let tail_len = tail.0.len();
+                let mut merged = Vec::with_capacity(tail_len + runs[0].0.len());
+                merged.extend_from_slice(&tail.0[..tail_len.saturating_sub(1)]);
+                merged.extend_from_slice(&runs[0].0);
+                runs[0].0 = merged;
+                runs[0].1 = tail.1;
+            }
+        }
+        if sp.closed && runs.len() == 1 && !runs[0].1 && !runs[0].2 && runs[0].0.len() >= 2 {
+            let closes_loop = match (runs[0].0.last(), runs[0].0.first()) {
+                (Some(le), Some(fs)) => le.distance_to(*fs) <= 1e-9,
+                _ => false,
+            };
+            if closes_loop {
+                if runs[0].0.len() > 2 {
+                    runs[0].0.pop();
+                }
+                runs[0].3 = true;
+            }
+        }
+
+        for (pts, _, _, closed) in runs {
+            let mut deduped: Vec<Point2D> = Vec::with_capacity(pts.len());
+            for pt in pts {
+                if deduped
+                    .last()
+                    .is_none_or(|prev| prev.distance_to(pt) > 1e-12)
+                {
+                    deduped.push(pt);
+                }
+            }
+            if deduped.len() < 2 {
+                continue;
+            }
+            out.move_to((deduped[0].x, deduped[0].y));
+            for pt in &deduped[1..] {
+                out.line_to((pt.x, pt.y));
+            }
+            if closed {
+                out.close_path();
+            }
+        }
+    }
+    out
+}
+
+fn sanitize_kurbo_dashes(
+    dash_pattern: &[f32],
+    dash_offset: f32,
+    dash_scale: f64,
+    approx_len: f64,
+) -> Option<(Vec<f64>, f64)> {
+    if !dash_scale.is_finite() || dash_scale <= 1e-9 || !approx_len.is_finite() {
+        return None;
+    }
+    let mut dashes: Vec<f64> = dash_pattern
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .filter_map(|v| {
+            let scaled = f64::from(v) * dash_scale;
+            (scaled.is_finite() && scaled > 1e-9).then_some(scaled)
+        })
+        .collect();
+    if dashes.is_empty() {
+        return None;
+    }
+    if !dashes.len().is_multiple_of(2) {
+        let dup = dashes.clone();
+        dashes.extend(dup);
+    }
+    let period: f64 = dashes.iter().sum();
+    if !period.is_finite() || period <= 1e-6 {
+        return None;
+    }
+    let est = (approx_len / period).ceil();
+    if !est.is_finite() || est > (MAX_LOCAL_DASH_SEGMENTS as f64) {
+        return None;
+    }
+    let offset = f64::from(sanitize_f32(dash_offset, 0.0)) * dash_scale;
+    let safe_offset = if offset.is_finite() { offset } else { 0.0 };
+    Some((dashes, safe_offset))
+}
+
+fn approx_bezier_length_f64(path: &BezierPath) -> f64 {
+    let mut total = 0.0_f64;
+    for sp in &path.subpaths {
+        let seg_count = sp.segment_count();
+        for seg_idx in 0..seg_count {
+            let Some((i0, i1)) = sp.segment_node_indices(seg_idx) else {
+                continue;
+            };
+            let n0 = sp.nodes[i0];
+            let n1 = sp.nodes[i1];
+            let seg_len = match (n0.handle_out, n1.handle_in) {
+                (None, None) => n0.pos.distance_to(n1.pos),
+                (h0, h1) => {
+                    let c0 = h0.unwrap_or(n0.pos);
+                    let c1 = h1.unwrap_or(n1.pos);
+                    n0.pos.distance_to(c0) + c0.distance_to(c1) + c1.distance_to(n1.pos)
+                }
+            };
+            if seg_len.is_finite() {
+                total += seg_len;
+            }
+        }
+    }
+    total
+}
+
+#[inline]
+fn is_nearly_isotropic(xf: Affine2D) -> bool {
+    let [a, b, c, d, _, _] = xf.m;
+    let sx = (a * a + b * b).sqrt();
+    let sy = (c * c + d * d).sqrt();
+    sx > 1e-9
+        && sy > 1e-9
+        && (sx - sy).abs() <= 1e-3 * sx.max(sy)
+        && (a * c + b * d).abs() <= 1e-3 * sx * sy
+}
+
+#[inline]
+fn make_kurbo_stroke(stroke: &StrokeParams, width: f64) -> kurbo::Stroke {
+    let cap = match stroke.cap {
+        LineCap::Butt => kurbo::Cap::Butt,
+        LineCap::Round => kurbo::Cap::Round,
+        LineCap::Square => kurbo::Cap::Square,
+    };
+    let join = match stroke.join {
+        LineJoin::Miter => kurbo::Join::Miter,
+        LineJoin::Round => kurbo::Join::Round,
+        LineJoin::Bevel => kurbo::Join::Bevel,
+    };
+    kurbo::Stroke {
+        width: width.max(0.0),
+        join,
+        miter_limit: f64::from(sanitize_f32(stroke.miter_limit, 4.0).max(1.0)),
+        start_cap: cap,
+        end_cap: cap,
+        dash_pattern: Default::default(),
+        dash_offset: 0.0,
+    }
+}
+
+fn kurbo_outlines_to_clipped_polygons(
+    kb: &kurbo::BezPath,
+    clip_rect: Rect2D,
+    flatten_tol: f64,
+) -> Vec<Vec<Point2D>> {
+    const MAX_FLATTEN_VERTICES: usize = 1_000_000;
+    let mut out = Vec::new();
+    let mut cur_poly: Vec<Point2D> = Vec::new();
+    let mut total_verts = 0usize;
+    let flush = |poly: &mut Vec<Point2D>, out: &mut Vec<Vec<Point2D>>| {
+        if poly.len() >= 3 {
+            let finite: Vec<Point2D> = poly.iter().copied().filter(|p| p.is_finite()).collect();
+            let clipped = clip_polygon_to_rect_f64(&finite, clip_rect);
+            if clipped.len() >= 3 {
+                out.push(clipped);
+            }
+        }
+        poly.clear();
+    };
+    kurbo::flatten(kb, flatten_tol.max(0.05), |el| {
+        if total_verts >= MAX_FLATTEN_VERTICES {
+            return;
+        }
+        match el {
+            kurbo::PathEl::MoveTo(p) => {
+                flush(&mut cur_poly, &mut out);
+                total_verts += 1;
+                cur_poly.push(Point2D::new(p.x, p.y));
+            }
+            kurbo::PathEl::LineTo(p) => {
+                total_verts += 1;
+                cur_poly.push(Point2D::new(p.x, p.y));
+            }
+            kurbo::PathEl::ClosePath => {
+                flush(&mut cur_poly, &mut out);
+            }
+            kurbo::PathEl::QuadTo(..) | kurbo::PathEl::CurveTo(..) => {}
+        }
+    });
+    flush(&mut cur_poly, &mut out);
+    out
+}
+
+fn kurbo_max_abs_coord(kb: &kurbo::BezPath) -> f64 {
+    use kurbo::Shape as _;
+    let bb = kb.bounding_box();
+    bb.x0
+        .abs()
+        .max(bb.x1.abs())
+        .max(bb.y0.abs())
+        .max(bb.y1.abs())
+}
+
+fn build_clipped_device_stroke_polygons(
+    path: &BezierPath,
+    stroke: &StrokeParams,
+    expanded_width: f32,
+    transform: Affine2D,
+    w: u32,
+    h: u32,
+    flatten_tol: Option<f64>,
+) -> Vec<Vec<Point2D>> {
+    if path.is_empty() || !path.is_finite() || !transform.is_finite() {
+        return Vec::new();
+    }
+    let Some(bb) = path.bounding_box() else {
+        return Vec::new();
+    };
+    let local_pad = stroke_reach_local_f64(stroke, expanded_width);
+    let stroked_local = bb.expand(local_pad);
+    if !bb.is_finite() || !local_pad.is_finite() || !stroked_local.is_finite() {
+        return Vec::new();
+    }
+    let sb = transform.transform_rect(stroked_local);
+    let clip_rect = Rect2D::new(-4.0, -4.0, f64::from(w) + 4.0, f64::from(h) + 4.0);
+    if !sb.is_finite() || !sb.intersects(clip_rect) {
+        return Vec::new();
+    }
+
+    let scale = estimate_scale_2d(transform);
+    let eff_reach_px = local_pad * scale;
+    if !eff_reach_px.is_finite() {
+        return Vec::new();
+    }
+
+    let expand_local_branch = || -> Vec<Vec<Point2D>> {
+        let local_max = bb
+            .min_x
+            .abs()
+            .max(bb.max_x.abs())
+            .max(bb.min_y.abs())
+            .max(bb.max_y.abs());
+        if !local_max.is_finite()
+            || local_max > 1e100
+            || !f64::from(expanded_width).is_finite()
+            || f64::from(expanded_width) > 1e100
+        {
+            return Vec::new();
+        }
+        let local_span = bb.width().max(bb.height()).max(f64::from(expanded_width));
+        let kb_local = path.to_kurbo();
+        let dashed_kb = if !stroke.dash_pattern.is_empty() && local_span <= 1_000_000.0 {
+            let approx_len = approx_bezier_length_f64(path);
+            sanitize_kurbo_dashes(&stroke.dash_pattern, stroke.dash_offset, 1.0, approx_len).map(
+                |(dashes, off)| {
+                    kurbo::dash(kb_local.elements().iter().copied(), off, &dashes)
+                        .collect::<kurbo::BezPath>()
+                },
+            )
+        } else {
+            None
+        };
+        let work_local = dashed_kb.as_ref().unwrap_or(&kb_local);
+        if kurbo_max_abs_coord(work_local) > 1e100 {
+            return Vec::new();
+        }
+        let stroke_tol = (local_span * 1e-5)
+            .max(flatten_tol.unwrap_or(0.05).max(1e-4))
+            .max(f64::from(expanded_width) * 1e-5);
+        let k_stroke = make_kurbo_stroke(stroke, f64::from(expanded_width));
+        let mut dev_stroked = kurbo::stroke(
+            work_local.elements().iter().copied(),
+            &k_stroke,
+            &kurbo::StrokeOpts::default(),
+            stroke_tol,
+        );
+        dev_stroked.apply_affine(kurbo::Affine::new(transform.m));
+        let dev_span = sb.width().max(sb.height());
+        let dev_tol = flatten_tol.unwrap_or(0.25).max(0.25).max(dev_span * 1e-5);
+        kurbo_outlines_to_clipped_polygons(&dev_stroked, clip_rect, dev_tol)
+    };
+
+    if eff_reach_px <= 16_384.0 {
+        let expand_pad = (eff_reach_px + 8.0).clamp(16.0, 32_768.0);
+        let expand_rect = clip_rect.expand(expand_pad);
+        let dev_path = path.transformed(&transform);
+        if is_nearly_isotropic(transform) {
+            let dev_span = dev_path
+                .bounding_box()
+                .map_or(0.0, |r| r.width().max(r.height()));
+            let dashed_dev = if !stroke.dash_pattern.is_empty()
+                && dev_span.is_finite()
+                && dev_span <= 1_000_000.0
+            {
+                let approx_len = approx_bezier_length_f64(&dev_path);
+                sanitize_kurbo_dashes(&stroke.dash_pattern, stroke.dash_offset, scale, approx_len)
+                    .map(|(dashes, off)| {
+                        let kb_dev = dev_path.to_kurbo();
+                        let dashed_kb: kurbo::BezPath =
+                            kurbo::dash(kb_dev.elements().iter().copied(), off, &dashes).collect();
+                        BezierPath::from_kurbo(&dashed_kb)
+                    })
+            } else {
+                None
+            };
+            let work_dev = dashed_dev.as_ref().unwrap_or(&dev_path);
+            let clipped_kb = clip_bezier_centerline_to_rect_f64(work_dev, expand_rect);
+            if clipped_kb.elements().is_empty() || kurbo_max_abs_coord(&clipped_kb) > 1e100 {
+                return Vec::new();
+            }
+            let k_stroke = make_kurbo_stroke(stroke, f64::from(expanded_width.max(0.0)) * scale);
+            let stroked = kurbo::stroke(
+                clipped_kb.elements().iter().copied(),
+                &k_stroke,
+                &kurbo::StrokeOpts::default(),
+                0.25,
+            );
+            let out_tol = flatten_tol.unwrap_or(0.25).max(0.25);
+            kurbo_outlines_to_clipped_polygons(&stroked, clip_rect, out_tol)
+        } else {
+            let Some(inv) = transform.inverse() else {
+                return expand_local_branch();
+            };
+            let mut clipped_local_kb = clip_bezier_centerline_to_rect_f64(&dev_path, expand_rect);
+            if clipped_local_kb.elements().is_empty() {
+                return Vec::new();
+            }
+            clipped_local_kb.apply_affine(kurbo::Affine::new(inv.m));
+            if kurbo_max_abs_coord(&clipped_local_kb) > 1e100 {
+                return expand_local_branch();
+            }
+            let local_tol = (0.25 / scale.max(1e-12)).clamp(1e-18, 0.25);
+            let k_stroke = make_kurbo_stroke(stroke, f64::from(expanded_width));
+            let mut dev_stroked = kurbo::stroke(
+                clipped_local_kb.elements().iter().copied(),
+                &k_stroke,
+                &kurbo::StrokeOpts::default(),
+                local_tol,
+            );
+            dev_stroked.apply_affine(kurbo::Affine::new(transform.m));
+            let out_tol = flatten_tol.unwrap_or(0.25).max(0.25);
+            kurbo_outlines_to_clipped_polygons(&dev_stroked, clip_rect, out_tol)
+        }
+    } else {
+        expand_local_branch()
+    }
+}
+
+fn build_clipped_device_stroke_skia_path(
+    path: &BezierPath,
+    stroke: &StrokeParams,
+    expanded_width: f32,
+    transform: Affine2D,
+    w: u32,
+    h: u32,
+    flatten_tol: Option<f64>,
+) -> Option<ts::Path> {
+    let polygons = build_clipped_device_stroke_polygons(
+        path,
+        stroke,
+        expanded_width,
+        transform,
+        w,
+        h,
+        flatten_tol,
+    );
+    if polygons.is_empty() {
+        return None;
+    }
+    let mut pb = ts::PathBuilder::new();
+    let quantize = !stroke.anti_alias;
+    let q = |v: f64| -> f32 {
+        if quantize {
+            ((v * 64.0).round() / 64.0) as f32
+        } else {
+            v as f32
+        }
+    };
+    for poly in polygons {
+        if poly.len() < 3 {
+            continue;
+        }
+        pb.move_to(q(poly[0].x), q(poly[0].y));
+        for pt in &poly[1..] {
+            pb.line_to(q(pt.x), q(pt.y));
+        }
+        pb.close();
+    }
+    pb.finish()
 }
 
 /// Sutherland-Hodgman `f64` polygon clipper against an axis-aligned rectangle.
@@ -2281,22 +3098,49 @@ impl WgpuGpuSurface {
         transform: Affine2D,
         flatten_tolerance: Option<f64>,
     ) {
-        let tol = flatten_tolerance.unwrap_or(0.25).clamp(0.05, 4.0);
-        let dev_path = path.transformed(&transform);
+        if !transform.is_finite() || transform.determinant().abs() <= 1e-12 {
+            return;
+        }
         let mut verts: Vec<GpuVertex> = Vec::new();
-        for poly in dev_path.flatten(tol) {
-            if poly.len() < 3 {
-                continue;
+        if needs_f64_device_clip(path, transform, self.width, self.height) {
+            for poly in build_clipped_device_fill_polygons(
+                path,
+                transform,
+                self.width,
+                self.height,
+                flatten_tolerance,
+            ) {
+                if poly.len() < 3 {
+                    continue;
+                }
+                let anchor = [poly[0].x as f32, poly[0].y as f32];
+                for i in 1..(poly.len() - 1) {
+                    verts.push(GpuVertex { pos: anchor });
+                    verts.push(GpuVertex {
+                        pos: [poly[i].x as f32, poly[i].y as f32],
+                    });
+                    verts.push(GpuVertex {
+                        pos: [poly[i + 1].x as f32, poly[i + 1].y as f32],
+                    });
+                }
             }
-            let anchor = [poly[0].x as f32, poly[0].y as f32];
-            for i in 1..(poly.len() - 1) {
-                verts.push(GpuVertex { pos: anchor });
-                verts.push(GpuVertex {
-                    pos: [poly[i].x as f32, poly[i].y as f32],
-                });
-                verts.push(GpuVertex {
-                    pos: [poly[i + 1].x as f32, poly[i + 1].y as f32],
-                });
+        } else {
+            let tol = flatten_tolerance.unwrap_or(0.25).clamp(0.05, 4.0);
+            let dev_path = path.transformed(&transform);
+            for poly in dev_path.flatten(tol) {
+                if poly.len() < 3 {
+                    continue;
+                }
+                let anchor = [poly[0].x as f32, poly[0].y as f32];
+                for i in 1..(poly.len() - 1) {
+                    verts.push(GpuVertex { pos: anchor });
+                    verts.push(GpuVertex {
+                        pos: [poly[i].x as f32, poly[i].y as f32],
+                    });
+                    verts.push(GpuVertex {
+                        pos: [poly[i + 1].x as f32, poly[i + 1].y as f32],
+                    });
+                }
             }
         }
         if verts.is_empty() {
@@ -2687,10 +3531,24 @@ fn build_gpu_paint(
         } => {
             let a = transform.transform_point(*start);
             let b = transform.transform_point(*end);
-            uniform.p0 = [a.x as f32, a.y as f32, b.x as f32, b.y as f32];
-            uniform.p1[3] = 1.0;
-            push_stops(st, &mut stops);
-            uniform.pat_mat0[3] = stops.len() as f32;
+            let ax = a.x as f32;
+            let ay = a.y as f32;
+            let bx = b.x as f32;
+            let by = b.y as f32;
+            if !ax.is_finite()
+                || !ay.is_finite()
+                || !bx.is_finite()
+                || !by.is_finite()
+                || estimate_scale_2d(transform) >= 1e18
+            {
+                uniform.solid_rgba = st.first().map_or([0.0; 4], |s| s.color.to_rgba_f32());
+                uniform.p1[3] = 0.0;
+            } else {
+                uniform.p0 = [ax, ay, bx, by];
+                uniform.p1[3] = 1.0;
+                push_stops(st, &mut stops);
+                uniform.pat_mat0[3] = stops.len() as f32;
+            }
         }
         PaintShader::RadialGradient {
             focal,
@@ -2850,24 +3708,84 @@ impl CanvasBackend for WgpuBackend {
     }
 
     fn stroke_path(&mut self, path: &BezierPath, stroke: &StrokeParams, transform: Affine2D) {
+        if !transform.is_finite()
+            || transform.determinant().abs() <= 1e-12
+            || !stroke.width.is_finite()
+            || stroke.width <= 1e-6
+            || !stroke.opacity.is_finite()
+            || stroke.opacity <= 1e-6
+        {
+            return;
+        }
         if let Some(ref mut gpu) = self.gpu {
-            let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) else {
-                return;
-            };
             let scale = estimate_scale_2d(transform);
-            let res_scale = (scale as f32).clamp(0.1, 64.0);
-            let dash = build_stroke_dash(&stroke.dash_pattern, stroke.dash_offset);
-            let dashed = dash.as_ref().and_then(|d| ts_path.dash(d, res_scale));
-            let src = dashed.as_ref().unwrap_or(&ts_path);
             let eff_px = stroke.width * (scale as f32);
             let (w, op) = if eff_px < 1.0 {
-                (
-                    ((1.0 / scale.max(1e-6)) as f32).max(stroke.width),
-                    (stroke.opacity * eff_px).clamp(0.0, 1.0),
-                )
+                let op = if stroke.anti_alias {
+                    (stroke.opacity * eff_px).clamp(0.0, 1.0)
+                } else {
+                    stroke.opacity
+                };
+                (((1.0 / scale.max(1e-6)) as f32).max(stroke.width), op)
             } else {
                 (stroke.width, stroke.opacity)
             };
+            if !op.is_finite() || op <= 1e-6 {
+                return;
+            }
+            if needs_f64_device_clip_for_stroke(path, stroke, w, transform, self.width, self.height)
+            {
+                let polygons = build_clipped_device_stroke_polygons(
+                    path,
+                    stroke,
+                    w,
+                    transform,
+                    self.width,
+                    self.height,
+                    self.flatten_tolerance,
+                );
+                if polygons.is_empty() {
+                    return;
+                }
+                let mut clipped_bp = BezierPath::new();
+                for poly in polygons {
+                    if poly.len() >= 3 {
+                        clipped_bp
+                            .subpaths
+                            .push(coree_core::Subpath::from_points(poly, true));
+                    }
+                }
+                if clipped_bp.is_empty() {
+                    return;
+                }
+                let paint = BackendPaint {
+                    shader: PaintShader::Solid(stroke.color.clone()),
+                    opacity: op,
+                    blend_mode: stroke.blend_mode,
+                    anti_alias: stroke.anti_alias,
+                };
+                gpu.fill_path_gpu(
+                    &clipped_bp,
+                    &paint,
+                    FillRule::Winding,
+                    Affine2D::IDENTITY,
+                    self.flatten_tolerance,
+                );
+                return;
+            }
+            let Some(ts_path) = bezier_to_skia_path(path, self.flatten_tolerance) else {
+                return;
+            };
+            let res_scale = (scale as f32).clamp(0.1, 64.0);
+            let dash = build_stroke_dash(&stroke.dash_pattern, stroke.dash_offset);
+            let dashed = dash.as_ref().and_then(|d| {
+                if estimate_dash_count(&ts_path, &stroke.dash_pattern) <= MAX_LOCAL_DASH_SEGMENTS {
+                    ts_path.dash(d, res_scale)
+                } else {
+                    None
+                }
+            });
+            let src = dashed.as_ref().unwrap_or(&ts_path);
             let ts_stroke = ts::Stroke {
                 width: w,
                 miter_limit: stroke.miter_limit.max(1.0),
@@ -2971,8 +3889,13 @@ impl CanvasBackend for WgpuBackend {
         blend_mode: BlendMode,
         smooth: bool,
     ) {
+        let opacity = sanitize_f32(opacity, 1.0).clamp(0.0, 1.0);
         if let Some(ref mut gpu) = self.gpu {
-            if image.is_empty() || opacity <= 1e-6 {
+            if !transform.is_finite()
+                || transform.determinant().abs() <= 1e-12
+                || image.is_empty()
+                || opacity <= 1e-6
+            {
                 return;
             }
             let paint = BackendPaint {
@@ -3423,6 +4346,62 @@ mod wgpu_tests {
         assert!(
             estimate_dash_count(&huge, &[1e-5, 1e-5]) > MAX_LOCAL_DASH_SEGMENTS,
             "Pathological sub-micron dash density must remain guarded"
+        );
+    }
+
+    #[test]
+    fn wgpu_backend_extreme_1e15_and_dense_dash_stroke_guards() {
+        let mut kb = kurbo::BezPath::new();
+        kb.move_to((0.0, 0.0));
+        kb.curve_to((10.0, 20.0), (40.0, 30.0), (50.0, 50.0));
+        kb.close_path();
+        let curve = BezierPath::from_kurbo(&kb);
+
+        let t0 = std::time::Instant::now();
+        let mut gpu = WgpuBackend::new(128, 128).unwrap();
+        gpu.clear(Color::WHITE);
+
+        let stroke = StrokeParams {
+            color: Color::BLACK,
+            width: 2.0,
+            cap: LineCap::Round,
+            join: LineJoin::Round,
+            miter_limit: 4.0,
+            dash_pattern: vec![4.0, 2.0],
+            dash_offset: 0.5,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            anti_alias: true,
+        };
+        // Disjoint 1e15 transform
+        gpu.stroke_path(
+            &curve,
+            &stroke,
+            Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, -1e15),
+        );
+        // Intersecting 1e15 transform + active 1e15 push_clip
+        let xf_origin = Affine2D::new(1e15, 0.0, 0.0, 1e15, 0.0, 0.0);
+        gpu.push_clip(&curve, FillRule::EvenOdd, xf_origin);
+        gpu.stroke_path(&curve, &stroke, xf_origin);
+        gpu.pop_clip();
+
+        // Dense pathological dash pattern on 10,000-unit line
+        let long_line = BezierPath::from_subpath(coree_core::Subpath::from_points(
+            [Point2D::new(0.0, 10.0), Point2D::new(10_000.0, 10.0)],
+            false,
+        ));
+        let dense_stroke = StrokeParams {
+            dash_pattern: vec![1e-5, 1e-5],
+            ..stroke
+        };
+        gpu.stroke_path(&long_line, &dense_stroke, Affine2D::IDENTITY);
+
+        let buf = gpu.into_rgba();
+        assert_eq!(buf.rgba.len(), 128 * 128 * 4);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "WgpuBackend 1e15 & dense dash guards took {:?}",
+            t0.elapsed()
         );
     }
 }

@@ -28,6 +28,12 @@ pub const MAX_CHUNKS: usize = 500_000;
 /// Default maximum number of entries permitted in a ZIP container (`10_000`).
 pub const MAX_ZIP_ENTRIES: usize = 10_000;
 
+/// Default maximum total scene objects decoded from a CDR/CMX document (`100_000`).
+pub const MAX_CDR_OBJECTS: usize = 100_000;
+
+/// Default maximum cumulative curve vertices/nodes decoded from a CDR/CMX document (`2_000_000`).
+pub const MAX_CDR_VERTICES: usize = 2_000_000;
+
 /// Minimum decompressed payload bytes before applying compression-ratio rejection
 /// (avoids false positives on tiny legitimate streams such as 40-byte MIME headers).
 const RATIO_CHECK_MIN_BYTES: u64 = 4096;

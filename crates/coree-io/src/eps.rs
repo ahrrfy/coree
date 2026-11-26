@@ -27,6 +27,8 @@ const MAX_PS_STEPS: usize = 2_000_000;
 const MAX_PS_TOKENS: usize = 2_000_000;
 const MAX_PS_STACK_LEN: usize = 4_096;
 const MAX_PS_STACK_NODES: usize = 100_000;
+const MAX_PS_EMITTED_OBJECTS: usize = 100_000;
+const MAX_PS_TOTAL_VERTICES: usize = 2_000_000;
 const MAX_EPS_INPUT_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
 const MAX_PS_STREAM_BYTES: usize = MAX_EPS_INPUT_BYTES;
 
@@ -195,10 +197,14 @@ fn emit_eps_display_op(
             artistic,
             fallback_curves,
             outline,
+            opacity,
             world_xf,
             is_perspective,
             ..
         } => {
+            if *opacity <= 1e-4 {
+                return;
+            }
             let plain = artistic.plain_text();
             let style = artistic
                 .runs
@@ -220,14 +226,16 @@ fn emit_eps_display_op(
                     || style.font_family.eq_ignore_ascii_case("Helvetica")
                     || style.font_family.eq_ignore_ascii_case("Arial"));
             if is_simple_ascii_helvetica {
-                emit_eps_ascii_type1_text(page, &plain, &style, *world_xf, use_cmyk, out);
+                let mut eff_style = style.clone();
+                eff_style.fill = apply_eps_opacity_to_color(&style.fill, *opacity);
+                emit_eps_ascii_type1_text(page, &plain, &eff_style, *world_xf, use_cmyk, out);
             } else {
                 let xf = if *is_perspective {
                     Affine2D::IDENTITY
                 } else {
                     *world_xf
                 };
-                emit_eps_shaped_pieces(page, fallback_curves, outline, xf, use_cmyk, out);
+                emit_eps_shaped_pieces(page, fallback_curves, outline, *opacity, xf, use_cmyk, out);
             }
         }
     }
@@ -577,7 +585,10 @@ fn apply_eps_opacity_to_color(c: &Color, opacity: f32) -> Color {
     } else {
         1.0
     };
-    if (op - 1.0).abs() <= 1e-4 {
+    if c.alpha() <= 1e-6 {
+        return c.clone();
+    }
+    if (op - 1.0).abs() <= 1e-4 && (c.alpha() - 1.0).abs() <= 1e-4 {
         return c.clone();
     }
     match c {
@@ -649,6 +660,67 @@ fn apply_eps_opacity_to_fill(fill: &Fill, opacity: f32) -> Fill {
             stops: stops
                 .iter()
                 .map(|s| GradientStop::new(s.offset, apply_eps_opacity_to_color(&s.color, op)))
+                .collect(),
+        },
+        Fill::ConicalGradient {
+            center,
+            angle_deg,
+            stops,
+        } => Fill::ConicalGradient {
+            center: *center,
+            angle_deg: *angle_deg,
+            stops: stops
+                .iter()
+                .map(|s| GradientStop::new(s.offset, apply_eps_opacity_to_color(&s.color, op)))
+                .collect(),
+        },
+        Fill::SquareGradient {
+            center,
+            size,
+            angle_deg,
+            stops,
+        } => Fill::SquareGradient {
+            center: *center,
+            size: *size,
+            angle_deg: *angle_deg,
+            stops: stops
+                .iter()
+                .map(|s| GradientStop::new(s.offset, apply_eps_opacity_to_color(&s.color, op)))
+                .collect(),
+        },
+        Fill::TwoColorPattern {
+            fg,
+            bg,
+            pattern_name,
+            tile_w,
+            tile_h,
+        } => Fill::TwoColorPattern {
+            fg: apply_eps_opacity_to_color(fg, op),
+            bg: apply_eps_opacity_to_color(bg, op),
+            pattern_name: pattern_name.clone(),
+            tile_w: *tile_w,
+            tile_h: *tile_h,
+        },
+        Fill::TextureFill {
+            preset,
+            seed,
+            fg,
+            bg,
+        } => Fill::TextureFill {
+            preset: preset.clone(),
+            seed: *seed,
+            fg: apply_eps_opacity_to_color(fg, op),
+            bg: apply_eps_opacity_to_color(bg, op),
+        },
+        Fill::MeshFill { rows, cols, nodes } => Fill::MeshFill {
+            rows: *rows,
+            cols: *cols,
+            nodes: nodes
+                .iter()
+                .map(|n| coree_core::MeshNode {
+                    color: apply_eps_opacity_to_color(&n.color, op),
+                    ..n.clone()
+                })
                 .collect(),
         },
         other => other.clone(),
@@ -783,21 +855,34 @@ fn emit_eps_shaped_pieces(
     page: &Page,
     pieces: &[coree_render::ShapedGlyphDraw],
     outline: &OutlineStyle,
+    opacity: f32,
     world_xf: Affine2D,
     use_cmyk: bool,
     out: &mut String,
 ) {
+    let mut eff_outline = outline.clone();
+    if eff_outline.is_visible() && (opacity - 1.0).abs() > 1e-4 {
+        eff_outline.color = apply_eps_opacity_to_color(&eff_outline.color, opacity);
+    }
     for piece in pieces {
         if piece.path.is_empty() {
             continue;
         }
         let world_path = piece.path.transformed(&world_xf);
         let fill = if piece.fill.alpha() > 1e-6 {
-            Fill::Solid(piece.fill.clone())
+            Fill::Solid(apply_eps_opacity_to_color(&piece.fill, opacity))
         } else {
             Fill::None
         };
-        emit_eps_styled_path(page, &world_path, &fill, outline, world_xf, use_cmyk, out);
+        emit_eps_styled_path(
+            page,
+            &world_path,
+            &fill,
+            &eff_outline,
+            world_xf,
+            use_cmyk,
+            out,
+        );
     }
 }
 
@@ -1127,7 +1212,7 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
         Ok(())
     };
 
-    for (idx, item) in interp.emitted.into_iter().enumerate() {
+    for (idx, item) in interp.emitted.drain(..).enumerate() {
         match item {
             EpsEmitted::ClipPush { eps_path } => {
                 let mut bez = BezierPath::from_kurbo(&eps_path);
@@ -1264,6 +1349,7 @@ pub fn import_eps_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
     while !clip_stack.is_empty() {
         flush_one_clip(&mut doc, &mut clip_stack, usize::MAX - 1)?;
     }
+    drop(interp);
 
     doc.refresh_document_palette();
     Ok(doc)
@@ -2030,6 +2116,7 @@ struct PsInterpreter {
     subpath_start: Option<Point2D>,
     emitted: Vec<EpsEmitted>,
     steps: usize,
+    total_vertices: usize,
     saw_cmyk: bool,
     saw_rgb: bool,
 }
@@ -2049,9 +2136,49 @@ impl PsInterpreter {
             subpath_start: None,
             emitted: Vec::new(),
             steps: 0,
+            total_vertices: 0,
             saw_cmyk: false,
             saw_rgb: false,
         }
+    }
+
+    fn check_current_path_vertices(&self, incoming: usize) -> IoResult<()> {
+        let projected = self
+            .total_vertices
+            .saturating_add(self.path.elements().len())
+            .saturating_add(incoming);
+        if projected > MAX_PS_TOTAL_VERTICES {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_ps_vertices={MAX_PS_TOTAL_VERTICES}"),
+                actual: format!("EPS vertex count {projected} exceeded {MAX_PS_TOTAL_VERTICES}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn push_emitted(&mut self, item: EpsEmitted) -> IoResult<()> {
+        if self.emitted.len() >= MAX_PS_EMITTED_OBJECTS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_ps_objects={MAX_PS_EMITTED_OBJECTS}"),
+                actual: format!("EPS emitted object count exceeded {MAX_PS_EMITTED_OBJECTS}"),
+            });
+        }
+        let verts = match &item {
+            EpsEmitted::Path { eps_path, .. } | EpsEmitted::ClipPush { eps_path } => {
+                eps_path.elements().len()
+            }
+            _ => 0,
+        };
+        let next_verts = self.total_vertices.saturating_add(verts);
+        if next_verts > MAX_PS_TOTAL_VERTICES {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_ps_vertices={MAX_PS_TOTAL_VERTICES}"),
+                actual: format!("EPS vertex count {next_verts} exceeded {MAX_PS_TOTAL_VERTICES}"),
+            });
+        }
+        self.total_vertices = next_verts;
+        self.emitted.push(item);
+        Ok(())
     }
 
     fn charge_step(&mut self) -> IoResult<()> {
@@ -2354,7 +2481,7 @@ impl PsInterpreter {
             "grestore" | "Q" => {
                 if let Some(prev) = self.gstack.pop() {
                     for _ in 0..self.gstate.clip_count {
-                        self.emitted.push(EpsEmitted::ClipPop);
+                        self.push_emitted(EpsEmitted::ClipPop)?;
                     }
                     self.gstate = prev;
                 }
@@ -2572,6 +2699,7 @@ impl PsInterpreter {
             "newpath" | "n" | "N" => self.clear_path(),
             "moveto" | "m" => {
                 if let (Some(y), Some(x)) = (self.pop_f64(), self.pop_f64()) {
+                    self.check_current_path_vertices(1)?;
                     let p = self.gstate.ctm.transform_point(Point2D::new(x, y));
                     self.path.move_to(p.to_kurbo());
                     self.cur_pt = Some(p);
@@ -2580,6 +2708,7 @@ impl PsInterpreter {
             }
             "rmoveto" => {
                 if let (Some(dy), Some(dx)) = (self.pop_f64(), self.pop_f64()) {
+                    self.check_current_path_vertices(1)?;
                     let base = self.cur_pt.unwrap_or(Point2D::ZERO);
                     let delta = self
                         .gstate
@@ -2593,6 +2722,7 @@ impl PsInterpreter {
             }
             "lineto" | "l" | "L" => {
                 if let (Some(y), Some(x)) = (self.pop_f64(), self.pop_f64()) {
+                    self.check_current_path_vertices(1)?;
                     let p = self.gstate.ctm.transform_point(Point2D::new(x, y));
                     if self.cur_pt.is_none() {
                         self.path.move_to(p.to_kurbo());
@@ -2605,6 +2735,7 @@ impl PsInterpreter {
             }
             "rlineto" => {
                 if let (Some(dy), Some(dx)) = (self.pop_f64(), self.pop_f64()) {
+                    self.check_current_path_vertices(1)?;
                     let base = self.cur_pt.unwrap_or(Point2D::ZERO);
                     let delta = self
                         .gstate
@@ -2629,6 +2760,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
+                    self.check_current_path_vertices(2)?;
                     let p1 = self.gstate.ctm.transform_point(Point2D::new(x1, y1));
                     let p2 = self.gstate.ctm.transform_point(Point2D::new(x2, y2));
                     let p3 = self.gstate.ctm.transform_point(Point2D::new(x3, y3));
@@ -2650,6 +2782,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
+                    self.check_current_path_vertices(2)?;
                     let base = self.cur_pt.unwrap_or(Point2D::ZERO);
                     let p1 = base
                         + self
@@ -2682,6 +2815,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
+                    self.check_current_path_vertices(1)?;
                     let p1 = self.cur_pt.unwrap_or(Point2D::ZERO);
                     let p2 = self.gstate.ctm.transform_point(Point2D::new(x2, y2));
                     let p3 = self.gstate.ctm.transform_point(Point2D::new(x3, y3));
@@ -2697,6 +2831,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
+                    self.check_current_path_vertices(1)?;
                     let p1 = self.gstate.ctm.transform_point(Point2D::new(x1, y1));
                     let p3 = self.gstate.ctm.transform_point(Point2D::new(x3, y3));
                     self.path
@@ -2712,7 +2847,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
-                    self.append_ps_arc(xc, yc, r, a1, a2, false);
+                    self.append_ps_arc(xc, yc, r, a1, a2, false)?;
                 }
             }
             "arcn" => {
@@ -2723,7 +2858,7 @@ impl PsInterpreter {
                     self.pop_f64(),
                     self.pop_f64(),
                 ) {
-                    self.append_ps_arc(xc, yc, r, a1, a2, true);
+                    self.append_ps_arc(xc, yc, r, a1, a2, true)?;
                 }
             }
             "closepath" => {
@@ -2740,11 +2875,11 @@ impl PsInterpreter {
                     self.pop_f64(),
                 ) {
                     let rp = self.build_rect_path(x, y, w, h);
-                    self.emitted.push(EpsEmitted::Path {
+                    self.push_emitted(EpsEmitted::Path {
                         eps_path: rp,
                         fill: Fill::Solid(self.gstate.fill_color.clone()),
                         outline: OutlineStyle::none(),
-                    });
+                    })?;
                 }
             }
             "rectstroke" => {
@@ -2756,11 +2891,11 @@ impl PsInterpreter {
                 ) {
                     let rp = self.build_rect_path(x, y, w, h);
                     let outline = self.current_outline();
-                    self.emitted.push(EpsEmitted::Path {
+                    self.push_emitted(EpsEmitted::Path {
                         eps_path: rp,
                         fill: Fill::None,
                         outline,
-                    });
+                    })?;
                 }
             }
             "rectclip" => {
@@ -2773,27 +2908,27 @@ impl PsInterpreter {
                     let rp = self.build_rect_path(x, y, w, h);
                     if !rp.is_empty() {
                         self.gstate.clip_count += 1;
-                        self.emitted.push(EpsEmitted::ClipPush { eps_path: rp });
+                        self.push_emitted(EpsEmitted::ClipPush { eps_path: rp })?;
                     }
                 }
             }
             "clip" | "eoclip" => {
                 if !self.path.is_empty() {
                     self.gstate.clip_count += 1;
-                    self.emitted.push(EpsEmitted::ClipPush {
+                    self.push_emitted(EpsEmitted::ClipPush {
                         eps_path: self.path.clone(),
-                    });
+                    })?;
                 }
             }
 
             // Painting
-            "fill" | "eofill" => self.emit_current_path(true, false, false),
-            "f" => self.emit_current_path(true, false, true),
-            "F" => self.emit_current_path(true, false, false),
-            "stroke" | "S" => self.emit_current_path(false, true, false),
-            "s" => self.emit_current_path(false, true, true),
-            "b" => self.emit_current_path(true, true, true),
-            "B" => self.emit_current_path(true, true, false),
+            "fill" | "eofill" => self.emit_current_path(true, false, false)?,
+            "f" => self.emit_current_path(true, false, true)?,
+            "F" => self.emit_current_path(true, false, false)?,
+            "stroke" | "S" => self.emit_current_path(false, true, false)?,
+            "s" => self.emit_current_path(false, true, true)?,
+            "b" => self.emit_current_path(true, true, true)?,
+            "B" => self.emit_current_path(true, true, false)?,
 
             // Fonts & Text
             "findfont" => {
@@ -2875,37 +3010,37 @@ impl PsInterpreter {
             }
             "show" => {
                 if let Some(PsVal::Str(raw)) = self.pop() {
-                    self.emit_text(&raw);
+                    self.emit_text(&raw)?;
                 }
             }
             "ashow" => {
                 if let (Some(PsVal::Str(raw)), Some(_ay), Some(_ax)) =
                     (self.pop(), self.pop_f64(), self.pop_f64())
                 {
-                    self.emit_text(&raw);
+                    self.emit_text(&raw)?;
                 }
             }
             "widthshow" => {
                 if let (Some(PsVal::Str(raw)), Some(_ch), Some(_cy), Some(_cx)) =
                     (self.pop(), self.pop_f64(), self.pop_f64(), self.pop_f64())
                 {
-                    self.emit_text(&raw);
+                    self.emit_text(&raw)?;
                 }
             }
             "kshow" => {
                 if let (Some(PsVal::Str(raw)), Some(_proc)) = (self.pop(), self.pop()) {
-                    self.emit_text(&raw);
+                    self.emit_text(&raw)?;
                 }
             }
             "shfill" => {
                 if let Some(PsVal::Dict(entries)) = self.pop() {
                     if let Some((eps_path, fill)) = parse_ps_shfill_dict(&entries, &self.gstate.ctm)
                     {
-                        self.emitted.push(EpsEmitted::Path {
+                        self.push_emitted(EpsEmitted::Path {
                             eps_path,
                             fill,
                             outline: OutlineStyle::none(),
-                        });
+                        })?;
                     }
                 }
             }
@@ -2995,12 +3130,12 @@ impl PsInterpreter {
                                                 }
                                             }
                                         }
-                                        self.emitted.push(EpsEmitted::Raster {
+                                        self.push_emitted(EpsEmitted::Raster {
                                             width: w,
                                             height: h,
                                             rgba_bytes: rgba,
                                             ctm: self.gstate.ctm,
-                                        });
+                                        })?;
                                     }
                                 }
                             }
@@ -3048,12 +3183,12 @@ impl PsInterpreter {
                                         ]);
                                     }
                                 }
-                                self.emitted.push(EpsEmitted::Raster {
+                                self.push_emitted(EpsEmitted::Raster {
                                     width: w,
                                     height: h,
                                     rgba_bytes: rgba,
                                     ctm: self.gstate.ctm,
-                                });
+                                })?;
                             }
                         }
                     }
@@ -3084,7 +3219,15 @@ impl PsInterpreter {
         p
     }
 
-    fn append_ps_arc(&mut self, xc: f64, yc: f64, r: f64, ang1_deg: f64, ang2_deg: f64, cw: bool) {
+    fn append_ps_arc(
+        &mut self,
+        xc: f64,
+        yc: f64,
+        r: f64,
+        ang1_deg: f64,
+        ang2_deg: f64,
+        cw: bool,
+    ) -> IoResult<()> {
         if !(xc.is_finite()
             && yc.is_finite()
             && r.is_finite()
@@ -3092,7 +3235,7 @@ impl PsInterpreter {
             && ang2_deg.is_finite())
             || r <= 0.0
         {
-            return;
+            return Ok(());
         }
         // O(1) modular angle normalization (never loops on extreme angles like 1e20)
         let mut a1 = ang1_deg.rem_euclid(360.0).to_radians();
@@ -3110,6 +3253,9 @@ impl PsInterpreter {
             delta_ccw.to_radians()
         };
 
+        let segs = ((total_sweep.abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).clamp(1, 32);
+        self.check_current_path_vertices(1 + segs)?;
+
         let start_u = Point2D::new(xc + r * a1.cos(), yc + r * a1.sin());
         let start_d = self.gstate.ctm.transform_point(start_u);
         if self.cur_pt.is_none() {
@@ -3120,7 +3266,6 @@ impl PsInterpreter {
         }
         self.cur_pt = Some(start_d);
 
-        let segs = ((total_sweep.abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).clamp(1, 32);
         let step = total_sweep / (segs as f64);
         let kappa = (4.0 / 3.0) * (step / 4.0).tan();
 
@@ -3141,6 +3286,7 @@ impl PsInterpreter {
             self.cur_pt = Some(d3);
             a1 = next_a;
         }
+        Ok(())
     }
 
     fn current_outline(&self) -> OutlineStyle {
@@ -3161,7 +3307,7 @@ impl PsInterpreter {
         out
     }
 
-    fn emit_current_path(&mut self, do_fill: bool, do_stroke: bool, close: bool) {
+    fn emit_current_path(&mut self, do_fill: bool, do_stroke: bool, close: bool) -> IoResult<()> {
         if close && self.cur_pt.is_some() {
             self.path.close_path();
         }
@@ -3169,7 +3315,7 @@ impl PsInterpreter {
         self.cur_pt = None;
         self.subpath_start = None;
         if path.is_empty() {
-            return;
+            return Ok(());
         }
         let fill = if do_fill {
             Fill::Solid(self.gstate.fill_color.clone())
@@ -3181,17 +3327,17 @@ impl PsInterpreter {
         } else {
             OutlineStyle::none()
         };
-        self.emitted.push(EpsEmitted::Path {
+        self.push_emitted(EpsEmitted::Path {
             eps_path: path,
             fill,
             outline,
-        });
+        })
     }
 
-    fn emit_text(&mut self, raw: &[u8]) {
+    fn emit_text(&mut self, raw: &[u8]) -> IoResult<()> {
         let text: String = raw.iter().map(|&b| char::from(b)).collect();
         if text.is_empty() {
-            return;
+            return Ok(());
         }
         // Recover current point in user space so `ctm` + `origin_eps` compose cleanly
         let cur_dev = self.cur_pt.unwrap_or(Point2D::ZERO);
@@ -3200,7 +3346,7 @@ impl PsInterpreter {
             .ctm
             .inverse()
             .map_or(cur_dev, |inv| inv.transform_point(cur_dev));
-        self.emitted.push(EpsEmitted::Text {
+        self.push_emitted(EpsEmitted::Text {
             text,
             font_family: self.gstate.font_family.clone(),
             font_size_pt: self.gstate.font_size_pt,
@@ -3209,7 +3355,7 @@ impl PsInterpreter {
             color: self.gstate.fill_color.clone(),
             ctm: self.gstate.ctm,
             origin_eps: origin_user,
-        });
+        })
     }
 }
 
@@ -3895,6 +4041,81 @@ grestore\n\
         assert!(
             matches!(flood_res, Err(IoError::LimitExceeded { .. })),
             "expected LimitExceeded for full 'z'-flood, got {flood_res:?}"
+        );
+    }
+
+    #[test]
+    fn tier5_eps_export_applies_opacity_to_text_runs_and_pattern_fills() {
+        let mut doc = Document::new("EPS Opacity", 100.0, 100.0, ColorMode::Rgb, 300.0);
+        let mut txt = SceneObject::new(
+            ObjectId(0),
+            "AlphaText",
+            NodePayload::ArtisticText(coree_core::ArtisticText::from_plain(
+                "TEST",
+                coree_core::TextStyle {
+                    font_size_pt: 18.0,
+                    fill: Color::BLACK,
+                    ..coree_core::TextStyle::default()
+                },
+            )),
+        )
+        .with_transform(Affine2D::translate(10.0, 25.0));
+        txt.opacity = 0.2;
+        doc.add_object(txt, None).unwrap();
+
+        let mut pat = SceneObject::new(
+            ObjectId(0),
+            "AlphaPattern",
+            NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                10.0, 40.0, 30.0, 30.0,
+            ))),
+        )
+        .with_fill(Fill::TwoColorPattern {
+            fg: Color::BLACK,
+            bg: Color::WHITE,
+            pattern_name: "Checker".to_owned(),
+            tile_w: 5.0,
+            tile_h: 5.0,
+        })
+        .with_outline(OutlineStyle::none());
+        pat.opacity = 0.2;
+        doc.add_object(pat, None).unwrap();
+
+        let eps = export_eps_to_string(&doc, 0).unwrap();
+        assert!(
+            eps.contains("0.8000 0.8000 0.8000 setrgbcolor"),
+            "EPS must blend 0.2-opacity black text and TwoColorPattern fg against paper white:\n{eps}"
+        );
+        assert!(
+            !eps.contains("0.0000 0.0000 0.0000 setrgbcolor"),
+            "EPS must NOT emit full 0.0000 opaque black when opacity=0.2:\n{eps}"
+        );
+    }
+
+    #[test]
+    fn eps_repeat_object_bomb_rejects_cleanly() {
+        let bomb = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n30 { 10000 { 0 0 10 10 rectfill } repeat } repeat\n%%EOF\n";
+        let err = import_eps_bytes(bomb, "EpsObjBomb").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on 300k rectfill repeat bomb, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn eps_clip_and_arc_vertex_amplification_rejects_cleanly() {
+        let clip_bomb = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n0 0 moveto 10000 { 1 0 lineto } repeat 500 { clip } repeat\n%%EOF\n";
+        let err = import_eps_bytes(clip_bomb, "EpsClipVertexBomb").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { ref limit, .. } if limit.contains("max_ps_vertices")),
+            "expected LimitExceeded(max_ps_vertices) on repeated clip bomb, got {err:?}"
+        );
+
+        let arc_bomb = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n/a { 0 0 10 0 360 arc } def 100 { 10000 { a } repeat } repeat fill\n%%EOF\n";
+        let err2 = import_eps_bytes(arc_bomb, "EpsArcVertexBomb").unwrap_err();
+        assert!(
+            matches!(err2, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on repeated arc bomb, got {err2:?}"
         );
     }
 }

@@ -3031,3 +3031,104 @@ fn w5a_coree_prod_pdf417_quad_persp_text_effects_preflight() {
         "perspective ArtisticText must not render at unwarped origin (5,5)"
     );
 }
+
+#[test]
+fn tier5_rhai_sandbox_infinite_loop_and_deep_cql() {
+    // 1. Rhai infinite loop must terminate via max_operations with atomic rollback (zero doc mutation)
+    let mut doc = Document::new("Sandbox", 200.0, 200.0, ColorMode::Rgb, 300.0);
+    let rid = doc
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "OriginalBox",
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    10.0, 10.0, 30.0, 30.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::CYAN)),
+            None,
+        )
+        .unwrap();
+    let err = run_macro(
+        &mut doc,
+        "set_fill_rgb(all_object_ids(), 1.0, 0.0, 0.0); loop {}",
+        &std::collections::BTreeMap::new(),
+        &coree_prod::MacroSandboxConfig::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, coree_prod::ProdError::MacroError(_)),
+        "expected MacroError on infinite loop sandbox abort, got {err:?}"
+    );
+    assert_eq!(
+        doc.object(rid).unwrap().fill,
+        Fill::Solid(Color::CYAN),
+        "aborted macro must atomically roll back partial fill mutation"
+    );
+
+    // 2. 5,000-level nested CQL parentheses must reject cleanly via MAX_CQL_DEPTH without stack overflow
+    let deep_cql = format!("{}name = \"X\"{}", "(".repeat(5000), ")".repeat(5000));
+    let cql_err = coree_prod::parse_cql_query(&deep_cql).unwrap_err();
+    assert!(
+        matches!(cql_err, coree_prod::ProdError::InvalidParameter(_)),
+        "expected InvalidParameter on 5,000-deep CQL nesting, got {cql_err:?}"
+    );
+}
+
+#[test]
+fn tier5_print_merge_streaming_malformed_quotes_and_10k_rows() {
+    let mut template = Document::new("Merge10k", 100.0, 60.0, ColorMode::Rgb, 300.0);
+    template
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "BadgeField",
+                NodePayload::ArtisticText(coree_core::ArtisticText::from_plain(
+                    "Hi {NAME}!",
+                    coree_core::TextStyle::default(),
+                )),
+            ),
+            None,
+        )
+        .unwrap();
+
+    // 1. Streaming 10,000 rows + mismatched column count finishes cleanly
+    let mut csv = String::with_capacity(220_000);
+    csv.push_str("NAME,CODE\n");
+    for i in 0..9999 {
+        csv.push_str(&format!("User_{i},C{i:05}\n"));
+    }
+    csv.push_str("ShortRowOnlyOneCol\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("merge_10k.csv");
+    let pdf_path = dir.path().join("merge_10k.pdf");
+    std::fs::write(&csv_path, csv.as_bytes()).unwrap();
+
+    let count = coree_prod::stream_print_merge_csv_to_pdf(
+        &template,
+        &csv_path,
+        &pdf_path,
+        &coree_prod::PrintMergeOptions::default(),
+    )
+    .expect("streaming CSV print merge must handle 10k rows and mismatched columns cleanly");
+    assert_eq!(count, 10_000);
+    let out_pdf = std::fs::read(&pdf_path).unwrap();
+    assert!(out_pdf.starts_with(b"%PDF-"));
+
+    // 2. Unterminated quoted CSV field rejects with CsvParseError (never panics or loops)
+    let bad_csv_path = dir.path().join("unclosed.csv");
+    let bad_pdf_path = dir.path().join("unclosed.pdf");
+    std::fs::write(&bad_csv_path, b"NAME,CODE\n\"UnclosedQuoteRow,C99999\n").unwrap();
+    let bad_err = coree_prod::stream_print_merge_csv_to_pdf(
+        &template,
+        &bad_csv_path,
+        &bad_pdf_path,
+        &coree_prod::PrintMergeOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(bad_err, coree_prod::ProdError::CsvParseError { .. }),
+        "expected CsvParseError on unterminated quote, got {bad_err:?}"
+    );
+}

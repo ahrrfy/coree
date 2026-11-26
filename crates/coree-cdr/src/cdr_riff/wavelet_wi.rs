@@ -163,6 +163,14 @@ pub fn decode_wi_to_rgba_with_budget(
         .and_then(|n| n.checked_mul(usize::from(channels)))
         .and_then(|n| n.checked_mul(2))
         .ok_or(CdrError::ArithmeticOverflow("WI subband bytes"))?;
+    let total_needed = (expected_subband_bytes as u64)
+        .checked_add(rgba_len as u64)
+        .ok_or(CdrError::ArithmeticOverflow("WI total budget"))?;
+    if total_needed > *budget_remaining {
+        return Err(CdrError::UncompressedSizeLimitExceeded {
+            limit: limits.max_uncompressed_bytes,
+        });
+    }
 
     let decompressed = decompress_zlib_bounded(r.read_rest(), limits, budget_remaining)?;
     if decompressed.len() != expected_subband_bytes {

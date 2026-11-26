@@ -203,6 +203,37 @@ pub(crate) fn render_underlay_effects_with_sym(
     icc: &IccColorPipeline,
     backend: &mut dyn CanvasBackend,
 ) {
+    render_underlay_effects_with_sym_and_deform(
+        doc,
+        obj,
+        deformed_local_path,
+        world_xf,
+        parent_to_screen,
+        page_to_surface,
+        sym_ctx,
+        None,
+        px_per_mm,
+        anti_alias,
+        icc,
+        backend,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_underlay_effects_with_sym_and_deform(
+    doc: &Document,
+    obj: &SceneObject,
+    deformed_local_path: &BezierPath,
+    world_xf: Affine2D,
+    parent_to_screen: Affine2D,
+    page_to_surface: Affine2D,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    deform_ctx: Option<(&[crate::renderer::DeformFrame<'_>], Affine2D)>,
+    px_per_mm: f64,
+    anti_alias: bool,
+    icc: &IccColorPipeline,
+    backend: &mut dyn CanvasBackend,
+) {
     if !world_xf.is_finite() || !parent_to_screen.is_finite() || !page_to_surface.is_finite() {
         return;
     }
@@ -322,6 +353,7 @@ pub(crate) fn render_underlay_effects_with_sym(
                     *along_path,
                     *rotate_along_path,
                     sym_ctx,
+                    deform_ctx,
                     page_to_surface,
                     px_per_mm,
                     anti_alias,
@@ -469,6 +501,7 @@ pub(crate) fn stroke_wireframe_effects(
                     *along_path,
                     *rotate_along_path,
                     sym_ctx,
+                    None,
                     &icc,
                     false,
                 ) {
@@ -1726,6 +1759,34 @@ struct ComputedBlendStep {
     outline_color: Color,
 }
 
+fn resolve_blend_world_path(
+    doc: &Document,
+    id: coree_core::ObjectId,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    deform_ctx: Option<(&[crate::renderer::DeformFrame<'_>], Affine2D)>,
+) -> Option<BezierPath> {
+    let world = crate::renderer::resolve_sym_world_path(doc, id, sym_ctx)?;
+    let Some((frames, outer_world_xf)) = deform_ctx else {
+        return Some(world);
+    };
+    let inside_sym = sym_ctx.is_none_or(|(m, _, _)| m.contains_key(&id));
+    if !inside_sym || frames.is_empty() || !outer_world_xf.is_finite() {
+        return Some(world);
+    }
+    let inner_to_outer = frames
+        .iter()
+        .skip(1)
+        .fold(Affine2D::IDENTITY, |acc, f| acc.compose(&f.rel_to_outer));
+    let frames_world_xf = outer_world_xf.compose(&inner_to_outer);
+    let Some(inv) = frames_world_xf.inverse() else {
+        return Some(world);
+    };
+    let in_inner = world.transformed(&inv);
+    let deformed =
+        crate::renderer::apply_deform_chain_in_bounds(&in_inner, Affine2D::IDENTITY, frames);
+    Some(deformed.transformed(&outer_world_xf))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_blend_steps(
     doc: &Document,
@@ -1737,6 +1798,7 @@ fn compute_blend_steps(
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
     sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    deform_ctx: Option<(&[crate::renderer::DeformFrame<'_>], Affine2D)>,
     icc: &IccColorPipeline,
     preserve_doc_rgb: bool,
 ) -> Vec<ComputedBlendStep> {
@@ -1748,7 +1810,7 @@ fn compute_blend_steps(
     else {
         return Vec::new();
     };
-    let Some(target_world_path) = crate::renderer::resolve_sym_world_path(doc, target_id, sym_ctx)
+    let Some(target_world_path) = resolve_blend_world_path(doc, target_id, sym_ctx, deform_ctx)
     else {
         return Vec::new();
     };
@@ -1790,7 +1852,7 @@ fn compute_blend_steps(
     let src_root = centroid(&contour_pairs.iter().map(|p| p.2).collect::<Vec<_>>());
     let dst_root = centroid(&contour_pairs.iter().map(|p| p.3).collect::<Vec<_>>());
     let host_path =
-        along_path.and_then(|pid| crate::renderer::resolve_sym_world_path(doc, pid, sym_ctx));
+        along_path.and_then(|pid| resolve_blend_world_path(doc, pid, sym_ctx, deform_ctx));
 
     let src_fill = primary_fill_color(&src_obj.fill);
     let dst_fill = primary_fill_color(&target_obj.fill);
@@ -1872,6 +1934,7 @@ fn render_blend_effect(
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
     sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    deform_ctx: Option<(&[crate::renderer::DeformFrame<'_>], Affine2D)>,
     page_to_screen: Affine2D,
     px_per_mm: f64,
     anti_alias: bool,
@@ -1888,6 +1951,7 @@ fn render_blend_effect(
         along_path,
         rotate_along_path,
         sym_ctx,
+        deform_ctx,
         icc,
         false,
     ) {
@@ -2521,6 +2585,17 @@ pub fn lower_effects_to_primitives(
     world_xf: Affine2D,
     alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
 ) -> Vec<SceneObject> {
+    lower_effects_to_primitives_with_sym(doc, obj, world_xf, None, alloc_id)
+}
+
+#[must_use]
+pub(crate) fn lower_effects_to_primitives_with_sym(
+    doc: &Document,
+    obj: &SceneObject,
+    world_xf: Affine2D,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
+    alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
+) -> Vec<SceneObject> {
     if obj.effects.is_empty() {
         return Vec::new();
     }
@@ -2699,6 +2774,7 @@ pub fn lower_effects_to_primitives(
                         *rotation_deg,
                         *along_path,
                         *rotate_along_path,
+                        sym_ctx,
                         &suffix,
                         &icc,
                         alloc_id,
@@ -2902,6 +2978,7 @@ fn emit_lowered_blend_objects(
     rotation_deg: f64,
     along_path: Option<coree_core::ObjectId>,
     rotate_along_path: bool,
+    sym_ctx: Option<crate::renderer::SymRenderCtx<'_>>,
     suffix: &str,
     icc: &IccColorPipeline,
     alloc_id: &mut dyn FnMut() -> coree_core::ObjectId,
@@ -2916,6 +2993,7 @@ fn emit_lowered_blend_objects(
         rotation_deg,
         along_path,
         rotate_along_path,
+        sym_ctx,
         None,
         icc,
         true,

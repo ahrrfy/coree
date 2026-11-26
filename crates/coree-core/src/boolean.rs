@@ -385,7 +385,19 @@ fn slice_subpath_dashes(sp: &Subpath, pattern: &[f64]) -> Vec<Subpath> {
     if segs.is_empty() || pattern.is_empty() {
         return vec![sp.clone()];
     }
-    let seg_lens: Vec<f64> = segs.iter().map(|s| s.arclen(1e-4).max(0.0)).collect();
+    let seg_lens: Vec<f64> = segs
+        .iter()
+        .map(|s| {
+            let bb = kurbo::Shape::bounding_box(s);
+            let span = bb.width().max(bb.height());
+            let acc = if span.is_finite() {
+                (1e-4 * span).max(1e-4)
+            } else {
+                1e-4
+            };
+            s.arclen(acc).max(0.0)
+        })
+        .collect();
     let total_len: f64 = seg_lens.iter().sum();
     if total_len <= 1e-6 {
         return Vec::new();
@@ -404,8 +416,15 @@ fn slice_subpath_dashes(sp: &Subpath, pattern: &[f64]) -> Vec<Subpath> {
                 let d0 = (start_s - acc).clamp(0.0, slen);
                 let d1 = (end_s - acc).clamp(0.0, slen);
                 if d1 > d0 + 1e-7 {
-                    let t0 = seg.inv_arclen(d0, 1e-4).clamp(0.0, 1.0);
-                    let t1 = seg.inv_arclen(d1, 1e-4).clamp(0.0, 1.0);
+                    let bb = kurbo::Shape::bounding_box(seg);
+                    let span = bb.width().max(bb.height());
+                    let acc = if span.is_finite() {
+                        (1e-4 * span).max(1e-4)
+                    } else {
+                        1e-4
+                    };
+                    let t0 = seg.inv_arclen(d0, acc).clamp(0.0, 1.0);
+                    let t1 = seg.inv_arclen(d1, acc).clamp(0.0, 1.0);
                     if t1 > t0 + 1e-7 {
                         let piece = seg.subsegment(t0..t1);
                         if !moved {

@@ -983,6 +983,15 @@ fn parse_extra_shape(r: &mut ByteReader<'_>) -> CdrResult<ParametricShape> {
 pub(crate) fn parse_loda_curve(r: &mut ByteReader<'_>) -> CdrResult<BezierPath> {
     let count = usize::try_from(r.read_u32_le("curve point count")?)
         .map_err(|_| CdrError::ArithmeticOverflow("curve point count"))?;
+    if count > crate::limits::MAX_CDR_VERTICES {
+        return Err(CdrError::InvalidChunk {
+            fourcc: "loda".to_owned(),
+            reason: format!(
+                "curve point count {count} exceeds limit {}",
+                crate::limits::MAX_CDR_VERTICES
+            ),
+        });
+    }
     let needed = count
         .checked_mul(9)
         .ok_or(CdrError::ArithmeticOverflow("curve byte size"))?;

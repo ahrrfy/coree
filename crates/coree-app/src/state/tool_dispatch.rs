@@ -417,6 +417,24 @@ impl StudioApp {
             object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
             symbols: struct_dirty.then(|| tab.document.symbols().clone()),
             metadata: struct_dirty.then(|| tab.document.metadata().clone()),
+            custom_icc_profile: struct_dirty
+                .then(|| tab.document.custom_icc_profile().map(<[u8]>::to_vec)),
+            custom_icc_name: struct_dirty
+                .then(|| tab.document.custom_icc_name().map(str::to_owned)),
+            rgb_icc_profile: struct_dirty
+                .then(|| tab.document.rgb_icc_profile().map(<[u8]>::to_vec)),
+            rgb_icc_name: struct_dirty.then(|| tab.document.rgb_icc_name().map(str::to_owned)),
+            cmyk_icc_profile: struct_dirty
+                .then(|| tab.document.cmyk_icc_profile().map(<[u8]>::to_vec)),
+            cmyk_icc_name: struct_dirty.then(|| tab.document.cmyk_icc_name().map(str::to_owned)),
+            gray_icc_profile: struct_dirty
+                .then(|| tab.document.gray_icc_profile().map(<[u8]>::to_vec)),
+            gray_icc_name: struct_dirty.then(|| tab.document.gray_icc_name().map(str::to_owned)),
+            rendering_intent: struct_dirty.then(|| tab.document.rendering_intent()),
+            black_point_compensation: struct_dirty.then(|| tab.document.black_point_compensation()),
+            drawing_scale: struct_dirty.then(|| tab.document.drawing_scale()),
+            unknown_doc_chunks: struct_dirty.then(|| tab.document.unknown_doc_chunks().to_vec()),
+            unknown_data_files: struct_dirty.then(|| tab.document.unknown_data_files().clone()),
         };
         if let Ok(delta_id) = db.enqueue_differential_autosave(patch) {
             tab.wal_base_snapshot_id = Some(delta_id.clone());

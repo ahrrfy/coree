@@ -95,6 +95,19 @@ fn main() {
             object_styles: None,
             symbols: None,
             metadata: None,
+            custom_icc_profile: None,
+            custom_icc_name: None,
+            rgb_icc_profile: None,
+            rgb_icc_name: None,
+            cmyk_icc_profile: None,
+            cmyk_icc_name: None,
+            gray_icc_profile: None,
+            gray_icc_name: None,
+            rendering_intent: None,
+            black_point_compensation: None,
+            drawing_scale: None,
+            unknown_doc_chunks: None,
+            unknown_data_files: None,
         };
 
         let t0 = Instant::now();

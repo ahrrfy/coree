@@ -751,7 +751,7 @@ impl StudioApp {
         }
     }
 
-    /// Toggles `clip_even_odd` on the first selected `PowerClip` container cleanly via undoable commands.
+    /// Toggles `clip_even_odd` on the first selected `PowerClip` container in place via an atomic undoable command.
     pub fn toggle_powerclip_even_odd(&mut self) {
         let plan = self.active_tab().and_then(|tab| {
             let oid = tab.selection.objects.iter().copied().find(|id| {
@@ -760,42 +760,17 @@ impl StudioApp {
                     .is_some_and(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
             })?;
             let obj = tab.document.object(oid)?;
-            let layer_id = enclosing_layer_of_object(&tab.document, oid)?;
-            let layer = tab.document.find_layer(layer_id)?;
-            let mut updated = obj.clone();
-            updated.clip_even_odd = !updated.clip_even_odd;
-            let next_even_odd = updated.clip_even_odd;
-            let new_id = ObjectId(
-                tab.document.next_id().max(
-                    tab.document
-                        .objects()
-                        .keys()
-                        .next_back()
-                        .map_or(1, |k| k.0 + 1),
-                ),
-            );
-            updated.id = new_id;
-            let layer_order: Vec<ObjectId> = layer
-                .objects
-                .iter()
-                .map(|&id| if id == oid { new_id } else { id })
-                .collect();
-            Some((oid, new_id, layer_id, updated, layer_order, next_even_odd))
+            Some((oid, !obj.clip_even_odd))
         });
-        let Some((old_id, new_id, layer_id, updated, layer_order, next_even_odd)) = plan else {
+        let Some((oid, next_even_odd)) = plan else {
             return;
         };
-        let ops = vec![
-            CommandOp::DeleteObjects { ids: vec![old_id] },
-            CommandOp::create_object(updated, Some(layer_id)),
-            CommandOp::ReorderLayerObjects {
-                layer_id,
-                object_ids: layer_order,
-            },
-        ];
-        if self.execute_command(CommandOp::Batch(ops)).is_ok() {
+        let cmd = CommandOp::SetPowerClipFillRule {
+            id: oid,
+            clip_even_odd: next_even_odd,
+        };
+        if self.execute_command(cmd).is_ok() {
             if let Some(tab) = self.active_tab_mut() {
-                tab.selection.select_single(&tab.document, new_id);
                 tab.needs_rerender = true;
             }
             self.push_toast(

@@ -1578,3 +1578,359 @@ fn w1b_r11_rejected_nan_commands_never_corrupt_wal_recovery() {
     assert_eq!(recovered_fill.document_palette(), doc.document_palette());
     assert_eq!(doc.document_palette().swatches.len(), 1);
 }
+
+#[test]
+fn all_builtin_default_templates_insert_and_query_without_constraint_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StorageDb::open(&dir.path().join("templates.db")).unwrap();
+
+    for (idx, cat) in [
+        "print",
+        "packaging",
+        "signage",
+        "laser-vinyl",
+        "web-ui",
+        "arabic-rtl",
+        "custom",
+    ]
+    .iter()
+    .enumerate()
+    {
+        db.upsert_template(&TemplateRecord {
+            id: format!("tpl-{cat}"),
+            name: format!("Template {cat}"),
+            category: (*cat).to_owned(),
+            description: "Valid template category".to_owned(),
+            template_path: format!("/tmp/tpl_{idx}.cdt"),
+            width_mm: 100.0,
+            height_mm: 100.0,
+            bleed_mm: 2.0,
+            page_count: 1,
+            color_mode: if *cat == "web-ui" {
+                "rgb".to_owned()
+            } else {
+                "cmyk".to_owned()
+            },
+            thumbnail_png: None,
+            is_builtin: true,
+            favorite: false,
+        })
+        .unwrap();
+    }
+    let all = db.list_templates(None).unwrap();
+    assert_eq!(all.len(), 7);
+    let web_ui = db.list_templates(Some("web-ui")).unwrap();
+    assert_eq!(web_ui.len(), 1);
+    assert_eq!(web_ui[0].id, "tpl-web-ui");
+
+    // Invalid category still fails CHECK cleanly without panic
+    assert!(db
+        .upsert_template(&TemplateRecord {
+            id: "bad-cat".to_owned(),
+            name: "Bad".to_owned(),
+            category: "unknown-cat".to_owned(),
+            description: String::new(),
+            template_path: "/tmp/bad.cdt".to_owned(),
+            width_mm: 50.0,
+            height_mm: 50.0,
+            bleed_mm: 0.0,
+            page_count: 1,
+            color_mode: "rgb".to_owned(),
+            thumbnail_png: None,
+            is_builtin: false,
+            favorite: false,
+        })
+        .is_err());
+}
+
+#[test]
+fn differential_autosave_preserves_icc_profiles_rendering_intent_bpc_and_drawing_scale() {
+    fn make_synthetic_icc(
+        cs: &[u8; 4],
+        pcs: &[u8; 4],
+        desc: &str,
+        tags: &[(&[u8; 4], Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut all_tags = Vec::with_capacity(tags.len() + 1);
+        let mut desc_buf = Vec::new();
+        desc_buf.extend_from_slice(b"desc\0\0\0\0");
+        desc_buf.extend_from_slice(&((desc.len() + 1) as u32).to_be_bytes());
+        desc_buf.extend_from_slice(desc.as_bytes());
+        desc_buf.push(0);
+        all_tags.push((*b"desc", desc_buf));
+        for (sig, data) in tags {
+            all_tags.push((**sig, data.clone()));
+        }
+        let mut out = vec![0u8; 128];
+        out[4..8].copy_from_slice(b"core");
+        out[8..12].copy_from_slice(&0x0210_0000u32.to_be_bytes());
+        out[12..16].copy_from_slice(b"mntr");
+        out[16..20].copy_from_slice(cs);
+        out[20..24].copy_from_slice(pcs);
+        out[36..40].copy_from_slice(b"acsp");
+        out[68..72].copy_from_slice(&0x0000_f6d6u32.to_be_bytes());
+        out[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        out[76..80].copy_from_slice(&0x0000_d32du32.to_be_bytes());
+        let count = all_tags.len() as u32;
+        out.extend_from_slice(&count.to_be_bytes());
+        let mut offset = 132 + all_tags.len() * 12;
+        let mut payloads = Vec::new();
+        for (sig, data) in &all_tags {
+            out.extend_from_slice(sig);
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            payloads.extend_from_slice(data);
+            while payloads.len() % 4 != 0 {
+                payloads.push(0);
+            }
+            offset = 132 + all_tags.len() * 12 + payloads.len();
+        }
+        out.extend_from_slice(&payloads);
+        let total_len = out.len() as u32;
+        out[0..4].copy_from_slice(&total_len.to_be_bytes());
+        out
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("icc_delta.db");
+    let db = StorageDb::open(&db_path).unwrap();
+
+    let mut doc = Document::new_a4("IccDeltaDoc");
+    let doc_id = doc.id().to_string();
+    let base = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+
+    let mut ktrc = Vec::new();
+    ktrc.extend_from_slice(b"curv\0\0\0\0");
+    ktrc.extend_from_slice(&1u32.to_be_bytes());
+    ktrc.extend_from_slice(&((2.2 * 256.0) as u16).to_be_bytes());
+    let mut xyz = Vec::new();
+    xyz.extend_from_slice(b"XYZ \0\0\0\0");
+    xyz.extend_from_slice(&0x0000_6f9cu32.to_be_bytes());
+    xyz.extend_from_slice(&0x0000_38f2u32.to_be_bytes());
+    xyz.extend_from_slice(&0x0000_0390u32.to_be_bytes());
+
+    let rgb_prof = make_synthetic_icc(
+        b"RGB ",
+        b"XYZ ",
+        "TestRGB",
+        &[
+            (b"rXYZ", xyz.clone()),
+            (b"gXYZ", xyz.clone()),
+            (b"bXYZ", xyz),
+            (b"rTRC", ktrc.clone()),
+            (b"gTRC", ktrc.clone()),
+            (b"bTRC", ktrc.clone()),
+        ],
+    );
+    let cmyk_prof = make_synthetic_icc(b"CMYK", b"Lab ", "TestCMYK", &[]);
+    let gray_prof = make_synthetic_icc(b"GRAY", b"XYZ ", "TestGray", &[(b"kTRC", ktrc)]);
+
+    doc.set_rgb_icc_profile(rgb_prof.clone()).unwrap();
+    doc.set_cmyk_icc_profile(cmyk_prof.clone()).unwrap();
+    doc.set_gray_icc_profile(gray_prof.clone()).unwrap();
+    doc.set_rendering_intent(coree_core::RenderingIntent::AbsoluteColorimetric);
+    doc.set_black_point_compensation(false);
+    doc.set_drawing_scale(coree_core::DrawingScale::new(1.0, 50.0));
+    doc.insert_unknown_data_file("content/data/extra.dat", vec![1, 2, 3, 4]);
+
+    let patch = coree_storage::DifferentialSnapshotPatch {
+        doc_id: doc_id.clone(),
+        session_id: base.session_id.clone(),
+        title: doc.title().to_owned(),
+        source_path: None,
+        base_snapshot_id: base.id.clone(),
+        last_command_seq: 0,
+        upserted_objects: Vec::new(),
+        deleted_object_ids: Vec::new(),
+        upserted_assets: Vec::new(),
+        deleted_asset_ids: Vec::new(),
+        full_assets: None,
+        pages: Some(doc.pages().to_vec()),
+        active_page_index: Some(0),
+        next_id: Some(doc.next_id()),
+        color_mode: Some(doc.color_mode()),
+        default_unit: Some(doc.default_unit()),
+        dpi: Some(doc.dpi()),
+        multipage_view: Some(doc.multipage_view()),
+        palettes: None,
+        document_palette: None,
+        guides: None,
+        grid: None,
+        perspective_grid: None,
+        color_styles: None,
+        object_styles: None,
+        symbols: None,
+        metadata: Some(doc.metadata().clone()),
+        custom_icc_profile: Some(doc.custom_icc_profile().map(<[u8]>::to_vec)),
+        custom_icc_name: Some(doc.custom_icc_name().map(str::to_owned)),
+        rgb_icc_profile: Some(doc.rgb_icc_profile().map(<[u8]>::to_vec)),
+        rgb_icc_name: Some(doc.rgb_icc_name().map(str::to_owned)),
+        cmyk_icc_profile: Some(doc.cmyk_icc_profile().map(<[u8]>::to_vec)),
+        cmyk_icc_name: Some(doc.cmyk_icc_name().map(str::to_owned)),
+        gray_icc_profile: Some(doc.gray_icc_profile().map(<[u8]>::to_vec)),
+        gray_icc_name: Some(doc.gray_icc_name().map(str::to_owned)),
+        rendering_intent: Some(doc.rendering_intent()),
+        black_point_compensation: Some(doc.black_point_compensation()),
+        drawing_scale: Some(doc.drawing_scale()),
+        unknown_doc_chunks: Some(doc.unknown_doc_chunks().to_vec()),
+        unknown_data_files: Some(doc.unknown_data_files().clone()),
+    };
+
+    let delta_id = db.enqueue_differential_autosave(patch).unwrap();
+    let _compact_id = db
+        .enqueue_compact_baseline(&doc_id, &base.session_id, doc.title(), None, &delta_id, 0)
+        .unwrap();
+    db.flush_autosave(Duration::from_secs(5)).unwrap();
+    drop(db);
+
+    let db2 = StorageDb::open(&db_path).unwrap();
+    let rec = db2.recover_document(&doc_id).unwrap();
+    assert_eq!(rec.rgb_icc_profile(), Some(rgb_prof.as_slice()));
+    assert_eq!(rec.cmyk_icc_profile(), Some(cmyk_prof.as_slice()));
+    assert_eq!(rec.gray_icc_profile(), Some(gray_prof.as_slice()));
+    assert_eq!(
+        rec.rendering_intent(),
+        coree_core::RenderingIntent::AbsoluteColorimetric
+    );
+    assert!(!rec.black_point_compensation());
+    assert_eq!(
+        rec.drawing_scale(),
+        coree_core::DrawingScale::new(1.0, 50.0)
+    );
+    assert_eq!(
+        rec.unknown_data_files().get("content/data/extra.dat"),
+        Some(&vec![1, 2, 3, 4])
+    );
+}
+
+#[test]
+fn corrupt_autosave_delta_chain_cycle_truncated_gz_and_corrupt_ttf_rejected_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("corrupt_chain.db");
+    let db = StorageDb::open(&db_path).unwrap();
+
+    let doc = Document::new_a4("ChainTest");
+    let doc_id = doc.id().to_string();
+    let base = db.save_snapshot(&doc_id, doc.title(), None, &doc).unwrap();
+
+    // 1. Corrupt/truncated .delta.json.gz
+    let make_patch = |base_id: String| coree_storage::DifferentialSnapshotPatch {
+        doc_id: doc_id.clone(),
+        session_id: base.session_id.clone(),
+        title: doc.title().to_owned(),
+        source_path: None,
+        base_snapshot_id: base_id,
+        last_command_seq: 0,
+        upserted_objects: Vec::new(),
+        deleted_object_ids: Vec::new(),
+        upserted_assets: Vec::new(),
+        deleted_asset_ids: Vec::new(),
+        full_assets: None,
+        pages: None,
+        active_page_index: None,
+        next_id: None,
+        color_mode: None,
+        default_unit: None,
+        dpi: None,
+        multipage_view: None,
+        palettes: None,
+        document_palette: None,
+        guides: None,
+        grid: None,
+        perspective_grid: None,
+        color_styles: None,
+        object_styles: None,
+        symbols: None,
+        metadata: None,
+        custom_icc_profile: None,
+        custom_icc_name: None,
+        rgb_icc_profile: None,
+        rgb_icc_name: None,
+        cmyk_icc_profile: None,
+        cmyk_icc_name: None,
+        gray_icc_profile: None,
+        gray_icc_name: None,
+        rendering_intent: None,
+        black_point_compensation: None,
+        drawing_scale: None,
+        unknown_doc_chunks: None,
+        unknown_data_files: None,
+    };
+
+    // Build > 512-deep delta chain -> must return error without stack overflow
+    let mut cur_id = base.id.clone();
+    for _ in 0..515 {
+        cur_id = db
+            .enqueue_differential_autosave(make_patch(cur_id))
+            .unwrap();
+    }
+    db.flush_autosave(Duration::from_secs(10)).unwrap();
+    assert!(db.recover_document(&doc_id).is_err());
+
+    // 2. Corrupt command_journal JSON on a fresh document
+    let doc2 = Document::new_a4("BadJournal");
+    let doc2_id = doc2.id().to_string();
+    let _b2 = db
+        .save_snapshot(&doc2_id, doc2.title(), None, &doc2)
+        .unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO command_journal (document_id, session_id, snapshot_id, seq_no, command_type, payload_json, inverse_json, applied) VALUES (?1, ?2, NULL, 1, 'SetFill', '{not-json', '{}', 1)",
+            rusqlite::params![doc2_id, _b2.session_id],
+        )
+        .unwrap();
+    assert!(db.recover_document(&doc2_id).is_err());
+
+    // 2b. Truncated .delta.json.gz fails with IntegrityMismatch/RecoveryFailed
+    let doc3 = Document::new_a4("TruncGz");
+    let doc3_id = doc3.id().to_string();
+    let b3 = db
+        .save_snapshot(&doc3_id, doc3.title(), None, &doc3)
+        .unwrap();
+    let mut p3 = make_patch(b3.id.clone());
+    p3.doc_id = doc3_id.clone();
+    p3.session_id = b3.session_id.clone();
+    let d3 = db.enqueue_differential_autosave(p3).unwrap();
+    db.flush_autosave(Duration::from_secs(5)).unwrap();
+    let d3_path: String = db
+        .connection()
+        .query_row(
+            "SELECT snapshot_blob_path FROM autosave_snapshots WHERE id = ?1",
+            rusqlite::params![d3],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::fs::write(&d3_path, b"\x1f\x8b\x08\x00trunc").unwrap();
+    assert!(db.recover_document(&doc3_id).is_err());
+
+    // 2c. Cyclic delta chain (delta -> self) rejected cleanly without infinite recursion
+    let mut p4 = make_patch("cycle-self".to_owned());
+    p4.doc_id = "cycle-doc".to_owned();
+    let env_json = serde_json::json!({
+        "autosave_format": "coree-diff-v1",
+        "patch": p4
+    });
+    let mut gz_enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut gz_enc, env_json.to_string().as_bytes()).unwrap();
+    let gz_bytes = gz_enc.finish().unwrap();
+    let cyc_path = dir.path().join("cycle.delta.json.gz");
+    std::fs::write(&cyc_path, &gz_bytes).unwrap();
+    let cyc_sha = coree_storage::sha256_hex(&gz_bytes);
+    db.connection()
+        .execute(
+            "INSERT INTO autosave_snapshots (id, document_id, session_id, original_file_path, display_name, snapshot_blob_path, snapshot_sha256, last_command_seq, byte_size, clean_shutdown) VALUES ('cycle-self', 'cycle-doc', 's1', NULL, 'Cycle', ?1, ?2, 0, ?3, 0)",
+            rusqlite::params![cyc_path.to_string_lossy().to_string(), cyc_sha, gz_bytes.len() as i64],
+        )
+        .unwrap();
+    assert!(db.recover_document("cycle-doc").is_err());
+
+    // 3. Corrupt truncated SFNT .ttf rejected cleanly
+    let bad_ttf = dir.path().join("corrupt.ttf");
+    std::fs::write(&bad_ttf, b"\x00\x01\x00\x00\x00\x0F\x00\x10truncated").unwrap();
+    let parsed = coree_storage::inspect_font_bytes(&std::fs::read(&bad_ttf).unwrap(), &bad_ttf);
+    assert!(parsed.is_empty());
+    let scan = db
+        .scan_font_directories(&[dir.path().to_path_buf()], "custom")
+        .unwrap();
+    assert_eq!(scan.faces_indexed, 0);
+}

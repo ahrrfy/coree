@@ -37,6 +37,9 @@ const MAX_PSD_DIMENSION: u32 = 300_000;
 const MAX_PSD_LAYERS: usize = 4_096;
 /// Maximum output pixel dimension per imported layer/composite (`16,384 px`).
 const MAX_LAYER_OUTPUT_DIM: u32 = 16_384;
+/// Maximum source pixel count per decoded plane (`256M` pixels) to prevent CPU/RAM DoS
+/// on huge PSB canvases downscaled to `MAX_LAYER_OUTPUT_DIM`.
+const MAX_PSD_SOURCE_PIXELS: u64 = 256_000_000;
 /// Strict cumulative decoded pixel byte budget across all imported layers (`512 MiB`).
 const MAX_CUMULATIVE_RGBA_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum compressed/decompressed bytes allowed for a single ZIP channel stream (`128 MiB`).
@@ -2615,6 +2618,7 @@ fn decode_composite_asset<R: Read + Seek>(
 
         match compression {
             0 => {
+                check_psd_source_budget(src_w, src_h)?;
                 for ch_idx in 0..num_channels {
                     if ch_idx > max_needed_ch {
                         break;
@@ -2641,6 +2645,7 @@ fn decode_composite_asset<R: Read + Seek>(
                         "composite RLE row table ({table_bytes} bytes) exceeds remaining file size ({remaining} bytes)"
                     )));
                 }
+                check_psd_source_budget(src_w, src_h)?;
                 let mut all_row_counts = Vec::with_capacity(total_rows);
                 for _ in 0..total_rows {
                     let len = if header.is_psb {
@@ -2758,6 +2763,7 @@ fn decode_composite_asset<R: Read + Seek>(
 
     match compression {
         0 => {
+            check_psd_source_budget(src_w, src_h)?;
             let row_bytes = scanline_byte_width(src_w, header.depth)?;
             for ch_idx in 0..num_channels {
                 if ch_idx > max_needed_ch {
@@ -2798,6 +2804,7 @@ fn decode_composite_asset<R: Read + Seek>(
                     "composite RLE row table ({table_bytes} bytes) exceeds remaining file size ({remaining} bytes)"
                 )));
             }
+            check_psd_source_budget(src_w, src_h)?;
             let mut all_row_counts = Vec::with_capacity(total_rows);
             for _ in 0..total_rows {
                 let len = if header.is_psb {
@@ -2906,13 +2913,17 @@ fn decode_single_channel_plane<R: Read>(
 ) -> IoResult<Vec<u8>> {
     let row_bytes = scanline_byte_width(src_w, depth)?;
     match compression {
-        0 => stream_decode_raw_plane(reader, src_w, src_h, dst_w, dst_h, depth, row_bytes),
+        0 => {
+            check_psd_source_budget(src_w, src_h)?;
+            stream_decode_raw_plane(reader, src_w, src_h, dst_w, dst_h, depth, row_bytes)
+        }
         1 => {
             let count_bytes_per_row = if is_psb { 4u64 } else { 2u64 };
             let table_bytes = u64::from(src_h).saturating_mul(count_bytes_per_row);
             if table_bytes > payload_len {
                 return Err(psd_err("RLE row length table exceeds channel payload"));
             }
+            check_psd_source_budget(src_w, src_h)?;
             let mut row_counts = Vec::with_capacity(src_h as usize);
             for _ in 0..src_h {
                 let len = if is_psb {
@@ -2980,13 +2991,17 @@ fn decode_single_channel_plane_16<R: Read>(
 ) -> IoResult<Vec<u16>> {
     let row_bytes = scanline_byte_width(src_w, 16)?;
     match compression {
-        0 => stream_decode_raw_plane_16(reader, src_w, src_h, dst_w, dst_h, row_bytes, false),
+        0 => {
+            check_psd_source_budget(src_w, src_h)?;
+            stream_decode_raw_plane_16(reader, src_w, src_h, dst_w, dst_h, row_bytes, false)
+        }
         1 => {
             let count_bytes_per_row = if is_psb { 4u64 } else { 2u64 };
             let table_bytes = u64::from(src_h).saturating_mul(count_bytes_per_row);
             if table_bytes > payload_len {
                 return Err(psd_err("RLE row length table exceeds channel payload"));
             }
+            check_psd_source_budget(src_w, src_h)?;
             let mut row_counts = Vec::with_capacity(src_h as usize);
             for _ in 0..src_h {
                 let len = if is_psb {
@@ -3029,6 +3044,17 @@ fn decode_single_channel_plane_16<R: Read>(
             "unsupported layer channel compression mode {other}"
         ))),
     }
+}
+
+fn check_psd_source_budget(src_w: u32, src_h: u32) -> IoResult<()> {
+    let pixels = u64::from(src_w).saturating_mul(u64::from(src_h));
+    if pixels > MAX_PSD_SOURCE_PIXELS {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_psd_source_pixels={MAX_PSD_SOURCE_PIXELS}"),
+            actual: format!("{pixels} pixels ({src_w}x{src_h})"),
+        });
+    }
+    Ok(())
 }
 
 fn scanline_byte_width(src_w: u32, depth: u16) -> IoResult<usize> {
@@ -3226,6 +3252,10 @@ fn stream_decode_rle_plane<R: Read>(
                 "PackBits scanline length {enc_len} exceeds safe bound {max_encoded_row}"
             )));
         }
+        if enc_len == 0 && depth != 1 {
+            acc.push_zero_row(y);
+            continue;
+        }
         packed.resize(enc_len, 0);
         reader.read_exact(&mut packed)?;
         decode_packbits_row(&packed, &mut raw_row);
@@ -3279,6 +3309,10 @@ fn stream_decode_rle_plane_16<R: Read>(
             return Err(psd_err(format!(
                 "PackBits scanline length {enc_len} exceeds safe bound {max_encoded_row}"
             )));
+        }
+        if enc_len == 0 {
+            acc.push_zero_row(y);
+            continue;
         }
         packed.resize(enc_len, 0);
         reader.read_exact(&mut packed)?;
@@ -3348,6 +3382,7 @@ struct BoxAccumulator {
     dst_w: usize,
     dst_h: usize,
     x_map: Vec<usize>,
+    x_counts: Vec<u32>,
     sums: Vec<u64>,
     counts: Vec<u32>,
 }
@@ -3358,9 +3393,12 @@ impl BoxAccumulator {
         let dw = dst_w as usize;
         let dh = dst_h as usize;
         let mut x_map = Vec::with_capacity(sw);
+        let mut x_counts = vec![0u32; dw];
         for x in 0..sw {
             let dx = ((x as u64) * (dw as u64) / (sw.max(1) as u64)) as usize;
-            x_map.push(dx.min(dw - 1));
+            let clamped = dx.min(dw - 1);
+            x_map.push(clamped);
+            x_counts[clamped] += 1;
         }
         let len = dw * dh;
         Self {
@@ -3368,8 +3406,17 @@ impl BoxAccumulator {
             dst_w: dw,
             dst_h: dh,
             x_map,
+            x_counts,
             sums: vec![0u64; len],
             counts: vec![0u32; len],
+        }
+    }
+
+    fn push_zero_row(&mut self, src_y: usize) {
+        let dy = (((src_y as u64) * (self.dst_h as u64)) / (self.src_h.max(1) as u64)) as usize;
+        let row_off = dy.min(self.dst_h - 1) * self.dst_w;
+        for (dx, &xc) in self.x_counts.iter().enumerate() {
+            self.counts[row_off + dx] += xc;
         }
     }
 

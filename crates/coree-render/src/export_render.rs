@@ -136,6 +136,304 @@ pub fn render_page_to_rgba_with_backend(
     })
 }
 
+fn usvg_xf_to_affine(xf: usvg::Transform) -> coree_core::Affine2D {
+    coree_core::Affine2D::new(
+        f64::from(xf.sx),
+        f64::from(xf.ky),
+        f64::from(xf.kx),
+        f64::from(xf.sy),
+        f64::from(xf.tx),
+        f64::from(xf.ty),
+    )
+}
+
+fn usvg_rect_exceeds_limit(r: usvg::Rect, limit: f64) -> bool {
+    let vals = [
+        f64::from(r.left()),
+        f64::from(r.top()),
+        f64::from(r.right()),
+        f64::from(r.bottom()),
+    ];
+    vals.iter().any(|v| !v.is_finite() || v.abs() > limit)
+}
+
+fn usvg_group_needs_f64_guard(
+    group: &usvg::Group,
+    parent_xf: coree_core::Affine2D,
+    limit: f64,
+) -> bool {
+    let xf = parent_xf.compose(&usvg_xf_to_affine(group.transform()));
+    if !xf.is_finite() {
+        return true;
+    }
+    if let Some(cp) = group.clip_path() {
+        let cp_xf = xf.compose(&usvg_xf_to_affine(cp.transform()));
+        if usvg_group_needs_f64_guard(cp.root(), cp_xf, limit) {
+            return true;
+        }
+    }
+    for child in group.children() {
+        match child {
+            usvg::Node::Group(g) => {
+                if usvg_group_needs_f64_guard(g, xf, limit) {
+                    return true;
+                }
+            }
+            usvg::Node::Path(p) => {
+                if !p.is_visible() {
+                    continue;
+                }
+                let bb = p.data().bounds();
+                let local_rect = coree_core::Rect2D::new(
+                    f64::from(bb.left()),
+                    f64::from(bb.top()),
+                    f64::from(bb.right()),
+                    f64::from(bb.bottom()),
+                );
+                let dev_rect = xf.transform_rect(local_rect);
+                if usvg_rect_exceeds_limit(bb, limit)
+                    || !dev_rect.is_finite()
+                    || dev_rect.min_x.abs() > limit
+                    || dev_rect.max_x.abs() > limit
+                    || dev_rect.min_y.abs() > limit
+                    || dev_rect.max_y.abs() > limit
+                {
+                    return true;
+                }
+                if let Some(stroke) = p.stroke() {
+                    let sw = f64::from(stroke.width().get());
+                    let scale = xf.m[0].hypot(xf.m[1]).max(xf.m[2].hypot(xf.m[3])).max(1e-6);
+                    if !sw.is_finite() || sw * scale > limit {
+                        return true;
+                    }
+                }
+            }
+            usvg::Node::Image(img) => {
+                let bb = img.bounding_box();
+                let dev_rect = xf.transform_rect(coree_core::Rect2D::new(
+                    f64::from(bb.left()),
+                    f64::from(bb.top()),
+                    f64::from(bb.right()),
+                    f64::from(bb.bottom()),
+                ));
+                if !dev_rect.is_finite()
+                    || dev_rect.min_x.abs() > limit
+                    || dev_rect.max_x.abs() > limit
+                    || dev_rect.min_y.abs() > limit
+                    || dev_rect.max_y.abs() > limit
+                {
+                    return true;
+                }
+            }
+            usvg::Node::Text(t) => {
+                if usvg_group_needs_f64_guard(t.flattened(), xf, limit) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn usvg_path_data_to_bezier(data: &usvg::tiny_skia_path::Path) -> coree_core::BezierPath {
+    use coree_core::{BezierPath, NodeKind, PathNode, Point2D, Subpath};
+    use usvg::tiny_skia_path::PathSegment;
+    let mut out = BezierPath::new();
+    let mut cur: Option<Subpath> = None;
+    for seg in data.segments() {
+        match seg {
+            PathSegment::MoveTo(p) => {
+                if let Some(sp) = cur.take() {
+                    if !sp.nodes.is_empty() {
+                        out.subpaths.push(sp);
+                    }
+                }
+                let mut sp = Subpath::new(false);
+                sp.nodes.push(PathNode::new(
+                    Point2D::new(f64::from(p.x), f64::from(p.y)),
+                    None,
+                    None,
+                    NodeKind::Cusp,
+                ));
+                cur = Some(sp);
+            }
+            PathSegment::LineTo(p) => {
+                if let Some(ref mut sp) = cur {
+                    sp.nodes.push(PathNode::new(
+                        Point2D::new(f64::from(p.x), f64::from(p.y)),
+                        None,
+                        None,
+                        NodeKind::Cusp,
+                    ));
+                }
+            }
+            PathSegment::QuadTo(p1, p2) => {
+                if let Some(ref mut sp) = cur {
+                    let prev = sp.nodes.last().map_or(Point2D::ZERO, |n| n.pos);
+                    let q1 = Point2D::new(f64::from(p1.x), f64::from(p1.y));
+                    let q2 = Point2D::new(f64::from(p2.x), f64::from(p2.y));
+                    if let Some(last) = sp.nodes.last_mut() {
+                        last.handle_out = Some(prev.lerp(q1, 2.0 / 3.0));
+                    }
+                    sp.nodes.push(PathNode::new(
+                        q2,
+                        Some(q2.lerp(q1, 2.0 / 3.0)),
+                        None,
+                        NodeKind::Cusp,
+                    ));
+                }
+            }
+            PathSegment::CubicTo(p1, p2, p3) => {
+                if let Some(ref mut sp) = cur {
+                    if let Some(last) = sp.nodes.last_mut() {
+                        last.handle_out = Some(Point2D::new(f64::from(p1.x), f64::from(p1.y)));
+                    }
+                    sp.nodes.push(PathNode::new(
+                        Point2D::new(f64::from(p3.x), f64::from(p3.y)),
+                        Some(Point2D::new(f64::from(p2.x), f64::from(p2.y))),
+                        None,
+                        NodeKind::Cusp,
+                    ));
+                }
+            }
+            PathSegment::Close => {
+                if let Some(ref mut sp) = cur {
+                    sp.closed = true;
+                }
+            }
+        }
+    }
+    if let Some(sp) = cur {
+        if !sp.nodes.is_empty() {
+            out.subpaths.push(sp);
+        }
+    }
+    out
+}
+
+fn usvg_paint_to_color(paint: &usvg::Paint) -> coree_core::Color {
+    match paint {
+        usvg::Paint::Color(c) => coree_core::Color::rgba8(c.red, c.green, c.blue, 255),
+        usvg::Paint::LinearGradient(lg) => {
+            lg.stops().first().map_or(coree_core::Color::BLACK, |s| {
+                let c = s.color();
+                coree_core::Color::rgba8(c.red, c.green, c.blue, s.opacity().to_u8())
+            })
+        }
+        usvg::Paint::RadialGradient(rg) => {
+            rg.stops().first().map_or(coree_core::Color::BLACK, |s| {
+                let c = s.color();
+                coree_core::Color::rgba8(c.red, c.green, c.blue, s.opacity().to_u8())
+            })
+        }
+        usvg::Paint::Pattern(_) => coree_core::Color::BLACK,
+    }
+}
+
+fn render_usvg_group_safe(
+    backend: &mut TinySkiaBackend,
+    group: &usvg::Group,
+    parent_xf: coree_core::Affine2D,
+    inherited_opacity: f32,
+) {
+    use crate::backend::{BackendPaint, FillRule, PaintShader, StrokeParams};
+    use coree_core::{BlendMode, LineCap, LineJoin};
+
+    let xf = parent_xf.compose(&usvg_xf_to_affine(group.transform()));
+    if !xf.is_finite() {
+        return;
+    }
+    let group_op = inherited_opacity * group.opacity().get();
+
+    let mut pushed_clip = false;
+    if let Some(cp) = group.clip_path() {
+        let cp_xf = xf.compose(&usvg_xf_to_affine(cp.transform()));
+        let mut combined = coree_core::BezierPath::new();
+        for n in cp.root().children() {
+            if let usvg::Node::Path(p) = n {
+                combined
+                    .subpaths
+                    .extend(usvg_path_data_to_bezier(p.data()).subpaths);
+            }
+        }
+        if !combined.is_empty() {
+            backend.push_clip(&combined, FillRule::Winding, cp_xf);
+            pushed_clip = true;
+        }
+    }
+
+    for child in group.children() {
+        match child {
+            usvg::Node::Group(g) => render_usvg_group_safe(backend, g, xf, group_op),
+            usvg::Node::Path(p) => {
+                if !p.is_visible() {
+                    continue;
+                }
+                let bp = usvg_path_data_to_bezier(p.data());
+                if bp.is_empty() {
+                    continue;
+                }
+                let aa = p.rendering_mode().use_shape_antialiasing();
+                let do_fill = |backend: &mut TinySkiaBackend| {
+                    if let Some(fill) = p.fill() {
+                        let rule = match fill.rule() {
+                            usvg::FillRule::NonZero => FillRule::Winding,
+                            usvg::FillRule::EvenOdd => FillRule::EvenOdd,
+                        };
+                        let paint = BackendPaint {
+                            shader: PaintShader::Solid(usvg_paint_to_color(fill.paint())),
+                            opacity: (group_op * fill.opacity().get()).clamp(0.0, 1.0),
+                            blend_mode: BlendMode::Normal,
+                            anti_alias: aa,
+                        };
+                        backend.fill_path(&bp, &paint, rule, xf);
+                    }
+                };
+                let do_stroke = |backend: &mut TinySkiaBackend| {
+                    if let Some(stroke) = p.stroke() {
+                        let params = StrokeParams {
+                            color: usvg_paint_to_color(stroke.paint()),
+                            width: stroke.width().get(),
+                            cap: match stroke.linecap() {
+                                usvg::LineCap::Butt => LineCap::Butt,
+                                usvg::LineCap::Round => LineCap::Round,
+                                usvg::LineCap::Square => LineCap::Square,
+                            },
+                            join: match stroke.linejoin() {
+                                usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => {
+                                    LineJoin::Miter
+                                }
+                                usvg::LineJoin::Round => LineJoin::Round,
+                                usvg::LineJoin::Bevel => LineJoin::Bevel,
+                            },
+                            miter_limit: stroke.miterlimit().get(),
+                            dash_pattern: stroke.dasharray().unwrap_or(&[]).to_vec(),
+                            dash_offset: stroke.dashoffset(),
+                            opacity: (group_op * stroke.opacity().get()).clamp(0.0, 1.0),
+                            blend_mode: BlendMode::Normal,
+                            anti_alias: aa,
+                        };
+                        backend.stroke_path(&bp, &params, xf);
+                    }
+                };
+                if p.paint_order() == usvg::PaintOrder::FillAndStroke {
+                    do_fill(backend);
+                    do_stroke(backend);
+                } else {
+                    do_stroke(backend);
+                    do_fill(backend);
+                }
+            }
+            usvg::Node::Text(t) => render_usvg_group_safe(backend, t.flattened(), xf, group_op),
+            usvg::Node::Image(_) => {}
+        }
+    }
+
+    if pushed_clip {
+        backend.pop_clip();
+    }
+}
+
 /// Rasterizes raw SVG bytes into a straight-RGBA [`RgbaBuffer`] of `width × height` pixels
 /// using `usvg` + `resvg` (useful for SVG preview thumbnails & visual regression checks).
 pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> RenderResult<RgbaBuffer> {
@@ -144,8 +442,6 @@ pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> RenderRe
     opts.fontdb_mut().load_system_fonts();
     let tree = usvg::Tree::from_data(svg_bytes, &opts)
         .map_err(|e| RenderError::Raster(format!("SVG parse failed: {e}")))?;
-    let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or(RenderError::AllocationFailed { width, height })?;
     let size = tree.size();
     let sx = if size.width() > 0.0 {
         width as f32 / size.width()
@@ -157,6 +453,14 @@ pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> RenderRe
     } else {
         1.0
     };
+    let root_xf = coree_core::Affine2D::scale(f64::from(sx), f64::from(sy));
+    if usvg_group_needs_f64_guard(tree.root(), root_xf, 1_000_000.0) {
+        let mut backend = TinySkiaBackend::new(width, height)?;
+        render_usvg_group_safe(&mut backend, tree.root(), root_xf, 1.0);
+        return Ok(backend.into_rgba());
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or(RenderError::AllocationFailed { width, height })?;
     let mut pm_mut = pixmap.as_mut();
     resvg::render(&tree, tiny_skia::Transform::from_scale(sx, sy), &mut pm_mut);
     let rgba = pixmap.take_demultiplied();
@@ -492,6 +796,53 @@ pub fn render_isolated_object_to_rgba(
     render_isolated_object_to_rgba_with_options(doc, page_idx, obj_id, parent_xf, dpi, false)
 }
 
+/// Stateful per-page isolation session for [`render_isolated_object_with_options`](ExportIsolationSession::render_isolated_object_with_options).
+///
+/// Reuses [`SceneRenderer`] (font shaping, ICC LUTs, frozen lens snapshots) and an
+/// export-scoped straight-RGBA lens cache across all objects on a page so stacked
+/// in-page lenses evaluate in `O(N)` instead of `O(N^2)`.
+pub struct ExportIsolationSession {
+    renderer: SceneRenderer,
+}
+
+impl Default for ExportIsolationSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExportIsolationSession {
+    /// Creates a new reusable page-export isolation session.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            renderer: SceneRenderer::new(),
+        }
+    }
+
+    /// Renders `obj_id` on `page_idx` using this session's cached [`SceneRenderer`].
+    pub fn render_isolated_object_with_options(
+        &mut self,
+        doc: &Document,
+        page_idx: usize,
+        obj_id: coree_core::ObjectId,
+        parent_xf: coree_core::Affine2D,
+        dpi: f64,
+        suppress_spot_cutcontour: bool,
+    ) -> RenderResult<Option<(coree_core::Rect2D, RgbaBuffer)>> {
+        render_isolated_object_with_renderer(
+            &mut self.renderer,
+            doc,
+            page_idx,
+            obj_id,
+            parent_xf,
+            dpi,
+            suppress_spot_cutcontour,
+            true,
+        )
+    }
+}
+
 /// Variant of [`render_isolated_object_to_rgba`] allowing export pipelines to suppress Spot
 /// `CutContour` strokes inside the rasterized composite so vector `/CutContour` overlays can be
 /// emitted crisply on top without Magenta fallback bleed.
@@ -503,11 +854,35 @@ pub fn render_isolated_object_to_rgba_with_options(
     dpi: f64,
     suppress_spot_cutcontour: bool,
 ) -> RenderResult<Option<(coree_core::Rect2D, RgbaBuffer)>> {
+    let mut renderer = SceneRenderer::new();
+    render_isolated_object_with_renderer(
+        &mut renderer,
+        doc,
+        page_idx,
+        obj_id,
+        parent_xf,
+        dpi,
+        suppress_spot_cutcontour,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_isolated_object_with_renderer(
+    renderer: &mut SceneRenderer,
+    doc: &Document,
+    page_idx: usize,
+    obj_id: coree_core::ObjectId,
+    parent_xf: coree_core::Affine2D,
+    dpi: f64,
+    suppress_spot_cutcontour: bool,
+    enable_export_lens_cache: bool,
+) -> RenderResult<Option<(coree_core::Rect2D, RgbaBuffer)>> {
     use crate::effects_render::{
         apply_geometry_effects, extract_local_geometry_path, symmetry_effect_transforms,
     };
     use crate::renderer::{collect_effective_layers, max_object_effect_padding_mm};
-    use coree_core::{Affine2D, Color, Effect, NodePayload, Rect2D};
+    use coree_core::{Affine2D, BlendMode, Color, Effect, NodePayload, Rect2D};
     use std::collections::HashSet;
 
     let pages = doc.pages();
@@ -532,21 +907,23 @@ pub fn render_isolated_object_to_rgba_with_options(
     };
     let inv_effective_parent = effective_parent_xf.inverse().unwrap_or(Affine2D::IDENTITY);
 
-    // Estimate object-local bounds including vector geometry deformations & Blends
-    let mut renderer = SceneRenderer::new();
+    // Reset per-object transient state while preserving caches on `renderer`
     renderer.active_icc = doc.icc_pipeline();
     renderer.force_offscreen_lens_backdrop = true;
-    if parent_xf != Affine2D::IDENTITY {
-        renderer.parent_xf_override = doc
-            .parent_container_of(obj_id)
+    renderer.frozen_scope_stack.clear();
+    renderer.current_sym_root_idx = None;
+    renderer.parent_xf_override = if parent_xf != Affine2D::IDENTITY {
+        doc.parent_container_of(obj_id)
             .map(|pid| (pid, effective_parent_xf))
             .or_else(|| {
                 effective_parent_xf
                     .compose(&obj.transform)
                     .is_finite()
                     .then(|| (obj_id, effective_parent_xf.compose(&obj.transform)))
-            });
-    }
+            })
+    } else {
+        None
+    };
     let resolved_obj_owned;
     let obj_eff: &coree_core::SceneObject =
         if matches!(obj.payload, coree_core::NodePayload::Clone { .. }) {
@@ -692,6 +1069,33 @@ pub fn render_isolated_object_to_rgba_with_options(
     let Some(raw_bb) = page_bb else {
         return Ok(None);
     };
+    if !raw_bb.is_finite() {
+        return Ok(None);
+    }
+    let page_w = if page.width_mm.is_finite() && page.width_mm > 0.0 {
+        page.width_mm
+    } else {
+        210.0
+    };
+    let page_h = if page.height_mm.is_finite() && page.height_mm > 0.0 {
+        page.height_mm
+    } else {
+        297.0
+    };
+    let page_max = page_w.max(page_h);
+    let max_coord = raw_bb
+        .min_x
+        .abs()
+        .max(raw_bb.max_x.abs())
+        .max(raw_bb.min_y.abs())
+        .max(raw_bb.max_y.abs());
+    if !max_coord.is_finite()
+        || raw_bb.width() > page_max * 1e4
+        || raw_bb.height() > page_max * 1e4
+        || max_coord > page_max * 1e6
+    {
+        return Ok(None);
+    }
     let pad = max_object_effect_padding_mm(doc, obj, effective_parent_xf)
         + obj.outline.effective_width_mm().max(0.5) * 2.0
         + doc.spatial_bounds_padding_mm(obj_id)
@@ -770,5 +1174,18 @@ pub fn render_isolated_object_to_rgba_with_options(
         0,
     );
     let buf = backend.into_rgba();
+    if enable_export_lens_cache
+        && parent_xf == Affine2D::IDENTITY
+        && doc.parent_container_of(obj_id).is_none()
+        && (scale_down - 1.0).abs() < 1e-9
+        && obj.lens.is_some()
+        && obj.blend_mode == BlendMode::Normal
+        && obj.effects.is_empty()
+    {
+        renderer.export_lens_cache.insert(
+            (obj_id, suppress_spot_cutcontour),
+            (px_per_mm, rect_mm, buf.clone()),
+        );
+    }
     Ok(Some((rect_mm, buf)))
 }

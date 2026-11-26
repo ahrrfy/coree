@@ -940,6 +940,8 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
             (n - 1).min(i + 2048)
         };
 
+        let mut prev_dir = 0u8;
+        let mut last_dir_change_j = i + 1;
         for j in (i + 1)..=max_j {
             let cur = pts[j % n];
             let prev = pts[(j - 1) % n];
@@ -956,12 +958,65 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
             // Guard against all 4 directions OR any 180-degree U-turn (E+W or S+N)
             // so 1px border strips and 1px peninsulas cannot collapse into chords.
             if dir_mask == 0x0F || (dir_mask & 0x05) == 0x05 || (dir_mask & 0x0A) == 0x0A {
+                // Rewind past a 1-2px peninsula tip before breaking so straight
+                // runs do not cut diagonally across 1px-wide features.
+                if j.saturating_sub(last_dir_change_j) <= 2 && last_dir_change_j > i + 1 {
+                    last_valid = last_valid.min(last_dir_change_j - 1);
+                }
                 break;
             }
-            // Scale by 2 so ±1 offsets represent Selinger's exact ±0.5-pixel tolerance cone.
+            if prev_dir != 0 && bit != 0 && bit != prev_dir {
+                last_dir_change_j = j;
+            }
+            if bit != 0 {
+                prev_dir = bit;
+            }
+            // Scale by 2 so ±1 offsets represent exact ±0.5-pixel box tolerance.
             let cur_x = 2 * i64::from(cur.0 - p0.0);
             let cur_y = 2 * i64::from(cur.1 - p0.1);
-            if xprod(c0.0, c0.1, cur_x, cur_y) < 0 || xprod(c1.0, c1.1, cur_x, cur_y) > 0 {
+            let inside_cone = if closed {
+                let box_c0_pt = (
+                    cur_x
+                        + if c0.1 < 0 {
+                            1
+                        } else if c0.1 > 0 {
+                            -1
+                        } else {
+                            0
+                        },
+                    cur_y
+                        + if c0.0 > 0 {
+                            1
+                        } else if c0.0 < 0 {
+                            -1
+                        } else {
+                            0
+                        },
+                );
+                let box_c1_pt = (
+                    cur_x
+                        + if c1.1 > 0 {
+                            1
+                        } else if c1.1 < 0 {
+                            -1
+                        } else {
+                            0
+                        },
+                    cur_y
+                        + if c1.0 < 0 {
+                            1
+                        } else if c1.0 > 0 {
+                            -1
+                        } else {
+                            0
+                        },
+                );
+                xprod(c0.0, c0.1, box_c0_pt.0, box_c0_pt.1) >= 0
+                    && xprod(c1.0, c1.1, box_c1_pt.0, box_c1_pt.1) <= 0
+            } else {
+                xprod(c0.0, c0.1, cur_x, cur_y) >= 0 && xprod(c1.0, c1.1, cur_x, cur_y) <= 0
+            };
+            if !inside_cone {
                 break;
             }
             last_valid = j;
@@ -981,9 +1036,6 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
                             -1
                         },
                 );
-                if xprod(c0.0, c0.1, off0.0, off0.1) >= 0 {
-                    c0 = off0;
-                }
                 let off1 = (
                     cur_x
                         + if cur_y <= 0 && (cur_y < 0 || cur_x < 0) {
@@ -998,7 +1050,14 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
                             -1
                         },
                 );
-                if xprod(c1.0, c1.1, off1.0, off1.1) <= 0 {
+                if xprod(c0.0, c0.1, off0.0, off0.1) >= 0
+                    && (c1 == (0, 0) || xprod(off0.0, off0.1, c1.0, c1.1) >= 0)
+                {
+                    c0 = off0;
+                }
+                if xprod(c1.0, c1.1, off1.0, off1.1) <= 0
+                    && (c0 == (0, 0) || xprod(c0.0, c0.1, off1.0, off1.1) >= 0)
+                {
                     c1 = off1;
                 }
             }
@@ -1234,27 +1293,15 @@ fn potrace_smooth_and_opticurve(
         let v_in = (curr - prev).normalize_or_zero();
         let v_out = (next - curr).normalize_or_zero();
         let turn = v_in.dot(v_out).clamp(-1.0, 1.0).acos();
-        if turn >= corner_rad {
+        if turn >= corner_rad || turn < 0.015 {
             is_corner[i] = true;
             continue;
         }
-        // Potrace dpara / ddenom metric
-        let dx = (next.x - prev.x).abs();
-        let dy = (next.y - prev.y).abs();
-        let ddenom = (dx + dy).max(1e-6);
-        let dpara =
-            ((curr.x - prev.x) * (next.y - prev.y) - (curr.y - prev.y) * (next.x - prev.x)).abs();
-        let dd = dpara / ddenom;
-        let alpha = if dd > 0.75 {
-            ((4.0 / 3.0) * (1.0 - 0.75 / dd)).min(1.0)
-        } else {
-            0.0
-        };
-        if alpha <= 0.05 || alpha > alphamax {
-            is_corner[i] = true;
-        } else {
-            alphas[i] = (alpha * (0.45 + 0.35 * smooth)).clamp(0.15, 0.75);
-        }
+        // Smooth vertex (0.015 <= turn < corner_rad): compute Potrace-style handle alpha
+        // scaled by smoothing strength & alphamax without misclassifying gentle long-chord arcs as cusps.
+        let bend_ratio = (turn / corner_rad.max(1e-6)).clamp(0.0, 1.0);
+        let base_alpha = (0.55 + 0.15 * bend_ratio).min(alphamax.max(0.25));
+        alphas[i] = (base_alpha * (0.45 + 0.55 * smooth)).clamp(0.25, 0.75);
     }
 
     // Build curve / corner nodes using Potrace midpoints and cubic Bézier control handles
@@ -1367,21 +1414,33 @@ fn potrace_opticurve_merge(nodes: &mut Vec<PathNode>, closed: bool, tol_mm: f64)
         let p0 = nodes[i0].pos;
         let p1 = nodes[i1].pos;
         let p2 = nodes[i2].pos;
-        // Check matching bend side & small deviation at midpoint
+        // Check matching bend side (skip S-inflections) & forward tangent progression along chord
         let c1 = nodes[i0].handle_out.unwrap();
         let c2 = nodes[i2].handle_in.unwrap();
+        let chord = p2 - p0;
         let t1 = (c1 - p0).normalize_or_zero();
         let t2 = (c2 - p2).normalize_or_zero();
-        let cross1 = (c1 - p0).x * (p2 - p0).y - (c1 - p0).y * (p2 - p0).x;
-        let cross2 = (c2 - p2).x * (p2 - p0).y - (c2 - p2).y * (p2 - p0).x;
-        if cross1 * cross2 > 0.0 || (t1.dot(t2) > 0.85) {
+        let cross1 = (c1 - p0).x * chord.y - (c1 - p0).y * chord.x;
+        let cross2 = (c2 - p2).x * chord.y - (c2 - p2).y * chord.x;
+        if cross1 * cross2 <= 0.0 || t1.dot(chord) <= 0.0 || t2.dot(p0 - p2) <= 0.0 {
             i += 1;
             continue;
         }
-        let mid_merged = cubic_eval(p0, p0 + (c1 - p0) * 1.5, p2 + (c2 - p2) * 1.5, p2, 0.5);
+        let h1_dir = c1 - p0;
+        let h2_dir = c2 - p2;
+        let d = h1_dir + h2_dir;
+        let m02 = p0.lerp(p2, 0.5);
+        let scale = if d.length_sq() > 1e-12 {
+            ((p1 - m02).dot(d) / (0.375 * d.length_sq())).clamp(1.25, 2.25)
+        } else {
+            1.5
+        };
+        let h1_new = p0 + h1_dir * scale;
+        let h2_new = p2 + h2_dir * scale;
+        let mid_merged = cubic_eval(p0, h1_new, h2_new, p2, 0.5);
         if mid_merged.distance_to(p1) <= tol_mm {
-            nodes[i0].handle_out = Some(p0 + (c1 - p0) * 1.5);
-            nodes[i2].handle_in = Some(p2 + (c2 - p2) * 1.5);
+            nodes[i0].handle_out = Some(h1_new);
+            nodes[i2].handle_in = Some(h2_new);
             nodes.remove(i1);
         } else {
             i += 1;
@@ -2548,5 +2607,145 @@ mod tests {
                 &rendered.rgba[off..off + 4]
             );
         }
+    }
+
+    #[test]
+    fn potrace_opticurve_merges_convex_circle_arcs_and_rejects_s_inflections() {
+        // 1. Synthetic convex circular arc nodes (quarter circle radius=100, 3 nodes) -> merges to 2
+        let r = 100.0;
+        let k_half = 0.2652 * r;
+        let p0 = Point2D::new(r, 0.0);
+        let p1 = Point2D::new(
+            r * std::f64::consts::FRAC_1_SQRT_2,
+            r * std::f64::consts::FRAC_1_SQRT_2,
+        );
+        let p2 = Point2D::new(0.0, r);
+        let t1 = Vec2D::new(
+            -std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        );
+        let mut convex_nodes = vec![
+            PathNode::new(
+                p0,
+                None,
+                Some(p0 + Vec2D::new(0.0, k_half)),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                p1,
+                Some(p1 - t1 * k_half),
+                Some(p1 + t1 * k_half),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                p2,
+                Some(p2 + Vec2D::new(k_half, 0.0)),
+                None,
+                NodeKind::Smooth,
+            ),
+            PathNode::corner(Point2D::ZERO),
+        ];
+        potrace_opticurve_merge(&mut convex_nodes, false, 1.5);
+        // Wait: potrace_opticurve_merge starts at i=1 for open; test closed 4-node-to-2-node or i=1
+        let mut closed_convex = vec![
+            PathNode::new(
+                Point2D::new(r, 0.0),
+                Some(Point2D::new(r, -k_half)),
+                Some(Point2D::new(r, k_half)),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                p1,
+                Some(p1 - t1 * k_half),
+                Some(p1 + t1 * k_half),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                p2,
+                Some(p2 + Vec2D::new(k_half, 0.0)),
+                Some(p2 - Vec2D::new(k_half, 0.0)),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                Point2D::new(-r, 0.0),
+                Some(Point2D::new(-r, k_half)),
+                Some(Point2D::new(-r, -k_half)),
+                NodeKind::Smooth,
+            ),
+        ];
+        potrace_opticurve_merge(&mut closed_convex, true, 1.5);
+        assert!(
+            closed_convex.len() < 4,
+            "convex circular arc triplet must merge"
+        );
+
+        // 2. S-curve inflection triplet (opposite cross product signs) must NOT merge
+        let mut s_curve = vec![
+            PathNode::corner(Point2D::new(-10.0, 0.0)),
+            PathNode::new(
+                Point2D::new(0.0, 0.0),
+                None,
+                Some(Point2D::new(3.0, 10.0)),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                Point2D::new(10.0, 0.0),
+                Some(Point2D::new(7.0, 5.0)),
+                Some(Point2D::new(13.0, -5.0)),
+                NodeKind::Smooth,
+            ),
+            PathNode::new(
+                Point2D::new(20.0, 0.0),
+                Some(Point2D::new(17.0, -10.0)),
+                None,
+                NodeKind::Smooth,
+            ),
+        ];
+        potrace_opticurve_merge(&mut s_curve, false, 10.0);
+        assert_eq!(s_curve.len(), 4, "S-inflection must never merge");
+
+        // 3. Real 256x256 black circle trace emits smooth cubic Bezier handles (nodes_with_handles > 0)
+        let w = 256u32;
+        let h = 256u32;
+        let mut buf = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = f64::from(x) - 127.5;
+                let dy = f64::from(y) - 127.5;
+                if dx * dx + dy * dy <= 90.0 * 90.0 {
+                    let off = ((y * w + x) * 4) as usize;
+                    buf[off..off + 4].copy_from_slice(&[0, 0, 0, 255]);
+                }
+            }
+        }
+        let asset = RasterAsset::new(w, h, buf, 96.0, ColorMode::Rgb).unwrap();
+        let traced = trace_raster_to_mm(
+            &asset,
+            64.0,
+            64.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                smoothing: 0.8,
+                remove_background: true,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(traced.len(), 1);
+        let (path, _) = &traced[0];
+        let total_nodes: usize = path.subpaths.iter().map(|s| s.nodes.len()).sum();
+        let nodes_with_handles: usize = path
+            .subpaths
+            .iter()
+            .flat_map(|s| s.nodes.iter())
+            .filter(|n| n.handle_in.is_some() || n.handle_out.is_some())
+            .count();
+        assert!(
+            nodes_with_handles > 0,
+            "traced 256x256 circle must emit smooth cubic Bezier handles (total_nodes={total_nodes})"
+        );
+        assert!(
+            total_nodes < 120,
+            "opticurve must simplify circle below 120 nodes, got {total_nodes}"
+        );
     }
 }

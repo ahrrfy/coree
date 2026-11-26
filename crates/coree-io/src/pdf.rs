@@ -477,6 +477,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         let bleed_x1 = (margin_mm + page.width_mm + bleed_mm) * MM_TO_PT;
         let bleed_y1 = (margin_mm + page.height_mm + bleed_mm) * MM_TO_PT;
 
+        let is_pdfx1a = resolved_pdfx == PdfXConformance::PdfX1a2001;
         let mut emit_state = PdfPageEmit {
             store: &mut store,
             embedded_fonts: &embedded_fonts,
@@ -490,6 +491,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
             dynamic_img_counter: &mut dynamic_img_counter,
             use_icc_for_raster,
             doc_icc: &doc_icc,
+            is_pdfx1a,
         };
         let mut stream = String::with_capacity(4096);
 
@@ -540,21 +542,7 @@ pub fn export_pdf_to_bytes(doc: &Document, opts: &PdfExportOptions) -> IoResult<
         }
 
         // Build ExtGState objects for this page
-        let mut gstate_refs = String::new();
-        for (key, gs_name) in &gstates {
-            let mut dict = format!(
-                "<< /Type /ExtGState /ca {:.4} /CA {:.4} /BM /{}",
-                f64::from(key.fill_alpha_milli) / 1000.0,
-                f64::from(key.stroke_alpha_milli) / 1000.0,
-                key.blend_mode
-            );
-            if key.overprint {
-                dict.push_str(" /OP true /op true /OPM 1");
-            }
-            dict.push_str(" >>");
-            let gs_id = store.add(dict.into_bytes());
-            let _ = write!(gstate_refs, " /{gs_name} {gs_id} 0 R");
-        }
+        let gstate_refs = build_extgstate_objects(&mut store, &gstates, is_pdfx1a);
 
         let mut xobj_refs = String::new();
         for (im_name, im_id) in &used_images {
@@ -897,6 +885,10 @@ impl StreamingPdfDocument {
             None
         };
 
+        let page_is_pdfx1a = self.opts.pdfx_conformance == PdfXConformance::PdfX1a2001
+            || (self.opts.pdfx_conformance == PdfXConformance::Auto
+                && self.use_cmyk
+                && !dl.has_transparency);
         let mut emit_state = PdfPageEmit {
             store: &mut self.store,
             embedded_fonts: &self.embedded_fonts,
@@ -910,6 +902,7 @@ impl StreamingPdfDocument {
             dynamic_img_counter: &mut self.dynamic_img_counter,
             use_icc_for_raster: self.use_icc_for_raster,
             doc_icc: &self.doc_icc,
+            is_pdfx1a: page_is_pdfx1a,
         };
         let mut stream = std::mem::take(&mut self.stream_buf);
         stream.clear();
@@ -951,21 +944,7 @@ impl StreamingPdfDocument {
         let page_spots = emit_state.used_spots;
         let has_fonts = !emit_state.used_fonts.is_empty();
 
-        let mut gstate_refs = String::new();
-        for (key, gs_name) in &gstates {
-            let mut dict = format!(
-                "<< /Type /ExtGState /ca {:.4} /CA {:.4} /BM /{}",
-                f64::from(key.fill_alpha_milli) / 1000.0,
-                f64::from(key.stroke_alpha_milli) / 1000.0,
-                key.blend_mode
-            );
-            if key.overprint {
-                dict.push_str(" /OP true /op true /OPM 1");
-            }
-            dict.push_str(" >>");
-            let gs_id = self.store.add(dict.into_bytes());
-            let _ = write!(gstate_refs, " /{gs_name} {gs_id} 0 R");
-        }
+        let gstate_refs = build_extgstate_objects(&mut self.store, &gstates, page_is_pdfx1a);
 
         let mut xobj_refs = String::new();
         for (im_name, im_id) in &used_images {
@@ -1195,6 +1174,7 @@ struct PdfPageEmit<'a> {
     dynamic_img_counter: &'a mut usize,
     use_icc_for_raster: bool,
     doc_icc: &'a coree_core::IccColorPipeline,
+    is_pdfx1a: bool,
 }
 
 fn emit_display_op(
@@ -1284,6 +1264,7 @@ fn emit_display_op(
                     *tl,
                     *opacity,
                     *blend_mode,
+                    emit.is_pdfx1a,
                     &mut emit.gstates,
                     out,
                 );
@@ -1343,23 +1324,37 @@ fn emit_pdf_image_quad(
     tl: Point2D,
     opacity: f32,
     blend_mode: BlendMode,
+    is_pdfx1a: bool,
     gstates: &mut BTreeMap<GStateKey, String>,
     out: &mut String,
 ) {
     let (x0, y0) = ctx.to_pdf_pt(bl);
     let (x1, y1) = ctx.to_pdf_pt(br);
     let (x2, y2) = ctx.to_pdf_pt(tl);
-    let gs = intern_gstate(gstates, opacity, opacity, blend_mode, false);
-    let _ = writeln!(
-        out,
-        "q /{gs} gs {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
-        x1 - x0,
-        y1 - y0,
-        x2 - x0,
-        y2 - y0,
-        x0,
-        y0
-    );
+    if !is_pdfx1a && ((opacity - 1.0).abs() > 1e-3 || blend_mode != BlendMode::Normal) {
+        let gs = intern_gstate(gstates, opacity, opacity, blend_mode, false);
+        let _ = writeln!(
+            out,
+            "q /{gs} gs {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
+            x1 - x0,
+            y1 - y0,
+            x2 - x0,
+            y2 - y0,
+            x0,
+            y0
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "q {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{im_name} Do Q",
+            x1 - x0,
+            y1 - y0,
+            x2 - x0,
+            y2 - y0,
+            x0,
+            y0
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1392,13 +1387,15 @@ fn emit_pdf_embedded_run(
     emit.used_fonts
         .insert(emb.res_name.clone(), emb.type0_obj_id);
 
-    let fill_alpha = (run.fill.alpha() * opacity).clamp(0.0, 1.0);
-    let stroke_alpha = (outline.color.alpha() * opacity).clamp(0.0, 1.0);
-    let has_fill = fill_alpha > 1e-6;
-    let has_stroke = outline.is_visible() && stroke_alpha > 1e-6;
+    let raw_fill_alpha = (run.fill.alpha() * opacity).clamp(0.0, 1.0);
+    let raw_stroke_alpha = (outline.color.alpha() * opacity).clamp(0.0, 1.0);
+    let has_fill = raw_fill_alpha > 1e-6;
+    let has_stroke = outline.is_visible() && raw_stroke_alpha > 1e-6;
     if !has_fill && !has_stroke {
         return true;
     }
+    let fill_alpha = if has_fill { raw_fill_alpha } else { 1.0 };
+    let stroke_alpha = if has_stroke { raw_stroke_alpha } else { 1.0 };
 
     let font_pt = if run.font_size_pt.is_finite() {
         run.font_size_pt.max(0.5)
@@ -1407,18 +1404,26 @@ fn emit_pdf_embedded_run(
     };
 
     out.push_str("q\n");
-    if (fill_alpha - 1.0).abs() > 1e-3
-        || (stroke_alpha - 1.0).abs() > 1e-3
-        || blend_mode != BlendMode::Normal
-        || outline.overprint
-    {
-        let gs = intern_gstate(
-            &mut emit.gstates,
-            fill_alpha,
-            stroke_alpha,
-            blend_mode,
-            outline.overprint,
-        );
+    let need_gstate = if emit.is_pdfx1a {
+        outline.overprint
+    } else {
+        (fill_alpha - 1.0).abs() > 1e-3
+            || (stroke_alpha - 1.0).abs() > 1e-3
+            || blend_mode != BlendMode::Normal
+            || outline.overprint
+    };
+    if need_gstate {
+        let gs = if emit.is_pdfx1a {
+            intern_gstate(&mut emit.gstates, 1.0, 1.0, BlendMode::Normal, true)
+        } else {
+            intern_gstate(
+                &mut emit.gstates,
+                fill_alpha,
+                stroke_alpha,
+                blend_mode,
+                outline.overprint,
+            )
+        };
         let _ = writeln!(out, "/{gs} gs");
     }
     if has_fill {
@@ -1624,7 +1629,9 @@ fn emit_pdf_styled_path_opts(
         return;
     }
 
-    let fill_alpha = if shading_name.is_some() {
+    let fill_alpha = if !do_fill {
+        1.0
+    } else if shading_name.is_some() {
         fill.referenced_colors()
             .first()
             .map_or(opacity, |c| (c.alpha() * opacity).clamp(0.0, 1.0))
@@ -1633,21 +1640,33 @@ fn emit_pdf_styled_path_opts(
             .as_ref()
             .map_or(1.0, |c| (c.alpha() * opacity).clamp(0.0, 1.0))
     };
-    let stroke_alpha = (outline.color.alpha() * opacity).clamp(0.0, 1.0);
+    let stroke_alpha = if do_stroke {
+        (outline.color.alpha() * opacity).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
 
     out.push_str("q\n");
-    if (fill_alpha - 1.0).abs() > 1e-3
-        || (stroke_alpha - 1.0).abs() > 1e-3
-        || blend_mode != BlendMode::Normal
-        || outline.overprint
-    {
-        let gs = intern_gstate(
-            &mut emit.gstates,
-            fill_alpha,
-            stroke_alpha,
-            blend_mode,
-            outline.overprint,
-        );
+    let need_gstate = if emit.is_pdfx1a {
+        outline.overprint
+    } else {
+        (fill_alpha - 1.0).abs() > 1e-3
+            || (stroke_alpha - 1.0).abs() > 1e-3
+            || blend_mode != BlendMode::Normal
+            || outline.overprint
+    };
+    if need_gstate {
+        let gs = if emit.is_pdfx1a {
+            intern_gstate(&mut emit.gstates, 1.0, 1.0, BlendMode::Normal, true)
+        } else {
+            intern_gstate(
+                &mut emit.gstates,
+                fill_alpha,
+                stroke_alpha,
+                blend_mode,
+                outline.overprint,
+            )
+        };
         let _ = writeln!(out, "/{gs} gs");
     }
 
@@ -2486,6 +2505,37 @@ fn add_rgba_bytes_xobject(
     Ok(store.add(img_buf))
 }
 
+fn build_extgstate_objects(
+    store: &mut PdfObjectStore,
+    gstates: &BTreeMap<GStateKey, String>,
+    is_pdfx1a: bool,
+) -> String {
+    let mut gstate_refs = String::new();
+    for (key, gs_name) in gstates {
+        if is_pdfx1a {
+            if !key.overprint {
+                continue;
+            }
+            let gs_id = store.add(b"<< /Type /ExtGState /OP true /op true /OPM 1 >>".to_vec());
+            let _ = write!(gstate_refs, " /{gs_name} {gs_id} 0 R");
+        } else {
+            let mut dict = format!(
+                "<< /Type /ExtGState /ca {:.4} /CA {:.4} /BM /{}",
+                f64::from(key.fill_alpha_milli) / 1000.0,
+                f64::from(key.stroke_alpha_milli) / 1000.0,
+                key.blend_mode
+            );
+            if key.overprint {
+                dict.push_str(" /OP true /op true /OPM 1");
+            }
+            dict.push_str(" >>");
+            let gs_id = store.add(dict.into_bytes());
+            let _ = write!(gstate_refs, " /{gs_name} {gs_id} 0 R");
+        }
+    }
+    gstate_refs
+}
+
 fn intern_gstate(
     gstates: &mut BTreeMap<GStateKey, String>,
     fill_alpha: f32,
@@ -3119,5 +3169,121 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    #[test]
+    fn pdfx1a_omits_transparency_extgstate_on_unstroked_and_unfilled_elements() {
+        let mut doc = Document::new("PDFX1a Opaque", 120.0, 80.0, ColorMode::Cmyk, 300.0);
+        // 1. Unstroked opaque path (`OutlineStyle::none()` has `Color::TRANSPARENT`)
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "UnstrokedRect",
+                NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                    10.0, 10.0, 40.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::Solid(Color::cmyk(0.0, 0.8, 0.9, 0.0)))
+            .with_outline(OutlineStyle::none()),
+            None,
+        )
+        .unwrap();
+        // 2. Unfilled opaque stroked path (`Fill::None`)
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "UnfilledStroke",
+                NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                    60.0, 10.0, 40.0, 20.0,
+                ))),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::solid(Color::cmyk(1.0, 0.0, 0.0, 0.0), 1.0)),
+            None,
+        )
+        .unwrap();
+        // 3. Unstroked opaque text (`OutlineStyle::none()`)
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "OpaqueText",
+                NodePayload::ArtisticText(ArtisticText::from_plain(
+                    "Hello PDFX1a",
+                    TextStyle {
+                        font_size_pt: 14.0,
+                        fill: Color::cmyk(0.0, 0.0, 0.0, 1.0),
+                        ..TextStyle::default()
+                    },
+                )),
+            )
+            .with_outline(OutlineStyle::none())
+            .with_transform(Affine2D::translate(15.0, 50.0)),
+            None,
+        )
+        .unwrap();
+
+        let opts = PdfExportOptions {
+            color_space: PdfColorSpace::DeviceCmyk,
+            crop_marks: true,
+            compress_streams: false,
+            pdfx_conformance: PdfXConformance::Auto,
+            ..PdfExportOptions::default()
+        };
+        let bytes = export_pdf_to_bytes(&doc, &opts).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("/GTS_PDFXVersion (PDF/X-1a:2001)"),
+            "opaque CMYK document must resolve to PDF/X-1a:2001"
+        );
+        assert!(
+            !text.contains("/ExtGState"),
+            "opaque PDF/X-1a without overprint must not emit /ExtGState:\n{text}"
+        );
+        assert!(!text.contains("/ca "), "PDF/X-1a must never emit /ca");
+        assert!(!text.contains("/CA "), "PDF/X-1a must never emit /CA");
+        assert!(!text.contains("/BM "), "PDF/X-1a must never emit /BM");
+
+        // Also test StreamingPdfDocument and overprint-only ExtGState in PDF/X-1a:2001
+        let mut overprint_outline = OutlineStyle::solid(Color::cmyk(0.0, 0.0, 0.0, 1.0), 0.5);
+        overprint_outline.overprint = true;
+        doc.add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "OverprintStroke",
+                NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+                    15.0, 55.0, 30.0, 10.0,
+                ))),
+            )
+            .with_fill(Fill::None)
+            .with_outline(overprint_outline),
+            None,
+        )
+        .unwrap();
+
+        let bytes_op = export_pdf_to_bytes(&doc, &opts).unwrap();
+        let text_op = String::from_utf8_lossy(&bytes_op);
+        assert!(text_op.contains("/GTS_PDFXVersion (PDF/X-1a:2001)"));
+        assert!(text_op.contains("/ExtGState"));
+        assert!(text_op.contains("/OP true /op true /OPM 1"));
+        assert!(
+            !text_op.contains("/ca ") && !text_op.contains("/CA ") && !text_op.contains("/BM "),
+            "PDF/X-1a overprint ExtGState must contain zero /ca, /CA, or /BM:\n{text_op}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let stream_path = dir.path().join("stream_pdfx1a.pdf");
+        let mut sdoc = StreamingPdfDocument::create(&doc, &opts, &stream_path).unwrap();
+        sdoc.push_page(&doc, 0).unwrap();
+        sdoc.finish().unwrap();
+        let stream_bytes = std::fs::read(&stream_path).unwrap();
+        let stream_text = String::from_utf8_lossy(&stream_bytes);
+        assert!(stream_text.contains("/GTS_PDFXVersion (PDF/X-1a:2001)"));
+        assert!(stream_text.contains("/OP true /op true /OPM 1"));
+        assert!(
+            !stream_text.contains("/ca ")
+                && !stream_text.contains("/CA ")
+                && !stream_text.contains("/BM "),
+            "streaming PDF/X-1a must contain zero /ca, /CA, or /BM"
+        );
     }
 }

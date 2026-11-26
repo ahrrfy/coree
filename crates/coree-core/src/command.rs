@@ -188,6 +188,10 @@ pub enum CommandOp {
         id: ObjectId,
         lock_contents: bool,
     },
+    SetPowerClipFillRule {
+        id: ObjectId,
+        clip_even_odd: bool,
+    },
     MoveToDesktopLayer {
         id: ObjectId,
     },
@@ -447,6 +451,13 @@ impl CommandOp {
             Self::CreatePowerClip { .. } => "Create PowerClip".to_owned(),
             Self::ExtractPowerClip { .. } => "Extract PowerClip".to_owned(),
             Self::SetPowerClipLock { .. } => "Toggle PowerClip Lock Contents".to_owned(),
+            Self::SetPowerClipFillRule { clip_even_odd, .. } => {
+                if *clip_even_odd {
+                    "Set PowerClip Fill Rule (Even-Odd)".to_owned()
+                } else {
+                    "Set PowerClip Fill Rule (Winding)".to_owned()
+                }
+            }
             Self::MoveToDesktopLayer { .. } => "Move to Desktop Layer".to_owned(),
             Self::ConvertToCurves { .. } => "Convert to Curves".to_owned(),
             Self::ConvertOutlineToObject { .. } => "Convert Outline to Object".to_owned(),
@@ -1843,6 +1854,15 @@ pub fn apply_command(doc: &mut Document, op: &CommandOp) -> CoreResult<()> {
                 return Err(CoreError::ObjectLocked(*id));
             }
             doc.set_powerclip_lock_contents(*id, *lock_contents)?;
+        }
+        CommandOp::SetPowerClipFillRule { id, clip_even_odd } => {
+            if !doc.has_object(*id) {
+                return Err(CoreError::ObjectNotFound(*id));
+            }
+            if doc.is_effectively_locked(*id) {
+                return Err(CoreError::ObjectLocked(*id));
+            }
+            doc.set_powerclip_clip_even_odd(*id, *clip_even_odd)?;
         }
         CommandOp::MoveToDesktopLayer { id } => {
             if !doc.has_object(*id) {

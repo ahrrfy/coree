@@ -3,6 +3,7 @@
 //! Pure-Rust multi-format clipboard payload encoding & decoding (`SVG`, `PDF`, `[MS-EMF]`,
 //! and `PNG` / `RGBA8`), wired cleanly into `coree-app` OS clipboard backends.
 
+use crate::display_list::{compose_world_persp, transform_world_path};
 use crate::error::{IoError, IoResult};
 use crate::pdf::{export_pdf_to_bytes, PdfColorSpace, PdfExportOptions};
 use crate::pdf_import::import_pdf_bytes;
@@ -13,8 +14,9 @@ use crate::svg::{export_svg_to_string, import_svg_str_with_limits};
 use crate::{resolve_export_connector_endpoints, resolve_export_world_path, ExportSymCtx};
 use coree_core::{
     Affine2D, BezierPath, Color, ColorMode, Document, Fill, NodePayload, ObjectId, OutlineStyle,
-    Point2D, Rect2D, SceneObject, Subpath, SymbolDef,
+    Perspective3x3, Point2D, Rect2D, SceneObject, Subpath, SymbolDef,
 };
+use coree_render::effects_render::apply_geometry_effects;
 use coree_render::{render_page_to_rgba, TextEngine, ViewMode};
 use kurbo::{BezPath, PathEl, Shape as _};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +28,9 @@ pub const MIME_PNG: &str = "image/png";
 pub const MIME_TEXT_PLAIN: &str = "text/plain;charset=utf-8";
 
 const CLIPBOARD_MAX_RASTER_DIM: u32 = 2048;
+const MAX_EMF_RECORDS: u32 = 200_000;
+const MAX_EMF_OBJECTS: usize = 100_000;
+const MAX_EMF_VERTICES: usize = 2_000_000;
 const HIMETRIC_PER_MM: f64 = 100.0;
 const DEFAULT_CLIPBOARD_DPI: f64 = 96.0;
 
@@ -298,6 +303,7 @@ pub fn encode_clipboard_emf(doc: &Document, page_index: usize) -> IoResult<Vec<u
                     obj,
                     Affine2D::IDENTITY,
                     None,
+                    None,
                     0,
                     &mut visited,
                     &mut text_engine,
@@ -376,11 +382,28 @@ fn build_emf_symbol_maps(sym: &SymbolDef) -> (HashMap<ObjectId, &SceneObject>, H
     (child_map, referenced)
 }
 
+#[inline]
+fn warp_emf_world_path(
+    local_bp: BezierPath,
+    obj: &SceneObject,
+    world_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    let bp = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local_bp)
+    } else {
+        local_bp
+    };
+    let deformed = apply_geometry_effects(&bp, &obj.effects);
+    transform_world_path(&deformed, obj.transform, world_xf, parent_persp)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_emf_object(
     doc: &Document,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<ExportSymCtx<'_>>,
     depth: usize,
     visited: &mut HashSet<ObjectId>,
@@ -397,6 +420,7 @@ fn emit_emf_object(
         return;
     }
     let world_xf = parent_xf.compose(&obj.transform);
+    let child_persp = compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
 
     match &obj.payload {
         NodePayload::Group(children) => {
@@ -409,6 +433,7 @@ fn emit_emf_object(
                         doc,
                         child,
                         world_xf,
+                        child_persp,
                         sym_ctx,
                         depth + 1,
                         visited,
@@ -429,9 +454,11 @@ fn emit_emf_object(
             contents,
             ..
         } => {
+            let warped_container =
+                warp_emf_world_path((**container).clone(), obj, world_xf, parent_persp);
             emit_emf_bezier_shape(
-                container.as_ref(),
-                world_xf,
+                &warped_container,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &obj.outline,
                 out,
@@ -451,6 +478,7 @@ fn emit_emf_object(
                         doc,
                         child,
                         world_xf,
+                        child_persp,
                         sym_ctx,
                         depth + 1,
                         visited,
@@ -467,9 +495,10 @@ fn emit_emf_object(
             }
         }
         NodePayload::Path(bp) => {
+            let warped = warp_emf_world_path(bp.clone(), obj, world_xf, parent_persp);
             emit_emf_bezier_shape(
-                bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &obj.outline,
                 out,
@@ -482,10 +511,10 @@ fn emit_emf_object(
             );
         }
         NodePayload::Shape(shape) => {
-            let bp = shape.to_bezier_path();
+            let warped = warp_emf_world_path(shape.to_bezier_path(), obj, world_xf, parent_persp);
             emit_emf_bezier_shape(
-                &bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &obj.outline,
                 out,
@@ -498,10 +527,10 @@ fn emit_emf_object(
             );
         }
         NodePayload::BSpline(bs) => {
-            let bp = bs.to_bezier_path();
+            let warped = warp_emf_world_path(bs.to_bezier_path(), obj, world_xf, parent_persp);
             emit_emf_bezier_shape(
-                &bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &obj.outline,
                 out,
@@ -514,10 +543,15 @@ fn emit_emf_object(
             );
         }
         NodePayload::ArtisticMedia { spine, style } => {
-            let bp = coree_core::ArtisticMedia::expand_stroke(spine, style);
-            emit_emf_bezier_shape(
-                &bp,
+            let warped = warp_emf_world_path(
+                coree_core::ArtisticMedia::expand_stroke(spine, style),
+                obj,
                 world_xf,
+                parent_persp,
+            );
+            emit_emf_bezier_shape(
+                &warped,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &obj.outline,
                 out,
@@ -544,6 +578,7 @@ fn emit_emf_object(
                     doc,
                     &resolved,
                     parent_xf,
+                    parent_persp,
                     sym_ctx,
                     depth + 1,
                     visited,
@@ -559,15 +594,20 @@ fn emit_emf_object(
             }
         }
         NodePayload::ArtisticText(text) => {
-            let bp = text_engine.artistic_text_to_curves(text);
+            let warped = warp_emf_world_path(
+                text_engine.artistic_text_to_curves(text),
+                obj,
+                world_xf,
+                parent_persp,
+            );
             let fill = text
                 .runs
                 .first()
                 .map(|r| Fill::Solid(r.style.fill.clone()))
                 .unwrap_or_else(|| obj.fill.clone());
             emit_emf_bezier_shape(
-                &bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &fill,
                 &obj.outline,
                 out,
@@ -580,15 +620,20 @@ fn emit_emf_object(
             );
         }
         NodePayload::ParagraphText(para) => {
-            let bp = text_engine.paragraph_text_to_curves(para);
+            let warped = warp_emf_world_path(
+                text_engine.paragraph_text_to_curves(para),
+                obj,
+                world_xf,
+                parent_persp,
+            );
             let fill = para
                 .runs
                 .first()
                 .map(|r| Fill::Solid(r.style.fill.clone()))
                 .unwrap_or_else(|| obj.fill.clone());
             emit_emf_bezier_shape(
-                &bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &fill,
                 &obj.outline,
                 out,
@@ -703,6 +748,7 @@ fn emit_emf_object(
                         doc,
                         sym_obj,
                         world_xf,
+                        child_persp,
                         Some((&child_map, &sym.objects, world_xf)),
                         depth + 1,
                         &mut sym_visited,
@@ -746,9 +792,10 @@ fn emit_emf_object(
                     false,
                 ));
             }
+            let warped = warp_emf_world_path(bp, obj, world_xf, parent_persp);
             emit_emf_bezier_shape(
-                &bp,
-                world_xf,
+                &warped,
+                Affine2D::IDENTITY,
                 &obj.fill,
                 &table.border_style,
                 out,
@@ -761,10 +808,15 @@ fn emit_emf_object(
             );
         }
         NodePayload::Dimension(dim) => {
-            let bp = BezierPath::from_line(dim.p1, dim.p2);
-            emit_emf_bezier_shape(
-                &bp,
+            let warped = warp_emf_world_path(
+                BezierPath::from_line(dim.p1, dim.p2),
+                obj,
                 world_xf,
+                parent_persp,
+            );
+            emit_emf_bezier_shape(
+                &warped,
+                Affine2D::IDENTITY,
                 &Fill::None,
                 &obj.outline,
                 out,
@@ -1340,6 +1392,12 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
             ),
         });
     }
+    if n_records > MAX_EMF_RECORDS {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_emf_records={MAX_EMF_RECORDS}"),
+            actual: format!("nRecords={n_records}"),
+        });
+    }
 
     let frame_l = read_i32_le(bytes, 24);
     let frame_t = read_i32_le(bytes, 28);
@@ -1358,11 +1416,35 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
 
     let mut in_path = false;
     let mut kurbo_builder = BezPath::new();
+    let mut total_vertices = 0usize;
+    let mut emitted_objects = 0usize;
+
+    let emf_add_object = |doc: &mut Document,
+                          layer_id: Option<coree_core::LayerId>,
+                          obj: SceneObject,
+                          emitted_objects: &mut usize|
+     -> IoResult<()> {
+        if *emitted_objects >= MAX_EMF_OBJECTS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_emf_objects={MAX_EMF_OBJECTS}"),
+                actual: "EMF emitted object count exceeded".into(),
+            });
+        }
+        *emitted_objects += 1;
+        doc.add_object(obj, layer_id)?;
+        Ok(())
+    };
 
     let mut pos = 0usize;
     let mut walked = 0u32;
     let mut saw_eof = false;
     while pos < n_bytes {
+        if walked >= MAX_EMF_RECORDS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_emf_records={MAX_EMF_RECORDS}"),
+                actual: format!("walked={walked}"),
+            });
+        }
         if pos + 8 > n_bytes {
             return Err(IoError::InvalidFormat {
                 format: "emf".into(),
@@ -1437,12 +1519,26 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                 kurbo_builder = BezPath::new();
             }
             EMR_MOVETOEX if rsize >= 16 && in_path => {
+                total_vertices = total_vertices.saturating_add(1);
+                if total_vertices > MAX_EMF_VERTICES {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_emf_vertices={MAX_EMF_VERTICES}"),
+                        actual: format!("EMF vertex count {total_vertices} exceeded cap"),
+                    });
+                }
                 kurbo_builder.move_to(kurbo::Point::new(
                     himetric_to_mm(read_i32_le(rec, 8)),
                     himetric_to_mm(read_i32_le(rec, 12)),
                 ));
             }
             EMR_LINETO if rsize >= 16 && in_path => {
+                total_vertices = total_vertices.saturating_add(1);
+                if total_vertices > MAX_EMF_VERTICES {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_emf_vertices={MAX_EMF_VERTICES}"),
+                        actual: format!("EMF vertex count {total_vertices} exceeded cap"),
+                    });
+                }
                 kurbo_builder.line_to(kurbo::Point::new(
                     himetric_to_mm(read_i32_le(rec, 8)),
                     himetric_to_mm(read_i32_le(rec, 12)),
@@ -1452,6 +1548,13 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                 let cptl = read_u32_le(rec, 24) as usize;
                 let max_pts = (rsize - 28) / 8;
                 let count = cptl.min(max_pts);
+                total_vertices = total_vertices.saturating_add(count / 3);
+                if total_vertices > MAX_EMF_VERTICES {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_emf_vertices={MAX_EMF_VERTICES}"),
+                        actual: format!("EMF vertex count {total_vertices} exceeded cap"),
+                    });
+                }
                 let mut i = 0;
                 while i + 2 < count {
                     let off = 28 + i * 8;
@@ -1495,7 +1598,7 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                         SceneObject::new(oid, format!("EMF Path {}", oid.0), NodePayload::Path(bp))
                             .with_fill(obj_fill)
                             .with_outline(obj_outline);
-                    doc.add_object(obj, layer_id)?;
+                    emf_add_object(&mut doc, layer_id, obj, &mut emitted_objects)?;
                     kurbo_builder = BezPath::new();
                 }
             }
@@ -1516,11 +1619,18 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                     SceneObject::new(oid, format!("EMF Shape {}", oid.0), NodePayload::Path(bp))
                         .with_fill(current_fill.clone())
                         .with_outline(current_outline.clone());
-                doc.add_object(obj, layer_id)?;
+                emf_add_object(&mut doc, layer_id, obj, &mut emitted_objects)?;
             }
             EMR_POLYGON | EMR_POLYLINE if rsize >= 28 => {
                 let cptl = read_u32_le(rec, 24) as usize;
                 let count = cptl.min((rsize - 28) / 8);
+                total_vertices = total_vertices.saturating_add(count);
+                if total_vertices > MAX_EMF_VERTICES {
+                    return Err(IoError::LimitExceeded {
+                        limit: format!("max_emf_vertices={MAX_EMF_VERTICES}"),
+                        actual: format!("EMF vertex count {total_vertices} exceeded cap"),
+                    });
+                }
                 let mut pts = Vec::with_capacity(count);
                 for idx in 0..count {
                     let off = 28 + idx * 8;
@@ -1540,7 +1650,7 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                                 Fill::None
                             })
                             .with_outline(current_outline.clone());
-                    doc.add_object(obj, layer_id)?;
+                    emf_add_object(&mut doc, layer_id, obj, &mut emitted_objects)?;
                 }
             }
             EMR_STRETCHDIBITS if rsize >= 120 => {
@@ -1571,7 +1681,7 @@ pub fn decode_clipboard_emf(bytes: &[u8]) -> IoResult<Document> {
                             }),
                         )
                         .with_transform(Affine2D::translate(x_dest, y_dest));
-                        doc.add_object(obj, layer_id)?;
+                        emf_add_object(&mut doc, layer_id, obj, &mut emitted_objects)?;
                     }
                 }
             }
@@ -2129,5 +2239,42 @@ mod tests {
                 "TextOnPath must not be double-transformed by sym_root_xf (10,15): {bb:?}"
             );
         }
+    }
+
+    #[test]
+    fn emf_record_and_object_caps_reject_bomb() {
+        let n_rects = 250_000u32;
+        let rec_size = 24usize;
+        let eof_size = 20usize;
+        let n_bytes = 88 + (n_rects as usize) * rec_size + eof_size;
+        let mut emf = vec![0u8; 88];
+        emf[0..4].copy_from_slice(&EMR_HEADER.to_le_bytes());
+        emf[4..8].copy_from_slice(&88u32.to_le_bytes());
+        emf[24..28].copy_from_slice(&0i32.to_le_bytes());
+        emf[28..32].copy_from_slice(&0i32.to_le_bytes());
+        emf[32..36].copy_from_slice(&10_000i32.to_le_bytes());
+        emf[36..40].copy_from_slice(&10_000i32.to_le_bytes());
+        emf[40..44].copy_from_slice(b" EMF");
+        emf[44..48].copy_from_slice(&0x10000u32.to_le_bytes());
+        emf[48..52].copy_from_slice(&(n_bytes as u32).to_le_bytes());
+        emf[52..56].copy_from_slice(&(2 + n_rects).to_le_bytes());
+        for _ in 0..n_rects {
+            emf.extend_from_slice(&43u32.to_le_bytes()); // EMR_RECTANGLE
+            emf.extend_from_slice(&24u32.to_le_bytes());
+            for v in [0i32, 0, 1000, 1000] {
+                emf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        emf.extend_from_slice(&EMR_EOF.to_le_bytes());
+        emf.extend_from_slice(&20u32.to_le_bytes());
+        emf.extend_from_slice(&0u32.to_le_bytes());
+        emf.extend_from_slice(&0x10u32.to_le_bytes());
+        emf.extend_from_slice(&20u32.to_le_bytes());
+
+        let err = decode_clipboard_emf(&emf).unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on 250k EMR_RECTANGLE bomb, got {err:?}"
+        );
     }
 }

@@ -18,7 +18,7 @@ use coree_core::{
 };
 use coree_render::{outline_arrowhead_geometries, FillRule, TextEngine};
 use kurbo::{BezPath, PathEl};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -26,6 +26,10 @@ use usvg::tiny_skia_path::PathSegment;
 
 /// Canonical SVG CSS pixel-to-millimeter factor at 96 DPI (`25.4 / 96.0`).
 const PX_TO_MM_96: f64 = 25.4 / 96.0;
+/// Maximum expanded SVG scene objects allowed during import.
+pub const MAX_SVG_OBJECTS: usize = 100_000;
+/// Maximum expanded SVG path vertices/segments allowed during import.
+pub const MAX_SVG_VERTICES: usize = 2_000_000;
 
 fn cached_system_fontdb() -> Arc<usvg::fontdb::Database> {
     static DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
@@ -141,6 +145,8 @@ fn import_svg_str_named(
         });
     }
 
+    precheck_svg_expansion_limits(&xml_doc, limits.max_svg_depth)?;
+
     let layer_meta_by_xml_id = collect_svg_layer_metadata(&xml_doc);
 
     let mut opts = usvg::Options {
@@ -166,8 +172,9 @@ fn import_svg_str_named(
     let default_layer_id = doc.pages()[0].layers[0].id;
 
     let mut created_named_layers = false;
-    let mut imported_text_via_usvg = false;
+    let mut imported_usvg_texts: HashMap<(String, String), Vec<ImportedUsvgText>> = HashMap::new();
     let mut xml_layer_ids: HashMap<String, LayerId> = HashMap::new();
+    let mut budget = SvgImportBudget::default();
 
     // `usvg` resolves SVG viewBox/units into 96-DPI pixels via an unnamed root wrapper group.
     // Start with `scale(PX_TO_MM_96)` and unwrap unnamed synthetic root wrapper groups so
@@ -206,7 +213,8 @@ fn import_svg_str_named(
                         1.0,
                         0,
                         limits,
-                        &mut imported_text_via_usvg,
+                        &mut budget,
+                        &mut imported_usvg_texts,
                     )?;
                 } else {
                     let group_to_mm = root_to_mm.compose(&usvg_transform_raw(group.transform()));
@@ -219,7 +227,8 @@ fn import_svg_str_named(
                             group.opacity().get(),
                             0,
                             limits,
-                            &mut imported_text_via_usvg,
+                            &mut budget,
+                            &mut imported_usvg_texts,
                         )?;
                     }
                 }
@@ -234,23 +243,28 @@ fn import_svg_str_named(
             1.0,
             0,
             limits,
-            &mut imported_text_via_usvg,
+            &mut budget,
+            &mut imported_usvg_texts,
         )?;
     }
 
-    // If `usvg` could not resolve fonts (e.g., headless container without matching system fonts),
-    // recover raw `<text>` nodes directly from the XML tree preserving ancestor layers & transforms.
-    if !imported_text_via_usvg {
-        import_fallback_xml_texts(
-            &mut doc,
-            &xml_doc,
-            page_id,
-            default_layer_id,
-            &layer_meta_by_xml_id,
-            &mut xml_layer_ids,
-            &mut created_named_layers,
-        )?;
-    }
+    // Recover any raw `<text>` nodes that `usvg` dropped (e.g., missing system fonts such as
+    // Helvetica/Arial in mixed-font SVGs), skipping only `<text>` elements already imported by `usvg`.
+    import_fallback_xml_texts(
+        &mut doc,
+        &xml_doc,
+        page_id,
+        default_layer_id,
+        &layer_meta_by_xml_id,
+        &mut xml_layer_ids,
+        &mut created_named_layers,
+        &mut budget,
+        &mut imported_usvg_texts,
+    )?;
+
+    // Release intermediate `usvg` and XML trees before refreshing palette / returning.
+    drop(tree);
+    drop(xml_doc);
 
     // Remove empty placeholder "Layer 1" when named SVG layers were created cleanly.
     if created_named_layers && doc.pages()[0].layers.len() > 1 {
@@ -335,6 +349,429 @@ fn collect_svg_layer_metadata(
     map
 }
 
+#[derive(Default)]
+struct SvgImportBudget {
+    emitted_objects: usize,
+    total_vertices: usize,
+}
+
+impl SvgImportBudget {
+    fn check_and_record_object(&mut self, doc: &Document) -> IoResult<()> {
+        let next = self.emitted_objects.saturating_add(1);
+        if next > MAX_SVG_OBJECTS || doc.object_count() >= MAX_SVG_OBJECTS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_svg_objects={MAX_SVG_OBJECTS}"),
+                actual: format!("SVG expanded object count exceeds {MAX_SVG_OBJECTS}"),
+            });
+        }
+        self.emitted_objects = next;
+        Ok(())
+    }
+
+    fn record_vertices(&mut self, count: usize) -> IoResult<()> {
+        let next = self.total_vertices.saturating_add(count);
+        if next > MAX_SVG_VERTICES {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_svg_vertices={MAX_SVG_VERTICES}"),
+                actual: format!(
+                    "SVG expanded vertex/segment count {next} exceeds {MAX_SVG_VERTICES}"
+                ),
+            });
+        }
+        self.total_vertices = next;
+        Ok(())
+    }
+}
+
+fn emit_svg_object(
+    doc: &mut Document,
+    obj: SceneObject,
+    target_layer: Option<LayerId>,
+    budget: &mut SvgImportBudget,
+) -> IoResult<ObjectId> {
+    budget.check_and_record_object(doc)?;
+    if let Some(lid) = target_layer {
+        Ok(doc.add_object(obj, Some(lid))?)
+    } else {
+        Ok(doc.insert_loaded_object(obj)?)
+    }
+}
+
+fn scan_svg_number(bytes: &[u8], idx: &mut usize) -> bool {
+    let len = bytes.len();
+    while *idx < len && (bytes[*idx].is_ascii_whitespace() || bytes[*idx] == b',') {
+        *idx += 1;
+    }
+    if *idx >= len {
+        return false;
+    }
+    let start = *idx;
+    if matches!(bytes[*idx], b'+' | b'-') {
+        *idx += 1;
+    }
+    let mut has_digit = false;
+    while *idx < len && bytes[*idx].is_ascii_digit() {
+        has_digit = true;
+        *idx += 1;
+    }
+    if *idx < len && bytes[*idx] == b'.' {
+        *idx += 1;
+        while *idx < len && bytes[*idx].is_ascii_digit() {
+            has_digit = true;
+            *idx += 1;
+        }
+    }
+    if !has_digit {
+        *idx = start;
+        return false;
+    }
+    if *idx < len && matches!(bytes[*idx], b'e' | b'E') {
+        let exp_pos = *idx;
+        *idx += 1;
+        if *idx < len && matches!(bytes[*idx], b'+' | b'-') {
+            *idx += 1;
+        }
+        let mut exp_digits = false;
+        while *idx < len && bytes[*idx].is_ascii_digit() {
+            exp_digits = true;
+            *idx += 1;
+        }
+        if !exp_digits {
+            *idx = exp_pos;
+        }
+    }
+    true
+}
+
+fn scan_svg_arc_flag(bytes: &[u8], idx: &mut usize) -> bool {
+    let len = bytes.len();
+    while *idx < len && (bytes[*idx].is_ascii_whitespace() || bytes[*idx] == b',') {
+        *idx += 1;
+    }
+    if *idx < len && matches!(bytes[*idx], b'0' | b'1') {
+        *idx += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn estimate_svg_path_vertices(d: &str) -> usize {
+    let bytes = d.as_bytes();
+    let len = bytes.len();
+    let mut idx = 0usize;
+    let mut total = 0usize;
+
+    while idx < len {
+        while idx < len && (bytes[idx].is_ascii_whitespace() || bytes[idx] == b',') {
+            idx += 1;
+        }
+        if idx >= len {
+            break;
+        }
+        let cmd = bytes[idx];
+        if !cmd.is_ascii_alphabetic() {
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+
+        match cmd {
+            b'Z' | b'z' => {}
+            b'H' | b'h' | b'V' | b'v' => {
+                while scan_svg_number(bytes, &mut idx) {
+                    total = total.saturating_add(1);
+                }
+            }
+            b'M' | b'm' | b'L' | b'l' | b'T' | b't' => {
+                let mut count = 0usize;
+                while scan_svg_number(bytes, &mut idx) {
+                    count += 1;
+                }
+                total = total.saturating_add(count / 2);
+            }
+            b'S' | b's' | b'Q' | b'q' => {
+                let mut count = 0usize;
+                while scan_svg_number(bytes, &mut idx) {
+                    count += 1;
+                }
+                total = total.saturating_add(count / 4);
+            }
+            b'C' | b'c' => {
+                let mut count = 0usize;
+                while scan_svg_number(bytes, &mut idx) {
+                    count += 1;
+                }
+                total = total.saturating_add(count / 6);
+            }
+            b'A' | b'a' => {
+                while scan_svg_number(bytes, &mut idx) {
+                    if !scan_svg_number(bytes, &mut idx)
+                        || !scan_svg_number(bytes, &mut idx)
+                        || !scan_svg_arc_flag(bytes, &mut idx)
+                        || !scan_svg_arc_flag(bytes, &mut idx)
+                        || !scan_svg_number(bytes, &mut idx)
+                        || !scan_svg_number(bytes, &mut idx)
+                    {
+                        break;
+                    }
+                    total = total.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    total
+}
+
+fn estimate_svg_points_count(points: &str) -> usize {
+    let bytes = points.as_bytes();
+    let mut idx = 0usize;
+    let mut count = 0usize;
+    while scan_svg_number(bytes, &mut idx) {
+        count += 1;
+        if idx < bytes.len()
+            && !bytes[idx].is_ascii_whitespace()
+            && bytes[idx] != b','
+            && !matches!(bytes[idx], b'+' | b'-' | b'.' | b'0'..=b'9')
+        {
+            idx += 1;
+        }
+    }
+    count / 2
+}
+
+fn extract_url_fragment(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix("url(")?.strip_suffix(')')?.trim();
+    let unquoted = rest.trim_matches(&['\'', '"'][..]).trim();
+    unquoted.strip_prefix('#').filter(|s| !s.is_empty())
+}
+
+fn svg_use_href_fragment<'a>(node: usvg::roxmltree::Node<'a, '_>) -> Option<&'a str> {
+    let href = node.attribute("href").or_else(|| {
+        node.attributes()
+            .find(|a| a.name() == "href")
+            .map(|a| a.value())
+    })?;
+    href.trim().strip_prefix('#').filter(|s| !s.is_empty())
+}
+
+fn check_svg_precheck_limits(objs: usize, verts: usize) -> IoResult<()> {
+    if objs > MAX_SVG_OBJECTS {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_svg_objects={MAX_SVG_OBJECTS}"),
+            actual: format!("SVG pre-expanded object count {objs} exceeds {MAX_SVG_OBJECTS}"),
+        });
+    }
+    if verts > MAX_SVG_VERTICES {
+        return Err(IoError::LimitExceeded {
+            limit: format!("max_svg_vertices={MAX_SVG_VERTICES}"),
+            actual: format!(
+                "SVG pre-expanded vertex/segment count {verts} exceeds {MAX_SVG_VERTICES}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+struct SvgPrecheckCtx<'a, 'input> {
+    id_to_node: HashMap<&'a str, usvg::roxmltree::Node<'a, 'input>>,
+    memo: HashMap<(usvg::roxmltree::NodeId, bool), (usize, usize)>,
+    clip_memo: HashMap<usvg::roxmltree::NodeId, usize>,
+    visiting: HashSet<usvg::roxmltree::NodeId>,
+    max_expand_depth: usize,
+    max_svg_depth: u32,
+}
+
+impl<'a, 'input> SvgPrecheckCtx<'a, 'input> {
+    fn clip_path_vertices(
+        &mut self,
+        cp_node: usvg::roxmltree::Node<'a, 'input>,
+        depth: usize,
+    ) -> IoResult<usize> {
+        if depth > self.max_expand_depth {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_svg_depth={}", self.max_svg_depth),
+                actual: format!("SVG clipPath depth {depth} exceeds cap"),
+            });
+        }
+        if let Some(&cached) = self.clip_memo.get(&cp_node.id()) {
+            return Ok(cached);
+        }
+        if !self.visiting.insert(cp_node.id()) {
+            return Ok(0);
+        }
+        let mut verts = 0usize;
+        for child in cp_node.children().filter(|c| c.is_element()) {
+            let (_co, cv) = self.node_cost(child, true, depth + 1)?;
+            verts = verts.saturating_add(cv);
+            check_svg_precheck_limits(0, verts)?;
+        }
+        if let Some(nested_cid) =
+            svg_element_attr(cp_node, "clip-path").and_then(extract_url_fragment)
+        {
+            if let Some(&nested_cp) = self.id_to_node.get(nested_cid) {
+                let ncv = self.clip_path_vertices(nested_cp, depth + 1)?;
+                verts = verts.saturating_add(ncv);
+                check_svg_precheck_limits(0, verts)?;
+            }
+        }
+        self.visiting.remove(&cp_node.id());
+        self.clip_memo.insert(cp_node.id(), verts);
+        Ok(verts)
+    }
+
+    fn node_cost(
+        &mut self,
+        node: usvg::roxmltree::Node<'a, 'input>,
+        via_use: bool,
+        depth: usize,
+    ) -> IoResult<(usize, usize)> {
+        if depth > self.max_expand_depth {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_svg_depth={}", self.max_svg_depth),
+                actual: format!("SVG <use> expansion depth {depth} exceeds cap"),
+            });
+        }
+        if svg_element_attr(node, "display").is_some_and(|v| v.eq_ignore_ascii_case("none")) {
+            return Ok((0, 0));
+        }
+        let tag = node.tag_name().name();
+        if !via_use && is_non_rendered_svg_tag(tag) {
+            return Ok((0, 0));
+        }
+        if via_use && is_non_rendered_svg_tag(tag) && tag != "symbol" {
+            return Ok((0, 0));
+        }
+        if let Some(&cached) = self.memo.get(&(node.id(), via_use)) {
+            check_svg_precheck_limits(cached.0, cached.1)?;
+            return Ok(cached);
+        }
+        if !self.visiting.insert(node.id()) {
+            return Ok((0, 0));
+        }
+
+        let (mut objs, mut verts) = match tag {
+            "g" | "a" | "switch" | "svg" | "symbol" => {
+                let mut child_objs = 0usize;
+                let mut child_verts = 0usize;
+                let mut elem_children = 0usize;
+                for child in node.children().filter(|c| c.is_element()) {
+                    elem_children += 1;
+                    let (co, cv) = self.node_cost(child, false, depth + 1)?;
+                    child_objs = child_objs.saturating_add(co);
+                    child_verts = child_verts.saturating_add(cv);
+                    check_svg_precheck_limits(child_objs, child_verts)?;
+                }
+                if child_objs == 0 {
+                    (0, 0)
+                } else if tag == "g"
+                    && elem_children == 1
+                    && node.attribute("id").is_none_or(str::is_empty)
+                    && svg_element_attr(node, "clip-path").is_none()
+                {
+                    (child_objs, child_verts)
+                } else {
+                    (1usize.saturating_add(child_objs), child_verts)
+                }
+            }
+            "use" => {
+                if let Some(target_id) = svg_use_href_fragment(node) {
+                    if let Some(&target) = self.id_to_node.get(target_id) {
+                        self.node_cost(target, true, depth + 1)?
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                }
+            }
+            "path" => {
+                let v = node.attribute("d").map_or(0, estimate_svg_path_vertices);
+                if v == 0 && node.attribute("d").is_none_or(|d| d.trim().is_empty()) {
+                    (0, 0)
+                } else {
+                    (1, v)
+                }
+            }
+            "rect" | "circle" | "ellipse" => (1, 4),
+            "line" => (1, 2),
+            "polyline" | "polygon" => {
+                let v = node
+                    .attribute("points")
+                    .map_or(0, estimate_svg_points_count);
+                if v == 0 {
+                    (0, 0)
+                } else {
+                    (1, v)
+                }
+            }
+            "text" | "image" => (1, 0),
+            _ => (0, 0),
+        };
+
+        if objs > 0 {
+            if let Some(cid) = svg_element_attr(node, "clip-path").and_then(extract_url_fragment) {
+                if let Some(&cp_node) = self.id_to_node.get(cid) {
+                    let cp_verts = self.clip_path_vertices(cp_node, depth + 1)?;
+                    verts = verts.saturating_add(cp_verts);
+                }
+            }
+        }
+        check_svg_precheck_limits(objs, verts)?;
+        // Cap `objs` if an empty wrapper didn't contribute.
+        let _ = &mut objs;
+
+        self.visiting.remove(&node.id());
+        self.memo.insert((node.id(), via_use), (objs, verts));
+        Ok((objs, verts))
+    }
+}
+
+fn precheck_svg_expansion_limits(
+    xml_doc: &usvg::roxmltree::Document<'_>,
+    max_svg_depth: u32,
+) -> IoResult<()> {
+    let mut id_to_node = HashMap::new();
+    for node in xml_doc.descendants().filter(|n| n.is_element()) {
+        if let Some(id) = node.attribute("id").filter(|s| !s.is_empty()) {
+            id_to_node.entry(id).or_insert(node);
+        }
+    }
+
+    let mut ctx = SvgPrecheckCtx {
+        id_to_node,
+        memo: HashMap::new(),
+        clip_memo: HashMap::new(),
+        visiting: HashSet::new(),
+        max_expand_depth: (max_svg_depth as usize).saturating_mul(4).max(512),
+        max_svg_depth,
+    };
+
+    let root_el = xml_doc.root_element();
+    let mut total_objs = 0usize;
+    let mut total_verts = 0usize;
+    for child in root_el.children().filter(|c| c.is_element()) {
+        let (co, cv) = ctx.node_cost(child, false, 1)?;
+        total_objs = total_objs.saturating_add(co);
+        total_verts = total_verts.saturating_add(cv);
+        check_svg_precheck_limits(total_objs, total_verts)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ImportedUsvgText {
+    families_lower: Vec<String>,
+    pos_mm: Point2D,
+}
+
+fn normalize_svg_text_key(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn import_usvg_node(
     doc: &mut Document,
@@ -344,7 +781,8 @@ fn import_usvg_node(
     inherited_opacity: f32,
     depth: u32,
     limits: &IoLimits,
-    imported_text: &mut bool,
+    budget: &mut SvgImportBudget,
+    imported_usvg_texts: &mut HashMap<(String, String), Vec<ImportedUsvgText>>,
 ) -> IoResult<Option<ObjectId>> {
     import_usvg_node_inner(
         doc,
@@ -355,7 +793,8 @@ fn import_usvg_node(
         inherited_opacity,
         depth,
         limits,
-        imported_text,
+        budget,
+        imported_usvg_texts,
     )
 }
 
@@ -369,7 +808,8 @@ fn import_usvg_node_inner(
     inherited_opacity: f32,
     depth: u32,
     limits: &IoLimits,
-    imported_text: &mut bool,
+    budget: &mut SvgImportBudget,
+    imported_usvg_texts: &mut HashMap<(String, String), Vec<ImportedUsvgText>>,
 ) -> IoResult<Option<ObjectId>> {
     if depth > limits.max_svg_depth {
         return Err(IoError::LimitExceeded {
@@ -402,11 +842,12 @@ fn import_usvg_node_inner(
                     group_opacity,
                     depth + 1,
                     limits,
-                    imported_text,
+                    budget,
+                    imported_usvg_texts,
                 );
             }
 
-            let mut clip_chain = Vec::new();
+            let mut clip_chain: Vec<(BezierPath, bool)> = Vec::new();
             let mut cur_cp = group.clip_path();
             let mut cp_depth = 0u32;
             while let Some(cp) = cur_cp {
@@ -418,9 +859,18 @@ fn import_usvg_node_inner(
                 }
                 let cp_xf = usvg_transform_raw(cp.transform());
                 let mut bp = BezierPath::default();
-                collect_usvg_clip_group_paths(cp.root(), cp_xf, 0, limits.max_svg_depth, &mut bp)?;
+                let mut even_odd = false;
+                collect_usvg_clip_group_paths(
+                    cp.root(),
+                    cp_xf,
+                    0,
+                    limits.max_svg_depth,
+                    budget,
+                    &mut bp,
+                    &mut even_odd,
+                )?;
                 if !bp.is_empty() {
-                    clip_chain.push(bp);
+                    clip_chain.push((bp, even_odd));
                 }
                 cur_cp = cp.clip_path();
                 cp_depth += 1;
@@ -443,7 +893,8 @@ fn import_usvg_node_inner(
                     1.0,
                     depth + 1,
                     limits,
-                    imported_text,
+                    budget,
+                    imported_usvg_texts,
                 )? {
                     child_ids.push(cid);
                 }
@@ -466,7 +917,7 @@ fn import_usvg_node_inner(
                 let singular = combined_local.inverse().is_none();
                 let mut current_ids = child_ids;
                 let last_idx = clip_chain.len() - 1;
-                for (idx, mut clip_bp) in clip_chain.into_iter().enumerate() {
+                for (idx, (mut clip_bp, even_odd)) in clip_chain.into_iter().enumerate() {
                     let is_outermost = idx == last_idx;
                     let container_xf = if singular {
                         clip_bp = clip_bp.transformed(&combined_local);
@@ -486,19 +937,17 @@ fn import_usvg_node_inner(
                     .with_fill(Fill::None)
                     .with_outline(OutlineStyle::none())
                     .with_transform(container_xf);
+                    container.clip_even_odd = even_odd;
                     if is_outermost {
                         container.opacity = group_opacity;
                         container.blend_mode = group_blend;
                     }
-                    let pc_id = if is_outermost {
-                        if let Some(lid) = target_layer {
-                            doc.add_object(container, Some(lid))?
-                        } else {
-                            doc.insert_loaded_object(container)?
-                        }
-                    } else {
-                        doc.insert_loaded_object(container)?
-                    };
+                    let pc_id = emit_svg_object(
+                        doc,
+                        container,
+                        if is_outermost { target_layer } else { None },
+                        budget,
+                    )?;
                     let created_id = doc.create_powerclip(pc_id, &current_ids)?;
                     current_ids = vec![created_id];
                 }
@@ -512,15 +961,11 @@ fn import_usvg_node_inner(
             obj.fill = Fill::None;
             obj.outline = OutlineStyle::none();
 
-            if let Some(lid) = target_layer {
-                let id = doc.add_object(obj, Some(lid))?;
-                Ok(Some(id))
-            } else {
-                let id = doc.insert_loaded_object(obj)?;
-                Ok(Some(id))
-            }
+            let id = emit_svg_object(doc, obj, target_layer, budget)?;
+            Ok(Some(id))
         }
         usvg::Node::Path(path) => {
+            budget.record_vertices(path.data().verbs().len())?;
             let bez = usvg_path_to_bezier_raw(path.data());
             if bez.is_empty() {
                 return Ok(None);
@@ -545,13 +990,8 @@ fn import_usvg_node_inner(
             obj.opacity = inherited_opacity.clamp(0.0, 1.0);
             obj.visible = path.is_visible();
 
-            if let Some(lid) = target_layer {
-                let id = doc.add_object(obj, Some(lid))?;
-                Ok(Some(id))
-            } else {
-                let id = doc.insert_loaded_object(obj)?;
-                Ok(Some(id))
-            }
+            let id = emit_svg_object(doc, obj, target_layer, budget)?;
+            Ok(Some(id))
         }
         usvg::Node::Image(img) => match img.kind() {
             usvg::ImageKind::PNG(data)
@@ -585,13 +1025,8 @@ fn import_usvg_node_inner(
                 obj.opacity = inherited_opacity.clamp(0.0, 1.0);
                 obj.visible = img.is_visible();
 
-                if let Some(lid) = target_layer {
-                    let id = doc.add_object(obj, Some(lid))?;
-                    Ok(Some(id))
-                } else {
-                    let id = doc.insert_loaded_object(obj)?;
-                    Ok(Some(id))
-                }
+                let id = emit_svg_object(doc, obj, target_layer, budget)?;
+                Ok(Some(id))
             }
             usvg::ImageKind::SVG(nested) => {
                 let mut child_ids = Vec::new();
@@ -605,7 +1040,8 @@ fn import_usvg_node_inner(
                         1.0,
                         depth + 1,
                         limits,
-                        imported_text,
+                        budget,
+                        imported_usvg_texts,
                     )? {
                         child_ids.push(cid);
                     }
@@ -619,17 +1055,11 @@ fn import_usvg_node_inner(
                         .with_outline(OutlineStyle::none())
                         .with_transform(local_xf_acc);
                 obj.opacity = inherited_opacity.clamp(0.0, 1.0);
-                if let Some(lid) = target_layer {
-                    let id = doc.add_object(obj, Some(lid))?;
-                    Ok(Some(id))
-                } else {
-                    let id = doc.insert_loaded_object(obj)?;
-                    Ok(Some(id))
-                }
+                let id = emit_svg_object(doc, obj, target_layer, budget)?;
+                Ok(Some(id))
             }
         },
         usvg::Node::Text(text) => {
-            *imported_text = true;
             // Use `local_xf_acc`'s scale to bake scaling into `font_size_pt` and remove it
             // from `obj.transform` so neither pixel-unit SVGs nor scaled `<g>`s double-scale text.
             let local_scale = effective_affine_scale(&local_xf_acc);
@@ -691,6 +1121,14 @@ fn import_usvg_node_inner(
                 return Ok(None);
             }
 
+            let norm_plain =
+                normalize_svg_text_key(&runs.iter().map(|r| r.text.as_str()).collect::<String>());
+            let families_lower: Vec<String> = runs
+                .iter()
+                .map(|r| r.style.font_family.trim().to_ascii_lowercase())
+                .collect();
+            let xml_id = text.id().trim().to_owned();
+
             let artistic = ArtisticText {
                 runs,
                 direction: TextDirection::Auto,
@@ -710,25 +1148,212 @@ fn import_usvg_node_inner(
             let text_xf = local_xf_acc
                 .compose(&Affine2D::translate(pos.x, pos.y))
                 .compose(&Affine2D::scale_uniform(inv_scale));
+            let pos_mm = text_xf.transform_point(Point2D::ZERO);
             let mut obj = SceneObject::new(ObjectId(0), name, NodePayload::ArtisticText(artistic))
                 .with_fill(Fill::None)
                 .with_outline(OutlineStyle::none())
                 .with_transform(text_xf);
             obj.opacity = inherited_opacity.clamp(0.0, 1.0);
 
-            if let Some(lid) = target_layer {
-                let id = doc.add_object(obj, Some(lid))?;
-                Ok(Some(id))
-            } else {
-                let id = doc.insert_loaded_object(obj)?;
-                Ok(Some(id))
+            let obj_id = emit_svg_object(doc, obj, target_layer, budget)?;
+            if !norm_plain.is_empty() {
+                imported_usvg_texts
+                    .entry((xml_id, norm_plain))
+                    .or_default()
+                    .push(ImportedUsvgText {
+                        families_lower,
+                        pos_mm,
+                    });
             }
+            Ok(Some(obj_id))
         }
     }
 }
 
-/// Fallback XML `<text>` extractor used only when `usvg` skipped text due to missing system fonts.
-/// Preserves ancestor named layers (`data-layer` / Inkscape layers) and SVG `transform` chains.
+fn svg_element_attr<'a>(node: usvg::roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    if let Some(v) = node.attribute(name) {
+        return Some(v.trim());
+    }
+    if let Some(style) = node.attribute("style") {
+        for decl in style.split(';').rev() {
+            if let Some((k, v)) = decl.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(name) {
+                    return Some(v.trim());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_svg_unit_opacity(raw: &str) -> Option<f32> {
+    let s = raw.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let v: f32 = pct.trim().parse().ok()?;
+        v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0))
+    } else {
+        let v: f32 = s.parse().ok()?;
+        v.is_finite().then(|| v.clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FallbackSpanStyle {
+    tspan_opacity: f32,
+    fill_color: Option<Color>,
+    fill_opacity: f32,
+    stroke_color: Option<Color>,
+    stroke_opacity: f32,
+    stroke_width: Option<f64>,
+    font_family: String,
+    font_size_pt: f64,
+    bold: bool,
+    italic: bool,
+    direction: TextDirection,
+}
+
+fn update_fallback_span_style_from_node(
+    el: usvg::roxmltree::Node<'_, '_>,
+    total_scale: f64,
+    is_tspan: bool,
+    st: &mut FallbackSpanStyle,
+) {
+    if is_tspan {
+        if let Some(op) = svg_element_attr(el, "opacity").and_then(parse_svg_unit_opacity) {
+            st.tspan_opacity = (st.tspan_opacity * op).clamp(0.0, 1.0);
+        }
+    }
+    if let Some(fill_attr) = svg_element_attr(el, "fill") {
+        if fill_attr.eq_ignore_ascii_case("none") {
+            st.fill_color = None;
+        } else if let Ok(c) = Color::from_hex(fill_attr) {
+            st.fill_color = Some(c);
+        }
+    }
+    if let Some(fo) = svg_element_attr(el, "fill-opacity").and_then(parse_svg_unit_opacity) {
+        st.fill_opacity = fo;
+    }
+    if let Some(stroke_attr) = svg_element_attr(el, "stroke") {
+        if stroke_attr.eq_ignore_ascii_case("none") {
+            st.stroke_color = None;
+        } else if let Ok(c) = Color::from_hex(stroke_attr) {
+            st.stroke_color = Some(c);
+        }
+    }
+    if let Some(so) = svg_element_attr(el, "stroke-opacity").and_then(parse_svg_unit_opacity) {
+        st.stroke_opacity = so;
+    }
+    if let Some(sw) = svg_element_attr(el, "stroke-width").and_then(parse_svg_len_to_user) {
+        if sw.is_finite() && sw >= 0.0 {
+            st.stroke_width = Some(sw);
+        }
+    }
+    if let Some(ff) = svg_element_attr(el, "font-family") {
+        let primary = ff
+            .split(',')
+            .next()
+            .unwrap_or(ff)
+            .trim()
+            .trim_matches(&['\'', '"'][..]);
+        if !primary.is_empty() {
+            st.font_family = primary.to_owned();
+        }
+    }
+    if let Some(fs) = svg_element_attr(el, "font-size").and_then(parse_svg_len_to_user) {
+        let font_size_mm = fs * total_scale;
+        st.font_size_pt = Unit::Point.from_mm(font_size_mm, 96.0).max(1.0);
+    }
+    if let Some(fw) = svg_element_attr(el, "font-weight") {
+        if fw.eq_ignore_ascii_case("bold") || fw.eq_ignore_ascii_case("bolder") {
+            st.bold = true;
+        } else if fw.eq_ignore_ascii_case("normal") || fw.eq_ignore_ascii_case("lighter") {
+            st.bold = false;
+        } else if let Ok(w) = fw.parse::<u16>() {
+            st.bold = w >= 600;
+        }
+    }
+    if let Some(fst) = svg_element_attr(el, "font-style") {
+        if fst.eq_ignore_ascii_case("italic") || fst.eq_ignore_ascii_case("oblique") {
+            st.italic = true;
+        } else if fst.eq_ignore_ascii_case("normal") {
+            st.italic = false;
+        }
+    }
+    if let Some(dir) = svg_element_attr(el, "direction") {
+        if dir.eq_ignore_ascii_case("rtl") {
+            st.direction = TextDirection::Rtl;
+        } else if dir.eq_ignore_ascii_case("ltr") {
+            st.direction = TextDirection::Ltr;
+        }
+    }
+}
+
+fn collect_fallback_text_chunks(
+    el: usvg::roxmltree::Node<'_, '_>,
+    total_scale: f64,
+    cur_style: &FallbackSpanStyle,
+    out: &mut Vec<(String, FallbackSpanStyle)>,
+) {
+    for child in el.children() {
+        if child.is_text() {
+            if let Some(t) = child.text().filter(|s| !s.is_empty()) {
+                out.push((t.to_owned(), cur_style.clone()));
+            }
+        } else if child.is_element() && child.tag_name().name() == "tspan" {
+            if svg_element_attr(child, "display").is_some_and(|v| v.eq_ignore_ascii_case("none")) {
+                continue;
+            }
+            let mut sub_style = cur_style.clone();
+            update_fallback_span_style_from_node(child, total_scale, true, &mut sub_style);
+            collect_fallback_text_chunks(child, total_scale, &sub_style, out);
+        }
+    }
+}
+
+fn parse_xml_font_families_lower(node: usvg::roxmltree::Node<'_, '_>) -> Vec<String> {
+    let mut cur = Some(node);
+    while let Some(el) = cur {
+        if el.is_element() {
+            if let Some(ff) = svg_element_attr(el, "font-family") {
+                let list: Vec<String> = ff
+                    .split(',')
+                    .map(|p| p.trim().trim_matches(&['\'', '"'][..]).to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !list.is_empty() {
+                    return list;
+                }
+            }
+        }
+        cur = el.parent();
+    }
+    vec!["noto sans".to_owned()]
+}
+
+fn is_non_rendered_svg_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "defs"
+            | "clipPath"
+            | "mask"
+            | "pattern"
+            | "symbol"
+            | "marker"
+            | "linearGradient"
+            | "radialGradient"
+            | "filter"
+            | "style"
+            | "title"
+            | "desc"
+            | "metadata"
+    )
+}
+
+/// Fallback XML `<text>` extractor recovering `<text>` elements skipped by `usvg` (for example,
+/// missing system fonts in mixed-font SVGs) while skipping `<text>` elements already imported by `usvg`.
+/// Preserves ancestor named layers (`data-layer` / Inkscape layers), SVG `transform` chains,
+/// and inherited/per-`<tspan>` `opacity` / `fill-opacity` / `stroke-opacity`.
+#[allow(clippy::too_many_arguments)]
 fn import_fallback_xml_texts(
     doc: &mut Document,
     xml_doc: &usvg::roxmltree::Document<'_>,
@@ -737,38 +1362,165 @@ fn import_fallback_xml_texts(
     layer_meta_by_xml_id: &HashMap<String, SvgLayerMeta>,
     xml_layer_ids: &mut HashMap<String, LayerId>,
     created_named_layers: &mut bool,
+    budget: &mut SvgImportBudget,
+    imported_usvg_texts: &mut HashMap<(String, String), Vec<ImportedUsvgText>>,
 ) -> IoResult<()> {
     let svg_el = xml_doc.root_element();
     let (scale_x, scale_y) = compute_fallback_user_unit_scale(&svg_el);
     let root_scale = Affine2D::scale(scale_x, scale_y);
 
+    struct FallbackCandidate<'a, 'input> {
+        node: usvg::roxmltree::Node<'a, 'input>,
+        chain: Vec<usvg::roxmltree::Node<'a, 'input>>,
+        key: (String, String),
+    }
+
+    let mut candidates = Vec::new();
+    let mut remaining_xml_counts: HashMap<(String, String), usize> = HashMap::new();
+
     for node in xml_doc
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "text")
     {
-        let content: String = node
+        let raw_plain: String = node
             .descendants()
+            .filter(|d| d.is_text())
             .filter_map(|d| d.text())
-            .collect::<String>()
-            .trim()
-            .to_owned();
-        if content.is_empty() {
+            .collect();
+        let norm_plain = normalize_svg_text_key(&raw_plain);
+        if norm_plain.is_empty() {
             continue;
         }
 
-        // Walk ancestors (root -> node) to find enclosing layer and compose transforms.
         let mut chain = Vec::new();
         let mut cursor = Some(node);
+        let mut hidden_or_defs = false;
         while let Some(cur) = cursor {
             if cur.is_element() {
+                if is_non_rendered_svg_tag(cur.tag_name().name())
+                    || svg_element_attr(cur, "display")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("none"))
+                {
+                    hidden_or_defs = true;
+                    break;
+                }
                 chain.push(cur);
             }
             cursor = cur.parent();
         }
+        if hidden_or_defs {
+            continue;
+        }
         chain.reverse();
 
-        let mut target_layer = default_layer_id;
+        let xml_id = node.attribute("id").unwrap_or("").trim().to_owned();
+        let key = (xml_id, norm_plain);
+        *remaining_xml_counts.entry(key.clone()).or_insert(0) += 1;
+        candidates.push(FallbackCandidate { node, chain, key });
+    }
+
+    for cand in candidates {
+        let node = cand.node;
+        let chain = cand.chain;
+        let key = cand.key;
+        let rem_xml = {
+            let cnt = remaining_xml_counts.entry(key.clone()).or_insert(1);
+            *cnt = cnt.saturating_sub(1);
+            *cnt
+        };
+
+        // Walk ancestors (root -> node) to compose transforms and accumulate inherited paint/opacity.
         let mut combined_xf = root_scale;
+        let mut inherited_opacity = 1.0_f32;
+        let mut inherited_fill_color: Option<Color> = Some(Color::BLACK);
+        let mut inherited_fill_opacity = 1.0_f32;
+        let mut inherited_stroke_color: Option<Color> = None;
+        let mut inherited_stroke_opacity = 1.0_f32;
+        let mut inherited_stroke_width: Option<f64> = None;
+
+        for anc in &chain {
+            if let Some(tf_str) = anc.attribute("transform") {
+                if let Some(parsed_xf) = parse_svg_transform_list(tf_str) {
+                    combined_xf = combined_xf.compose(&parsed_xf);
+                }
+            }
+            if let Some(op) = svg_element_attr(*anc, "opacity").and_then(parse_svg_unit_opacity) {
+                inherited_opacity = (inherited_opacity * op).clamp(0.0, 1.0);
+            }
+            if let Some(fill_attr) = svg_element_attr(*anc, "fill") {
+                if fill_attr.eq_ignore_ascii_case("none") {
+                    inherited_fill_color = None;
+                } else if let Ok(c) = Color::from_hex(fill_attr) {
+                    inherited_fill_color = Some(c);
+                }
+            }
+            if let Some(fo) =
+                svg_element_attr(*anc, "fill-opacity").and_then(parse_svg_unit_opacity)
+            {
+                inherited_fill_opacity = fo;
+            }
+            if let Some(stroke_attr) = svg_element_attr(*anc, "stroke") {
+                if stroke_attr.eq_ignore_ascii_case("none") {
+                    inherited_stroke_color = None;
+                } else if let Ok(c) = Color::from_hex(stroke_attr) {
+                    inherited_stroke_color = Some(c);
+                }
+            }
+            if let Some(so) =
+                svg_element_attr(*anc, "stroke-opacity").and_then(parse_svg_unit_opacity)
+            {
+                inherited_stroke_opacity = so;
+            }
+            if let Some(sw) = svg_element_attr(*anc, "stroke-width").and_then(parse_svg_len_to_user)
+            {
+                if sw.is_finite() && sw >= 0.0 {
+                    inherited_stroke_width = Some(sw);
+                }
+            }
+        }
+
+        let x = node
+            .attribute("x")
+            .and_then(parse_svg_len_to_user)
+            .unwrap_or(0.0);
+        let y = node
+            .attribute("y")
+            .and_then(parse_svg_len_to_user)
+            .unwrap_or(0.0);
+        let total_scale = effective_affine_scale(&combined_xf);
+        let inv_scale = if total_scale > 1e-9 {
+            1.0 / total_scale
+        } else {
+            1.0
+        };
+        let final_xf = combined_xf
+            .compose(&Affine2D::translate(x, y))
+            .compose(&Affine2D::scale_uniform(inv_scale));
+        let candidate_pos_mm = final_xf.transform_point(Point2D::ZERO);
+
+        if let Some(usvg_entries) = imported_usvg_texts.get_mut(&key) {
+            if !usvg_entries.is_empty() {
+                let xml_families = parse_xml_font_families_lower(node);
+                let matched_idx = usvg_entries.iter().position(|entry| {
+                    let family_match = entry
+                        .families_lower
+                        .iter()
+                        .any(|ef| xml_families.iter().any(|xf| xf == ef));
+                    let pos_match = entry.pos_mm.distance_to(candidate_pos_mm) < 0.5;
+                    family_match || pos_match
+                });
+                if let Some(idx) = matched_idx {
+                    usvg_entries.remove(idx);
+                    continue;
+                }
+                if usvg_entries.len() > rem_xml {
+                    usvg_entries.pop();
+                    continue;
+                }
+            }
+        }
+
+        let mut target_layer = default_layer_id;
         for anc in &chain {
             if anc.tag_name().name() == "g" {
                 if let Some(id) = anc.attribute("id") {
@@ -791,69 +1543,135 @@ fn import_fallback_xml_texts(
                     }
                 }
             }
-            if let Some(tf_str) = anc.attribute("transform") {
-                if let Some(parsed_xf) = parse_svg_transform_list(tf_str) {
-                    combined_xf = combined_xf.compose(&parsed_xf);
+        }
+
+        let default_font_size_mm = Unit::Point.to_mm(12.0, 96.0);
+        let default_font_size_pt = Unit::Point.from_mm(default_font_size_mm, 96.0).max(1.0);
+        let mut base_span_style = FallbackSpanStyle {
+            tspan_opacity: 1.0,
+            fill_color: inherited_fill_color,
+            fill_opacity: inherited_fill_opacity,
+            stroke_color: inherited_stroke_color,
+            stroke_opacity: inherited_stroke_opacity,
+            stroke_width: inherited_stroke_width,
+            font_family: "Noto Sans".to_owned(),
+            font_size_pt: default_font_size_pt,
+            bold: false,
+            italic: false,
+            direction: TextDirection::Auto,
+        };
+        for anc in &chain {
+            update_fallback_span_style_from_node(*anc, total_scale, false, &mut base_span_style);
+        }
+
+        let mut chunks = Vec::new();
+        collect_fallback_text_chunks(node, total_scale, &base_span_style, &mut chunks);
+        if let Some(first) = chunks.first_mut() {
+            first.0 = first.0.trim_start().to_owned();
+        }
+        if let Some(last) = chunks.last_mut() {
+            last.0 = last.0.trim_end().to_owned();
+        }
+        chunks.retain(|(t, _)| !t.is_empty());
+        if chunks.is_empty() {
+            continue;
+        }
+
+        let first_tspan_op = chunks[0].1.tspan_opacity;
+        let uniform_tspan_opacity = chunks
+            .iter()
+            .all(|(_, s)| (s.tspan_opacity - first_tspan_op).abs() <= 1e-4)
+            .then_some(first_tspan_op);
+        let obj_opacity = match uniform_tspan_opacity {
+            Some(common_op) => (inherited_opacity * common_op).clamp(0.0, 1.0),
+            None => inherited_opacity.clamp(0.0, 1.0),
+        };
+
+        let mut runs: Vec<TextRun> = Vec::new();
+        for (txt, st) in &chunks {
+            let per_run_op = if uniform_tspan_opacity.is_some() {
+                1.0
+            } else {
+                st.tspan_opacity
+            };
+            let fill_color = match &st.fill_color {
+                Some(c) => {
+                    let [r, g, b, a] = c.to_rgba_f32();
+                    Color::rgba(r, g, b, (a * st.fill_opacity * per_run_op).clamp(0.0, 1.0))
                 }
+                None => Color::TRANSPARENT,
+            };
+            let style = TextStyle {
+                font_family: st.font_family.clone(),
+                font_size_pt: st.font_size_pt,
+                bold: st.bold,
+                italic: st.italic,
+                fill: fill_color,
+                direction: st.direction,
+                ..TextStyle::default()
+            };
+            if let Some(prev) = runs.last_mut().filter(|r| r.style == style) {
+                prev.text.push_str(txt);
+            } else {
+                runs.push(TextRun::new(txt.clone(), style));
             }
         }
 
-        let x = node
-            .attribute("x")
-            .and_then(parse_svg_len_to_user)
-            .unwrap_or(0.0);
-        let y = node
-            .attribute("y")
-            .and_then(parse_svg_len_to_user)
-            .unwrap_or(0.0);
-        let total_scale = effective_affine_scale(&combined_xf);
-        let font_size_mm = node
-            .attribute("font-size")
-            .and_then(parse_svg_len_to_user)
-            .map(|v| v * total_scale)
-            .unwrap_or(Unit::Point.to_mm(12.0, 96.0));
-        let font_size_pt = Unit::Point.from_mm(font_size_mm, 96.0).max(1.0);
-        let font_family = node
-            .attribute("font-family")
-            .unwrap_or("Noto Sans")
-            .trim_matches(&['\'', '"'][..])
-            .to_owned();
-        let direction = match node.attribute("direction") {
-            Some(d) if d.eq_ignore_ascii_case("rtl") => TextDirection::Rtl,
-            Some(d) if d.eq_ignore_ascii_case("ltr") => TextDirection::Ltr,
-            _ => TextDirection::Auto,
+        let eff_stroke_style = chunks
+            .iter()
+            .map(|(_, s)| s)
+            .find(|s| s.stroke_color.is_some())
+            .unwrap_or(&chunks[0].1);
+        let outline = match &eff_stroke_style.stroke_color {
+            Some(c)
+                if (c.alpha()
+                    * eff_stroke_style.stroke_opacity
+                    * if uniform_tspan_opacity.is_some() {
+                        1.0
+                    } else {
+                        eff_stroke_style.tspan_opacity
+                    })
+                    > 1e-6 =>
+            {
+                let [r, g, b, a] = c.to_rgba_f32();
+                let extra_op = if uniform_tspan_opacity.is_some() {
+                    1.0
+                } else {
+                    eff_stroke_style.tspan_opacity
+                };
+                let sc = Color::rgba(
+                    r,
+                    g,
+                    b,
+                    (a * eff_stroke_style.stroke_opacity * extra_op).clamp(0.0, 1.0),
+                );
+                let width_mm =
+                    (eff_stroke_style.stroke_width.unwrap_or(1.0) * total_scale).max(0.0);
+                if width_mm > 0.0 {
+                    OutlineStyle::solid(sc, width_mm)
+                } else {
+                    OutlineStyle::none()
+                }
+            }
+            _ => OutlineStyle::none(),
         };
-        let fill_color = node
-            .attribute("fill")
-            .and_then(|s| Color::from_hex(s).ok())
-            .unwrap_or(Color::BLACK);
 
-        let inv_scale = if total_scale > 1e-9 {
-            1.0 / total_scale
-        } else {
-            1.0
+        let artistic = ArtisticText {
+            runs,
+            direction: base_span_style.direction,
+            align: TextAlign::Left,
         };
-        let final_xf = combined_xf
-            .compose(&Affine2D::translate(x, y))
-            .compose(&Affine2D::scale_uniform(inv_scale));
-
-        let style = TextStyle {
-            font_family,
-            font_size_pt,
-            fill: fill_color,
-            direction,
-            ..TextStyle::default()
-        };
-        let obj = SceneObject::new(
+        let mut obj = SceneObject::new(
             ObjectId(0),
             node.attribute("id").unwrap_or("Text"),
-            NodePayload::ArtisticText(ArtisticText::from_plain(content, style)),
+            NodePayload::ArtisticText(artistic),
         )
         .with_fill(Fill::None)
-        .with_outline(OutlineStyle::none())
+        .with_outline(outline)
         .with_transform(final_xf);
+        obj.opacity = obj_opacity;
 
-        doc.add_object(obj, Some(target_layer))?;
+        emit_svg_object(doc, obj, Some(target_layer), budget)?;
     }
     Ok(())
 }
@@ -1010,7 +1828,9 @@ fn collect_usvg_clip_group_paths(
     acc_xf: Affine2D,
     depth: u32,
     max_depth: u32,
+    budget: &mut SvgImportBudget,
     out: &mut BezierPath,
+    any_even_odd: &mut bool,
 ) -> IoResult<()> {
     if depth > max_depth {
         return Err(IoError::LimitExceeded {
@@ -1022,14 +1842,36 @@ fn collect_usvg_clip_group_paths(
     for child in group.children() {
         match child {
             usvg::Node::Group(sub_g) => {
-                collect_usvg_clip_group_paths(sub_g, xf, depth + 1, max_depth, out)?;
+                collect_usvg_clip_group_paths(
+                    sub_g,
+                    xf,
+                    depth + 1,
+                    max_depth,
+                    budget,
+                    out,
+                    any_even_odd,
+                )?;
             }
             usvg::Node::Path(p) => {
+                budget.record_vertices(p.data().verbs().len())?;
+                if p.fill()
+                    .is_some_and(|f| matches!(f.rule(), usvg::FillRule::EvenOdd))
+                {
+                    *any_even_odd = true;
+                }
                 let bez = usvg_path_to_bezier_raw(p.data()).transformed(&xf);
                 out.subpaths.extend(bez.subpaths);
             }
             usvg::Node::Text(t) => {
-                collect_usvg_clip_group_paths(t.flattened(), xf, depth + 1, max_depth, out)?;
+                collect_usvg_clip_group_paths(
+                    t.flattened(),
+                    xf,
+                    depth + 1,
+                    max_depth,
+                    budget,
+                    out,
+                    any_even_odd,
+                )?;
             }
             usvg::Node::Image(_) => {}
         }
@@ -2884,5 +3726,307 @@ mod tests {
         assert_eq!(sc_px(10.0, 10.0), [255, 255, 255, 255]);
         assert_eq!(sc_px(75.0, 75.0), [16, 32, 224, 255]);
         assert_eq!(sc_px(50.0, 50.0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn tier5_svg_import_preserves_clip_rule_evenodd_donut() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+  <defs>
+    <clipPath id="donut">
+      <path d="M10,10 H90 V90 H10 Z M30,30 H70 V70 H30 Z" clip-rule="evenodd" fill-rule="evenodd"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#donut)">
+    <rect x="0" y="0" width="100" height="100" fill="#ff0000"/>
+  </g>
+</svg>"##;
+        let doc = import_svg_str(svg).expect("import evenodd donut clip SVG");
+        let pc = doc
+            .objects()
+            .values()
+            .find(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
+            .expect("expected PowerClip container");
+        assert!(
+            pc.clip_even_odd,
+            "SVG clip-rule='evenodd' must set clip_even_odd=true on imported PowerClip"
+        );
+        let ren =
+            coree_render::render_page_to_rgba(&doc, 0, 72.0, coree_render::ViewMode::Enhanced)
+                .expect("render evenodd donut SVG");
+        let px_at = |x_mm: f64, y_mm: f64| -> [u8; 4] {
+            let px = ((x_mm * 72.0 / 25.4).round() as u32).min(ren.width - 1);
+            let py = ((y_mm * 72.0 / 25.4).round() as u32).min(ren.height - 1);
+            let idx = ((py * ren.width + px) * 4) as usize;
+            [
+                ren.rgba[idx],
+                ren.rgba[idx + 1],
+                ren.rgba[idx + 2],
+                ren.rgba[idx + 3],
+            ]
+        };
+        assert_eq!(
+            px_at(20.0, 20.0),
+            [255, 0, 0, 255],
+            "outer ring must be red"
+        );
+        assert_eq!(
+            px_at(50.0, 50.0),
+            [255, 255, 255, 255],
+            "even-odd inner hole must reveal paper white"
+        );
+    }
+
+    #[test]
+    fn fallback_xml_text_preserves_content_and_inherited_opacity_to_eps() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+  <rect x="5" y="5" width="20" height="10" fill="#000" opacity="0.2"/>
+  <text x="10" y="30" font-family="Helvetica" font-size="16" fill="#000" opacity="0.2">TEST</text>
+  <g opacity="0.5">
+    <text x="10" y="42" font-family="NoSuchMissingFont" font-size="12" fill="#000" fill-opacity="0.4"><tspan>SUB</tspan><tspan>SPAN</tspan></text>
+  </g>
+</svg>"##;
+        let doc = import_svg_str(svg).expect("import fallback XML text SVG");
+        let texts: Vec<_> = doc
+            .objects()
+            .values()
+            .filter_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) => {
+                    Some((at.plain_text(), o.opacity, at.runs[0].style.fill.alpha()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|(t, op, _)| t == "TEST" && (*op - 0.2).abs() < 1e-4),
+            "expected 'TEST' with opacity ~0.2 (never 'TESTTEST'), got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, op, fa)| t == "SUBSPAN"
+                && (*op - 0.5).abs() < 1e-4
+                && (*fa - 0.4).abs() < 1e-4),
+            "expected 'SUBSPAN' with opacity ~0.5 and fill_alpha ~0.4, got: {texts:?}"
+        );
+
+        let eps = crate::export_eps_to_string(&doc, 0).expect("export SVG->EPS");
+        assert!(
+            eps.contains("(TEST) show"),
+            "EPS must contain '(TEST) show':\n{eps}"
+        );
+        assert!(
+            !eps.contains("TESTTEST"),
+            "EPS must not contain duplicated TESTTEST"
+        );
+        assert!(
+            eps.contains("0.8000 0.8000 0.8000 setrgbcolor"),
+            "EPS must blend opaque black at 0.2 opacity to 0.8000 gray:\n{eps}"
+        );
+        assert!(
+            !eps.contains("0.0000 0.0000 0.0000 setrgbcolor"),
+            "EPS must not emit un-tinted 0.0000 black:\n{eps}"
+        );
+    }
+
+    #[test]
+    fn mixed_font_svg_preserves_usvg_and_fallback_texts_to_eps_and_pdf() {
+        let mixed_helv = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+  <defs><text x="0" y="0" font-family="Helvetica">IGNORED_DEF</text></defs>
+  <text x="10" y="20" font-family="Noto Sans" font-size="12" fill="#000" opacity="0.2">KNOWN</text>
+  <text x="10" y="40" font-family="Helvetica" font-size="12" fill="#000" opacity="0.2">HELVETICA_TEXT</text>
+</svg>"##;
+        let doc = import_svg_str(mixed_helv).expect("import mixed Noto Sans + Helvetica SVG");
+        assert_eq!(
+            doc.objects().len(),
+            2,
+            "mixed-font SVG must keep both Noto Sans and Helvetica texts (and ignore <defs>)"
+        );
+        let texts: Vec<_> = doc
+            .objects()
+            .values()
+            .filter_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) => Some((at.plain_text(), o.opacity)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|(t, op)| t == "KNOWN" && (*op - 0.2).abs() < 1e-4),
+            "missing Noto Sans KNOWN text: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(t, op)| t == "HELVETICA_TEXT" && (*op - 0.2).abs() < 1e-4),
+            "missing Helvetica HELVETICA_TEXT: {texts:?}"
+        );
+
+        let eps = crate::export_eps_to_string(&doc, 0).expect("export mixed SVG -> EPS");
+        assert!(
+            eps.contains("(KNOWN) show"),
+            "EPS must contain '(KNOWN) show':\n{eps}"
+        );
+        assert!(
+            eps.contains("(HELVETICA_TEXT) show"),
+            "EPS must contain '(HELVETICA_TEXT) show':\n{eps}"
+        );
+        assert!(
+            eps.contains("0.8000 0.8000 0.8000 setrgbcolor"),
+            "EPS must blend 0.2 opacity black to 0.8000 gray:\n{eps}"
+        );
+        assert!(
+            !eps.contains("0.0000 0.0000 0.0000 setrgbcolor"),
+            "EPS must not emit un-tinted 0.0000 black:\n{eps}"
+        );
+        let pdf_bytes = crate::export_pdf_to_bytes(&doc, &crate::PdfExportOptions::default())
+            .expect("export mixed SVG -> PDF");
+        assert!(
+            pdf_bytes.starts_with(b"%PDF-"),
+            "PDF export must emit valid %PDF- header"
+        );
+
+        let arial_dejavu = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+  <text x="10" y="20" font-family="DejaVu Sans" font-size="12" fill="#000">DEJAVU</text>
+  <text x="10" y="40" font-family="Arial" font-size="12" fill="#000">ARIAL_TEXT</text>
+</svg>"##;
+        let doc2 = import_svg_str(arial_dejavu).expect("import mixed DejaVu Sans + Arial SVG");
+        assert_eq!(
+            doc2.objects().len(),
+            2,
+            "mixed DejaVu Sans + Arial SVG must preserve both text objects"
+        );
+        let names2: Vec<String> = doc2
+            .objects()
+            .values()
+            .filter_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) => Some(at.plain_text()),
+                _ => None,
+            })
+            .collect();
+        assert!(names2.contains(&"DEJAVU".to_owned()), "got {names2:?}");
+        assert!(names2.contains(&"ARIAL_TEXT".to_owned()), "got {names2:?}");
+
+        // Identical text without id where missing font precedes installed font
+        let same_text = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+  <text x="10" y="20" font-family="Helvetica" font-size="12" fill="#000">SAME</text>
+  <text x="10" y="40" font-family="Noto Sans" font-size="12" fill="#000">SAME</text>
+</svg>"##;
+        let doc3 = import_svg_str(same_text).expect("import identical text mixed-font SVG");
+        assert_eq!(
+            doc3.objects().len(),
+            2,
+            "identical text with mixed fonts must keep exactly 2 objects"
+        );
+    }
+
+    #[test]
+    fn fallback_xml_tspan_preserves_per_tspan_opacity_and_fill_opacity() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+  <text x="10" y="20" font-family="Helvetica" font-size="16" fill="#000"><tspan opacity="0.2">TSPAN_OP</tspan></text>
+  <text x="10" y="40" font-family="NoSuchMissingFont" font-size="12" fill="#000"><tspan opacity="0.2">FIRST</tspan><tspan opacity="0.8">SECOND</tspan></text>
+</svg>"##;
+        let doc = import_svg_str(svg).expect("import tspan opacity fallback SVG");
+        assert_eq!(doc.objects().len(), 2);
+
+        let tspan_op = doc
+            .objects()
+            .values()
+            .find(|o| matches!(&o.payload, NodePayload::ArtisticText(at) if at.plain_text() == "TSPAN_OP"))
+            .expect("expected TSPAN_OP object");
+        assert!(
+            (tspan_op.opacity - 0.2).abs() < 1e-4,
+            "single-opacity <tspan opacity='0.2'> must fold to ~0.2, got {}",
+            tspan_op.opacity
+        );
+
+        let multi_tspan = doc
+            .objects()
+            .values()
+            .find_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) if at.plain_text() == "FIRSTSECOND" => Some(at),
+                _ => None,
+            })
+            .expect("expected FIRSTSECOND multi-tspan object");
+        assert_eq!(multi_tspan.runs.len(), 2);
+        assert!((multi_tspan.runs[0].style.fill.alpha() - 0.2).abs() < 1e-4);
+        assert!((multi_tspan.runs[1].style.fill.alpha() - 0.8).abs() < 1e-4);
+
+        let eps = crate::export_eps_to_string(&doc, 0).expect("export tspan opacity SVG -> EPS");
+        assert!(
+            eps.contains("(TSPAN_OP) show"),
+            "EPS must contain '(TSPAN_OP) show':\n{eps}"
+        );
+        assert!(
+            eps.contains("0.8000 0.8000 0.8000 setrgbcolor"),
+            "EPS must blend <tspan opacity='0.2'> black to 0.8000 gray:\n{eps}"
+        );
+    }
+
+    #[test]
+    fn svg_200k_use_bomb_rejects_with_limit_exceeded() {
+        let g1_uses = "<use href=\"#p\"/>".repeat(10);
+        let g2_uses = "<use href=\"#g1\"/>".repeat(10);
+        let g3_uses = "<use href=\"#g2\"/>".repeat(10);
+        let g4_uses = "<use href=\"#g3\"/>".repeat(10);
+        let top_uses = "<use href=\"#g4\"/>".repeat(20);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <path id="p" d="M0,0 L1,1"/>
+    <g id="g1">{g1_uses}</g>
+    <g id="g2">{g2_uses}</g>
+    <g id="g3">{g3_uses}</g>
+    <g id="g4">{g4_uses}</g>
+  </defs>
+  {top_uses}
+</svg>"#
+        );
+        let err = import_svg_str(&svg).unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { ref limit, .. } if limit.contains("max_svg_objects")),
+            "expected LimitExceeded(max_svg_objects) on 200k <use> bomb, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn svg_use_vertex_amplification_bomb_rejects_with_limit_exceeded() {
+        let mut d = String::from("M0,0");
+        for i in 1..=200 {
+            d.push_str(&format!(" L{},{}", i % 10, i / 10));
+        }
+        let g1_uses = "<use href=\"#p\"/>".repeat(10);
+        let g2_uses = "<use href=\"#g1\"/>".repeat(10);
+        let g3_uses = "<use href=\"#g2\"/>".repeat(10);
+        let g4_uses = "<use href=\"#g3\"/>".repeat(10);
+        let top_uses = "<use href=\"#g4\"/>".repeat(10);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <path id="p" d="{d}"/>
+    <g id="g1">{g1_uses}</g>
+    <g id="g2">{g2_uses}</g>
+    <g id="g3">{g3_uses}</g>
+    <g id="g4">{g4_uses}</g>
+  </defs>
+  {top_uses}
+</svg>"#
+        );
+        let err = import_svg_str(&svg).unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { ref limit, .. } if limit.contains("max_svg_vertices")),
+            "expected LimitExceeded(max_svg_vertices) on 100k x 200-seg <use> bomb, got {err:?}"
+        );
+
+        // Cyclic <use> must terminate safely without stack overflow or hang
+        let cyclic = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <g id="a"><use href="#b"/></g>
+    <g id="b"><use href="#a"/></g>
+  </defs>
+  <use href="#a"/>
+  <rect x="0" y="0" width="10" height="10" fill="#000"/>
+</svg>"##;
+        let _ = import_svg_str(cyclic);
     }
 }

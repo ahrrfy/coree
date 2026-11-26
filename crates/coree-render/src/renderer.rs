@@ -15,8 +15,8 @@ use crate::effects_render::{
     apply_deform_point_steps, apply_geometry_effects, apply_geometry_effects_in_bounds,
     apply_transparency_mask, effect_bounds_padding_mm, find_transparency_effect,
     prepare_deform_point_steps, render_overlay_effects, render_underlay_effects,
-    render_underlay_effects_with_sym, stroke_wireframe_effects, symmetry_effect_transforms,
-    DeformPointStep,
+    render_underlay_effects_with_sym, render_underlay_effects_with_sym_and_deform,
+    stroke_wireframe_effects, symmetry_effect_transforms, DeformPointStep,
 };
 use crate::hit_test::resolve_connector_endpoints_with_sym;
 use crate::lens_render::{render_lens_object_with_backdrop, BackdropItem, FrozenLensSnapshot};
@@ -179,20 +179,12 @@ pub(crate) fn resolve_sym_world_path(
                 NodePayload::PowerClip { container, .. } => Some((**container).clone()),
                 _ => None,
             }?;
-            let mut warped = if let Some(persp) = sub.perspective {
+            let warped = if let Some(persp) = sub.perspective {
                 persp.transform_bezier_path(&local)
             } else {
                 local
             };
-            for eff in &sub.effects {
-                if let Effect::Perspective { quad } = eff {
-                    if let Some(bb) = warped.bounding_box() {
-                        if let Some(h) = Perspective3x3::from_rect_to_quad(bb, quad) {
-                            warped = h.transform_bezier_path(&warped);
-                        }
-                    }
-                }
-            }
+            let warped = crate::effects_render::apply_geometry_effects(&warped, &sub.effects);
             return Some(warped.transformed(&p_xf));
         }
     }
@@ -501,6 +493,7 @@ pub struct SceneRenderer {
     pub(crate) parent_xf_override: Option<(ObjectId, Affine2D)>,
     pub(crate) frozen_scope_stack: Vec<u64>,
     pub(crate) current_sym_root_idx: Option<usize>,
+    pub(crate) export_lens_cache: HashMap<(ObjectId, bool), (f64, Rect2D, RgbaBuffer)>,
     active_symbols: HashSet<SymbolId>,
     active_pattern_symbols: HashSet<SymbolId>,
 }
@@ -527,6 +520,7 @@ impl SceneRenderer {
             parent_xf_override: None,
             frozen_scope_stack: Vec::new(),
             current_sym_root_idx: None,
+            export_lens_cache: HashMap::new(),
             active_symbols: HashSet::new(),
             active_pattern_symbols: HashSet::new(),
         }
@@ -5805,13 +5799,20 @@ impl SceneRenderer {
                         deform_frames,
                     );
                     if !obj.effects.is_empty() {
-                        render_underlay_effects(
+                        let outer_world_xf = page_to_surface
+                            .inverse()
+                            .map(|inv| inv.compose(&group_to_screen))
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(Affine2D::IDENTITY);
+                        render_underlay_effects_with_sym_and_deform(
                             doc,
                             obj,
                             &deformed,
                             Affine2D::IDENTITY,
                             group_to_screen,
                             page_to_surface,
+                            sym_ctx,
+                            Some((deform_frames, outer_world_xf)),
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -5892,6 +5893,7 @@ impl SceneRenderer {
                     obj,
                     &deformed,
                     Some(&mesh_deform),
+                    sym_ctx,
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5923,6 +5925,7 @@ impl SceneRenderer {
                     obj,
                     &deformed,
                     Some(&mesh_deform),
+                    sym_ctx,
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5954,6 +5957,7 @@ impl SceneRenderer {
                     obj,
                     &deformed,
                     Some(&mesh_deform),
+                    sym_ctx,
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -5985,6 +5989,7 @@ impl SceneRenderer {
                     obj,
                     &deformed,
                     Some(&mesh_deform),
+                    sym_ctx,
                     page_to_surface,
                     group_to_screen,
                     px_per_mm,
@@ -6159,13 +6164,20 @@ impl SceneRenderer {
                     return;
                 }
                 if !obj.effects.is_empty() {
-                    render_underlay_effects(
+                    let outer_world_xf = page_to_surface
+                        .inverse()
+                        .map(|inv| inv.compose(&group_to_screen))
+                        .filter(|m| m.is_finite())
+                        .unwrap_or(Affine2D::IDENTITY);
+                    render_underlay_effects_with_sym_and_deform(
                         doc,
                         obj,
                         &deformed_grid,
                         Affine2D::IDENTITY,
                         group_to_screen,
                         page_to_surface,
+                        sym_ctx,
+                        Some((deform_frames, outer_world_xf)),
                         px_per_mm,
                         anti_alias,
                         &self.active_icc,
@@ -6488,7 +6500,12 @@ impl SceneRenderer {
                     stroke_wireframe(&deformed, group_to_screen, px_per_mm, options, backend);
                 } else {
                     if !obj.effects.is_empty() {
-                        render_underlay_effects_with_sym(
+                        let outer_world_xf = page_to_surface
+                            .inverse()
+                            .map(|inv| inv.compose(&group_to_screen))
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(Affine2D::IDENTITY);
+                        render_underlay_effects_with_sym_and_deform(
                             doc,
                             obj,
                             &deformed,
@@ -6496,6 +6513,7 @@ impl SceneRenderer {
                             group_to_screen,
                             page_to_surface,
                             sym_ctx,
+                            Some((deform_frames, outer_world_xf)),
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -6634,13 +6652,20 @@ impl SceneRenderer {
                 }
                 if child_has_underlay {
                     if let (Some(proxy), Some(def_sil)) = (&child_proxy, &child_sil) {
-                        render_underlay_effects(
+                        let outer_world_xf = page_to_surface
+                            .inverse()
+                            .map(|inv| inv.compose(&group_to_screen))
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(Affine2D::IDENTITY);
+                        render_underlay_effects_with_sym_and_deform(
                             doc,
                             proxy,
                             def_sil,
                             Affine2D::IDENTITY,
                             group_to_screen,
                             page_to_surface,
+                            sym_ctx,
+                            Some((deform_frames, outer_world_xf)),
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -6814,7 +6839,12 @@ impl SceneRenderer {
                     self.current_sym_root_idx = saved_sym_root_idx;
                 } else {
                     if !obj.effects.is_empty() {
-                        render_underlay_effects_with_sym(
+                        let outer_world_xf = page_to_surface
+                            .inverse()
+                            .map(|inv| inv.compose(&group_to_screen))
+                            .filter(|m| m.is_finite())
+                            .unwrap_or(Affine2D::IDENTITY);
+                        render_underlay_effects_with_sym_and_deform(
                             doc,
                             obj,
                             &deformed_container,
@@ -6822,6 +6852,7 @@ impl SceneRenderer {
                             group_to_screen,
                             page_to_surface,
                             sym_ctx,
+                            Some((deform_frames, outer_world_xf)),
                             px_per_mm,
                             anti_alias,
                             &self.active_icc,
@@ -7198,6 +7229,7 @@ impl SceneRenderer {
         obj: &SceneObject,
         deformed_in_group: &BezierPath,
         mesh_deform: Option<&MeshDeformCtx<'_>>,
+        sym_ctx: Option<SymRenderCtx<'_>>,
         page_to_surface: Affine2D,
         group_to_screen: Affine2D,
         px_per_mm: f64,
@@ -7218,13 +7250,21 @@ impl SceneRenderer {
             return;
         }
         if !obj.effects.is_empty() {
-            render_underlay_effects(
+            let outer_world_xf = page_to_surface
+                .inverse()
+                .map(|inv| inv.compose(&group_to_screen))
+                .filter(|m| m.is_finite())
+                .unwrap_or(Affine2D::IDENTITY);
+            let deform_ctx = mesh_deform.map(|md| (md.deform_frames, outer_world_xf));
+            render_underlay_effects_with_sym_and_deform(
                 doc,
                 obj,
                 deformed_in_group,
                 Affine2D::IDENTITY,
                 group_to_screen,
                 page_to_surface,
+                sym_ctx,
+                deform_ctx,
                 px_per_mm,
                 anti_alias,
                 &self.active_icc,

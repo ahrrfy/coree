@@ -510,42 +510,80 @@ impl BezierPath {
     /// Flattens every subpath into polylines with maximum chord error `tolerance_mm`.
     #[must_use]
     pub fn flatten(&self, tolerance_mm: f64) -> Vec<Vec<Point2D>> {
-        let tol = sanitize_f64(tolerance_mm, 0.05).max(1e-4);
+        const MAX_FLATTEN_VERTICES: usize = 1_000_000;
+        if self.subpaths.iter().any(|sp| {
+            sp.nodes.iter().any(|n| {
+                !n.pos.is_finite()
+                    || n.handle_in.is_some_and(|h| !h.is_finite())
+                    || n.handle_out.is_some_and(|h| !h.is_finite())
+            })
+        }) {
+            return Vec::new();
+        }
+        let Some(bb) = self.bounding_box() else {
+            return Vec::new();
+        };
+        if !bb.is_finite() {
+            return Vec::new();
+        }
+        let max_span = bb.width().max(bb.height());
+        if !max_span.is_finite() {
+            return Vec::new();
+        }
+        let tol = sanitize_f64(tolerance_mm, 0.05)
+            .max(1e-4)
+            .max(max_span * 1e-5);
         let kb = self.to_kurbo();
         let mut polylines: Vec<Vec<Point2D>> = Vec::new();
         let mut current: Vec<Point2D> = Vec::new();
         let mut start_pt: Option<Point2D> = None;
+        let mut total_verts = 0usize;
 
-        kurbo::flatten(kb.iter(), tol, |el| match el {
-            PathEl::MoveTo(p) => {
-                if !current.is_empty() {
-                    polylines.push(std::mem::take(&mut current));
-                }
-                let pt = Point2D::from_kurbo(p);
-                start_pt = Some(pt);
-                current.push(pt);
+        kurbo::flatten(kb.iter(), tol, |el| {
+            if total_verts >= MAX_FLATTEN_VERTICES {
+                return;
             }
-            PathEl::LineTo(p) => {
-                let pt = Point2D::from_kurbo(p);
-                if current
-                    .last()
-                    .is_none_or(|prev| prev.distance_to(pt) > 1e-9)
-                {
-                    current.push(pt);
-                }
-            }
-            PathEl::ClosePath => {
-                if let Some(s) = start_pt {
-                    if current.last().is_none_or(|prev| prev.distance_to(s) > 1e-9) {
-                        current.push(s);
+            match el {
+                PathEl::MoveTo(p) => {
+                    if !current.is_empty() {
+                        polylines.push(std::mem::take(&mut current));
+                    }
+                    let pt = Point2D::from_kurbo(p);
+                    if pt.is_finite() {
+                        start_pt = Some(pt);
+                        current.push(pt);
+                        total_verts += 1;
+                    } else {
+                        start_pt = None;
                     }
                 }
-                if !current.is_empty() {
-                    polylines.push(std::mem::take(&mut current));
+                PathEl::LineTo(p) => {
+                    let pt = Point2D::from_kurbo(p);
+                    if pt.is_finite()
+                        && current
+                            .last()
+                            .is_none_or(|prev| prev.distance_to(pt) > 1e-9)
+                    {
+                        current.push(pt);
+                        total_verts += 1;
+                    }
                 }
-                start_pt = None;
+                PathEl::ClosePath => {
+                    if let Some(s) = start_pt {
+                        if current.last().is_none_or(|prev| prev.distance_to(s) > 1e-9)
+                            && total_verts < MAX_FLATTEN_VERTICES
+                        {
+                            current.push(s);
+                            total_verts += 1;
+                        }
+                    }
+                    if !current.is_empty() {
+                        polylines.push(std::mem::take(&mut current));
+                    }
+                    start_pt = None;
+                }
+                PathEl::QuadTo(..) | PathEl::CurveTo(..) => {}
             }
-            PathEl::QuadTo(..) | PathEl::CurveTo(..) => {}
         });
 
         if !current.is_empty() {
@@ -560,7 +598,14 @@ impl BezierPath {
         let kb = self.to_kurbo();
         let mut total = 0.0;
         for seg in kb.segments() {
-            let len = seg.arclen(1e-4);
+            let bb = kurbo::Shape::bounding_box(&seg);
+            let span = bb.width().max(bb.height());
+            let acc = if span.is_finite() {
+                (1e-4 * span).max(1e-4)
+            } else {
+                1e-4
+            };
+            let len = seg.arclen(acc);
             if len.is_finite() {
                 total += len;
             }
@@ -604,13 +649,23 @@ impl BezierPath {
             return None;
         }
         let mut remaining = dist_mm.max(0.0);
+        let seg_acc = |seg: &PathSeg| -> f64 {
+            let bb = kurbo::Shape::bounding_box(seg);
+            let span = bb.width().max(bb.height());
+            if span.is_finite() {
+                (1e-4 * span).max(1e-4)
+            } else {
+                1e-4
+            }
+        };
         for seg in &segments {
-            let len = seg.arclen(1e-4);
+            let acc = seg_acc(seg);
+            let len = seg.arclen(acc);
             if !len.is_finite() || len <= 1e-12 {
                 continue;
             }
             if remaining <= len {
-                let t = seg.inv_arclen(remaining, 1e-4).clamp(0.0, 1.0);
+                let t = seg.inv_arclen(remaining, acc).clamp(0.0, 1.0);
                 return Some(eval_seg_point_tangent(*seg, t));
             }
             remaining -= len;
@@ -619,7 +674,7 @@ impl BezierPath {
         segments
             .iter()
             .rev()
-            .find(|seg| seg.arclen(1e-4) > 1e-12)
+            .find(|seg| seg.arclen(seg_acc(seg)) > 1e-12)
             .map(|seg| eval_seg_point_tangent(*seg, 1.0))
     }
 

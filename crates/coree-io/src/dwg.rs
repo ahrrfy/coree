@@ -7,13 +7,15 @@
 //! tables, CRC-16 checksums, R2004+ header unmasking, and vector/text/dimension entities.
 
 use crate::atomic::atomic_write_bytes;
+use crate::display_list::{compose_world_persp, transform_world_path};
 use crate::error::{IoError, IoResult, DEFAULT_MAX_SVG_BYTES};
 use crate::{resolve_export_connector_endpoints, ExportSymCtx};
 use coree_core::{
     Affine2D, ArtisticText, BezierPath, Color, ColorMode, DimensionKind, DimensionObject, Document,
     EllipseMode, Fill, Layer, LayerId, MasterLayerScope, NodePayload, ObjectId, OutlineStyle,
-    ParametricShape, Point2D, SceneObject, SymbolDef, TextDirection, TextStyle,
+    ParametricShape, Perspective3x3, Point2D, SceneObject, SymbolDef, TextDirection, TextStyle,
 };
+use coree_render::effects_render::apply_geometry_effects;
 use encoding_rs::{
     Encoding, BIG5, EUC_KR, GBK, SHIFT_JIS, UTF_8, WINDOWS_1251, WINDOWS_1252, WINDOWS_1256,
 };
@@ -24,7 +26,8 @@ use std::path::Path;
 
 const MAX_DWG_INPUT_BYTES: usize = DEFAULT_MAX_SVG_BYTES * 2; // 128 MiB
 const MAX_DWG_DEPTH: usize = 64;
-const MAX_DWG_ENTITIES: usize = 250_000;
+const MAX_DWG_ENTITIES: usize = 100_000;
+const MAX_DWG_VERTICES: usize = 2_000_000;
 
 /// Supported AutoCAD DWG version strings (`AC1012`..=`AC1032`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +292,7 @@ pub fn export_dwg_to_bytes(doc: &Document, page_index: usize) -> IoResult<Vec<u8
                     page_h,
                     obj,
                     Affine2D::IDENTITY,
+                    None,
                     None,
                     l_idx,
                     &mut next_handle,
@@ -595,8 +599,15 @@ pub fn import_dwg_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
 
     if let Some(sec5) = sections.get(&5) {
         if sec5.starts_with(COREE_DWG_ENTITY_MAGIC) && sec5.len() >= 8 {
-            let ent_count = (u32::from_le_bytes([sec5[4], sec5[5], sec5[6], sec5[7]]) as usize)
-                .min(MAX_DWG_ENTITIES);
+            let raw_ent_count = u32::from_le_bytes([sec5[4], sec5[5], sec5[6], sec5[7]]) as usize;
+            if raw_ent_count > MAX_DWG_ENTITIES {
+                return Err(IoError::LimitExceeded {
+                    limit: format!("max_dwg_entities={MAX_DWG_ENTITIES}"),
+                    actual: format!("entity_count={raw_ent_count}"),
+                });
+            }
+            let ent_count = raw_ent_count;
+            let mut total_vertices = 0usize;
             let mut pos = 8usize;
             for idx in 0..ent_count {
                 if pos + 8 > sec5.len() {
@@ -689,6 +700,13 @@ pub fn import_dwg_bytes(bytes: &[u8], title: &str) -> IoResult<Document> {
                             sec5[pos + 4],
                         ]) as usize)
                             .min(100_000);
+                        total_vertices = total_vertices.saturating_add(count);
+                        if total_vertices > MAX_DWG_VERTICES {
+                            return Err(IoError::LimitExceeded {
+                                limit: format!("max_dwg_vertices={MAX_DWG_VERTICES}"),
+                                actual: format!("DWG vertex count {total_vertices} exceeded cap"),
+                            });
+                        }
                         pos += 5;
                         let mut pts = Vec::with_capacity(count);
                         for _ in 0..count {
@@ -930,12 +948,29 @@ fn emit_dwg_path(
     }
 }
 
+#[inline]
+fn warp_dwg_world_path(
+    local_bp: BezierPath,
+    obj: &SceneObject,
+    world_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
+) -> BezierPath {
+    let bp = if let Some(persp) = obj.perspective {
+        persp.transform_bezier_path(&local_bp)
+    } else {
+        local_bp
+    };
+    let deformed = apply_geometry_effects(&bp, &obj.effects);
+    transform_world_path(&deformed, obj.transform, world_xf, parent_persp)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_dwg_object_records(
     doc: &Document,
     page_h: f64,
     obj: &SceneObject,
     parent_xf: Affine2D,
+    parent_persp: Option<Perspective3x3>,
     sym_ctx: Option<ExportSymCtx<'_>>,
     layer_idx: u16,
     next_handle: &mut u32,
@@ -955,7 +990,7 @@ fn emit_dwg_object_records(
         return;
     }
 
-    if obj.effects.is_empty() {
+    if obj.effects.is_empty() && obj.perspective.is_none() && parent_persp.is_none() {
         if let NodePayload::Shape(ParametricShape::Ellipse {
             rx,
             ry,
@@ -995,7 +1030,7 @@ fn emit_dwg_object_records(
     match &obj.payload {
         NodePayload::Path(p) => emit_dwg_path(
             page_h,
-            &p.transformed(&world_xf),
+            &warp_dwg_world_path(p.clone(), obj, world_xf, parent_persp),
             layer_idx,
             next_handle,
             out,
@@ -1003,7 +1038,7 @@ fn emit_dwg_object_records(
         ),
         NodePayload::Shape(s) => emit_dwg_path(
             page_h,
-            &s.to_bezier_path().transformed(&world_xf),
+            &warp_dwg_world_path(s.to_bezier_path(), obj, world_xf, parent_persp),
             layer_idx,
             next_handle,
             out,
@@ -1011,7 +1046,7 @@ fn emit_dwg_object_records(
         ),
         NodePayload::BSpline(bs) => emit_dwg_path(
             page_h,
-            &bs.to_bezier_path().transformed(&world_xf),
+            &warp_dwg_world_path(bs.to_bezier_path(), obj, world_xf, parent_persp),
             layer_idx,
             next_handle,
             out,
@@ -1019,7 +1054,12 @@ fn emit_dwg_object_records(
         ),
         NodePayload::ArtisticMedia { spine, style } => emit_dwg_path(
             page_h,
-            &coree_core::ArtisticMedia::expand_stroke(spine, style).transformed(&world_xf),
+            &warp_dwg_world_path(
+                coree_core::ArtisticMedia::expand_stroke(spine, style),
+                obj,
+                world_xf,
+                parent_persp,
+            ),
             layer_idx,
             next_handle,
             out,
@@ -1027,7 +1067,7 @@ fn emit_dwg_object_records(
         ),
         NodePayload::Table(t) => emit_dwg_path(
             page_h,
-            &t.to_grid_paths().transformed(&world_xf),
+            &warp_dwg_world_path(t.to_grid_paths(), obj, world_xf, parent_persp),
             layer_idx,
             next_handle,
             out,
@@ -1046,7 +1086,7 @@ fn emit_dwg_object_records(
         }
         NodePayload::PowerClip { container, .. } => emit_dwg_path(
             page_h,
-            &container.transformed(&world_xf),
+            &warp_dwg_world_path((**container).clone(), obj, world_xf, parent_persp),
             layer_idx,
             next_handle,
             out,
@@ -1068,6 +1108,7 @@ fn emit_dwg_object_records(
                     page_h,
                     &resolved,
                     parent_xf,
+                    parent_persp,
                     sym_ctx,
                     layer_idx,
                     next_handle,
@@ -1079,6 +1120,8 @@ fn emit_dwg_object_records(
             }
         }
         NodePayload::Group(children) => {
+            let child_persp =
+                compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
             for &cid in children {
                 let child_opt = sym_ctx
                     .and_then(|(m, _, _)| m.get(&cid).copied())
@@ -1089,6 +1132,7 @@ fn emit_dwg_object_records(
                         page_h,
                         child,
                         world_xf,
+                        child_persp,
                         sym_ctx,
                         layer_idx,
                         next_handle,
@@ -1104,6 +1148,8 @@ fn emit_dwg_object_records(
             if let Some(sym) = doc.symbol(*sym_id) {
                 let (child_map, referenced) = build_dwg_symbol_maps(sym);
                 let mut sym_visited = HashSet::new();
+                let child_persp =
+                    compose_world_persp(parent_persp, obj.transform, world_xf, obj.perspective);
                 for sub in &sym.objects {
                     if sub.id.0 != 0 && referenced.contains(&sub.id) {
                         continue;
@@ -1113,6 +1159,7 @@ fn emit_dwg_object_records(
                         page_h,
                         sub,
                         world_xf,
+                        child_persp,
                         Some((&child_map, &sym.objects, world_xf)),
                         layer_idx,
                         next_handle,
@@ -1553,5 +1600,41 @@ mod tests {
         assert!((xs[0] - 15.0).abs() < 0.2);
         assert!((xs[1] - 40.0).abs() < 0.2);
         assert!((xs[2] - 70.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn dwg_entity_cap_rejects_249k_bomb() {
+        let n_lines = 249_999u32;
+        let mut sec5 = Vec::with_capacity(8 + (n_lines as usize) * 40);
+        sec5.extend_from_slice(COREE_DWG_ENTITY_MAGIC);
+        sec5.extend_from_slice(&n_lines.to_le_bytes());
+        for _ in 0..n_lines {
+            sec5.extend_from_slice(&1u32.to_le_bytes());
+            sec5.extend_from_slice(&DWG_ENT_LINE.to_le_bytes());
+            sec5.extend_from_slice(&0u16.to_le_bytes());
+            for v in [0.0f64, 0.0, 10.0, 10.0] {
+                sec5.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let off = (25 + 9 + 2 + 16) as u32;
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"AC1015");
+        hdr.resize(19, 0);
+        hdr.extend_from_slice(&30u16.to_le_bytes());
+        hdr.extend_from_slice(&1u32.to_le_bytes());
+        hdr.push(5);
+        hdr.extend_from_slice(&off.to_le_bytes());
+        hdr.extend_from_slice(&(sec5.len() as u32).to_le_bytes());
+        let crc = dwg_crc16(0xC0C1, &hdr);
+        let mut dwg = hdr;
+        dwg.extend_from_slice(&crc.to_le_bytes());
+        dwg.extend_from_slice(&R2000_HDR_SENTINEL);
+        dwg.extend_from_slice(&sec5);
+
+        let err = import_dwg_bytes(&dwg, "DwgBomb").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on 249,999 DWG lines, got {err:?}"
+        );
     }
 }

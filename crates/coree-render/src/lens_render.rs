@@ -718,10 +718,12 @@ pub(crate) fn render_lens_object_with_backdrop(
         return;
     }
     let lens_screen_bounds = lens_to_surface.transform_rect(local_bounds);
+    let surface_max = f64::from(backend.width().max(backend.height()).max(1));
     if !lens_screen_bounds.is_finite()
         || lens_screen_bounds.is_empty()
         || lens_screen_bounds.width() <= 1e-6
         || lens_screen_bounds.height() <= 1e-6
+        || lens_screen_bounds.width().max(lens_screen_bounds.height()) > surface_max * 1e4
     {
         return;
     }
@@ -1283,6 +1285,10 @@ fn obtain_sample_backdrop(
 
     let prev_scope_stack = std::mem::take(&mut renderer.frozen_scope_stack);
     let prev_sym_root_idx = renderer.current_sym_root_idx.take();
+    // Inside `sub`, `underlying[0..idx]` is already rendered onto `sub` in `local_page_xf` coordinates,
+    // so nested lenses can read directly from `sub` instead of re-rendering `underlying` recursively (`O(2^N)` -> `O(N)`).
+    let prev_force_offscreen = renderer.force_offscreen_lens_backdrop;
+    renderer.force_offscreen_lens_backdrop = false;
     let mut sym_scope_lens: Vec<usize> = Vec::new();
     let mut sym_branch_lens: Vec<usize> = Vec::new();
     let mut sym_branch_xfs: Vec<Affine2D> = vec![Affine2D::IDENTITY];
@@ -1411,6 +1417,34 @@ fn obtain_sample_backdrop(
                         &mut visit,
                     );
                 } else {
+                    let can_use_export_cache = active_sym.is_none()
+                        && sym_branch_xfs.last().copied().unwrap_or(Affine2D::IDENTITY)
+                            == Affine2D::IDENTITY
+                        && parent_override.is_none()
+                        && view_mode == ViewMode::Enhanced;
+                    if can_use_export_cache {
+                        if let Some((cached_ppm, rect_mm, cached_buf)) = renderer
+                            .export_lens_cache
+                            .get(&(oid, options.suppress_spot_cutcontour))
+                            .cloned()
+                        {
+                            if (cached_ppm - px_per_mm).abs() <= cached_ppm * 1e-4 {
+                                let draw_xf = local_page_xf
+                                    .compose(&Affine2D::translate(rect_mm.min_x, rect_mm.min_y))
+                                    .compose(&Affine2D::scale(1.0 / cached_ppm, 1.0 / cached_ppm));
+                                let smooth = draw_xf.m[4].fract().abs() > 1e-4
+                                    || draw_xf.m[5].fract().abs() > 1e-4;
+                                sub.draw_pixmap(
+                                    &cached_buf,
+                                    draw_xf,
+                                    1.0,
+                                    BlendMode::Normal,
+                                    smooth,
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let branch_xf = sym_branch_xfs.last().copied().unwrap_or(Affine2D::IDENTITY);
                     let raw_parent_world = match active_sym {
                         Some(sf) if sf.sym_map.contains_key(&oid) => {
@@ -1523,10 +1557,10 @@ fn obtain_sample_backdrop(
                         || (**container).clone(),
                         |p| p.transform_bezier_path(container),
                     );
+                    let maybe_deform =
+                        build_deform_frames(doc, &deform_stack, parent_override, active_sym);
                     let (deformed_container, pc_local_xf, pc_parent_to_sub, pc_obj_to_sub) =
-                        if let Some((active, frames)) =
-                            build_deform_frames(doc, &deform_stack, parent_override, active_sym)
-                        {
+                        if let Some((ref active, ref frames)) = maybe_deform {
                             let inner = active.last().expect("non-empty active deform frames");
                             let branch_inner_rel =
                                 sym_branch_rel_to_inner(&sym_branch_xfs, &inner.group_world_xf);
@@ -1542,7 +1576,7 @@ fn obtain_sample_backdrop(
                             let def = apply_deform_chain_in_bounds(
                                 &apply_geometry_effects(&persp_container, &pc_obj.effects),
                                 pc_rel_xf,
-                                &frames,
+                                frames,
                             );
                             let outer_to_sub = active[0].group_to_sub;
                             (def, Affine2D::IDENTITY, outer_to_sub, outer_to_sub)
@@ -1564,13 +1598,21 @@ fn obtain_sample_backdrop(
                             (def, pc_local_xf, pc_parent_to_sub, pc_obj_to_sub)
                         };
                     if !pc_obj.effects.is_empty() {
-                        crate::effects_render::render_underlay_effects(
+                        let sym_ctx = active_sym.map(|sf| {
+                            (&sf.sym_map, sf.sym_def.objects.as_slice(), sf.sym_world_xf)
+                        });
+                        let deform_ctx = maybe_deform
+                            .as_ref()
+                            .map(|(active, frames)| (frames.as_slice(), active[0].group_world_xf));
+                        crate::effects_render::render_underlay_effects_with_sym_and_deform(
                             doc,
                             pc_obj,
                             &deformed_container,
                             pc_local_xf,
                             pc_parent_to_sub,
                             local_page_xf,
+                            sym_ctx,
+                            deform_ctx,
                             px_per_mm,
                             anti_alias,
                             &renderer.active_icc,
@@ -1625,6 +1667,7 @@ fn obtain_sample_backdrop(
     for _ in 0..open_clips {
         sub.pop_clip();
     }
+    renderer.force_offscreen_lens_backdrop = prev_force_offscreen;
     renderer.frozen_scope_stack = prev_scope_stack;
     renderer.current_sym_root_idx = prev_sym_root_idx;
 

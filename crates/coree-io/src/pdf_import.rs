@@ -56,12 +56,18 @@ const MAX_PARSE_DEPTH: usize = 64;
 const MAX_REF_DEPTH: usize = 32;
 /// Maximum Form XObject recursion depth.
 const MAX_FORM_DEPTH: usize = 32;
+/// Maximum Form XObject `Do` invocations across an imported PDF document.
+const MAX_PDF_FORM_CALLS: usize = 50_000;
+/// Maximum total SceneObjects emitted across an imported PDF document.
+const MAX_PDF_OBJECTS: usize = 100_000;
+/// Maximum cumulative path vertices/nodes across an imported PDF document.
+pub const MAX_PDF_VERTICES: usize = 2_000_000;
 /// Maximum graphics state stack depth (`q`/`Q`).
 const MAX_GSTATE_DEPTH: usize = 128;
 /// Maximum number of pages imported from a single PDF.
 const MAX_PDF_PAGES: usize = 4_096;
 /// Maximum number of content-stream operations per page.
-const MAX_OPS_PER_PAGE: usize = 2_000_000;
+const MAX_OPS_PER_PAGE: usize = 500_000;
 /// Maximum chained `/Filter` entries per stream.
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 /// Maximum `/Contents` array entries per page.
@@ -202,6 +208,8 @@ pub fn import_pdf_bytes_with_password(
         saw_rgb: false,
         rgba_budget_remaining: MAX_PDF_RGBA_BUDGET,
         per_image_budget,
+        form_calls: 0,
+        total_vertices: 0,
     };
 
     for (page_idx, spec) in pages_spec.iter().enumerate() {
@@ -1992,6 +2000,8 @@ struct ImportContext<'d> {
     saw_rgb: bool,
     rgba_budget_remaining: usize,
     per_image_budget: usize,
+    form_calls: usize,
+    total_vertices: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2243,6 +2253,7 @@ struct PdfContentInterpreter<'p, 'a, 'd> {
     font_cache: HashMap<String, PdfFontInfo>,
     op_count: usize,
     emitted_count: usize,
+    path_vertices: usize,
 }
 
 impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
@@ -2276,6 +2287,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             font_cache: HashMap::new(),
             op_count: 0,
             emitted_count: 0,
+            path_vertices: 0,
         }
     }
 
@@ -2317,6 +2329,42 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         Ok(())
     }
 
+    fn check_path_construction_vertices(&mut self, add: usize) -> IoResult<()> {
+        let next_path = self.path_vertices.saturating_add(add);
+        let projected = self.ctx.total_vertices.saturating_add(next_path);
+        if projected > MAX_PDF_VERTICES {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_pdf_vertices={MAX_PDF_VERTICES}"),
+                actual: format!("PDF vertex count {projected} exceeded {MAX_PDF_VERTICES}"),
+            });
+        }
+        self.path_vertices = next_path;
+        Ok(())
+    }
+
+    fn add_emitted_object(&mut self, obj: SceneObject) -> IoResult<ObjectId> {
+        if self.ctx.doc.object_count() >= MAX_PDF_OBJECTS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_pdf_objects={MAX_PDF_OBJECTS}"),
+                actual: format!("PDF object count exceeded {MAX_PDF_OBJECTS}"),
+            });
+        }
+        let verts = match &obj.payload {
+            NodePayload::Path(p) => p.node_count(),
+            NodePayload::PowerClip { container, .. } => container.node_count(),
+            _ => 0,
+        };
+        let next_verts = self.ctx.total_vertices.saturating_add(verts);
+        if next_verts > MAX_PDF_VERTICES {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_pdf_vertices={MAX_PDF_VERTICES}"),
+                actual: format!("PDF vertex count {next_verts} exceeded {MAX_PDF_VERTICES}"),
+            });
+        }
+        self.ctx.total_vertices = next_verts;
+        Ok(self.ctx.doc.add_object(obj, Some(self.layer_id))?)
+    }
+
     fn record_emitted_id(&mut self, id: ObjectId) {
         if let Some(top) = self.clip_stack.last_mut() {
             top.2.push(id);
@@ -2340,7 +2388,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             )
             .with_fill(Fill::None)
             .with_outline(OutlineStyle::none());
-            let pc_id = self.ctx.doc.add_object(container, Some(self.layer_id))?;
+            let pc_id = self.add_emitted_object(container)?;
             if let Ok(created_id) = self.ctx.doc.create_powerclip(pc_id, &children) {
                 self.record_emitted_id(created_id);
             } else {
@@ -2510,6 +2558,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             // Path construction
             "m" if args.len() >= 2 => {
                 if let (Some(x), Some(y)) = (args[0].as_f64(), args[1].as_f64()) {
+                    self.check_path_construction_vertices(1)?;
                     let p = self.world_xf().transform_point(Point2D::new(x, y));
                     self.path.move_to(p.to_kurbo());
                     self.cur_pt = Some(p);
@@ -2518,6 +2567,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             }
             "l" if args.len() >= 2 => {
                 if let (Some(x), Some(y)) = (args[0].as_f64(), args[1].as_f64()) {
+                    self.check_path_construction_vertices(1)?;
                     let p = self.world_xf().transform_point(Point2D::new(x, y));
                     if self.cur_pt.is_none() {
                         self.path.move_to(p.to_kurbo());
@@ -2537,6 +2587,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     args[4].as_f64(),
                     args[5].as_f64(),
                 ) {
+                    self.check_path_construction_vertices(1)?;
                     let xf = self.world_xf();
                     let p1 = xf.transform_point(Point2D::new(x1, y1));
                     let p2 = xf.transform_point(Point2D::new(x2, y2));
@@ -2557,6 +2608,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     args[2].as_f64(),
                     args[3].as_f64(),
                 ) {
+                    self.check_path_construction_vertices(1)?;
                     let xf = self.world_xf();
                     let p1 = self.cur_pt.unwrap_or(Point2D::ZERO);
                     let p2 = xf.transform_point(Point2D::new(x2, y2));
@@ -2573,6 +2625,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     args[2].as_f64(),
                     args[3].as_f64(),
                 ) {
+                    self.check_path_construction_vertices(1)?;
                     let xf = self.world_xf();
                     let p1 = xf.transform_point(Point2D::new(x1, y1));
                     let p3 = xf.transform_point(Point2D::new(x3, y3));
@@ -2588,6 +2641,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     args[2].as_f64(),
                     args[3].as_f64(),
                 ) {
+                    self.check_path_construction_vertices(4)?;
                     let xf = self.world_xf();
                     let p0 = xf.transform_point(Point2D::new(x, y));
                     let p1 = xf.transform_point(Point2D::new(x + w, y));
@@ -2644,6 +2698,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             }
             "n" => {
                 self.path = BezPath::new();
+                self.path_vertices = 0;
                 self.cur_pt = None;
                 self.subpath_start = None;
                 self.activate_pending_clip();
@@ -3145,6 +3200,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
             self.path.close_path();
         }
         let kb = std::mem::take(&mut self.path);
+        self.path_vertices = 0;
         self.cur_pt = None;
         self.subpath_start = None;
         if kb.is_empty() {
@@ -3198,7 +3254,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                         .with_fill(fill)
                         .with_outline(OutlineStyle::none());
                         fill_obj.blend_mode = self.gstate.blend_mode;
-                        let oid = self.ctx.doc.add_object(fill_obj, Some(self.layer_id))?;
+                        let oid = self.add_emitted_object(fill_obj)?;
                         self.record_emitted_id(oid);
                     }
                     self.emitted_count += 1;
@@ -3210,7 +3266,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                     .with_fill(Fill::None)
                     .with_outline(outline);
                     stroke_obj.blend_mode = self.gstate.blend_mode;
-                    let oid = self.ctx.doc.add_object(stroke_obj, Some(self.layer_id))?;
+                    let oid = self.add_emitted_object(stroke_obj)?;
                     self.record_emitted_id(oid);
                     return Ok(());
                 }
@@ -3226,7 +3282,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
                 .with_fill(fill)
                 .with_outline(OutlineStyle::none());
                 obj.blend_mode = self.gstate.blend_mode;
-                let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+                let oid = self.add_emitted_object(obj)?;
                 self.record_emitted_id(oid);
                 return Ok(());
             }
@@ -3241,7 +3297,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_fill(fill)
         .with_outline(outline);
         obj.blend_mode = self.gstate.blend_mode;
-        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.add_emitted_object(obj)?;
         self.record_emitted_id(oid);
         Ok(())
     }
@@ -3375,7 +3431,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_fill(fill)
         .with_outline(OutlineStyle::none());
         obj.blend_mode = self.gstate.blend_mode;
-        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.add_emitted_object(obj)?;
         self.record_emitted_id(oid);
         Ok(())
     }
@@ -3411,6 +3467,13 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
     ) -> IoResult<()> {
         if form_depth >= MAX_FORM_DEPTH {
             return Ok(());
+        }
+        self.ctx.form_calls = self.ctx.form_calls.saturating_add(1);
+        if self.ctx.form_calls > MAX_PDF_FORM_CALLS {
+            return Err(IoError::LimitExceeded {
+                limit: format!("max_pdf_form_calls={MAX_PDF_FORM_CALLS}"),
+                actual: format!("Form XObject Do calls exceeded {MAX_PDF_FORM_CALLS}"),
+            });
         }
         let stream_bytes = self.parser.decode_stream_slice(dict, start, len)?;
         if stream_bytes.is_empty() {
@@ -3648,7 +3711,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_transform(obj_xf);
         obj.opacity = self.gstate.fill_alpha;
         obj.blend_mode = self.gstate.blend_mode;
-        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.add_emitted_object(obj)?;
         self.record_emitted_id(oid);
         Ok(())
     }
@@ -3998,7 +4061,7 @@ impl<'p, 'a, 'd> PdfContentInterpreter<'p, 'a, 'd> {
         .with_outline(OutlineStyle::none())
         .with_transform(text_xf);
         obj.blend_mode = self.gstate.blend_mode;
-        let oid = self.ctx.doc.add_object(obj, Some(self.layer_id))?;
+        let oid = self.add_emitted_object(obj)?;
         self.record_emitted_id(oid);
 
         let w_1000 = total_w_1000.unwrap_or_else(|| (text.chars().count() as f64) * 550.0);
@@ -5583,5 +5646,138 @@ mod tests {
             matches!(err, IoError::InvalidFormat { .. }),
             "expected InvalidFormat on partial ASCII85 overflow, got {err:?}"
         );
+    }
+
+    #[test]
+    fn pdf_import_form_xobject_do_bomb_rejects_cleanly() {
+        // 20 nested Form XObjects each calling `/F Do` twice -> 2^20 = 1,048,576 invocations
+        let mut objs: Vec<Vec<u8>> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n".to_vec(),
+            b"4 0 obj\n<< /Length 7 >>\nstream\n/F1 Do\n\nendstream\nendobj\n".to_vec(),
+        ];
+        for lvl in 0..20usize {
+            let oid = 5 + lvl;
+            let (res, body) = if lvl == 19 {
+                (String::new(), "0 0 10 10 re f\n".to_owned())
+            } else {
+                let nxt = oid + 1;
+                (
+                    format!("/Resources << /XObject << /F {nxt} 0 R >> >> "),
+                    "/F Do\n/F Do\n".to_owned(),
+                )
+            };
+            objs.push(
+                format!(
+                    "{oid} 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] {res}/Length {} >>\nstream\n{body}\nendstream\nendobj\n",
+                    body.len()
+                )
+                .into_bytes(),
+            );
+        }
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offs = Vec::with_capacity(objs.len());
+        for o in &objs {
+            offs.push(pdf.len());
+            pdf.extend_from_slice(o);
+        }
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes(),
+        );
+        for off in offs {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let err = import_pdf_bytes(&pdf, "PdfDoBomb").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { .. }),
+            "expected LimitExceeded on 2^20 Form XObject Do bomb, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_import_multipage_shared_stream_vertex_bomb_rejects_cleanly() {
+        fn build_shared_stream_pdf(pages: usize, segs_per_page: usize) -> Vec<u8> {
+            use std::fmt::Write as _;
+            let mut stream = String::with_capacity(segs_per_page * 12 + 32);
+            stream.push_str("1 0 0 RG 1 w 10 10 m\n");
+            for i in 1..=segs_per_page {
+                let _ = writeln!(stream, "{} {} l", 10 + (i % 500), 10 + ((i / 500) % 500));
+            }
+            stream.push_str("S\n");
+
+            let stream_oid = 3 + pages;
+            let mut objs: Vec<Vec<u8>> = Vec::with_capacity(pages + 3);
+            objs.push(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec());
+            let kids: String = (0..pages)
+                .map(|i| format!("{} 0 R", 3 + i))
+                .collect::<Vec<_>>()
+                .join(" ");
+            objs.push(
+                format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {pages} >>\nendobj\n")
+                    .into_bytes(),
+            );
+            for i in 0..pages {
+                let oid = 3 + i;
+                objs.push(
+                    format!(
+                        "{oid} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents {stream_oid} 0 R >>\nendobj\n"
+                    )
+                    .into_bytes(),
+                );
+            }
+            objs.push(
+                format!(
+                    "{stream_oid} 0 obj\n<< /Length {} >>\nstream\n{stream}endstream\nendobj\n",
+                    stream.len()
+                )
+                .into_bytes(),
+            );
+
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let mut offs = Vec::with_capacity(objs.len());
+            for o in &objs {
+                offs.push(pdf.len());
+                pdf.extend_from_slice(o);
+            }
+            let xref_off = pdf.len();
+            pdf.extend_from_slice(
+                format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes(),
+            );
+            for off in offs {
+                pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                    objs.len() + 1
+                )
+                .as_bytes(),
+            );
+            pdf
+        }
+
+        // 30 pages sharing a 200k-segment stream = 6,000,000 segments > MAX_PDF_VERTICES (2,000,000)
+        let bomb_pdf = build_shared_stream_pdf(30, 200_000);
+        let err = import_pdf_bytes(&bomb_pdf, "Pdf30p200kSegs").unwrap_err();
+        assert!(
+            matches!(err, IoError::LimitExceeded { ref limit, .. } if limit == "max_pdf_vertices=2000000"),
+            "expected LimitExceeded(max_pdf_vertices=2000000) on 30x200k PDF, got {err:?}"
+        );
+
+        // 10 pages sharing a 100k-segment stream = ~1,000,010 segments <= MAX_PDF_VERTICES (2,000,000)
+        let ok_pdf = build_shared_stream_pdf(10, 100_000);
+        let ok_doc = import_pdf_bytes(&ok_pdf, "Pdf10p100kSegs").expect("10x100k PDF must succeed");
+        assert_eq!(ok_doc.pages().len(), 10);
+        assert_eq!(ok_doc.object_count(), 10);
     }
 }

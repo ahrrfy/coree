@@ -5508,3 +5508,106 @@ fn sculpt_sub_mode_attract_repel_and_shift_inversion() {
     assert!(!SculptSubMode::Repel.is_attract(false));
     assert!(SculptSubMode::Repel.is_attract(true));
 }
+
+#[test]
+fn non_finite_pointer_events_never_emit_nan_transforms_or_actions() {
+    let mut h = Harness::new();
+    let box_obj = SceneObject::new(
+        ObjectId(0),
+        "Target",
+        NodePayload::Path(BezierPath::from_rect(coree_core::Rect2D::from_xywh(
+            10.0, 10.0, 30.0, 30.0,
+        ))),
+    );
+    let lid = Some(h.layer_id());
+    h.history
+        .execute(&mut h.doc, CommandOp::create_object(box_obj, lid))
+        .unwrap();
+    let rid = *h.doc.objects().keys().max().unwrap();
+    h.selection.select_single(&h.doc, rid);
+
+    let bad_world = PointerEvent::primary(Point2D::new(f64::NAN, f64::INFINITY), [10.0, 10.0]);
+    let bad_screen = PointerEvent::primary(Point2D::new(25.0, 25.0), [f32::NAN, 0.0]);
+
+    let assert_output_finite = |out: &ToolOutput, label: &str| match out {
+        ToolOutput::Continue { overlay } => {
+            assert!(
+                overlay.dirty_world_bbox_mm.is_none_or(|b| b.is_finite()),
+                "{label}: non-finite dirty bbox"
+            );
+        }
+        ToolOutput::Commit { ops, .. } => {
+            for op in ops {
+                if let CommandOp::TransformObjects { affine, .. } = op {
+                    assert!(
+                        affine.is_finite(),
+                        "{label}: non-finite CommandOp transform"
+                    );
+                }
+            }
+        }
+        ToolOutput::Consumed { actions, .. } => {
+            for act in actions {
+                match act {
+                    ToolActionRequest::PanTo { pan_mm, .. } => {
+                        assert!(pan_mm.is_finite(), "{label}: non-finite PanTo");
+                    }
+                    ToolActionRequest::SetPivot { pivot_mm } => {
+                        assert!(pivot_mm.is_finite(), "{label}: non-finite SetPivot");
+                    }
+                    ToolActionRequest::ZoomAtScreen { screen_px, .. } => {
+                        assert!(screen_px.is_finite(), "{label}: non-finite ZoomAtScreen");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ToolOutput::Cancel => {}
+    };
+
+    // Panning + Crop + Pick + ShapeNode
+    for tool in [ToolId::Pan, ToolId::Pick, ToolId::ShapeNode, ToolId::Crop] {
+        let mut tc = ToolCore::new(tool);
+        let out_down = tc.on_pointer_down(&h.ctx(), &bad_world);
+        assert_output_finite(&out_down, "down bad_world");
+        let out_down2 = tc.on_pointer_down(&h.ctx(), &bad_screen);
+        assert_output_finite(&out_down2, "down bad_screen");
+
+        // Start a valid drag inside object, then inject non-finite move & up
+        let d1 = tc.on_pointer_down(
+            &h.ctx(),
+            &PointerEvent::primary(Point2D::new(25.0, 25.0), [25.0, 25.0]),
+        );
+        assert_output_finite(&d1, "valid down");
+        let m_bad1 = tc.on_pointer_move(&h.ctx(), &bad_world);
+        assert_output_finite(&m_bad1, "move bad_world");
+        let m_bad2 = tc.on_pointer_move(&h.ctx(), &bad_screen);
+        assert_output_finite(&m_bad2, "move bad_screen");
+        let u_bad = tc.on_pointer_up(&h.ctx(), &bad_world);
+        assert_output_finite(&u_bad, "up bad_world");
+    }
+
+    // Specifically test Pick SkewingSelection & DraggingPivot with NaN pointer move
+    h.selection.transform_mode = coree_core::TransformMode::RotateAndSkew;
+    h.selection.pivot = Point2D::new(25.0, 25.0);
+    let mut tc_pick = ToolCore::new(ToolId::Pick);
+    let _ = tc_pick.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(25.0, 10.0), [25.0, 10.0]),
+    );
+    let m_skew = tc_pick.on_pointer_move(&h.ctx(), &bad_world);
+    assert_output_finite(&m_skew, "skew move bad_world");
+    let u_skew = tc_pick.on_pointer_up(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(25.0, 10.0), [25.0, 10.0]),
+    );
+    assert_output_finite(&u_skew, "skew up");
+
+    let _ = tc_pick.on_pointer_down(
+        &h.ctx(),
+        &PointerEvent::primary(Point2D::new(25.0, 25.0), [25.0, 25.0]),
+    );
+    let m_piv = tc_pick.on_pointer_move(&h.ctx(), &bad_world);
+    assert_output_finite(&m_piv, "pivot move bad_world");
+    let _ = tc_pick.on_pointer_up(&h.ctx(), &bad_screen);
+}

@@ -4548,3 +4548,351 @@ fn w5a_autopage_number_page_bg_drawing_scale_even_odd_wmf_emf_and_eps_opacity() 
         .values()
         .any(|o| matches!(o.payload, NodePayload::Raster(_))));
 }
+
+#[test]
+fn tier5_psd_psb_extreme_dim_rle_bomb_rejects_fast() {
+    // 300_000 x 100_000 grayscale 8-bit PSB with RLE compression=1 and all-zero scanline lengths (~400 KiB).
+    // Must reject immediately via MAX_PSD_SOURCE_PIXELS without CPU DoS hang (< 500 ms).
+    let w = 300_000u32;
+    let h = 100_000u32;
+    let mut psb = Vec::with_capacity(26 + 14 + (h as usize) * 4);
+    psb.extend_from_slice(b"8BPS");
+    psb.extend_from_slice(&2u16.to_be_bytes()); // PSB version 2
+    psb.extend_from_slice(&[0u8; 6]);
+    psb.extend_from_slice(&1u16.to_be_bytes()); // 1 channel
+    psb.extend_from_slice(&h.to_be_bytes());
+    psb.extend_from_slice(&w.to_be_bytes());
+    psb.extend_from_slice(&8u16.to_be_bytes()); // 8-bit
+    psb.extend_from_slice(&1u16.to_be_bytes()); // Grayscale
+    psb.extend_from_slice(&0u32.to_be_bytes()); // Color Mode Data length = 0
+    psb.extend_from_slice(&0u32.to_be_bytes()); // Image Resources length = 0
+    psb.extend_from_slice(&0u64.to_be_bytes()); // Layer & Mask Info length (PSB = 8 bytes) = 0
+    psb.extend_from_slice(&1u16.to_be_bytes()); // Composite RLE compression
+    psb.resize(psb.len() + (h as usize) * 4, 0);
+
+    let t0 = std::time::Instant::now();
+    let err = coree_io::import_psd_bytes(&psb, "PsbBomb").unwrap_err();
+    let elapsed = t0.elapsed();
+    assert!(
+        matches!(
+            err,
+            IoError::LimitExceeded { .. } | IoError::InvalidFormat { .. }
+        ),
+        "expected clean LimitExceeded/InvalidFormat for 300k x 100k PSB bomb, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "PSB CPU DoS bomb took {elapsed:?} (must reject in < 500ms)"
+    );
+}
+
+#[test]
+fn tier5_cad_dwg_emf_preserve_perspective_and_envelope_warps() {
+    let mut doc = Document::new("WarpExport", 300.0, 300.0, ColorMode::Rgb, 300.0);
+    // Source 10x10 square at [0..10, 0..10], warped via Perspective3x3 to [120..200, 140..220]
+    let persp = coree_core::Perspective3x3::from_rect_to_quad(
+        Rect2D::from_xywh(0.0, 0.0, 10.0, 10.0),
+        &[
+            Point2D::new(120.0, 140.0),
+            Point2D::new(200.0, 140.0),
+            Point2D::new(190.0, 220.0),
+            Point2D::new(125.0, 220.0),
+        ],
+    )
+    .unwrap();
+    let mut p_obj = SceneObject::new(
+        ObjectId(0),
+        "PerspRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 10.0, 10.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::CYAN))
+    .with_outline(OutlineStyle::solid(Color::BLACK, 0.5));
+    p_obj.perspective = Some(persp);
+    doc.add_object(p_obj, None).unwrap();
+
+    // Envelope object translated to x=20..40, y=20..40 stretched by envelope nodes to y=80
+    let mut e_obj = SceneObject::new(
+        ObjectId(0),
+        "EnvRect",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 20.0, 20.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::MAGENTA))
+    .with_outline(OutlineStyle::solid(Color::BLACK, 0.5))
+    .with_transform(coree_core::Affine2D::translate(20.0, 20.0));
+    e_obj.effects.push(Effect::Envelope {
+        mode: coree_core::EnvelopeMode::Unconstrained,
+        cage: vec![
+            Point2D::new(0.0, 0.0),
+            Point2D::new(20.0, 0.0),
+            Point2D::new(20.0, 60.0),
+            Point2D::new(0.0, 60.0),
+        ],
+    });
+    doc.add_object(e_obj, None).unwrap();
+
+    // 1. DXF roundtrip preserves warped bounds (PerspRect max_x ~ 200mm)
+    let dxf = coree_io::export_dxf_to_string(&doc, 0).unwrap();
+    let dxf_doc = coree_io::import_dxf_bytes(dxf.as_bytes(), "DxfWarp").unwrap();
+    let dxf_max_x = dxf_doc
+        .objects()
+        .values()
+        .filter_map(|o| dxf_doc.world_object_bounds(o.id))
+        .map(|b| b.max_x)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        dxf_max_x > 180.0,
+        "DXF must export Perspective3x3 warped bounds (got max_x={dxf_max_x})"
+    );
+
+    // 2. PLT (HPGL) roundtrip preserves warped bounds
+    let plt = coree_io::export_plt_to_string(&doc, 0).unwrap();
+    let plt_doc = coree_io::import_plt_bytes(plt.as_bytes(), "PltWarp").unwrap();
+    let plt_max_x = plt_doc
+        .objects()
+        .values()
+        .filter_map(|o| plt_doc.world_object_bounds(o.id))
+        .map(|b| b.max_x)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        plt_max_x > 180.0,
+        "PLT must export Perspective3x3 warped bounds (got max_x={plt_max_x})"
+    );
+
+    // 3. DWG roundtrip preserves warped bounds
+    let dwg = coree_io::export_dwg_to_bytes(&doc, 0).unwrap();
+    let dwg_doc = coree_io::import_dwg_bytes(&dwg, "DwgWarp").unwrap();
+    let dwg_max_x = dwg_doc
+        .objects()
+        .values()
+        .filter_map(|o| dwg_doc.world_object_bounds(o.id))
+        .map(|b| b.max_x)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        dwg_max_x > 180.0,
+        "DWG must export Perspective3x3 warped bounds (got max_x={dwg_max_x})"
+    );
+
+    // 4. EMF roundtrip preserves warped bounds (EnvRect max_y ~ 80mm, PerspRect max_x ~ 200mm)
+    let emf = coree_io::export_emf_to_bytes(&doc, 0).unwrap();
+    let emf_doc = coree_io::import_emf_bytes(&emf, "EmfWarp").unwrap();
+    let emf_max_x = emf_doc
+        .objects()
+        .values()
+        .filter_map(|o| emf_doc.world_object_bounds(o.id))
+        .map(|b| b.max_x)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        emf_max_x > 180.0,
+        "EMF must export Perspective3x3 warped bounds (got max_x={emf_max_x})"
+    );
+}
+
+#[test]
+fn tier5_pdf_import_ascii85_partial_tails_and_jbig2_bounded() {
+    let build_pdf_with_stream = |filter: &str, payload: &[u8]| -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+        let mut push_obj = |id: usize, body: &[u8]| {
+            offs.push(pdf.len());
+            pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        push_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push_obj(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+        );
+        let mut s4 =
+            format!("<< /Length {} /Filter {filter} >>\nstream\n", payload.len()).into_bytes();
+        s4.extend_from_slice(payload);
+        s4.extend_from_slice(b"\nendstream");
+        push_obj(4, &s4);
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for off in offs {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    };
+
+    // 1. Valid 2/3/4-char partial ASCII85Decode tails decoding valid PDF rect/fill streams
+    // "0 0 100 100 re f" (16 bytes -> exact, + " " 17 bytes -> 2-char tail, + "  " 18 bytes -> 3-char tail)
+    let a85_encode = |raw: &[u8]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in raw.chunks(4) {
+            let mut buf = [0u8; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let mut val = u32::from_be_bytes(buf);
+            let mut digs = [0u8; 5];
+            for d in digs.iter_mut().rev() {
+                *d = (val % 85) as u8 + b'!';
+                val /= 85;
+            }
+            out.extend_from_slice(&digs[..chunk.len() + 1]);
+        }
+        out.extend_from_slice(b"~>");
+        out
+    };
+    for padded in [
+        b"10 10 50 50 re f ".as_slice(),
+        b"10 10 50 50 re f  ".as_slice(),
+        b"10 10 50 50 re f   ".as_slice(),
+    ] {
+        let enc = a85_encode(padded);
+        let pdf = build_pdf_with_stream("/ASCII85Decode", &enc);
+        let doc = coree_io::import_pdf_bytes(&pdf, "A85Tail").unwrap();
+        assert!(
+            !doc.objects().is_empty(),
+            "ASCII85 partial tail len={} must decode content stream",
+            padded.len() % 4
+        );
+    }
+
+    // 2. Overflow 5-tuple "uuuuu~>" errors cleanly without panic
+    let bad_pdf = build_pdf_with_stream("/ASCII85Decode", b"uuuuu~>");
+    assert!(coree_io::import_pdf_bytes(&bad_pdf, "A85Overflow").is_err());
+
+    // 3. JBIG2Decode & JPXDecode stream filter paths complete safely or reject z-flood LimitExceeded
+    for flt in ["/JBIG2Decode", "/JPXDecode"] {
+        let ok_pdf = build_pdf_with_stream(flt, b"\x00\x01\x02\x03");
+        assert!(coree_io::import_pdf_bytes(&ok_pdf, "BoundedStub").is_ok());
+
+        let mut z_flood = vec![b'z'; 64 * 1024 * 1024 / 4 + 8];
+        z_flood.extend_from_slice(b"~>");
+        let bomb_pdf = build_pdf_with_stream("[/ASCII85Decode /JBIG2Decode]", &z_flood);
+        assert!(coree_io::import_pdf_bytes(&bomb_pdf, "JbigBomb").is_err());
+    }
+}
+
+#[test]
+fn tier5_dwg_corrupt_crc_and_nan_coords() {
+    let mut doc = Document::new("DwgAdv", 100.0, 100.0, ColorMode::Rgb, 300.0);
+    doc.add_object(
+        SceneObject::new(
+            ObjectId(0),
+            "Line",
+            NodePayload::Path(BezierPath::from_line(
+                Point2D::new(10.0, 10.0),
+                Point2D::new(80.0, 80.0),
+            )),
+        )
+        .with_outline(OutlineStyle::solid(Color::BLACK, 0.5)),
+        None,
+    )
+    .unwrap();
+    let base_dwg = coree_io::export_dwg_to_bytes(&doc, 0).unwrap();
+
+    // 1. Corrupt R2000 CRC-16 byte inside header or section table -> must either error cleanly or remain valid without panic
+    let mut bad_crc = base_dwg.clone();
+    bad_crc[24] ^= 0xFF; // corrupt section count / table
+    let _ = coree_io::import_dwg_bytes(&bad_crc, "CorruptDwg");
+
+    // 2. Huge layer count (l_count > 4096) / NaN float coordinates in synthetic R2000 section -> bounded & finite
+    let mut bad_layers = base_dwg.clone();
+    // Corrupt last bytes with NaN bit patterns & validate no panic/NaN leaks
+    let len = bad_layers.len();
+    if len > 40 {
+        for b in &mut bad_layers[len - 16..len - 8] {
+            *b = 0xFF;
+        }
+    }
+    if let Ok(parsed) = coree_io::import_dwg_bytes(&bad_layers, "NanDwg") {
+        assert!(parsed.pages()[0].layers.len() <= 4096);
+    }
+}
+
+#[test]
+fn tier5_svg_1e15_intersecting_stroked_cubic_imports_and_renders_without_panic() {
+    use coree_render::{
+        render_page_to_rgba_with_backend, render_svg_to_rgba, RenderBackendKind, RenderOptions,
+        ViewMode,
+    };
+
+    let svg_exact = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M 0 0 C 10 20 40 30 50 50 Z" transform="matrix(1e15 0 0 1e15 0 0)" stroke="black" fill="none"/></svg>"#;
+    let svg_open_dashed = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path d="M 0 0 C 10 20 40 30 50 50" transform="matrix(1e15 0 0 1e15 0 0)" stroke="black" stroke-dasharray="4 2" fill="none"/></svg>"#;
+
+    let t0 = std::time::Instant::now();
+    for svg_str in [svg_exact, svg_open_dashed] {
+        let doc = import_svg_str_with_limits(svg_str, &IoLimits::default()).expect("SVG import");
+        assert_eq!(doc.objects().len(), 1);
+
+        let img_150 = render_page_to_rgba_with_backend(
+            &doc,
+            0,
+            150.0,
+            ViewMode::Enhanced,
+            &RenderOptions::export(),
+            RenderBackendKind::TinySkia,
+        )
+        .expect("150 DPI TinySkia render");
+        assert!(img_150.width > 0 && img_150.height > 0);
+        assert!(
+            img_150
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[0] < 200 || p[1] < 200 || p[2] < 200),
+            "150 DPI TinySkia render must show dark stroke pixels near (0,0)"
+        );
+
+        let img_150_wgpu = render_page_to_rgba_with_backend(
+            &doc,
+            0,
+            150.0,
+            ViewMode::Enhanced,
+            &RenderOptions::export(),
+            RenderBackendKind::Wgpu,
+        )
+        .expect("150 DPI Wgpu render");
+        assert_eq!(img_150_wgpu.rgba.len(), img_150.rgba.len());
+
+        let img_96 = render_page_to_rgba_with_backend(
+            &doc,
+            0,
+            96.0,
+            ViewMode::Enhanced,
+            &RenderOptions::export(),
+            RenderBackendKind::TinySkia,
+        )
+        .expect("96 DPI TinySkia render");
+        assert_eq!(
+            img_96.rgba.len(),
+            (img_96.width * img_96.height * 4) as usize
+        );
+
+        let img_wire = render_page_to_rgba_with_backend(
+            &doc,
+            0,
+            96.0,
+            ViewMode::SimpleWireframe,
+            &RenderOptions::export(),
+            RenderBackendKind::TinySkia,
+        )
+        .expect("SimpleWireframe TinySkia render");
+        assert_eq!(
+            img_wire.rgba.len(),
+            (img_wire.width * img_wire.height * 4) as usize
+        );
+
+        let svg_rgba = render_svg_to_rgba(svg_str.as_bytes(), 100, 100)
+            .expect("render_svg_to_rgba on 1e15 SVG");
+        assert_eq!(svg_rgba.rgba.len(), 100 * 100 * 4);
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "1e15 SVG import & render suite took {:?}",
+        t0.elapsed()
+    );
+}

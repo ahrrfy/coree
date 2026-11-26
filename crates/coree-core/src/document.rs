@@ -2468,6 +2468,51 @@ impl Document {
         self.unknown_data_files = files;
     }
 
+    /// Replaces the unknown binary `.cdr` chunk passthrough buffer (used by snapshot/delta recovery).
+    pub fn replace_unknown_doc_chunks(&mut self, chunks: Vec<UnknownCdrChunk>) {
+        self.unknown_doc_chunks = chunks;
+    }
+
+    /// Restores the legacy custom ICC profile slot during snapshot/delta recovery.
+    pub fn restore_custom_icc_from_snapshot(
+        &mut self,
+        profile: Option<Vec<u8>>,
+        name: Option<String>,
+    ) {
+        self.custom_icc_profile = profile;
+        self.custom_icc_name = name;
+    }
+
+    /// Restores the RGB working-space ICC profile slot during snapshot/delta recovery.
+    pub fn restore_rgb_icc_from_snapshot(
+        &mut self,
+        profile: Option<Vec<u8>>,
+        name: Option<String>,
+    ) {
+        self.rgb_icc_profile = profile;
+        self.rgb_icc_name = name;
+    }
+
+    /// Restores the CMYK press-space ICC profile slot during snapshot/delta recovery.
+    pub fn restore_cmyk_icc_from_snapshot(
+        &mut self,
+        profile: Option<Vec<u8>>,
+        name: Option<String>,
+    ) {
+        self.cmyk_icc_profile = profile;
+        self.cmyk_icc_name = name;
+    }
+
+    /// Restores the Gray ICC profile slot during snapshot/delta recovery.
+    pub fn restore_gray_icc_from_snapshot(
+        &mut self,
+        profile: Option<Vec<u8>>,
+        name: Option<String>,
+    ) {
+        self.gray_icc_profile = profile;
+        self.gray_icc_name = name;
+    }
+
     /// Updates a guide's orientation (used during guide dragging/cancellation).
     pub fn set_guide_orientation(&mut self, guide_id: u64, orientation: GuideOrientation) -> bool {
         if let Some(g) = self.guides.iter_mut().find(|g| g.id == guide_id) {
@@ -3201,9 +3246,9 @@ impl Document {
             }
         };
 
-        self.objects.insert(id, object);
+        let was_present = self.objects.insert(id, object).is_some();
         if let Some(layer) = self.find_layer_mut(target_layer_id) {
-            if !layer.objects.contains(&id) {
+            if !was_present || !layer.objects.contains(&id) {
                 layer.objects.push(id);
             }
         }
@@ -4562,6 +4607,28 @@ impl Document {
             .ok_or(CoreError::ObjectNotFound(powerclip_id))?;
         if let NodePayload::PowerClip { lock_contents, .. } = &mut obj.payload {
             *lock_contents = locked;
+            self.touch();
+            Ok(())
+        } else {
+            Err(CoreError::InvalidParameter(format!(
+                "{powerclip_id} is not a PowerClip"
+            )))
+        }
+    }
+
+    /// Updates `clip_even_odd` fill-rule on an existing [`NodePayload::PowerClip`] in place,
+    /// preserving `ObjectId`, container hierarchy, z-order, and dependent references.
+    pub fn set_powerclip_clip_even_odd(
+        &mut self,
+        powerclip_id: ObjectId,
+        clip_even_odd: bool,
+    ) -> CoreResult<()> {
+        let obj = self
+            .objects
+            .get_mut(&powerclip_id)
+            .ok_or(CoreError::ObjectNotFound(powerclip_id))?;
+        if matches!(obj.payload, NodePayload::PowerClip { .. }) {
+            obj.clip_even_odd = clip_even_odd;
             self.touch();
             Ok(())
         } else {
@@ -9798,6 +9865,55 @@ mod tests {
         assert_eq!(
             crate::hit_test_point(&doc, 0, Point2D::new(135.0, 25.0), 0.5),
             None
+        );
+    }
+
+    #[test]
+    fn add_object_bulk_insertion_is_o1_amortized_and_preserves_uniqueness() {
+        let mut doc = Document::new("BulkInsert", 210.0, 297.0, ColorMode::Rgb, 300.0);
+        let layer_id = doc.pages()[0].layers[0].id;
+        let count = 50_000usize;
+        let t0 = std::time::Instant::now();
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let obj = SceneObject::new(
+                ObjectId(0),
+                format!("Item {i}"),
+                NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+                    (i % 100) as f64,
+                    (i / 100) as f64,
+                    1.0,
+                    1.0,
+                ))),
+            );
+            ids.push(doc.add_object(obj, Some(layer_id)).unwrap());
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "50k add_object took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(doc.object_count(), count);
+        assert_eq!(doc.find_layer(layer_id).unwrap().objects.len(), count);
+
+        // Overwriting an existing object ID on the same layer must not duplicate layer membership.
+        let existing_id = ids[count / 2];
+        let replacement = SceneObject::new(
+            existing_id,
+            "Replaced",
+            NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(0.0, 0.0, 2.0, 2.0))),
+        );
+        doc.add_object(replacement, Some(layer_id)).unwrap();
+        assert_eq!(doc.object_count(), count);
+        assert_eq!(doc.find_layer(layer_id).unwrap().objects.len(), count);
+        assert_eq!(
+            doc.find_layer(layer_id)
+                .unwrap()
+                .objects
+                .iter()
+                .filter(|&&oid| oid == existing_id)
+                .count(),
+            1
         );
     }
 }

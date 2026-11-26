@@ -755,6 +755,12 @@ impl ToolCore {
 
     /// Handles pointer press (single-click or drag initiation).
     pub fn on_pointer_down(&mut self, ctx: &ToolReadContext<'_>, ev: &PointerEvent) -> ToolOutput {
+        if !ev.world_pt_mm.is_finite()
+            || !ev.screen_pt_px[0].is_finite()
+            || !ev.screen_pt_px[1].is_finite()
+        {
+            return ToolOutput::noop();
+        }
         self.cursor_world_mm = ev.world_pt_mm;
         if ev.click_count >= 2 {
             return self.handle_double_click(ctx, ev);
@@ -1756,6 +1762,16 @@ impl ToolCore {
 
     /// Updates the active drag (or hover rubber-band preview) without mutating `Document`.
     pub fn on_pointer_move(&mut self, ctx: &ToolReadContext<'_>, ev: &PointerEvent) -> ToolOutput {
+        if !ev.world_pt_mm.is_finite()
+            || !ev.screen_pt_px[0].is_finite()
+            || !ev.screen_pt_px[1].is_finite()
+        {
+            if matches!(self.drag_state, ActiveDragState::Idle) {
+                return ToolOutput::noop();
+            }
+            let overlay = self.finalize_overlay(self.build_overlay(ctx));
+            return ToolOutput::Continue { overlay };
+        }
         self.cursor_world_mm = ev.world_pt_mm;
         let pt = ev.world_pt_mm;
         let ctrl = ev.modifiers.ctrl;
@@ -1864,9 +1880,25 @@ impl ToolCore {
             } => {
                 *current_mm = pt;
                 let (sx, sy) = if *horizontal {
-                    (((pt.x - start_mm.x) / 60.0).clamp(-1.2, 1.2), 0.0)
+                    let raw = (pt.x - start_mm.x) / 60.0;
+                    (
+                        if raw.is_finite() {
+                            raw.clamp(-1.2, 1.2)
+                        } else {
+                            0.0
+                        },
+                        0.0,
+                    )
                 } else {
-                    (0.0, ((pt.y - start_mm.y) / 60.0).clamp(-1.2, 1.2))
+                    let raw = (pt.y - start_mm.y) / 60.0;
+                    (
+                        0.0,
+                        if raw.is_finite() {
+                            raw.clamp(-1.2, 1.2)
+                        } else {
+                            0.0
+                        },
+                    )
                 };
                 *last_affine = Affine2D::translate(pivot_mm.x, pivot_mm.y)
                     .compose(&Affine2D::skew(sx, sy))
@@ -2422,6 +2454,15 @@ impl ToolCore {
 
     /// Completes an active gesture, emitting atomic [`CommandOp`]s (or non-mutating UI actions).
     pub fn on_pointer_up(&mut self, ctx: &ToolReadContext<'_>, ev: &PointerEvent) -> ToolOutput {
+        if !ev.world_pt_mm.is_finite()
+            || !ev.screen_pt_px[0].is_finite()
+            || !ev.screen_pt_px[1].is_finite()
+        {
+            self.drag_state = ActiveDragState::Idle;
+            self.active_guides.clear();
+            self.prev_dirty_bbox_mm = None;
+            return ToolOutput::Cancel;
+        }
         self.cursor_world_mm = ev.world_pt_mm;
         let pt = ev.world_pt_mm;
         let ctrl = ev.modifiers.ctrl;

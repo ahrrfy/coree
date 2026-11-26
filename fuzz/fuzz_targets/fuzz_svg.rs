@@ -3,8 +3,8 @@
 
 use coree_fuzz::fuzz_target;
 use coree_io::{
-    import_dxf_bytes, import_plt_bytes, import_svg_str_with_limits, load_coree_from_reader,
-    IoLimits,
+    decode_clipboard_emf, import_dwg_bytes, import_dxf_bytes, import_emf_bytes, import_plt_bytes,
+    import_svg_str_with_limits, import_wmf_bytes, load_coree_from_reader, IoLimits,
 };
 use std::io::Cursor;
 
@@ -18,4 +18,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = load_coree_from_reader(Cursor::new(data), &limits);
     let _ = import_dxf_bytes(data, "fuzz_svg");
     let _ = import_plt_bytes(data, "fuzz_svg");
+    let _ = import_dwg_bytes(data, "fuzz_svg");
+    let _ = import_wmf_bytes(data, "fuzz_svg");
+    let _ = import_emf_bytes(data, "fuzz_svg");
+    let _ = decode_clipboard_emf(data);
 });

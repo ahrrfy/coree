@@ -134,7 +134,7 @@ impl StudioApp {
     /// Creates a fresh document from a SQLite/built-in template (opening `.cdt` if present on disk,
     /// otherwise creating a configured `Document` with matching dimensions, bleed, color mode & pages).
     pub fn create_document_from_template(&mut self, tpl: &TemplateRecord) {
-        if !tpl.template_path.trim().is_empty() {
+        if !tpl.template_path.trim().is_empty() && !tpl.template_path.starts_with("builtin://") {
             let path = Path::new(&tpl.template_path);
             if path.is_file() && self.open_file_path(path).is_ok() {
                 return;
@@ -225,7 +225,7 @@ pub(super) fn builtin_default_templates() -> Vec<TemplateRecord> {
             name: "A4 Print Flyer (CMYK 3mm Bleed)".to_owned(),
             category: "print".to_owned(),
             description: "ISO A4 210x297 mm CMYK press-ready layout with 3 mm bleed.".to_owned(),
-            template_path: String::new(),
+            template_path: "builtin://builtin-a4-flyer".to_owned(),
             width_mm: 210.0,
             height_mm: 297.0,
             bleed_mm: 3.0,
@@ -240,7 +240,7 @@ pub(super) fn builtin_default_templates() -> Vec<TemplateRecord> {
             name: "Business Card (90x50 mm)".to_owned(),
             category: "print".to_owned(),
             description: "Standard 90x50 mm front & back double-sided business card.".to_owned(),
-            template_path: String::new(),
+            template_path: "builtin://builtin-bizcard".to_owned(),
             width_mm: 90.0,
             height_mm: 50.0,
             bleed_mm: 3.0,
@@ -255,7 +255,7 @@ pub(super) fn builtin_default_templates() -> Vec<TemplateRecord> {
             name: "Packaging Dieline Sheet (450x320 mm)".to_owned(),
             category: "packaging".to_owned(),
             description: "SRA3 450x320 mm packaging & CutContour dieline sheet.".to_owned(),
-            template_path: String::new(),
+            template_path: "builtin://builtin-fefco-pkg".to_owned(),
             width_mm: 450.0,
             height_mm: 320.0,
             bleed_mm: 5.0,
@@ -268,9 +268,9 @@ pub(super) fn builtin_default_templates() -> Vec<TemplateRecord> {
         TemplateRecord {
             id: "builtin-social-rgb".to_owned(),
             name: "Social Square Post (1080px / RGB)".to_owned(),
-            category: "digital".to_owned(),
+            category: "web-ui".to_owned(),
             description: "Square sRGB social media graphic preset.".to_owned(),
-            template_path: String::new(),
+            template_path: "builtin://builtin-social-rgb".to_owned(),
             width_mm: 91.44,
             height_mm: 91.44,
             bleed_mm: 0.0,
@@ -341,6 +341,20 @@ pub(super) fn build_differential_patch_from_tab(
         object_styles: struct_dirty.then(|| tab.document.object_styles().to_vec()),
         symbols: struct_dirty.then(|| tab.document.symbols().clone()),
         metadata: struct_dirty.then(|| tab.document.metadata().clone()),
+        custom_icc_profile: struct_dirty
+            .then(|| tab.document.custom_icc_profile().map(<[u8]>::to_vec)),
+        custom_icc_name: struct_dirty.then(|| tab.document.custom_icc_name().map(str::to_owned)),
+        rgb_icc_profile: struct_dirty.then(|| tab.document.rgb_icc_profile().map(<[u8]>::to_vec)),
+        rgb_icc_name: struct_dirty.then(|| tab.document.rgb_icc_name().map(str::to_owned)),
+        cmyk_icc_profile: struct_dirty.then(|| tab.document.cmyk_icc_profile().map(<[u8]>::to_vec)),
+        cmyk_icc_name: struct_dirty.then(|| tab.document.cmyk_icc_name().map(str::to_owned)),
+        gray_icc_profile: struct_dirty.then(|| tab.document.gray_icc_profile().map(<[u8]>::to_vec)),
+        gray_icc_name: struct_dirty.then(|| tab.document.gray_icc_name().map(str::to_owned)),
+        rendering_intent: struct_dirty.then(|| tab.document.rendering_intent()),
+        black_point_compensation: struct_dirty.then(|| tab.document.black_point_compensation()),
+        drawing_scale: struct_dirty.then(|| tab.document.drawing_scale()),
+        unknown_doc_chunks: struct_dirty.then(|| tab.document.unknown_doc_chunks().to_vec()),
+        unknown_data_files: struct_dirty.then(|| tab.document.unknown_data_files().clone()),
     }
 }
 
@@ -376,6 +390,7 @@ pub(super) fn command_op_touches_structure(op: &CommandOp) -> bool {
         | CommandOp::SetObjectVisibility { .. }
         | CommandOp::SetObjectLocked { .. }
         | CommandOp::SetObjectPrintable { .. }
+        | CommandOp::SetPowerClipFillRule { .. }
         | CommandOp::RenameObject { .. }
         | CommandOp::UpdateRaster { .. } => false,
         CommandOp::Batch(ops) => ops.iter().any(command_op_touches_structure),

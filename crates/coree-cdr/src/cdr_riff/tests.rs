@@ -99,6 +99,7 @@ fn legacy_arrw_vpat_clrs_and_v7_outl_fallbacks_decode_cleanly() {
         color_styles: HashMap::new(),
         text_streams: HashMap::new(),
         master_layers: Vec::new(),
+        total_vertices: 0,
         warnings: Vec::new(),
     };
 
@@ -427,5 +428,17 @@ fn non_flattening_objects_and_page_layer_unknown_chunks_roundtrip() {
         ColorMode::Cmyk,
         Page::new(PageId(1), "p", 10.0, 10.0, 0.0, LayerId(1)),
         Layer::new(LayerId(1), "l"),
+    );
+}
+
+#[test]
+fn loda_curve_point_cap_rejects_oversized_vertex_bomb() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(crate::limits::MAX_CDR_VERTICES as u32 + 1).to_le_bytes());
+    let mut r = crate::limits::ByteReader::new(&payload);
+    let err = super::loda::parse_loda_curve(&mut r).unwrap_err();
+    assert!(
+        matches!(err, crate::CdrError::InvalidChunk { ref fourcc, .. } if fourcc == "loda"),
+        "expected InvalidChunk(loda) on oversized curve vertex count, got {err:?}"
     );
 }

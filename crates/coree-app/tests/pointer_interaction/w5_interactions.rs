@@ -1133,3 +1133,144 @@ fn w5_print_preview_controls_non_aabb_raster_and_spot_plate_tinting() {
         bb.width()
     );
 }
+
+#[test]
+fn tier5_toggle_powerclip_even_odd_preserves_id_nested_parent_and_clone_dependents() {
+    use coree_core::{BezierPath, Rect2D};
+
+    let mut d = UiDriver::new();
+    let mut outer = BezierPath::from_rect(Rect2D::from_xywh(10.0, 10.0, 80.0, 80.0));
+    let inner = BezierPath::from_rect(Rect2D::from_xywh(30.0, 30.0, 40.0, 40.0));
+    outer.subpaths.extend(inner.subpaths);
+
+    let lid = d.app.active_tab().unwrap().active_layer_id;
+    let host_id = d.app.active_tab().unwrap().document.next_id();
+    let host = SceneObject::new(ObjectId(host_id), "DonutHost", NodePayload::Path(outer))
+        .with_fill(Fill::None)
+        .with_outline(OutlineStyle::none());
+    d.app
+        .execute_command(CommandOp::create_object(host, lid))
+        .unwrap();
+
+    let child_id = d.add_rect("ClippedFill", 0.0, 0.0, 100.0, 100.0, Color::CYAN);
+    d.app
+        .execute_command(CommandOp::CreatePowerClip {
+            container_id: ObjectId(host_id),
+            content_ids: vec![child_id],
+        })
+        .unwrap();
+    let pc_id = d
+        .app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .values()
+        .find(|o| matches!(o.payload, NodePayload::PowerClip { .. }))
+        .unwrap()
+        .id;
+
+    // Group the PowerClip inside an outer Group AND create a Clone referencing the PowerClip
+    let sibling = d.add_rect("Sibling", 110.0, 10.0, 20.0, 20.0, Color::YELLOW);
+    {
+        let tab = d.app.active_tab_mut().unwrap();
+        tab.selection.select_many(&tab.document, &[pc_id, sibling]);
+    }
+    d.app.group_selection();
+    let grp_id = d
+        .app
+        .active_tab()
+        .unwrap()
+        .document
+        .objects()
+        .values()
+        .find(|o| matches!(o.payload, NodePayload::Group(_)))
+        .unwrap()
+        .id;
+    {
+        let tab = d.app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, pc_id);
+    }
+    let clone_ids = d.app.clone_selection();
+    assert_eq!(clone_ids.len(), 1);
+    let clone_id = clone_ids[0];
+
+    // Toggle PowerClip Even-Odd IN PLACE
+    {
+        let tab = d.app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, pc_id);
+    }
+    d.app.toggle_powerclip_even_odd();
+
+    {
+        let tab = d.app.active_tab().unwrap();
+        let pc_after = tab
+            .document
+            .object(pc_id)
+            .expect("PowerClip ObjectId must be preserved across toggle");
+        assert!(pc_after.clip_even_odd);
+        assert!(
+            matches!(tab.document.object(grp_id).unwrap().payload, NodePayload::Group(ref kids) if kids == &vec![pc_id, sibling]),
+            "Outer Group membership and z-order must remain intact"
+        );
+        assert!(
+            matches!(tab.document.object(clone_id).unwrap().payload, NodePayload::Clone { master_id, .. } if master_id == pc_id),
+            "Dependent Clone master_id must stay linked to pc_id"
+        );
+    }
+
+    // Undo and Redo must preserve pc_id and flip clip_even_odd cleanly
+    d.app.undo().unwrap();
+    assert!(
+        !d.app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(pc_id)
+            .unwrap()
+            .clip_even_odd
+    );
+    d.app.redo().unwrap();
+    assert!(
+        d.app
+            .active_tab()
+            .unwrap()
+            .document
+            .object(pc_id)
+            .unwrap()
+            .clip_even_odd
+    );
+}
+
+#[test]
+fn tier5_rtl_canvas_rulers_zoom256_and_builtin_templates_sqlite_persist() {
+    // 1. Verify ALL built-in templates persist to SQLite (no CHECK violation on builtin-social-rgb)
+    let mut d = UiDriver::new();
+    let templates = d.app.templates.clone();
+    assert!(
+        templates
+            .iter()
+            .any(|t| t.id == "builtin-social-rgb" && t.category == "web-ui"),
+        "builtin-social-rgb must use valid SQLite category 'web-ui'"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let db = coree_storage::StorageDb::open(&tmp.path().join("tpl_check.sqlite")).unwrap();
+    for tpl in &templates {
+        db.upsert_template(tpl)
+            .expect("every built-in template must pass SQLite CHECK");
+    }
+    assert!(db
+        .list_templates(Some("web-ui"))
+        .unwrap()
+        .iter()
+        .any(|t| t.id == "builtin-social-rgb"));
+
+    // 2. Arabic RTL canvas with rulers + extreme 256x zoom renders & processes pointer steps cleanly
+    d.app.set_ui_language(StudioLanguage::Arabic);
+    d.app.show_rulers = true;
+    if let Some(tab) = d.app.active_tab_mut() {
+        tab.viewport.zoom = 256.0;
+    }
+    let out = d.step_with_output(Vec::new(), Modifiers::NONE);
+    assert!(!out.shapes.is_empty());
+}

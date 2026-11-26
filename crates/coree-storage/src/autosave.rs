@@ -11,8 +11,9 @@ use crate::db::StorageDb;
 use crate::error::{StorageError, StorageResult};
 use coree_core::{
     apply_command, ColorMode, ColorPalette, ColorStyle, CommandHistory, CommandOp, Document,
-    DocumentMetadata, GridConfig, Guide, ImageAssetId, ObjectId, ObjectStyle, Page,
-    PerspectiveGridConfig, RasterAsset, SceneObject, SymbolDef, SymbolId, Unit,
+    DocumentMetadata, DrawingScale, GridConfig, Guide, ImageAssetId, ObjectId, ObjectStyle, Page,
+    PerspectiveGridConfig, RasterAsset, RenderingIntent, SceneObject, SymbolDef, SymbolId, Unit,
+    UnknownCdrChunk,
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -114,6 +115,32 @@ pub struct DifferentialSnapshotPatch {
     pub object_styles: Option<Vec<ObjectStyle>>,
     pub symbols: Option<BTreeMap<SymbolId, SymbolDef>>,
     pub metadata: Option<DocumentMetadata>,
+    #[serde(default)]
+    pub custom_icc_profile: Option<Option<Vec<u8>>>,
+    #[serde(default)]
+    pub custom_icc_name: Option<Option<String>>,
+    #[serde(default)]
+    pub rgb_icc_profile: Option<Option<Vec<u8>>>,
+    #[serde(default)]
+    pub rgb_icc_name: Option<Option<String>>,
+    #[serde(default)]
+    pub cmyk_icc_profile: Option<Option<Vec<u8>>>,
+    #[serde(default)]
+    pub cmyk_icc_name: Option<Option<String>>,
+    #[serde(default)]
+    pub gray_icc_profile: Option<Option<Vec<u8>>>,
+    #[serde(default)]
+    pub gray_icc_name: Option<Option<String>>,
+    #[serde(default)]
+    pub rendering_intent: Option<RenderingIntent>,
+    #[serde(default)]
+    pub black_point_compensation: Option<bool>,
+    #[serde(default)]
+    pub drawing_scale: Option<DrawingScale>,
+    #[serde(default)]
+    pub unknown_doc_chunks: Option<Vec<UnknownCdrChunk>>,
+    #[serde(default)]
+    pub unknown_data_files: Option<BTreeMap<String, Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1513,6 +1540,53 @@ fn apply_differential_patch(
     if let Some(ref meta) = patch.metadata {
         doc.set_metadata(meta.clone());
     }
+    if let Some(ref custom_prof) = patch.custom_icc_profile {
+        let name = patch
+            .custom_icc_name
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| doc.custom_icc_name().map(str::to_owned));
+        doc.restore_custom_icc_from_snapshot(custom_prof.clone(), name);
+    }
+    if let Some(ref rgb_prof) = patch.rgb_icc_profile {
+        let name = patch
+            .rgb_icc_name
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| doc.rgb_icc_name().map(str::to_owned));
+        doc.restore_rgb_icc_from_snapshot(rgb_prof.clone(), name);
+    }
+    if let Some(ref cmyk_prof) = patch.cmyk_icc_profile {
+        let name = patch
+            .cmyk_icc_name
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| doc.cmyk_icc_name().map(str::to_owned));
+        doc.restore_cmyk_icc_from_snapshot(cmyk_prof.clone(), name);
+    }
+    if let Some(ref gray_prof) = patch.gray_icc_profile {
+        let name = patch
+            .gray_icc_name
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| doc.gray_icc_name().map(str::to_owned));
+        doc.restore_gray_icc_from_snapshot(gray_prof.clone(), name);
+    }
+    if let Some(intent) = patch.rendering_intent {
+        doc.set_rendering_intent(intent);
+    }
+    if let Some(bpc) = patch.black_point_compensation {
+        doc.set_black_point_compensation(bpc);
+    }
+    if let Some(scale) = patch.drawing_scale {
+        doc.set_drawing_scale(scale);
+    }
+    if let Some(ref chunks) = patch.unknown_doc_chunks {
+        doc.replace_unknown_doc_chunks(chunks.clone());
+    }
+    if let Some(ref files) = patch.unknown_data_files {
+        doc.replace_unknown_data_files(files.clone());
+    }
     if let Some(nid) = patch.next_id {
         doc.restore_next_id_from_snapshot(nid);
     }
@@ -1589,6 +1663,7 @@ const fn command_op_type_name(op: &CommandOp) -> &'static str {
         CommandOp::CreatePowerClip { .. } => "CreatePowerClip",
         CommandOp::ExtractPowerClip { .. } => "ExtractPowerClip",
         CommandOp::SetPowerClipLock { .. } => "SetPowerClipLock",
+        CommandOp::SetPowerClipFillRule { .. } => "SetPowerClipFillRule",
         CommandOp::MoveToDesktopLayer { .. } => "MoveToDesktopLayer",
         CommandOp::ConvertToCurves { .. } => "ConvertToCurves",
         CommandOp::ConvertOutlineToObject { .. } => "ConvertOutlineToObject",
@@ -1907,6 +1982,19 @@ mod tests {
             object_styles: None,
             symbols: None,
             metadata: None,
+            custom_icc_profile: None,
+            custom_icc_name: None,
+            rgb_icc_profile: None,
+            rgb_icc_name: None,
+            cmyk_icc_profile: None,
+            cmyk_icc_name: None,
+            gray_icc_profile: None,
+            gray_icc_name: None,
+            rendering_intent: None,
+            black_point_compensation: None,
+            drawing_scale: None,
+            unknown_doc_chunks: None,
+            unknown_data_files: None,
         };
 
         let start = std::time::Instant::now();
@@ -1988,6 +2076,19 @@ mod tests {
             object_styles: None,
             symbols: None,
             metadata: None,
+            custom_icc_profile: None,
+            custom_icc_name: None,
+            rgb_icc_profile: None,
+            rgb_icc_name: None,
+            cmyk_icc_profile: None,
+            cmyk_icc_name: None,
+            gray_icc_profile: None,
+            gray_icc_name: None,
+            rendering_intent: None,
+            black_point_compensation: None,
+            drawing_scale: None,
+            unknown_doc_chunks: None,
+            unknown_data_files: None,
         };
         let delta_id = db.enqueue_differential_autosave(patch).unwrap();
         db.flush_autosave(Duration::from_secs(5)).unwrap();
@@ -2061,6 +2162,19 @@ mod tests {
                 object_styles: None,
                 symbols: None,
                 metadata: None,
+                custom_icc_profile: None,
+                custom_icc_name: None,
+                rgb_icc_profile: None,
+                rgb_icc_name: None,
+                cmyk_icc_profile: None,
+                cmyk_icc_name: None,
+                gray_icc_profile: None,
+                gray_icc_name: None,
+                rendering_intent: None,
+                black_point_compensation: None,
+                drawing_scale: None,
+                unknown_doc_chunks: None,
+                unknown_data_files: None,
             };
             cur_base = db.enqueue_differential_autosave(patch).unwrap();
         }

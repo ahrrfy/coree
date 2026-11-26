@@ -497,6 +497,33 @@ pub(super) fn parse_object_list(
     obj.printable = props.printable;
     obj.unknown_chunks = unknown_chunks;
 
+    if doc.object_count() >= crate::limits::MAX_CDR_OBJECTS {
+        return Err(CdrError::InvalidChunk {
+            fourcc: "obj ".to_owned(),
+            reason: format!(
+                "CDR object count exceeds limit {}",
+                crate::limits::MAX_CDR_OBJECTS
+            ),
+        });
+    }
+    let verts = match &obj.payload {
+        NodePayload::Path(p) => p.node_count(),
+        NodePayload::PowerClip { container, .. } => container.node_count(),
+        NodePayload::ArtisticMedia { spine, .. } => spine.node_count(),
+        _ => 0,
+    };
+    let next_verts = ctx.total_vertices.saturating_add(verts);
+    if next_verts > crate::limits::MAX_CDR_VERTICES {
+        return Err(CdrError::InvalidChunk {
+            fourcc: "loda".to_owned(),
+            reason: format!(
+                "CDR cumulative curve vertex count {next_verts} exceeds limit {}",
+                crate::limits::MAX_CDR_VERTICES
+            ),
+        });
+    }
+    ctx.total_vertices = next_verts;
+
     let _ = doc.insert_loaded_object(obj);
     Ok(Some(oid))
 }

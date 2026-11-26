@@ -13217,3 +13217,173 @@ fn command_set_page_properties_and_reorder_layers_undo_redo_and_guards() {
         vec![l3, l1, l2]
     );
 }
+
+#[test]
+fn extreme_scale_bezier_curve_1e15_flattens_under_budget() {
+    let mut kb = kurbo::BezPath::new();
+    kb.move_to((0.0, 0.0));
+    kb.curve_to((0.0, 10.0), (10.0, 10.0), (10.0, 0.0));
+    kb.close_path();
+    let curve = BezierPath::from_kurbo(&kb);
+    let huge = curve.transformed(&Affine2D::new(1e15, 0.0, 0.0, 1e15, 1e15, -1e15));
+    let t0 = std::time::Instant::now();
+    let polys = huge.flatten(0.25);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(200),
+        "1e15 BezierPath::flatten took too long: {:?}",
+        t0.elapsed()
+    );
+    let total_pts: usize = polys.iter().map(Vec::len).sum();
+    assert!(
+        total_pts > 0 && total_pts < 10_000,
+        "expected finite bounded vertex count, got {total_pts}"
+    );
+    assert!(polys.iter().flatten().all(|p| p.is_finite()));
+
+    let non_finite = BezierPath {
+        subpaths: vec![Subpath {
+            nodes: vec![
+                PathNode::corner(Point2D::new(f64::INFINITY, 0.0)),
+                PathNode::corner(Point2D::new(10.0, 0.0)),
+                PathNode::corner(Point2D::new(10.0, 10.0)),
+            ],
+            closed: true,
+        }],
+    };
+    assert!(non_finite.flatten(0.25).is_empty());
+}
+
+#[test]
+fn degenerate_json_page_and_warped_symbol_powerclip_clone_bounds_hit_test() {
+    let doc = Document::new("Tier5Degenerate", 100.0, 100.0, ColorMode::Rgb, 72.0);
+    let mut val = serde_json::to_value(&doc).unwrap();
+    val["pages"][0]["width_mm"] = serde_json::json!(0.0);
+    val["pages"][0]["height_mm"] = serde_json::json!(-50.0);
+    let round: Document = serde_json::from_value(val).unwrap();
+    assert_eq!(round.pages()[0].width_mm, 0.0);
+    assert_eq!(round.pages()[0].height_mm, -50.0);
+
+    // Build a SymbolDef containing an Envelope-warped PowerClip(clip_even_odd=true) donut + Clone
+    let mut doc2 = Document::new("WarpedSymPC", 200.0, 200.0, ColorMode::Rgb, 72.0);
+    let mut outer_kb = kurbo::BezPath::new();
+    outer_kb.move_to((0.0, 0.0));
+    outer_kb.line_to((40.0, 0.0));
+    outer_kb.line_to((40.0, 40.0));
+    outer_kb.line_to((0.0, 40.0));
+    outer_kb.close_path();
+    // Same winding inner hole: relies on clip_even_odd = true to carve hole!
+    outer_kb.move_to((12.0, 12.0));
+    outer_kb.line_to((28.0, 12.0));
+    outer_kb.line_to((28.0, 28.0));
+    outer_kb.line_to((12.0, 28.0));
+    outer_kb.close_path();
+    let donut = BezierPath::from_kurbo(&outer_kb);
+
+    let child_obj = SceneObject::new(
+        ObjectId(201),
+        "InnerFill",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 40.0, 40.0,
+        ))),
+    )
+    .with_fill(Fill::Solid(Color::rgba8(220, 40, 40, 255)));
+
+    let mut pc_obj = SceneObject::new(
+        ObjectId(202),
+        "DonutPC",
+        NodePayload::PowerClip {
+            container: Box::new(donut),
+            container_parametric: None,
+            lock_contents: true,
+            contents: vec![ObjectId(201)],
+        },
+    )
+    .with_fill(Fill::None)
+    .with_outline(OutlineStyle::none());
+    pc_obj.clip_even_odd = true;
+
+    let mut sym = SymbolDef::new("DonutSym", vec![child_obj, pc_obj]);
+    sym.objects[1].effects.push(Effect::Envelope {
+        mode: EnvelopeMode::Unconstrained,
+        cage: vec![
+            Point2D::new(0.0, 0.0),
+            Point2D::new(40.0, 0.0),
+            Point2D::new(40.0, 40.0),
+            Point2D::new(0.0, 40.0),
+        ],
+    });
+    let sym_id = sym.id;
+    let mut hist = CommandHistory::new(32);
+    hist.execute(&mut doc2, CommandOp::UpsertSymbol { symbol: sym })
+        .unwrap();
+
+    let l0 = doc2.pages()[0].layers[0].id;
+    let mut inst = SceneObject::new(ObjectId(0), "SymInst", NodePayload::SymbolInstance(sym_id))
+        .with_transform(Affine2D::translate(50.0, 50.0));
+    inst.perspective = Some(
+        Perspective3x3::from_rect_to_quad(
+            Rect2D::from_xywh(0.0, 0.0, 40.0, 40.0),
+            &[
+                Point2D::new(0.0, 0.0),
+                Point2D::new(44.0, 4.0),
+                Point2D::new(42.0, 42.0),
+                Point2D::new(2.0, 38.0),
+            ],
+        )
+        .unwrap(),
+    );
+    let inst_id = doc2.add_object(inst, Some(l0)).unwrap();
+
+    // Clone referencing the SymbolInstance + singular transform + empty MeshFill object
+    let clone_obj = SceneObject::new(
+        ObjectId(0),
+        "SymClone",
+        NodePayload::Clone {
+            master_id: inst_id,
+            link_fill: true,
+            link_outline: true,
+            link_shape: true,
+        },
+    )
+    .with_transform(Affine2D::translate(60.0, 0.0));
+    let clone_id = doc2.add_object(clone_obj, Some(l0)).unwrap();
+
+    let mut deg = SceneObject::new(
+        ObjectId(0),
+        "DegMesh",
+        NodePayload::Path(BezierPath::from_rect(Rect2D::from_xywh(
+            0.0, 0.0, 20.0, 20.0,
+        ))),
+    )
+    .with_transform(Affine2D::new(0.0, 0.0, 0.0, 0.0, 10.0, 10.0))
+    .with_fill(Fill::MeshFill {
+        rows: 2,
+        cols: 2,
+        nodes: Vec::new(),
+    });
+    deg.effects.clear();
+    let deg_id = doc2.add_object(deg, Some(l0)).unwrap();
+
+    assert!(doc2
+        .world_object_bounds(inst_id)
+        .is_some_and(|b| b.is_finite()));
+    assert!(doc2
+        .world_object_bounds(clone_id)
+        .is_some_and(|b| b.is_finite()));
+    assert!(doc2
+        .world_object_bounds(deg_id)
+        .is_some_and(|b| b.is_finite()));
+
+    // Donut hole at center (70, 70) must NOT hit inside clip_even_odd PowerClip, while ring (55, 70) MUST hit
+    let hit_ring = coree_core::hit_test_point(&doc2, 0, Point2D::new(55.0, 70.0), 1.0);
+    let hit_hole = coree_core::hit_test_point(&doc2, 0, Point2D::new(70.0, 70.0), 0.5);
+    assert_eq!(hit_ring, Some(inst_id));
+    assert_eq!(hit_hole, None, "clip_even_odd donut hole must not hit");
+
+    // ConvertToCurves on SymbolInstance clone rejects cleanly without panic, and degenerate mesh succeeds cleanly
+    assert!(hist
+        .execute(&mut doc2, CommandOp::ConvertToCurves { id: clone_id })
+        .is_err());
+    hist.execute(&mut doc2, CommandOp::ConvertToCurves { id: deg_id })
+        .unwrap();
+}
