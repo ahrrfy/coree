@@ -29,6 +29,9 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
     } else {
         egui::Panel::left("coree_toolbox")
     };
+    let mut toolbox_rect = Rect::NOTHING;
+    let mut flyout_toggled_this_frame = false;
+
     panel
         .exact_size(width)
         .frame(
@@ -38,13 +41,36 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                 .stroke(Stroke::new(1.0, tokens.border)),
         )
         .show(ui, |ui| {
+            toolbox_rect = ui.max_rect();
+            let avail_h = ui.available_height();
+            let cols = if app.toolbox_two_column { 2 } else { 1 };
+            let rows = TOOL_GROUPS.len().div_ceil(cols) as f32;
+            // Adaptive button height (`22..=29px`) so all 15 tool groups fit without scrolling
+            // on every supported window height (`>= 620px`), plus a 1-click 1/2-column toggle.
+            let toggle_footer_h = 22.0;
+            let dividers_h = if cols == 1 { 18.0 } else { 6.0 };
+            let btn_h = ((avail_h - toggle_footer_h - dividers_h - (rows - 1.0) * 2.0) / rows)
+                .clamp(22.0, 29.0);
+
             egui::ScrollArea::vertical()
                 .id_salt("toolbox_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
-                    let cols = if app.toolbox_two_column { 2 } else { 1 };
+                    ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
                     let mut idx = 0usize;
                     while idx < TOOL_GROUPS.len() {
+                        // Subtle visual section dividers between logical studio tool clusters
+                        if cols == 1 && matches!(idx, 3 | 6 | 11) {
+                            let (sep_rect, _) =
+                                ui.allocate_exact_size(vec2(30.0, 4.0), Sense::hover());
+                            ui.painter().line_segment(
+                                [
+                                    pos2(sep_rect.left() + 4.0, sep_rect.center().y),
+                                    pos2(sep_rect.right() - 4.0, sep_rect.center().y),
+                                ],
+                                Stroke::new(1.0, tokens.border),
+                            );
+                        }
                         shell_dir.with_horizontal(ui, |ui| {
                             for _ in 0..cols {
                                 if idx >= TOOL_GROUPS.len() {
@@ -58,7 +84,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 let has_flyout = TOOL_GROUPS[g].len() > 1;
 
                                 let (rect, resp) =
-                                    ui.allocate_exact_size(vec2(32.0, 30.0), Sense::click());
+                                    ui.allocate_exact_size(vec2(32.0, btn_h), Sense::click());
                                 let painter = ui.painter();
 
                                 // Crisp classic studio background & hover/active frame
@@ -110,9 +136,16 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                 } else {
                                     tokens.text
                                 };
+                                let pad = ((btn_h - 17.0) * 0.5).clamp(3.0, 5.5);
                                 paint_tool_icon(
                                     painter,
-                                    rect.shrink(5.5),
+                                    Rect::from_center_size(
+                                        rect.center(),
+                                        vec2(
+                                            (32.0 - pad * 2.0).min(19.0),
+                                            (btn_h - pad * 2.0).min(19.0),
+                                        ),
+                                    ),
                                     primary_tool,
                                     icon_color,
                                     &tokens,
@@ -195,6 +228,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                         _ => {}
                                     }
                                 } else if resp.secondary_clicked() && has_flyout {
+                                    flyout_toggled_this_frame = true;
                                     app.open_flyout_group = if app.open_flyout_group == Some(g) {
                                         None
                                     } else {
@@ -212,6 +246,7 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                                             }
                                         });
                                     if has_flyout && (clicked_corner || is_active) {
+                                        flyout_toggled_this_frame = true;
                                         app.open_flyout_group = if app.open_flyout_group == Some(g)
                                         {
                                             None
@@ -234,13 +269,45 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                             }
                         });
                     }
+
+                    // 1-click compact single/two-column layout switcher at the foot of the Toolbox
+                    ui.add_space(2.0);
+                    let toggle_w = if app.toolbox_two_column { 68.0 } else { 32.0 };
+                    let (t_rect, t_resp) =
+                        ui.allocate_exact_size(vec2(toggle_w, 16.0), Sense::click());
+                    if t_resp.hovered() {
+                        ui.painter().rect_filled(
+                            t_rect,
+                            CornerRadius::same(3),
+                            tokens.surface_elevated,
+                        );
+                    }
+                    ui.painter().text(
+                        t_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if app.toolbox_two_column {
+                            "« 1"
+                        } else {
+                            "2 »"
+                        },
+                        egui::FontId::proportional(9.5),
+                        tokens.text_muted,
+                    );
+                    if t_resp
+                        .on_hover_text(
+                            crate::i18n::I18nKey::WindowTwoColumnToolbox.tr_ui(app.ui_language),
+                        )
+                        .clicked()
+                    {
+                        app.toolbox_two_column = !app.toolbox_two_column;
+                    }
                 });
         });
 
     // Floating Tool Flyout Drawer anchored beside the clicked Toolbox button
     if let Some((g, anchor)) = flyout_anchor {
         let ctx = ui.ctx().clone();
-        Area::new(Id::unique("coree_tool_flyout"))
+        let area_resp = Area::new(Id::unique("coree_tool_flyout"))
             .order(Order::Foreground)
             .fixed_pos(anchor)
             .show(&ctx, |ui| {
@@ -284,6 +351,19 @@ pub fn show_toolbox(ui: &mut Ui, app: &mut StudioApp) {
                         }
                     });
             });
+
+        // Auto-dismiss flyout cleanly on Escape or outside click
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let clicked_outside = !flyout_toggled_this_frame
+            && ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| {
+                        !area_resp.response.rect.contains(p) && !toolbox_rect.contains(p)
+                    })
+            });
+        if esc || clicked_outside {
+            app.open_flyout_group = None;
+        }
     }
 }
 

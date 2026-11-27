@@ -82,11 +82,11 @@ pub(super) fn ui_find_replace_docker(ui: &mut Ui, app: &mut StudioApp) {
         });
     shell_dir.with_horizontal(ui, |ui| {
         ui.label(crate::i18n::I18nKey::DockFindTextLabel.tr_ui(lang));
-        ui.text_edit_singleline(&mut fr.text_query);
+        crate::theme::bidi_text_edit_singleline(ui, &mut fr.text_query, None, None);
     });
     shell_dir.with_horizontal(ui, |ui| {
         ui.label(crate::i18n::I18nKey::DockFindReplaceLabel.tr_ui(lang));
-        ui.text_edit_singleline(&mut fr.replace_text);
+        crate::theme::bidi_text_edit_singleline(ui, &mut fr.replace_text, None, None);
     });
     ui.checkbox(
         &mut fr.case_sensitive,

@@ -285,6 +285,7 @@ pub(super) fn show_inline_text_editor_overlay(
     canvas_rect: Rect,
 ) {
     let tokens = app.theme.tokens();
+    let default_rtl = app.default_text_style.direction == coree_core::TextDirection::Rtl;
     let editor_geom = app.active_tab().and_then(|tab| {
         let edit = tab.inline_text_edit.as_ref()?;
         let pos = world_to_screen(canvas_rect, tab, edit.world_pos_mm);
@@ -295,7 +296,7 @@ pub(super) fn show_inline_text_editor_overlay(
         let avail_w = (canvas_rect.width() - 24.0).max(24.0);
         let avail_h = (canvas_rect.height() - 44.0).max(24.0);
         let max_w = avail_w.min(520.0);
-        let min_w = max_w.min(180.0);
+        let min_w = max_w.min(220.0);
         let max_h = avail_h.min(260.0);
         let min_h = max_h.min(48.0);
         let width_px = w_px.clamp(min_w, max_w);
@@ -306,14 +307,29 @@ pub(super) fn show_inline_text_editor_overlay(
         let max_y = (canvas_rect.bottom() - (height_px + 38.0)).max(min_y);
         let px = if pos.x.is_finite() { pos.x } else { min_x };
         let py = if pos.y.is_finite() { pos.y } else { min_y };
+        let obj_rtl = edit
+            .object_id
+            .and_then(|oid| tab.document.object(oid))
+            .is_some_and(|obj| match &obj.payload {
+                NodePayload::ArtisticText(a) => a
+                    .runs
+                    .first()
+                    .is_some_and(|r| r.style.direction == coree_core::TextDirection::Rtl),
+                NodePayload::ParagraphText(p) => p
+                    .runs
+                    .first()
+                    .is_some_and(|r| r.style.direction == coree_core::TextDirection::Rtl),
+                _ => false,
+            });
         Some((
             pos2(px.clamp(min_x, max_x), py.clamp(min_y, max_y)),
             width_px,
             height_px,
             edit.is_paragraph,
+            obj_rtl || default_rtl,
         ))
     });
-    let Some((anchor_pos, width_px, height_px, is_para)) = editor_geom else {
+    let Some((anchor_pos, width_px, height_px, is_para, prefer_rtl)) = editor_geom else {
         return;
     };
 
@@ -321,6 +337,55 @@ pub(super) fn show_inline_text_editor_overlay(
     let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
     let mut commit_req = false;
     let mut cancel_req = false;
+
+    // Paint a live real-time shaped preview pill right above the floating input box while typing
+    let live_preview_opt = if anchor_pos.y > canvas_rect.top() + 34.0 {
+        app.active_tab().and_then(|t| {
+            let e = t.inline_text_edit.as_ref()?;
+            (!e.buffer.is_empty()).then(|| e.buffer.clone())
+        })
+    } else {
+        None
+    };
+    if let Some(live_preview) = live_preview_opt {
+        let is_rtl_live = crate::theme::has_rtl_script(&live_preview) || prefer_rtl;
+        let galley = crate::theme::layout_bidi_text_edit_galley(
+            ui,
+            &live_preview,
+            width_px,
+            false,
+            prefer_rtl,
+        );
+        let pad = vec2(8.0, 4.0);
+        let pill_w = (galley.size().x + pad.x * 2.0).clamp(64.0, width_px + 12.0);
+        let pill_h = (galley.size().y + pad.y * 2.0).clamp(22.0, 34.0);
+        let pill_min_x = if is_rtl_live {
+            (anchor_pos.x + width_px + 12.0 - pill_w).max(canvas_rect.left() + 6.0)
+        } else {
+            anchor_pos.x
+        };
+        let pill_rect = Rect::from_min_size(
+            pos2(
+                pill_min_x,
+                (anchor_pos.y - pill_h - 4.0).max(canvas_rect.top() + 4.0),
+            ),
+            vec2(pill_w, pill_h),
+        );
+        let painter = ui.painter();
+        painter.rect(
+            pill_rect,
+            CornerRadius::same(4),
+            tokens.bg.gamma_multiply(0.92),
+            Stroke::new(1.0, tokens.border_input),
+            StrokeKind::Inside,
+        );
+        let text_x = if is_rtl_live {
+            (pill_rect.right() - pad.x - galley.size().x).max(pill_rect.left() + pad.x)
+        } else {
+            pill_rect.left() + pad.x
+        };
+        painter.galley(pos2(text_x, pill_rect.top() + pad.y), galley, tokens.text);
+    }
 
     egui::Area::new(ui.scope_id().with("coree_inline_text_edit_area"))
         .fixed_pos(anchor_pos)
@@ -334,20 +399,35 @@ pub(super) fn show_inline_text_editor_overlay(
                 .show(ui, |ui| {
                     if let Some(tab) = app.active_tab_mut() {
                         if let Some(ref mut edit) = tab.inline_text_edit {
+                            let is_rtl_buf = crate::theme::has_rtl_script(&edit.buffer)
+                                || (edit.buffer.is_empty() && prefer_rtl);
+                            let mut rtl_layouter =
+                                |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                    crate::theme::layout_bidi_text_edit_galley(
+                                        ui,
+                                        buf.as_str(),
+                                        wrap_width,
+                                        is_para,
+                                        prefer_rtl,
+                                    )
+                                };
+
                             let resp = if is_para {
-                                ui.add_sized(
-                                    vec2(width_px, height_px),
-                                    egui::TextEdit::multiline(&mut edit.buffer).hint_text(
-                                        crate::i18n::I18nKey::InlineTextParaHint.tr_ui(lang),
-                                    ),
-                                )
+                                let mut te = egui::TextEdit::multiline(&mut edit.buffer)
+                                    .hint_text(crate::i18n::I18nKey::InlineTextParaHint.tr_ui(lang))
+                                    .layouter(&mut rtl_layouter);
+                                if is_rtl_buf {
+                                    te = te.align(egui::Align2::RIGHT_TOP);
+                                }
+                                ui.add_sized(vec2(width_px, height_px), te)
                             } else {
-                                ui.add_sized(
-                                    vec2(width_px, 28.0),
-                                    egui::TextEdit::singleline(&mut edit.buffer).hint_text(
-                                        crate::i18n::I18nKey::InlineTextArtHint.tr_ui(lang),
-                                    ),
-                                )
+                                let mut te = egui::TextEdit::singleline(&mut edit.buffer)
+                                    .hint_text(crate::i18n::I18nKey::InlineTextArtHint.tr_ui(lang))
+                                    .layouter(&mut rtl_layouter);
+                                if is_rtl_buf {
+                                    te = te.align(egui::Align2::RIGHT_CENTER);
+                                }
+                                ui.add_sized(vec2(width_px, 28.0), te)
                             };
                             if edit.just_opened {
                                 resp.request_focus();

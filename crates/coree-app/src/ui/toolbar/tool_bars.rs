@@ -1072,10 +1072,12 @@ pub(super) fn show_text_property_bar(ui: &mut Ui, app: &mut StudioApp, tokens: &
             app.default_text_style.align = align;
         }
         ui.separator();
-        ui.add(
-            egui::TextEdit::singleline(&mut app.tool_settings.text_insert_draft)
-                .hint_text(I18nKey::TbDraftTextHint.tr_ui(lang))
-                .desired_width(110.0),
+        let hint = I18nKey::TbDraftTextHint.tr_ui(lang);
+        crate::theme::bidi_text_edit_singleline(
+            ui,
+            &mut app.tool_settings.text_insert_draft,
+            Some(&hint),
+            Some(110.0),
         );
     }
 

@@ -35,18 +35,19 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
     let lang = app.ui_language;
     let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
 
-    // Row 1: Standard Studio Toolbar
+    // Row 1: Standard Studio Toolbar (compact zero-scrollbar layout fitting >= 960px windows)
     egui::Panel::top("coree_standard_toolbar")
-        .exact_size(31.0)
+        .exact_size(32.0)
         .frame(
             Frame::NONE
                 .fill(tokens.surface)
-                .inner_margin(Margin::symmetric(6, 3))
+                .inner_margin(Margin::symmetric(6, 4))
                 .stroke(Stroke::new(1.0, tokens.border)),
         )
         .show(ui, |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("std_toolbar_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
                     shell_dir.with_horizontal(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -172,13 +173,13 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             ui.separator();
                         }
 
-                        // Zoom preset combo
+                        // Zoom preset combo + F9 Full-Screen Preview
                         if app.toolbar_config.show_zoom {
                             let zoom_pct = app
                                 .active_tab()
                                 .map_or(100.0, |t| (t.viewport.zoom * 100.0).round());
                             ComboBox::from_id_salt("std_zoom_preset")
-                                .width(74.0)
+                                .width(68.0)
                                 .selected_text(format!("{zoom_pct:.0}%"))
                                 .show_ui(ui, |ui| {
                                     if ui
@@ -222,7 +223,6 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     }
                                 });
 
-                            // F9 Full-Screen Preview toggle
                             if std_icon_btn(
                                 ui,
                                 &tokens,
@@ -243,7 +243,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         if let Some(tab) = app.active_tab_mut() {
                             if tb_cfg.show_view_mode {
                                 ComboBox::from_id_salt("std_view_mode")
-                                    .width(102.0)
+                                    .width(92.0)
                                     .selected_text(format!("{:?}", tab.view_mode))
                                     .show_ui(ui, |ui| {
                                         for (mode, label) in [
@@ -271,10 +271,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
 
                             if tb_cfg.show_layout_toggles {
                                 if ui
-                                    .selectable_label(
-                                        tab.document.multipage_view(),
-                                        format!("⊞ {}", I18nKey::ViewMultipage.tr_ui(lang)),
-                                    )
+                                    .selectable_label(tab.document.multipage_view(), "⊞")
                                     .on_hover_text(I18nKey::ViewMultipage.tr_ui(lang))
                                     .clicked()
                                 {
@@ -287,10 +284,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     if ui
                                         .selectable_label(
                                             page.facing_pages,
-                                            format!(
-                                                "📖 {}",
-                                                I18nKey::LayoutFacingPages.tr_ui(lang)
-                                            ),
+                                            I18nKey::TbFacingShort.tr_ui(lang),
                                         )
                                         .on_hover_text(I18nKey::LayoutFacingPages.tr_ui(lang))
                                         .clicked()
@@ -304,7 +298,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                             if tb_cfg.show_drawing_scale {
                                 let cur_scale = tab.document.drawing_scale();
                                 ComboBox::from_id_salt("std_drawing_scale")
-                                    .width(66.0)
+                                    .width(58.0)
                                     .selected_text(cur_scale.label())
                                     .show_ui(ui, |ui| {
                                         for (num, den) in [
@@ -328,63 +322,89 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                     });
                             }
 
+                            // Consolidated Snap popover button (replaces 4 sprawling controls)
                             if tb_cfg.show_snap_toggles {
                                 ui.separator();
-                                ui.checkbox(
-                                    &mut tab.snap_options.objects,
-                                    I18nKey::ViewSnapObjects.tr_ui(lang),
-                                );
-                                ui.checkbox(
-                                    &mut tab.snap_options.guidelines,
-                                    I18nKey::ViewSnapGuidelines.tr_ui(lang),
-                                );
-                                ui.checkbox(
-                                    &mut tab.snap_options.grid,
-                                    I18nKey::ViewSnapGrid.tr_ui(lang),
-                                );
+                                let so = &tab.snap_options;
+                                let snap_count = [
+                                    so.objects,
+                                    so.guidelines,
+                                    so.grid,
+                                    so.nodes,
+                                    so.page_edges,
+                                    so.tangent,
+                                    so.perpendicular,
+                                    so.quadrant,
+                                    so.intersection,
+                                    so.baseline,
+                                ]
+                                .into_iter()
+                                .filter(|&on| on)
+                                .count();
+                                let snap_btn_lbl = if snap_count > 0 {
+                                    RichText::new(format!(
+                                        "{} ({snap_count}) ▾",
+                                        I18nKey::ViewSnapTo.tr_ui(lang)
+                                    ))
+                                    .color(tokens.accent)
+                                } else {
+                                    RichText::new(format!("{} ▾", I18nKey::ViewSnapTo.tr_ui(lang)))
+                                        .color(tokens.text_muted)
+                                };
+                                ui.menu_button(snap_btn_lbl, |ui| {
+                                    ui.set_min_width(188.0);
+                                    ui.checkbox(
+                                        &mut tab.snap_options.objects,
+                                        I18nKey::ViewSnapObjects.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.guidelines,
+                                        I18nKey::ViewSnapGuidelines.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.grid,
+                                        I18nKey::ViewSnapGrid.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.nodes,
+                                        I18nKey::ViewSnapNodes.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.page_edges,
+                                        I18nKey::ViewSnapPageEdges.tr_ui(lang),
+                                    );
+                                    ui.separator();
+                                    ui.checkbox(
+                                        &mut tab.snap_options.tangent,
+                                        I18nKey::ViewSnapTangent.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.perpendicular,
+                                        I18nKey::ViewSnapPerpendicular.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.quadrant,
+                                        I18nKey::ViewSnapQuadrant.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.intersection,
+                                        I18nKey::ViewSnapIntersection.tr_ui(lang),
+                                    );
+                                    ui.checkbox(
+                                        &mut tab.snap_options.baseline,
+                                        I18nKey::ViewSnapBaseline.tr_ui(lang),
+                                    );
+                                    ui.separator();
+                                    ui.checkbox(
+                                        &mut tab.snap_options.dynamic_guides,
+                                        I18nKey::ViewDynamicGuides.tr_ui(lang),
+                                    );
+                                });
                                 if tab.snap_options.grid != tab.document.grid().snap {
                                     let mut g = tab.document.grid();
                                     g.snap = tab.snap_options.grid;
                                     pending_grid = Some(g);
                                 }
-                                ui.menu_button(
-                                    format!("{} ▾", I18nKey::ViewSnapTo.tr_ui(lang)),
-                                    |ui| {
-                                        ui.checkbox(
-                                            &mut tab.snap_options.nodes,
-                                            I18nKey::ViewSnapNodes.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.page_edges,
-                                            I18nKey::ViewSnapPageEdges.tr_ui(lang),
-                                        );
-                                        ui.separator();
-                                        ui.checkbox(
-                                            &mut tab.snap_options.tangent,
-                                            I18nKey::ViewSnapTangent.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.perpendicular,
-                                            I18nKey::ViewSnapPerpendicular.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.quadrant,
-                                            I18nKey::ViewSnapQuadrant.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.intersection,
-                                            I18nKey::ViewSnapIntersection.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.baseline,
-                                            I18nKey::ViewSnapBaseline.tr_ui(lang),
-                                        );
-                                        ui.checkbox(
-                                            &mut tab.snap_options.dynamic_guides,
-                                            I18nKey::ViewDynamicGuides.tr_ui(lang),
-                                        );
-                                    },
-                                );
                             }
                         }
                         if pending_multipage.is_some() || pending_scale.is_some() {
@@ -442,53 +462,45 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
 
                         ui.separator();
 
-                        // Compact Laser Quick-Send Strip
-                        if ui
-                            .selectable_label(
-                                app.show_laser_toolpath_overlay,
-                                RichText::new(I18nKey::TbLaserPreview.tr_ui(lang)).color(
-                                    if app.show_laser_toolpath_overlay {
-                                        tokens.accent_secondary
-                                    } else {
-                                        tokens.text
-                                    },
+                        // Consolidated Laser & Plotter Quick-Send Menu + CutContour + Macro Record
+                        let laser_lbl =
+                            RichText::new(format!("{} ▾", I18nKey::TbLaserPreview.tr_ui(lang)))
+                                .color(if app.show_laser_toolpath_overlay {
+                                    tokens.accent_secondary
+                                } else {
+                                    tokens.text
+                                });
+                        ui.menu_button(laser_lbl, |ui| {
+                            ui.set_min_width(184.0);
+                            let mut preview_on = app.show_laser_toolpath_overlay;
+                            if ui
+                                .checkbox(&mut preview_on, I18nKey::TbLaserPreview.tr_ui(lang))
+                                .on_hover_text(I18nKey::TbLaserPreviewTip.tr_ui(lang))
+                                .changed()
+                            {
+                                if preview_on {
+                                    app.refresh_laser_plan_preview();
+                                } else {
+                                    app.show_laser_toolpath_overlay = false;
+                                }
+                            }
+                            ui.separator();
+                            for (plugin_id, tip) in [
+                                ("lightburn-bridge", I18nKey::MenuSendLightBurn.tr_ui(lang)),
+                                ("rdworks-ruida", I18nKey::MenuSendRdWorks.tr_ui(lang)),
+                                ("ezcad-fiber", I18nKey::MenuSendEzCad.tr_ui(lang)),
+                                (
+                                    "vinyl-plotter-hpgl",
+                                    I18nKey::MenuSendVinylPlotter.tr_ui(lang),
                                 ),
-                            )
-                            .on_hover_text(I18nKey::TbLaserPreviewTip.tr_ui(lang))
-                            .clicked()
-                        {
-                            if app.show_laser_toolpath_overlay {
-                                app.show_laser_toolpath_overlay = false;
-                            } else {
-                                app.refresh_laser_plan_preview();
+                            ] {
+                                if ui.button(tip).clicked() {
+                                    app.send_to_laser_plugin(plugin_id, true);
+                                    ui.close();
+                                }
                             }
-                        }
-                        for (plugin_id, short_lbl, tip) in [
-                            (
-                                "lightburn-bridge",
-                                "LightBurn",
-                                I18nKey::MenuSendLightBurn.tr_ui(lang),
-                            ),
-                            (
-                                "rdworks-ruida",
-                                "RDWorks",
-                                I18nKey::MenuSendRdWorks.tr_ui(lang),
-                            ),
-                            ("ezcad-fiber", "EZCad", I18nKey::MenuSendEzCad.tr_ui(lang)),
-                            (
-                                "vinyl-plotter-hpgl",
-                                "Plotter",
-                                I18nKey::MenuSendVinylPlotter.tr_ui(lang),
-                            ),
-                        ] {
-                            if ui.small_button(short_lbl).on_hover_text(tip).clicked() {
-                                app.send_to_laser_plugin(plugin_id, true);
-                            }
-                        }
+                        });
 
-                        ui.separator();
-
-                        // One-Click CutContour & Macro Record
                         if ui
                             .button(
                                 RichText::new(I18nKey::TbCutContourBtn.tr_ui(lang))
@@ -500,6 +512,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                         {
                             app.generate_cut_contour_active();
                         }
+
                         let recording = app.active_tab().is_some_and(|t| t.history.recording_macro);
                         if recording {
                             if ui
@@ -516,7 +529,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                                 app.stop_macro_recording();
                             }
                         } else if ui
-                            .small_button(format!("● {}", I18nKey::ToolsRecordMacro.tr_ui(lang)))
+                            .small_button(format!("● {}", I18nKey::DockerMacros.tr_ui(lang)))
                             .on_hover_text(I18nKey::TbRecordMacroTip.tr_ui(lang))
                             .clicked()
                         {
@@ -526,7 +539,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
                 });
         });
 
-    // Row 2: Authentic Context-Sensitive Property Bar (36px)
+    // Row 2: Authentic Context-Sensitive Property Bar (36px, smooth hidden scrollbar)
     egui::Panel::top("coree_property_bar")
         .exact_size(PROPERTY_BAR_HEIGHT)
         .frame(
@@ -538,6 +551,7 @@ pub fn show_toolbars(ui: &mut Ui, app: &mut StudioApp) {
         .show(ui, |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("prop_bar_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
                     shell_dir.with_horizontal(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;

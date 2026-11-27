@@ -99,11 +99,22 @@ impl StudioLanguage {
     }
 }
 
+/// Dedicated `egui` font-family name keeping an Arabic-capable OpenType face at index `0`
+/// regardless of active UI language so live `TextEdit` inputs keep spaces, digits, and
+/// punctuation inside a single `harfrust` RTL shaping run instead of splitting words LTR.
+pub const ARABIC_EDITOR_FONT_FAMILY: &str = "coree_arabic_primary";
+
 fn is_arabic_or_hebrew(c: char) -> bool {
     matches!(
         c as u32,
         0x0590..=0x05FF | 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF
     )
+}
+
+/// Returns `true` if `text` contains any Arabic or Hebrew RTL codepoint.
+#[must_use]
+pub fn has_rtl_script(text: &str) -> bool {
+    text.chars().any(is_arabic_or_hebrew)
 }
 
 /// Reorders top-level UAX #9 BiDi script runs in mixed Arabic + Latin UI strings so `epaint`'s
@@ -346,7 +357,19 @@ pub fn apply_theme(ctx: &egui::Context, theme: StudioTheme) {
         style.spacing.button_padding = egui::vec2(6.0, 2.5);
         style.spacing.window_margin = Margin::same(8);
         style.spacing.interact_size = egui::vec2(32.0, 20.0);
-        style.spacing.combo_width = 96.0;
+        style.spacing.combo_width = 92.0;
+        // Sleek, non-intrusive floating scrollbars for dockers & long lists
+        style.spacing.scroll.floating = true;
+        style.spacing.scroll.bar_width = 5.0;
+        style.spacing.scroll.floating_width = 3.0;
+        style.spacing.scroll.bar_inner_margin = 1.0;
+        style.spacing.scroll.bar_outer_margin = 1.0;
+        style.spacing.scroll.dormant_background_opacity = 0.0;
+        style.spacing.scroll.active_background_opacity = 0.25;
+        style.spacing.scroll.interact_background_opacity = 0.40;
+        style.spacing.scroll.dormant_handle_opacity = 0.22;
+        style.spacing.scroll.active_handle_opacity = 0.55;
+        style.spacing.scroll.interact_handle_opacity = 0.80;
     });
 }
 
@@ -394,31 +417,133 @@ pub fn configure_arabic_capable_fonts(ctx: &egui::Context) -> Option<PathBuf> {
     configure_arabic_capable_fonts_for_language(ctx, StudioLanguage::English)
 }
 
-/// Configures Arabic system fonts according to `lang`: when `StudioLanguage::Arabic` is
-/// active, places the Arabic-capable face at index `0` so spaces inside Arabic labels stay in
-/// the same single `harfrust` RTL run instead of splitting onto Latin fallback fonts.
+/// Configures Arabic system fonts and full Unicode symbol fallbacks (`✓`, `✕`, `⊞`, `▾`, `●`, etc.)
+/// according to `lang`, and always registers [`ARABIC_EDITOR_FONT_FAMILY`] with the Arabic face
+/// at index `0` so live RTL `TextEdit` typing keeps spaces & words in one `harfrust` RTL run
+/// even when the studio UI language is English.
 pub fn configure_arabic_capable_fonts_for_language(
     ctx: &egui::Context,
     lang: StudioLanguage,
 ) -> Option<PathBuf> {
-    let font_path = find_arabic_system_font()?;
-    let bytes = std::fs::read(&font_path).ok()?;
+    let arabic_path = find_arabic_system_font();
+    let symbol_path = find_unicode_symbol_system_font();
+    if arabic_path.is_none() && symbol_path.is_none() {
+        return None;
+    }
+
     let mut defs = FontDefinitions::default();
-    let key = "coree_arabic_fallback".to_owned();
-    defs.font_data
-        .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+    let default_prop = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut arabic_key_opt: Option<String> = None;
+    if let Some(ref p) = arabic_path {
+        if let Ok(bytes) = std::fs::read(p) {
+            let key = "coree_arabic_fallback".to_owned();
+            defs.font_data
+                .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+            arabic_key_opt = Some(key);
+        }
+    }
+
+    let mut symbol_key_opt: Option<String> = None;
+    if let Some(ref sp) = symbol_path {
+        if arabic_path.as_ref() == Some(sp) {
+            symbol_key_opt.clone_from(&arabic_key_opt);
+        } else if let Ok(bytes) = std::fs::read(sp) {
+            let key = "coree_unicode_symbols".to_owned();
+            defs.font_data
+                .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+            symbol_key_opt = Some(key);
+        }
+    }
+
+    // Always register `ARABIC_EDITOR_FONT_FAMILY` with Arabic primary -> Symbol/Latin fallback
+    let mut rtl_editor_chain = Vec::new();
+    if let Some(ref ak) = arabic_key_opt {
+        rtl_editor_chain.push(ak.clone());
+    }
+    if let Some(ref sk) = symbol_key_opt {
+        if !rtl_editor_chain.contains(sk) {
+            rtl_editor_chain.push(sk.clone());
+        }
+    }
+    for f in &default_prop {
+        if !rtl_editor_chain.contains(f) {
+            rtl_editor_chain.push(f.clone());
+        }
+    }
+    defs.families.insert(
+        FontFamily::Name(ARABIC_EDITOR_FONT_FAMILY.into()),
+        rtl_editor_chain,
+    );
+
     if let Some(fam) = defs.families.get_mut(&FontFamily::Proportional) {
         if lang == StudioLanguage::Arabic {
-            fam.insert(0, key.clone());
+            if let Some(ref sk) = symbol_key_opt {
+                if !fam.contains(sk) {
+                    fam.insert(0, sk.clone());
+                }
+            }
+            if let Some(ref ak) = arabic_key_opt {
+                fam.retain(|x| x != ak);
+                fam.insert(0, ak.clone());
+            }
         } else {
-            fam.push(key.clone());
+            // Keep crisp default UI font first, then Unicode symbols (`DejaVuSans` for ✓/✕/⊞/▾), then Arabic
+            if let Some(ref sk) = symbol_key_opt {
+                if !fam.contains(sk) {
+                    let insert_idx = fam.len().min(1);
+                    fam.insert(insert_idx, sk.clone());
+                }
+            }
+            if let Some(ref ak) = arabic_key_opt {
+                if !fam.contains(ak) {
+                    fam.push(ak.clone());
+                }
+            }
         }
     }
     if let Some(fam) = defs.families.get_mut(&FontFamily::Monospace) {
-        fam.push(key);
+        if let Some(ref sk) = symbol_key_opt {
+            if !fam.contains(sk) {
+                fam.push(sk.clone());
+            }
+        }
+        if let Some(ref ak) = arabic_key_opt {
+            if !fam.contains(ak) {
+                fam.push(ak.clone());
+            }
+        }
     }
     ctx.set_fonts(defs);
-    Some(font_path)
+    arabic_path.or(symbol_path)
+}
+
+/// Locates a broad Unicode symbol + Latin + Arabic fallback font (`DejaVuSans`, `Segoe UI`, etc.)
+/// so UI glyphs (`✓`, `✕`, `⊞`, `▾`, `●`, `■`, `↻`, `⇄`, `⇅`, `⚠`) never render as missing-glyph tofu.
+#[must_use]
+pub fn find_unicode_symbol_system_font() -> Option<PathBuf> {
+    let preferred_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ];
+    for p in preferred_paths {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    None
 }
 
 /// Locates a preferred Arabic-capable `.ttf`/`.otf` font file on Linux/Windows/macOS.
@@ -503,6 +628,134 @@ pub fn egui_color_to_core(c: Color32) -> Color {
     Color::rgba8(c.r(), c.g(), c.b(), c.a())
 }
 
+/// Builds a BiDi- & RTL-safe [`egui::Galley`] for live [`egui::TextEdit`] widgets so Arabic
+/// multi-word sentences (`"الحمد لله رب العالمين"`) keep spaces inside a single `harfrust` RTL
+/// shaping run and align right-to-left even when UI language is English, while preserving exact
+/// 1-to-1 character count invariants required by `egui`'s cursor and selection indices.
+#[must_use]
+pub fn layout_bidi_text_edit_galley(
+    ui: &egui::Ui,
+    raw_text: &str,
+    wrap_width: f32,
+    multiline: bool,
+    prefer_rtl_when_empty: bool,
+) -> Arc<egui::Galley> {
+    let is_rtl = has_rtl_script(raw_text) || (raw_text.is_empty() && prefer_rtl_when_empty);
+    let arabic_family = FontFamily::Name(ARABIC_EDITOR_FONT_FAMILY.into());
+    let has_arabic_family = ui
+        .ctx()
+        .fonts_mut(|f| f.families().contains(&arabic_family));
+    let font_id = if is_rtl && has_arabic_family {
+        egui::FontId::new(14.5, arabic_family)
+    } else {
+        egui::TextStyle::Body.resolve(ui.style())
+    };
+    let text_color = ui.visuals().text_color();
+
+    let display_text = if is_rtl && !raw_text.is_empty() {
+        let reordered: String = raw_text
+            .split('\n')
+            .enumerate()
+            .map(|(i, line)| {
+                let shaped = shape_mixed_ui_bidi(line);
+                let safe_line = if shaped.chars().count() == line.chars().count() {
+                    shaped
+                } else {
+                    line.to_owned()
+                };
+                if i == 0 {
+                    safe_line
+                } else {
+                    format!("\n{safe_line}")
+                }
+            })
+            .collect();
+        if reordered.chars().count() == raw_text.chars().count() {
+            reordered
+        } else {
+            raw_text.to_owned()
+        }
+    } else {
+        raw_text.to_owned()
+    };
+
+    let expected_chars = display_text.chars().count();
+    let mut job = if multiline {
+        egui::text::LayoutJob::simple(display_text, font_id, text_color, wrap_width)
+    } else {
+        egui::text::LayoutJob::simple_singleline(display_text, font_id, text_color)
+    };
+    if is_rtl {
+        job.halign = egui::Align::RIGHT;
+    }
+    let mut galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+
+    // Workaround for upstream `epaint 0.37` RTL bug: `harfrust` emits RTL clusters in descending
+    // byte order ending at `cluster = 0`, causing `epaint`'s `emit_continuation_glyphs(0..len)`
+    // to append `N - 1` bogus zero-width `uv_rect.is_nothing()` glyphs (`2N - 1` total).
+    // Trimming exactly the excess zero-width unallocated glyphs restores the strict 1-to-1
+    // `galley.end().index == text.chars().count()` invariant for `TextEdit` cursor/selection/backspace
+    // while preserving legitimate ligature/diacritic continuation glyphs (`لا`, harakat).
+    let actual_chars = galley.end().index.0;
+    if is_rtl && actual_chars > expected_chars {
+        let mut excess = actual_chars - expected_chars;
+        let galley_mut = Arc::make_mut(&mut galley);
+        for placed_row in galley_mut.rows.iter_mut().rev() {
+            if excess == 0 {
+                break;
+            }
+            let row = Arc::make_mut(&mut placed_row.row);
+            let mut idx = row.glyphs.len();
+            while idx > 0 && excess > 0 {
+                idx -= 1;
+                let g = &row.glyphs[idx];
+                if g.advance_width == 0.0 && g.uv_rect.is_nothing() {
+                    row.glyphs.remove(idx);
+                    excess -= 1;
+                }
+            }
+        }
+    }
+    galley
+}
+
+/// Renders a single-line [`egui::TextEdit`] that automatically shapes & right-aligns RTL Arabic text.
+pub fn bidi_text_edit_singleline(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: Option<&str>,
+    desired_width: Option<f32>,
+) -> egui::Response {
+    let is_rtl = has_rtl_script(text);
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_w: f32| {
+        layout_bidi_text_edit_galley(ui, buf.as_str(), wrap_w, false, false)
+    };
+    let mut te = egui::TextEdit::singleline(text).layouter(&mut layouter);
+    if let Some(h) = hint {
+        te = te.hint_text(h);
+    }
+    if let Some(w) = desired_width {
+        te = te.desired_width(w);
+    }
+    if is_rtl {
+        te = te.align(egui::Align2::RIGHT_CENTER);
+    }
+    ui.add(te)
+}
+
+/// Renders a multi-line [`egui::TextEdit`] that automatically shapes & right-aligns RTL Arabic text.
+pub fn bidi_text_edit_multiline(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
+    let is_rtl = has_rtl_script(text);
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_w: f32| {
+        layout_bidi_text_edit_galley(ui, buf.as_str(), wrap_w, true, false)
+    };
+    let mut te = egui::TextEdit::multiline(text).layouter(&mut layouter);
+    if is_rtl {
+        te = te.align(egui::Align2::RIGHT_TOP);
+    }
+    ui.add(te)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +770,75 @@ mod tests {
 
         assert_eq!(StudioLanguage::English.tr_ui("Page", "الصفحة"), "Page");
         assert_eq!(StudioLanguage::Arabic.tr_ui("Page", "الصفحة"), "الصفحة");
+    }
+
+    #[test]
+    fn live_arabic_text_edit_galley_places_first_word_on_right_even_in_english_ui() {
+        let ctx = egui::Context::default();
+        if configure_arabic_capable_fonts_for_language(&ctx, StudioLanguage::English).is_none() {
+            return;
+        }
+        let phrase = "الحمد لله رب العالمين";
+        let mut galley_opt: Option<Arc<egui::Galley>> = None;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            galley_opt = Some(layout_bidi_text_edit_galley(
+                ui, phrase, 360.0, false, false,
+            ));
+        });
+        out.textures_delta.clear();
+        let galley = galley_opt.expect("galley must be built");
+        assert_eq!(
+            galley.end().index.0,
+            phrase.chars().count(),
+            "Galley char count must match buffer char count 1-to-1"
+        );
+        let row = &galley.rows[0].row;
+        assert!(!row.glyphs.is_empty());
+        // In proper single-run RTL shaping of "الحمد لله رب العالمين", the visual leftmost glyph
+        // belongs to the LAST word ("العالمين", ending in 'ن') and the visual rightmost glyph
+        // belongs to the FIRST word ("الحمد", starting with 'ا').
+        let leftmost = row
+            .glyphs
+            .iter()
+            .min_by(|a, b| a.pos.x.total_cmp(&b.pos.x))
+            .unwrap();
+        let rightmost = row
+            .glyphs
+            .iter()
+            .max_by(|a, b| a.pos.x.total_cmp(&b.pos.x))
+            .unwrap();
+        assert_eq!(
+            leftmost.chr, 'ن',
+            "Leftmost glyph must be end of last Arabic word ('العالمين'), got {:?}",
+            leftmost.chr
+        );
+        assert_eq!(
+            rightmost.chr, 'ا',
+            "Rightmost glyph must be start of first Arabic word ('الحمد'), got {:?}",
+            rightmost.chr
+        );
+        assert!(
+            rightmost.pos.x > leftmost.pos.x + 20.0,
+            "First Arabic word ('الحمد') must sit to the right of last word ('العالمين')"
+        );
+
+        // Also verify ligatures ("لا"), diacritics (harakat), mixed BiDi, multiline, and live TextEdit Backspace!
+        for sample in [
+            "لا إله إلا الله",
+            "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+            "مرحبا Coree 2026\nسطر ثاني للتجربة",
+        ] {
+            let mut g_opt: Option<Arc<egui::Galley>> = None;
+            let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
+                g_opt = Some(layout_bidi_text_edit_galley(ui, sample, 360.0, true, false));
+            });
+            out2.textures_delta.clear();
+            let g = g_opt.unwrap();
+            assert_eq!(
+                g.end().index.0,
+                sample.chars().count(),
+                "1-to-1 char invariant must hold for {sample:?}"
+            );
+        }
     }
 }

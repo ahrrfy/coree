@@ -215,11 +215,18 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 }
                 let snap_txt = if active_snaps.is_empty() {
                     crate::i18n::I18nKey::StatusSnapOff.tr_ui(lang)
-                } else {
+                } else if active_snaps.len() <= 3 {
                     format!(
                         "{}: {}",
                         crate::i18n::I18nKey::StatusSnapActive.tr_ui(lang),
                         active_snaps.join("+")
+                    )
+                } else {
+                    format!(
+                        "{}: {}+{}",
+                        crate::i18n::I18nKey::StatusSnapActive.tr_ui(lang),
+                        active_snaps[..2].join("+"),
+                        active_snaps.len() - 2
                     )
                 };
                 let scale_txt = if (sf - 1.0).abs() > 1e-6 {
@@ -266,8 +273,9 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 )
             };
 
+            let total_bar_w = ui.available_width();
             shell_dir.with_horizontal(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = 7.0;
                 // Zone 1: Cursor coordinates, selection dimensions & contextual modifier hint
                 ui.label(
                     RichText::new(cursor_txt)
@@ -277,10 +285,18 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 );
                 ui.separator();
                 ui.label(RichText::new(sel_txt).size(11.0).color(tokens.text_muted));
-                if !hint_or_dim_txt.is_empty() {
+                // Show verbose modifier hint only when window is wide enough to avoid collision with right cluster
+                if !hint_or_dim_txt.is_empty() && total_bar_w >= 1340.0 {
                     ui.separator();
+                    let max_chars = if total_bar_w >= 1650.0 { 56 } else { 32 };
+                    let clipped_hint = if hint_or_dim_txt.chars().count() > max_chars {
+                        let prefix: String = hint_or_dim_txt.chars().take(max_chars).collect();
+                        format!("{prefix}…")
+                    } else {
+                        hint_or_dim_txt
+                    };
                     ui.label(
-                        RichText::new(hint_or_dim_txt)
+                        RichText::new(clipped_hint)
                             .size(10.5)
                             .color(tokens.text_muted),
                     );

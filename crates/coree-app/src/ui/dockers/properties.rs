@@ -799,7 +799,8 @@ pub(super) fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     Some(NodePayload::ArtisticText(mut art)) => {
                         let mut changed = false;
                         if let Some(run) = art.runs.first_mut() {
-                            changed |= ui.text_edit_multiline(&mut run.text).changed();
+                            changed |=
+                                crate::theme::bidi_text_edit_multiline(ui, &mut run.text).changed();
                             shell_dir.with_horizontal_wrapped(ui, |ui| {
                                 ui.label(
                                     RichText::new(
@@ -866,7 +867,8 @@ pub(super) fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     Some(NodePayload::ParagraphText(mut para)) => {
                         let mut changed = false;
                         if let Some(run) = para.runs.first_mut() {
-                            changed |= ui.text_edit_multiline(&mut run.text).changed();
+                            changed |=
+                                crate::theme::bidi_text_edit_multiline(ui, &mut run.text).changed();
                             shell_dir.with_horizontal_wrapped(ui, |ui| {
                                 ui.label(
                                     RichText::new(
@@ -1215,7 +1217,13 @@ pub(super) fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     Some(NodePayload::TextOnPath(mut top)) => {
                         let mut changed = false;
                         if let Some(run) = top.text.runs.first_mut() {
-                            changed |= ui.text_edit_singleline(&mut run.text).changed();
+                            changed |= crate::theme::bidi_text_edit_singleline(
+                                ui,
+                                &mut run.text,
+                                None,
+                                None,
+                            )
+                            .changed();
                             changed |= render_docker_text_style_fields(
                                 ui,
                                 &mut run.style,
@@ -1277,7 +1285,12 @@ pub(super) fn ui_properties_docker(ui: &mut Ui, app: &mut StudioApp) {
                     RichText::new(crate::i18n::I18nKey::DockTextSelectOrDefault.tr_ui(lang))
                         .color(tokens.text_muted),
                 );
-                ui.text_edit_singleline(&mut app.tool_settings.text_insert_draft);
+                crate::theme::bidi_text_edit_singleline(
+                    ui,
+                    &mut app.tool_settings.text_insert_draft,
+                    None,
+                    None,
+                );
                 let _ = render_docker_text_style_fields(
                     ui,
                     &mut app.default_text_style,
