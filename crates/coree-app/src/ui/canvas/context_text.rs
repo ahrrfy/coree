@@ -13,6 +13,16 @@ pub(super) fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut S
                     .is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }))
             })
         });
+        let has_raster = app.active_tab().is_some_and(|t| {
+            t.selection.objects.iter().any(|id| {
+                t.document.object(*id).is_some_and(|o| {
+                    matches!(o.payload, NodePayload::Raster(_))
+                        || t.document
+                            .resolve_clone_payload_and_style_with_sym_scope(o, None)
+                            .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_)))
+                })
+            })
+        });
         let has_clip = app.has_clipboard_content();
         let lang = app.ui_language;
 
@@ -87,6 +97,26 @@ pub(super) fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut S
 
         ui.separator();
 
+        if has_raster {
+            if ui
+                .button(crate::i18n::I18nKey::BitmapTraceVector.tr_ui(lang))
+                .clicked()
+            {
+                if let Err(e) = app.trace_selected_raster() {
+                    app.push_toast(e, true);
+                }
+                ui.close();
+            }
+            if ui
+                .button(crate::i18n::I18nKey::DockerVectorTrace.tr_ui(lang))
+                .clicked()
+            {
+                app.trace_state.split_preview = true;
+                app.focus_docker(DockerTab::VectorTrace);
+                ui.close();
+            }
+            ui.separator();
+        }
         if ui
             .add_enabled(
                 has_sel,

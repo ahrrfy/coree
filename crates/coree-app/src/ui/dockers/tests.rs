@@ -218,3 +218,100 @@ fn trace_split_preview_and_cdr_hex_view_render_headlessly() {
     out.textures_delta.clear();
     assert!(!out.shapes.is_empty());
 }
+
+#[test]
+fn trace_raster_via_to_curves_keep_original_side_by_side_and_split_preview() {
+    use coree_core::{
+        ColorMode, Fill, NodePayload, ObjectId, OutlineStyle, RasterAsset, RasterLayerData,
+        SceneObject,
+    };
+    let mut app = StudioApp::new_headless();
+    let w = 48u32;
+    let h = 48u32;
+    let mut rgba = vec![255u8; (w * h * 4) as usize];
+    for y in 8..40 {
+        for x in 8..40 {
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&[210, 30, 40, 255]);
+        }
+    }
+    let asset = RasterAsset::new(w, h, rgba, 96.0, ColorMode::Rgb).unwrap();
+    let aid = asset.id;
+    let tab = app.active_tab_mut().unwrap();
+    tab.document.insert_asset_if_absent(asset);
+    let lid = tab.document.pages()[0].layers[0].id;
+    let rid = tab
+        .document
+        .add_object(
+            SceneObject::new(
+                ObjectId(0),
+                "LogoBmp",
+                NodePayload::Raster(RasterLayerData {
+                    asset_id: aid,
+                    width_mm: 40.0,
+                    height_mm: 40.0,
+                    filters: Vec::new(),
+                    filter_enabled: Vec::new(),
+                    crop_rect: None,
+                }),
+            )
+            .with_fill(Fill::None)
+            .with_outline(OutlineStyle::none()),
+            Some(lid),
+        )
+        .unwrap();
+    tab.selection.select_single(&tab.document, rid);
+
+    // 1. Live WYSIWYG Split Preview with an actual selected raster renders cleanly
+    let ctx = egui::Context::default();
+    let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(360.0, 480.0),
+        )),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| {
+        crate::ui::dockers::render_trace_split_preview(ui, &mut app);
+    });
+    out.textures_delta.clear();
+    assert!(app.trace_state.split_preview_cache.borrow().is_some());
+
+    // 2. `convert_selection_to_curves` (`To Curves` / `Ctrl+Q`) on a selected Raster traces it
+    // non-destructively (keeps original + places beside when enabled)
+    app.trace_state.keep_original = true;
+    app.trace_state.place_side_by_side = true;
+    app.convert_selection_to_curves();
+    {
+        let tab = app.active_tab().unwrap();
+        assert!(
+            tab.document.object(rid).is_some(),
+            "original raster must be preserved when keep_original=true"
+        );
+        assert!(
+            tab.document.objects().len() >= 2,
+            "expected traced vector curve created alongside original raster"
+        );
+    }
+    app.undo().unwrap();
+    assert_eq!(app.active_tab().unwrap().document.objects().len(), 1);
+
+    // 3. `keep_original = false` replaces original bitmap atomically and restores on 1 Undo
+    {
+        let tab = app.active_tab_mut().unwrap();
+        tab.selection.select_single(&tab.document, rid);
+    }
+    app.trace_state.keep_original = false;
+    app.trace_state.place_side_by_side = false;
+    let cnt = app.trace_selected_raster().unwrap();
+    assert_eq!(cnt, 1);
+    assert!(
+        app.active_tab().unwrap().document.object(rid).is_none(),
+        "original raster must be removed when keep_original=false"
+    );
+    app.undo().unwrap();
+    assert!(
+        app.active_tab().unwrap().document.object(rid).is_some(),
+        "single undo must restore original raster"
+    );
+}

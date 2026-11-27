@@ -431,6 +431,8 @@ pub enum I18nKey {
     TraceSmoothing,
     TraceCorners,
     TraceSpeckles,
+    TraceKeepOriginal,
+    TracePlaceBeside,
 
     // Production, Preflight, Collect, Print (`S12`, `S13`, `S14`)
     ProdPreflightTab,

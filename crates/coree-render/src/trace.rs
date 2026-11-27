@@ -151,26 +151,27 @@ pub fn trace_raster_to_mm(
 }
 
 fn effective_params(config: &TraceConfig) -> (usize, f64, f64, f64, usize) {
-    let (preset_max_colors, preset_detail, preset_smooth) = match config.mode {
-        TraceMode::QuickTrace => (16, 0.65, 0.5),
-        TraceMode::OutlineTrace(OutlinePreset::LineArt) => (2, 0.85, 0.35),
-        TraceMode::OutlineTrace(OutlinePreset::Logo) => (12, 0.75, 0.55),
-        TraceMode::OutlineTrace(OutlinePreset::DetailedLogo) => (24, 0.9, 0.45),
-        TraceMode::OutlineTrace(OutlinePreset::Clipart) => (16, 0.75, 0.6),
-        TraceMode::OutlineTrace(OutlinePreset::LowQualityImage) => (12, 0.5, 0.75),
-        TraceMode::OutlineTrace(OutlinePreset::HighQualityImage) => (64, 0.9, 0.5),
-        TraceMode::CenterlineTrace => (2, 0.8, 0.4),
+    let (preset_detail, preset_smooth) = match config.mode {
+        TraceMode::QuickTrace => (0.80, 0.50),
+        TraceMode::OutlineTrace(OutlinePreset::LineArt) => (0.90, 0.35),
+        TraceMode::OutlineTrace(OutlinePreset::Logo) => (0.82, 0.50),
+        TraceMode::OutlineTrace(OutlinePreset::DetailedLogo) => (0.92, 0.42),
+        TraceMode::OutlineTrace(OutlinePreset::Clipart) => (0.80, 0.55),
+        TraceMode::OutlineTrace(OutlinePreset::LowQualityImage) => (0.60, 0.72),
+        TraceMode::OutlineTrace(OutlinePreset::HighQualityImage) => (0.92, 0.48),
+        TraceMode::CenterlineTrace => (0.85, 0.40),
     };
-    let k = config.max_colors.clamp(2, 64).min(preset_max_colors);
-    let detail = (0.5 * sanitize_f64(config.detail, preset_detail) + 0.5 * preset_detail)
-        .clamp(0.05_f64, 1.0);
-    let smooth = (0.5 * sanitize_f64(config.smoothing, preset_smooth) + 0.5 * preset_smooth)
-        .clamp(0.0_f64, 1.0);
+    let k = match config.mode {
+        TraceMode::CenterlineTrace | TraceMode::OutlineTrace(OutlinePreset::LineArt) => 2,
+        _ => config.max_colors.clamp(2, 64),
+    };
+    let detail = sanitize_f64(config.detail, preset_detail).clamp(0.05_f64, 1.0);
+    let smooth = sanitize_f64(config.smoothing, preset_smooth).clamp(0.0_f64, 1.0);
     let corner_deg = sanitize_f64(config.corner_threshold, 60.0).clamp(5.0_f64, 175.0);
     let min_area_px = if config.speckle_size > 0 {
         config.speckle_size
     } else {
-        ((1.0 - detail) * 16.0).round() as usize + 1
+        ((1.0 - detail) * 12.0).round() as usize + 1
     };
     (k, detail, smooth, corner_deg, min_area_px)
 }
@@ -190,13 +191,14 @@ fn trace_outline_potrace(
 ) -> Vec<(BezierPath, Color)> {
     let (k, detail, smooth, corner_deg, turd_size) = effective_params(config);
     let (palette, mut labels) = quantize_kmeans_u8(&rgba8, w, h, k);
-    drop(rgba8);
     if palette.is_empty() {
         return Vec::new();
     }
+    suppress_antialias_halos(&rgba8, &palette, &mut labels, w, h);
+    drop(rgba8);
 
     if config.remove_background {
-        if let Some(bg_lbl) = detect_border_background_label_u8(&labels, w, h) {
+        if let Some(bg_lbl) = detect_border_background_label_u8(&labels, w, h, palette.len()) {
             for l in &mut labels {
                 if *l == bg_lbl {
                     *l = u8::MAX;
@@ -258,13 +260,13 @@ fn trace_outline_potrace(
 }
 
 fn potrace_alphamax_from_params(corner_deg: f64, smooth: f64) -> f64 {
-    if smooth <= 0.05 {
+    if smooth <= 0.02 {
         return 0.0;
     }
-    // Lower corner_threshold => keep more corners crisp (lower alphamax);
-    // higher smoothing => allow gentler bends to become smooth cubic curves.
-    let base = 0.55 + (corner_deg / 180.0) * 0.65;
-    (base * (0.65 + 0.55 * smooth)).clamp(0.25, 1.3333)
+    // Maps default (60 deg, smooth=0.5) to canonical Potrace alphamax ~= 1.0,
+    // while keeping circles smooth even at lower CLI corner thresholds.
+    let base = 0.65 + (corner_deg / 180.0) * 0.65;
+    (base * (0.85 + 0.60 * smooth)).clamp(0.55, 1.3333)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +287,10 @@ struct TracedBoundarySeg {
     right_label: u8,
     start_v: u32,
     end_v: u32,
+    /// Exact orthogonal grid unit step leaving `start_v` (`pts[0] -> pts[1]`).
+    start_step: (i8, i8),
+    /// Exact orthogonal grid unit step arriving at `end_v` (`pts[len - 2] -> pts[len - 1]`).
+    end_step: (i8, i8),
     /// Nodes along `start_v -> end_v`, with `start_v` (first) and `end_v` (last) pinned endpoints.
     nodes: Vec<PathNode>,
 }
@@ -544,6 +550,8 @@ fn potrace_extract_shared_subpaths(
                 pts.push(vcoords(nv));
                 cur_v = nv;
             }
+            let start_step = grid_unit_step(pts[0], pts[1]);
+            let end_step = grid_unit_step(pts[pts.len() - 2], pts[pts.len() - 1]);
             let chain = PotraceChain {
                 pts: &pts,
                 kind: ArcKind::OpenArc,
@@ -556,6 +564,8 @@ fn potrace_extract_shared_subpaths(
                 right_label: right_lbl,
                 start_v: start_v as u32,
                 end_v: cur_v as u32,
+                start_step,
+                end_step,
                 nodes,
             });
         }
@@ -639,11 +649,8 @@ fn potrace_extract_shared_subpaths(
         if seg.nodes.len() < 2 {
             continue;
         }
-        let out_fwd = dir_sign_vec(seg.nodes[0].pos, seg.nodes[1].pos);
-        let in_fwd = dir_sign_vec(
-            seg.nodes[seg.nodes.len() - 2].pos,
-            seg.nodes[seg.nodes.len() - 1].pos,
-        );
+        let out_fwd = seg.start_step;
+        let in_fwd = seg.end_step;
 
         if (seg.left_label as usize) < num_labels {
             by_label[seg.left_label as usize].push(HalfSeg {
@@ -774,14 +781,9 @@ fn potrace_extract_shared_subpaths(
     out
 }
 
-fn dir_sign_vec(a: Point2D, b: Point2D) -> (i8, i8) {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    if dx.abs() >= dy.abs() {
-        (if dx >= 0.0 { 1 } else { -1 }, 0)
-    } else {
-        (0, if dy >= 0.0 { 1 } else { -1 })
-    }
+#[inline]
+fn grid_unit_step(a: (i32, i32), b: (i32, i32)) -> (i8, i8) {
+    ((b.0 - a.0).signum() as i8, (b.1 - a.1).signum() as i8)
 }
 
 /// Priority for sharpest LEFT turn in screen coords (`+X right, +Y down`):
@@ -1271,7 +1273,7 @@ fn potrace_smooth_and_opticurve(
         return Vec::new();
     }
     let scale = |p: Point2D| Point2D::new(p.x * scale_x, p.y * scale_y);
-    if smooth <= 0.05 || (closed && m < 3) {
+    if smooth <= 0.02 || alphamax <= 0.0 || (closed && m < 3) {
         return vertices
             .iter()
             .map(|&p| PathNode::corner(scale(p)))
@@ -1279,7 +1281,8 @@ fn potrace_smooth_and_opticurve(
     }
 
     let corner_rad = corner_deg.to_radians();
-    // Classify each vertex as corner (Cusp) or smooth curve with Potrace alpha parameter
+    // Classify each vertex via Selinger's Potrace L_inf chord distance dd = dpara / ddenom,
+    // and assign exact trigonometric circular-arc cubic Bezier handle ratios on smooth bends.
     let mut alphas = vec![0.0_f64; m];
     let mut is_corner = vec![false; m];
     for i in 0..m {
@@ -1290,18 +1293,51 @@ fn potrace_smooth_and_opticurve(
         let prev = vertices[(i + m - 1) % m];
         let curr = vertices[i];
         let next = vertices[(i + 1) % m];
-        let v_in = (curr - prev).normalize_or_zero();
-        let v_out = (next - curr).normalize_or_zero();
-        let turn = v_in.dot(v_out).clamp(-1.0, 1.0).acos();
-        if turn >= corner_rad || turn < 0.015 {
+        let e_in = curr - prev;
+        let e_out = next - curr;
+        let len_in = e_in.length();
+        let len_out = e_out.length();
+        if len_in <= 1e-6 || len_out <= 1e-6 {
             is_corner[i] = true;
             continue;
         }
-        // Smooth vertex (0.015 <= turn < corner_rad): compute Potrace-style handle alpha
-        // scaled by smoothing strength & alphamax without misclassifying gentle long-chord arcs as cusps.
-        let bend_ratio = (turn / corner_rad.max(1e-6)).clamp(0.0, 1.0);
-        let base_alpha = (0.55 + 0.15 * bend_ratio).min(alphamax.max(0.25));
-        alphas[i] = (base_alpha * (0.45 + 0.55 * smooth)).clamp(0.25, 0.75);
+        let v_in = e_in / len_in;
+        let v_out = e_out / len_out;
+        let turn = v_in.dot(v_out).clamp(-1.0, 1.0).acos();
+        let span = next - prev;
+        let ddenom = span.x.abs() + span.y.abs();
+        let dpara = (e_in.x * span.y - e_in.y * span.x).abs();
+        let dd = if ddenom > 1e-6 {
+            dpara / ddenom
+        } else {
+            f64::INFINITY
+        };
+        let alpha_potrace = if dd > 1.0 {
+            (4.0 / 3.0) * (1.0 - 1.0 / dd)
+        } else {
+            0.0
+        };
+        let min_edge = len_in.min(len_out);
+        let max_edge = len_in.max(len_out);
+        // Preserve true geometric corners:
+        // 1) Selinger's Potrace L_inf sagitta exceeds alphamax (distinguishes squares from tiny circles)
+        // 2) Explicit sharp geometric angle on long edges
+        // 3) Asymmetric 90-deg end-caps on 1px strokes/peninsulas (long side >= 5.5px + sharp turn)
+        let sharp_asymmetric_cap =
+            max_edge >= 5.5 && max_edge >= 3.5 * min_edge.max(0.5) && turn >= 1.25;
+        let sharp_long_corner = dd > 2.0 && min_edge >= 4.5 && turn >= corner_rad;
+        if alpha_potrace > alphamax || sharp_long_corner || sharp_asymmetric_cap {
+            is_corner[i] = true;
+            continue;
+        }
+        // Exact trigonometric cubic Bezier tangent ratio for circular arc of angle `turn`:
+        // alpha_arc(theta) = (4/3) * tan(theta/4) / tan(theta/2) = (2/3) * (1 - tan^2(theta/4))
+        // (= 0.66667 as theta -> 0, 0.55228475 at theta = 90 deg), gently modulated by smoothing.
+        let tan_q = (turn.clamp(0.0, 3.0) * 0.25).tan();
+        let exact_arc_alpha = (2.0 / 3.0) * (1.0 - tan_q * tan_q);
+        let potrace_floor = 0.50 + 0.32 * alpha_potrace;
+        let blend_smooth = 0.85 + 0.15 * smooth;
+        alphas[i] = (exact_arc_alpha.max(potrace_floor) * blend_smooth).clamp(0.45, 0.85);
     }
 
     // Build curve / corner nodes using Potrace midpoints and cubic Bézier control handles
@@ -1771,7 +1807,8 @@ fn extract_skeleton_chains(skeleton: &[bool], w: usize, h: usize) -> Vec<(Vec<Po
 }
 
 /// Deterministic K-Means++ RGB color quantization ignoring transparent pixels (`alpha < 128`).
-/// Stores `u8` palette indices (`1 B/px`, `u8::MAX` = transparent) to keep >16MP traces low-RSS.
+/// Separates flat interior pixels from anti-aliased edge transition pixels so K-Means++ discovers
+/// true region colors instead of blurry 1px edge blend halos, storing `u8` palette indices (`1 B/px`).
 fn quantize_kmeans_u8(
     rgba8: &[u8],
     w: usize,
@@ -1779,21 +1816,49 @@ fn quantize_kmeans_u8(
     max_colors: usize,
 ) -> (Vec<[u8; 3]>, Vec<u8>) {
     let n_px = w * h;
-    let mut opaque_samples: Vec<[f32; 3]> = Vec::new();
-    let stride = (n_px / 8192).max(1);
+    let stride = (n_px / 32_768).max(1);
+    let mut flat_samples: Vec<[f32; 3]> = Vec::new();
+    let mut all_samples: Vec<[f32; 3]> = Vec::new();
+    let chunks = rgba8.as_chunks::<4>().0;
 
-    for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
-        if i % stride == 0 && px[3] >= 128 {
-            opaque_samples.push([f32::from(px[0]), f32::from(px[1]), f32::from(px[2])]);
+    for (i, px) in chunks.iter().enumerate() {
+        if i % stride != 0 || px[3] < 128 {
+            continue;
+        }
+        let sample = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
+        all_samples.push(sample);
+        if px[3] < 220 {
+            continue;
+        }
+        let x = i % w;
+        let y = i / w;
+        if x > 0 && x + 1 < w && y > 0 && y + 1 < h {
+            let nbrs = [i - 1, i + 1, i - w, i + w];
+            let is_flat = nbrs.iter().all(|&ni| {
+                let np = chunks[ni];
+                np[3] >= 220
+                    && px[0].abs_diff(np[0]) <= 18
+                    && px[1].abs_diff(np[1]) <= 18
+                    && px[2].abs_diff(np[2]) <= 18
+            });
+            if is_flat {
+                flat_samples.push(sample);
+            }
         }
     }
-    if opaque_samples.is_empty() {
+    if all_samples.is_empty() {
         return (Vec::new(), vec![u8::MAX; n_px]);
     }
 
     let eff_max = max_colors.clamp(1, 254);
+    let primary_pool = if flat_samples.len() >= 16 {
+        &flat_samples
+    } else {
+        &all_samples
+    };
+
     let mut distinct: Vec<[u8; 3]> = Vec::new();
-    for s in &opaque_samples {
+    for s in primary_pool {
         let rgb = [s[0] as u8, s[1] as u8, s[2] as u8];
         if !distinct.contains(&rgb) {
             distinct.push(rgb);
@@ -1805,15 +1870,15 @@ fn quantize_kmeans_u8(
 
     let mut centroids: Vec<[f32; 3]> = if distinct.len() <= eff_max {
         distinct
-            .into_iter()
-            .map(|[r, g, b]| [f32::from(r), f32::from(g), f32::from(b)])
+            .iter()
+            .map(|&[r, g, b]| [f32::from(r), f32::from(g), f32::from(b)])
             .collect()
     } else {
-        let mut init = vec![opaque_samples[0]];
+        let mut init = vec![primary_pool[0]];
         while init.len() < eff_max {
             let mut best_dist = -1.0_f32;
-            let mut best_sample = opaque_samples[0];
-            for &s in &opaque_samples {
+            let mut best_sample = primary_pool[0];
+            for &s in primary_pool {
                 let min_d = init
                     .iter()
                     .map(|c| color_dist_sq(s, *c))
@@ -1823,7 +1888,7 @@ fn quantize_kmeans_u8(
                     best_sample = s;
                 }
             }
-            if best_dist <= 1.0 {
+            if best_dist <= 16.0 {
                 break;
             }
             init.push(best_sample);
@@ -1831,10 +1896,36 @@ fn quantize_kmeans_u8(
         init
     };
 
+    // Rescue genuine thin-stroke colors absent from `flat_samples` while rejecting linear AA blends
+    while centroids.len() < eff_max {
+        let mut best_dist = 2025.0_f32; // > 45 RGB units from all current centroids
+        let mut rescue_sample: Option<[f32; 3]> = None;
+        for &s in &all_samples {
+            let min_d = centroids
+                .iter()
+                .map(|c| color_dist_sq(s, *c))
+                .fold(f32::INFINITY, f32::min);
+            if min_d > best_dist && !is_linear_blend_of_any(s, &centroids, 324.0) {
+                best_dist = min_d;
+                rescue_sample = Some(s);
+            }
+        }
+        if let Some(rs) = rescue_sample {
+            centroids.push(rs);
+        } else {
+            break;
+        }
+    }
+
+    let refine_pool = if flat_samples.len() >= 16 && centroids.len() <= distinct.len().max(1) {
+        &flat_samples
+    } else {
+        &all_samples
+    };
     for _ in 0..10 {
         let mut sums = vec![[0.0_f64; 3]; centroids.len()];
         let mut counts = vec![0u64; centroids.len()];
-        for &s in &opaque_samples {
+        for &s in refine_pool {
             let best = nearest_centroid(s, &centroids);
             sums[best][0] += f64::from(s[0]);
             sums[best][1] += f64::from(s[1]);
@@ -1860,10 +1951,10 @@ fn quantize_kmeans_u8(
         }
     }
 
-    // Merge near-identical centroids (Euclidean^2 < 16.0)
+    // Merge near-identical centroids (perceptual^2 < 36.0)
     let mut merged: Vec<[f32; 3]> = Vec::new();
     for c in centroids {
-        if !merged.iter().any(|&m| color_dist_sq(c, m) < 16.0) {
+        if !merged.iter().any(|&m| color_dist_sq(c, m) < 36.0) {
             merged.push(c);
         }
     }
@@ -1883,7 +1974,7 @@ fn quantize_kmeans_u8(
         .collect();
 
     let mut labels = vec![u8::MAX; n_px];
-    for (i, px) in rgba8.as_chunks::<4>().0.iter().enumerate() {
+    for (i, px) in chunks.iter().enumerate() {
         if px[3] >= 128 {
             let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
             labels[i] = nearest_centroid(s, &merged) as u8;
@@ -1893,12 +1984,107 @@ fn quantize_kmeans_u8(
     (palette, labels)
 }
 
+/// Returns `true` if `s` lies within `max_perp_sq` of the RGB segment between any pair in `centroids`.
+fn is_linear_blend_of_any(s: [f32; 3], centroids: &[[f32; 3]], max_perp_sq: f32) -> bool {
+    if centroids.len() < 2 {
+        return false;
+    }
+    for i in 0..centroids.len() {
+        let a = centroids[i];
+        for &b in &centroids[(i + 1)..] {
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            if len_sq <= 64.0 {
+                continue;
+            }
+            let ap = [s[0] - a[0], s[1] - a[1], s[2] - a[2]];
+            let t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len_sq;
+            if (0.04..=0.96).contains(&t) {
+                let proj = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+                let dr = s[0] - proj[0];
+                let dg = s[1] - proj[1];
+                let db = s[2] - proj[2];
+                if dr * dr + dg * dg + db * db <= max_perp_sq {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Reassigns 1px anti-aliasing transition pixels sandwiched between two distinct regions `L_a != L_b`
+/// whose RGB value is a linear blend of `palette[L_a]` and `palette[L_b]`, eliminating halo rings
+/// while leaving 1px thin strokes (`L_a == L_b`) completely untouched.
+fn suppress_antialias_halos(
+    rgba8: &[u8],
+    palette: &[[u8; 3]],
+    labels: &mut [u8],
+    w: usize,
+    h: usize,
+) {
+    if palette.len() < 3 || w < 3 || h < 3 {
+        return;
+    }
+    let pal_f: Vec<[f32; 3]> = palette
+        .iter()
+        .map(|&[r, g, b]| [f32::from(r), f32::from(g), f32::from(b)])
+        .collect();
+    let chunks = rgba8.as_chunks::<4>().0;
+    let mut updates: Vec<(usize, u8)> = Vec::new();
+    for y in 1..(h - 1) {
+        let row = y * w;
+        for x in 1..(w - 1) {
+            let idx = row + x;
+            let lp = labels[idx];
+            if lp == u8::MAX {
+                continue;
+            }
+            let px = chunks[idx];
+            let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
+            for (n1, n2) in [(idx - 1, idx + 1), (idx - w, idx + w)] {
+                let la = labels[n1];
+                let lb = labels[n2];
+                if la == u8::MAX || lb == u8::MAX || la == lb || lp == la || lp == lb {
+                    continue;
+                }
+                let a = pal_f[la as usize];
+                let b = pal_f[lb as usize];
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                if len_sq <= 64.0 {
+                    continue;
+                }
+                let ap = [s[0] - a[0], s[1] - a[1], s[2] - a[2]];
+                let t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len_sq;
+                if (0.05..=0.95).contains(&t) {
+                    let proj = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+                    let dr = s[0] - proj[0];
+                    let dg = s[1] - proj[1];
+                    let db = s[2] - proj[2];
+                    if dr * dr + dg * dg + db * db <= 484.0 {
+                        updates.push((idx, if t < 0.5 { la } else { lb }));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for (idx, nl) in updates {
+        labels[idx] = nl;
+    }
+}
+
 #[inline]
 fn color_dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let rmean = 0.5 * (a[0] + b[0]);
     let dr = a[0] - b[0];
     let dg = a[1] - b[1];
     let db = a[2] - b[2];
-    dr * dr + dg * dg + db * db
+    let wr = 2.0 + rmean / 256.0;
+    let wg = 4.0;
+    let wb = 2.0 + (255.0 - rmean) / 256.0;
+    (wr * dr * dr + wg * dg * dg + wb * db * db) * (1.0 / 3.0)
 }
 
 #[inline]
@@ -1915,33 +2101,68 @@ fn nearest_centroid(sample: [f32; 3], centroids: &[[f32; 3]]) -> usize {
     best_i
 }
 
-fn detect_border_background_label_u8(labels: &[u8], w: usize, h: usize) -> Option<u8> {
+fn detect_border_background_label_u8(
+    labels: &[u8],
+    w: usize,
+    h: usize,
+    palette_len: usize,
+) -> Option<u8> {
+    if palette_len <= 1 || w < 2 || h < 2 {
+        return None;
+    }
+    // Never remove the sole opaque foreground color in an image
+    let mut seen_opaque = [false; 255];
+    let mut distinct_opaque = 0usize;
+    for &l in labels {
+        if l != u8::MAX && !seen_opaque[l as usize] {
+            seen_opaque[l as usize] = true;
+            distinct_opaque += 1;
+            if distinct_opaque >= 2 {
+                break;
+            }
+        }
+    }
+    if distinct_opaque < 2 {
+        return None;
+    }
+
     let mut counts: [usize; 255] = [0; 255];
+    let mut side_mask: [u8; 255] = [0; 255];
+    let mut transparent_border = 0usize;
     let mut total_border = 0usize;
-    let mut visit = |x: usize, y: usize| {
+    let mut visit = |x: usize, y: usize, side_bit: u8| {
         total_border += 1;
         let lbl = labels[y * w + x];
-        if lbl != u8::MAX {
+        if lbl == u8::MAX {
+            transparent_border += 1;
+        } else {
             counts[lbl as usize] += 1;
+            side_mask[lbl as usize] |= side_bit;
         }
     };
     for x in 0..w {
-        visit(x, 0);
+        visit(x, 0, 1 << 0);
         if h > 1 {
-            visit(x, h - 1);
+            visit(x, h - 1, 1 << 1);
         }
     }
     for y in 1..h.saturating_sub(1) {
-        visit(0, y);
+        visit(0, y, 1 << 2);
         if w > 1 {
-            visit(w - 1, y);
+            visit(w - 1, y, 1 << 3);
         }
+    }
+    // If >= 20% of the perimeter is already alpha-transparent, keep all opaque foreground colors!
+    if transparent_border * 5 >= total_border {
+        return None;
     }
     counts
         .iter()
         .enumerate()
         .max_by_key(|&(_, &c)| c)
-        .filter(|&(_, &c)| c > 0 && c * 4 >= total_border)
+        .filter(|&(lbl, &c)| {
+            c > 0 && c * 100 > total_border * 52 && side_mask[lbl].count_ones() >= 3
+        })
         .map(|(lbl, _)| lbl as u8)
 }
 
@@ -2747,5 +2968,100 @@ mod tests {
             total_nodes < 120,
             "opticurve must simplify circle below 120 nodes, got {total_nodes}"
         );
+    }
+
+    #[test]
+    fn potrace_antialiased_logo_and_transparent_png_never_vanish_or_halo() {
+        // 1. Transparent PNG where opaque blue badge touches ~40% of image border:
+        // remove_background=true must NEVER wipe the foreground badge!
+        let w = 128u32;
+        let h = 128u32;
+        let mut trans_buf = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 20..108 {
+                if y < 96 {
+                    let off = ((y * w + x) * 4) as usize;
+                    trans_buf[off..off + 4].copy_from_slice(&[20, 90, 220, 255]);
+                }
+            }
+        }
+        let trans_asset = RasterAsset::new(w, h, trans_buf, 96.0, ColorMode::Rgb).unwrap();
+        let trans_traced = trace_raster_to_mm(
+            &trans_asset,
+            128.0,
+            128.0,
+            &TraceConfig {
+                remove_background: true,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(
+            trans_traced.len(),
+            1,
+            "transparent PNG foreground touching border must never vanish"
+        );
+
+        // 2. Anti-aliased 2-color ring logo (Red + Navy on White) with max_colors = 12:
+        // K-Means++ flat seeding + AA halo suppression must produce exactly 2 clean vector regions
+        // (zero gray/pink onion-skin halo contours) and < 1 px radial circle accuracy!
+        let mut aa_buf = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let mut r_acc = 0.0_f64;
+                let mut g_acc = 0.0_f64;
+                let mut b_acc = 0.0_f64;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let px = f64::from(x) + (f64::from(sx) + 0.5) * 0.25 - 64.0;
+                        let py = f64::from(y) + (f64::from(sy) + 0.5) * 0.25 - 64.0;
+                        let dist = px.hypot(py);
+                        let rgb = if dist <= 18.0 {
+                            [20.0, 45.0, 140.0]
+                        } else if dist <= 44.0 {
+                            [220.0, 30.0, 35.0]
+                        } else {
+                            [255.0, 255.0, 255.0]
+                        };
+                        r_acc += rgb[0];
+                        g_acc += rgb[1];
+                        b_acc += rgb[2];
+                    }
+                }
+                let off = ((y * w + x) * 4) as usize;
+                aa_buf[off] = (r_acc / 16.0).round() as u8;
+                aa_buf[off + 1] = (g_acc / 16.0).round() as u8;
+                aa_buf[off + 2] = (b_acc / 16.0).round() as u8;
+                aa_buf[off + 3] = 255;
+            }
+        }
+        let aa_asset = RasterAsset::new(w, h, aa_buf, 96.0, ColorMode::Rgb).unwrap();
+        let aa_traced = trace_raster_to_mm(
+            &aa_asset,
+            128.0,
+            128.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                max_colors: 12,
+                remove_background: true,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(
+            aa_traced.len(),
+            2,
+            "expected exactly 2 clean regions (Red ring + Navy core) with 0 AA halo rings, got {}",
+            aa_traced.len()
+        );
+        for (path, _) in &aa_traced {
+            for sub in &path.subpaths {
+                for n in &sub.nodes {
+                    let r = (n.pos.x - 64.0).hypot(n.pos.y - 64.0);
+                    assert!(
+                        (r - 44.0).abs() < 1.2 || (r - 18.0).abs() < 1.2,
+                        "circle contour anchor drifted outside subpixel tolerance: r={r}"
+                    );
+                }
+            }
+        }
     }
 }

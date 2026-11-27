@@ -1257,11 +1257,11 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                         }
                         ui.separator();
                         if menu_item(ui, I18nKey::DockerVectorTrace.tr_ui(lang), "") {
+                            app.trace_state.split_preview = true;
                             app.focus_docker(DockerTab::VectorTrace);
                             ui.close();
                         }
                         if menu_item(ui, I18nKey::BitmapTraceVector.tr_ui(lang), "") {
-                            app.trace_state.mode_idx = 0;
                             if let Err(e) = app.trace_selected_raster() {
                                 app.push_toast(e, true);
                             }

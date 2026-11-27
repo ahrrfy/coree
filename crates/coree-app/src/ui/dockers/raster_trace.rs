@@ -26,6 +26,7 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
     });
 
     if tr.mode_idx == 1 {
+        let prev_preset = tr.preset;
         ComboBox::from_id_salt("trace_preset")
             .selected_text(format!("{:?}", tr.preset))
             .show_ui(ui, |ui| {
@@ -40,6 +41,9 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
                     ui.selectable_value(&mut tr.preset, p, format!("{p:?}"));
                 }
             });
+        if tr.preset != prev_preset {
+            tr.apply_preset_defaults();
+        }
     }
 
     ui.add(
@@ -71,6 +75,16 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
         &mut tr.remove_background,
         crate::i18n::I18nKey::TraceRemoveBackground.tr_ui(lang),
     );
+    ui.checkbox(
+        &mut tr.keep_original,
+        crate::i18n::I18nKey::TraceKeepOriginal.tr_ui(lang),
+    );
+    if tr.keep_original {
+        ui.checkbox(
+            &mut tr.place_side_by_side,
+            crate::i18n::I18nKey::TracePlaceBeside.tr_ui(lang),
+        );
+    }
     super::render_trace_split_preview(ui, app);
 
     ui.add_space(6.0);

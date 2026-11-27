@@ -1613,6 +1613,29 @@ fn show_selected_objects_property_bar(
                         });
                     }
                 }
+                NodePayload::Raster(_) => {
+                    ui.separator();
+                    if ui
+                        .button(
+                            RichText::new(I18nKey::BitmapTraceVector.tr_ui(lang))
+                                .size(11.0)
+                                .strong()
+                                .color(tokens.accent),
+                        )
+                        .clicked()
+                    {
+                        if let Err(e) = app.trace_selected_raster() {
+                            app.push_toast(e, true);
+                        }
+                    }
+                    if ui
+                        .small_button(I18nKey::DockerVectorTrace.tr_ui(lang))
+                        .clicked()
+                    {
+                        app.trace_state.split_preview = true;
+                        app.focus_docker(DockerTab::VectorTrace);
+                    }
+                }
                 NodePayload::Clone { .. } => {
                     ui.separator();
                     if ui

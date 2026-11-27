@@ -182,8 +182,28 @@ impl StudioApp {
                 return Err("trace produced 0 contours (adjust detail or colors)".to_owned());
             }
 
+            let mut placed_xf = xf;
+            if self.trace_state.place_side_by_side {
+                let corners = [
+                    Point2D::new(offset_x_mm, offset_y_mm),
+                    Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm),
+                    Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm + trace_h_mm),
+                    Point2D::new(offset_x_mm, offset_y_mm + trace_h_mm),
+                ];
+                let (mut min_wx, mut max_wx) = (f64::INFINITY, f64::NEG_INFINITY);
+                for c in corners {
+                    let cp = persp.and_then(|p| p.transform_point(c)).unwrap_or(c);
+                    let wp = xf.transform_point(cp);
+                    min_wx = min_wx.min(wp.x);
+                    max_wx = max_wx.max(wp.x);
+                }
+                if (max_wx - min_wx).is_finite() {
+                    placed_xf.m[4] += (max_wx - min_wx).max(1.0) + 6.0;
+                }
+            }
+
             let mut next_id = tab.document.next_id().max(1);
-            let mut ops = Vec::with_capacity(count + 1);
+            let mut ops = Vec::with_capacity(count + 2);
             let mut created_ids = Vec::with_capacity(count);
             for (idx, (mut path, color)) in traced.into_iter().enumerate() {
                 if offset_x_mm.abs() > 1e-9 || offset_y_mm.abs() > 1e-9 {
@@ -199,7 +219,7 @@ impl StudioApp {
                     format!("Traced Curve {}", idx + 1),
                     NodePayload::Path(path),
                 )
-                .with_transform(xf);
+                .with_transform(placed_xf);
                 if is_centerline {
                     obj.fill = Fill::None;
                     obj.outline = OutlineStyle::solid(color, 0.25);
@@ -214,6 +234,11 @@ impl StudioApp {
                 ops.push(CommandOp::Group {
                     ids: created_ids.clone(),
                     name: "Vector Trace Result".to_owned(),
+                });
+            }
+            if !self.trace_state.keep_original {
+                ops.push(CommandOp::DeleteObjects {
+                    ids: vec![target_id],
                 });
             }
             (ops, created_ids, count)

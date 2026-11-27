@@ -564,21 +564,74 @@ pub(super) fn render_trace_split_preview(ui: &mut Ui, app: &mut StudioApp) {
             for b in format!("{:?}", cfg).as_bytes() {
                 key = key.wrapping_mul(0x0100_0000_01b3) ^ u64::from(*b);
             }
-            let cached_paths = {
-                let mut cache = app.trace_state.split_preview_cache.borrow_mut();
-                if cache.as_ref().is_some_and(|(k, _)| *k == key) {
-                    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+            const PREV_W: u32 = 220;
+            const PREV_H: u32 = 110;
+            let (path_count, pw, ph, before_rgba, after_rgba) = {
+                let cache = app.trace_state.split_preview_cache.borrow();
+                if let Some((k, cnt, cw, ch, bef, aft)) = cache.as_ref() {
+                    if *k == key {
+                        (*cnt, *cw, *ch, bef.clone(), aft.clone())
+                    } else {
+                        drop(cache);
+                        let built =
+                            build_trace_split_preview_buffers(&asset, &r, &cfg, PREV_W, PREV_H);
+                        *app.trace_state.split_preview_cache.borrow_mut() = Some((
+                            key,
+                            built.0,
+                            built.1,
+                            built.2,
+                            built.3.clone(),
+                            built.4.clone(),
+                        ));
+                        built
+                    }
                 } else {
-                    let traced = coree_render::trace_raster_to_mm(
-                        &asset,
-                        r.width_mm.max(1.0),
-                        r.height_mm.max(1.0),
-                        &cfg,
-                    );
-                    *cache = Some((key, traced.clone()));
-                    traced
+                    drop(cache);
+                    let built = build_trace_split_preview_buffers(&asset, &r, &cfg, PREV_W, PREV_H);
+                    *app.trace_state.split_preview_cache.borrow_mut() = Some((
+                        key,
+                        built.0,
+                        built.1,
+                        built.2,
+                        built.3.clone(),
+                        built.4.clone(),
+                    ));
+                    built
                 }
             };
+
+            let tex_cache_id = egui::Id::unique("coree_trace_split_textures");
+            let cached_tex = ui.ctx().data(|d| {
+                d.get_temp::<(u64, egui::TextureHandle, egui::TextureHandle)>(tex_cache_id)
+                    .filter(|(tk, _, _)| *tk == key)
+                    .map(|(_, bt, at)| (bt, at))
+            });
+            let (bef_tex, aft_tex) = if let Some(pair) = cached_tex {
+                pair
+            } else {
+                let bef_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [pw as usize, ph as usize],
+                    &before_rgba,
+                );
+                let aft_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [pw as usize, ph as usize],
+                    &after_rgba,
+                );
+                let bt = ui.ctx().load_texture(
+                    "coree_trace_before",
+                    bef_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                let at = ui.ctx().load_texture(
+                    "coree_trace_after",
+                    aft_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(tex_cache_id, (key, bt.clone(), at.clone())));
+                (bt, at)
+            };
+
             let (rect, resp) =
                 ui.allocate_exact_size(vec2(220.0, 110.0), egui::Sense::click_and_drag());
             let resp = resp.on_hover_text(crate::i18n::I18nKey::TraceSplitDivider.tr_ui(lang));
@@ -588,72 +641,19 @@ pub(super) fn render_trace_split_preview(ui: &mut Ui, app: &mut StudioApp) {
                         ((pos.x - rect.left()) / rect.width()).clamp(0.05, 0.95);
                 }
             }
-            let split_x =
-                rect.left() + rect.width() * app.trace_state.split_divider.clamp(0.05, 0.95);
+            let split_t = app.trace_state.split_divider.clamp(0.05, 0.95);
+            let split_x = rect.left() + rect.width() * split_t;
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, CornerRadius::same(4), tokens.canvas_well);
 
-            // Left half: source bitmap grid sample (Before)
-            let left_clip = egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y));
-            let left_painter = painter.with_clip_rect(left_clip);
-            let cols = 16u32.min(asset.width.max(1));
-            let rows = 10u32.min(asset.height.max(1));
-            let rgba = asset.to_rgba8_vec();
-            let cell_w = rect.width() / cols as f32;
-            let cell_h = rect.height() / rows as f32;
-            for ry in 0..rows {
-                let sy = ((ry as f32 + 0.5) / rows as f32 * asset.height as f32) as u32;
-                let sy = sy.min(asset.height.saturating_sub(1));
-                for cx in 0..cols {
-                    let sx = ((cx as f32 + 0.5) / cols as f32 * asset.width as f32) as u32;
-                    let sx = sx.min(asset.width.saturating_sub(1));
-                    let idx = ((sy * asset.width + sx) * 4) as usize;
-                    if idx + 3 < rgba.len() {
-                        let c = Color32::from_rgba_unmultiplied(
-                            rgba[idx],
-                            rgba[idx + 1],
-                            rgba[idx + 2],
-                            rgba[idx + 3],
-                        );
-                        left_painter.rect_filled(
-                            egui::Rect::from_min_size(
-                                egui::pos2(
-                                    rect.left() + cx as f32 * cell_w,
-                                    rect.top() + ry as f32 * cell_h,
-                                ),
-                                vec2(cell_w + 0.5, cell_h + 0.5),
-                            ),
-                            CornerRadius::ZERO,
-                            c,
-                        );
-                    }
-                }
-            }
+            let left_rect = egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y));
+            let left_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(split_t, 1.0));
+            painter.image(bef_tex.id(), left_rect, left_uv, Color32::WHITE);
 
-            // Right half: live traced vector contours (After)
-            let right_clip = egui::Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
-            let right_painter = painter.with_clip_rect(right_clip);
-            right_painter.rect_filled(right_clip, CornerRadius::ZERO, Color32::WHITE);
-            let sx = rect.width() / (r.width_mm.max(1.0) as f32);
-            let sy = rect.height() / (r.height_mm.max(1.0) as f32);
-            for (path, col) in cached_paths.iter().take(120) {
-                let c32 = core_color_to_egui(col);
-                for sub in &path.subpaths {
-                    let pts: Vec<egui::Pos2> = sub
-                        .nodes
-                        .iter()
-                        .map(|n| {
-                            egui::pos2(
-                                rect.left() + n.pos.x as f32 * sx,
-                                rect.top() + n.pos.y as f32 * sy,
-                            )
-                        })
-                        .collect();
-                    if pts.len() >= 2 {
-                        right_painter.add(egui::Shape::line(pts, Stroke::new(1.2, c32)));
-                    }
-                }
-            }
+            let right_rect = egui::Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
+            let right_uv = egui::Rect::from_min_max(egui::pos2(split_t, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(aft_tex.id(), right_rect, right_uv, Color32::WHITE);
+
             painter.line_segment(
                 [
                     egui::pos2(split_x, rect.top()),
@@ -666,18 +666,17 @@ pub(super) fn render_trace_split_preview(ui: &mut Ui, app: &mut StudioApp) {
                 egui::Align2::LEFT_TOP,
                 crate::i18n::I18nKey::DockTraceBefore.tr_ui(lang),
                 egui::FontId::proportional(9.5),
-                tokens.text,
+                Color32::from_rgb(30, 30, 35),
             );
             painter.text(
                 rect.right_top() + vec2(-4.0, 2.0),
                 egui::Align2::RIGHT_TOP,
                 format!(
-                    "{} ({})",
+                    "{} ({path_count})",
                     crate::i18n::I18nKey::DockTraceAfter.tr_ui(lang),
-                    cached_paths.len()
                 ),
                 egui::FontId::proportional(9.5),
-                Color32::BLACK,
+                Color32::from_rgb(30, 30, 35),
             );
         } else {
             ui.label(
@@ -687,6 +686,116 @@ pub(super) fn render_trace_split_preview(ui: &mut Ui, app: &mut StudioApp) {
             );
         }
     }
+}
+
+fn build_trace_split_preview_buffers(
+    asset: &coree_core::RasterAsset,
+    r: &coree_core::RasterLayerData,
+    cfg: &coree_render::TraceConfig,
+    pw: u32,
+    ph: u32,
+) -> (usize, u32, u32, Vec<u8>, Vec<u8>) {
+    let w_mm = r.width_mm.max(1.0);
+    let h_mm = r.height_mm.max(1.0);
+    let traced = coree_render::trace_raster_to_mm(asset, w_mm, h_mm, cfg);
+    let path_count = traced.len();
+
+    // Aspect-fit rect inside [0..pw, 0..ph] over a subtle neutral checkerboard
+    let scale = ((pw as f64) / w_mm).min((ph as f64) / h_mm).max(1e-6);
+    let fit_w = (w_mm * scale).round().clamp(2.0, pw as f64) as u32;
+    let fit_h = (h_mm * scale).round().clamp(2.0, ph as f64) as u32;
+    let ox = (pw - fit_w) / 2;
+    let oy = (ph - fit_h) / 2;
+
+    let make_checker = || -> Vec<u8> {
+        let mut buf = vec![0u8; (pw * ph * 4) as usize];
+        for y in 0..ph {
+            for x in 0..pw {
+                let light = ((x / 8) + (y / 8)) % 2 == 0;
+                let v = if light { 244u8 } else { 224u8 };
+                let idx = ((y * pw + x) * 4) as usize;
+                buf[idx..idx + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        buf
+    };
+
+    let mut before_rgba = make_checker();
+    for fy in 0..fit_h {
+        let sy = (((u64::from(fy) * u64::from(asset.height)) / u64::from(fit_h)) as u32)
+            .min(asset.height.saturating_sub(1));
+        for fx in 0..fit_w {
+            let sx = (((u64::from(fx) * u64::from(asset.width)) / u64::from(fit_w)) as u32)
+                .min(asset.width.saturating_sub(1));
+            if let Some([sr, sg, sb, sa]) = asset.read_pixel_rgba8(sx, sy) {
+                let dst = (((oy + fy) * pw + (ox + fx)) * 4) as usize;
+                let a = u16::from(sa);
+                let inv = 255 - a;
+                before_rgba[dst] =
+                    ((u16::from(sr) * a + u16::from(before_rgba[dst]) * inv) / 255) as u8;
+                before_rgba[dst + 1] =
+                    ((u16::from(sg) * a + u16::from(before_rgba[dst + 1]) * inv) / 255) as u8;
+                before_rgba[dst + 2] =
+                    ((u16::from(sb) * a + u16::from(before_rgba[dst + 2]) * inv) / 255) as u8;
+            }
+        }
+    }
+
+    let mut after_rgba = make_checker();
+    let is_centerline = matches!(cfg.mode, coree_render::TraceMode::CenterlineTrace);
+    let mut doc = coree_core::Document::new(
+        "TracePreview",
+        fit_w as f64,
+        fit_h as f64,
+        coree_core::ColorMode::Rgb,
+        96.0,
+    );
+    if let Some(page) = doc.active_page_mut() {
+        page.background_fill = coree_core::Fill::None;
+        page.printable_background = true;
+    }
+    let preview_xf = coree_core::Affine2D::scale((fit_w as f64) / w_mm, (fit_h as f64) / h_mm);
+    for (idx, (mut path, col)) in traced.into_iter().enumerate() {
+        path.transform(&preview_xf);
+        let mut obj = coree_core::SceneObject::new(
+            coree_core::ObjectId(0),
+            format!("P{idx}"),
+            coree_core::NodePayload::Path(path),
+        );
+        if is_centerline {
+            obj.fill = coree_core::Fill::None;
+            obj.outline = coree_core::OutlineStyle::solid(col, 1.0);
+        } else {
+            obj.fill = coree_core::Fill::Solid(col);
+            obj.outline = coree_core::OutlineStyle::none();
+        }
+        let _ = doc.add_object(obj, None);
+    }
+    // 25.4 DPI => 1 mm == 1 px, so `doc` (`fit_w x fit_h` mm) renders to exact `fit_w x fit_h` px!
+    if let Ok(rendered) =
+        coree_render::render_page_to_rgba(&doc, 0, 25.4, coree_core::ViewMode::Enhanced)
+    {
+        let rw = rendered.width.min(fit_w);
+        let rh = rendered.height.min(fit_h);
+        for fy in 0..rh {
+            for fx in 0..rw {
+                let src = ((fy * rendered.width + fx) * 4) as usize;
+                let dst = (((oy + fy) * pw + (ox + fx)) * 4) as usize;
+                let sa = u16::from(rendered.rgba[src + 3]);
+                let inv = 255 - sa;
+                after_rgba[dst] = ((u16::from(rendered.rgba[src]) * sa
+                    + u16::from(after_rgba[dst]) * inv)
+                    / 255) as u8;
+                after_rgba[dst + 1] = ((u16::from(rendered.rgba[src + 1]) * sa
+                    + u16::from(after_rgba[dst + 1]) * inv)
+                    / 255) as u8;
+                after_rgba[dst + 2] = ((u16::from(rendered.rgba[src + 2]) * sa
+                    + u16::from(after_rgba[dst + 2]) * inv)
+                    / 255) as u8;
+            }
+        }
+    }
+    (path_count, pw, ph, before_rgba, after_rgba)
 }
 
 pub(super) fn hex_view(

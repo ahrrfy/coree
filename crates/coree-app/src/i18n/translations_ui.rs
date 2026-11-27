@@ -396,6 +396,8 @@ pub(super) const fn tr_ar(key: I18nKey) -> &'static str {
         I18nKey::TraceSmoothing => "التنعيم",
         I18nKey::TraceCorners => "زوايا ناعمة",
         I18nKey::TraceSpeckles => "ترشيح البقع",
+        I18nKey::TraceKeepOriginal => "الاحتفاظ بالصورة الأصلية",
+        I18nKey::TracePlaceBeside => "وضع المتجه بجانب الصورة",
         I18nKey::ProdPreflightTab => "فحص الطباعة",
         I18nKey::ProdSeparationsTab => "فصل الألوان",
         I18nKey::ProdCutDielinesTab => "القص والقوالب",

@@ -396,6 +396,8 @@ pub(super) const fn tr_en(key: I18nKey) -> &'static str {
         I18nKey::TraceSmoothing => "Smoothing",
         I18nKey::TraceCorners => "Corner Smoothness",
         I18nKey::TraceSpeckles => "Speckle Filter",
+        I18nKey::TraceKeepOriginal => "Keep Original Bitmap",
+        I18nKey::TracePlaceBeside => "Place Vector Beside Image",
         I18nKey::ProdPreflightTab => "Preflight",
         I18nKey::ProdSeparationsTab => "Separations",
         I18nKey::ProdCutDielinesTab => "Cut & Dielines",

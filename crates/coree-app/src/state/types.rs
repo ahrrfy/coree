@@ -886,9 +886,9 @@ impl Default for TransformDockerState {
     }
 }
 
-/// Cached traced contours for `SplitPreview` `(config_hash, Vec<(path, color)>)`.
-pub type SplitPreviewCache =
-    std::cell::RefCell<Option<(u64, Vec<(coree_core::BezierPath, Color)>)>>;
+/// Cached high-res RGBA buffers for `SplitPreview`:
+/// `(config_hash, contour_count, preview_w, preview_h, before_rgba, after_rgba)`.
+pub type SplitPreviewCache = std::cell::RefCell<Option<(u64, usize, u32, u32, Vec<u8>, Vec<u8>)>>;
 
 /// Vector Trace Docker state (`S11`).
 #[derive(Debug, Clone)]
@@ -901,6 +901,8 @@ pub struct TraceDockerState {
     pub remove_background: bool,
     pub corner_threshold: f64,
     pub speckle_size: usize,
+    pub keep_original: bool,
+    pub place_side_by_side: bool,
     pub split_preview: bool,
     pub split_divider: f32,
     pub split_preview_cache: SplitPreviewCache,
@@ -911,13 +913,15 @@ impl Default for TraceDockerState {
         Self {
             mode_idx: 1,
             preset: OutlinePreset::Logo,
-            max_colors: 8,
-            smoothing: 0.5,
-            detail: 0.75,
+            max_colors: 12,
+            smoothing: 0.50,
+            detail: 0.82,
             remove_background: true,
             corner_threshold: 60.0,
-            speckle_size: 4,
-            split_preview: false,
+            speckle_size: 2,
+            keep_original: true,
+            place_side_by_side: false,
+            split_preview: true,
             split_divider: 0.5,
             split_preview_cache: std::cell::RefCell::new(None),
         }
@@ -925,6 +929,23 @@ impl Default for TraceDockerState {
 }
 
 impl TraceDockerState {
+    /// Populates sliders with tuned defaults when the user switches `OutlinePreset` in the UI.
+    pub fn apply_preset_defaults(&mut self) {
+        let (colors, detail, smooth, corners, speckle) = match self.preset {
+            OutlinePreset::LineArt => (2, 0.90, 0.35, 65.0, 2),
+            OutlinePreset::Logo => (12, 0.82, 0.50, 60.0, 2),
+            OutlinePreset::DetailedLogo => (24, 0.92, 0.42, 55.0, 1),
+            OutlinePreset::Clipart => (16, 0.80, 0.55, 60.0, 3),
+            OutlinePreset::LowQualityImage => (12, 0.60, 0.72, 70.0, 6),
+            OutlinePreset::HighQualityImage => (48, 0.92, 0.48, 55.0, 1),
+        };
+        self.max_colors = colors;
+        self.detail = detail;
+        self.smoothing = smooth;
+        self.corner_threshold = corners;
+        self.speckle_size = speckle;
+    }
+
     /// Converts UI controls into `coree_render::TraceConfig`.
     #[must_use]
     pub fn to_config(&self) -> TraceConfig {
