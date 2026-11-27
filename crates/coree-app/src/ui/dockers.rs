@@ -534,30 +534,10 @@ pub(super) fn render_trace_split_preview(ui: &mut Ui, app: &mut StudioApp) {
     );
 
     if tr.split_preview {
-        let preview_src = app.active_tab().and_then(|tab| {
-            let target_id = tab
-                .selection
-                .objects
-                .iter()
-                .copied()
-                .find(|id| {
-                    tab.document
-                        .object(*id)
-                        .is_some_and(|o| matches!(o.payload, NodePayload::Raster(_)))
-                })
-                .or_else(|| {
-                    tab.document
-                        .objects()
-                        .iter()
-                        .find(|(_, o)| matches!(o.payload, NodePayload::Raster(_)))
-                        .map(|(&id, _)| id)
-                })?;
-            let NodePayload::Raster(ref r) = tab.document.object(target_id)?.payload else {
-                return None;
-            };
-            let asset = tab.document.asset(r.asset_id)?;
-            Some((target_id, r.clone(), asset.clone()))
-        });
+        let preview_src = app
+            .active_tab()
+            .and_then(StudioApp::find_trace_target_in_tab)
+            .map(|res| (res.root_id, res.raster, res.asset));
         if let Some((oid, r, asset)) = preview_src {
             let cfg = app.trace_state.to_config();
             let mut key: u64 = oid.0 ^ ((asset.width as u64) << 16) ^ (asset.height as u64);

@@ -338,10 +338,20 @@ pub fn apply_theme(ctx: &egui::Context, theme: StudioTheme) {
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.1, t.text);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
 
-    visuals.widgets.active.bg_fill = t.accent;
-    visuals.widgets.active.weak_bg_fill = t.accent;
+    let active_bg = if t.is_dark {
+        Color32::from_rgb(0x1e, 0x78, 0xd8)
+    } else {
+        t.accent
+    };
+    let active_fg = if t.is_dark {
+        Color32::WHITE
+    } else {
+        t.on_accent
+    };
+    visuals.widgets.active.bg_fill = active_bg;
+    visuals.widgets.active.weak_bg_fill = active_bg;
     visuals.widgets.active.bg_stroke = Stroke::new(1.2, t.accent_hover);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.2, t.on_accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.2, active_fg);
     visuals.widgets.active.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.open.bg_fill = hover_bg;

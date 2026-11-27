@@ -314,4 +314,48 @@ fn trace_raster_via_to_curves_keep_original_side_by_side_and_split_preview() {
         app.active_tab().unwrap().document.object(rid).is_some(),
         "single undo must restore original raster"
     );
+
+    // 4. Imported PDF `PowerClip` wrapping a `Raster` ("PDF Clip 4"):
+    // `Convert To Curves` MUST vectorize the raster inside the PowerClip instead of wiping it!
+    let pc_frame_id = {
+        let tab = app.active_tab_mut().unwrap();
+        let fid = tab
+            .document
+            .add_object(
+                SceneObject::new(
+                    ObjectId(0),
+                    "PDF Clip 4",
+                    NodePayload::Path(coree_core::BezierPath::from_rect(
+                        coree_core::Rect2D::from_xywh(0.0, 0.0, 40.0, 40.0),
+                    )),
+                )
+                .with_fill(Fill::None)
+                .with_outline(OutlineStyle::none()),
+                Some(lid),
+            )
+            .unwrap();
+        let pc_id = tab.document.create_powerclip(fid, &[rid]).unwrap();
+        tab.selection.select_single(&tab.document, pc_id);
+        pc_id
+    };
+    assert!(app.selection_has_traceable_raster());
+    assert!(app.selection_is_exclusively_traceable_raster());
+    app.trace_state.keep_original = true;
+    app.convert_selection_to_curves();
+    {
+        let tab = app.active_tab().unwrap();
+        assert!(
+            tab.document.object(pc_frame_id).is_some(),
+            "PDF Clip PowerClip must NOT be destroyed when keep_original=true"
+        );
+        let has_filled_traced_path = tab
+            .document
+            .objects()
+            .values()
+            .any(|o| matches!(o.payload, NodePayload::Path(_)) && o.fill.is_visible());
+        assert!(
+            has_filled_traced_path,
+            "Convert To Curves on PDF PowerClip raster must create visible traced vector curve"
+        );
+    }
 }

@@ -514,24 +514,10 @@ impl StudioApp {
     }
 
     /// Converts all selected shapes/text/tables/rasters to editable [`NodePayload::Path`] curves (`Ctrl+Q`).
-    /// For raster bitmaps, automatically runs high-accuracy Potrace vectorization (`trace_selected_raster`).
-    /// For text objects, extracts real glyph vector outlines via `coree_render`.
+    /// Automatically vectorizes selected rasters as well as imported PDF `PowerClip` / `Group` raster wrappers
+    /// so `Convert To Curves` never strips a `PowerClip` image into an empty frame.
     pub fn convert_selection_to_curves(&mut self) {
-        let all_raster = self.active_tab().is_some_and(|tab| {
-            !tab.selection.objects.is_empty()
-                && tab.selection.objects.iter().all(|&id| {
-                    let Some(obj) = tab.document.object(id) else {
-                        return false;
-                    };
-                    if matches!(obj.payload, NodePayload::Raster(_)) {
-                        return true;
-                    }
-                    tab.document
-                        .resolve_clone_payload_and_style_with_sym_scope(obj, None)
-                        .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_)))
-                })
-        });
-        if all_raster {
+        if self.selection_is_exclusively_traceable_raster() {
             if let Err(e) = self.trace_selected_raster() {
                 self.push_toast(e, true);
             }

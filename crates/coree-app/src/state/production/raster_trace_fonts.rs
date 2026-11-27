@@ -2,7 +2,250 @@
 
 use super::*;
 
+/// Resolved raster object (including rasters nested inside imported PDF `PowerClip`s, `Group`s, or `Clone`s).
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTraceTarget {
+    /// Selected top-level container or object ID (deleted if `keep_original == false`).
+    pub root_id: ObjectId,
+    /// Underlying raster payload.
+    pub raster: coree_core::RasterLayerData,
+    /// Embedded pixel asset.
+    pub asset: RasterAsset,
+    /// Effective world transform of the raster object.
+    pub world_xf: Affine2D,
+    /// Optional perspective envelope on the raster/container.
+    pub persp: Option<coree_core::Perspective3x3>,
+    /// Effective local crop rect in `[0..width_mm, 0..height_mm]` combining `crop_rect` & `PowerClip` bounds.
+    pub effective_crop: Option<Rect2D>,
+}
+
+fn intersect_optional_rects(a: Option<Rect2D>, b: Option<Rect2D>) -> Option<Rect2D> {
+    match (a, b) {
+        (Some(ra), Some(rb)) => {
+            let min_x = ra.min_x.max(rb.min_x);
+            let min_y = ra.min_y.max(rb.min_y);
+            let max_x = ra.max_x.min(rb.max_x);
+            let max_y = ra.max_y.min(rb.max_y);
+            Some(Rect2D {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            })
+        }
+        (Some(ra), None) => Some(ra),
+        (None, Some(rb)) => Some(rb),
+        (None, None) => None,
+    }
+}
+
+/// Recursively resolves a single traceable raster inside `id` (`Raster`, `Clone`, `PowerClip`, or `Group`),
+/// mapping any `PowerClip` container clip bounds into the raster's local millimeter coordinate space.
+fn resolve_single_raster_in_subtree(
+    doc: &Document,
+    root_id: ObjectId,
+    cur_id: ObjectId,
+    world_clip: Option<Rect2D>,
+    depth: usize,
+) -> Option<ResolvedTraceTarget> {
+    if depth > 16 {
+        return None;
+    }
+    let obj = doc.object(cur_id)?;
+    if !obj.visible {
+        return None;
+    }
+    match &obj.payload {
+        NodePayload::Raster(r) => {
+            let asset = doc.asset(r.asset_id)?.clone();
+            let world_xf = doc.world_transform_of(cur_id).unwrap_or(obj.transform);
+            let local_clip_from_world = world_clip.and_then(|wc| {
+                let inv = world_xf.inverse()?;
+                let corners = [
+                    inv.transform_point(Point2D::new(wc.min_x, wc.min_y)),
+                    inv.transform_point(Point2D::new(wc.max_x, wc.min_y)),
+                    inv.transform_point(Point2D::new(wc.max_x, wc.max_y)),
+                    inv.transform_point(Point2D::new(wc.min_x, wc.max_y)),
+                ];
+                let min_x = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let min_y = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                let max_x = corners
+                    .iter()
+                    .map(|p| p.x)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let max_y = corners
+                    .iter()
+                    .map(|p| p.y)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                Some(Rect2D::new(min_x, min_y, max_x, max_y))
+            });
+            let merged_crop = intersect_optional_rects(
+                r.crop_rect.filter(|c| c.is_finite()),
+                local_clip_from_world,
+            );
+            Some(ResolvedTraceTarget {
+                root_id,
+                raster: r.clone(),
+                asset,
+                world_xf,
+                persp: obj.perspective,
+                effective_crop: merged_crop,
+            })
+        }
+        NodePayload::Clone { .. } => {
+            let (eff_payload, _, _, _) =
+                doc.resolve_clone_payload_and_style_with_sym_scope(obj, None)?;
+            let NodePayload::Raster(r) = eff_payload else {
+                return None;
+            };
+            let asset = doc.asset(r.asset_id)?.clone();
+            let world_xf = doc.world_transform_of(cur_id).unwrap_or(obj.transform);
+            Some(ResolvedTraceTarget {
+                root_id,
+                raster: r.clone(),
+                asset,
+                world_xf,
+                persp: obj.perspective,
+                effective_crop: r.crop_rect.filter(|c| c.is_finite()),
+            })
+        }
+        NodePayload::PowerClip {
+            container,
+            contents,
+            ..
+        } => {
+            let pc_world_xf = doc.world_transform_of(cur_id).unwrap_or(obj.transform);
+            let pc_world_bb = container.bounding_box().map(|bb| {
+                let corners = [
+                    pc_world_xf.transform_point(Point2D::new(bb.min_x, bb.min_y)),
+                    pc_world_xf.transform_point(Point2D::new(bb.max_x, bb.min_y)),
+                    pc_world_xf.transform_point(Point2D::new(bb.max_x, bb.max_y)),
+                    pc_world_xf.transform_point(Point2D::new(bb.min_x, bb.max_y)),
+                ];
+                let min_x = corners.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let min_y = corners.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                let max_x = corners
+                    .iter()
+                    .map(|p| p.x)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let max_y = corners
+                    .iter()
+                    .map(|p| p.y)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                Rect2D::new(min_x, min_y, max_x, max_y)
+            });
+            let next_clip = intersect_optional_rects(world_clip, pc_world_bb);
+            let mut found: Option<ResolvedTraceTarget> = None;
+            for &cid in contents {
+                if let Some(res) =
+                    resolve_single_raster_in_subtree(doc, root_id, cid, next_clip, depth + 1)
+                {
+                    found = Some(res);
+                }
+            }
+            found
+        }
+        NodePayload::Group(children) => {
+            let mut found: Option<ResolvedTraceTarget> = None;
+            for &cid in children {
+                if let Some(res) =
+                    resolve_single_raster_in_subtree(doc, root_id, cid, world_clip, depth + 1)
+                {
+                    found = Some(res);
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+fn subtree_contains_only_rasters(doc: &Document, id: ObjectId, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let Some(obj) = doc.object(id) else {
+        return false;
+    };
+    match &obj.payload {
+        NodePayload::Raster(_) => true,
+        NodePayload::Clone { .. } => doc
+            .resolve_clone_payload_and_style_with_sym_scope(obj, None)
+            .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_))),
+        NodePayload::PowerClip { contents, .. } => {
+            !contents.is_empty()
+                && contents
+                    .iter()
+                    .all(|&c| subtree_contains_only_rasters(doc, c, depth + 1))
+        }
+        NodePayload::Group(children) => {
+            !children.is_empty()
+                && children
+                    .iter()
+                    .all(|&c| subtree_contains_only_rasters(doc, c, depth + 1))
+        }
+        _ => false,
+    }
+}
+
 impl StudioApp {
+    /// Returns `true` if any currently selected object is (or contains inside a `PowerClip`/`Group`) a raster bitmap.
+    #[must_use]
+    pub fn selection_has_traceable_raster(&self) -> bool {
+        self.active_tab().is_some_and(|tab| {
+            tab.selection.objects.iter().any(|&id| {
+                resolve_single_raster_in_subtree(&tab.document, id, id, None, 0).is_some()
+            })
+        })
+    }
+
+    /// Returns `true` if the non-empty selection consists exclusively of rasters or `PowerClip`/`Group` wrappers around rasters.
+    #[must_use]
+    pub fn selection_is_exclusively_traceable_raster(&self) -> bool {
+        self.active_tab().is_some_and(|tab| {
+            !tab.selection.objects.is_empty()
+                && tab
+                    .selection
+                    .objects
+                    .iter()
+                    .all(|&id| subtree_contains_only_rasters(&tab.document, id, 0))
+        })
+    }
+
+    /// Finds the active raster target from the current selection (supporting imported PDF `PowerClip`s and `Group`s),
+    /// falling back to the first visible editable raster on the active page.
+    #[must_use]
+    pub(crate) fn find_trace_target_in_tab(tab: &DocumentTab) -> Option<ResolvedTraceTarget> {
+        for &sel_id in &tab.selection.objects {
+            if let Some(target) =
+                resolve_single_raster_in_subtree(&tab.document, sel_id, sel_id, None, 0)
+            {
+                return Some(target);
+            }
+        }
+        let active_page_idx = tab.document.active_page_index();
+        for (p_idx, page) in tab.document.pages().iter().enumerate() {
+            for layer in &page.layers {
+                if !layer.visible
+                    || layer.locked
+                    || !Document::layer_applies_to_page(layer, p_idx, active_page_idx)
+                {
+                    continue;
+                }
+                for &oid in layer.objects.iter().rev() {
+                    if is_object_editable_in_doc(&tab.document, oid) {
+                        if let Some(target) =
+                            resolve_single_raster_in_subtree(&tab.document, oid, oid, None, 0)
+                        {
+                            return Some(target);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Traces the selected raster object via `coree_render::trace_raster_to_mm` and adds grouped vector curves.
     pub fn trace_selected_raster(&mut self) -> Result<usize, String> {
         let layer_id = self.active_creation_layer_or_err()?;
@@ -14,86 +257,16 @@ impl StudioApp {
                 .get(self.active_tab)
                 .ok_or_else(|| "no active document".to_owned())?;
 
-            // Find selected raster object (or Clone of raster, or first raster on active page)
-            let is_raster_or_clone = |id: ObjectId| -> bool {
-                let Some(obj) = tab.document.object(id) else {
-                    return false;
-                };
-                if matches!(obj.payload, NodePayload::Raster(_)) {
-                    return true;
-                }
-                tab.document
-                    .resolve_clone_payload_and_style_with_sym_scope(obj, None)
-                    .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_)))
-            };
-            let target_id = tab
-                .selection
-                .objects
-                .iter()
-                .copied()
-                .find(|id| is_raster_or_clone(*id))
-                .or_else(|| {
-                    let active_page_idx = tab.document.active_page_index();
-                    tab.document
-                        .objects()
-                        .iter()
-                        .find(|(&id, _)| {
-                            is_raster_or_clone(id)
-                                && is_object_editable_in_doc(&tab.document, id)
-                                && enclosing_layer_of_object(&tab.document, id).is_some_and(|lid| {
-                                    tab.document.pages().iter().enumerate().any(|(p_idx, p)| {
-                                        p.layers.iter().any(|l| {
-                                            l.id == lid
-                                                && Document::layer_applies_to_page(
-                                                    l,
-                                                    p_idx,
-                                                    active_page_idx,
-                                                )
-                                        })
-                                    })
-                                })
-                        })
-                        .map(|(&id, _)| id)
-                })
+            let resolved = Self::find_trace_target_in_tab(tab)
                 .ok_or_else(|| "select a raster bitmap object to run Vector Trace".to_owned())?;
-
-            let (asset, filters, crop_rect, w_mm, h_mm, xf, persp) = {
-                let obj = tab
-                    .document
-                    .object(target_id)
-                    .ok_or_else(|| "raster object missing".to_owned())?;
-                let resolved_payload = if let NodePayload::Raster(ref r) = obj.payload {
-                    Some(r.clone())
-                } else {
-                    tab.document
-                        .resolve_clone_payload_and_style_with_sym_scope(obj, None)
-                        .and_then(|(p, _, _, _)| match p {
-                            NodePayload::Raster(r) => Some(r),
-                            _ => None,
-                        })
-                };
-                let Some(r) = resolved_payload else {
-                    return Err("object is not a raster".to_owned());
-                };
-                let asset = tab
-                    .document
-                    .asset(r.asset_id)
-                    .cloned()
-                    .ok_or_else(|| "embedded raster asset missing".to_owned())?;
-                let xf = tab
-                    .document
-                    .world_transform_of(target_id)
-                    .unwrap_or(obj.transform);
-                (
-                    asset,
-                    r.active_filters(),
-                    r.crop_rect,
-                    r.width_mm,
-                    r.height_mm,
-                    xf,
-                    obj.perspective,
-                )
-            };
+            let target_id = resolved.root_id;
+            let asset = resolved.asset;
+            let filters = resolved.raster.active_filters();
+            let crop_rect = resolved.effective_crop;
+            let w_mm = resolved.raster.width_mm;
+            let h_mm = resolved.raster.height_mm;
+            let xf = resolved.world_xf;
+            let persp = resolved.persp;
 
             if !w_mm.is_finite() || w_mm <= 0.0 || !h_mm.is_finite() || h_mm <= 0.0 {
                 return Err("raster has invalid dimensions".to_owned());

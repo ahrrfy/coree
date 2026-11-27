@@ -13,16 +13,7 @@ pub(super) fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut S
                     .is_some_and(|o| matches!(o.payload, NodePayload::Clone { .. }))
             })
         });
-        let has_raster = app.active_tab().is_some_and(|t| {
-            t.selection.objects.iter().any(|id| {
-                t.document.object(*id).is_some_and(|o| {
-                    matches!(o.payload, NodePayload::Raster(_))
-                        || t.document
-                            .resolve_clone_payload_and_style_with_sym_scope(o, None)
-                            .is_some_and(|(p, _, _, _)| matches!(p, NodePayload::Raster(_)))
-                })
-            })
-        });
+        let has_raster = app.selection_has_traceable_raster();
         let has_clip = app.has_clipboard_content();
         let lang = app.ui_language;
 

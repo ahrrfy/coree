@@ -190,12 +190,18 @@ fn trace_outline_potrace(
     mut scale_y: f64,
 ) -> Vec<(BezierPath, Color)> {
     let (k, detail, smooth, corner_deg, turd_size) = effective_params(config);
-    let (palette, mut labels) = quantize_kmeans_u8(&rgba8, w, h, k);
+    let allow_bimodal_lineart = !matches!(
+        config.mode,
+        TraceMode::OutlineTrace(OutlinePreset::LowQualityImage | OutlinePreset::HighQualityImage)
+    );
+    let orig_w = w;
+    let orig_h = h;
+    let bg_rgb_est = estimate_border_rgb_rgba(&rgba8, w, h);
+    let (palette, mut labels) = quantize_kmeans_u8(&rgba8, w, h, k, allow_bimodal_lineart);
     if palette.is_empty() {
         return Vec::new();
     }
     suppress_antialias_halos(&rgba8, &palette, &mut labels, w, h);
-    drop(rgba8);
 
     if config.remove_background {
         if let Some(bg_lbl) = detect_border_background_label_u8(&labels, w, h, palette.len()) {
@@ -208,6 +214,7 @@ fn trace_outline_potrace(
     }
 
     prune_speckles_reassign(&mut labels, w, h, turd_size);
+    prune_sideways_1px_burrs(&mut labels, w, h);
     enforce_trace_edge_budget(&mut labels, &mut w, &mut h, &mut scale_x, &mut scale_y);
 
     // Count area per label after background removal, speckle reassignment, and edge-budget pass
@@ -219,8 +226,19 @@ fn trace_outline_potrace(
     }
 
     let potrace_alphamax = potrace_alphamax_from_params(corner_deg, smooth);
-    let potrace_opttol = 0.05 + smooth * 0.35 + (1.0 - detail) * 0.25;
-    let region_subpaths = potrace_extract_shared_subpaths(
+    let potrace_opttol = 0.32 + smooth * 0.58 + (1.0 - detail) * 0.30;
+    let subpixel_ctx = if w == orig_w && h == orig_h {
+        Some(SubpixelCtx {
+            rgba8: &rgba8,
+            w,
+            h,
+            palette: &palette,
+            bg_rgb: bg_rgb_est,
+        })
+    } else {
+        None
+    };
+    let region_subpaths = potrace_extract_shared_subpaths_with_subpixel(
         &labels,
         w,
         h,
@@ -231,7 +249,9 @@ fn trace_outline_potrace(
         corner_deg,
         scale_x,
         scale_y,
+        subpixel_ctx,
     );
+    drop(rgba8);
     drop(labels);
 
     let mut ordered: Vec<(usize, usize)> = color_counts
@@ -412,10 +432,17 @@ fn enforce_trace_edge_budget(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SubpixelCtx<'a> {
+    rgba8: &'a [u8],
+    w: usize,
+    h: usize,
+    palette: &'a [[u8; 3]],
+    bg_rgb: [u8; 3],
+}
+
 /// Topological shared-edge Potrace boundary extractor.
-/// Uses a 1-byte-per-vertex packed bitmask over `(w + 1) * (h + 1)` vertices (no per-vertex
-/// `HashMap` or `UndirEdge` heap bloat), traces every boundary arc between `(left_label, right_label)`
-/// ONCE by Potrace, and shares it identically (forward for `left_label`, reversed for `right_label`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn potrace_extract_shared_subpaths(
     labels: &[u8],
@@ -428,6 +455,39 @@ fn potrace_extract_shared_subpaths(
     corner_deg: f64,
     scale_x: f64,
     scale_y: f64,
+) -> HashMap<usize, Vec<Subpath>> {
+    potrace_extract_shared_subpaths_with_subpixel(
+        labels,
+        w,
+        h,
+        palette_len,
+        alphamax,
+        opttol,
+        smooth,
+        corner_deg,
+        scale_x,
+        scale_y,
+        None,
+    )
+}
+
+/// Topological shared-edge Potrace boundary extractor with optional sub-pixel `rgba8` iso-contouring.
+/// Uses a 1-byte-per-vertex packed bitmask over `(w + 1) * (h + 1)` vertices (no per-vertex
+/// `HashMap` or `UndirEdge` heap bloat), traces every boundary arc between `(left_label, right_label)`
+/// ONCE by Potrace + Taubin-Schneider, and shares it identically (forward for `left_label`, reversed for `right_label`).
+#[allow(clippy::too_many_arguments)]
+fn potrace_extract_shared_subpaths_with_subpixel(
+    labels: &[u8],
+    w: usize,
+    h: usize,
+    palette_len: usize,
+    alphamax: f64,
+    opttol: f64,
+    smooth: f64,
+    corner_deg: f64,
+    scale_x: f64,
+    scale_y: f64,
+    subpixel: Option<SubpixelCtx<'_>>,
 ) -> HashMap<usize, Vec<Subpath>> {
     const BIT_E: u8 = 1 << 0;
     const BIT_S: u8 = 1 << 1;
@@ -557,7 +617,8 @@ fn potrace_extract_shared_subpaths(
                 kind: ArcKind::OpenArc,
             };
             let nodes = potrace(
-                &chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+                &chain, left_lbl, right_lbl, subpixel, alphamax, opttol, smooth, corner_deg,
+                scale_x, scale_y,
             );
             traced_segs.push(TracedBoundarySeg {
                 left_label: left_lbl,
@@ -610,7 +671,8 @@ fn potrace_extract_shared_subpaths(
                     kind: ArcKind::ClosedLoop,
                 };
                 let nodes = potrace(
-                    &chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+                    &chain, left_lbl, right_lbl, subpixel, alphamax, opttol, smooth, corner_deg,
+                    scale_x, scale_y,
                 );
                 if nodes.len() >= 2 {
                     if (left_lbl as usize) < num_labels {
@@ -810,9 +872,13 @@ fn reverse_nodes(nodes: &[PathNode]) -> Vec<PathNode> {
         .collect()
 }
 
-/// Peter Selinger's Potrace polygon & cubic Bézier optimization on one canonical chain/loop.
+/// Peter Selinger's Potrace polygon + Taubin shrinkage-free fairing + Schneider cubic Bézier fit.
+#[allow(clippy::too_many_arguments)]
 fn potrace(
     chain: &PotraceChain<'_>,
+    left_lbl: u8,
+    right_lbl: u8,
+    subpixel: Option<SubpixelCtx<'_>>,
     alphamax: f64,
     opttol: f64,
     smooth: f64,
@@ -821,12 +887,17 @@ fn potrace(
     scale_y: f64,
 ) -> Vec<PathNode> {
     potrace_vectorize_chain(
-        chain, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+        chain, left_lbl, right_lbl, subpixel, alphamax, opttol, smooth, corner_deg, scale_x,
+        scale_y,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn potrace_vectorize_chain(
     chain: &PotraceChain<'_>,
+    left_lbl: u8,
+    right_lbl: u8,
+    subpixel: Option<SubpixelCtx<'_>>,
     alphamax: f64,
     opttol: f64,
     smooth: f64,
@@ -843,8 +914,9 @@ fn potrace_vectorize_chain(
     let lon = potrace_calc_lon(chain.pts, closed);
     let po = potrace_bestpolygon(chain.pts, &sums, &lon, closed);
     let vertices = potrace_adjust_vertices(chain.pts, &sums, &po, closed);
-    let mut nodes = potrace_smooth_and_opticurve(
-        &vertices, closed, alphamax, opttol, smooth, corner_deg, scale_x, scale_y,
+    let mut nodes = potrace_taubin_schneider_fit(
+        chain.pts, &po, &vertices, closed, left_lbl, right_lbl, subpixel, alphamax, opttol, smooth,
+        corner_deg, scale_x, scale_y,
     );
     if nodes.len() < 2 {
         nodes = chain
@@ -973,7 +1045,8 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
             if bit != 0 {
                 prev_dir = bit;
             }
-            // Scale by 2 so ±1 offsets represent exact ±0.5-pixel box tolerance.
+            // Scale by 2 so ±1 offsets represent exact ±0.5-pixel box tolerance,
+            // keeping 1px peninsulas and border edges exact while Taubin-Schneider smooths curves.
             let cur_x = 2 * i64::from(cur.0 - p0.0);
             let cur_y = 2 * i64::from(cur.1 - p0.1);
             let inside_cone = if closed {
@@ -1023,7 +1096,6 @@ fn potrace_calc_lon(pts: &[(i32, i32)], closed: bool) -> Vec<usize> {
             }
             last_valid = j;
             if cur_x.abs() > 1 || cur_y.abs() > 1 {
-                // Tighten cone constraints around exact ±0.5-pixel box (±1 in 2x coordinates)
                 let off0 = (
                     cur_x
                         + if cur_y >= 0 && (cur_y > 0 || cur_x < 0) {
@@ -1258,9 +1330,14 @@ fn intersect_lines(p0: Point2D, d0: Vec2D, p1: Point2D, d1: Vec2D) -> Option<Poi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn potrace_smooth_and_opticurve(
+fn potrace_taubin_schneider_fit(
+    pts: &[(i32, i32)],
+    po: &[usize],
     vertices: &[Point2D],
     closed: bool,
+    left_lbl: u8,
+    right_lbl: u8,
+    subpixel: Option<SubpixelCtx<'_>>,
     alphamax: f64,
     opttol: f64,
     smooth: f64,
@@ -1281,9 +1358,6 @@ fn potrace_smooth_and_opticurve(
     }
 
     let corner_rad = corner_deg.to_radians();
-    // Classify each vertex via Selinger's Potrace L_inf chord distance dd = dpara / ddenom,
-    // and assign exact trigonometric circular-arc cubic Bezier handle ratios on smooth bends.
-    let mut alphas = vec![0.0_f64; m];
     let mut is_corner = vec![false; m];
     for i in 0..m {
         if !closed && (i == 0 || i + 1 == m) {
@@ -1319,107 +1393,559 @@ fn potrace_smooth_and_opticurve(
         };
         let min_edge = len_in.min(len_out);
         let max_edge = len_in.max(len_out);
-        // Preserve true geometric corners:
-        // 1) Selinger's Potrace L_inf sagitta exceeds alphamax (distinguishes squares from tiny circles)
-        // 2) Explicit sharp geometric angle on long edges
-        // 3) Asymmetric 90-deg end-caps on 1px strokes/peninsulas (long side >= 5.5px + sharp turn)
-        let sharp_asymmetric_cap =
-            max_edge >= 5.5 && max_edge >= 3.5 * min_edge.max(0.5) && turn >= 1.25;
-        let sharp_long_corner = dd > 2.0 && min_edge >= 4.5 && turn >= corner_rad;
+        // True 1-2px peninsula end-cap makes a 180-deg U-turn across a short cap edge
+        // (whereas a shallow-arch 1px staircase step continues in the same forward direction!).
+        let sharp_asymmetric_cap = if max_edge >= 5.5 && min_edge <= 2.5 && turn >= 1.25 {
+            if len_in < len_out {
+                let prev2 = vertices[(i + m - 2) % m];
+                let v_prev_long = (prev - prev2).normalize_or_zero();
+                v_prev_long.dot(v_out) < -0.5
+            } else {
+                let next2 = vertices[(i + 2) % m];
+                let v_next_long = (next2 - next).normalize_or_zero();
+                v_in.dot(v_next_long) < -0.5
+            }
+        } else {
+            false
+        };
+        let sharp_long_corner = dd > 3.2 && min_edge >= 6.0 && turn >= corner_rad;
         if alpha_potrace > alphamax || sharp_long_corner || sharp_asymmetric_cap {
             is_corner[i] = true;
+        }
+    }
+
+    let taubin_passes = (3.0 + smooth * 6.0).round() as usize;
+    let fit_tol_px = opttol.clamp(0.22, 1.35);
+    let n = pts.len();
+    let corner_indices: Vec<usize> = (0..m).filter(|&i| is_corner[i]).collect();
+
+    // Case 1: Closed smooth loop with ZERO sharp corners (circles, ovals, smooth organic holes/blobs)
+    if closed && corner_indices.is_empty() {
+        let mut ring = Vec::with_capacity(n);
+        for idx in 0..n {
+            let a = pts[idx];
+            let b = pts[(idx + 1) % n];
+            ring.push(subpixel_edge_midpoint(a, b, left_lbl, right_lbl, subpixel));
+        }
+        taubin_fair_points(&mut ring, true, taubin_passes);
+        if ring.len() < 4 {
+            return vertices
+                .iter()
+                .map(|&p| PathNode::corner(scale(p)))
+                .collect();
+        }
+        let half = ring.len() / 2;
+        let win = (ring.len() / 16).clamp(1, 5);
+        let t0 = cyclic_unit_tangent(&ring, 0, win);
+        let th = cyclic_unit_tangent(&ring, half, win);
+
+        let seg1 = ring[0..=half].to_vec();
+        let mut seg2 = ring[half..].to_vec();
+        seg2.push(ring[0]);
+        if seg1.len() < 2 || seg2.len() < 2 {
+            return vertices
+                .iter()
+                .map(|&p| PathNode::corner(scale(p)))
+                .collect();
+        }
+        let fit1 = schneider_fit_segment(&seg1, t0, -th, fit_tol_px);
+        let fit2 = schneider_fit_segment(&seg2, th, -t0, fit_tol_px);
+        let mut out_nodes: Vec<PathNode> = Vec::with_capacity(fit1.len() + fit2.len());
+        append_cubic_chain(&mut out_nodes, &fit1, scale, true);
+        append_cubic_chain(&mut out_nodes, &fit2, scale, true);
+        if out_nodes.len() >= 3
+            && out_nodes.last().unwrap().pos.distance_to(out_nodes[0].pos) < 1e-5
+        {
+            let last = out_nodes.pop().unwrap();
+            out_nodes[0].handle_in = last.handle_in;
+            out_nodes[0].kind = NodeKind::Smooth;
+        }
+        return out_nodes;
+    }
+
+    // Case 2: OpenArc or ClosedLoop with >= 1 sharp corner(s)
+    let span_count = if closed {
+        corner_indices.len()
+    } else {
+        corner_indices.len().saturating_sub(1)
+    };
+    let mut out_nodes: Vec<PathNode> = Vec::with_capacity(m * 2);
+    for s_idx in 0..span_count {
+        let ca = corner_indices[s_idx];
+        let cb = corner_indices[(s_idx + 1) % corner_indices.len()];
+        let start_pt = vertices[ca];
+        let end_pt = vertices[cb];
+        let poly_steps = if closed {
+            if cb > ca {
+                cb - ca
+            } else {
+                m - ca + cb
+            }
+        } else {
+            cb - ca
+        };
+
+        // Single optimal-polygon edge between two sharp corners -> pure straight line segment!
+        if poly_steps == 1 {
+            let s0 = scale(start_pt);
+            let s1 = scale(end_pt);
+            if out_nodes.is_empty() {
+                out_nodes.push(PathNode::corner(s0));
+            } else if let Some(last) = out_nodes.last_mut() {
+                last.kind = NodeKind::Cusp;
+            }
+            out_nodes.push(PathNode::corner(s1));
             continue;
         }
-        // Exact trigonometric cubic Bezier tangent ratio for circular arc of angle `turn`:
-        // alpha_arc(theta) = (4/3) * tan(theta/4) / tan(theta/2) = (2/3) * (1 - tan^2(theta/4))
-        // (= 0.66667 as theta -> 0, 0.55228475 at theta = 90 deg), gently modulated by smoothing.
-        let tan_q = (turn.clamp(0.0, 3.0) * 0.25).tan();
-        let exact_arc_alpha = (2.0 / 3.0) * (1.0 - tan_q * tan_q);
-        let potrace_floor = 0.50 + 0.32 * alpha_potrace;
-        let blend_smooth = 0.85 + 0.15 * smooth;
-        alphas[i] = (exact_arc_alpha.max(potrace_floor) * blend_smooth).clamp(0.45, 0.85);
-    }
 
-    // Build curve / corner nodes using Potrace midpoints and cubic Bézier control handles
-    let mut nodes: Vec<PathNode> = Vec::with_capacity(m * 2);
-    if !closed {
-        nodes.push(PathNode::corner(scale(vertices[0])));
-        for i in 1..(m - 1) {
-            let prev = vertices[i - 1];
-            let curr = vertices[i];
-            let next = vertices[i + 1];
-            if is_corner[i] {
-                nodes.push(PathNode::corner(scale(curr)));
+        // Multi-edge smooth curve span between sharp corners `ca` and `cb`
+        let raw_i0 = po[ca] % n;
+        let raw_i1 = po[cb] % n;
+        let mut curve_pts = Vec::new();
+        curve_pts.push(start_pt);
+        if closed {
+            let steps = if raw_i1 > raw_i0 {
+                raw_i1 - raw_i0
             } else {
-                let b_in = prev.lerp(curr, 0.5);
-                let b_out = curr.lerp(next, 0.5);
-                let a = alphas[i];
-                let c1 = b_in.lerp(curr, a);
-                let c2 = b_out.lerp(curr, a);
-                // If previous node wasn't already b_in, push b_in
-                let b_in_s = scale(b_in);
-                let c1_s = scale(c1);
-                let c2_s = scale(c2);
-                let b_out_s = scale(b_out);
-                if nodes
-                    .last()
-                    .is_some_and(|n| n.pos.distance_to(b_in_s) < 1e-6)
-                {
-                    if let Some(last) = nodes.last_mut() {
-                        last.handle_out = Some(c1_s);
-                        last.kind = NodeKind::Smooth;
-                    }
-                } else {
-                    nodes.push(PathNode::new(b_in_s, None, Some(c1_s), NodeKind::Smooth));
-                }
-                nodes.push(PathNode::new(b_out_s, Some(c2_s), None, NodeKind::Smooth));
+                n - raw_i0 + raw_i1
+            };
+            for step in 0..steps {
+                let idx = (raw_i0 + step) % n;
+                let a = pts[idx];
+                let b = pts[(idx + 1) % n];
+                curve_pts.push(subpixel_edge_midpoint(a, b, left_lbl, right_lbl, subpixel));
+            }
+        } else {
+            for idx in raw_i0..raw_i1 {
+                let a = pts[idx];
+                let b = pts[idx + 1];
+                curve_pts.push(subpixel_edge_midpoint(a, b, left_lbl, right_lbl, subpixel));
             }
         }
-        nodes.push(PathNode::corner(scale(vertices[m - 1])));
-    } else {
-        for i in 0..m {
-            let prev = vertices[(i + m - 1) % m];
-            let curr = vertices[i];
-            let next = vertices[(i + 1) % m];
-            if is_corner[i] {
-                nodes.push(PathNode::corner(scale(curr)));
-            } else {
-                let b_in = prev.lerp(curr, 0.5);
-                let b_out = curr.lerp(next, 0.5);
-                let a = alphas[i];
-                let c1 = b_in.lerp(curr, a);
-                let c2 = b_out.lerp(curr, a);
-                let b_in_s = scale(b_in);
-                let c1_s = scale(c1);
-                let c2_s = scale(c2);
-                let b_out_s = scale(b_out);
-                if nodes
-                    .last()
-                    .is_some_and(|n| n.pos.distance_to(b_in_s) < 1e-6)
-                {
-                    if let Some(last) = nodes.last_mut() {
-                        last.handle_out = Some(c1_s);
-                        last.kind = NodeKind::Smooth;
-                    }
-                } else {
-                    nodes.push(PathNode::new(b_in_s, None, Some(c1_s), NodeKind::Smooth));
-                }
-                nodes.push(PathNode::new(b_out_s, Some(c2_s), None, NodeKind::Smooth));
-            }
-        }
-        // Merge wrap-around duplicate node if last == first
-        if nodes.len() >= 4 && nodes.last().unwrap().pos.distance_to(nodes[0].pos) < 1e-6 {
-            let last = nodes.pop().unwrap();
-            nodes[0].handle_in = last.handle_in;
-            nodes[0].kind = NodeKind::Smooth;
-        }
+        curve_pts.push(end_pt);
+
+        taubin_fair_points(&mut curve_pts, false, taubin_passes);
+        let win = (curve_pts.len() / 8).clamp(1, 4);
+        let t_start = open_start_tangent(&curve_pts, win);
+        let t_end = open_end_tangent(&curve_pts, win);
+        let fitted = schneider_fit_segment(&curve_pts, t_start, t_end, fit_tol_px);
+        append_cubic_chain(&mut out_nodes, &fitted, scale, false);
     }
 
-    // Potrace opticurve pass: merge consecutive collinear/co-curving smooth segments within opttolerance
-    potrace_opticurve_merge(&mut nodes, closed, opttol * scale_x.min(scale_y));
-    nodes
+    if closed
+        && out_nodes.len() >= 3
+        && out_nodes.last().unwrap().pos.distance_to(out_nodes[0].pos) < 1e-5
+    {
+        let last = out_nodes.pop().unwrap();
+        out_nodes[0].handle_in = last.handle_in;
+        out_nodes[0].kind = NodeKind::Cusp;
+    }
+    out_nodes
 }
 
+/// Computes the sub-pixel midpoint of grid step `a -> b` shifted along its perpendicular normal
+/// using the continuous 0.5-iso-surface crossing of `rgba8` between `left_lbl` and `right_lbl`.
+fn subpixel_edge_midpoint(
+    a: (i32, i32),
+    b: (i32, i32),
+    left_lbl: u8,
+    right_lbl: u8,
+    subpixel: Option<SubpixelCtx<'_>>,
+) -> Point2D {
+    let mx = (f64::from(a.0) + f64::from(b.0)) * 0.5;
+    let my = (f64::from(a.1) + f64::from(b.1)) * 0.5;
+    let Some(ctx) = subpixel else {
+        return Point2D::new(mx, my);
+    };
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let (pl, pr) = match (dx, dy) {
+        (1, 0) => ((a.0, a.1 - 1), (a.0, a.1)),
+        (0, 1) => ((a.0, a.1), (a.0 - 1, a.1)),
+        (-1, 0) => ((a.0 - 1, a.1), (a.0 - 1, a.1 - 1)),
+        (0, -1) => ((a.0 - 1, a.1 - 1), (a.0, a.1 - 1)),
+        _ => return Point2D::new(mx, my),
+    };
+    if pl.0 < 0
+        || pl.1 < 0
+        || pr.0 < 0
+        || pr.1 < 0
+        || (pl.0 as usize) >= ctx.w
+        || (pl.1 as usize) >= ctx.h
+        || (pr.0 as usize) >= ctx.w
+        || (pr.1 as usize) >= ctx.h
+    {
+        return Point2D::new(mx, my);
+    }
+    let il = ((pl.1 as usize) * ctx.w + (pl.0 as usize)) * 4;
+    let ir = ((pr.1 as usize) * ctx.w + (pr.0 as usize)) * 4;
+    let pxl = &ctx.rgba8[il..il + 4];
+    let pxr = &ctx.rgba8[ir..ir + 4];
+
+    // Alpha boundary sub-pixel interpolation for transparent PNGs
+    if (pxl[3] < 128) != (pxr[3] < 128) {
+        let fl = f64::from(pxl[3]) / 255.0;
+        let fr = f64::from(pxr[3]) / 255.0;
+        let denom = fr - fl;
+        if denom.abs() > 0.15 {
+            let delta = ((0.5 - fl) / denom - 0.5).clamp(-0.40, 0.40);
+            let nx = f64::from(-dy);
+            let ny = f64::from(dx);
+            return Point2D::new(mx + nx * delta, my + ny * delta);
+        }
+        return Point2D::new(mx, my);
+    }
+
+    let cl = if (left_lbl as usize) < ctx.palette.len() {
+        ctx.palette[left_lbl as usize]
+    } else {
+        ctx.bg_rgb
+    };
+    let cr = if (right_lbl as usize) < ctx.palette.len() {
+        ctx.palette[right_lbl as usize]
+    } else {
+        ctx.bg_rgb
+    };
+    let dcr = f64::from(cr[0]) - f64::from(cl[0]);
+    let dcg = f64::from(cr[1]) - f64::from(cl[1]);
+    let dcb = f64::from(cr[2]) - f64::from(cl[2]);
+    let dc_sq = dcr * dcr + dcg * dcg + dcb * dcb;
+    if dc_sq <= 400.0 {
+        return Point2D::new(mx, my);
+    }
+    let proj = |px: &[u8]| -> f64 {
+        let vr = f64::from(px[0]) - f64::from(cl[0]);
+        let vg = f64::from(px[1]) - f64::from(cl[1]);
+        let vb = f64::from(px[2]) - f64::from(cl[2]);
+        ((vr * dcr + vg * dcg + vb * dcb) / dc_sq).clamp(0.0, 1.0)
+    };
+    let fl = proj(pxl);
+    let fr = proj(pxr);
+    if fr - fl > 0.15 {
+        let delta = ((0.5 - fl) / (fr - fl) - 0.5).clamp(-0.40, 0.40);
+        let nx = f64::from(-dy);
+        let ny = f64::from(dx);
+        Point2D::new(mx + nx * delta, my + ny * delta)
+    } else {
+        Point2D::new(mx, my)
+    }
+}
+
+/// Taubin SIGGRAPH '95 shrinkage-free low-pass contour filter (`lambda = 0.45, mu = -0.473`).
+/// Eliminates pixel-grid staircase oscillation while preserving circle/stroke radii to < 0.1%.
+fn taubin_fair_points(pts: &mut [Point2D], closed: bool, passes: usize) {
+    let n = pts.len();
+    if (closed && n < 4) || (!closed && n < 4) || passes == 0 {
+        return;
+    }
+    const LAMBDA: f64 = 0.45;
+    const MU: f64 = -0.473;
+    let mut tmp = pts.to_vec();
+    for _ in 0..passes {
+        for weight in [LAMBDA, MU] {
+            if closed {
+                for i in 0..n {
+                    let prev = pts[(i + n - 1) % n];
+                    let curr = pts[i];
+                    let next = pts[(i + 1) % n];
+                    let lap_x = 0.5 * (prev.x + next.x) - curr.x;
+                    let lap_y = 0.5 * (prev.y + next.y) - curr.y;
+                    tmp[i] = Point2D::new(curr.x + weight * lap_x, curr.y + weight * lap_y);
+                }
+                pts.copy_from_slice(&tmp);
+            } else {
+                tmp[0] = pts[0];
+                tmp[n - 1] = pts[n - 1];
+                for i in 1..(n - 1) {
+                    let prev = pts[i - 1];
+                    let curr = pts[i];
+                    let next = pts[i + 1];
+                    let lap_x = 0.5 * (prev.x + next.x) - curr.x;
+                    let lap_y = 0.5 * (prev.y + next.y) - curr.y;
+                    tmp[i] = Point2D::new(curr.x + weight * lap_x, curr.y + weight * lap_y);
+                }
+                pts.copy_from_slice(&tmp);
+            }
+        }
+    }
+}
+
+fn cyclic_unit_tangent(pts: &[Point2D], idx: usize, win: usize) -> Vec2D {
+    let n = pts.len();
+    let a = pts[(idx + n - win.min(n - 1)) % n];
+    let b = pts[(idx + win.min(n - 1)) % n];
+    let d = b - a;
+    if d.length_sq() > 1e-12 {
+        d.normalize_or_zero()
+    } else {
+        (pts[(idx + 1) % n] - pts[idx]).normalize_or_zero()
+    }
+}
+
+fn open_start_tangent(pts: &[Point2D], win: usize) -> Vec2D {
+    let k = win.min(pts.len() - 1).max(1);
+    let d = pts[k] - pts[0];
+    if d.length_sq() > 1e-12 {
+        d.normalize_or_zero()
+    } else {
+        Vec2D::new(1.0, 0.0)
+    }
+}
+
+fn open_end_tangent(pts: &[Point2D], win: usize) -> Vec2D {
+    let last = pts.len() - 1;
+    let k = win.min(last).max(1);
+    let d = pts[last - k] - pts[last];
+    if d.length_sq() > 1e-12 {
+        d.normalize_or_zero()
+    } else {
+        Vec2D::new(-1.0, 0.0)
+    }
+}
+
+/// Appends fitted `[p0, c1, c2, p3]` cubic segments onto `out_nodes` with `G1` `NodeKind::Smooth`
+/// interior joins and `NodeKind::Cusp` (or `Smooth` when `smooth_ends`) span endpoints.
+fn append_cubic_chain(
+    out_nodes: &mut Vec<PathNode>,
+    cubics: &[[Point2D; 4]],
+    scale: impl Fn(Point2D) -> Point2D,
+    smooth_ends: bool,
+) {
+    if cubics.is_empty() {
+        return;
+    }
+    let end_kind = if smooth_ends {
+        NodeKind::Smooth
+    } else {
+        NodeKind::Cusp
+    };
+    for (idx, seg) in cubics.iter().enumerate() {
+        let p0 = scale(seg[0]);
+        let c1 = scale(seg[1]);
+        let c2 = scale(seg[2]);
+        let p3 = scale(seg[3]);
+        let is_line = c1.distance_to(p0.lerp(p3, 1.0 / 3.0)) < 1e-4
+            && c2.distance_to(p0.lerp(p3, 2.0 / 3.0)) < 1e-4;
+        let h_out = (!is_line).then_some(c1);
+        let h_in = (!is_line).then_some(c2);
+
+        if out_nodes.is_empty() {
+            out_nodes.push(PathNode::new(p0, None, h_out, end_kind));
+        } else if let Some(last) = out_nodes.last_mut() {
+            last.handle_out = h_out;
+            if idx > 0 {
+                last.kind = NodeKind::Smooth;
+            } else {
+                last.kind = end_kind;
+            }
+        }
+        let next_kind = if idx + 1 == cubics.len() {
+            end_kind
+        } else {
+            NodeKind::Smooth
+        };
+        out_nodes.push(PathNode::new(p3, h_in, None, next_kind));
+    }
+}
+
+/// Philip J. Schneider's Least-Squares Cubic Bézier Curve Fitter (`Graphics Gems`)
+/// with Newton-Raphson parameter refinement and bounded recursion depth (`<= 14`).
+fn schneider_fit_segment(
+    pts: &[Point2D],
+    t_hat1: Vec2D,
+    t_hat2: Vec2D,
+    tol_px: f64,
+) -> Vec<[Point2D; 4]> {
+    let mut out = Vec::new();
+    schneider_fit_recursive(pts, t_hat1, t_hat2, tol_px * tol_px, 0, &mut out);
+    out
+}
+
+fn schneider_fit_recursive(
+    pts: &[Point2D],
+    t_hat1: Vec2D,
+    t_hat2: Vec2D,
+    tol_sq: f64,
+    depth: usize,
+    out: &mut Vec<[Point2D; 4]>,
+) {
+    let n = pts.len();
+    if n < 2 {
+        return;
+    }
+    let p0 = pts[0];
+    let p3 = pts[n - 1];
+    if n == 2 {
+        let dist = p0.distance_to(p3) / 3.0;
+        out.push([p0, p0 + t_hat1 * dist, p3 + t_hat2 * dist, p3]);
+        return;
+    }
+
+    // Collinear fast-path: emit exact straight line segment when all points lie within 0.18 px of chord
+    let max_line_err_sq = (0.18_f64 * 0.18_f64).min(tol_sq * 0.5);
+    if pts[1..(n - 1)]
+        .iter()
+        .all(|&p| point_seg_dist_sq(p, p0, p3) <= max_line_err_sq)
+    {
+        out.push([p0, p0.lerp(p3, 1.0 / 3.0), p0.lerp(p3, 2.0 / 3.0), p3]);
+        return;
+    }
+
+    let mut u = chord_length_parameterize(pts);
+    let mut bez = generate_least_squares_bezier(pts, &u, t_hat1, t_hat2);
+    let (mut max_err, mut split_idx) = compute_max_bezier_error(pts, &bez, &u);
+    if max_err <= tol_sq {
+        out.push(bez);
+        return;
+    }
+
+    // Newton-Raphson parameter refinement when close to tolerance
+    if max_err <= tol_sq * 12.0 {
+        for _ in 0..4 {
+            reparameterize_newton_raphson(pts, &bez, &mut u);
+            bez = generate_least_squares_bezier(pts, &u, t_hat1, t_hat2);
+            let (err, s_idx) = compute_max_bezier_error(pts, &bez, &u);
+            max_err = err;
+            split_idx = s_idx;
+            if max_err <= tol_sq {
+                out.push(bez);
+                return;
+            }
+        }
+    }
+
+    if depth >= 14 || n <= 3 {
+        out.push(bez);
+        return;
+    }
+
+    let split = split_idx.clamp(1, n - 2);
+    let win = 3.min(split).min(n - 1 - split).max(1);
+    let mut t_center = (pts[split - win] - pts[split + win]).normalize_or_zero();
+    if t_center.length_sq() <= 1e-12 {
+        t_center = (pts[split - 1] - pts[split + 1]).normalize_or_zero();
+    }
+    schneider_fit_recursive(&pts[..=split], t_hat1, t_center, tol_sq, depth + 1, out);
+    schneider_fit_recursive(&pts[split..], -t_center, t_hat2, tol_sq, depth + 1, out);
+}
+
+fn chord_length_parameterize(pts: &[Point2D]) -> Vec<f64> {
+    let mut u = vec![0.0_f64; pts.len()];
+    for i in 1..pts.len() {
+        u[i] = u[i - 1] + pts[i].distance_to(pts[i - 1]);
+    }
+    let total = u[pts.len() - 1];
+    if total > 1e-12 {
+        for v in &mut u[1..] {
+            *v /= total;
+        }
+        u[pts.len() - 1] = 1.0;
+    }
+    u
+}
+
+fn generate_least_squares_bezier(
+    pts: &[Point2D],
+    u: &[f64],
+    t_hat1: Vec2D,
+    t_hat2: Vec2D,
+) -> [Point2D; 4] {
+    let p0 = pts[0];
+    let p3 = pts[pts.len() - 1];
+    let chord_len = p0.distance_to(p3);
+    let mut c00 = 0.0_f64;
+    let mut c01 = 0.0_f64;
+    let mut c11 = 0.0_f64;
+    let mut x0 = 0.0_f64;
+    let mut x1 = 0.0_f64;
+
+    for (&d_i, &t) in pts.iter().zip(u.iter()) {
+        let inv = 1.0 - t;
+        let b0 = inv * inv * inv;
+        let b1 = 3.0 * inv * inv * t;
+        let b2 = 3.0 * inv * t * t;
+        let b3 = t * t * t;
+        let a1 = t_hat1 * b1;
+        let a2 = t_hat2 * b2;
+        c00 += a1.dot(a1);
+        c01 += a1.dot(a2);
+        c11 += a2.dot(a2);
+        let base_x = p0.x * (b0 + b1) + p3.x * (b2 + b3);
+        let base_y = p0.y * (b0 + b1) + p3.y * (b2 + b3);
+        let tmp = Vec2D::new(d_i.x - base_x, d_i.y - base_y);
+        x0 += a1.dot(tmp);
+        x1 += a2.dot(tmp);
+    }
+
+    let det_c = c00 * c11 - c01 * c01;
+    let fallback = (chord_len / 3.0).max(1e-3);
+    let (mut alpha1, mut alpha2) = if det_c.abs() > 1e-9 {
+        ((x0 * c11 - c01 * x1) / det_c, (c00 * x1 - x0 * c01) / det_c)
+    } else {
+        (fallback, fallback)
+    };
+    let seg_len = pts.windows(2).map(|w| w[0].distance_to(w[1])).sum::<f64>();
+    let eps = 1e-4 * seg_len;
+    if alpha1 < eps || alpha2 < eps {
+        alpha1 = fallback;
+        alpha2 = fallback;
+    } else {
+        let max_handle = (seg_len * 0.75).max(chord_len * 1.15).max(fallback);
+        alpha1 = alpha1.min(max_handle);
+        alpha2 = alpha2.min(max_handle);
+    }
+    [p0, p0 + t_hat1 * alpha1, p3 + t_hat2 * alpha2, p3]
+}
+
+fn compute_max_bezier_error(pts: &[Point2D], bez: &[Point2D; 4], u: &[f64]) -> (f64, usize) {
+    let mut max_d = 0.0_f64;
+    let mut split = pts.len() / 2;
+    for i in 1..(pts.len() - 1) {
+        let p = cubic_eval(bez[0], bez[1], bez[2], bez[3], u[i]);
+        let d = p.distance_sq(pts[i]);
+        if d >= max_d {
+            max_d = d;
+            split = i;
+        }
+    }
+    (max_d, split)
+}
+
+fn reparameterize_newton_raphson(pts: &[Point2D], bez: &[Point2D; 4], u: &mut [f64]) {
+    let q1_0 = (bez[1] - bez[0]) * 3.0;
+    let q1_1 = (bez[2] - bez[1]) * 3.0;
+    let q1_2 = (bez[3] - bez[2]) * 3.0;
+    let q2_0 = (q1_1 - q1_0) * 2.0;
+    let q2_1 = (q1_2 - q1_1) * 2.0;
+
+    for i in 1..(pts.len() - 1) {
+        let t = u[i];
+        let inv = 1.0 - t;
+        let qt = cubic_eval(bez[0], bez[1], bez[2], bez[3], t);
+        let q1t = q1_0 * (inv * inv) + q1_1 * (2.0 * inv * t) + q1_2 * (t * t);
+        let q2t = q2_0 * inv + q2_1 * t;
+        let diff = qt - pts[i];
+        let num = diff.dot(q1t);
+        let den = q1t.dot(q1t) + diff.dot(q2t);
+        if den.abs() > 1e-12 {
+            let next_t = (t - num / den).clamp(u[i - 1], 1.0);
+            u[i] = next_t;
+        }
+    }
+}
+
+#[inline]
+fn point_seg_dist_sq(p: Point2D, a: Point2D, b: Point2D) -> f64 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq <= 1e-12 {
+        return p.distance_sq(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance_sq(a + ab * t)
+}
+
+#[allow(dead_code)]
 fn potrace_opticurve_merge(nodes: &mut Vec<PathNode>, closed: bool, tol_mm: f64) {
     if nodes.len() < 4 || tol_mm <= 1e-6 {
         return;
@@ -1807,18 +2333,22 @@ fn extract_skeleton_chains(skeleton: &[bool], w: usize, h: usize) -> Vec<(Vec<Po
 }
 
 /// Deterministic K-Means++ RGB color quantization ignoring transparent pixels (`alpha < 128`).
-/// Separates flat interior pixels from anti-aliased edge transition pixels so K-Means++ discovers
-/// true region colors instead of blurry 1px edge blend halos, storing `u8` palette indices (`1 B/px`).
+/// Automatically detects bimodal achromatic line-art / coloring-book / text drawings via Otsu
+/// luminance separation so anti-aliased / JPEG-compressed B&W line art never splits into multi-gray
+/// onion-skin halos, and uses 5x5-cross flat interior seeding on full-color artwork.
 fn quantize_kmeans_u8(
     rgba8: &[u8],
     w: usize,
     h: usize,
     max_colors: usize,
+    allow_bimodal_lineart: bool,
 ) -> (Vec<[u8; 3]>, Vec<u8>) {
     let n_px = w * h;
     let stride = (n_px / 32_768).max(1);
     let mut flat_samples: Vec<[f32; 3]> = Vec::new();
     let mut all_samples: Vec<[f32; 3]> = Vec::new();
+    let mut luma_hist = [0u32; 256];
+    let mut chromatic_samples = 0usize;
     let chunks = rgba8.as_chunks::<4>().0;
 
     for (i, px) in chunks.iter().enumerate() {
@@ -1827,19 +2357,37 @@ fn quantize_kmeans_u8(
         }
         let sample = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
         all_samples.push(sample);
+        let cmax = px[0].max(px[1]).max(px[2]);
+        let cmin = px[0].min(px[1]).min(px[2]);
+        if cmax - cmin > 28 {
+            chromatic_samples += 1;
+        }
+        let luma = ((u32::from(px[0]) * 54 + u32::from(px[1]) * 183 + u32::from(px[2]) * 19) >> 8)
+            .min(255) as usize;
+        luma_hist[luma] += 1;
+
         if px[3] < 220 {
             continue;
         }
         let x = i % w;
         let y = i / w;
-        if x > 0 && x + 1 < w && y > 0 && y + 1 < h {
-            let nbrs = [i - 1, i + 1, i - w, i + w];
+        if x >= 2 && x + 2 < w && y >= 2 && y + 2 < h {
+            let nbrs = [
+                i - 1,
+                i + 1,
+                i - 2,
+                i + 2,
+                i - w,
+                i + w,
+                i - 2 * w,
+                i + 2 * w,
+            ];
             let is_flat = nbrs.iter().all(|&ni| {
                 let np = chunks[ni];
                 np[3] >= 220
-                    && px[0].abs_diff(np[0]) <= 18
-                    && px[1].abs_diff(np[1]) <= 18
-                    && px[2].abs_diff(np[2]) <= 18
+                    && px[0].abs_diff(np[0]) <= 12
+                    && px[1].abs_diff(np[1]) <= 12
+                    && px[2].abs_diff(np[2]) <= 12
             });
             if is_flat {
                 flat_samples.push(sample);
@@ -1848,6 +2396,28 @@ fn quantize_kmeans_u8(
     }
     if all_samples.is_empty() {
         return (Vec::new(), vec![u8::MAX; n_px]);
+    }
+
+    // Automatic bimodal Otsu ink-vs-paper binarization for monochrome line art / coloring books
+    if allow_bimodal_lineart
+        && chromatic_samples < 4
+        && chromatic_samples * 1000 <= all_samples.len()
+    {
+        if let Some((thresh, ink_rgb, paper_rgb)) =
+            try_otsu_bimodal_achromatic(&luma_hist, all_samples.len())
+        {
+            let palette = vec![ink_rgb, paper_rgb];
+            let mut labels = vec![u8::MAX; n_px];
+            for (i, px) in chunks.iter().enumerate() {
+                if px[3] >= 128 {
+                    let luma =
+                        (u32::from(px[0]) * 54 + u32::from(px[1]) * 183 + u32::from(px[2]) * 19)
+                            >> 8;
+                    labels[i] = u8::from(luma > thresh);
+                }
+            }
+            return (palette, labels);
+        }
     }
 
     let eff_max = max_colors.clamp(1, 254);
@@ -2013,7 +2583,135 @@ fn is_linear_blend_of_any(s: [f32; 3], centroids: &[[f32; 3]], max_perp_sq: f32)
     false
 }
 
-/// Reassigns 1px anti-aliasing transition pixels sandwiched between two distinct regions `L_a != L_b`
+/// Detects bimodal achromatic drawings (black/dark ink on white/light paper with anti-aliased or
+/// JPEG-compressed edges) via Otsu inter-class variance and returns `(threshold, ink_rgb, paper_rgb)`.
+fn try_otsu_bimodal_achromatic(
+    hist: &[u32; 256],
+    total_samples: usize,
+) -> Option<(u32, [u8; 3], [u8; 3])> {
+    if total_samples < 16 {
+        return None;
+    }
+    let total_f = total_samples as f64;
+    let total_sum: f64 = hist
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i as f64) * f64::from(c))
+        .sum();
+    let mut w0 = 0.0_f64;
+    let mut sum0 = 0.0_f64;
+    let mut best_var = -1.0_f64;
+    let mut best_t = 128usize;
+    let mut best_mu0 = 0.0_f64;
+    let mut best_mu1 = 255.0_f64;
+
+    for (t, &cnt) in hist.iter().enumerate().take(255) {
+        w0 += f64::from(cnt);
+        if w0 <= 0.0 {
+            continue;
+        }
+        let w1 = total_f - w0;
+        if w1 <= 0.0 {
+            break;
+        }
+        sum0 += (t as f64) * f64::from(cnt);
+        let mu0 = sum0 / w0;
+        let mu1 = (total_sum - sum0) / w1;
+        let diff = mu1 - mu0;
+        let between = w0 * w1 * diff * diff;
+        if between > best_var {
+            best_var = between;
+            best_t = t;
+            best_mu0 = mu0;
+            best_mu1 = mu1;
+        }
+    }
+
+    if best_mu1 - best_mu0 < 85.0 {
+        return None;
+    }
+    let lo_band = best_t.saturating_sub(24);
+    let hi_band = (best_t + 24).min(255);
+    let mid_count: u32 = hist[lo_band..=hi_band].iter().sum();
+    if (mid_count as usize) * 100 >= total_samples * 18 {
+        return None;
+    }
+    let ink_v = best_mu0.round().clamp(0.0, 255.0) as u8;
+    let paper_v = best_mu1.round().clamp(0.0, 255.0) as u8;
+    Some((
+        best_t as u32,
+        [ink_v, ink_v, ink_v],
+        [paper_v, paper_v, paper_v],
+    ))
+}
+
+/// Shaves isolated 1-pixel JPEG/staircase pimples protruding sideways from thick walls
+/// while leaving 1px thin strokes and 1px peninsulas 100% intact.
+fn prune_sideways_1px_burrs(labels: &mut [u8], w: usize, h: usize) {
+    if w < 3 || h < 3 {
+        return;
+    }
+    let mut flips: Vec<(usize, u8)> = Vec::new();
+    for y in 1..(h - 1) {
+        let row = y * w;
+        for x in 1..(w - 1) {
+            let idx = row + x;
+            let a = labels[idx];
+            let n = labels[idx - w];
+            let s = labels[idx + w];
+            let w_l = labels[idx - 1];
+            let e_l = labels[idx + 1];
+            // North-pointing 1px pimple on a solid South wall `(SW == A && S == A && SE == A)`
+            if n == w_l
+                && n == e_l
+                && n != a
+                && s == a
+                && labels[idx + w - 1] == a
+                && labels[idx + w + 1] == a
+            {
+                flips.push((idx, n));
+                continue;
+            }
+            // South-pointing 1px pimple on a solid North wall
+            if s == w_l
+                && s == e_l
+                && s != a
+                && n == a
+                && labels[idx - w - 1] == a
+                && labels[idx - w + 1] == a
+            {
+                flips.push((idx, s));
+                continue;
+            }
+            // West-pointing 1px pimple on a solid East wall
+            if w_l == n
+                && w_l == s
+                && w_l != a
+                && e_l == a
+                && labels[idx - w + 1] == a
+                && labels[idx + w + 1] == a
+            {
+                flips.push((idx, w_l));
+                continue;
+            }
+            // East-pointing 1px pimple on a solid West wall
+            if e_l == n
+                && e_l == s
+                && e_l != a
+                && w_l == a
+                && labels[idx - w - 1] == a
+                && labels[idx + w - 1] == a
+            {
+                flips.push((idx, e_l));
+            }
+        }
+    }
+    for (idx, nl) in flips {
+        labels[idx] = nl;
+    }
+}
+
+/// Reassigns 1..3px anti-aliasing transition pixels sandwiched between two distinct regions `L_a != L_b`
 /// whose RGB value is a linear blend of `palette[L_a]` and `palette[L_b]`, eliminating halo rings
 /// while leaving 1px thin strokes (`L_a == L_b`) completely untouched.
 fn suppress_antialias_halos(
@@ -2023,7 +2721,7 @@ fn suppress_antialias_halos(
     w: usize,
     h: usize,
 ) {
-    if palette.len() < 3 || w < 3 || h < 3 {
+    if palette.len() < 3 || w < 5 || h < 5 {
         return;
     }
     let pal_f: Vec<[f32; 3]> = palette
@@ -2032,46 +2730,66 @@ fn suppress_antialias_halos(
         .collect();
     let chunks = rgba8.as_chunks::<4>().0;
     let mut updates: Vec<(usize, u8)> = Vec::new();
-    for y in 1..(h - 1) {
-        let row = y * w;
-        for x in 1..(w - 1) {
-            let idx = row + x;
-            let lp = labels[idx];
-            if lp == u8::MAX {
-                continue;
-            }
-            let px = chunks[idx];
-            let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
-            for (n1, n2) in [(idx - 1, idx + 1), (idx - w, idx + w)] {
-                let la = labels[n1];
-                let lb = labels[n2];
-                if la == u8::MAX || lb == u8::MAX || la == lb || lp == la || lp == lb {
+    for _pass in 0..3 {
+        updates.clear();
+        for y in 3..(h - 3) {
+            let row = y * w;
+            for x in 3..(w - 3) {
+                let idx = row + x;
+                let lp = labels[idx];
+                if lp == u8::MAX {
                     continue;
                 }
-                let a = pal_f[la as usize];
-                let b = pal_f[lb as usize];
-                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                let len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-                if len_sq <= 64.0 {
-                    continue;
-                }
-                let ap = [s[0] - a[0], s[1] - a[1], s[2] - a[2]];
-                let t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len_sq;
-                if (0.05..=0.95).contains(&t) {
-                    let proj = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
-                    let dr = s[0] - proj[0];
-                    let dg = s[1] - proj[1];
-                    let db = s[2] - proj[2];
-                    if dr * dr + dg * dg + db * db <= 484.0 {
-                        updates.push((idx, if t < 0.5 { la } else { lb }));
+                let px = chunks[idx];
+                let s = [f32::from(px[0]), f32::from(px[1]), f32::from(px[2])];
+                let mut matched = false;
+                for r in 1..=3usize {
+                    let rw = r * w;
+                    let pairs = [
+                        (idx - r, idx + r),
+                        (idx - rw, idx + rw),
+                        (idx - rw - r, idx + rw + r),
+                        (idx - rw + r, idx + rw - r),
+                    ];
+                    for (n1, n2) in pairs {
+                        let la = labels[n1];
+                        let lb = labels[n2];
+                        if la == u8::MAX || lb == u8::MAX || la == lb || lp == la || lp == lb {
+                            continue;
+                        }
+                        let a = pal_f[la as usize];
+                        let b = pal_f[lb as usize];
+                        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                        let len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                        if len_sq <= 64.0 {
+                            continue;
+                        }
+                        let ap = [s[0] - a[0], s[1] - a[1], s[2] - a[2]];
+                        let t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len_sq;
+                        if (0.04..=0.96).contains(&t) {
+                            let proj = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+                            let dr = s[0] - proj[0];
+                            let dg = s[1] - proj[1];
+                            let db = s[2] - proj[2];
+                            if dr * dr + dg * dg + db * db <= 625.0 {
+                                updates.push((idx, if t < 0.5 { la } else { lb }));
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if matched {
                         break;
                     }
                 }
             }
         }
-    }
-    for (idx, nl) in updates {
-        labels[idx] = nl;
+        if updates.is_empty() {
+            break;
+        }
+        for &(idx, nl) in &updates {
+            labels[idx] = nl;
+        }
     }
 }
 
@@ -3063,5 +3781,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn potrace_coloring_book_lineart_produces_single_ultra_smooth_curve() {
+        // Simulates an anti-aliased + JPEG-ringing coloring-book drawing (256x256) with concentric
+        // intersecting curved strokes, traced with `Logo` preset (`max_colors = 12`).
+        // Must produce 1 single crisp black vector path (0 gray halo layers!) with smooth cubic handles!
+        let w = 256u32;
+        let h = 256u32;
+        let mut buf = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let mut luma_sum = 0.0_f64;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let px = f64::from(x) + (f64::from(sx) + 0.5) * 0.25 - 128.0;
+                        let py = f64::from(y) + (f64::from(sy) + 0.5) * 0.25 - 128.0;
+                        let r1 = px.hypot(py);
+                        let r2 = (px - 32.0).hypot(py + 18.0);
+                        let on_ring1 = (r1 - 78.0).abs() <= 3.2;
+                        let on_ring2 = (r2 - 42.0).abs() <= 2.6;
+                        luma_sum += if on_ring1 || on_ring2 { 10.0 } else { 252.0 };
+                    }
+                }
+                // Add slight deterministic JPEG-like 8x8 ringing (±5 luma) on background/edges
+                let ring_noise = if ((x / 4 + y / 4) & 1) == 0 {
+                    3.0
+                } else {
+                    -4.0
+                };
+                let v = (luma_sum / 16.0 + ring_noise).round().clamp(0.0, 255.0) as u8;
+                let off = ((y * w + x) * 4) as usize;
+                buf[off..off + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let asset = RasterAsset::new(w, h, buf, 96.0, ColorMode::Rgb).unwrap();
+        let traced = trace_raster_to_mm(
+            &asset,
+            128.0,
+            128.0,
+            &TraceConfig {
+                mode: TraceMode::OutlineTrace(OutlinePreset::Logo),
+                max_colors: 12,
+                smoothing: 0.5,
+                detail: 0.82,
+                remove_background: true,
+                ..TraceConfig::default()
+            },
+        );
+        assert_eq!(
+            traced.len(),
+            1,
+            "B&W coloring-book drawing must produce 1 clean ink curve (0 gray halo layers), got {}",
+            traced.len()
+        );
+        let (path, col) = &traced[0];
+        let rgba = col.to_rgba8();
+        assert!(rgba[0] < 40 && rgba[1] < 40 && rgba[2] < 40);
+        let total_nodes: usize = path.subpaths.iter().map(|s| s.nodes.len()).sum();
+        let smooth_nodes: usize = path
+            .subpaths
+            .iter()
+            .flat_map(|s| s.nodes.iter())
+            .filter(|n| n.handle_in.is_some() || n.handle_out.is_some())
+            .count();
+        assert!(
+            smooth_nodes * 2 >= total_nodes && total_nodes <= 120,
+            "expected compact smooth Schneider Bezier curve (total_nodes={total_nodes}, smooth={smooth_nodes})"
+        );
     }
 }

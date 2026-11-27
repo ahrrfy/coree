@@ -1505,6 +1505,9 @@ fn show_selected_objects_property_bar(
                     {
                         app.extract_selected_powerclip();
                     }
+                    if app.selection_has_traceable_raster() {
+                        tool_bars::render_raster_trace_quick_strip(ui, app, lang, tokens);
+                    }
                 }
                 NodePayload::ArtisticText(mut art) => {
                     ui.separator();
@@ -1614,27 +1617,10 @@ fn show_selected_objects_property_bar(
                     }
                 }
                 NodePayload::Raster(_) => {
-                    ui.separator();
-                    if ui
-                        .button(
-                            RichText::new(I18nKey::BitmapTraceVector.tr_ui(lang))
-                                .size(11.0)
-                                .strong()
-                                .color(tokens.accent),
-                        )
-                        .clicked()
-                    {
-                        if let Err(e) = app.trace_selected_raster() {
-                            app.push_toast(e, true);
-                        }
-                    }
-                    if ui
-                        .small_button(I18nKey::DockerVectorTrace.tr_ui(lang))
-                        .clicked()
-                    {
-                        app.trace_state.split_preview = true;
-                        app.focus_docker(DockerTab::VectorTrace);
-                    }
+                    tool_bars::render_raster_trace_quick_strip(ui, app, lang, tokens);
+                }
+                NodePayload::Group(_) if app.selection_has_traceable_raster() => {
+                    tool_bars::render_raster_trace_quick_strip(ui, app, lang, tokens);
                 }
                 NodePayload::Clone { .. } => {
                     ui.separator();
@@ -1644,6 +1630,9 @@ fn show_selected_objects_property_bar(
                         .clicked()
                     {
                         app.unlink_clone_selection();
+                    }
+                    if app.selection_has_traceable_raster() {
+                        tool_bars::render_raster_trace_quick_strip(ui, app, lang, tokens);
                     }
                 }
                 _ => {}

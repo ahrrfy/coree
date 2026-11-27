@@ -398,10 +398,10 @@ pub enum Commands {
         #[arg(long, default_value_t = 75.0)]
         detail: f32,
         /// Curve smoothing strength (0..=100).
-        #[arg(long, default_value_t = 25.0)]
+        #[arg(long, default_value_t = 50.0)]
         smoothing: f32,
         /// Corner sharpness threshold (0..=100).
-        #[arg(long, default_value_t = 20.0)]
+        #[arg(long, default_value_t = 60.0)]
         corner_threshold: f32,
         /// Remove solid border background color during trace.
         #[arg(long)]

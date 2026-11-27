@@ -4,10 +4,31 @@ use super::*;
 
 pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
     let lang = app.ui_language;
+    let tokens = app.theme.tokens();
     let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
-    ui.label(RichText::new(crate::i18n::I18nKey::DockTraceHeading.tr_ui(lang)).strong());
+    ui.label(
+        RichText::new(crate::i18n::I18nKey::DockTraceHeading.tr_ui(lang))
+            .color(tokens.text)
+            .strong(),
+    );
+
+    // Primary high-contrast CTA button right at the top so the user never has to scroll to run Trace
+    let cta_btn = egui::Button::new(
+        RichText::new(crate::i18n::I18nKey::TraceRunVectorize.tr_ui(lang))
+            .color(tokens.on_accent)
+            .strong(),
+    )
+    .fill(tokens.accent)
+    .min_size(vec2(ui.available_width().max(140.0), 26.0));
+    if ui.add(cta_btn).clicked() {
+        if let Err(err) = app.trace_selected_raster() {
+            app.push_toast(err, true);
+        }
+    }
+    ui.add_space(2.0);
+
     let tr = &mut app.trace_state;
-    shell_dir.with_horizontal(ui, |ui| {
+    shell_dir.with_horizontal_wrapped(ui, |ui| {
         ui.selectable_value(
             &mut tr.mode_idx,
             0,
@@ -28,6 +49,7 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
     if tr.mode_idx == 1 {
         let prev_preset = tr.preset;
         ComboBox::from_id_salt("trace_preset")
+            .width(170.0)
             .selected_text(format!("{:?}", tr.preset))
             .show_ui(ui, |ui| {
                 for p in [
@@ -46,6 +68,7 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
         }
     }
 
+    ui.spacing_mut().slider_width = 105.0;
     ui.add(
         egui::Slider::new(&mut tr.max_colors, 2..=64)
             .text(crate::i18n::I18nKey::TraceMaxColors.tr_ui(lang)),
@@ -86,16 +109,6 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
         );
     }
     super::render_trace_split_preview(ui, app);
-
-    ui.add_space(6.0);
-    if ui
-        .button(RichText::new(crate::i18n::I18nKey::TraceRunVectorize.tr_ui(lang)).strong())
-        .clicked()
-    {
-        if let Err(err) = app.trace_selected_raster() {
-            app.push_toast(err, true);
-        }
-    }
 }
 
 // =============================================================================
