@@ -21,9 +21,7 @@ pub(super) fn ui_vector_trace_docker(ui: &mut Ui, app: &mut StudioApp) {
     .fill(tokens.accent)
     .min_size(vec2(ui.available_width().max(140.0), 26.0));
     if ui.add(cta_btn).clicked() {
-        if let Err(err) = app.trace_selected_raster() {
-            app.push_toast(err, true);
-        }
+        app.trace_selected_raster_interactive();
     }
     ui.add_space(2.0);
 

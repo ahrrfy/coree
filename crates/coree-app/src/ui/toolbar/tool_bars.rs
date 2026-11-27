@@ -1311,9 +1311,7 @@ pub(super) fn render_raster_trace_quick_strip(
         )
         .clicked()
     {
-        if let Err(e) = app.trace_selected_raster() {
-            app.push_toast(e, true);
-        }
+        app.trace_selected_raster_interactive();
     }
     if ui
         .small_button(I18nKey::DockerVectorTrace.tr_ui(lang))

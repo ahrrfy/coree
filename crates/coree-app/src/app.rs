@@ -263,18 +263,27 @@ impl StudioApp {
             crate::i18n::I18nKey::AppTitle.tr_ui(self.ui_language),
             crate::i18n::I18nKey::AppSubtitle.tr_ui(self.ui_language)
         );
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(localized_title));
+        if self.last_window_title != localized_title {
+            self.last_window_title = localized_title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(localized_title));
+        }
 
-        // Poll async background jobs, printer discovery, incoming single-instance IPC files, toasts, autosave
+        // Poll async background jobs, hardware resource governor, printer discovery, IPC, toasts, autosave
+        self.tick_resource_governor();
         self.tick_background_jobs();
         self.poll_system_printers_async();
         self.prune_toasts();
         self.tick_autosave();
         let _ = self.process_pending_ipc(Some(&ctx));
 
-        // Keep repainting smoothly while background jobs or printer discovery run
-        if !self.active_jobs.is_empty() || self.scanning_printers {
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        // Keep repainting smoothly while background jobs, async I/O, or printer discovery run
+        let metrics_busy = self.active_tab().is_some_and(|t| t.metrics_job.is_some());
+        if !self.active_jobs.is_empty()
+            || !self.async_ui_ops.is_empty()
+            || self.scanning_printers
+            || metrics_busy
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
 
         // Handle OS drag-and-drop files onto the studio window
@@ -287,9 +296,7 @@ impl StudioApp {
                 .collect()
         });
         for path in dropped {
-            if let Err(err) = self.open_file_path(&path) {
-                self.push_toast(err, true);
-            }
+            self.open_file_path_interactive(&path);
         }
 
         // Process global keyboard shortcuts (unless Command Palette is open and consuming keys)

@@ -41,6 +41,11 @@ pub(super) fn show_options_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                         3,
                         crate::i18n::I18nKey::DlgOptTab4.tr_ui(lang),
                     );
+                    ui.selectable_value(
+                        &mut app.options_tab,
+                        4,
+                        crate::i18n::I18nKey::DlgOptTabPerf.tr_ui(lang),
+                    );
                 });
                 ui.separator();
 
@@ -51,7 +56,8 @@ pub(super) fn show_options_dialog(ctx: &egui::Context, app: &mut StudioApp) {
                         0 => show_options_appearance_workspace(ui, app, &tokens, shell_dir),
                         1 => show_options_general_nudge(ui, app, &tokens, shell_dir),
                         2 => show_options_color_management(ui, app, &tokens, shell_dir),
-                        _ => show_options_laser_plugins(ui, app, &tokens, shell_dir),
+                        3 => show_options_laser_plugins(ui, app, &tokens, shell_dir),
+                        _ => show_options_performance_resources(ui, app, &tokens, shell_dir),
                     });
 
                 ui.separator();
@@ -1088,5 +1094,159 @@ fn show_options_laser_plugins(
                 });
             ui.add_space(3.0);
         }
+    }
+}
+
+fn show_options_performance_resources(
+    ui: &mut egui::Ui,
+    app: &mut StudioApp,
+    tokens: &crate::theme::ThemeTokens,
+    shell_dir: crate::i18n::ShellLayoutDirections,
+) {
+    use coree_core::ResourceGovernorMode;
+    let lang = app.ui_language;
+
+    ui.label(RichText::new(crate::i18n::I18nKey::DlgOptPerfHeader.tr_ui(lang)).strong());
+    ui.add_space(4.0);
+
+    let modes = [
+        (
+            ResourceGovernorMode::Auto,
+            crate::i18n::I18nKey::DlgOptPerfModeAuto,
+        ),
+        (
+            ResourceGovernorMode::EcoLowMemory,
+            crate::i18n::I18nKey::DlgOptPerfModeEco,
+        ),
+        (
+            ResourceGovernorMode::Balanced,
+            crate::i18n::I18nKey::DlgOptPerfModeBalanced,
+        ),
+        (
+            ResourceGovernorMode::MaxPerformance,
+            crate::i18n::I18nKey::DlgOptPerfModeMax,
+        ),
+    ];
+    let mut chosen_mode = None;
+    shell_dir.with_horizontal_wrapped(ui, |ui| {
+        for (mode, key) in modes {
+            if ui
+                .selectable_label(app.resource_mode == mode, key.tr_ui(lang))
+                .clicked()
+            {
+                chosen_mode = Some(mode);
+            }
+        }
+    });
+    if let Some(m) = chosen_mode {
+        app.set_resource_governor_mode(m);
+    }
+
+    if app.resource_budget.under_memory_pressure {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "⚠ {}",
+                crate::i18n::I18nKey::DlgOptPerfPressureWarn.tr_ui(lang)
+            ))
+            .color(tokens.warning)
+            .strong(),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(RichText::new(crate::i18n::I18nKey::DlgOptPerfDetectedHdr.tr_ui(lang)).strong());
+    ui.add_space(4.0);
+
+    let prof = app.host_resources;
+    let budget = app.resource_budget;
+    let (cached_cpu_tiles, cached_gpu_tiles) = app.active_tab().map_or((0, 0), |t| {
+        (
+            t.tile_cache.cached_world_tile_count(),
+            t.gpu_tile_textures.len(),
+        )
+    });
+
+    Frame::NONE
+        .fill(tokens.surface)
+        .stroke(Stroke::new(1.0, tokens.border))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            shell_dir.with_horizontal(ui, |ui| {
+                ui.label(crate::i18n::I18nKey::DlgOptPerfCpuWorkers.tr_ui(lang));
+                ui.label(
+                    RichText::new(format!(
+                        "{} threads  →  {} workers",
+                        prof.logical_cpus, budget.worker_threads
+                    ))
+                    .monospace()
+                    .strong()
+                    .color(tokens.accent),
+                );
+            });
+            shell_dir.with_horizontal(ui, |ui| {
+                ui.label(crate::i18n::I18nKey::DlgOptPerfSystemRam.tr_ui(lang));
+                ui.label(
+                    RichText::new(format!(
+                        "{:.1} GiB / {:.1} GiB",
+                        prof.available_ram_gib(),
+                        prof.total_ram_gib()
+                    ))
+                    .monospace()
+                    .color(tokens.text),
+                );
+            });
+            if let Some(rss_mib) = prof.process_rss_mib() {
+                shell_dir.with_horizontal(ui, |ui| {
+                    ui.label(crate::i18n::I18nKey::DlgOptPerfProcessRss.tr_ui(lang));
+                    ui.label(
+                        RichText::new(format!("{rss_mib:.1} MiB"))
+                            .monospace()
+                            .color(tokens.text),
+                    );
+                });
+            }
+            shell_dir.with_horizontal(ui, |ui| {
+                ui.label(crate::i18n::I18nKey::DlgOptPerfTileBudget.tr_ui(lang));
+                ui.label(
+                    RichText::new(format!(
+                        "{cached_cpu_tiles} / {} tiles ({:.0} MiB max)",
+                        budget.max_cached_world_tiles,
+                        budget.max_tile_cache_mib()
+                    ))
+                    .monospace()
+                    .color(tokens.text),
+                );
+            });
+            shell_dir.with_horizontal(ui, |ui| {
+                ui.label(crate::i18n::I18nKey::DlgOptPerfGpuBudget.tr_ui(lang));
+                ui.label(
+                    RichText::new(format!(
+                        "{cached_gpu_tiles} / {} GPU 256×256 textures",
+                        budget.max_gpu_tile_textures
+                    ))
+                    .monospace()
+                    .color(tokens.success),
+                );
+            });
+            shell_dir.with_horizontal(ui, |ui| {
+                ui.label(crate::i18n::I18nKey::DlgOptPerfUndoBudget.tr_ui(lang));
+                ui.label(
+                    RichText::new(format!("{} steps", budget.undo_history_limit))
+                        .monospace()
+                        .color(tokens.text),
+                );
+            });
+        });
+
+    ui.add_space(8.0);
+    if ui
+        .button(crate::i18n::I18nKey::DlgOptPerfPurgeBtn.tr_ui(lang))
+        .clicked()
+    {
+        let _ = app.purge_unused_caches();
+        let msg = crate::i18n::I18nKey::DlgOptPerfPurgeToast.tr_ui(lang);
+        app.push_toast(msg, false);
     }
 }

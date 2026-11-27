@@ -1236,5 +1236,33 @@ pub(super) const fn tr_ar(key: I18nKey) -> &'static str {
         I18nKey::DockLaserAir => "هواء",
         I18nKey::DockLaserCross => "متقاطع",
         I18nKey::DlgFillRgbLabel => "قيم RGB:",
+        I18nKey::DlgOptTabPerf => "الأداء والموارد",
+        I18nKey::DlgOptPerfHeader => "مدير موارد العتاد الذكي",
+        I18nKey::DlgOptPerfModeAuto => "تلقائي (متكيف مع العتاد)",
+        I18nKey::DlgOptPerfModeEco => "اقتصادي / ذاكرة منخفضة",
+        I18nKey::DlgOptPerfModeBalanced => "متوازن للاستوديو",
+        I18nKey::DlgOptPerfModeMax => "أقصى أداء لمحطات العمل",
+        I18nKey::DlgOptPerfDetectedHdr => "مواصفات العتاد المكتشفة",
+        I18nKey::DlgOptPerfCpuWorkers => "مسارات المعالج وخيوط العمل:",
+        I18nKey::DlgOptPerfSystemRam => "ذاكرة النظام (المتاح / الإجمالي):",
+        I18nKey::DlgOptPerfProcessRss => "ذاكرة البرنامج الحالية:",
+        I18nKey::DlgOptPerfTileBudget => "ميزانية مربعات الصفحات:",
+        I18nKey::DlgOptPerfGpuBudget => "ذاكرة مربعات كرت الشاشة:",
+        I18nKey::DlgOptPerfUndoBudget => "عمق التراجع المتكيف:",
+        I18nKey::DlgOptPerfPressureWarn => {
+            "ذاكرة النظام منخفضة — التفريغ التلقائي للذاكرة المؤقتة نشط"
+        }
+        I18nKey::DlgOptPerfPurgeBtn => "تفريغ الذاكرة المؤقتة غير المستخدمة",
+        I18nKey::DlgOptPerfPurgeToast => "تم تفريغ ذاكرة المربعات المؤقتة بنجاح",
+        I18nKey::StatusPerfBadgeTip => {
+            "مدير الموارد ومحرك مربعات كرت الشاشة (انقر للضبط)"
+        }
+        I18nKey::CanvasBgTaskCancel => "إلغاء",
+        I18nKey::CanvasNodesLodBanner => "وضع الكثافة العالية: قرّب اللوحة لعرض كافة مقابض العقد",
+        I18nKey::PageNavFirstTip => "الصفحة الأولى",
+        I18nKey::PageNavPrevTip => "الصفحة السابقة",
+        I18nKey::PageNavNextTip => "الصفحة التالية",
+        I18nKey::PageNavLastTip => "الصفحة الأخيرة",
+        I18nKey::PageNavJumpHint => "انتقال إلى صفحة:",
     }
 }

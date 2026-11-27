@@ -142,9 +142,7 @@ impl StudioApp {
             .add_filter("All Files", &["*"])
             .pick_file();
         if let Some(path) = picked {
-            if let Err(err) = self.open_file_path(&path) {
-                self.push_toast(err, true);
-            }
+            self.open_file_path_interactive(&path);
         }
     }
 
@@ -196,9 +194,7 @@ impl StudioApp {
             .add_filter("All Files", &["*"])
             .pick_file();
         if let Some(path) = picked {
-            if let Err(err) = self.import_file_path(&path) {
-                self.push_toast(err, true);
-            }
+            self.import_file_path_interactive(&path);
         }
     }
 

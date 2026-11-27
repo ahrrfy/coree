@@ -188,6 +188,113 @@ fn subtree_contains_only_rasters(doc: &Document, id: ObjectId, depth: usize) -> 
     }
 }
 
+pub(in crate::state) fn crop_filtered_trace_asset(
+    filtered_asset: RasterAsset,
+    crop_rect: Option<Rect2D>,
+    w_mm: f64,
+    h_mm: f64,
+) -> Result<(RasterAsset, f64, f64, f64, f64), String> {
+    if let Some(cr) = crop_rect.filter(|c| c.is_finite()) {
+        let vis_min_x = cr.min_x.max(0.0);
+        let vis_min_y = cr.min_y.max(0.0);
+        let vis_max_x = cr.max_x.min(w_mm);
+        let vis_max_y = cr.max_y.min(h_mm);
+        if vis_max_x - vis_min_x <= 1e-6 || vis_max_y - vis_min_y <= 1e-6 {
+            return Err("cropped raster region is empty (outside image bounds)".to_owned());
+        }
+        let aw = filtered_asset.width;
+        let ah = filtered_asset.height;
+        if aw < 2 || ah < 2 {
+            return Err("raster resolution too small to trace".to_owned());
+        }
+        let px_per_mm_x = f64::from(aw) / w_mm;
+        let px_per_mm_y = f64::from(ah) / h_mm;
+        let mut x0 = (vis_min_x * px_per_mm_x)
+            .floor()
+            .clamp(0.0, (aw - 1) as f64) as u32;
+        let mut y0 = (vis_min_y * px_per_mm_y)
+            .floor()
+            .clamp(0.0, (ah - 1) as f64) as u32;
+        let mut x1 = (vis_max_x * px_per_mm_x)
+            .ceil()
+            .clamp((x0 + 1) as f64, aw as f64) as u32;
+        let mut y1 = (vis_max_y * px_per_mm_y)
+            .ceil()
+            .clamp((y0 + 1) as f64, ah as f64) as u32;
+        if x1 - x0 < 2 {
+            if x1 < aw {
+                x1 += 1;
+            } else {
+                x0 = x0.saturating_sub(1);
+            }
+        }
+        if y1 - y0 < 2 {
+            if y1 < ah {
+                y1 += 1;
+            } else {
+                y0 = y0.saturating_sub(1);
+            }
+        }
+        let cw = x1 - x0;
+        let ch = y1 - y0;
+        let filtered_rgba = filtered_asset.to_rgba8_vec();
+        let mut cropped_bytes = Vec::with_capacity((cw * ch * 4) as usize);
+        for row in y0..y1 {
+            let start = ((row * aw + x0) * 4) as usize;
+            let end = ((row * aw + x1) * 4) as usize;
+            cropped_bytes.extend_from_slice(&filtered_rgba[start..end]);
+        }
+        let cropped_asset = RasterAsset::new(
+            cw,
+            ch,
+            cropped_bytes,
+            filtered_asset.source_dpi,
+            filtered_asset.color_mode,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((
+            cropped_asset,
+            f64::from(x0) / px_per_mm_x,
+            f64::from(y0) / px_per_mm_y,
+            f64::from(cw) / px_per_mm_x,
+            f64::from(ch) / px_per_mm_y,
+        ))
+    } else {
+        Ok((filtered_asset, 0.0, 0.0, w_mm, h_mm))
+    }
+}
+
+pub(in crate::state) fn compute_trace_placed_transform(
+    xf: Affine2D,
+    persp: Option<coree_core::Perspective3x3>,
+    offset_x_mm: f64,
+    offset_y_mm: f64,
+    trace_w_mm: f64,
+    trace_h_mm: f64,
+    place_side_by_side: bool,
+) -> Affine2D {
+    let mut placed_xf = xf;
+    if place_side_by_side {
+        let corners = [
+            Point2D::new(offset_x_mm, offset_y_mm),
+            Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm),
+            Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm + trace_h_mm),
+            Point2D::new(offset_x_mm, offset_y_mm + trace_h_mm),
+        ];
+        let (mut min_wx, mut max_wx) = (f64::INFINITY, f64::NEG_INFINITY);
+        for c in corners {
+            let cp = persp.and_then(|p| p.transform_point(c)).unwrap_or(c);
+            let wp = xf.transform_point(cp);
+            min_wx = min_wx.min(wp.x);
+            max_wx = max_wx.max(wp.x);
+        }
+        if (max_wx - min_wx).is_finite() {
+            placed_xf.m[4] += (max_wx - min_wx).max(1.0) + 6.0;
+        }
+    }
+    placed_xf
+}
+
 impl StudioApp {
     /// Returns `true` if any currently selected object is (or contains inside a `PowerClip`/`Group`) a raster bitmap.
     #[must_use]
@@ -251,7 +358,9 @@ impl StudioApp {
         let layer_id = self.active_creation_layer_or_err()?;
         let cfg = self.trace_state.to_config();
         let is_centerline = matches!(cfg.mode, TraceMode::CenterlineTrace);
-        let (ops, created_ids, count) = {
+        let place_side_by_side = self.trace_state.place_side_by_side;
+        let keep_original = self.trace_state.keep_original;
+        let (target_id, traced, offset_x_mm, offset_y_mm, placed_xf, persp) = {
             let tab = self
                 .tabs
                 .get(self.active_tab)
@@ -278,103 +387,58 @@ impl StudioApp {
                 coree_render::apply_raster_filters(&asset, &filters)
             };
 
-            let (trace_asset, offset_x_mm, offset_y_mm, trace_w_mm, trace_h_mm) = if let Some(cr) =
-                crop_rect.filter(|c| c.is_finite())
-            {
-                let vis_min_x = cr.min_x.max(0.0);
-                let vis_min_y = cr.min_y.max(0.0);
-                let vis_max_x = cr.max_x.min(w_mm);
-                let vis_max_y = cr.max_y.min(h_mm);
-                if vis_max_x - vis_min_x <= 1e-6 || vis_max_y - vis_min_y <= 1e-6 {
-                    return Err("cropped raster region is empty (outside image bounds)".to_owned());
-                }
-                let aw = filtered_asset.width;
-                let ah = filtered_asset.height;
-                if aw < 2 || ah < 2 {
-                    return Err("raster resolution too small to trace".to_owned());
-                }
-                let px_per_mm_x = f64::from(aw) / w_mm;
-                let px_per_mm_y = f64::from(ah) / h_mm;
-                let mut x0 = (vis_min_x * px_per_mm_x)
-                    .floor()
-                    .clamp(0.0, (aw - 1) as f64) as u32;
-                let mut y0 = (vis_min_y * px_per_mm_y)
-                    .floor()
-                    .clamp(0.0, (ah - 1) as f64) as u32;
-                let mut x1 = (vis_max_x * px_per_mm_x)
-                    .ceil()
-                    .clamp((x0 + 1) as f64, aw as f64) as u32;
-                let mut y1 = (vis_max_y * px_per_mm_y)
-                    .ceil()
-                    .clamp((y0 + 1) as f64, ah as f64) as u32;
-                if x1 - x0 < 2 {
-                    if x1 < aw {
-                        x1 += 1;
-                    } else {
-                        x0 = x0.saturating_sub(1);
-                    }
-                }
-                if y1 - y0 < 2 {
-                    if y1 < ah {
-                        y1 += 1;
-                    } else {
-                        y0 = y0.saturating_sub(1);
-                    }
-                }
-                let cw = x1 - x0;
-                let ch = y1 - y0;
-                let filtered_rgba = filtered_asset.to_rgba8_vec();
-                let mut cropped_bytes = Vec::with_capacity((cw * ch * 4) as usize);
-                for row in y0..y1 {
-                    let start = ((row * aw + x0) * 4) as usize;
-                    let end = ((row * aw + x1) * 4) as usize;
-                    cropped_bytes.extend_from_slice(&filtered_rgba[start..end]);
-                }
-                let cropped_asset = RasterAsset::new(
-                    cw,
-                    ch,
-                    cropped_bytes,
-                    filtered_asset.source_dpi,
-                    filtered_asset.color_mode,
-                )
-                .map_err(|e| e.to_string())?;
-                (
-                    cropped_asset,
-                    f64::from(x0) / px_per_mm_x,
-                    f64::from(y0) / px_per_mm_y,
-                    f64::from(cw) / px_per_mm_x,
-                    f64::from(ch) / px_per_mm_y,
-                )
-            } else {
-                (filtered_asset, 0.0, 0.0, w_mm, h_mm)
-            };
+            let (trace_asset, offset_x_mm, offset_y_mm, trace_w_mm, trace_h_mm) =
+                crop_filtered_trace_asset(filtered_asset, crop_rect, w_mm, h_mm)?;
 
             let traced = trace_raster_to_mm(&trace_asset, trace_w_mm, trace_h_mm, &cfg);
-            let count = traced.len();
-            if count == 0 {
+            if traced.is_empty() {
                 return Err("trace produced 0 contours (adjust detail or colors)".to_owned());
             }
 
-            let mut placed_xf = xf;
-            if self.trace_state.place_side_by_side {
-                let corners = [
-                    Point2D::new(offset_x_mm, offset_y_mm),
-                    Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm),
-                    Point2D::new(offset_x_mm + trace_w_mm, offset_y_mm + trace_h_mm),
-                    Point2D::new(offset_x_mm, offset_y_mm + trace_h_mm),
-                ];
-                let (mut min_wx, mut max_wx) = (f64::INFINITY, f64::NEG_INFINITY);
-                for c in corners {
-                    let cp = persp.and_then(|p| p.transform_point(c)).unwrap_or(c);
-                    let wp = xf.transform_point(cp);
-                    min_wx = min_wx.min(wp.x);
-                    max_wx = max_wx.max(wp.x);
-                }
-                if (max_wx - min_wx).is_finite() {
-                    placed_xf.m[4] += (max_wx - min_wx).max(1.0) + 6.0;
-                }
-            }
+            let placed_xf = compute_trace_placed_transform(
+                xf,
+                persp,
+                offset_x_mm,
+                offset_y_mm,
+                trace_w_mm,
+                trace_h_mm,
+                place_side_by_side,
+            );
+            (target_id, traced, offset_x_mm, offset_y_mm, placed_xf, persp)
+        };
 
+        self.commit_traced_contours(
+            target_id,
+            layer_id,
+            traced,
+            offset_x_mm,
+            offset_y_mm,
+            placed_xf,
+            persp,
+            is_centerline,
+            keep_original,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_traced_contours(
+        &mut self,
+        target_id: ObjectId,
+        layer_id: Option<LayerId>,
+        traced: Vec<(BezierPath, Color)>,
+        offset_x_mm: f64,
+        offset_y_mm: f64,
+        placed_xf: Affine2D,
+        persp: Option<coree_core::Perspective3x3>,
+        is_centerline: bool,
+        keep_original: bool,
+    ) -> Result<usize, String> {
+        let count = traced.len();
+        let (ops, created_ids) = {
+            let tab = self
+                .tabs
+                .get(self.active_tab)
+                .ok_or_else(|| "no active document".to_owned())?;
             let mut next_id = tab.document.next_id().max(1);
             let mut ops = Vec::with_capacity(count + 2);
             let mut created_ids = Vec::with_capacity(count);
@@ -409,12 +473,12 @@ impl StudioApp {
                     name: "Vector Trace Result".to_owned(),
                 });
             }
-            if !self.trace_state.keep_original {
+            if !keep_original && tab.document.has_object(target_id) {
                 ops.push(CommandOp::DeleteObjects {
                     ids: vec![target_id],
                 });
             }
-            (ops, created_ids, count)
+            (ops, created_ids)
         };
 
         let cmd = if ops.len() == 1 {

@@ -93,9 +93,7 @@ pub(super) fn show_canvas_context_menu(canvas_resp: &egui::Response, app: &mut S
                 .button(crate::i18n::I18nKey::BitmapTraceVector.tr_ui(lang))
                 .clicked()
             {
-                if let Err(e) = app.trace_selected_raster() {
-                    app.push_toast(e, true);
-                }
+                app.trace_selected_raster_interactive();
                 ui.close();
             }
             if ui

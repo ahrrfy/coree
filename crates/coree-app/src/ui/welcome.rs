@@ -412,9 +412,7 @@ pub fn show_welcome_hub(ui: &mut Ui, app: &mut StudioApp) {
                                             .clicked()
                                         {
                                             let pb = PathBuf::from(&rec.file_path);
-                                            if let Err(err) = app.open_file_path(&pb) {
-                                                app.push_toast(err, true);
-                                            }
+                                            app.open_file_path_interactive(&pb);
                                         }
                                     });
                                 });

@@ -3568,6 +3568,17 @@ impl CommandHistory {
         self.max_history
     }
 
+    /// Updates the undo stack retention limit dynamically (used by the adaptive resource governor),
+    /// trimming the oldest undo entries if the current stack exceeds the new limit.
+    pub fn set_max_history(&mut self, max_history: usize) {
+        let clamped = max_history.max(1);
+        self.max_history = clamped;
+        if self.undo_stack.len() > clamped {
+            let excess = self.undo_stack.len() - clamped;
+            self.undo_stack.drain(0..excess);
+        }
+    }
+
     /// Drains and returns the sorted list of [`ImageAssetId`]s pruned by the most recent
     /// [`Self::gc_after_commit`] call (used to keep WAL command journals synchronized across
     /// `max_history` eviction).

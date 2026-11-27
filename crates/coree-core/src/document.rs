@@ -28,6 +28,7 @@ use rayon::prelude::*;
 use rstar::{RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Maximum recursion depth for nested groups / PowerClips / symbols to prevent stack overflow.
@@ -1792,6 +1793,41 @@ impl PartialEq for RevisionCounter {
     }
 }
 
+type SpatialCacheMap = HashMap<(usize, u64), Arc<SpatialIndex>>;
+
+#[derive(Debug)]
+struct CachedSpatialIndices {
+    inner: std::sync::RwLock<(u64, SpatialCacheMap)>,
+}
+
+impl Default for CachedSpatialIndices {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::RwLock::new((u64::MAX, HashMap::new())),
+        }
+    }
+}
+
+impl Clone for CachedSpatialIndices {
+    fn clone(&self) -> Self {
+        let cloned = self
+            .inner
+            .read()
+            .map(|g| (g.0, g.1.clone()))
+            .unwrap_or_else(|_| (u64::MAX, HashMap::new()));
+        Self {
+            inner: std::sync::RwLock::new(cloned),
+        }
+    }
+}
+
+impl PartialEq for CachedSpatialIndices {
+    #[inline]
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     id: Uuid,
@@ -1841,6 +1877,8 @@ pub struct Document {
     next_id: u64,
     #[serde(skip)]
     spatial_revision: RevisionCounter,
+    #[serde(skip)]
+    spatial_cache: CachedSpatialIndices,
 }
 
 impl Default for Document {
@@ -1901,6 +1939,7 @@ impl Document {
             drawing_scale: DrawingScale::default(),
             next_id,
             spatial_revision: RevisionCounter(1),
+            spatial_cache: CachedSpatialIndices::default(),
         }
     }
 
@@ -8604,6 +8643,50 @@ impl Document {
         }
     }
 
+    /// Returns a revision-cached [`Arc<SpatialIndex>`] for `page_index`, rebuilding at most once
+    /// per document/layer mutation so interactive hit-testing, marquee selection, and snapping
+    /// run in `O(log N)` instead of `O(N log N)` per pointer event.
+    #[must_use]
+    pub fn cached_spatial_index(&self, page_index: usize) -> Arc<SpatialIndex> {
+        if page_index >= self.pages.len() {
+            return Arc::new(SpatialIndex { tree: RTree::new() });
+        }
+        let mut page_sig = 0xcbf2_9ce4_8422_2325_u64;
+        page_sig ^= self.objects.len() as u64;
+        page_sig = page_sig.wrapping_mul(0x0100_0000_01b3);
+        page_sig ^= self.symbols.len() as u64;
+        page_sig = page_sig.wrapping_mul(0x0100_0000_01b3);
+        for (p_idx, p) in self.pages.iter().enumerate() {
+            for layer in &p.layers {
+                if Self::layer_applies_to_page(layer, p_idx, page_index) {
+                    page_sig ^= layer.id.0;
+                    page_sig = page_sig.wrapping_mul(0x0100_0000_01b3);
+                    page_sig ^= u64::from(layer.visible);
+                    page_sig = page_sig.wrapping_mul(0x0100_0000_01b3);
+                    page_sig ^= layer.objects.len() as u64;
+                    page_sig = page_sig.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        let rev = self.spatial_revision.0;
+        if let Ok(guard) = self.spatial_cache.inner.read() {
+            if guard.0 == rev {
+                if let Some(hit) = guard.1.get(&(page_index, page_sig)) {
+                    return Arc::clone(hit);
+                }
+            }
+        }
+        let built = Arc::new(self.build_spatial_index(page_index));
+        if let Ok(mut guard) = self.spatial_cache.inner.write() {
+            if guard.0 != rev {
+                guard.0 = rev;
+                guard.1.clear();
+            }
+            guard.1.insert((page_index, page_sig), Arc::clone(&built));
+        }
+        built
+    }
+
     /// Returns the topmost visible, unlocked object hit near `pt` on the active page,
     /// skipping objects residing on locked or invisible layers (including cross-page master/desktop layers).
     #[must_use]
@@ -8618,7 +8701,7 @@ impl Document {
                 }
             }
         }
-        let index = self.build_spatial_index(self.active_page_index);
+        let index = self.cached_spatial_index(self.active_page_index);
         for oid in index.query_point(pt, tolerance_mm) {
             if locked_layer_ids.contains(&oid) {
                 continue;

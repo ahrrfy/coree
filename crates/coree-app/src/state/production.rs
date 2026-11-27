@@ -5,6 +5,7 @@ use super::*;
 mod palette_io_macros;
 mod prepress_laser;
 mod raster_trace_fonts;
+pub(super) use raster_trace_fonts::{compute_trace_placed_transform, crop_filtered_trace_asset};
 
 impl StudioApp {
     // -------------------------------------------------------------------------

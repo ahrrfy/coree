@@ -53,7 +53,7 @@ pub fn hit_test_point_exact(
     }
     let tol = sanitize_f64(tolerance_mm, 1.0).abs();
     let blocked = locked_or_hidden_layer_objects(doc, page_index);
-    let index = doc.build_spatial_index(page_index);
+    let index = doc.cached_spatial_index(page_index);
     // Candidates are returned frontmost-first
     for oid in index.query_point(pt_mm, tol) {
         if blocked.contains(&oid) {
@@ -199,7 +199,7 @@ pub fn hit_test_rect(
         return Vec::new();
     }
     let blocked = locked_or_hidden_layer_objects(doc, page_index);
-    let index = doc.build_spatial_index(page_index);
+    let index = doc.cached_spatial_index(page_index);
     let mut hits = Vec::new();
     for oid in index.query_rect(rect_mm) {
         if blocked.contains(&oid) {
@@ -296,6 +296,52 @@ pub fn hit_test_node(
                     }
                 }
                 continue;
+            }
+            // Zero-allocation fast path for affine-only `NodePayload::Path` (avoids cloning
+            // 40,000+ nodes on every pointer move when `Snap to Nodes` or `F10` is active).
+            let has_persp_or_warp = obj.perspective.is_some()
+                || obj.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Perspective { .. }
+                            | Effect::Envelope { .. }
+                            | Effect::Distort { .. }
+                    )
+                });
+            if !has_persp_or_warp {
+                if let NodePayload::Path(local_path) = &obj.payload {
+                    let world_xf = doc.world_transform_of(oid).unwrap_or(obj.transform);
+                    if let Some(local_bb) = local_path.bounding_box() {
+                        if let Some(wb) = world_xf.try_transform_rect(local_bb) {
+                            let ex = wb.expand(tol);
+                            if pt_mm.x < ex.min_x
+                                || pt_mm.x > ex.max_x
+                                || pt_mm.y < ex.min_y
+                                || pt_mm.y > ex.max_y
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    for (sp_idx, sp) in local_path.subpaths.iter().enumerate() {
+                        for (node_idx, node) in sp.nodes.iter().enumerate() {
+                            let wp = world_xf.transform_point(node.pos);
+                            let d = wp.distance_to(pt_mm);
+                            if d <= tol && best.is_none_or(|b| d < b.distance_mm) {
+                                best = Some(NodeHit {
+                                    node: NodeRef {
+                                        object_id: oid,
+                                        subpath_index: sp_idx,
+                                        node_index: node_idx,
+                                    },
+                                    position_mm: wp,
+                                    distance_mm: d,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
         }
         let Some(world_path) = doc.world_path_of(oid) else {
@@ -2540,8 +2586,8 @@ impl SnapEngine {
             .map(crate::Page::trim_rect)
             .unwrap_or_else(|| Rect2D::from_xywh(0.0, 0.0, 210.0, 297.0));
 
-        let candidates: Vec<ObjectId> = if page.is_some() {
-            let index = doc.build_spatial_index(page_index);
+        let spatial_index = page.map(|_| doc.cached_spatial_index(page_index));
+        let candidates: Vec<ObjectId> = if let Some(ref index) = spatial_index {
             index
                 .query_point(pt_mm, tol.max(8.0))
                 .into_iter()
@@ -2757,27 +2803,31 @@ impl SnapEngine {
                     }
                 }
 
-                // Also collect world path for Perpendicular / Intersection / non-ellipse Tangent
-                if let Some(wp) = doc.world_path_of(oid) {
-                    let is_full_ellipse = matches!(
-                        obj.payload,
-                        NodePayload::Shape(ParametricShape::Ellipse {
-                            mode: crate::EllipseMode::Full,
-                            ..
-                        })
-                    );
-                    let mut segs = Vec::new();
-                    for poly in wp.flatten(0.02) {
-                        for w in poly.windows(2) {
-                            if w[0].distance_to(w[1]) > 1e-7 {
-                                segs.push((w[0], w[1]));
+                // Collect world path ONLY when Perpendicular / Intersection / Tangent snaps are enabled
+                if options.perpendicular || options.tangent || options.intersection {
+                    if let Some(wp) = doc.world_path_of(oid) {
+                        let is_full_ellipse = matches!(
+                            obj.payload,
+                            NodePayload::Shape(ParametricShape::Ellipse {
+                                mode: crate::EllipseMode::Full,
+                                ..
+                            })
+                        );
+                        if options.perpendicular || options.intersection {
+                            let mut segs = Vec::new();
+                            for poly in wp.flatten(0.02) {
+                                for w in poly.windows(2) {
+                                    if w[0].distance_to(w[1]) > 1e-7 {
+                                        segs.push((w[0], w[1]));
+                                    }
+                                }
+                            }
+                            if !segs.is_empty() {
+                                seg_groups.push((oid, segs));
                             }
                         }
+                        world_paths.push((oid, wp, is_full_ellipse));
                     }
-                    if !segs.is_empty() {
-                        seg_groups.push((oid, segs));
-                    }
-                    world_paths.push((oid, wp, is_full_ellipse));
                 }
             }
 
@@ -3029,6 +3079,23 @@ impl SnapEngine {
 
         // 2a. Object edges & centers (emits dynamic alignment guides!)
         if options.objects && page.is_some() {
+            // On large scenes (> 256 objects), pre-filter via R-Tree X/Y strip queries in O(log N)
+            // since any object whose min/center/max lies within `tol` of `pt_mm.x` or `pt_mm.y`
+            // must intersect one of the two infinite tolerance bands.
+            let strip_candidates: Option<HashSet<ObjectId>> = if doc.objects().len() > 256 {
+                spatial_index.as_ref().map(|idx| {
+                    let mut set: HashSet<ObjectId> = idx
+                        .query_rect(Rect2D::new(pt_mm.x - tol, -1.0e9, pt_mm.x + tol, 1.0e9))
+                        .into_iter()
+                        .collect();
+                    set.extend(
+                        idx.query_rect(Rect2D::new(-1.0e9, pt_mm.y - tol, 1.0e9, pt_mm.y + tol)),
+                    );
+                    set
+                })
+            } else {
+                None
+            };
             for (p_idx, pg) in doc.pages().iter().enumerate() {
                 for layer in &pg.layers {
                     if !layer.visible || !Document::layer_applies_to_page(layer, p_idx, page_index)
@@ -3038,6 +3105,11 @@ impl SnapEngine {
                     for &oid in &layer.objects {
                         if exclude.contains(&oid) {
                             continue;
+                        }
+                        if let Some(ref allow) = strip_candidates {
+                            if !allow.contains(&oid) {
+                                continue;
+                            }
                         }
                         let Some(obj) = doc.object(oid) else {
                             continue;

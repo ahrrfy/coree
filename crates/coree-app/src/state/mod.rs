@@ -78,6 +78,7 @@ mod canvas_tools;
 mod editing;
 pub(crate) mod helpers;
 mod production;
+pub mod resources_async;
 mod session_io;
 mod tab;
 mod templates_autosave;
@@ -85,6 +86,7 @@ mod tool_dispatch;
 mod types;
 
 pub(crate) use helpers::*;
+pub use resources_async::ActiveAsyncUiOp;
 pub use tab::*;
 pub use types::*;
 
@@ -185,13 +187,20 @@ pub struct StudioApp {
     pub(crate) clipboard_backend: Box<dyn crate::clipboard::ClipboardBackend>,
     pub(crate) last_clipboard_hash: Option<u64>,
 
-    // Offline local storage & async job pool
+    // Offline local storage, adaptive hardware governor & async job pool
     pub storage: Option<StorageDb>,
     pub job_pool: Option<JobPool>,
+    pub host_resources: coree_core::HostResourceProfile,
+    pub resource_mode: coree_core::ResourceGovernorMode,
+    pub resource_budget: coree_core::ResourceBudget,
+    pub last_resource_probe_at: Instant,
+    pub async_interactive_io: bool,
+    pub(crate) last_window_title: String,
     pub(crate) ipc_server: Option<crate::ipc::IpcServer>,
     pub recent_docs: Vec<RecentDocumentRecord>,
     pub unclean_sessions: Vec<UncleanSession>,
     pub active_jobs: Vec<ActiveBackgroundJob>,
+    pub async_ui_ops: Vec<ActiveAsyncUiOp>,
     pub autosave_interval: Duration,
 
     // Styling defaults & Palettes
@@ -435,7 +444,18 @@ impl StudioApp {
             .map(|t| t.toolbar_config.clone())
             .unwrap_or_default();
 
-        let job_pool = JobPool::default_pool().ok();
+        let saved_resource_mode = storage
+            .as_ref()
+            .and_then(|db| {
+                db.get_preference::<coree_core::ResourceGovernorMode>("perf.governor_mode")
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        let host_resources = coree_core::HostResourceProfile::probe();
+        let resource_budget =
+            coree_core::ResourceBudget::compute(&host_resources, saved_resource_mode);
+        let job_pool = JobPool::new(resource_budget.worker_threads).ok();
 
         let initial_display_icc = display_icc_provider.load_display_icc();
         let initial_use_display_icc = initial_display_icc.is_some();
@@ -519,10 +539,17 @@ impl StudioApp {
             last_clipboard_hash: None,
             storage,
             job_pool,
+            host_resources,
+            resource_mode: saved_resource_mode,
+            resource_budget,
+            last_resource_probe_at: Instant::now(),
+            async_interactive_io: open_welcome_when_empty,
+            last_window_title: String::new(),
             ipc_server: None,
             recent_docs,
             unclean_sessions,
             active_jobs: Vec::new(),
+            async_ui_ops: Vec::new(),
             autosave_interval: Duration::from_secs(30),
             default_fill: Fill::Solid(Color::cmyk(0.75, 0.15, 0.0, 0.0)),
             default_outline: OutlineStyle::solid(Color::KEY_BLACK, 0.3),

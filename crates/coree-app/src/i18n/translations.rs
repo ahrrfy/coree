@@ -1236,5 +1236,33 @@ pub(super) const fn tr_en(key: I18nKey) -> &'static str {
         I18nKey::DockLaserAir => "Air",
         I18nKey::DockLaserCross => "Cross",
         I18nKey::DlgFillRgbLabel => "RGB:",
+        I18nKey::DlgOptTabPerf => "Performance & Resources",
+        I18nKey::DlgOptPerfHeader => "Adaptive Hardware Resource Governor",
+        I18nKey::DlgOptPerfModeAuto => "Auto (Hardware-Adaptive)",
+        I18nKey::DlgOptPerfModeEco => "Eco / Low Memory",
+        I18nKey::DlgOptPerfModeBalanced => "Balanced Studio",
+        I18nKey::DlgOptPerfModeMax => "Max Workstation",
+        I18nKey::DlgOptPerfDetectedHdr => "Detected Host Hardware",
+        I18nKey::DlgOptPerfCpuWorkers => "CPU Threads & Workers:",
+        I18nKey::DlgOptPerfSystemRam => "System RAM (Avail / Total):",
+        I18nKey::DlgOptPerfProcessRss => "Studio Process Memory:",
+        I18nKey::DlgOptPerfTileBudget => "Multi-Page Tile Cache Budget:",
+        I18nKey::DlgOptPerfGpuBudget => "Direct GPU Tile Pool:",
+        I18nKey::DlgOptPerfUndoBudget => "Adaptive Undo Depth:",
+        I18nKey::DlgOptPerfPressureWarn => {
+            "Low system memory detected — automatic cache trimming is active"
+        }
+        I18nKey::DlgOptPerfPurgeBtn => "Purge Unused Tile & GPU Caches",
+        I18nKey::DlgOptPerfPurgeToast => "Purged unused CPU & GPU tile caches",
+        I18nKey::StatusPerfBadgeTip => {
+            "Hardware Resource Governor & Direct GPU Tile Engine (click to configure)"
+        }
+        I18nKey::CanvasBgTaskCancel => "Cancel",
+        I18nKey::CanvasNodesLodBanner => "High-Detail LOD: zoom in to view all anchor handles",
+        I18nKey::PageNavFirstTip => "First Page",
+        I18nKey::PageNavPrevTip => "Previous Page",
+        I18nKey::PageNavNextTip => "Next Page",
+        I18nKey::PageNavLastTip => "Last Page",
+        I18nKey::PageNavJumpHint => "Jump to page:",
     }
 }

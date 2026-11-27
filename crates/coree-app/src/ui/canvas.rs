@@ -28,12 +28,13 @@ mod context_text;
 mod navigator;
 pub use navigator::show_navigator_popup_area;
 mod overlays;
+mod page_bar;
 #[cfg(test)]
 mod tests;
 
 pub fn show_canvas_and_status(ui: &mut Ui, app: &mut StudioApp) {
     show_status_bar(ui, app);
-    show_page_tabs_and_doc_palette(ui, app);
+    page_bar::show_page_tabs_and_doc_palette(ui, app);
     show_central_viewport(ui, app);
     if app.show_navigator_popup {
         show_navigator_popup_area(ui, app);
@@ -95,6 +96,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
         .show(ui, |ui| {
             let active_tool_label = crate::i18n::tool_i18n_key(app.active_tool).tr_ui(lang);
             let tool_hint = tool_status_hint(app.active_tool, lang);
+            app.poll_active_tab_metrics_nonblocking();
             let (
                 cursor_txt,
                 sel_txt,
@@ -109,7 +111,6 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 snap_summary,
                 scale_label,
             ) = if let Some(tab) = app.active_tab_mut() {
-                tab.ensure_metrics_fresh();
                 let u = tab.document.default_unit();
                 let dpi = f64::from(tab.document.dpi());
                 let scale = tab.document.drawing_scale();
@@ -339,20 +340,49 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 }
 
                 // Active Background Job progress indicator
-                if let Some(job) = app.active_jobs.first() {
+                if let Some((job_name, pct, count)) = app.active_background_progress_summary() {
                     ui.separator();
-                    let pct = job.handle.progress();
+                    let suffix = if count > 1 {
+                        format!(" +{count}")
+                    } else {
+                        String::new()
+                    };
                     ui.label(
-                        RichText::new(format!("⏳ {} ({pct}%)", job.handle.name()))
+                        RichText::new(format!("⏳ {job_name} ({pct}%){suffix}"))
                             .size(11.0)
                             .color(tokens.accent_secondary),
                     );
                 }
 
-                // Opposite-aligned zone: navigator, swatches, color mode, snap pill, zoom
+                // Opposite-aligned zone: navigator, hardware resource badge, swatches, color mode, snap pill, zoom
                 ui.with_layout(
                     shell_dir.opposite_horizontal_layout(egui::Align::Center),
                     |ui| {
+                        let perf_label = format!(
+                            "⚡ {}T",
+                            app.resource_budget.worker_threads
+                        );
+                        let perf_color = if app.resource_budget.under_memory_pressure {
+                            tokens.warning
+                        } else {
+                            tokens.success
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(perf_label)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(perf_color),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text(crate::i18n::I18nKey::StatusPerfBadgeTip.tr_ui(lang))
+                            .clicked()
+                        {
+                            app.options_tab = 4;
+                            app.show_options_dialog = true;
+                        }
                         if ui
                             .selectable_label(
                                 app.show_navigator_popup,
@@ -480,270 +510,6 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
 }
 
 // =============================================================================
-// Bottom Page Tabs Bar & Document Palette Strip
-// =============================================================================
-
-fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
-    let tokens = app.theme.tokens();
-    let page_lang = app.ui_language;
-    let shell_dir = crate::i18n::ShellLayoutDirections::from_language(page_lang);
-
-    egui::Panel::bottom("coree_page_tabs")
-        .exact_size(PAGE_TABS_HEIGHT)
-        .frame(
-            Frame::NONE
-                .fill(tokens.surface)
-                .inner_margin(Margin::symmetric(6, 2))
-                .stroke(Stroke::new(1.0, tokens.border)),
-        )
-        .show(ui, |ui| {
-            let mut add_page_req = false;
-            let mut delete_page_req = None;
-            let mut duplicate_page_req = None;
-            let mut rename_page_req: Option<(coree_core::PageId, String)> = None;
-            let mut reorder_pages_req: Option<Vec<coree_core::PageId>> = None;
-            let mut multipage_toggle_req: Option<bool> = None;
-            let mut apply_doc_fill: Option<Color> = None;
-            let mut apply_doc_stroke: Option<Color> = None;
-
-            shell_dir.with_horizontal(ui, |ui| {
-                if let Some(tab) = app.active_tab_mut() {
-                    let active_idx = tab.document.active_page_index();
-                    let page_ids: Vec<coree_core::PageId> =
-                        tab.document.pages().iter().map(|p| p.id).collect();
-                    let page_count = page_ids.len();
-
-                    for idx in 0..page_count {
-                        let page_name = tab.document.pages()[idx].name.clone();
-                        let page_id = page_ids[idx];
-                        let is_active = idx == active_idx;
-
-                        if tab.inline_renaming_page == Some(idx) {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut tab.inline_page_name_buf)
-                                    .desired_width(88.0),
-                            );
-                            if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                let new_name = tab.inline_page_name_buf.trim().to_owned();
-                                if !new_name.is_empty() {
-                                    rename_page_req = Some((page_id, new_name));
-                                }
-                                tab.inline_renaming_page = None;
-                            }
-                            continue;
-                        }
-
-                        let btn = ui.add(
-                            egui::Button::new(RichText::new(&page_name).size(11.5).color(
-                                if is_active {
-                                    tokens.text
-                                } else {
-                                    tokens.text_muted
-                                },
-                            ))
-                            .sense(Sense::click_and_drag())
-                            .fill(if is_active {
-                                tokens.surface_elevated
-                            } else {
-                                tokens.surface
-                            })
-                            .stroke(if is_active {
-                                Stroke::new(1.0, tokens.accent)
-                            } else {
-                                Stroke::new(1.0, tokens.border)
-                            }),
-                        );
-                        if btn.drag_started() {
-                            egui::DragAndDrop::set_payload(ui.ctx(), idx);
-                        }
-                        if let Some(src_idx) = btn.dnd_release_payload::<usize>() {
-                            let src = *src_idx;
-                            if src < page_count && src != idx {
-                                let mut reordered = page_ids.clone();
-                                let moved = reordered.remove(src);
-                                reordered.insert(idx, moved);
-                                reorder_pages_req = Some(reordered);
-                            }
-                        }
-                        if btn.clicked() {
-                            let _ = tab.document.set_active_page_index(idx);
-                            tab.selection.clear();
-                            tab.sync_active_layer();
-                            tab.needs_rerender = true;
-                        }
-                        if btn.double_clicked() {
-                            tab.inline_renaming_page = Some(idx);
-                            tab.inline_page_name_buf = page_name.clone();
-                        }
-                        btn.context_menu(|ui| {
-                            let lang = page_lang;
-                            if ui
-                                .button(crate::i18n::I18nKey::LayoutRenamePage.tr_ui(lang))
-                                .clicked()
-                            {
-                                tab.inline_renaming_page = Some(idx);
-                                tab.inline_page_name_buf = page_name.clone();
-                                ui.close();
-                            }
-                            if ui
-                                .button(crate::i18n::I18nKey::LayoutDuplicatePage.tr_ui(lang))
-                                .clicked()
-                            {
-                                duplicate_page_req = Some(idx);
-                                ui.close();
-                            }
-                            if idx > 0
-                                && ui
-                                    .button(crate::i18n::I18nKey::PageMoveLeft.tr_ui(lang))
-                                    .clicked()
-                            {
-                                let mut reordered = page_ids.clone();
-                                reordered.swap(idx - 1, idx);
-                                reorder_pages_req = Some(reordered);
-                                ui.close();
-                            }
-                            if idx + 1 < page_count
-                                && ui
-                                    .button(crate::i18n::I18nKey::PageMoveRight.tr_ui(lang))
-                                    .clicked()
-                            {
-                                let mut reordered = page_ids.clone();
-                                reordered.swap(idx, idx + 1);
-                                reorder_pages_req = Some(reordered);
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(
-                                    page_count > 1,
-                                    egui::Button::new(
-                                        crate::i18n::I18nKey::LayoutDeletePage.tr_ui(lang),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                delete_page_req = Some(page_id);
-                                ui.close();
-                            }
-                        });
-                    }
-
-                    if ui
-                        .small_button(RichText::new("+").color(tokens.accent))
-                        .on_hover_text(crate::i18n::I18nKey::PageAddButton.tr_ui(page_lang))
-                        .clicked()
-                    {
-                        add_page_req = true;
-                    }
-
-                    ui.separator();
-                    if ui
-                        .selectable_label(
-                            tab.document.multipage_view(),
-                            format!("⊞ {}", crate::i18n::I18nKey::ViewMultipage.tr_ui(page_lang)),
-                        )
-                        .clicked()
-                    {
-                        let next = !tab.document.multipage_view();
-                        multipage_toggle_req = Some(next);
-                        tab.viewport.multipage_view = next;
-                        tab.needs_rerender = true;
-                    }
-
-                    // Document Palette Strip
-                    ui.separator();
-                    ui.label(
-                        RichText::new(crate::i18n::I18nKey::StatusDocColorsLabel.tr_ui(page_lang))
-                            .size(10.5)
-                            .color(tokens.text_muted),
-                    );
-                    for sw in tab.document.document_palette().swatches.iter().take(16) {
-                        let (r, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
-                        ui.painter().rect(
-                            r,
-                            CornerRadius::same(2),
-                            core_color_to_egui(&sw.color),
-                            Stroke::new(0.8, tokens.border_input),
-                            StrokeKind::Inside,
-                        );
-                        let resp = resp.on_hover_text(format!(
-                            "{} ({})",
-                            sw.name,
-                            crate::i18n::I18nKey::StatusFillOutlineHint.tr_ui(page_lang)
-                        ));
-                        if resp.clicked() {
-                            apply_doc_fill = Some(sw.color.clone());
-                        } else if resp.secondary_clicked() {
-                            apply_doc_stroke = Some(sw.color.clone());
-                        }
-                    }
-                }
-            });
-
-            if add_page_req {
-                let (w, h, b, n) = app
-                    .active_tab()
-                    .and_then(|t| {
-                        t.document.active_page().map(|p| {
-                            (
-                                p.width_mm,
-                                p.height_mm,
-                                p.bleed_mm,
-                                t.document.pages().len() + 1,
-                            )
-                        })
-                    })
-                    .unwrap_or((210.0, 297.0, 3.0, 2));
-                let _ = app.execute_command(CommandOp::AddPage {
-                    name: format!("Page {n}"),
-                    width_mm: w,
-                    height_mm: h,
-                    bleed_mm: b,
-                });
-            }
-            if let Some(pid) = delete_page_req {
-                let _ = app.execute_command(CommandOp::DeletePage { page_id: pid });
-            }
-            if let Some((page_id, new_name)) = rename_page_req {
-                let _ = app.execute_command(CommandOp::RenamePage { page_id, new_name });
-            }
-            if let Some(page_ids) = reorder_pages_req {
-                let _ = app.execute_command(CommandOp::ReorderPages { page_ids });
-            }
-            if let Some(next) = multipage_toggle_req {
-                let _ = app.execute_command(CommandOp::SetDocumentProperties {
-                    title: None,
-                    color_mode: None,
-                    default_unit: None,
-                    dpi: None,
-                    multipage_view: Some(next),
-                    active_page_index: None,
-                    metadata: None,
-                    custom_icc_profile: None,
-                    clear_custom_icc: false,
-                    rgb_icc_profile: None,
-                    clear_rgb_icc: false,
-                    cmyk_icc_profile: None,
-                    clear_cmyk_icc: false,
-                    gray_icc_profile: None,
-                    clear_gray_icc: false,
-                    rendering_intent: None,
-                    black_point_compensation: None,
-                    drawing_scale: None,
-                });
-            }
-            if let Some(idx) = duplicate_page_req {
-                app.duplicate_page(idx);
-            }
-            if let Some(c) = apply_doc_fill {
-                app.apply_fill_color(c);
-            }
-            if let Some(c) = apply_doc_stroke {
-                app.apply_outline_color(c);
-            }
-        });
-}
-
-// =============================================================================
 // Central Rulers + Interactive Canvas Viewport
 // =============================================================================
 
@@ -833,6 +599,7 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
             };
             let disp_icc_int = app.display_icc_intent;
 
+            let max_gpu_tiles = app.resource_budget.max_gpu_tile_textures;
             {
                 let Some(tab) = app.active_tab_mut() else {
                     return;
@@ -877,19 +644,23 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                     tab.viewport_initialized = true;
                 }
 
-                // Re-render dirty 256x256 tiles & update egui TextureHandle
-                let rendered_tiles = tab.tile_cache.render_dirty_tiles(
-                    &tab.document,
-                    &tab.viewport,
-                    tab.view_mode,
-                    &tab.render_options,
-                    &mut tab.renderer,
-                );
-                if rendered_tiles > 0 || tab.needs_rerender || tab.last_rendered_texture.is_none() {
-                    let mut rgba_buf = tab.tile_cache.composite_to_rgba();
-
-                    // Optional live Overprint / Separation plate preview overlay
-                    if tab.overprint_preview {
+                if !tab.overprint_preview {
+                    // Direct GPU `256 × 256` World-Tile Texture Compositor (`0` full-screen CPU copy!)
+                    page_bar::paint_viewport_tiles_gpu(ui, canvas_rect, tab, max_gpu_tiles);
+                } else {
+                    // Live Overprint / Separation plate preview path
+                    let rendered_tiles = tab.tile_cache.render_dirty_tiles(
+                        &tab.document,
+                        &tab.viewport,
+                        tab.view_mode,
+                        &tab.render_options,
+                        &mut tab.renderer,
+                    );
+                    if rendered_tiles > 0
+                        || tab.needs_rerender
+                        || tab.last_rendered_texture.is_none()
+                    {
+                        let mut rgba_buf = tab.tile_cache.composite_to_rgba();
                         if let Some(ref sep) = tab.separations_preview {
                             let sim = simulate_overprint_rgba(sep);
                             if sim.len() == (sep.width * sep.height * 4) as usize {
@@ -898,32 +669,29 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                                 rgba_buf.rgba = sim;
                             }
                         }
+                        let img = ColorImage::from_rgba_unmultiplied(
+                            [rgba_buf.width as usize, rgba_buf.height as usize],
+                            &rgba_buf.rgba,
+                        );
+                        if let Some(ref mut tex) = tab.last_rendered_texture {
+                            tex.set(img, TextureOptions::LINEAR);
+                        } else {
+                            tab.last_rendered_texture = Some(ui.ctx().load_texture(
+                                format!("coree_canvas_{}", tab.id),
+                                img,
+                                TextureOptions::LINEAR,
+                            ));
+                        }
+                        tab.needs_rerender = false;
                     }
-
-                    let img = ColorImage::from_rgba_unmultiplied(
-                        [rgba_buf.width as usize, rgba_buf.height as usize],
-                        &rgba_buf.rgba,
-                    );
-                    if let Some(ref mut tex) = tab.last_rendered_texture {
-                        tex.set(img, TextureOptions::LINEAR);
-                    } else {
-                        tab.last_rendered_texture = Some(ui.ctx().load_texture(
-                            format!("coree_canvas_{}", tab.id),
-                            img,
-                            TextureOptions::LINEAR,
-                        ));
+                    if let Some(ref tex) = tab.last_rendered_texture {
+                        ui.painter().image(
+                            tex.id(),
+                            canvas_rect,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
                     }
-                    tab.needs_rerender = false;
-                }
-
-                // Paint rendered vector canvas texture
-                if let Some(ref tex) = tab.last_rendered_texture {
-                    ui.painter().image(
-                        tex.id(),
-                        canvas_rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
                 }
             }
 
@@ -1118,7 +886,8 @@ fn show_central_viewport(ui: &mut Ui, app: &mut StudioApp) {
                 );
             }
 
-            // Non-blocking floating toasts at top-right of canvas
+            // Non-blocking floating background tasks progress & toasts at top-right of canvas
+            page_bar::show_background_jobs_hud(ui, app, canvas_rect);
             overlays::paint_toasts(ui, app, canvas_rect);
         });
 }

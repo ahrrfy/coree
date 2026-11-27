@@ -64,7 +64,8 @@ pub use text_layout::{
     ShapedPdfGlyph, ShapedPdfRun, TextEngine,
 };
 pub use tile_cache::{
-    object_visual_world_bounds, CachedTile, DirtyTileCache, WorldTileKey, TILE_SIZE_PX,
+    object_visual_world_bounds, CachedTile, DirtyTileCache, GpuTileView, WorldTileKey,
+    TILE_SIZE_PX,
 };
 pub use trace::{trace_raster, trace_raster_to_mm, OutlinePreset, TraceConfig, TraceMode};
 pub use viewport::{ViewMode, Viewport};

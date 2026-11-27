@@ -205,8 +205,40 @@ pub(super) fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect:
         }
     }
 
-    // 3. `F10` Shape / Node Editing Overlay (Parametric Shape Diamonds + Cubic Bézier Nodes & Handles)
+    // 3. `F10` Shape / Node Editing Overlay (Viewport-Culled + Screen-Cell LOD for 40k–200k+ Node Paths)
     if app.active_tool == ToolId::ShapeNode {
+        let cull_rect = canvas_rect.expand(16.0);
+        let node_budget = app.resource_budget.node_overlay_budget.max(400);
+        let mut unselected_visible_total = 0usize;
+        for &oid in &tab.selection.objects {
+            if let Some(obj) = tab.document.object(oid) {
+                if let NodePayload::Path(p) = &obj.payload {
+                    let world_xf = world_transform_of_or_local(&tab.document, oid);
+                    for sp in &p.subpaths {
+                        for node in &sp.nodes {
+                            let sp_pt = world_to_screen(
+                                canvas_rect,
+                                tab,
+                                world_xf.transform_point(node.pos),
+                            );
+                            if cull_rect.contains(sp_pt) {
+                                unselected_visible_total += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let draw_unselected_handles = unselected_visible_total <= 240;
+        let use_cell_decimation = unselected_visible_total > node_budget;
+        let mut occupied_cells: std::collections::HashSet<(i32, i32)> = if use_cell_decimation {
+            std::collections::HashSet::with_capacity(node_budget.min(8192))
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut drawn_unselected = 0usize;
+        let mut any_decimated = false;
+
         for &oid in &tab.selection.objects {
             let Some(obj) = tab.document.object(oid) else {
                 continue;
@@ -216,6 +248,9 @@ pub(super) fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect:
                 NodePayload::Shape(shape) => {
                     for (_, wpt) in parametric_shape_handles(shape, &world_xf) {
                         let p = world_to_screen(canvas_rect, tab, wpt);
+                        if !cull_rect.contains(p) {
+                            continue;
+                        }
                         let diamond = vec![
                             p + vec2(0.0, -6.0),
                             p + vec2(6.0, 0.0),
@@ -243,21 +278,43 @@ pub(super) fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect:
                                 tab,
                                 world_xf.transform_point(node.pos),
                             );
-                            for h in [node.handle_in, node.handle_out].into_iter().flatten() {
-                                let h_pos =
-                                    world_to_screen(canvas_rect, tab, world_xf.transform_point(h));
-                                painter
-                                    .line_segment([a_pos, h_pos], Stroke::new(1.0, tokens.accent));
-                                painter.circle(
-                                    h_pos,
-                                    3.5,
-                                    tokens.accent,
-                                    Stroke::new(1.0, Color32::WHITE),
-                                );
+                            if !selected && !cull_rect.contains(a_pos) {
+                                continue;
+                            }
+                            if !selected && use_cell_decimation {
+                                if drawn_unselected >= node_budget {
+                                    any_decimated = true;
+                                    continue;
+                                }
+                                let cell = ((a_pos.x * 0.2).floor() as i32, (a_pos.y * 0.2).floor() as i32);
+                                if !occupied_cells.insert(cell) {
+                                    any_decimated = true;
+                                    continue;
+                                }
+                            }
+                            if selected || draw_unselected_handles {
+                                for h in [node.handle_in, node.handle_out].into_iter().flatten() {
+                                    let h_pos = world_to_screen(
+                                        canvas_rect,
+                                        tab,
+                                        world_xf.transform_point(h),
+                                    );
+                                    painter.line_segment(
+                                        [a_pos, h_pos],
+                                        Stroke::new(1.0, tokens.accent),
+                                    );
+                                    painter.circle(
+                                        h_pos,
+                                        3.5,
+                                        tokens.accent,
+                                        Stroke::new(1.0, Color32::WHITE),
+                                    );
+                                }
                             }
                             let fill = if selected {
                                 tokens.accent
                             } else {
+                                drawn_unselected += 1;
                                 Color32::WHITE
                             };
                             if node.kind == NodeKind::Cusp {
@@ -276,6 +333,28 @@ pub(super) fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect:
                 }
                 _ => {}
             }
+        }
+
+        if any_decimated || (!draw_unselected_handles && unselected_visible_total > 240) {
+            let banner = crate::i18n::I18nKey::CanvasNodesLodBanner.tr_ui(app.ui_language);
+            let pill_rect = Rect::from_min_size(
+                pos2(canvas_rect.left() + 12.0, canvas_rect.bottom() - 32.0),
+                vec2(310.0, 22.0),
+            );
+            painter.rect(
+                pill_rect,
+                CornerRadius::same(6),
+                tokens.surface_elevated.gamma_multiply(0.92),
+                Stroke::new(1.0, tokens.border),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                pill_rect.center(),
+                Align2::CENTER_CENTER,
+                banner,
+                FontId::proportional(10.5),
+                tokens.text_muted,
+            );
         }
     }
 

@@ -91,9 +91,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                                         format!("{}  [{}]", rec.display_name, rec.file_format);
                                     if ui.button(lbl).clicked() {
                                         let path = std::path::PathBuf::from(&rec.file_path);
-                                        if let Err(err) = app.open_file_path(&path) {
-                                            app.push_toast(err, true);
-                                        }
+                                        app.open_file_path_interactive(&path);
                                         ui.close();
                                     }
                                 }
@@ -1262,9 +1260,7 @@ pub fn show_menu_bar_and_tabs(ui: &mut Ui, app: &mut StudioApp) {
                             ui.close();
                         }
                         if menu_item(ui, I18nKey::BitmapTraceVector.tr_ui(lang), "") {
-                            if let Err(e) = app.trace_selected_raster() {
-                                app.push_toast(e, true);
-                            }
+                            app.trace_selected_raster_interactive();
                             ui.close();
                         }
                         if menu_item(ui, I18nKey::BitmapAutoLevel.tr_ui(lang), "") {

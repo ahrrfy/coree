@@ -15,6 +15,7 @@ use coree_core::{
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// Computes the conservative full visual world-space bounding box of `id`, including
 /// [`coree_core::Effect::Symmetry`] clones, [`coree_core::Effect::Blend`] targets/paths,
@@ -27,21 +28,36 @@ pub fn object_visual_world_bounds(doc: &Document, id: coree_core::ObjectId) -> O
 /// Tile edge length in canonical tile pixels (`256 × 256`).
 pub const TILE_SIZE_PX: u32 = 256;
 
-/// Maximum number of world tiles retained in the LRU cache across pan/zoom.
-const MAX_CACHED_WORLD_TILES: usize = 1024;
+/// Default maximum number of world tiles retained in the LRU cache across pan/zoom/pages.
+const DEFAULT_MAX_CACHED_WORLD_TILES: usize = 1024;
 
-/// Persistent world-space tile cache key (`IMP-02`).
+/// Sentinel `page_scope` value inside [`WorldTileKey`] representing continuous multipage layout.
+pub const MULTIPAGE_TILE_SCOPE: u32 = u32::MAX;
+
+/// Persistent world-space tile cache key (`IMP-02` + multi-page retention).
 ///
 /// Independent of screen viewport position/dimensions (`pan_mm`, `width_px`, `height_px`)
-/// so panning and zooming across cached LODs never discard unaffected tiles.
+/// and scoped by `page_scope` so panning, zooming, AND switching across pages in multi-page
+/// documents never discard cached tiles of visited pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorldTileKey {
+    pub page_scope: u32,
     pub lod_level: i32,
     pub tile_x: i64,
     pub tile_y: i64,
     pub view_mode: ViewMode,
     pub proof_hash: u64,
     pub icc_hash: u64,
+}
+
+/// Zero-copy view of a rendered `256 × 256` world tile ready for direct GPU texture upload.
+#[derive(Debug, Clone, Copy)]
+pub struct GpuTileView<'a> {
+    pub key: WorldTileKey,
+    pub revision: u64,
+    pub tile_zoom: f64,
+    pub world_rect_mm: Rect2D,
+    pub buffer: &'a RgbaBuffer,
 }
 
 /// Single cached viewport-projected tile view returned by [`DirtyTileCache::tiles`].
@@ -62,6 +78,7 @@ struct CachedWorldTile {
     buffer: RgbaBuffer,
     dirty: bool,
     last_used: u64,
+    revision: u64,
 }
 
 /// Scene chrome, page layout, guides, and color-management state (excluding camera pan/zoom/size
@@ -72,11 +89,7 @@ struct SceneChromeKey {
     dpi_bits: u64,
     multipage_view: bool,
     view_mode: ViewMode,
-    active_page_index: usize,
     page_count: usize,
-    active_page_w_bits: u64,
-    active_page_h_bits: u64,
-    active_page_bleed_bits: u64,
     show_page_shadow: bool,
     show_bleed_guides: bool,
     show_margin_guides: bool,
@@ -158,8 +171,13 @@ fn compute_icc_hash(doc: &Document, options: &RenderOptions) -> u64 {
 }
 
 impl SceneChromeKey {
-    fn from(doc: &Document, vp: &Viewport, mode: ViewMode, options: &RenderOptions) -> Self {
-        let active_page = doc.active_page();
+    fn from(
+        doc: &Document,
+        vp: &Viewport,
+        mode: ViewMode,
+        options: &RenderOptions,
+        icc_hash: u64,
+    ) -> Self {
         let grid = doc.grid();
         let perspective_grid = doc.perspective_grid();
         let guides = doc.guides();
@@ -204,17 +222,12 @@ impl SceneChromeKey {
             }
         }
         let proof_hash = compute_proof_hash(options);
-        let icc_hash = compute_icc_hash(doc, options);
         Self {
             rot_bits: vp.rotation_deg.to_bits(),
             dpi_bits: vp.dpi.to_bits(),
             multipage_view: vp.multipage_view || doc.multipage_view(),
             view_mode: mode,
-            active_page_index: doc.active_page_index(),
             page_count: pages.len(),
-            active_page_w_bits: active_page.map_or(0, |p| p.width_mm.to_bits()),
-            active_page_h_bits: active_page.map_or(0, |p| p.height_mm.to_bits()),
-            active_page_bleed_bits: active_page.map_or(0, |p| p.bleed_mm.to_bits()),
             show_page_shadow: options.show_page_shadow,
             show_bleed_guides: options.show_bleed_guides,
             show_margin_guides: options.show_margin_guides,
@@ -285,6 +298,16 @@ impl DocSignature {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedIccKey {
+    doc_sig: DocSignature,
+    disp_ptr: usize,
+    disp_len: usize,
+    doc_intent: u32,
+    doc_bpc: bool,
+    disp_intent: u32,
+}
+
 /// Spatial R-Tree frustum-culled persistent world-space `256 × 256` dirty-tile cache.
 pub struct DirtyTileCache {
     width_px: u32,
@@ -293,10 +316,14 @@ pub struct DirtyTileCache {
     rows: u32,
     world_tiles: HashMap<WorldTileKey, CachedWorldTile>,
     active_keys: Vec<WorldTileKey>,
-    active_tiles: Vec<CachedTile>,
+    active_tiles_lazy: OnceLock<Vec<CachedTile>>,
     frame_counter: u64,
+    next_tile_revision: u64,
+    max_cached_tiles: usize,
+    last_page_scope: u32,
     last_chrome_key: Option<SceneChromeKey>,
     last_doc_sig: Option<DocSignature>,
+    cached_icc: Option<(CachedIccKey, u64)>,
     last_viewport: Viewport,
     last_tile_zoom: f64,
     last_lod_level: i32,
@@ -334,10 +361,14 @@ impl DirtyTileCache {
             rows: 0,
             world_tiles: HashMap::new(),
             active_keys: Vec::new(),
-            active_tiles: Vec::new(),
+            active_tiles_lazy: OnceLock::new(),
             frame_counter: 0,
+            next_tile_revision: 1,
+            max_cached_tiles: DEFAULT_MAX_CACHED_WORLD_TILES,
+            last_page_scope: 0,
             last_chrome_key: None,
             last_doc_sig: None,
+            cached_icc: None,
             last_viewport: vp,
             last_tile_zoom: 1.0,
             last_lod_level: 0,
@@ -345,7 +376,7 @@ impl DirtyTileCache {
             spatial_indices: HashMap::new(),
             spatial_dirty: true,
         };
-        cache.sync_active_grid(&vp, ViewMode::Enhanced, 0, 0, true);
+        cache.sync_active_grid(&vp, ViewMode::Enhanced, 0, 0, 0);
         cache
     }
 
@@ -376,16 +407,77 @@ impl DirtyTileCache {
         self.world_tiles.len()
     }
 
+    /// Returns the configured maximum number of cached world tiles in the LRU pool.
+    #[must_use]
+    pub fn max_cached_tiles(&self) -> usize {
+        self.max_cached_tiles
+    }
+
+    /// Dynamically updates the LRU world-tile capacity (driven by `ResourceBudget`) and
+    /// immediately evicts oldest off-screen tiles if above the new limit.
+    pub fn set_max_cached_tiles(&mut self, limit: usize) {
+        let clamped = limit.clamp(64, 8192);
+        self.max_cached_tiles = clamped;
+        self.evict_to_limit(clamped);
+    }
+
+    /// Evicts all off-screen cached world tiles (or trims down to `keep_limit`), freeing RAM
+    /// immediately during OS memory pressure or when switching document tabs.
+    pub fn trim_inactive_tiles(&mut self, keep_limit: usize) {
+        self.evict_to_limit(keep_limit.max(16));
+    }
+
+    fn evict_to_limit(&mut self, limit: usize) {
+        if self.world_tiles.len() <= limit {
+            return;
+        }
+        let active_set: HashSet<WorldTileKey> = self.active_keys.iter().copied().collect();
+        let mut candidates: Vec<(u64, WorldTileKey)> = self
+            .world_tiles
+            .iter()
+            .filter(|(k, _)| !active_set.contains(k))
+            .map(|(k, v)| (v.last_used, *k))
+            .collect();
+        candidates.sort_by_key(|(used, _)| *used);
+        let remove_count = self
+            .world_tiles
+            .len()
+            .saturating_sub(limit)
+            .min(candidates.len());
+        if remove_count > 0 {
+            for (_, k) in candidates.into_iter().take(remove_count) {
+                self.world_tiles.remove(&k);
+            }
+            self.active_tiles_lazy = OnceLock::new();
+        }
+    }
+
     /// Returns the currently active [`WorldTileKey`]s for the visible viewport.
     #[must_use]
     pub fn active_world_tile_keys(&self) -> &[WorldTileKey] {
         &self.active_keys
     }
 
-    /// Immutable slice of active viewport tiles (for diagnostics / GPU texture upload).
+    /// Iterates over all visible world tiles with zero buffer cloning (for direct GPU texture upload).
+    pub fn active_gpu_tiles(&self) -> impl Iterator<Item = GpuTileView<'_>> + '_ {
+        self.active_keys.iter().filter_map(|&key| {
+            let entry = self.world_tiles.get(&key)?;
+            Some(GpuTileView {
+                key,
+                revision: entry.revision,
+                tile_zoom: entry.tile_zoom,
+                world_rect_mm: entry.world_rect_mm,
+                buffer: &entry.buffer,
+            })
+        })
+    }
+
+    /// Immutable slice of active viewport tiles (materialized lazily only when inspected).
     #[must_use]
     pub fn tiles(&self) -> &[CachedTile] {
-        &self.active_tiles
+        self.active_tiles_lazy
+            .get_or_init(|| self.build_active_tiles_snapshot())
+            .as_slice()
     }
 
     /// Marks every cached world tile whose world bounding box intersects `rect_mm` (plus AA margin)
@@ -395,26 +487,33 @@ impl DirtyTileCache {
             return;
         }
         let expanded = rect_mm.expand(1.0);
+        let mut any = false;
         for tile in self.world_tiles.values_mut() {
             if tile.world_rect_mm.intersects(expanded) {
                 tile.dirty = true;
+                any = true;
             }
         }
-        for tile in &mut self.active_tiles {
-            if tile.world_rect_mm.intersects(expanded) {
-                tile.dirty = true;
-            }
+        if any {
+            self.active_tiles_lazy = OnceLock::new();
         }
     }
 
-    /// Marks every tile intersecting `id`'s full visual world bounds (including `Effect::Symmetry`
-    /// clones, `Effect::Blend` targets/paths, `Effect::Extrude25D` vanishing points, effect
-    /// overhang padding, scaled child outlines, ancestor container `Symmetry`/effect bounds, and
-    /// transitive scene dependents such as `Blend`, `Connector`, `TextOnPath`, `linked_next_frame`,
-    /// and `SymbolInstance` references) as dirty.
+    /// Marks every tile intersecting `id`'s full visual world bounds and transitive dependents dirty.
     pub fn mark_object_dirty(&mut self, doc: &Document, id: coree_core::ObjectId) {
+        self.mark_objects_dirty(doc, &[id]);
+    }
+
+    /// Batch-marks every tile intersecting any object in `ids` (plus `Effect::Symmetry`, `Blend`,
+    /// `Connector`, `TextOnPath`, `linked_next_frame`, `Clone`, and `SymbolInstance` dependents)
+    /// using a single shared reverse-dependency scan instead of `O(|ids| × |doc.objects()|)`.
+    pub fn mark_objects_dirty(&mut self, doc: &Document, ids: &[coree_core::ObjectId]) {
         use coree_core::{Effect, NodePayload, ObjectId};
         use std::collections::VecDeque;
+
+        if ids.is_empty() {
+            return;
+        }
 
         let mut dependents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         let mut wrap_frames: Vec<(ObjectId, Rect2D)> = Vec::new();
@@ -501,8 +600,13 @@ impl DirtyTileCache {
             }
         }
 
-        let mut visited: HashSet<ObjectId> = HashSet::from([id]);
-        let mut queue: VecDeque<(ObjectId, bool)> = VecDeque::from([(id, true)]);
+        let mut visited: HashSet<ObjectId> = HashSet::with_capacity(ids.len() * 2);
+        let mut queue: VecDeque<(ObjectId, bool)> = VecDeque::with_capacity(ids.len() * 2);
+        for &id in ids {
+            if visited.insert(id) {
+                queue.push_back((id, true));
+            }
+        }
         let mut any_marked = false;
 
         while let Some((cur, expand_children)) = queue.pop_front() {
@@ -561,10 +665,31 @@ impl DirtyTileCache {
         for tile in self.world_tiles.values_mut() {
             tile.dirty = true;
         }
-        for tile in &mut self.active_tiles {
-            tile.dirty = true;
-        }
+        self.active_tiles_lazy = OnceLock::new();
         self.spatial_dirty = true;
+    }
+
+    fn resolve_icc_hash(&mut self, doc: &Document, doc_sig: DocSignature, options: &RenderOptions) -> u64 {
+        let (disp_ptr, disp_len) = options
+            .display_icc_profile
+            .as_deref()
+            .map_or((0usize, 0usize), |b| (b.as_ptr() as usize, b.len()));
+        let key = CachedIccKey {
+            doc_sig,
+            disp_ptr,
+            disp_len,
+            doc_intent: doc.rendering_intent().to_u32(),
+            doc_bpc: doc.black_point_compensation(),
+            disp_intent: options.display_icc_intent.to_u32(),
+        };
+        if let Some((prev_key, hash)) = self.cached_icc {
+            if prev_key == key {
+                return hash;
+            }
+        }
+        let hash = compute_icc_hash(doc, options);
+        self.cached_icc = Some((key, hash));
+        hash
     }
 
     /// Computes the full visual world-space bounding box of `id` (alias for [`object_visual_world_bounds`]).
@@ -583,32 +708,40 @@ impl DirtyTileCache {
         options: &RenderOptions,
         renderer: &mut SceneRenderer,
     ) -> usize {
-        let chrome_key = SceneChromeKey::from(doc, viewport, view_mode, options);
-        if self.last_chrome_key.as_ref() != Some(&chrome_key) {
-            if self.last_chrome_key.as_ref().is_none_or(|prev| {
-                prev.multipage_view != chrome_key.multipage_view
-                    || prev.page_count != chrome_key.page_count
-                    || prev.active_page_index != chrome_key.active_page_index
-                    || prev.pages_hash != chrome_key.pages_hash
-            }) {
-                self.spatial_dirty = true;
-            }
-            self.world_tiles.clear();
-            self.last_chrome_key = Some(chrome_key.clone());
-        }
-
         let doc_sig = DocSignature::from(doc);
         if self.last_doc_sig != Some(doc_sig) {
             self.spatial_dirty = true;
             self.last_doc_sig = Some(doc_sig);
         }
 
+        let icc_hash = self.resolve_icc_hash(doc, doc_sig, options);
+        let chrome_key = SceneChromeKey::from(doc, viewport, view_mode, options, icc_hash);
+        if self.last_chrome_key.as_ref() != Some(&chrome_key) {
+            if self.last_chrome_key.as_ref().is_none_or(|prev| {
+                prev.multipage_view != chrome_key.multipage_view
+                    || prev.page_count != chrome_key.page_count
+                    || prev.pages_hash != chrome_key.pages_hash
+            }) {
+                self.spatial_dirty = true;
+            }
+            self.world_tiles.clear();
+            self.active_tiles_lazy = OnceLock::new();
+            self.last_chrome_key = Some(chrome_key.clone());
+        }
+
+        let multipage = viewport.multipage_view || doc.multipage_view();
+        let page_scope = if multipage {
+            MULTIPAGE_TILE_SCOPE
+        } else {
+            doc.active_page_index().min((u32::MAX - 1) as usize) as u32
+        };
+
         self.sync_active_grid(
             viewport,
             view_mode,
+            page_scope,
             chrome_key.proof_hash,
             chrome_key.icc_hash,
-            false,
         );
 
         let dirty_keys: Vec<WorldTileKey> = self
@@ -621,19 +754,18 @@ impl DirtyTileCache {
             return 0;
         }
 
-        let multipage = viewport.multipage_view || doc.multipage_view();
         let layouts = compute_page_layouts(doc, multipage, options.multipage_gap_mm);
 
-        // Refresh R-Tree spatial indices ONLY when document objects/pages actually changed
-        if self.spatial_dirty || self.spatial_indices.is_empty() {
+        // Refresh R-Tree spatial indices ONLY when document objects/pages changed or a newly
+        // visited page has not yet populated its `SpatialIndex` entry.
+        if self.spatial_dirty {
             self.spatial_indices.clear();
-            for layout in &layouts {
-                self.spatial_indices.insert(
-                    layout.page_index,
-                    doc.build_spatial_index(layout.page_index),
-                );
-            }
             self.spatial_dirty = false;
+        }
+        for layout in &layouts {
+            self.spatial_indices
+                .entry(layout.page_index)
+                .or_insert_with(|| (*doc.cached_spatial_index(layout.page_index)).clone());
         }
         renderer.warm_page_cull_cache(doc, &layouts);
 
@@ -652,6 +784,8 @@ impl DirtyTileCache {
         // Warm any unwarmed frozen lenses sequentially BEFORE Rayon across remaining tiles
         if renderer.has_unwarmed_frozen_lens(doc, multipage) {
             for &key in &dirty_keys {
+                let rev = self.next_tile_revision;
+                self.next_tile_revision = self.next_tile_revision.wrapping_add(1).max(1);
                 let Some(entry) = self.world_tiles.get_mut(&key) else {
                     continue;
                 };
@@ -678,6 +812,7 @@ impl DirtyTileCache {
                     );
                     entry.buffer = backend.into_rgba();
                     entry.dirty = false;
+                    entry.revision = rev;
                     rendered_count += 1;
                 }
                 if !renderer.has_unwarmed_frozen_lens(doc, multipage) {
@@ -735,14 +870,19 @@ impl DirtyTileCache {
                 .collect();
 
             for (key, buf) in rendered_tiles {
+                let rev = self.next_tile_revision;
+                self.next_tile_revision = self.next_tile_revision.wrapping_add(1).max(1);
                 if let Some(entry) = self.world_tiles.get_mut(&key) {
                     entry.buffer = buf;
                     entry.dirty = false;
+                    entry.revision = rev;
                 }
             }
             rendered_count = rendered_counter.load(Ordering::Relaxed);
         } else {
             for key in remaining_keys {
+                let rev = self.next_tile_revision;
+                self.next_tile_revision = self.next_tile_revision.wrapping_add(1).max(1);
                 let Some(entry) = self.world_tiles.get_mut(&key) else {
                     continue;
                 };
@@ -766,12 +906,13 @@ impl DirtyTileCache {
                     );
                     entry.buffer = backend.into_rgba();
                     entry.dirty = false;
+                    entry.revision = rev;
                     rendered_count += 1;
                 }
             }
         }
 
-        self.refresh_active_tiles();
+        self.active_tiles_lazy = OnceLock::new();
         rendered_count
     }
 
@@ -1016,11 +1157,13 @@ impl DirtyTileCache {
             }
 
             let num_tx = unique_txs.len();
+            let page_scope = self.last_page_scope;
             let mut tile_grid: Vec<Option<&RgbaBuffer>> =
                 Vec::with_capacity(unique_tys.len() * num_tx);
             for &ty in &unique_tys {
                 for &tx in &unique_txs {
                     let key = WorldTileKey {
+                        page_scope,
                         lod_level,
                         tile_x: tx,
                         tile_y: ty,
@@ -1184,6 +1327,7 @@ impl DirtyTileCache {
         } else {
             let screen_to_world = self.last_viewport.screen_to_world_transform();
             let tile_sz = f64::from(TILE_SIZE_PX);
+            let page_scope = self.last_page_scope;
             out.rgba
                 .par_chunks_mut(stride)
                 .enumerate()
@@ -1196,6 +1340,7 @@ impl DirtyTileCache {
                         let tx = (wx / tile_sz).floor() as i64;
                         let ty = (wy / tile_sz).floor() as i64;
                         let key = WorldTileKey {
+                            page_scope,
                             lod_level,
                             tile_x: tx,
                             tile_y: ty,
@@ -1238,15 +1383,16 @@ impl DirtyTileCache {
         &mut self,
         viewport: &Viewport,
         view_mode: ViewMode,
+        page_scope: u32,
         proof_hash: u64,
         icc_hash: u64,
-        force_refresh: bool,
     ) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let frame = self.frame_counter;
         self.width_px = viewport.width_px.max(1);
         self.height_px = viewport.height_px.max(1);
         self.last_viewport = *viewport;
+        self.last_page_scope = page_scope;
 
         let (lod_level, tile_zoom) = compute_lod_and_zoom(viewport.zoom, viewport.lod_dragging);
         self.last_lod_level = lod_level;
@@ -1275,15 +1421,14 @@ impl DirtyTileCache {
 
         self.cols = (tx1 - tx0 + 1).max(1) as u32;
         self.rows = (ty1 - ty0 + 1).max(1) as u32;
-        let prev_keys = std::mem::take(&mut self.active_keys);
+        self.active_keys.clear();
         self.active_keys
             .reserve((self.cols as usize).saturating_mul(self.rows as usize));
 
-        let mut any_reset = false;
-        let mut any_dirty = false;
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
                 let key = WorldTileKey {
+                    page_scope,
                     lod_level,
                     tile_x: tx,
                     tile_y: ty,
@@ -1302,8 +1447,6 @@ impl DirtyTileCache {
                     None => true,
                 };
                 if needs_reset {
-                    any_reset = true;
-                    any_dirty = true;
                     self.world_tiles.insert(
                         key,
                         CachedWorldTile {
@@ -1312,61 +1455,23 @@ impl DirtyTileCache {
                             buffer: RgbaBuffer::new_transparent(TILE_SIZE_PX, TILE_SIZE_PX),
                             dirty: true,
                             last_used: frame,
+                            revision: 0,
                         },
                     );
                 } else if let Some(entry) = self.world_tiles.get_mut(&key) {
                     entry.last_used = frame;
-                    if entry.dirty {
-                        any_dirty = true;
-                    }
                 }
                 self.active_keys.push(key);
             }
         }
 
-        if self.world_tiles.len() > MAX_CACHED_WORLD_TILES {
-            let active_set: HashSet<WorldTileKey> = self.active_keys.iter().copied().collect();
-            let mut candidates: Vec<(u64, WorldTileKey)> = self
-                .world_tiles
-                .iter()
-                .filter(|(k, _)| !active_set.contains(k))
-                .map(|(k, v)| (v.last_used, *k))
-                .collect();
-            candidates.sort_by_key(|(used, _)| *used);
-            let remove_count = self
-                .world_tiles
-                .len()
-                .saturating_sub(MAX_CACHED_WORLD_TILES)
-                .min(candidates.len());
-            for (_, k) in candidates.into_iter().take(remove_count) {
-                self.world_tiles.remove(&k);
-            }
-        }
-
-        if self.active_keys == prev_keys
-            && !any_reset
-            && self.active_tiles.len() == self.active_keys.len()
-        {
-            let s_vp = self.last_viewport.px_per_mm();
-            let origin_x = (self.last_viewport.pan_mm.x * s_vp).round() as i32;
-            let origin_y = (self.last_viewport.pan_mm.y * s_vp).round() as i32;
-            for (tile, key) in self.active_tiles.iter_mut().zip(self.active_keys.iter()) {
-                let x = (key.tile_x * i64::from(TILE_SIZE_PX)) as i32 - origin_x;
-                let y = (key.tile_y * i64::from(TILE_SIZE_PX)) as i32 - origin_y;
-                tile.rect_px.x = x;
-                tile.rect_px.y = y;
-                if let Some(entry) = self.world_tiles.get(key) {
-                    tile.dirty = entry.dirty;
-                }
-            }
-        } else if force_refresh || !any_dirty {
-            self.refresh_active_tiles();
-        }
+        let max_tiles = self.max_cached_tiles;
+        self.evict_to_limit(max_tiles);
+        self.active_tiles_lazy = OnceLock::new();
     }
 
-    fn refresh_active_tiles(&mut self) {
-        self.active_tiles.clear();
-        self.active_tiles.reserve(self.active_keys.len());
+    fn build_active_tiles_snapshot(&self) -> Vec<CachedTile> {
+        let mut out = Vec::with_capacity(self.active_keys.len());
         let cols = self.cols.max(1) as usize;
         let s_vp = self.last_viewport.px_per_mm();
         let origin_x = (self.last_viewport.pan_mm.x * s_vp).round() as i32;
@@ -1377,7 +1482,7 @@ impl DirtyTileCache {
             if let Some(entry) = self.world_tiles.get(key) {
                 let x = (key.tile_x * i64::from(TILE_SIZE_PX)) as i32 - origin_x;
                 let y = (key.tile_y * i64::from(TILE_SIZE_PX)) as i32 - origin_y;
-                self.active_tiles.push(CachedTile {
+                out.push(CachedTile {
                     col,
                     row,
                     rect_px: PixelRect::new(x, y, entry.buffer.width, entry.buffer.height),
@@ -1387,6 +1492,7 @@ impl DirtyTileCache {
                 });
             }
         }
+        out
     }
 }
 
@@ -1845,6 +1951,7 @@ mod tests {
                     continue;
                 }
                 let key = WorldTileKey {
+                    page_scope: cache.last_page_scope,
                     lod_level,
                     tile_x: tx,
                     tile_y: ty,
@@ -2054,5 +2161,67 @@ mod tests {
             tiled.rgba, direct.rgba,
             "Transitive linked_next_frame dirtying must match direct render with 0 stale diff pixels"
         );
+    }
+
+    #[test]
+    fn multipage_switching_retains_cached_world_tiles_across_pages_with_zero_rerender() {
+        let mut doc = Document::new_a4("MultiPageCacheBook");
+        for p in 1..5 {
+            doc.add_page(format!("Page {}", p + 1), 210.0, 297.0, 3.0);
+        }
+        let colors = [
+            Color::rgba8(220, 40, 40, 255),
+            Color::rgba8(40, 190, 80, 255),
+            Color::rgba8(40, 90, 220, 255),
+            Color::rgba8(220, 170, 30, 255),
+            Color::rgba8(160, 50, 210, 255),
+        ];
+        for (p_idx, col) in colors.into_iter().enumerate() {
+            let lid = doc.pages()[p_idx].layers[0].id;
+            let obj = SceneObject::new(
+                ObjectId(0),
+                format!("P{p_idx}Rect"),
+                coree_core::NodePayload::Shape(ParametricShape::Rectangle {
+                    width: 80.0,
+                    height: 80.0,
+                    corner_radii: [0.0; 4],
+                    corner_style: CornerStyle::Rounded,
+                    lock_corners: true,
+                }),
+            )
+            .with_fill(Fill::Solid(col))
+            .with_transform(Affine2D::translate(20.0, 20.0));
+            doc.add_object(obj, Some(lid)).unwrap();
+        }
+
+        let vp = Viewport::for_export(512, 512, 96.0);
+        let opts = RenderOptions::export();
+        let mut cache = DirtyTileCache::new(vp.width_px, vp.height_px);
+        cache.set_max_cached_tiles(512);
+        let mut renderer = SceneRenderer::new();
+
+        // Render pages 0, 1, 2 for the first time
+        for idx in 0..3 {
+            doc.set_active_page_index(idx).unwrap();
+            let rendered =
+                cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+            assert!(rendered > 0, "First visit to page {idx} must render tiles");
+        }
+
+        // Revisit pages 0, 1, 2 -> 0 dirty tiles re-rendered because page_scope keeps them cached!
+        let probe_px = (50.0_f64 * 96.0 / 25.4).round() as u32;
+        let expected_rgb = [[220u8, 40, 40], [40, 190, 80], [40, 90, 220]];
+        for (idx, exp) in expected_rgb.into_iter().enumerate() {
+            doc.set_active_page_index(idx).unwrap();
+            let rerendered =
+                cache.render_dirty_tiles(&doc, &vp, ViewMode::Enhanced, &opts, &mut renderer);
+            assert_eq!(
+                rerendered, 0,
+                "Revisiting page {idx} must hit retained world tiles with 0 re-renders"
+            );
+            let img = cache.composite_to_rgba();
+            let px = img.get_pixel(probe_px, probe_px).unwrap();
+            assert_eq!([px[0], px[1], px[2]], exp);
+        }
     }
 }

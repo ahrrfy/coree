@@ -46,6 +46,8 @@ pub struct DocumentTab {
     pub autosave_deleted_assets: HashSet<ImageAssetId>,
     pub autosave_dirty_all: bool,
     pub last_rendered_texture: Option<egui::TextureHandle>,
+    pub gpu_tile_textures: HashMap<coree_render::WorldTileKey, (u64, u64, egui::TextureHandle)>,
+    pub gpu_tile_frame: u64,
     pub needs_rerender: bool,
     pub viewport_initialized: bool,
     pub tool_core: ToolCore,
@@ -65,6 +67,8 @@ pub struct DocumentTab {
     pub editing_symbol: Option<SymbolEditSession>,
     pub last_metrics: ProductionMetrics,
     pub metrics_dirty: bool,
+    pub(crate) metrics_generation: u64,
+    pub(crate) metrics_job: Option<(u64, JobHandle<ProductionMetrics>)>,
     pub preflight_report: Option<PreflightReport>,
     pub nudge_mm: f64,
     pub super_nudge_factor: f64,
@@ -82,22 +86,45 @@ impl DocumentTab {
     /// Creates a new interactive tab wrapping `document`.
     #[must_use]
     pub fn new(document: Document, source_path: Option<PathBuf>, theme: StudioTheme) -> Self {
+        let budget = coree_core::ResourceBudget::compute(
+            &coree_core::HostResourceProfile::probe(),
+            coree_core::ResourceGovernorMode::Auto,
+        );
+        Self::new_with_budget(document, source_path, theme, budget)
+    }
+
+    /// Creates a new interactive tab sized according to `budget` (deferring expensive full-document
+    /// Bézier flattening on large multi-page files so tab creation is instantaneous).
+    #[must_use]
+    pub fn new_with_budget(
+        document: Document,
+        source_path: Option<PathBuf>,
+        theme: StudioTheme,
+        budget: coree_core::ResourceBudget,
+    ) -> Self {
         let mut render_options = RenderOptions::interactive();
         render_options.canvas_bg = theme.tokens().canvas_well_core_color();
         let active_layer_id = document
             .active_page()
             .and_then(|p| p.layers.last())
             .map(|l| l.id);
-        let metrics = compute_production_metrics(&document, None);
+        let is_lightweight = document.objects().len() <= 96 && document.pages().len() <= 4;
+        let (metrics, metrics_dirty) = if is_lightweight {
+            (compute_production_metrics(&document, None), false)
+        } else {
+            (ProductionMetrics::default(), true)
+        };
+        let mut tile_cache = DirtyTileCache::new(1024, 720);
+        tile_cache.set_max_cached_tiles(budget.max_cached_world_tiles);
         Self {
             id: document.id(),
             document,
-            history: CommandHistory::default(),
+            history: CommandHistory::new(budget.undo_history_limit),
             selection: SelectionState::new(),
             viewport: Viewport::new(1024, 720),
             view_mode: ViewMode::Enhanced,
             render_options,
-            tile_cache: DirtyTileCache::new(1024, 720),
+            tile_cache,
             renderer: SceneRenderer::new(),
             snap_options: SnapOptions::default(),
             active_guides: Vec::new(),
@@ -117,6 +144,8 @@ impl DocumentTab {
             autosave_deleted_assets: HashSet::new(),
             autosave_dirty_all: false,
             last_rendered_texture: None,
+            gpu_tile_textures: HashMap::new(),
+            gpu_tile_frame: 0,
             needs_rerender: true,
             viewport_initialized: false,
             tool_core: ToolCore::new(ToolId::Pick),
@@ -135,7 +164,9 @@ impl DocumentTab {
             powerclip_edit_id: None,
             editing_symbol: None,
             last_metrics: metrics,
-            metrics_dirty: false,
+            metrics_dirty,
+            metrics_generation: 1,
+            metrics_job: None,
             preflight_report: None,
             nudge_mm: 1.0,
             super_nudge_factor: 2.0,
@@ -195,6 +226,7 @@ impl DocumentTab {
         self.dirty = true;
         self.needs_rerender = true;
         self.metrics_dirty = true;
+        self.metrics_generation = self.metrics_generation.wrapping_add(1);
         self.separations_preview = None;
         match inv {
             DocumentInvalidation::All => {
@@ -212,13 +244,44 @@ impl DocumentTab {
                 for &rect in dirty_rects_mm {
                     self.tile_cache.mark_dirty(rect);
                 }
-                for &id in object_ids {
-                    self.tile_cache.mark_object_dirty(&self.document, id);
-                }
+                self.tile_cache
+                    .mark_objects_dirty(&self.document, object_ids);
             }
         }
         self.selection.prune_missing(&self.document);
         self.sync_active_layer();
+    }
+
+    /// Evicts oldest off-screen GPU tile textures when exceeding `max_textures`.
+    pub fn trim_gpu_tile_textures(&mut self, max_textures: usize) {
+        if max_textures == 0 {
+            self.gpu_tile_textures.clear();
+            return;
+        }
+        if self.gpu_tile_textures.len() <= max_textures {
+            return;
+        }
+        let active_set: HashSet<coree_render::WorldTileKey> = self
+            .tile_cache
+            .active_world_tile_keys()
+            .iter()
+            .copied()
+            .collect();
+        let mut candidates: Vec<(u64, coree_render::WorldTileKey)> = self
+            .gpu_tile_textures
+            .iter()
+            .filter(|(k, _)| !active_set.contains(k))
+            .map(|(k, &(_, used, _))| (used, *k))
+            .collect();
+        candidates.sort_by_key(|(used, _)| *used);
+        let remove_n = self
+            .gpu_tile_textures
+            .len()
+            .saturating_sub(max_textures)
+            .min(candidates.len());
+        for (_, k) in candidates.into_iter().take(remove_n) {
+            self.gpu_tile_textures.remove(&k);
+        }
     }
 
     /// Maps a world-space point (mm) into global egui screen coordinates using the last
