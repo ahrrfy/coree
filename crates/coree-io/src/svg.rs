@@ -764,6 +764,7 @@ fn precheck_svg_expansion_limits(
 
 #[derive(Debug, Clone)]
 struct ImportedUsvgText {
+    obj_id: ObjectId,
     families_lower: Vec<String>,
     pos_mm: Point2D,
 }
@@ -1161,6 +1162,7 @@ fn import_usvg_node_inner(
                     .entry((xml_id, norm_plain))
                     .or_default()
                     .push(ImportedUsvgText {
+                        obj_id,
                         families_lower,
                         pos_mm,
                     });
@@ -1349,6 +1351,119 @@ fn is_non_rendered_svg_tag(tag: &str) -> bool {
     )
 }
 
+/// Reconciles SVG 2 `<tspan opacity="...">` attributes on `<text>` elements already imported by `usvg`
+/// (`usvg` ignores element-level `opacity` on `<tspan>` when system fonts like Windows `Arial` match).
+fn reconcile_usvg_text_tspan_opacity(
+    doc: &mut Document,
+    obj_id: ObjectId,
+    node: usvg::roxmltree::Node<'_, '_>,
+    chain: &[usvg::roxmltree::Node<'_, '_>],
+    total_scale: f64,
+    inherited_fill_color: Option<Color>,
+    inherited_fill_opacity: f32,
+) {
+    let has_tspan_opacity = node.descendants().any(|d| {
+        d.is_element() && d.tag_name().name() == "tspan" && svg_element_attr(d, "opacity").is_some()
+    });
+    if !has_tspan_opacity {
+        return;
+    }
+
+    let default_font_size_mm = Unit::Point.to_mm(12.0, 96.0);
+    let default_font_size_pt = Unit::Point.from_mm(default_font_size_mm, 96.0).max(1.0);
+    let mut base_span_style = FallbackSpanStyle {
+        tspan_opacity: 1.0,
+        fill_color: inherited_fill_color,
+        fill_opacity: inherited_fill_opacity,
+        stroke_color: None,
+        stroke_opacity: 1.0,
+        stroke_width: None,
+        font_family: "Noto Sans".to_owned(),
+        font_size_pt: default_font_size_pt,
+        bold: false,
+        italic: false,
+        direction: TextDirection::Auto,
+    };
+    for anc in chain {
+        update_fallback_span_style_from_node(*anc, total_scale, false, &mut base_span_style);
+    }
+
+    let mut chunks = Vec::new();
+    collect_fallback_text_chunks(node, total_scale, &base_span_style, &mut chunks);
+    if let Some(first) = chunks.first_mut() {
+        first.0 = first.0.trim_start().to_owned();
+    }
+    if let Some(last) = chunks.last_mut() {
+        last.0 = last.0.trim_end().to_owned();
+    }
+    chunks.retain(|(t, _)| !t.is_empty());
+    if chunks.is_empty() {
+        return;
+    }
+
+    let first_tspan_op = chunks[0].1.tspan_opacity;
+    let uniform_tspan_opacity = chunks
+        .iter()
+        .all(|(_, s)| (s.tspan_opacity - first_tspan_op).abs() <= 1e-4)
+        .then_some(first_tspan_op);
+
+    let Some(obj) = doc.object(obj_id).cloned() else {
+        return;
+    };
+    let mut hist = coree_core::CommandHistory::new(4);
+    if let Some(common_op) = uniform_tspan_opacity {
+        let next_opacity = (obj.opacity * common_op).clamp(0.0, 1.0);
+        let _ = hist.execute(
+            doc,
+            coree_core::CommandOp::SetOpacity {
+                ids: vec![obj_id],
+                opacity: next_opacity,
+            },
+        );
+        return;
+    }
+
+    if let NodePayload::ArtisticText(mut artistic) = obj.payload {
+        let base_style = artistic
+            .runs
+            .first()
+            .map(|r| r.style.clone())
+            .unwrap_or_default();
+        let mut new_runs: Vec<TextRun> = Vec::with_capacity(chunks.len());
+        for (txt, st) in &chunks {
+            let fill_color = match &st.fill_color {
+                Some(c) => {
+                    let [r, g, b, a] = c.to_rgba_f32();
+                    Color::rgba(
+                        r,
+                        g,
+                        b,
+                        (a * st.fill_opacity * st.tspan_opacity).clamp(0.0, 1.0),
+                    )
+                }
+                None => Color::TRANSPARENT,
+            };
+            let mut style = base_style.clone();
+            style.fill = fill_color;
+            if let Some(prev) = new_runs.last_mut().filter(|r| r.style == style) {
+                prev.text.push_str(txt);
+            } else {
+                new_runs.push(TextRun::new(txt.clone(), style));
+            }
+        }
+        if !new_runs.is_empty() {
+            artistic.runs = new_runs;
+            let _ = hist.execute(
+                doc,
+                coree_core::CommandOp::EditText {
+                    id: obj_id,
+                    payload: NodePayload::ArtisticText(artistic),
+                },
+            );
+        }
+    }
+}
+
 /// Fallback XML `<text>` extractor recovering `<text>` elements skipped by `usvg` (for example,
 /// missing system fonts in mixed-font SVGs) while skipping `<text>` elements already imported by `usvg`.
 /// Preserves ancestor named layers (`data-layer` / Inkscape layers), SVG `transform` chains,
@@ -1510,11 +1625,30 @@ fn import_fallback_xml_texts(
                     family_match || pos_match
                 });
                 if let Some(idx) = matched_idx {
-                    usvg_entries.remove(idx);
+                    let entry = usvg_entries.remove(idx);
+                    reconcile_usvg_text_tspan_opacity(
+                        doc,
+                        entry.obj_id,
+                        node,
+                        &chain,
+                        total_scale,
+                        inherited_fill_color,
+                        inherited_fill_opacity,
+                    );
                     continue;
                 }
                 if usvg_entries.len() > rem_xml {
-                    usvg_entries.pop();
+                    if let Some(entry) = usvg_entries.pop() {
+                        reconcile_usvg_text_tspan_opacity(
+                            doc,
+                            entry.obj_id,
+                            node,
+                            &chain,
+                            total_scale,
+                            inherited_fill_color,
+                            inherited_fill_opacity,
+                        );
+                    }
                     continue;
                 }
             }
@@ -3922,12 +4056,13 @@ mod tests {
 
     #[test]
     fn fallback_xml_tspan_preserves_per_tspan_opacity_and_fill_opacity() {
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="80mm" viewBox="0 0 100 80">
   <text x="10" y="20" font-family="Helvetica" font-size="16" fill="#000"><tspan opacity="0.2">TSPAN_OP</tspan></text>
   <text x="10" y="40" font-family="NoSuchMissingFont" font-size="12" fill="#000"><tspan opacity="0.2">FIRST</tspan><tspan opacity="0.8">SECOND</tspan></text>
+  <text x="10" y="60" font-family="DejaVu Sans" font-size="14" fill="#000"><tspan opacity="0.25">SYS_A</tspan><tspan opacity="0.75">SYS_B</tspan></text>
 </svg>"##;
         let doc = import_svg_str(svg).expect("import tspan opacity fallback SVG");
-        assert_eq!(doc.objects().len(), 2);
+        assert_eq!(doc.objects().len(), 3);
 
         let tspan_op = doc
             .objects()
@@ -3951,6 +4086,18 @@ mod tests {
         assert_eq!(multi_tspan.runs.len(), 2);
         assert!((multi_tspan.runs[0].style.fill.alpha() - 0.2).abs() < 1e-4);
         assert!((multi_tspan.runs[1].style.fill.alpha() - 0.8).abs() < 1e-4);
+
+        let sys_tspan = doc
+            .objects()
+            .values()
+            .find_map(|o| match &o.payload {
+                NodePayload::ArtisticText(at) if at.plain_text() == "SYS_ASYS_B" => Some(at),
+                _ => None,
+            })
+            .expect("expected SYS_ASYS_B installed-font multi-tspan object");
+        assert_eq!(sys_tspan.runs.len(), 2);
+        assert!((sys_tspan.runs[0].style.fill.alpha() - 0.25).abs() < 1e-4);
+        assert!((sys_tspan.runs[1].style.fill.alpha() - 0.75).abs() < 1e-4);
 
         let eps = crate::export_eps_to_string(&doc, 0).expect("export tspan opacity SVG -> EPS");
         assert!(

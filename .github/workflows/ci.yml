@@ -152,8 +152,9 @@ jobs:
           assert any(e.get("dest") == ".cargo" and e.get("dest-filename") == "config.toml" for e in sources)
 
           flatpak = Path("packaging/linux/flatpak/io.github.ahrrfy.coree.yml").read_text(encoding="utf-8")
-          assert "id: io.github.ahrrfy.coree" in flatpak
-          assert "--share=network" not in flatpak
+          non_comment = [line.split("#", 1)[0].strip() for line in flatpak.splitlines()]
+          assert "id: io.github.ahrrfy.coree" in non_comment
+          assert not any("--share=network" in s for s in non_comment)
           assert "CARGO_NET_OFFLINE: 'true'" in flatpak
           assert "../cargo-sources.json" in flatpak
 
