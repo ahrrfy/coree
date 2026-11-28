@@ -60,7 +60,7 @@ byteorder = "1.5"
 encoding_rs = "0.8"
 fax = "0.2.7"
 ttf-parser = "0.25.1"
-weezl = "0.1.12"
+weezl = "0.2.1"
 
 # Serialization, concurrency, scripting & utilities
 serde = { version = "1.0", features = ["derive"] }
