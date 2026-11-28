@@ -35,7 +35,7 @@ egui_dock = { version = "0.22", features = ["serde"] }
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 wl-clipboard-rs = "0.9.5"
-x11rb = "0.13.2"
+x11rb = "0.14.0"
 
 # Local storage
 rusqlite = { version = "0.43", features = ["bundled"] }
