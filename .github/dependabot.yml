@@ -1,12 +1,36 @@
 version: 2
 updates:
-  - package-ecosystem: "cargo"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 1
+    groups:
+      cargo-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+    ignore:
+      # Ignore breaking 0.x bumps that duplicate transitive dependencies;
+      # Cargo.lock updates must also regenerate packaging/linux/cargo-sources.json.
+      - dependency-name: "quick-xml"
+        versions: [">= 0.42.0"]
+      - dependency-name: "weezl"
+        versions: [">= 0.2.0"]
+      - dependency-name: "x11rb"
+        versions: [">= 0.14.0"]
+      - dependency-name: "fax"
+        versions: [">= 0.3.0"]
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

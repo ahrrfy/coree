@@ -24,13 +24,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build-and-test"
+          cache-on-failure: true
 
       - name: Resolve and validate release version
         id: ver
@@ -191,7 +194,7 @@ jobs:
           fi
 
       - name: Upload Linux release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: |
@@ -206,13 +209,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build-and-test"
+          cache-on-failure: true
 
       - name: Resolve and validate release version
         id: ver
@@ -401,7 +407,7 @@ jobs:
           "$hash  $zipName" | Out-File -Encoding ascii "$zipPath.sha256"
 
       - name: Upload Windows release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: |
@@ -416,7 +422,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -429,7 +435,7 @@ jobs:
           cat release-assets/SHA256SUMS.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           body: |

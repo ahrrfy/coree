@@ -74,7 +74,7 @@
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release version="0.3.1" date="2026-11-22">
+    <release version="0.3.1" date="2026-11-28">
       <description>
         <p>
           Deep atomic architecture, precision, security, and UI audit release (BUG-106 through

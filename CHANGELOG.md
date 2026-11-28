@@ -4,9 +4,15 @@ All notable changes to **`coree`** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.1] - 2026-11-22
+## [0.3.1] - 2026-11-28
 
-### Fixed & Added (Deep Atomic Architecture, Precision, Security & UI Audit — `BUG-106`–`BUG-116`)
+### Fixed & Added (Hardware Resource Governor, Ultra-Smooth Vector Trace, Tier-5 Hardening & Deep Parity — `BUG-106`–`BUG-116`)
+- **Adaptive Hardware Resource Governor & Multi-Page Fluidity (`coree-core`, `coree-render`, `coree-app`):**
+  - Added cross-platform `HostResourceProfile::probe()` and `ResourceBudget::compute()` (`Auto`, `EcoLowMemory`, `Balanced`, `MaxPerformance`) adapting worker threads, LRU world-tile budgets, GPU tile texture pools, Undo depth, and node-overlay budgets automatically to any host machine.
+  - Added direct GPU `256×256` tile texture compositing (`paint_viewport_tiles_gpu`), multi-page `WorldTileKey.page_scope` LRU retention for zero-rerender page switching, `RwLock`-cached `SpatialIndex` hit-testing, viewport + `5×5 px` screen-cell LOD node decimation for `40k–200k+` node paths, scrollable multi-page jump bar (`1..500+` pages), and non-blocking async file Open/Import/Trace/Metrics with cancelable HUD.
+- **Precision Vector Trace, UX Polish & Cross-Platform BiDi/IPC (`coree-render`, `coree-io`, `coree-app`, Packaging):**
+  - Upgraded Vector Trace with Taubin curvature-preserving polyline fairing, Philip Schneider iterative Newton-Raphson cubic Bézier fitting, Otsu anti-halo foreground clustering, and recursive extraction of raster images inside PDF `PowerClip`/Group containers.
+  - Replaced horizontal toolbar/vertical toolbox scrollbars with responsive wrapping and compact 2-column classic layout, fixed per-section UAX #9 Arabic RTL/BiDi live `TextEdit` shaping across both dedicated (`Noto Sans Arabic`) and combined Latin+Arabic (`Arial`/`Tahoma`/`Segoe UI`/`DejaVu Sans`) system fonts, reconciled SVG 2 `<tspan opacity>` on system-matched fonts, added `O(W × H)` 3-pass premultiplied box blur for large radii, replaced Windows PowerShell NamedPipe IPC with a zero-hang atomic spool maildrop, and shipped the Win32 `IThumbnailProvider` COM Shell Extension (`coree_thumb.dll`).
 - **Geometry, Curves & Scene Graph (`coree-core`):**
   - Implemented Philip Schneider cubic Bézier curve re-fitting (`fit_cubic_bezier_subpath`) preserving sharp corners across `boolean.rs` and `erase_circle`, and fixed the `erase_circle` open-subpath tail drop/duplication bug (`BUG-106`).
   - Aligned `build_spatial_index` and `hit_test` with `MasterLayerScope::{OddPages,EvenPages}`, resolved composed ancestor `world_xf` on `ConnectorObject` endpoints and `convert_to_curves_with_outliner`, and added undo-safe `CommandHistory::gc_document_assets` garbage collection (`BUG-107`).
