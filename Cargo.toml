@@ -58,7 +58,7 @@ zip = { version = "9.8", default-features = false, features = ["deflate"] }
 flate2 = "1.1"
 byteorder = "1.5"
 encoding_rs = "0.8"
-fax = "0.2.7"
+fax = "0.3.0"
 ttf-parser = "0.25.1"
 weezl = "0.1.12"
 
