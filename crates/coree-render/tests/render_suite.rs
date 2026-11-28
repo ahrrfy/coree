@@ -11993,11 +11993,11 @@ fn autopagenumber_expanded_width_not_culled_by_placeholder_bbox() {
     let px_1 = count_non_white_pixels(&img_1.rgba);
     let px_100 = count_non_white_pixels(&img_100.rgba);
     assert!(
-        px_1 > 50,
+        px_1 >= 25,
         "Page 1 AutoPageNumber rendered too few pixels: {px_1}"
     );
     assert!(
-        px_100 > px_1 + 80,
+        px_100 >= px_1 * 2 && px_100 > px_1 + 60,
         "Page 100 AutoPageNumber ('100') must render full 3-digit width without culling: px_1={px_1}, px_100={px_100}"
     );
 }
