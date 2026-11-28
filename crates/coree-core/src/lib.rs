@@ -89,10 +89,8 @@ pub use icc::{
 };
 pub use ids::{ImageAssetId, LayerId, ObjectId, ObjectStyleId, PageId, SymbolId};
 pub use lens::{ColorMapMode, LensConfig, LensKind};
-pub use resources::{
-    HostResourceProfile, ResourceBudget, ResourceGovernorMode, WORLD_TILE_BYTES,
-};
 pub use math::{Affine2D, AffineDecomposed, Perspective3x3, Point2D, Rect2D, Unit, Vec2D};
+pub use resources::{HostResourceProfile, ResourceBudget, ResourceGovernorMode, WORLD_TILE_BYTES};
 pub use selection::{
     NodeRef, NodeSelection, RasterMaskMode, RasterMaskSelection, RasterMaskShape, SelectionState,
     TransformMode,

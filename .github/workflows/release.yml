@@ -21,6 +21,7 @@ jobs:
   package-linux:
     name: Package Linux (x86_64)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -202,6 +203,7 @@ jobs:
   package-windows:
     name: Package Windows (x86_64)
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

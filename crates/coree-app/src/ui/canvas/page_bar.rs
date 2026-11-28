@@ -255,7 +255,13 @@ pub(super) fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
 
                     // Bounded horizontal ScrollArea so 27..500+ page tabs scroll smoothly without
                     // pushing `+`, `Multipage View`, or `Doc Colors` off-screen!
-                    let max_tabs_w = (total_w - 430.0).clamp(180.0, total_w * 0.54);
+                    let tabs_cap = if total_w.is_finite() && total_w > 0.0 {
+                        (total_w * 0.54).max(32.0)
+                    } else {
+                        32.0
+                    };
+                    let tabs_floor = 180.0_f32.min(tabs_cap);
+                    let max_tabs_w = (total_w - 430.0).clamp(tabs_floor, tabs_cap);
                     let prev_tracked_id = ui.scope_id().with("last_scrolled_page_idx");
                     let last_scrolled: Option<usize> =
                         ui.ctx().data(|d| d.get_temp::<usize>(prev_tracked_id));
@@ -300,28 +306,29 @@ pub(super) fn show_page_tabs_and_doc_palette(ui: &mut Ui, app: &mut StudioApp) {
                                             continue;
                                         }
 
-                                        let btn = ui.add(
-                                            egui::Button::new(
-                                                RichText::new(&page_name).size(11.0).color(
-                                                    if is_active {
-                                                        tokens.text
-                                                    } else {
-                                                        tokens.text_muted
-                                                    },
-                                                ),
-                                            )
-                                            .sense(Sense::click_and_drag())
-                                            .fill(if is_active {
-                                                tokens.surface_elevated
-                                            } else {
-                                                tokens.surface
-                                            })
-                                            .stroke(if is_active {
-                                                Stroke::new(1.0, tokens.accent)
-                                            } else {
-                                                Stroke::new(1.0, tokens.border)
-                                            }),
-                                        );
+                                        let btn =
+                                            ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(&page_name).size(11.0).color(
+                                                        if is_active {
+                                                            tokens.text
+                                                        } else {
+                                                            tokens.text_muted
+                                                        },
+                                                    ),
+                                                )
+                                                .sense(Sense::click_and_drag())
+                                                .fill(if is_active {
+                                                    tokens.surface_elevated
+                                                } else {
+                                                    tokens.surface
+                                                })
+                                                .stroke(if is_active {
+                                                    Stroke::new(1.0, tokens.accent)
+                                                } else {
+                                                    Stroke::new(1.0, tokens.border)
+                                                }),
+                                            );
                                         if is_active && should_auto_scroll {
                                             btn.scroll_to_me(Some(egui::Align::Center));
                                         }
@@ -547,7 +554,10 @@ pub(super) fn show_background_jobs_hud(ui: &Ui, app: &mut StudioApp, canvas_rect
     let tokens = app.theme.tokens();
     let lang = app.ui_language;
     let shell_dir = crate::i18n::ShellLayoutDirections::from_language(lang);
-    let anchor = pos2((canvas_rect.right() - 295.0).max(canvas_rect.left() + 8.0), canvas_rect.top() + 38.0);
+    let anchor = pos2(
+        (canvas_rect.right() - 295.0).max(canvas_rect.left() + 8.0),
+        canvas_rect.top() + 38.0,
+    );
     let mut cancel_req = false;
 
     egui::Area::new(ui.scope_id().with("coree_bg_jobs_hud"))

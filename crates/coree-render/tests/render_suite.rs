@@ -12288,8 +12288,9 @@ fn extreme_numeric_zoom256_zero_font_huge_steps_and_singular_transparency_mask()
         &mut backend,
     );
     let elapsed = t0.elapsed();
+    let max_ms = if cfg!(debug_assertions) { 1500 } else { 500 };
     assert!(
-        elapsed < std::time::Duration::from_millis(500),
+        elapsed < std::time::Duration::from_millis(max_ms),
         "extreme numeric stress took too long: {elapsed:?}"
     );
     let buf = backend.into_rgba();

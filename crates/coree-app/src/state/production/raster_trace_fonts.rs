@@ -404,7 +404,14 @@ impl StudioApp {
                 trace_h_mm,
                 place_side_by_side,
             );
-            (target_id, traced, offset_x_mm, offset_y_mm, placed_xf, persp)
+            (
+                target_id,
+                traced,
+                offset_x_mm,
+                offset_y_mm,
+                placed_xf,
+                persp,
+            )
         };
 
         self.commit_traced_contours(

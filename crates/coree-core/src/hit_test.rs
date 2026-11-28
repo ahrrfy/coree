@@ -3088,9 +3088,12 @@ impl SnapEngine {
                         .query_rect(Rect2D::new(pt_mm.x - tol, -1.0e9, pt_mm.x + tol, 1.0e9))
                         .into_iter()
                         .collect();
-                    set.extend(
-                        idx.query_rect(Rect2D::new(-1.0e9, pt_mm.y - tol, 1.0e9, pt_mm.y + tol)),
-                    );
+                    set.extend(idx.query_rect(Rect2D::new(
+                        -1.0e9,
+                        pt_mm.y - tol,
+                        1.0e9,
+                        pt_mm.y + tol,
+                    )));
                     set
                 })
             } else {

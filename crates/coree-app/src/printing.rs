@@ -12,6 +12,7 @@ use coree_core::{Affine2D, CommandHistory, CommandOp, Document};
 use coree_io::{export_pdf, PdfColorSpace, PdfExportOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -140,36 +141,54 @@ pub fn parse_page_range_1based(
 // Binary CUPS IPP 2.0 Encoder & Decoder (`RFC 8010` / `RFC 8011`)
 // =============================================================================
 
+#[cfg(unix)]
 const IPP_VERSION_MAJOR: u8 = 2;
+#[cfg(unix)]
 const IPP_VERSION_MINOR: u8 = 0;
 #[cfg(unix)]
 const IPP_DEFAULT_PORT: u16 = 631;
 
+#[cfg(unix)]
 const IPP_OP_PRINT_JOB: u16 = 0x0002;
+#[cfg(unix)]
 const IPP_OP_CUPS_GET_DEFAULT: u16 = 0x4001;
+#[cfg(unix)]
 const IPP_OP_CUPS_GET_PRINTERS: u16 = 0x4002;
 
+#[cfg(unix)]
 const IPP_TAG_OPERATION_ATTRS: u8 = 0x01;
+#[cfg(unix)]
 const IPP_TAG_JOB_ATTRS: u8 = 0x02;
+#[cfg(unix)]
 const IPP_TAG_END_OF_ATTRS: u8 = 0x03;
+#[cfg(unix)]
 const IPP_TAG_PRINTER_ATTRS: u8 = 0x04;
 
+#[cfg(unix)]
 const IPP_TAG_INTEGER: u8 = 0x21;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(unix, test))]
 const IPP_TAG_ENUM: u8 = 0x23;
+#[cfg(unix)]
 const IPP_TAG_NAME_NO_LANG: u8 = 0x42;
+#[cfg(unix)]
 const IPP_TAG_KEYWORD: u8 = 0x44;
+#[cfg(unix)]
 const IPP_TAG_URI: u8 = 0x45;
+#[cfg(unix)]
 const IPP_TAG_CHARSET: u8 = 0x47;
+#[cfg(unix)]
 const IPP_TAG_NATURAL_LANG: u8 = 0x48;
+#[cfg(unix)]
 const IPP_TAG_MIME_MEDIA_TYPE: u8 = 0x49;
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 enum IppAttrValue {
     Str(u8, String),
     Int(i32),
 }
 
+#[cfg(unix)]
 fn push_ipp_attr(buf: &mut Vec<u8>, tag: u8, name: &str, value_bytes: &[u8]) {
     buf.push(tag);
     buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -178,6 +197,7 @@ fn push_ipp_attr(buf: &mut Vec<u8>, tag: u8, name: &str, value_bytes: &[u8]) {
     buf.extend_from_slice(value_bytes);
 }
 
+#[cfg(unix)]
 fn encode_ipp_packet(
     op_id: u16,
     request_id: u32,
@@ -225,15 +245,19 @@ fn encode_ipp_packet(
     pkt
 }
 
+#[cfg(unix)]
 type IppAttrEntry = (String, Vec<u8>, u8);
+#[cfg(unix)]
 type IppAttrGroup = (u8, Vec<IppAttrEntry>);
 
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct ParsedIppResponse {
     status_code: u16,
     groups: Vec<IppAttrGroup>,
 }
 
+#[cfg(unix)]
 fn parse_ipp_response(raw: &[u8]) -> Result<ParsedIppResponse, String> {
     if raw.len() < 8 {
         return Err("truncated IPP response header".to_owned());
@@ -397,6 +421,7 @@ fn discover_cups_socket_path() -> Option<PathBuf> {
     None
 }
 
+#[cfg(unix)]
 fn ipp_printer_state_label(state_num: i32) -> &'static str {
     match state_num {
         3 => "Idle",

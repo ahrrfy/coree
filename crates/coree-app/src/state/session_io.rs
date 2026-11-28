@@ -540,7 +540,8 @@ impl StudioApp {
         };
 
         let title = doc.title().to_owned();
-        let mut tab = DocumentTab::new_with_budget(doc, orig_path, self.theme, self.resource_budget);
+        let mut tab =
+            DocumentTab::new_with_budget(doc, orig_path, self.theme, self.resource_budget);
         tab.dirty = true;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;

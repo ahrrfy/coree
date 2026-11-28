@@ -2,7 +2,7 @@
 
 //! Pure-Rust, zero-`unsafe`, zero-`std::net` single-instance desktop & automation IPC
 //! over owner-only Unix Domain Sockets (`0o700` dir / `0o600` socket) on Unix and
-//! `#[cfg(windows)]` Named Pipes (`\\.\pipe\coree-*`) on Windows.
+//! atomic per-instance spool-directory maildrops (`<lock>.spool`) on Windows.
 //!
 //! Supports both single-instance file-open handoffs (`app.open_files`) and
 //! bidirectional JSON-RPC `2.0` Scene-DOM / `CommandHistory` commands (`studio.ping`,
@@ -13,18 +13,21 @@
 use coree_core::{CommandHistory, CommandOp, Document, ObjectId};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
 const RPC_DISPATCH_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_IPC_LINE_BYTES: u64 = 1024 * 1024;
+#[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
 pub const JSONRPC_PARSE_ERROR: i32 = -32700;
@@ -40,6 +43,8 @@ struct InstanceLockFile {
     socket_path: String,
     #[serde(default)]
     pipe_name: String,
+    #[serde(default)]
+    spool_dir: String,
     pid: u32,
     token: String,
 }
@@ -243,7 +248,10 @@ fn send_jsonrpc_with_lock(
 
     #[cfg(windows)]
     {
-        windows_named_pipe_roundtrip(&lock.pipe_name, &line)
+        if lock.spool_dir.is_empty() {
+            return Err("lockfile missing Windows IPC spool_dir".to_owned());
+        }
+        spool_dir_roundtrip(Path::new(&lock.spool_dir), &line)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -521,6 +529,8 @@ pub fn dispatch_jsonrpc_on_session(
 pub struct IpcServer {
     lock_path: PathBuf,
     socket_path: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    spool_dir: PathBuf,
     pipe_name: String,
     token: String,
     rx_batches: Mutex<Receiver<Vec<PathBuf>>>,
@@ -549,6 +559,7 @@ impl IpcServer {
         ensure_private_parent_dir(lock_path)?;
 
         let socket_path = lock_path.with_extension("sock");
+        let spool_dir = lock_path.with_extension("spool");
         let token = Uuid::new_v4().to_string();
         let pipe_name = format!(r"\\.\pipe\coree-{}-{}", std::process::id(), &token[..8]);
 
@@ -621,12 +632,30 @@ impl IpcServer {
 
         #[cfg(windows)]
         let handle = {
-            let pipe_clone = pipe_name.clone();
+            if lock_path.exists() {
+                let ping = JsonRpcRequest::new(0, "studio.ping", serde_json::json!({}));
+                if send_jsonrpc_at(lock_path, &ping).is_ok() {
+                    return Err(format!(
+                        "IPC server already running at {}",
+                        lock_path.display()
+                    ));
+                }
+            }
+            if spool_dir.exists() {
+                let _ = fs::remove_dir_all(&spool_dir);
+            }
+            fs::create_dir_all(&spool_dir).map_err(|e| {
+                format!(
+                    "failed to create Windows IPC spool dir {}: {e}",
+                    spool_dir.display()
+                )
+            })?;
+            let spool_clone = spool_dir.clone();
             thread::Builder::new()
-                .name("coree-ipc-named-pipe".to_owned())
+                .name("coree-ipc-spool".to_owned())
                 .spawn(move || {
-                    NamedPipeServer::serve_loop(
-                        &pipe_clone,
+                    serve_spool_dir_loop(
+                        &spool_clone,
                         &expected_token,
                         &tx_batches,
                         &tx_rpc,
@@ -634,7 +663,7 @@ impl IpcServer {
                         &stop_flag,
                     );
                 })
-                .map_err(|e| format!("failed to spawn NamedPipe IPC thread: {e}"))?
+                .map_err(|e| format!("failed to spawn Windows IPC thread: {e}"))?
         };
 
         #[cfg(not(any(unix, windows)))]
@@ -648,6 +677,7 @@ impl IpcServer {
         let lock_payload = InstanceLockFile {
             socket_path: socket_path.to_string_lossy().into_owned(),
             pipe_name: pipe_name.clone(),
+            spool_dir: spool_dir.to_string_lossy().into_owned(),
             pid: std::process::id(),
             token: token.clone(),
         };
@@ -658,6 +688,7 @@ impl IpcServer {
         Ok(Self {
             lock_path: lock_path.to_path_buf(),
             socket_path,
+            spool_dir,
             pipe_name,
             token,
             rx_batches: Mutex::new(rx_batches),
@@ -724,13 +755,13 @@ impl Drop for IpcServer {
             let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
             let _ = fs::remove_file(&self.socket_path);
         }
-        #[cfg(windows)]
-        {
-            let _ = windows_named_pipe_ping_shutdown(&self.pipe_name);
-        }
         remove_lock_if_token_matches(&self.lock_path, &self.token);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_dir_all(&self.spool_dir);
         }
     }
 }
@@ -865,122 +896,115 @@ fn process_jsonrpc_line(
     }
 }
 
-#[cfg(windows)]
-struct NamedPipeServer;
-
-#[cfg(windows)]
-impl NamedPipeServer {
-    fn serve_loop(
-        pipe_name: &str,
-        expected_token: &str,
-        tx_batches: &mpsc::Sender<Vec<PathBuf>>,
-        tx_rpc: &mpsc::Sender<PendingIpcCall>,
-        wake_ctx: &Option<egui::Context>,
-        stop_flag: &AtomicBool,
-    ) {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let short_name = pipe_name.trim_start_matches(r"\\.\pipe\");
-        let ps_script = format!(
-            r#"$ErrorActionPreference='Stop';
-$user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
-$sec=New-Object System.IO.Pipes.PipeSecurity;
-$rule=New-Object System.IO.Pipes.PipeAccessRule($user,[System.IO.Pipes.PipeAccessRights]::FullControl,[System.Security.AccessControl.AccessControlType]::Allow);
-$sec.AddAccessRule($rule);
-$srv=[System.IO.Pipes.NamedPipeServerStream]::new('{short_name}',[System.IO.Pipes.PipeDirection]::InOut,1,[System.IO.Pipes.PipeTransmissionMode]::Byte,[System.IO.Pipes.PipeOptions]::None,65536,65536,$sec);
-$srv.WaitForConnection();
-$sr=New-Object System.IO.StreamReader($srv,[System.Text.Encoding]::UTF8,$false,4096,$true);
-$sw=New-Object System.IO.StreamWriter($srv,[System.Text.Encoding]::UTF8,4096,$true);
-while($null -ne ($line=$sr.ReadLine())){{
-  if($line.Trim().Length -eq 0){{ continue; }}
-  [Console]::Out.WriteLine($line);
-  [Console]::Out.Flush();
-  $resp=[Console]::In.ReadLine();
-  if($null -eq $resp){{ break; }}
-  $sw.WriteLine($resp);
-  $sw.Flush();
-}}
-$srv.Dispose();"#,
-        );
-        while !stop_flag.load(Ordering::SeqCst) {
-            let child = std::process::Command::new("powershell")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn();
-            let Ok(mut proc) = child else {
-                break;
-            };
-            let Some(stdout) = proc.stdout.take() else {
-                let _ = proc.kill();
-                break;
-            };
-            let Some(mut stdin) = proc.stdin.take() else {
-                let _ = proc.kill();
-                break;
-            };
-            let mut reader = BufReader::new(stdout);
-            while !stop_flag.load(Ordering::SeqCst) {
-                let mut line = String::new();
-                let read_res = {
-                    let mut limited = (&mut reader).take(MAX_IPC_LINE_BYTES);
-                    limited.read_line(&mut line)
-                };
-                match read_res {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn serve_spool_dir_loop(
+    spool_dir: &Path,
+    expected_token: &str,
+    tx_batches: &mpsc::Sender<Vec<PathBuf>>,
+    tx_rpc: &mpsc::Sender<PendingIpcCall>,
+    wake_ctx: &Option<egui::Context>,
+    stop_flag: &AtomicBool,
+) {
+    while !stop_flag.load(Ordering::SeqCst) {
+        let mut handled_any = false;
+        if let Ok(entries) = fs::read_dir(spool_dir) {
+            for entry in entries.flatten() {
+                if stop_flag.load(Ordering::SeqCst) {
+                    return;
                 }
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+                let req_path = entry.path();
+                let Some(file_name) = req_path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(req_id) = file_name.strip_suffix(".req") else {
+                    continue;
+                };
+                let mut raw_line = String::new();
+                let read_ok = fs::File::open(&req_path).and_then(|f| {
+                    f.take(MAX_IPC_LINE_BYTES)
+                        .read_to_string(&mut raw_line)
+                        .map(|_| ())
+                });
+                let _ = fs::remove_file(&req_path);
+                if read_ok.is_err() {
                     continue;
                 }
-                let resp =
-                    process_jsonrpc_line(trimmed, expected_token, tx_batches, tx_rpc, wake_ctx);
-                if let Ok(mut encoded) = serde_json::to_string(&resp) {
-                    encoded.push('\n');
-                    if stdin.write_all(encoded.as_bytes()).is_err() || stdin.flush().is_err() {
-                        break;
+                handled_any = true;
+                let resp = process_jsonrpc_line(
+                    raw_line.trim(),
+                    expected_token,
+                    tx_batches,
+                    tx_rpc,
+                    wake_ctx,
+                );
+                if let Ok(encoded) = serde_json::to_string(&resp) {
+                    let resp_tmp = spool_dir.join(format!("{req_id}.resp.tmp"));
+                    let resp_final = spool_dir.join(format!("{req_id}.resp"));
+                    if write_private_file(&resp_tmp, encoded.as_bytes()).is_ok()
+                        && fs::rename(&resp_tmp, &resp_final).is_err()
+                    {
+                        let _ = write_private_file(&resp_final, encoded.as_bytes());
+                        let _ = fs::remove_file(&resp_tmp);
                     }
                 }
             }
-            drop(stdin);
-            let _ = proc.wait();
+        } else {
+            break;
+        }
+        if !handled_any {
+            thread::sleep(Duration::from_millis(4));
         }
     }
 }
 
-#[cfg(windows)]
-fn windows_named_pipe_roundtrip(pipe_name: &str, line: &str) -> Result<JsonRpcResponse, String> {
-    if pipe_name.is_empty() {
-        return Err("lockfile missing Windows NamedPipe name".to_owned());
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn spool_dir_roundtrip(spool_dir: &Path, line: &str) -> Result<JsonRpcResponse, String> {
+    if !spool_dir.is_dir() {
+        return Err(format!(
+            "IPC spool directory missing: {}",
+            spool_dir.display()
+        ));
     }
-    let mut stream = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)
-        .map_err(|e| format!("NamedPipe open failed ({pipe_name}): {e}"))?;
-    stream
-        .write_all(line.as_bytes())
-        .and_then(|()| stream.flush())
-        .map_err(|e| format!("NamedPipe write failed: {e}"))?;
-    let mut resp_line = String::new();
-    let mut reader = BufReader::new(stream.take(MAX_IPC_LINE_BYTES));
-    reader
-        .read_line(&mut resp_line)
-        .map_err(|e| format!("NamedPipe read failed: {e}"))?;
-    serde_json::from_str::<JsonRpcResponse>(resp_line.trim())
-        .map_err(|e| format!("invalid NamedPipe JSON-RPC response: {e}"))
-}
+    let req_id = Uuid::new_v4().to_string();
+    let req_tmp = spool_dir.join(format!("{req_id}.req.tmp"));
+    let req_final = spool_dir.join(format!("{req_id}.req"));
+    let resp_final = spool_dir.join(format!("{req_id}.resp"));
 
-#[cfg(windows)]
-fn windows_named_pipe_ping_shutdown(pipe_name: &str) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)?;
-    f.write_all(b"\n")?;
-    f.flush()
+    write_private_file(&req_tmp, line.as_bytes())
+        .map_err(|e| format!("IPC spool write failed ({}): {e}", req_tmp.display()))?;
+    if fs::rename(&req_tmp, &req_final).is_err() {
+        write_private_file(&req_final, line.as_bytes()).map_err(|e| {
+            let _ = fs::remove_file(&req_tmp);
+            format!("IPC spool commit failed ({}): {e}", req_final.display())
+        })?;
+        let _ = fs::remove_file(&req_tmp);
+    }
+
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while Instant::now() < deadline {
+        if resp_final.exists() {
+            let mut resp_line = String::new();
+            let read_res = fs::File::open(&resp_final).and_then(|f| {
+                f.take(MAX_IPC_LINE_BYTES)
+                    .read_to_string(&mut resp_line)
+                    .map(|_| ())
+            });
+            let _ = fs::remove_file(&resp_final);
+            read_res
+                .map_err(|e| format!("IPC spool read failed ({}): {e}", resp_final.display()))?;
+            return serde_json::from_str::<JsonRpcResponse>(resp_line.trim())
+                .map_err(|e| format!("invalid IPC spool JSON-RPC response: {e}"));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let _ = fs::remove_file(&req_final);
+    let _ = fs::remove_file(&resp_final);
+    Err(format!(
+        "IPC spool timed out after {:?} ({})",
+        IO_TIMEOUT,
+        spool_dir.display()
+    ))
 }
 
 fn absolutize_paths(files: &[PathBuf]) -> Vec<String> {
@@ -1137,6 +1161,7 @@ mod tests {
         let stale = serde_json::json!({
             "socket_path": dir.path().join("missing.sock").to_string_lossy(),
             "pipe_name": "",
+            "spool_dir": dir.path().join("missing.spool").to_string_lossy(),
             "pid": 999_999u32,
             "token": "stale-token"
         });
@@ -1145,14 +1170,66 @@ mod tests {
         assert!(!lock_path.exists(), "stale lockfile must be cleaned up");
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn spool_dir_transport_roundtrip_and_fast_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = dir.path().join("win_ipc.spool");
+        fs::create_dir_all(&spool).expect("create spool");
+
+        let (tx_batches, rx_batches) = mpsc::channel::<Vec<PathBuf>>();
+        let (tx_rpc, _rx_rpc) = mpsc::channel::<PendingIpcCall>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let spool_bg = spool.clone();
+
+        let srv = thread::spawn(move || {
+            serve_spool_dir_loop(&spool_bg, "tok-123", &tx_batches, &tx_rpc, &None, &stop_bg);
+        });
+
+        let ping_line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "studio.ping",
+            "params": {},
+            "token": "tok-123"
+        })
+        .to_string();
+        let resp = spool_dir_roundtrip(&spool, &ping_line).expect("spool ping roundtrip");
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["ok"], serde_json::json!(true));
+
+        let open_line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "app.open_files",
+            "params": { "files": ["شعار.cdr"] },
+            "token": "tok-123"
+        })
+        .to_string();
+        let open_resp = spool_dir_roundtrip(&spool, &open_line).expect("spool open_files");
+        assert_eq!(open_resp.result.unwrap()["count"], serde_json::json!(1));
+        assert_eq!(
+            rx_batches.try_recv().unwrap(),
+            vec![PathBuf::from("شعار.cdr")]
+        );
+
+        let bad_resp = spool_dir_roundtrip(&spool, "{not-json").expect("spool parse error");
+        assert_eq!(bad_resp.error.unwrap().code, JSONRPC_PARSE_ERROR);
+
+        let t0 = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        srv.join().expect("spool server joins cleanly");
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "spool shutdown must never hang"
+        );
+    }
+
     #[test]
     fn json_rpc_bidirectional_command_history_roundtrip_and_undo_redo() {
-        use std::os::unix::net::UnixStream;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_path = dir.path().join("rpc.lock");
-        let server = Arc::new(IpcServer::bind_at(&lock_path).expect("bind UDS RPC server"));
+        let server = Arc::new(IpcServer::bind_at(&lock_path).expect("bind IPC RPC server"));
         let done = Arc::new(AtomicBool::new(false));
 
         let server_bg = Arc::clone(&server);
@@ -1309,14 +1386,25 @@ mod tests {
         .expect("unknown method");
         assert_eq!(unknown_resp.error.unwrap().code, JSONRPC_METHOD_NOT_FOUND);
 
-        // 7. Malformed JSON over raw UnixStream returns -32700 Parse error
-        let mut raw_stream = UnixStream::connect(server.socket_path()).expect("connect raw UDS");
-        raw_stream.write_all(b"{not-json\n").unwrap();
-        raw_stream.flush().unwrap();
-        let mut line = String::new();
-        BufReader::new(raw_stream).read_line(&mut line).unwrap();
-        let parse_err: JsonRpcResponse = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(parse_err.error.unwrap().code, JSONRPC_PARSE_ERROR);
+        // 8. Malformed JSON over transport returns -32700 Parse error
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let mut raw_stream =
+                UnixStream::connect(server.socket_path()).expect("connect raw UDS");
+            raw_stream.write_all(b"{not-json\n").unwrap();
+            raw_stream.flush().unwrap();
+            let mut line = String::new();
+            BufReader::new(raw_stream).read_line(&mut line).unwrap();
+            let parse_err: JsonRpcResponse = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(parse_err.error.unwrap().code, JSONRPC_PARSE_ERROR);
+        }
+        #[cfg(windows)]
+        {
+            let parse_err =
+                spool_dir_roundtrip(&server.spool_dir, "{not-json").expect("spool raw parse err");
+            assert_eq!(parse_err.error.unwrap().code, JSONRPC_PARSE_ERROR);
+        }
 
         done.store(true, Ordering::SeqCst);
         worker.join().unwrap();

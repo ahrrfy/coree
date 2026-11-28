@@ -358,10 +358,7 @@ fn show_status_bar(ui: &mut Ui, app: &mut StudioApp) {
                 ui.with_layout(
                     shell_dir.opposite_horizontal_layout(egui::Align::Center),
                     |ui| {
-                        let perf_label = format!(
-                            "⚡ {}T",
-                            app.resource_budget.worker_threads
-                        );
+                        let perf_label = format!("⚡ {}T", app.resource_budget.worker_threads);
                         let perf_color = if app.resource_budget.under_memory_pressure {
                             tokens.warning
                         } else {

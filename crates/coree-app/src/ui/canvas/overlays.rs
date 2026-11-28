@@ -286,7 +286,10 @@ pub(super) fn paint_canvas_overlays(ui: &egui::Ui, app: &StudioApp, canvas_rect:
                                     any_decimated = true;
                                     continue;
                                 }
-                                let cell = ((a_pos.x * 0.2).floor() as i32, (a_pos.y * 0.2).floor() as i32);
+                                let cell = (
+                                    (a_pos.x * 0.2).floor() as i32,
+                                    (a_pos.y * 0.2).floor() as i32,
+                                );
                                 if !occupied_cells.insert(cell) {
                                     any_decimated = true;
                                     continue;

@@ -77,7 +77,8 @@ impl HostResourceProfile {
             .filter(|&mb| mb >= 256)
             .map(|mb| mb.saturating_mul(MIB));
 
-        let (mut total_ram, mut avail_ram, rss, cgroup_cap, exact) = probe_platform_memory(logical_cpus);
+        let (mut total_ram, mut avail_ram, rss, cgroup_cap, exact) =
+            probe_platform_memory(logical_cpus);
 
         let effective_cap = match (env_cap, cgroup_cap) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -201,8 +202,7 @@ impl ResourceBudget {
             }
         };
 
-        let budget_bytes = (profile.available_ram_bytes / ram_div)
-            .min(profile.total_ram_bytes / 8);
+        let budget_bytes = (profile.available_ram_bytes / ram_div).min(profile.total_ram_bytes / 8);
         let raw_tiles = (budget_bytes / WORLD_TILE_BYTES) as usize;
         let max_cached_world_tiles = raw_tiles.clamp(min_tiles, max_tiles);
 
@@ -305,7 +305,9 @@ fn probe_platform_memory(_logical_cpus: usize) -> (u64, u64, Option<u64>, Option
         for line in meminfo.lines() {
             let mut parts = line.split_whitespace();
             let Some(key) = parts.next() else { continue };
-            let Some(val_str) = parts.next() else { continue };
+            let Some(val_str) = parts.next() else {
+                continue;
+            };
             let Ok(val) = val_str.parse::<u64>() else {
                 continue;
             };
@@ -343,8 +345,11 @@ fn probe_platform_memory(_logical_cpus: usize) -> (u64, u64, Option<u64>, Option
 
     if let Some(total_kb) = mem_total_kb {
         let total = total_kb.saturating_mul(1024);
-        let avail_kb =
-            mem_avail_kb.unwrap_or_else(|| mem_free_kb.saturating_add(buffers_kb).saturating_add(cached_kb));
+        let avail_kb = mem_avail_kb.unwrap_or_else(|| {
+            mem_free_kb
+                .saturating_add(buffers_kb)
+                .saturating_add(cached_kb)
+        });
         let mut avail = avail_kb.saturating_mul(1024);
         // Also refine cgroup available memory when `memory.current` is exposed
         if let Some(cap) = cgroup_cap {

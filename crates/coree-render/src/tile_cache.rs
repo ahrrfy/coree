@@ -669,7 +669,12 @@ impl DirtyTileCache {
         self.spatial_dirty = true;
     }
 
-    fn resolve_icc_hash(&mut self, doc: &Document, doc_sig: DocSignature, options: &RenderOptions) -> u64 {
+    fn resolve_icc_hash(
+        &mut self,
+        doc: &Document,
+        doc_sig: DocSignature,
+        options: &RenderOptions,
+    ) -> u64 {
         let (disp_ptr, disp_len) = options
             .display_icc_profile
             .as_deref()

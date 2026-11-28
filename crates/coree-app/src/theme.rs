@@ -569,8 +569,9 @@ pub fn find_arabic_system_font() -> Option<PathBuf> {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
         "/System/Library/Fonts/GeezaPro.ttc",
     ];
     for p in preferred_paths {
@@ -582,7 +583,7 @@ pub fn find_arabic_system_font() -> Option<PathBuf> {
 
     if let Some(windir) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
         let fonts_dir = PathBuf::from(windir).join("Fonts");
-        for name in ["arial.ttf", "tahoma.ttf", "segoeui.ttf", "calibri.ttf"] {
+        for name in ["tahoma.ttf", "segoeui.ttf", "arial.ttf", "calibri.ttf"] {
             let pb = fonts_dir.join(name);
             if pb.is_file() {
                 return Some(pb);
@@ -655,75 +656,210 @@ pub fn layout_bidi_text_edit_galley(
     let has_arabic_family = ui
         .ctx()
         .fonts_mut(|f| f.families().contains(&arabic_family));
-    let font_id = if is_rtl && has_arabic_family {
+    let body_font_id = egui::TextStyle::Body.resolve(ui.style());
+    let rtl_font_id = if is_rtl && has_arabic_family {
         egui::FontId::new(14.5, arabic_family)
     } else {
-        egui::TextStyle::Body.resolve(ui.style())
+        body_font_id.clone()
     };
     let text_color = ui.visuals().text_color();
 
-    let display_text = if is_rtl && !raw_text.is_empty() {
-        let reordered: String = raw_text
-            .split('\n')
-            .enumerate()
-            .map(|(i, line)| {
-                let shaped = shape_mixed_ui_bidi(line);
-                let safe_line = if shaped.chars().count() == line.chars().count() {
-                    shaped
-                } else {
-                    line.to_owned()
-                };
-                if i == 0 {
-                    safe_line
-                } else {
-                    format!("\n{safe_line}")
-                }
-            })
-            .collect();
-        if reordered.chars().count() == raw_text.chars().count() {
-            reordered
+    if !is_rtl || raw_text.is_empty() {
+        let mut job = if multiline {
+            egui::text::LayoutJob::simple(raw_text.to_owned(), rtl_font_id, text_color, wrap_width)
         } else {
-            raw_text.to_owned()
+            egui::text::LayoutJob::simple_singleline(raw_text.to_owned(), rtl_font_id, text_color)
+        };
+        if is_rtl {
+            job.halign = egui::Align::RIGHT;
         }
-    } else {
-        raw_text.to_owned()
+        return ui.ctx().fonts_mut(|f| f.layout_job(job));
+    }
+
+    // Emit each UAX #9 BiDi visual run as its own `LayoutSection` so `epaint` invokes `harfrust`
+    // separately per script direction even when a single font (e.g. Windows `Arial`/`Tahoma`/`Segoe UI`
+    // or Linux `DejaVuSans`) covers both Latin and Arabic glyphs.
+    let mut job = egui::text::LayoutJob {
+        break_on_newline: multiline,
+        halign: egui::Align::RIGHT,
+        ..Default::default()
+    };
+    job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
+
+    let rtl_fmt = egui::TextFormat {
+        font_id: rtl_font_id,
+        color: text_color,
+        ..Default::default()
+    };
+    let ltr_fmt = egui::TextFormat {
+        font_id: body_font_id,
+        color: text_color,
+        ..Default::default()
     };
 
-    let expected_chars = display_text.chars().count();
-    let mut job = if multiline {
-        egui::text::LayoutJob::simple(display_text, font_id, text_color, wrap_width)
+    let lines: Vec<&str> = if multiline {
+        raw_text.split('\n').collect()
     } else {
-        egui::text::LayoutJob::simple_singleline(display_text, font_id, text_color)
+        vec![raw_text]
     };
-    if is_rtl {
-        job.halign = egui::Align::RIGHT;
+    let mut expected_para_chars: Vec<usize> = Vec::with_capacity(lines.len());
+
+    for (line_idx, line) in lines.iter().copied().enumerate() {
+        if line_idx > 0 {
+            job.append("\n", 0.0, rtl_fmt.clone());
+        }
+        let line_char_len = line.chars().count();
+        expected_para_chars.push(line_char_len);
+        if line.is_empty() {
+            continue;
+        }
+        let has_line_rtl = line.chars().any(is_arabic_or_hebrew);
+        let has_line_ltr = line.chars().any(|c| c.is_ascii_alphabetic());
+        if !has_line_rtl {
+            job.append(line, 0.0, ltr_fmt.clone());
+            continue;
+        }
+        if !has_line_ltr {
+            job.append(line, 0.0, rtl_fmt.clone());
+            continue;
+        }
+
+        let bidi = unicode_bidi::BidiInfo::new(line, Some(unicode_bidi::Level::rtl()));
+        if let Some(para) = bidi.paragraphs.first() {
+            let (levels, runs) = bidi.visual_runs(para, para.range.clone());
+            let mut appended_chars = 0usize;
+            let mut staged_sections: Vec<(String, bool)> = Vec::with_capacity(runs.len());
+            for run in &runs {
+                let slice = &line[run.clone()];
+                let is_rtl_run = levels.get(run.start).is_some_and(|l| l.is_rtl());
+                let seg = if is_rtl_run {
+                    slice
+                        .chars()
+                        .map(|ch| match ch {
+                            '(' => ')',
+                            ')' => '(',
+                            '[' => ']',
+                            ']' => '[',
+                            _ => ch,
+                        })
+                        .collect::<String>()
+                } else {
+                    slice.to_owned()
+                };
+                appended_chars += seg.chars().count();
+                staged_sections.push((seg, is_rtl_run));
+            }
+            if appended_chars == line_char_len {
+                for (seg, is_rtl_run) in staged_sections {
+                    let fmt = if is_rtl_run {
+                        rtl_fmt.clone()
+                    } else {
+                        ltr_fmt.clone()
+                    };
+                    job.append(&seg, 0.0, fmt);
+                }
+            } else {
+                job.append(line, 0.0, rtl_fmt.clone());
+            }
+        } else {
+            job.append(line, 0.0, rtl_fmt.clone());
+        }
     }
+
     let mut galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
 
-    // Workaround for upstream `epaint 0.37` RTL bug: `harfrust` emits RTL clusters in descending
-    // byte order ending at `cluster = 0`, causing `epaint`'s `emit_continuation_glyphs(0..len)`
-    // to append `N - 1` bogus zero-width `uv_rect.is_nothing()` glyphs (`2N - 1` total).
-    // Trimming exactly the excess zero-width unallocated glyphs restores the strict 1-to-1
-    // `galley.end().index == text.chars().count()` invariant for `TextEdit` cursor/selection/backspace
-    // while preserving legitimate ligature/diacritic continuation glyphs (`لا`, harakat).
-    let actual_chars = galley.end().index.0;
-    if is_rtl && actual_chars > expected_chars {
-        let mut excess = actual_chars - expected_chars;
-        let galley_mut = Arc::make_mut(&mut galley);
-        for placed_row in galley_mut.rows.iter_mut().rev() {
-            if excess == 0 {
-                break;
-            }
-            let row = Arc::make_mut(&mut placed_row.row);
-            let mut idx = row.glyphs.len();
-            while idx > 0 && excess > 0 {
-                idx -= 1;
-                let g = &row.glyphs[idx];
-                if g.advance_width == 0.0 && g.uv_rect.is_nothing() {
-                    row.glyphs.remove(idx);
-                    excess -= 1;
+    // Reconcile upstream `epaint 0.37` per-paragraph glyph counts:
+    // 1. `harfrust` RTL clusters end at `cluster = 0`, causing `emit_continuation_glyphs(0..len)`
+    //    to append excess zero-width `uv_rect.is_nothing()` glyphs (`actual > expected`).
+    // 2. When a system font lacks an uncommon combining mark (e.g. `U+0670` in Windows `Arial`),
+    //    `epaint` drops `.notdef` combining marks (`actual < expected`).
+    // Enforcing exact 1-to-1 per-paragraph glyph count keeps `TextEdit` cursor/selection/Backspace exact.
+    let expected_total = raw_text.chars().count();
+    let needs_reconcile = galley.end().index.0 != expected_total || {
+        let mut row_cursor = 0usize;
+        let mut mismatch = false;
+        for &exp_len in &expected_para_chars {
+            let mut para_len = 0usize;
+            while row_cursor < galley.rows.len() {
+                let pr = &galley.rows[row_cursor];
+                para_len += pr.row.glyphs.len();
+                let ended = pr.ends_with_newline;
+                row_cursor += 1;
+                if ended {
+                    break;
                 }
             }
+            if para_len != exp_len {
+                mismatch = true;
+                break;
+            }
+        }
+        mismatch
+    };
+
+    if needs_reconcile {
+        let galley_mut = Arc::make_mut(&mut galley);
+        let mut row_start = 0usize;
+        for &exp_len in &expected_para_chars {
+            if row_start >= galley_mut.rows.len() {
+                break;
+            }
+            let mut row_end = row_start;
+            let mut actual_para = 0usize;
+            while row_end < galley_mut.rows.len() {
+                actual_para += galley_mut.rows[row_end].row.glyphs.len();
+                let ended = galley_mut.rows[row_end].ends_with_newline;
+                row_end += 1;
+                if ended {
+                    break;
+                }
+            }
+            if actual_para > exp_len {
+                let mut excess = actual_para - exp_len;
+                for r_idx in (row_start..row_end).rev() {
+                    if excess == 0 {
+                        break;
+                    }
+                    let row = Arc::make_mut(&mut galley_mut.rows[r_idx].row);
+                    let mut idx = row.glyphs.len();
+                    while idx > 0 && excess > 0 {
+                        idx -= 1;
+                        let g = &row.glyphs[idx];
+                        if g.advance_width == 0.0 && g.uv_rect.is_nothing() {
+                            row.glyphs.remove(idx);
+                            excess -= 1;
+                        }
+                    }
+                }
+                if excess > 0 {
+                    for r_idx in (row_start..row_end).rev() {
+                        if excess == 0 {
+                            break;
+                        }
+                        let row = Arc::make_mut(&mut galley_mut.rows[r_idx].row);
+                        let mut idx = row.glyphs.len();
+                        while idx > 0 && excess > 0 {
+                            idx -= 1;
+                            if row.glyphs[idx].advance_width == 0.0 {
+                                row.glyphs.remove(idx);
+                                excess -= 1;
+                            }
+                        }
+                    }
+                }
+            } else if actual_para < exp_len && row_end > row_start {
+                let deficit = exp_len - actual_para;
+                let row = Arc::make_mut(&mut galley_mut.rows[row_end - 1].row);
+                if let Some(&tmpl) = row.glyphs.last() {
+                    let mut pad = tmpl;
+                    pad.advance_width = 0.0;
+                    pad.uv_rect = Default::default();
+                    for _ in 0..deficit {
+                        row.glyphs.push(pad);
+                    }
+                }
+            }
+            row_start = row_end;
         }
     }
     galley
@@ -806,14 +942,21 @@ mod tests {
         assert!(!row.glyphs.is_empty());
         // In proper single-run RTL shaping of "الحمد لله رب العالمين", the visual leftmost glyph
         // belongs to the LAST word ("العالمين", ending in 'ن') and the visual rightmost glyph
-        // belongs to the FIRST word ("الحمد", starting with 'ا').
-        let leftmost = row
+        // belongs to the FIRST word ("الحمد", starting with 'ا'). Filter out zero-width unallocated
+        // ligature continuation glyphs (e.g. Windows `Arial`/`Tahoma` "لله" ligature) placed at `cursor_x`.
+        let visible_glyphs: Vec<&egui::epaint::text::Glyph> = row
             .glyphs
+            .iter()
+            .filter(|g| {
+                !(g.advance_width == 0.0 && g.uv_rect.is_nothing()) && !g.chr.is_whitespace()
+            })
+            .collect();
+        assert!(!visible_glyphs.is_empty());
+        let leftmost = visible_glyphs
             .iter()
             .min_by(|a, b| a.pos.x.total_cmp(&b.pos.x))
             .unwrap();
-        let rightmost = row
-            .glyphs
+        let rightmost = visible_glyphs
             .iter()
             .max_by(|a, b| a.pos.x.total_cmp(&b.pos.x))
             .unwrap();
@@ -848,6 +991,46 @@ mod tests {
                 g.end().index.0,
                 sample.chars().count(),
                 "1-to-1 char invariant must hold for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_arabic_text_edit_galley_single_combined_latin_arabic_font_mirrors_windows_arial() {
+        let Some(combined_font) = find_unicode_symbol_system_font() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&combined_font) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut defs = FontDefinitions::default();
+        let key = "combined_latin_arabic".to_owned();
+        defs.font_data
+            .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        defs.families.insert(
+            FontFamily::Name(ARABIC_EDITOR_FONT_FAMILY.into()),
+            vec![key.clone()],
+        );
+        defs.families.insert(FontFamily::Proportional, vec![key]);
+        ctx.set_fonts(defs);
+
+        for sample in [
+            "الحمد لله رب العالمين",
+            "لا إله إلا الله",
+            "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+            "مرحبا Coree 2026\nسطر ثاني للتجربة",
+        ] {
+            let mut g_opt: Option<Arc<egui::Galley>> = None;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                g_opt = Some(layout_bidi_text_edit_galley(ui, sample, 360.0, true, false));
+            });
+            out.textures_delta.clear();
+            let g = g_opt.unwrap();
+            assert_eq!(
+                g.end().index.0,
+                sample.chars().count(),
+                "Single combined Latin+Arabic font must preserve 1-to-1 char count for {sample:?}"
             );
         }
     }

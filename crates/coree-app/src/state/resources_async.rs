@@ -73,10 +73,9 @@ pub(crate) fn estimate_tab_metrics_nodes(tab: &DocumentTab) -> usize {
             NodePayload::ArtisticText(t) => t.plain_text().len() * 12,
             NodePayload::ParagraphText(p) => p.plain_text().len() * 12,
             NodePayload::TextOnPath(top) => top.text.plain_text().len() * 12,
-            NodePayload::Group(children) => children
-                .iter()
-                .map(|&c| obj_nodes(doc, c, depth + 1))
-                .sum(),
+            NodePayload::Group(children) => {
+                children.iter().map(|&c| obj_nodes(doc, c, depth + 1)).sum()
+            }
             NodePayload::PowerClip {
                 container,
                 contents,
@@ -206,8 +205,7 @@ impl StudioApp {
                     .iter()
                     .copied()
                     .collect();
-                tab.gpu_tile_textures
-                    .retain(|k, _| active_keys.contains(k));
+                tab.gpu_tile_textures.retain(|k, _| active_keys.contains(k));
             } else {
                 tab.gpu_tile_textures.clear();
                 tab.last_rendered_texture = None;
@@ -267,10 +265,7 @@ impl StudioApp {
                 if ctx.is_cancelled() {
                     return Err("cancelled".to_owned());
                 }
-                Ok(compute_production_metrics(
-                    &doc_clone,
-                    sel_clone.as_deref(),
-                ))
+                Ok(compute_production_metrics(&doc_clone, sel_clone.as_deref()))
             });
             tab.metrics_job = Some((target_gen, handle));
         }
@@ -389,7 +384,8 @@ impl StudioApp {
             self.push_toast("select a raster bitmap object to run Vector Trace", true);
             return;
         };
-        let px_area = u64::from(resolved.asset.width).saturating_mul(u64::from(resolved.asset.height));
+        let px_area =
+            u64::from(resolved.asset.width).saturating_mul(u64::from(resolved.asset.height));
         if px_area < 360_000 {
             if let Err(err) = self.trace_selected_raster() {
                 self.push_toast(err, true);
@@ -438,7 +434,12 @@ impl StudioApp {
                 return Err("cancelled".to_owned());
             }
             let (trace_asset, offset_x_mm, offset_y_mm, trace_w_mm, trace_h_mm) =
-                super::production::crop_filtered_trace_asset(filtered_asset, crop_rect, w_mm, h_mm)?;
+                super::production::crop_filtered_trace_asset(
+                    filtered_asset,
+                    crop_rect,
+                    w_mm,
+                    h_mm,
+                )?;
             ctx.set_progress(50);
             let traced = trace_raster_to_mm(&trace_asset, trace_w_mm, trace_h_mm, &cfg);
             if ctx.is_cancelled() {
