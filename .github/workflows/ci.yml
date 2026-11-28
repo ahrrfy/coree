@@ -31,6 +31,8 @@ jobs:
 
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -206,7 +208,7 @@ jobs:
           foreach ($ps1 in @("packaging\windows\sign-windows.ps1", "packaging\windows\thumbnail_provider\build-thumb-dll.ps1")) {
             $tokens = $null; $errs = $null
             [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ps1), [ref]$tokens, [ref]$errs) | Out-Null
-            if ($errs.Count -gt 0) { throw "PowerShell syntax error in $ps1: $($errs | Out-String)" }
+            if ($errs.Count -gt 0) { throw "PowerShell syntax error in ${ps1}: $($errs | Out-String)" }
           }
           & .\packaging\windows\thumbnail_provider\build-thumb-dll.ps1 -OutDir "target\release"
           if (-not (Test-Path "target\release\coree_thumb.dll")) { throw "coree_thumb.dll missing after build" }
