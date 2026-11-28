@@ -8,11 +8,19 @@
 //! - Windows / macOS / fallback: `arboard` (`ImageData` RGBA8 + UTF-8 SVG text).
 //! - Headless tests: isolated `MemoryClipboardBackend` default in `StudioApp::new_headless()`.
 
-use coree_io::clipboard_codec::{
-    ClipboardPayload, MIME_EMF, MIME_PDF, MIME_PNG, MIME_SVG, MIME_TEXT_PLAIN,
-};
+use coree_io::clipboard_codec::ClipboardPayload;
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use coree_io::clipboard_codec::{MIME_EMF, MIME_PDF, MIME_PNG, MIME_SVG, MIME_TEXT_PLAIN};
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 /// Raw external clipboard payloads retrieved from OS or shared memory clipboard.
 #[derive(Debug, Clone, Default)]

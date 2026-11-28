@@ -4,6 +4,7 @@
 //! `WM_POINTER` / `egui::Event::Touch` on Windows, zero `unsafe` across all platforms).
 
 use coree_core::StylusSample;
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 /// Cross-platform hardware stylus input provider (`IMP-03`).
